@@ -101,6 +101,22 @@
 > normalisation would silently drop now refuses startup; and the static
 > check refuses payload mutation of an except-bound exception. Numbers below
 > are re-measured on the round-8 spike on `199ee7c`.
+>
+> **Round 9** (after the round-8 panel; gemini clean; claude and codex the
+> same single blocker): the promise said the startup `ValueError`s went
+> through `render_auth_message`, but all 13 builtin `ValueError`/`HTTPError`
+> sites handed the member straight to the builtin (0 renderer calls,
+> measured by both seats), so a swapped member needing `{url}` would have
+> published the literal placeholder. Every builtin site now raises
+> `ValueError(render_auth_message(AuthMessage.<NAME>, **fields))` (and
+> `HTTPError`'s message likewise), the static check requires exactly that
+> form with field names equal to the member's placeholders, and a spy test
+> drives every builtin site. Also: a URL `sanitize_public_auth_url` refuses
+> keeps its own, more specific registry message (claude N1: an IP-literal
+> JWKS URL says "non-public IP literal", through the real CLI), and the
+> list of metadata URLs now refused is corrected -- a `?token=` query alone
+> is not one (claude N2). Numbers below are re-measured on the round-9
+> spike on `199ee7c`.
 
 ## Task
 
@@ -413,20 +429,28 @@ payload mutation.**
 |---|---|---|
 | The CLI check refused configs that work on main (claude B1) | measured through the real CLI: (a) `PMCP_OAUTH_JWKS_URL` ending in `\n` (a Kubernetes Secret from a file), (a') in `\r` (a CRLF env file), (b) `--oauth-jwks-url` with a leading space -- all three work end to end on main, because `urlsplit` and yarl clean them; (c) `--transport stdio` with an unused bad `PMCP_REQUIRED_SCOPES`; (d) HTTP with auth mode `none` and an unused bad `PMCP_OAUTH_JWKS_URL`. All five exited 1 | `check_auth_config` checks a URL as it will be stored: `_stored_url_ok` runs `sanitize_public_auth_url` (as `AsyncJWKS` and `normalize_auth_metadata` do) and then `_url_field` on the result, so the CLI, `AsyncJWKS` and `create_http_app` agree on the same input. `_check_auth_args` returns early unless `transport == "http"` and `auth_mode == "resource-server"`, the only mode that reads these values; `create_http_app` likewise passes `required_scopes` to the check only in resource-server mode (`GatewayServer` forwards the CLI's scopes in every mode). All five are must-start tests; every round-6 N1 refusal (interior or trailing space, `""`, `a"b`, `a\b`, `café`, `a b`) still refuses |
 | A caught exception's payload rewritten before its permitted re-raise (codex 1) | `except ResourceServerAuthError as exc: exc.args = ("Token expired.",); raise exc` passed the static check and published `Token [REDACTED]` | the static check refuses, inside any `except ... as <name>` handler in the two modules: an assignment, augmented or annotated assignment, or `del` whose target is an attribute or item of `<name>` (tuple targets unpacked); `setattr`/`delattr`/`object.__setattr__`/`object.__delattr__`/`Exception.__init__`/`BaseException.__init__` with `<name>` first; and `<name>.__setattr__`/`__delattr__`/`__init__`/`add_note`/`with_traceback`. Eight shapes; no real site does any of it today |
-| Invalid metadata configuration evaded the startup refusal (codex 2) | `check_auth_config` received the *normalised* metadata URL, and normalisation turns a relative, non-http(s), credential-bearing or non-public-IP URL into `None`, so `/.well-known/oauth-protected-resource` and `ftp://pmcp.example/...` passed and the route was silently omitted | `create_http_app` passes the metadata URL *as configured* (`protected_resource_metadata_url or None`); `_stored_url_ok` sanitises it the same way normalisation would and refuses with `METADATA_URL_NOT_USABLE` where normalisation would have dropped it. Both values are tested through `create_http_app` |
+| Invalid metadata configuration evaded the startup refusal (codex 2) | `check_auth_config` received the *normalised* metadata URL, and normalisation turns a relative, non-http(s), plain-http-to-a-non-loopback-host or non-public-IP URL into `None`, so `/.well-known/oauth-protected-resource` and `ftp://pmcp.example/...` passed and the route was silently omitted | `create_http_app` passes the metadata URL *as configured* (`protected_resource_metadata_url or None`); `_stored_url_ok` sanitises it the same way normalisation would, so where normalisation would have dropped it startup is refused -- since round 9 with `sanitize_public_auth_url`'s own registry message (e.g. `PUBLIC_URL_NOT_ABSOLUTE`), and with `METADATA_URL_NOT_USABLE` for a sanitised URL that still has whitespace. Both values are tested through `create_http_app` |
 
 **Behaviour change, stated (codex 2).** Only the programmatic
 `create_http_app` path is affected: the CLI never passes a metadata URL. A
 metadata URL that `normalize_auth_metadata` drops -- relative,
-non-http(s), with a credential-like query (`?token=…`), or a non-public IP
-literal -- used to start with the metadata route omitted, no
+non-http(s), plain `http://` to a non-loopback host, an unparseable port,
+or a non-public IP literal -- used to start with the metadata route omitted, no
 `resource_metadata` in the challenge and a diagnostic; it now refuses
 startup with a message that carries none of the URL. No configuration that
 *serves* metadata today changes: a URL that survives normalisation is
-unaffected. One existing test pinned the old drop
+unaffected -- including an https URL with a credential-like query
+(`?token=…`), which normalisation keeps (redacted where shown) and which
+starts and serves its route on main and here (round 9 corrects round 8's
+list, claude N2; pinned by
+`test_an_https_metadata_url_with_a_credential_like_query_starts`). One
+existing test pinned the old drop
 (`test_transport_http.py::TestAuthGuardHttp::test_invalid_metadata_url_does_not_create_route_or_challenge_header`,
-measured: the only failure in the touched suites); it now asserts the
-refusal and that the message names neither the host nor `secret`. The
+measured: the only failure in the touched suites). Its URL is refused
+because it is plain `http://` to a non-loopback host, not because of its
+`?token=secret` query; it now asserts that refusal
+(`PUBLIC_URL_HTTP_LOOPBACK_ONLY`), says why in a comment, and checks the
+message names neither the host nor `secret`. The
 check runs in every auth mode, because the metadata route is served in
 every mode when configured.
 
@@ -434,8 +458,13 @@ every mode when configured.
 
 **The guarantee is the runtime registry.** Every operator-facing message
 in `auth.py` and `transport/http.py` reaches an operator through
-`render_auth_message` -- the auth error constructors, `_auth_response` and
-the startup `ValueError`s all call it -- so whatever code produced it:
+`render_auth_message` -- the auth error constructors and `_auth_response`
+call it, and since round 9 every builtin site raises
+`ValueError(render_auth_message(AuthMessage.<NAME>, **fields))` /
+`HTTPError(…, render_auth_message(…), …)` (13 sites; each driven through a
+spy by `test_every_builtin_refusal_goes_through_the_renderer`, and
+`test_every_builtin_message_site_is_driven` checks the table covers them
+all) -- so whatever code produced it:
 - membership is identity (`id(message) in _MEMBER_IDS`; a minted `AuthText`
   or an unminted `PyJwtText` is refused);
 - fields are exactly the member's placeholders, and each value has its
@@ -450,13 +479,15 @@ the startup `ValueError`s all call it -- so whatever code produced it:
 **The static check is a guard rail for listed shapes.** It refuses exactly:
 (1) a raise of anything but a known site or a handler-bound re-raise, and
 any new exception class; (2) a message site whose message is not
-`AuthMessage.<NAME>`; (3) wrong arity -- extra positionals, stray keywords,
+`AuthMessage.<NAME>` -- or, at a builtin `ValueError`/`HTTPError` site,
+not `render_auth_message(AuthMessage.<NAME>, **fields)` with one
+positional, no `**` and field names equal to the member's placeholders; (3) wrong arity -- extra positionals, stray keywords,
 star-arguments; (4) field names that differ from the member's
 placeholders, and literal field values; (5) `raise <name>` outside the
 handler that binds it, or after rebinding it; (6) `pyjwt_text` outside
 `except _FIXED_TEXT_CLAIM_ERRORS as <name>`; (7) payload mutation of an
 except-bound exception (the eight shapes above). Each is pinned in
-`_STATIC_SHAPES` (36) and by a mutant. **It is not exhaustive against
+`_STATIC_SHAPES` (42) and by a mutant. **It is not exhaustive against
 deliberate obfuscation** -- `getattr` chains, `exec`, `vars(exc)[…]`, a
 helper that mutates its argument would pass it -- and the plan no longer
 claims it fails closed for any future code. What it buys is that the
@@ -589,10 +620,10 @@ embedders, and the working configuration uses `resource_server_audience`
 
 ## Changes
 
-The round-8 spike diff on `199ee7c` is 8 files (`git diff --numstat`):
-`auth.py` +326/-37 (the registry is most of it), `transport/http.py`
-+59/-19, `cli.py` +26, `README.md` +34/-5 and four existing test files
-(+33/-22). It also adds a new test module.
+The round-9 spike diff on `199ee7c` is 8 files (`git diff --numstat`):
+`auth.py` +332/-37 (the registry is most of it), `transport/http.py`
++61/-17, `cli.py` +26, `README.md` +34/-5 and four existing test files
+(+35/-22). It also adds a new test module.
 
 ### `src/pmcp/auth.py` (modify)
 - After the imports: `AuthText(str)`, `PyJwtText(str)`, the registry
@@ -613,7 +644,11 @@ The round-8 spike diff on `199ee7c` is 8 files (`git diff --numstat`):
   and its three members; `AsyncJWKS.__init__` calls it on the stored URL.
 - Round 8: `_stored_url_ok(url)` -- `sanitize_public_auth_url`, then
   `_url_field` on the result -- is what `check_auth_config` applies to both
-  URLs.
+  URLs. Round 9: it no longer catches `sanitize_public_auth_url`'s
+  `ValueError`, so that message (non-public IP, plain http, not absolute,
+  invalid) comes through unchanged.
+- Round 9: every builtin site -- the eight `ValueError`s here and the
+  redirect `HTTPError` -- wraps its member in `render_auth_message(...)`.
 
 ### `src/pmcp/transport/http.py` (modify)
 - Import `AuthMessage`, `AuthText`. New module-level `_auth_response(status,
@@ -628,6 +663,8 @@ The round-8 spike diff on `199ee7c` is 8 files (`git diff --numstat`):
   and the five challenge-carrying `_reject` calls pass `headers=`;
   `create_http_app` calls `check_auth_config(metadata_url=...,
   required_scopes=...)` after the resource-server block.
+- Round 9: the four startup `ValueError`s wrap their member in
+  `render_auth_message(...)`.
 - Round 8: that call passes the metadata URL as configured
   (`protected_resource_metadata_url or None`), and `required_scopes` only
   when the effective auth mode is `resource-server`.
@@ -667,12 +704,14 @@ the first full run: 2 in `test_http_transport.py`, 26 parametrized cases in
   raises).
 - Round 8, `test_transport_http.py`:
   `test_invalid_metadata_url_does_not_create_route_or_challenge_header`
-  pinned the silent drop of a `?token=secret` metadata URL; it now expects
-  the startup refusal and checks the message names neither the host nor
-  `secret` (*Behaviour change, stated*).
+  pinned the silent drop of `http://auth.example/...?token=secret`; it now
+  expects the startup refusal, which (round 9) it attributes in a comment
+  to the plain `http://` non-loopback host, not the query, matches
+  `PUBLIC_URL_HTTP_LOOPBACK_ONLY`, and checks the message names neither the
+  host nor `secret` (*Behaviour change, stated*).
 
 ### `tests/test_auth_operator_messages.py` (create)
-222 tests on 3.10 (about 3 s), no network, no timed sleeps (one test runs a local TCP server; the CLI tests call `run_server` with a patched `GatewayServer`):
+244 tests on 3.10 (about 1.5 s), no network, no timed sleeps (one test runs a local TCP server; the CLI tests call `run_server` with a patched `GatewayServer`):
 
 | Test | Count | Pins |
 |---|---|---|
@@ -688,7 +727,7 @@ the first full run: 2 in `test_http_transport.py`, 26 parametrized cases in
 | **round 6:** `test_an_auth_response_body_of_the_right_type_that_is_not_a_member_is_refused`, `test_isinstance_auth_text_is_only_used_to_enumerate_the_registry` | 2 | the one guard |
 | **round 6:** `test_every_registry_placeholder_has_a_validator_and_no_odd_braces`, `test_the_jwks_redirect_path_raises_its_registry_message` | 2 | claude N4 and N1 |
 | `test_every_message_site_names_a_registry_member`, `test_the_site_check_sees_every_site`, `test_auth_text_is_built_only_in_the_registry` | 3 | the static check on the real modules |
-| `test_the_site_check_refuses_every_shape[shape]` | 36 | the static check on the rounds 1–4 shapes as source (round 5 adds a literal and an f-string field, three named raises -- outside its handler, in another function, rebound in the handler -- and `pyjwt_text` at the `InvalidTokenError` site and outside any handler; round 6 a misnamed and a missing field; round 7 an extra positional message at each site kind -- `ValueError`, both error classes, `HTTPError`, `_reject`, `_auth_response` -- and a stray keyword; round 8 eight payload mutations: `exc.args =`, `exc.description =`, a tuple target, `+=`, `exc.__dict__[…] =`, `setattr`, `object.__setattr__`, `add_note`) |
+| `test_the_site_check_refuses_every_shape[shape]` | 42 | the static check on the rounds 1–4 shapes as source (round 5 adds a literal and an f-string field, three named raises -- outside its handler, in another function, rebound in the handler -- and `pyjwt_text` at the `InvalidTokenError` site and outside any handler; round 6 a misnamed and a missing field; round 7 an extra positional message at each site kind -- `ValueError`, both error classes, `HTTPError`, `_reject`, `_auth_response` -- and a stray keyword; round 8 eight payload mutations: `exc.args =`, `exc.description =`, a tuple target, `+=`, `exc.__dict__[…] =`, `setattr`, `object.__setattr__`, `add_note`; round 9 six builtin-site shapes: a bare member at `ValueError` and at `HTTPError`, codex's swapped member with its field missing, a literal field, an extra positional to the renderer, `**fields`) |
 | **round 7:** `test_an_extra_argument_cannot_carry_a_second_message[...]`, `test_reject_takes_headers_keyword_only` | 5 + 1 | the runtime arity guards: a third positional to either error class, a positional string or mapping `headers` to `_auth_response`, a string `headers=`; `_reject`'s signature read from source (it is a closure) |
 | **round 7:** `test_startup_refuses_a_jwks_url_the_renderer_would_refuse[...]`, `..._a_metadata_url_...[...]`, `..._a_required_scope_...[...]` | 3 + 4 + 5 | `https://issuer.example/key set.json`, a trailing space and `ftp://` through `AsyncJWKS` and `create_http_app`; two metadata URLs with a space, and (round 8) `/.well-known/oauth-protected-resource` and `ftp://pmcp.example/...` through `create_http_app`; required scopes `""`, `a"b`, `a\b`, `café`, `a b` through `create_http_app` and `check_auth_config` |
 | **round 7:** `test_cli_and_env_paths_refuse_at_startup[...]`, `test_cli_and_env_paths_start_a_valid_config`, `test_a_valid_config_starts_and_renders_every_challenge` | 15 + 1 + 1 | the same table through `--oauth-jwks-url` / `--required-scope` and `PMCP_OAUTH_JWKS_URL` / `PMCP_REQUIRED_SCOPES` (exit 1, `error: ...` on stderr); a valid config (every NQCHAR class in one scope) starts on both paths and still serves its 401 |
@@ -697,6 +736,8 @@ the first full run: 2 in `test_http_transport.py`, 26 parametrized cases in
 | `test_the_challenges_cover_401_403_503`, `test_challenge_parameters_survive_the_sanitiser[...]`, `test_pmcp_reads_its_own_challenge_back[...]` | 1 + 8 + 8 | `WWW-Authenticate` |
 | `test_the_whole_header_is_redacted_by_the_base_bearer_rule_by_design` | 1 | the deliberate exception |
 | **round 8:** `test_configs_that_start_on_main_still_start[...]`, `test_a_value_the_store_cleans_is_checked_as_stored[...]`, `test_create_http_app_ignores_scopes_it_never_reads` | 5 + 3 + 1 | claude's B1 (a)–(d) through the real `run_server`: trailing `\n` and `\r` in `PMCP_OAUTH_JWKS_URL`, a leading space on the flag, stdio with a bad `PMCP_REQUIRED_SCOPES`, mode `none` with a bad JWKS URL; the three cleaned values through `check_auth_config`, `AsyncJWKS` (stored URL is clean) and `create_http_app`; a bad scope list in mode `none` through `create_http_app`. The CLI refusal tests now run under `--transport http` |
+| **round 9:** `test_every_builtin_refusal_goes_through_the_renderer[MEMBER]`, `test_every_builtin_message_site_is_driven` | 12 + 1 | every builtin site driven for real under a renderer spy (the four `create_http_app` refusals, the three `check_auth_config` refusals, the four `sanitize_public_auth_url` refusals incl. `https://issuer.example:not-a-port/jwks` and `https://10.0.0.5/jwks.json`, `ELICITATION_URL_INVALID`, and `HTTPError`'s `REDIRECTS_NOT_ALLOWED`): the exception carries the renderer's output for the expected member; the table covers every builtin site except `METADATA_NEEDS_RESOURCE`, which its own test drives |
+| **round 9:** `test_a_swapped_member_at_a_builtin_site_is_a_type_error_not_a_placeholder`, `test_an_ip_literal_jwks_url_keeps_its_specific_message_through_the_cli`, `test_an_https_metadata_url_with_a_credential_like_query_starts` | 3 | codex's swap (`JWKS_FETCH_FAILED` at the port-parse raise) is a `TypeError` through `AsyncJWKS` and `create_http_app`, never `{url}`; claude N1 through the real CLI (`error: Public auth URL host is a non-public IP literal or loopback name.`); claude N2 pinned as starting, route served, no `secret` in the body |
 | `test_metadata_route_refuses_to_start_without_a_canonical_resource` | 1 | Design decision 5 (round 7: it patches out `check_auth_config`, which now refuses the forced relative URL first) |
 | `test_readme_prefixed_metadata_url_404s_behind_a_stripping_proxy`, `test_readme_rfc9728_form_with_audience_serves_the_public_resource` | 2 | the README's claims |
 
@@ -711,7 +752,10 @@ the first full run: 2 in `test_http_transport.py`, 26 parametrized cases in
   sanitiser. In resource-server mode PMCP now refuses to start on a JWKS
   URL, metadata URL or required scope that an auth message could not
   carry, and `create_http_app` refuses a protected-resource metadata URL it
-  used to drop silently (omitting the metadata route). The
+  used to drop silently (omitting the metadata route): relative,
+  non-http(s), plain http to a non-loopback host or a non-public IP
+  literal. Every fixed auth message, including startup refusals, is
+  rendered through the registry's runtime guard. The
   protected-resource metadata route now refuses to start rather than publish
   an empty `resource`, which no shipped configuration reaches. The README
   documents the prefix-stripping proxy case.
@@ -750,9 +794,9 @@ Apply *Verbatim bodies*: `git apply` both patches, write the test module, and
 add the CHANGELOG bullet by hand. Then:
 
 ```bash
-# 1. the new module (round-8 spike: 222 passed, ~3 s)
+# 1. the new module (round-9 spike: 244 passed, ~1.5 s)
 uv run pytest tests/test_auth_operator_messages.py --cov-fail-under=0 -p no:cacheprovider -q
-# 2. the suites that touch auth, the HTTP transport and the redactor (round-8 spike on 199ee7c: 976 passed, 55 deselected, 0 failed, 89 s)
+# 2. the suites that touch auth, the HTTP transport and the redactor (round-9 spike on 199ee7c: 998 passed, 55 deselected, 0 failed, 94 s)
 uv run pytest tests/test_auth.py tests/test_transport_http.py tests/test_auth_origin_wiring.py \
   tests/test_redaction_additive.py tests/test_auth_operator_messages.py tests/test_cli.py tests/test_server.py \
   tests/test_http_transport.py tests/test_scoped_advisor_audit.py \
@@ -764,7 +808,7 @@ python3 scripts/check_security_claims.py          # expect OK, 129 cited node id
 python3 scripts/check_plan_consistency.py .consiliency/plans/detailed-326-auth-messages-20261003-0226.md
 #   measured on this file: "consistent ... blocking inconsistencies: 0", exit 0 (a detailed plan has no roadmap pin)
 # 4. the full suite: once, detached, with a notifying waiter (memory on dev0 is shared)
-#    (round-8 spike on 199ee7c, run alone: 5452 passed, 3 skipped, 80 deselected, 0 failed, 684 s;
+#    (round-9 spike on 199ee7c, run alone: 5474 passed, 3 skipped, 80 deselected, 0 failed, 641 s;
 #     round 4's first run, before the three existing test files were moved
 #     onto members, had 28 failures -- see Changes)
 nohup uv run pytest -q -p no:cacheprovider > "$WORKTREE_ROOT/pmcp-326-full.log" 2>&1 &
@@ -795,12 +839,14 @@ shapes and is not exhaustive against deliberate obfuscation.
   written. Proven by `test_every_registry_message_survives_the_sanitiser`
   and `test_a_stored_description_is_the_text_written`; mutants W1–W4.
 - [ ] Every message that reaches an operator passes through
-  `render_auth_message`, which refuses (`TypeError`) anything that is not a
-  member by identity, or the narrow minted `pyjwt_text` pass-through --
-  whatever shape produced it. Proven by the construction-refusal and
-  right-type-not-member tests and
-  `test_isinstance_auth_text_is_only_used_to_enumerate_the_registry`;
-  mutants G1, G5, V1–V3, X1.
+  `render_auth_message` -- the auth error constructors, `_auth_response`,
+  and (round 9) all 13 builtin `ValueError`/`HTTPError` sites -- which
+  refuses (`TypeError`) anything that is not a member by identity, or the
+  narrow minted `pyjwt_text` pass-through, whatever shape produced it, and
+  a member whose fields are missing (codex's swap publishes no `{url}`).
+  Proven by the construction-refusal and right-type-not-member tests,
+  `test_isinstance_auth_text_is_only_used_to_enumerate_the_registry`, the
+  round-9 spy and swap tests; mutants G1, G5, V1–V3, X1, U1, U2, U5.
 - [ ] Fields are exactly the member's placeholders and every field value has
   its placeholder's shape; the registry has named-only fields. Proven by the
   placeholder and field-shape tests; mutants V4, X2–X5, X8.
@@ -819,7 +865,9 @@ shapes and is not exhaustive against deliberate obfuscation.
   the round-7 seat measured on revision 7 (for the JWKS URL and scopes, round 8
   only narrows where the check runs and cleans URLs first, so it refuses
   nothing there that revision 7 accepted; the CLI passes no metadata URL). Proven by the round-7 and round-8 startup
-  tests; mutants R1–R5, C1–C4.
+  tests; mutants R1–R5, C1–C4. A URL `sanitize_public_auth_url` refuses
+  keeps its own registry message (an IP literal says so, through the real
+  CLI); mutant N1.
 
 **The guard rail (static, listed shapes only).**
 
@@ -828,10 +876,10 @@ shapes and is not exhaustive against deliberate obfuscation.
   exception classes; non-member messages; wrong arity; field names and
   literal values; named raises outside their handler; `pyjwt_text`
   placement; payload mutation of an except-bound exception. Each is pinned
-  by `test_the_site_check_refuses_every_shape` (36 shapes), the real
+  by `test_the_site_check_refuses_every_shape` (42 shapes), the real
   modules pass (`test_every_message_site_names_a_registry_member`), and the
   check visits every site (`test_the_site_check_sees_every_site`). Mutants
-  G3, G4, S1–S5, V7–V12, X6, X7, A1–A3, P1–P5. It is **not** claimed to be
+  G3, G4, S1–S5, V7–V12, X6, X7, A1–A3, P1–P5, U3, U4. It is **not** claimed to be
   exhaustive against deliberate obfuscation.
 
 **Logs, challenges, metadata, README.**
@@ -863,12 +911,12 @@ shapes and is not exhaustive against deliberate obfuscation.
 
 ## Mutation table
 
-Each mutant was measured on the round-8 spike on `199ee7c` (`mutants8.py`: one or more
+Each mutant was measured on the round-9 spike on `199ee7c` (`mutants9.py`: one or more
 string edits to `auth.py`, `transport/http.py`, `cli.py` or the test module,
 run `tests/test_auth_operator_messages.py` under `-o timeout=60` and a 300 s
 cap, restore every touched file from its saved copy in a `finally`). **All
-58 are red.** After the run, every file was byte-identical to the spike. C
-and P are round 8, R and A round 7, X round 6, V round 5; G, W, S, L and B carry over (round 4's G2 is replaced by
+64 are red.** After the run, every file was byte-identical to the spike. U
+and N are round 9, C and P round 8, R and A round 7, X round 6, V round 5; G, W, S, L and B carry over (round 4's G2 is replaced by
 X1, since `_auth_response` no longer has its own check).
 
 | # | Mutant | Red tests (measured) |
@@ -876,16 +924,16 @@ X1, since `_auth_response` no longer has its own check).
 | G1 | constructor accepts any non-member (membership check dropped) | 17 red -- a_message_outside_the_registry_is_refused_at_construction[, a_message_outside_the_registry_is_refused_at_construction[, a_message_outside_the_registry_is_refused_at_construction[ (+14) |
 | X1 | _auth_response accepts any AuthText (type, not identity; codex r5 1) | 2 red -- an_auth_response_body_of_the_right_type_that_is_not_a_memb, isinstance_auth_text_is_only_used_to_enumerate_the_registr |
 | X2 | url field: any value accepted | 2 red -- a_field_value_without_its_placeholder_shape_is_refused[url, startup_refuses_a_jwks_url_the_renderer_would_refuse[ftp:/ |
-| X3 | scopes field: any str accepted | 14 red -- a_field_value_without_its_placeholder_shape_is_refused[sco, a_field_value_without_its_placeholder_shape_is_refused[sco, a_field_value_without_its_placeholder_shape_is_refused[sco (+11) |
+| X3 | scopes field: any str accepted | 15 red -- a_field_value_without_its_placeholder_shape_is_refused[sco, a_field_value_without_its_placeholder_shape_is_refused[sco, a_field_value_without_its_placeholder_shape_is_refused[sco (+12) |
 | X4 | renderer skips field-shape validation (codex r5 2) | 9 red -- a_field_value_without_its_placeholder_shape_is_refused[red, a_field_value_without_its_placeholder_shape_is_refused[sco, a_field_value_without_its_placeholder_shape_is_refused[sco (+6) |
-| X5 | url field: whitespace allowed | 9 red -- a_field_value_without_its_placeholder_shape_is_refused[url, startup_refuses_a_jwks_url_the_renderer_would_refuse[https, startup_refuses_a_jwks_url_the_renderer_would_refuse[https (+6) |
+| X5 | url field: whitespace allowed | 11 red -- a_field_value_without_its_placeholder_shape_is_refused[url, startup_refuses_a_jwks_url_the_renderer_would_refuse[https, startup_refuses_a_jwks_url_the_renderer_would_refuse[https (+8) |
 | X6 | static check ignores field names (claude r5 N1) | 2 red -- the_site_check_refuses_every_shape[misnamed_field], the_site_check_refuses_every_shape[missing_field] |
 | X7 | misnamed field at the real redirect site (claude r5 N1) | 2 red -- the_jwks_redirect_path_raises_its_registry_message, every_message_site_names_a_registry_member |
 | X8 | registry gains an escaped-brace member (claude r5 N4) | 2 red -- the_registry_is_complete_and_typed, every_registry_placeholder_has_a_validator_and_no_odd_brac |
 | V1 | membership checked by type, not identity (codex r4 1 / claude N2) | 5 red -- a_value_of_the_right_type_that_is_not_a_member_is_refused[, a_value_of_the_right_type_that_is_not_a_member_is_refused[, a_value_of_the_right_type_that_is_not_a_member_is_refused[ (+2) |
 | V2 | unminted PyJwtText accepted | 1 red -- a_value_of_the_right_type_that_is_not_a_member_is_refused[ |
 | V3 | PyJwtText constructible directly | 1 red -- pyjwt_text_cannot_be_constructed_directly |
-| V4 | fields not checked against placeholders (claude r4 B1) | 3 red -- fields_must_be_exactly_the_placeholders[extra], fields_must_be_exactly_the_placeholders[misnamed], fields_must_be_exactly_the_placeholders[missing] |
+| V4 | fields not checked against placeholders (claude r4 B1) | 4 red -- fields_must_be_exactly_the_placeholders[extra], fields_must_be_exactly_the_placeholders[misnamed], fields_must_be_exactly_the_placeholders[missing] (+1) |
 | V5 | get() turns a TypeError into a 503 | 1 red -- a_programming_error_in_the_fetch_is_not_a_503 |
 | V6 | _fetch() turns a TypeError into a 503 | 1 red -- a_programming_error_inside_fetch_itself_is_not_rewrapped |
 | V7 | static check accepts literal field values | 2 red -- the_site_check_refuses_every_shape[field_f_string], the_site_check_refuses_every_shape[field_literal] |
@@ -894,7 +942,7 @@ X1, since `_auth_response` no longer has its own check).
 | V10 | pyjwt_text moved to the InvalidTokenError site (claude N1) | 6 red -- every_message_site_names_a_registry_member, the_challenges_cover_401_403_503, challenge_parameters_survive_the_sanitiser[401-invalid-aud (+3) |
 | V11 | a literal field value at a real site | 1 red -- every_message_site_names_a_registry_member |
 | V12 | a named raise of a new exception at a real site (codex r4 2) | 2 red -- every_message_site_names_a_registry_member, the_site_check_sees_every_site |
-| G3 | static check accepts any argument | 11 red -- every_message_site_names_a_registry_member, the_site_check_refuses_every_shape[attribute_not_member], the_site_check_refuses_every_shape[keyword] (+8) |
+| G3 | static check accepts any argument | 9 red -- every_message_site_names_a_registry_member, the_site_check_refuses_every_shape[attribute_not_member], the_site_check_refuses_every_shape[keyword] (+6) |
 | G4 | static check accepts unknown raise callees | 2 red -- the_site_check_refuses_every_shape[alias], the_site_check_refuses_every_shape[runtime_error] |
 | G5 | pyjwt pass-through accepts any exception | 1 red -- the_pyjwt_pass_through_is_narrow |
 | W1 | registry: 401 key-mismatch text reverted | 3 red -- the_registry_is_complete_and_typed, every_registry_message_survives_the_sanitiser[KEY_CANNOT_V, a_stored_description_is_the_text_written[KEY_CANNOT_VERIFY |
@@ -911,28 +959,34 @@ X1, since `_auth_response` no longer has its own check).
 | L3 | a non-constant log template | 1 red -- the_log_templates_are_collected |
 | B5 | metadata startup guard removed | 1 red -- metadata_route_refuses_to_start_without_a_canonical_resour |
 | B7 | challenge gains a param the sanitiser rewrites | 6 red -- challenge_parameters_survive_the_sanitiser[401-invalid-aud, challenge_parameters_survive_the_sanitiser[403-scope-audie, challenge_parameters_survive_the_sanitiser[503-jwks-audien (+3) |
-| R1 | create_http_app drops the startup check (metadata URL / required scopes) | 9 red -- startup_refuses_a_metadata_url_the_renderer_would_refuse[h, startup_refuses_a_metadata_url_the_renderer_would_refuse[h, startup_refuses_a_metadata_url_the_renderer_would_refuse[/ (+6) |
-| R2 | AsyncJWKS drops the startup JWKS URL check | 2 red -- startup_refuses_a_jwks_url_the_renderer_would_refuse[https, startup_refuses_a_jwks_url_the_renderer_would_refuse[https |
-| R3 | the CLI / env path drops the startup check | 15 red -- cli_and_env_paths_refuse_at_startup[['--oauth-jwks-url',, cli_and_env_paths_refuse_at_startup[['--oauth-jwks-url',, cli_and_env_paths_refuse_at_startup[['--oauth-jwks-url', (+12) |
-| R4 | shared validator drops the required-scope check | 14 red -- startup_refuses_a_required_scope_the_renderer_would_refuse, startup_refuses_a_required_scope_the_renderer_would_refuse, startup_refuses_a_required_scope_the_renderer_would_refuse (+11) |
+| R1 | create_http_app drops the startup check (metadata URL / required scopes) | 12 red -- startup_refuses_a_metadata_url_the_renderer_would_refuse[h, startup_refuses_a_metadata_url_the_renderer_would_refuse[h, startup_refuses_a_metadata_url_the_renderer_would_refuse[/ (+9) |
+| R2 | AsyncJWKS drops the startup JWKS URL check | 3 red -- startup_refuses_a_jwks_url_the_renderer_would_refuse[https, startup_refuses_a_jwks_url_the_renderer_would_refuse[https, every_builtin_refusal_goes_through_the_renderer[JWKS_URL_N |
+| R3 | the CLI / env path drops the startup check | 16 red -- cli_and_env_paths_refuse_at_startup[['--oauth-jwks-url',, cli_and_env_paths_refuse_at_startup[['--oauth-jwks-url',, cli_and_env_paths_refuse_at_startup[['--oauth-jwks-url', (+13) |
+| R4 | shared validator drops the required-scope check | 15 red -- startup_refuses_a_required_scope_the_renderer_would_refuse, startup_refuses_a_required_scope_the_renderer_would_refuse, startup_refuses_a_required_scope_the_renderer_would_refuse (+12) |
 | R5 | shared validator accepts a multi-scope string as one scope | 3 red -- startup_refuses_a_required_scope_the_renderer_would_refuse, cli_and_env_paths_refuse_at_startup[['--oauth-jwks-url',, cli_and_env_paths_refuse_at_startup[['--oauth-jwks-url', |
 | A1 | static check drops the exact-arity rule (codex r6) | 6 red -- the_site_check_refuses_every_shape[extra_positional_auth_e, the_site_check_refuses_every_shape[extra_positional_auth_r, the_site_check_refuses_every_shape[extra_positional_http_e (+3) |
 | A2 | static check allows stray keywords | 1 red -- the_site_check_refuses_every_shape[stray_keyword_value_err |
-| A3 | a real site gains a second positional message | 1 red -- every_message_site_names_a_registry_member |
+| A3 | a real site gains a second positional message | 2 red -- every_message_site_names_a_registry_member, every_builtin_refusal_goes_through_the_renderer[JWKS_URL_N |
 | A4 | _auth_response takes headers positionally | 1 red -- an_extra_argument_cannot_carry_a_second_message[auth_respo |
 | A5 | _auth_response drops the mapping check | 1 red -- an_extra_argument_cannot_carry_a_second_message[auth_respo |
 | A6 | _reject takes headers positionally | 1 red -- reject_takes_headers_keyword_only |
 | C1 | CLI checks in every transport and auth mode (claude r7 B1 c/d) | 2 red -- configs_that_start_on_main_still_start[stdio_unused_scopes, configs_that_start_on_main_still_start[mode_none_unused_jw |
-| C2 | shared validator checks the raw URL, not the stored one (claude r7 B1 a/b) | 6 red -- configs_that_start_on_main_still_start[env_trailing_lf], configs_that_start_on_main_still_start[env_trailing_cr], configs_that_start_on_main_still_start[flag_leading_space] (+3) |
-| C3 | create_http_app checks the normalised metadata URL (codex r7 2) | 2 red -- startup_refuses_a_metadata_url_the_renderer_would_refuse[/, startup_refuses_a_metadata_url_the_renderer_would_refuse[f |
+| C2 | shared validator checks the raw URL, not the stored one (claude r7 B1 a/b) | 8 red -- configs_that_start_on_main_still_start[env_trailing_lf], configs_that_start_on_main_still_start[env_trailing_cr], configs_that_start_on_main_still_start[flag_leading_space] (+5) |
+| C3 | create_http_app checks the normalised metadata URL (codex r7 2) | 3 red -- startup_refuses_a_metadata_url_the_renderer_would_refuse[/, startup_refuses_a_metadata_url_the_renderer_would_refuse[f, every_builtin_refusal_goes_through_the_renderer[PUBLIC_URL |
 | C4 | create_http_app checks scopes it never reads (mode none) | 1 red -- create_http_app_ignores_scopes_it_never_reads |
 | P1 | static check drops the payload-mutation rule (codex r7 1) | 8 red -- the_site_check_refuses_every_shape[payload_add_note], the_site_check_refuses_every_shape[payload_args], the_site_check_refuses_every_shape[payload_attribute] (+5) |
 | P2 | a real handler mutates its exception's payload | 1 red -- every_message_site_names_a_registry_member |
 | P3 | payload rule misses setattr/object.__setattr__ | 1 red -- the_site_check_refuses_every_shape[payload_setattr] |
 | P4 | payload rule misses mutating methods | 1 red -- the_site_check_refuses_every_shape[payload_add_note] |
 | P5 | payload rule misses augmented assignment | 1 red -- the_site_check_refuses_every_shape[payload_augassign] |
+| U1 | a builtin site drops the render wrapper (claude + codex r8) | 3 red -- every_message_site_names_a_registry_member, every_builtin_refusal_goes_through_the_renderer[PUBLIC_URL, every_builtin_message_site_is_driven |
+| U2 | codex r8: JWKS_FETCH_FAILED swapped in at the URL-validation raise | 3 red -- every_message_site_names_a_registry_member, every_builtin_refusal_goes_through_the_renderer[PUBLIC_URL, every_builtin_message_site_is_driven |
+| U3 | static check accepts a bare member at a builtin site | 2 red -- the_site_check_refuses_every_shape[builtin_bare_member], the_site_check_refuses_every_shape[http_error_bare_member] |
+| U4 | static check skips field names at a rendered builtin site | 2 red -- the_site_check_refuses_every_shape[builtin_render_literal_, the_site_check_refuses_every_shape[builtin_swapped_member_ |
+| U5 | HTTPError message no longer rendered | 3 red -- every_message_site_names_a_registry_member, every_builtin_refusal_goes_through_the_renderer[REDIRECTS_, every_builtin_message_site_is_driven |
+| N1 | startup check hides sanitize's specific message (claude r8 N1) | 2 red -- every_builtin_refusal_goes_through_the_renderer[PUBLIC_URL, an_ip_literal_jwks_url_keeps_its_specific_message_through_ |
 
-The implementer re-runs all 58 on the final tree, restoring from a saved copy
+The implementer re-runs all 64 on the final tree, restoring from a saved copy
 (never `git checkout --`).
 
 ## Non-goals
@@ -975,8 +1029,8 @@ The implementer re-runs all 58 on the final tree, restoring from a saved copy
   a `str`-mixin `Enum` would print `AuthMessage.X`; the registry uses a plain
   `str` subclass for exactly that reason, so a member prints its text on
   every version.)
-- **The full suite** was run once on the round-8 spike on `199ee7c`, alone
-  and detached (5452 passed, 3 skipped, 80 deselected, 0 failed, 684 s).
+- **The full suite** was run once on the round-9 spike on `199ee7c`, alone
+  and detached (5474 passed, 3 skipped, 80 deselected, 0 failed, 641 s).
 
 ## Execution Policy
 
@@ -1003,7 +1057,7 @@ The implementer re-runs all 58 on the final tree, restoring from a saved copy
 
 ````diff
 diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
-index e929470..aeafeff 100644
+index e929470..b916cce 100644
 --- a/src/pmcp/auth.py
 +++ b/src/pmcp/auth.py
 @@ -4,9 +4,10 @@ from __future__ import annotations
@@ -1018,7 +1072,7 @@ index e929470..aeafeff 100644
  from dataclasses import dataclass
  from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
  from itertools import product
-@@ -24,6 +25,271 @@ from pmcp.redaction_additive import redact_additive
+@@ -24,6 +25,269 @@ from pmcp.redaction_additive import redact_additive
  from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
  
  
@@ -1202,12 +1256,10 @@ index e929470..aeafeff 100644
 +
 +def _stored_url_ok(url: str) -> bool:
 +    """True if `url`, sanitised the way every caller stores it, has the
-+    renderer's `{url}` shape."""
-+    try:
-+        stored = sanitize_public_auth_url(url)
-+    except ValueError:
-+        return False
-+    return _url_field(stored)
++    renderer's `{url}` shape. A value `sanitize_public_auth_url` refuses
++    raises ITS registry message (non-public IP literal, plain http, not
++    absolute ...), which is more specific than ours (round 9, claude N1)."""
++    return _url_field(sanitize_public_auth_url(url))
 +
 +
 +def check_auth_config(
@@ -1231,12 +1283,12 @@ index e929470..aeafeff 100644
 +    silently drop (relative, non-http(s), a non-public IP literal) is
 +    refused here instead (round 8)."""
 +    if jwks_url is not None and not _stored_url_ok(jwks_url):
-+        raise ValueError(AuthMessage.JWKS_URL_NOT_USABLE)
++        raise ValueError(render_auth_message(AuthMessage.JWKS_URL_NOT_USABLE))
 +    if metadata_url is not None and not _stored_url_ok(metadata_url):
-+        raise ValueError(AuthMessage.METADATA_URL_NOT_USABLE)
++        raise ValueError(render_auth_message(AuthMessage.METADATA_URL_NOT_USABLE))
 +    for scope in required_scopes or ():
 +        if not _scopes_field(scope) or " " in scope:
-+            raise ValueError(AuthMessage.REQUIRED_SCOPE_INVALID)
++            raise ValueError(render_auth_message(AuthMessage.REQUIRED_SCOPE_INVALID))
 +
 +
 +def _check_registry_fields() -> None:
@@ -1290,32 +1342,38 @@ index e929470..aeafeff 100644
  class _NoRedirectHandler(HTTPRedirectHandler):
      """Refuse HTTP redirects so a public URL cannot 3xx to an internal host."""
  
-@@ -36,7 +302,7 @@ class _NoRedirectHandler(HTTPRedirectHandler):
+@@ -36,7 +300,13 @@ class _NoRedirectHandler(HTTPRedirectHandler):
          headers: Any,
          newurl: str,
      ) -> Request | None:
 -        raise HTTPError(newurl, code, "Redirects are not allowed.", headers, fp)
-+        raise HTTPError(newurl, code, AuthMessage.REDIRECTS_NOT_ALLOWED, headers, fp)
++        raise HTTPError(
++            newurl,
++            code,
++            render_auth_message(AuthMessage.REDIRECTS_NOT_ALLOWED),
++            headers,
++            fp,
++        )
  
  
  _NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler)
-@@ -332,22 +598,20 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) ->
+@@ -332,22 +602,20 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) ->
          hostname = parsed.hostname
          _ = parsed.port
      except ValueError as exc:
 -        raise ValueError("Invalid public auth URL.") from exc
-+        raise ValueError(AuthMessage.PUBLIC_URL_INVALID) from exc
++        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_INVALID)) from exc
  
 -    if parsed.scheme not in {"https", "http"} or not parsed.netloc or not hostname:
 -        raise ValueError("Public auth URL must be an absolute HTTP(S) URL.")
 +    if not _is_absolute_http(parsed) or not hostname:
-+        raise ValueError(AuthMessage.PUBLIC_URL_NOT_ABSOLUTE)
++        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_NOT_ABSOLUTE))
  
      if parsed.scheme == "http" and (
          not allow_loopback_http or not _is_loopback_host(hostname)
      ):
 -        raise ValueError("Public auth URL only allows http:// URLs for loopback hosts.")
-+        raise ValueError(AuthMessage.PUBLIC_URL_HTTP_LOOPBACK_ONLY)
++        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_HTTP_LOOPBACK_ONLY))
      if not (
          allow_loopback_http and parsed.scheme == "http" and _is_loopback_host(hostname)
      ):
@@ -1323,24 +1381,24 @@ index e929470..aeafeff 100644
 -            raise ValueError(
 -                "Public auth URL host is a non-public IP literal or loopback name."
 -            )
-+            raise ValueError(AuthMessage.PUBLIC_URL_NOT_PUBLIC)
++            raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_NOT_PUBLIC))
  
      return redact_auth_url(url)
  
-@@ -364,19 +628,29 @@ class ResourceServerTokenClaims:
+@@ -364,19 +632,29 @@ class ResourceServerTokenClaims:
  
  
  class ResourceServerAuthError(Exception):
 -    """Raised for failed Resource Server token validation."""
 +    """Raised for failed Resource Server token validation.
-+
+ 
+-    def __init__(self, error: str, description: str) -> None:
 +    ``description`` must be an `AuthMessage` member (with its ``url`` /
 +    ``scopes`` fields as keywords) or a `pyjwt_text` pass-through; anything
 +    else is a `TypeError` at construction (Consiliency/pmcp#326), which a
 +    subclass cannot avoid either -- whatever it passes up arrives here.
 +    """
- 
--    def __init__(self, error: str, description: str) -> None:
++
 +    def __init__(
 +        self, error: str, description: AuthText | PyJwtText, **fields: str
 +    ) -> None:
@@ -1362,7 +1420,7 @@ index e929470..aeafeff 100644
  
  
  class AsyncJWKS:
-@@ -393,6 +667,9 @@ class AsyncJWKS:
+@@ -393,6 +671,9 @@ class AsyncJWKS:
          refresh_failure_backoff_seconds: float = 5.0,
      ) -> None:
          self.url = sanitize_public_auth_url(url)
@@ -1372,7 +1430,7 @@ index e929470..aeafeff 100644
          self._raw_url = url
          self._ttl_seconds = ttl_seconds
          self._max_bytes = max_bytes
-@@ -460,7 +737,7 @@ class AsyncJWKS:
+@@ -460,7 +741,7 @@ class AsyncJWKS:
                  if cached is not None:
                      return cached
                  raise ResourceServerJWKSUnavailable(
@@ -1381,7 +1439,7 @@ index e929470..aeafeff 100644
                  )
              # (3) A fetch is about to be attempted: the only place the
              # forced-refresh window advances (success or failure alike).
-@@ -472,6 +749,11 @@ class AsyncJWKS:
+@@ -472,6 +753,11 @@ class AsyncJWKS:
              except ResourceServerJWKSUnavailable:
                  self._last_refresh_failure = time.monotonic()
                  raise
@@ -1393,7 +1451,7 @@ index e929470..aeafeff 100644
              except Exception as exc:
                  # Any other failure is still a failed refresh: it opens the
                  # shared backoff and is the same value-free 503, never a 500
-@@ -483,7 +765,7 @@ class AsyncJWKS:
+@@ -483,7 +769,7 @@ class AsyncJWKS:
                  # stays, because the attempt was made.
                  self._last_refresh_failure = time.monotonic()
                  raise ResourceServerJWKSUnavailable(
@@ -1402,7 +1460,7 @@ index e929470..aeafeff 100644
                  ) from exc
              self._last_refresh_failure = float("-inf")
              self._jwks = jwks
-@@ -511,20 +793,21 @@ class AsyncJWKS:
+@@ -511,20 +797,21 @@ class AsyncJWKS:
                  ) as response:
                      if 300 <= response.status < 400:
                          raise ResourceServerJWKSUnavailable(
@@ -1429,7 +1487,7 @@ index e929470..aeafeff 100644
              )
          try:
              jwks = json.loads(content.decode("utf-8"))
-@@ -532,10 +815,12 @@ class AsyncJWKS:
+@@ -532,10 +819,12 @@ class AsyncJWKS:
              # ValueError covers JSONDecodeError and UnicodeDecodeError; a
              # deeply nested body under the size cap raises RecursionError.
              raise ResourceServerJWKSUnavailable(
@@ -1444,7 +1502,7 @@ index e929470..aeafeff 100644
          return jwks
  
  
-@@ -557,9 +842,7 @@ def _select_jwk_key(token: str, jwks: Mapping[str, Any]) -> Any:
+@@ -557,9 +846,7 @@ def _select_jwk_key(token: str, jwks: Mapping[str, Any]) -> Any:
          # InvalidTokenError, so unmapped it escaped as a 500 (see
          # Consiliency/pmcp#320). Fixed text: never echo pyjwt's message or any
          # JWKS content.
@@ -1455,7 +1513,7 @@ index e929470..aeafeff 100644
      keys = key_set.keys
      if kid:
          for key in keys:
-@@ -567,7 +850,7 @@ def _select_jwk_key(token: str, jwks: Mapping[str, Any]) -> Any:
+@@ -567,7 +854,7 @@ def _select_jwk_key(token: str, jwks: Mapping[str, Any]) -> Any:
                  return key.key
      if len(keys) == 1:
          return keys[0].key
@@ -1464,7 +1522,7 @@ index e929470..aeafeff 100644
  
  
  def _claim_scopes(claims: Mapping[str, Any]) -> list[str]:
-@@ -626,7 +909,7 @@ def _decode_with_key(
+@@ -626,7 +913,7 @@ def _decode_with_key(
          raise
      except (jwt.PyJWTError, TypeError, ValueError) as exc:
          raise ResourceServerAuthError(
@@ -1473,7 +1531,7 @@ index e929470..aeafeff 100644
          ) from exc
  
  
-@@ -641,16 +924,18 @@ def validate_resource_server_token(
+@@ -641,16 +928,18 @@ def validate_resource_server_token(
  ) -> ResourceServerTokenClaims:
      """Validate an AS-issued JWT for PMCP Resource Server mode."""
      if not token:
@@ -1495,7 +1553,7 @@ index e929470..aeafeff 100644
          signing_key = _select_jwk_key(token, jwks)
          claims = _decode_with_key(
              token,
-@@ -662,22 +947,26 @@ def validate_resource_server_token(
+@@ -662,22 +951,26 @@ def validate_resource_server_token(
      except ResourceServerAuthError:
          raise
      except jwt.InvalidAudienceError as exc:
@@ -1527,12 +1585,14 @@ index e929470..aeafeff 100644
          )
      raw_audience = claims.get("aud")
      audiences = raw_audience if isinstance(raw_audience, list) else [raw_audience]
-@@ -718,7 +1007,7 @@ def sanitize_url_elicitation_url(
+@@ -718,7 +1011,9 @@ def sanitize_url_elicitation_url(
              url, allow_loopback_http=provenance == "operator"
          )
      except ValueError as exc:
 -        raise ValueError("Invalid URL-mode elicitation URL.") from exc
-+        raise ValueError(AuthMessage.ELICITATION_URL_INVALID) from exc
++        raise ValueError(
++            render_auth_message(AuthMessage.ELICITATION_URL_INVALID)
++        ) from exc
  
  
  def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> str:
@@ -1581,7 +1641,7 @@ index bbaee51..2be0ff2 100644
          "PMCP_ALLOWED_ORIGINS"
      ):
 diff --git a/src/pmcp/transport/http.py b/src/pmcp/transport/http.py
-index 41af495..da56f1e 100644
+index 41af495..624108b 100644
 --- a/src/pmcp/transport/http.py
 +++ b/src/pmcp/transport/http.py
 @@ -23,7 +23,7 @@ import ipaddress
@@ -1634,21 +1694,20 @@ index 41af495..da56f1e 100644
          effective_auth_mode = "shared-secret" if auth_token is not None else "none"
      if effective_auth_mode not in {"none", "shared-secret", "resource-server"}:
 -        raise ValueError("Unsupported auth mode.")
-+        raise ValueError(AuthMessage.UNSUPPORTED_AUTH_MODE)
++        raise ValueError(render_auth_message(AuthMessage.UNSUPPORTED_AUTH_MODE))
      if effective_auth_mode == "shared-secret" and auth_token is None:
 -        raise ValueError("shared-secret auth mode requires auth_token.")
-+        raise ValueError(AuthMessage.SHARED_SECRET_NEEDS_TOKEN)
++        raise ValueError(render_auth_message(AuthMessage.SHARED_SECRET_NEEDS_TOKEN))
      resource_jwks: AsyncJWKS | None = None
      if effective_auth_mode == "resource-server":
          if (
-@@ -321,11 +340,22 @@ def create_http_app(
-             or not resource_server_jwks_url
+@@ -322,10 +341,23 @@ def create_http_app(
              or not resource_server_audience
          ):
--            raise ValueError(
+             raise ValueError(
 -                "resource-server auth mode requires issuer, JWKS URL, and audience."
--            )
-+            raise ValueError(AuthMessage.RESOURCE_SERVER_NEEDS_CONFIG)
++                render_auth_message(AuthMessage.RESOURCE_SERVER_NEEDS_CONFIG)
+             )
          sanitize_public_auth_url(resource_server_jwks_url)
          resource_jwks = AsyncJWKS(resource_server_jwks_url)
 +    # Every value a rejection may carry in a registry field must have that
@@ -1667,7 +1726,7 @@ index 41af495..da56f1e 100644
      diagnostics = GatewayDiagnosticsInfo(
          transport="http",
          header_compatibility={
-@@ -461,10 +491,10 @@ def create_http_app(
+@@ -461,10 +493,10 @@ def create_http_app(
          return token
  
      def _reject(
@@ -1680,7 +1739,7 @@ index 41af495..da56f1e 100644
  
      async def handle_health(request: Request) -> Response:
          """Unauthenticated health check — safe for load-balancers and container probes."""
-@@ -541,11 +571,11 @@ def create_http_app(
+@@ -541,11 +573,11 @@ def create_http_app(
  
          if _origin_rejected(request):
              logger.debug("handle_mcp [%s]: 403 invalid origin", request_id)
@@ -1694,7 +1753,7 @@ index 41af495..da56f1e 100644
  
          if effective_auth_mode == "shared-secret":
              incoming = request.headers.get("authorization", "")
-@@ -559,16 +589,20 @@ def create_http_app(
+@@ -559,16 +591,20 @@ def create_http_app(
                  f"Bearer {auth_token}".encode(),
              ):
                  logger.debug("handle_mcp [%s]: 401 unauthorized", request_id)
@@ -1718,7 +1777,7 @@ index 41af495..da56f1e 100644
                      )
                  jwks = await resource_jwks.get_for_token(token)
                  claims = validate_resource_server_token(
-@@ -589,8 +623,8 @@ def create_http_app(
+@@ -589,8 +625,8 @@ def create_http_app(
                  logger.debug("handle_mcp [%s]: 503 jwks unavailable", request_id)
                  return _reject(
                      503,
@@ -1729,7 +1788,7 @@ index 41af495..da56f1e 100644
                  )
              except ResourceServerAuthError as exc:
                  if exc.error == "insufficient_scope":
-@@ -598,14 +632,14 @@ def create_http_app(
+@@ -598,14 +634,14 @@ def create_http_app(
                      logger.debug("handle_mcp [%s]: 403 insufficient scope", request_id)
                      return _reject(
                          403,
@@ -1748,7 +1807,7 @@ index 41af495..da56f1e 100644
                  )
  
          # Per-IP rate limiting (optional — only when rate_limit_rpm > 0)
-@@ -769,6 +803,12 @@ def create_http_app(
+@@ -769,6 +805,14 @@ def create_http_app(
      if auth_metadata.protected_resource_metadata_url:
          metadata_path = urlparse(auth_metadata.protected_resource_metadata_url).path
          if metadata_path:
@@ -1757,7 +1816,9 @@ index 41af495..da56f1e 100644
 +            # always absolute -- so this fails closed at startup, not per
 +            # request, if a later change makes it reachable (Consiliency/pmcp#326).
 +            if not _canonical_resource():
-+                raise ValueError(AuthMessage.METADATA_NEEDS_RESOURCE)
++                raise ValueError(
++                    render_auth_message(AuthMessage.METADATA_NEEDS_RESOURCE)
++                )
              routes.append(
                  Route(
                      metadata_path,
@@ -1938,10 +1999,10 @@ index 138e06a..edf4db0 100644
      "MissingApiKeyError": ("STUB_VAR", "stub", "stub"),
  }
 diff --git a/tests/test_transport_http.py b/tests/test_transport_http.py
-index c382254..5b5e458 100644
+index c382254..237759b 100644
 --- a/tests/test_transport_http.py
 +++ b/tests/test_transport_http.py
-@@ -184,19 +184,18 @@ class TestAuthGuardHttp:
+@@ -184,19 +184,20 @@ class TestAuthGuardHttp:
      def test_invalid_metadata_url_does_not_create_route_or_challenge_header(
          self,
      ) -> None:
@@ -1958,10 +2019,12 @@ index c382254..5b5e458 100644
 -        assert unauth.status_code == 401
 -        assert "www-authenticate" not in unauth.headers
 -        assert metadata.status_code == 404
-+        # Consiliency/pmcp#326 round 8: a metadata URL that normalisation
-+        # would drop (silently omitting the route) now refuses startup, with
-+        # a registry message that carries none of the URL.
-+        with pytest.raises(ValueError, match="metadata URL") as refused:
++        # Consiliency/pmcp#326 round 8: refused because it is plain http://
++        # to a non-loopback host -- normalisation would drop it and silently
++        # omit the route. (The `?token=` query alone is not a reason: an
++        # https URL with one starts and serves its route.) The message is
++        # the registry's and carries none of the URL.
++        with pytest.raises(ValueError, match="only allows http:// URLs") as refused:
 +            _make_app(
 +                auth_token="mysecret",
 +                protected_resource_metadata_url=(
@@ -2023,6 +2086,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import re
 import functools
 import string
 from pathlib import Path
@@ -2627,6 +2691,46 @@ def _payload_mutations(rel: str, tree: ast.Module) -> list[str]:
     return out
 
 
+# Builtin exceptions cannot refuse a message, so their message argument
+# must be `render_auth_message(AuthMessage.<NAME>, **fields)` (round 9).
+_BUILTIN_SITES = {"ValueError", "HTTPError"}
+
+
+def _rendered_member(arg: ast.expr | None) -> ast.Call | None:
+    """``arg`` if it is `render_auth_message(AuthMessage.<NAME>, ...)` with
+    exactly one positional and no `**`, else None."""
+    if (
+        isinstance(arg, ast.Call)
+        and isinstance(arg.func, ast.Name)
+        and arg.func.id == "render_auth_message"
+        and len(arg.args) == 1
+        and _is_member(arg.args[0])
+        and all(k.arg is not None for k in arg.keywords)
+    ):
+        return arg
+    return None
+
+
+def _render_field_violations(rel: str, render: ast.Call) -> list[str]:
+    member = render.args[0]
+    assert isinstance(member, ast.Attribute)
+    out: list[str] = []
+    given = {k.arg for k in render.keywords}
+    wanted = _placeholders(_MESSAGES[member.attr])
+    if given != wanted:
+        out.append(
+            f"{rel}:{render.lineno} AuthMessage.{member.attr} fields "
+            f"{sorted(k for k in given if k)} != placeholders {sorted(wanted)}"
+        )
+    for kw in render.keywords:
+        if not isinstance(kw.value, (ast.Name, ast.Attribute)):
+            out.append(
+                f"{rel}:{render.lineno} field {kw.arg}= is "
+                f"{ast.unparse(kw.value)[:40]}, not a runtime name"
+            )
+    return out
+
+
 def _site_violations(rel: str, tree: ast.Module) -> list[str]:
     """Syntax only: every raise/`_reject` site passes `AuthMessage.<NAME>`
     directly, its keyword fields are exactly the member's placeholders and
@@ -2705,9 +2809,18 @@ def _site_violations(rel: str, tree: ast.Module) -> list[str]:
             arg = next((k.value for k in node.keywords if k.arg == keyword), None)
             if arg is None and len(node.args) > index:
                 arg = node.args[index]
-            ok = _is_member(arg) or (
-                name == "ResourceServerAuthError" and _is_pyjwt_pass_through(arg)
-            )
+            if name in _BUILTIN_SITES:
+                # round 9 (claude + codex round 8): a builtin cannot check
+                # its message, so it must be rendered at the site
+                ok = False
+                render = _rendered_member(arg)
+                if render is not None:
+                    ok = True
+                    out.extend(_render_field_violations(rel, render))
+            else:
+                ok = _is_member(arg) or (
+                    name == "ResourceServerAuthError" and _is_pyjwt_pass_through(arg)
+                )
             if name in ("_reject", "_auth_response") and isinstance(arg, ast.Name):
                 ok = ok or arg.id == "body"  # the helper's own parameter
             arity = _arity_violation(name, node, keyword)
@@ -2817,19 +2930,19 @@ _STATIC_SHAPES = {
     "    except jwt.InvalidTokenError as exc:\n"
     "        raise ResourceServerAuthError('invalid_token', pyjwt_text(exc))\n",
     "extra_positional_value_error": "def f():\n    raise ValueError("
-    "AuthMessage.UNSUPPORTED_AUTH_MODE, 'Token expired.')\n",
+    "render_auth_message(AuthMessage.UNSUPPORTED_AUTH_MODE), 'Token expired.')\n",
     "extra_positional_auth_error": "def f():\n    raise ResourceServerAuthError("
     "'invalid_token', AuthMessage.INVALID_TOKEN, 'Token expired.')\n",
     "extra_positional_jwks_error": "def f():\n    raise ResourceServerJWKSUnavailable("
     "AuthMessage.JWKS_NO_USABLE_KEYS, 'Token expired.')\n",
     "extra_positional_http_error": "def f(u, c, h, fp):\n    raise HTTPError("
-    "u, c, AuthMessage.REDIRECTS_NOT_ALLOWED, h, fp, 'Token expired.')\n",
+    "u, c, render_auth_message(AuthMessage.REDIRECTS_NOT_ALLOWED), h, fp, 'Token expired.')\n",
     "extra_positional_reject": "def f():\n    return _reject("
     "401, AuthMessage.UNAUTHORIZED, 'Token expired.')\n",
     "extra_positional_auth_response": "def f():\n    return _auth_response("
     "401, AuthMessage.UNAUTHORIZED, 'Token expired.')\n",
     "stray_keyword_value_error": "def f():\n    raise ValueError("
-    "AuthMessage.UNSUPPORTED_AUTH_MODE, note='Token expired.')\n",
+    "render_auth_message(AuthMessage.UNSUPPORTED_AUTH_MODE), note='Token expired.')\n",
     # round 8 (codex round 7): changing a caught exception's payload, then
     # re-raising it from its own handler
     "payload_args": "def f():\n    try:\n        g()\n    except ResourceServerAuthError as exc:\n"
@@ -2848,6 +2961,18 @@ _STATIC_SHAPES = {
     "        object.__setattr__(exc, 'args', ('Token expired.',))\n        raise exc\n",
     "payload_add_note": "def f():\n    try:\n        g()\n    except ResourceServerAuthError as exc:\n"
     "        exc.add_note('Token expired.')\n        raise exc\n",
+    # round 9 (claude + codex round 8): a builtin message must be rendered
+    "builtin_bare_member": "def f():\n    raise ValueError(AuthMessage.PUBLIC_URL_INVALID)\n",
+    "http_error_bare_member": "def f(u, c, h, fp):\n    raise HTTPError("
+    "u, c, AuthMessage.REDIRECTS_NOT_ALLOWED, h, fp)\n",
+    "builtin_swapped_member_missing_field": "def f():\n    raise ValueError("
+    "render_auth_message(AuthMessage.JWKS_FETCH_FAILED))\n",
+    "builtin_render_literal_field": "def f():\n    raise ValueError("
+    "render_auth_message(AuthMessage.JWKS_FETCH_FAILED, url='Token expired.'))\n",
+    "builtin_render_extra_positional": "def f():\n    raise ValueError("
+    "render_auth_message(AuthMessage.PUBLIC_URL_INVALID, 'Token expired.'))\n",
+    "builtin_render_star_fields": "def f(d):\n    raise ValueError("
+    "render_auth_message(AuthMessage.JWKS_FETCH_FAILED, **d))\n",
     "misnamed_field": "def f(self):\n    raise ResourceServerJWKSUnavailable("
     "AuthMessage.JWKS_REDIRECT_REFUSED, uri=self.url)\n",
     "missing_field": "def f():\n    raise ResourceServerJWKSUnavailable("
@@ -3290,6 +3415,11 @@ _GOOD_JWKS = "https://issuer.example/.well-known/jwks.json"
 # tab or newline is stripped by `urlsplit` before anything stores the URL,
 # so the stored value never carries it (and is not in the table).
 _JWKS_REFUSAL = "JWKS URL must be an absolute|Public auth URL must be an absolute"
+# Round 9 (claude N1): a URL `sanitize_public_auth_url` refuses keeps its own,
+# more specific registry message.
+_METADATA_REFUSAL = (
+    "metadata URL must be an absolute|Public auth URL must be an absolute"
+)
 
 
 @pytest.mark.parametrize(
@@ -3356,7 +3486,7 @@ def test_startup_refuses_a_jwks_url_the_renderer_would_refuse(url: str) -> None:
     ],
 )
 def test_startup_refuses_a_metadata_url_the_renderer_would_refuse(url: str) -> None:
-    with pytest.raises(ValueError, match="metadata URL must be an absolute"):
+    with pytest.raises(ValueError, match=_METADATA_REFUSAL):
         _client(protected_resource_metadata_url=url)
 
 
@@ -3412,7 +3542,7 @@ _CLI_BASE = [
 @pytest.mark.parametrize(
     ("argv", "env", "message"),
     [
-        *[(["--oauth-jwks-url", url], {}, "JWKS URL") for url in _BAD_JWKS_URLS],
+        *[(["--oauth-jwks-url", url], {}, _JWKS_REFUSAL) for url in _BAD_JWKS_URLS],
         *[
             (
                 ["--oauth-jwks-url", _GOOD_JWKS, "--required-scope", s],
@@ -3421,7 +3551,7 @@ _CLI_BASE = [
             )
             for s in _BAD_SCOPES
         ],
-        *[([], {"PMCP_OAUTH_JWKS_URL": url}, "JWKS URL") for url in _BAD_JWKS_URLS],
+        *[([], {"PMCP_OAUTH_JWKS_URL": url}, _JWKS_REFUSAL) for url in _BAD_JWKS_URLS],
         *[
             (
                 ["--oauth-jwks-url", _GOOD_JWKS],
@@ -3449,7 +3579,7 @@ def test_cli_and_env_paths_refuse_at_startup(
         _run_cli(monkeypatch, [*_CLI_BASE, *argv])
     assert exc.value.code == 1
     err = capsys.readouterr().err
-    assert message in err and err.startswith("error: ")
+    assert re.search(message, err) and err.startswith("error: ")
 
 
 def test_cli_and_env_paths_start_a_valid_config(
@@ -3533,4 +3663,177 @@ def test_create_http_app_ignores_scopes_it_never_reads() -> None:
         resource_server_audience=None,
         required_scopes=['a"b', ""],
     )
+
+
+# --- Round 9 (claude B1 + codex, round 8): builtin message sites render
+# --- through the registry's one guard; sanitize's own message comes through.
+
+
+def _spy_renderer(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, str]]:
+    calls: list[tuple[Any, str]] = []
+    real = auth_mod.render_auth_message
+
+    def spy(message: Any, **fields: str) -> str:
+        text = real(message, **fields)
+        calls.append((message, text))
+        return text
+
+    monkeypatch.setattr(auth_mod, "render_auth_message", spy)
+    monkeypatch.setattr(http_mod, "render_auth_message", spy)
+    return calls
+
+
+def _redirect() -> None:
+    auth_mod._NoRedirectHandler().redirect_request(
+        MagicMock(), None, 302, "Found", {}, "https://elsewhere.example/"
+    )
+
+
+_STARTUP_REFUSALS: dict[str, tuple[Callable[[], Any], str, type[Exception]]] = {
+    "UNSUPPORTED_AUTH_MODE": (
+        lambda: _client(auth_mode="bogus"),
+        "UNSUPPORTED_AUTH_MODE",
+        ValueError,
+    ),
+    "SHARED_SECRET_NEEDS_TOKEN": (
+        lambda: _client(auth_mode="shared-secret", auth_token=None),
+        "SHARED_SECRET_NEEDS_TOKEN",
+        ValueError,
+    ),
+    "RESOURCE_SERVER_NEEDS_CONFIG": (
+        lambda: _client(resource_server_jwks_url=None),
+        "RESOURCE_SERVER_NEEDS_CONFIG",
+        ValueError,
+    ),
+    "JWKS_URL_NOT_USABLE": (
+        lambda: auth_mod.AsyncJWKS("https://issuer.example/key set.json"),
+        "JWKS_URL_NOT_USABLE",
+        ValueError,
+    ),
+    "METADATA_URL_NOT_USABLE": (
+        lambda: _client(protected_resource_metadata_url=_META + " x"),
+        "METADATA_URL_NOT_USABLE",
+        ValueError,
+    ),
+    "REQUIRED_SCOPE_INVALID": (
+        lambda: _client(required_scopes=['a"b']),
+        "REQUIRED_SCOPE_INVALID",
+        ValueError,
+    ),
+    "PUBLIC_URL_INVALID": (
+        lambda: auth_mod.AsyncJWKS("https://issuer.example:not-a-port/jwks"),
+        "PUBLIC_URL_INVALID",
+        ValueError,
+    ),
+    "PUBLIC_URL_NOT_ABSOLUTE": (
+        lambda: _client(
+            protected_resource_metadata_url="/.well-known/oauth-protected-resource"
+        ),
+        "PUBLIC_URL_NOT_ABSOLUTE",
+        ValueError,
+    ),
+    "PUBLIC_URL_HTTP_LOOPBACK_ONLY": (
+        lambda: auth_mod.AsyncJWKS("http://issuer.example/jwks.json"),
+        "PUBLIC_URL_HTTP_LOOPBACK_ONLY",
+        ValueError,
+    ),
+    "PUBLIC_URL_NOT_PUBLIC": (
+        lambda: auth_mod.AsyncJWKS("https://10.0.0.5/jwks.json"),
+        "PUBLIC_URL_NOT_PUBLIC",
+        ValueError,
+    ),
+    "ELICITATION_URL_INVALID": (
+        lambda: auth_mod.sanitize_url_elicitation_url("ftp://x.example/"),
+        "ELICITATION_URL_INVALID",
+        ValueError,
+    ),
+    "REDIRECTS_NOT_ALLOWED": (_redirect, "REDIRECTS_NOT_ALLOWED", Exception),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_STARTUP_REFUSALS))
+def test_every_builtin_refusal_goes_through_the_renderer(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Each builtin `ValueError`/`HTTPError` site, driven for real: the
+    message the exception carries is the renderer's output for the expected
+    member -- not a member handed straight to the builtin."""
+    trigger, member, exc_type = _STARTUP_REFUSALS[case]
+    calls = _spy_renderer(monkeypatch)
+    with pytest.raises(exc_type) as raised:
+        trigger()
+    rendered = [
+        text for message, text in calls if message is getattr(AuthMessage, member)
+    ]
+    assert rendered, [getattr(m, "__str__", lambda: m)() for m, _ in calls]
+    carried = getattr(raised.value, "msg", None) or str(raised.value)
+    assert carried == rendered[-1] == getattr(AuthMessage, member)
+
+
+def test_every_builtin_message_site_is_driven() -> None:
+    """The table above drives every builtin site in the two modules."""
+    members = set()
+    for _rel, tree in _module_trees():
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", "") in _BUILTIN_SITES
+            ):
+                for arg in node.args:
+                    render = _rendered_member(arg)
+                    if render is not None:
+                        members.add(render.args[0].attr)  # type: ignore[attr-defined]
+    assert members - {"METADATA_NEEDS_RESOURCE"} == set(_STARTUP_REFUSALS)
+
+
+def test_a_swapped_member_at_a_builtin_site_is_a_type_error_not_a_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codex round 8: put `JWKS_FETCH_FAILED` (which needs `url`) at the
+    URL-validation raise. Startup fails with the renderer's `TypeError`; the
+    literal `{url}` is never published."""
+    monkeypatch.setattr(
+        AuthMessage, "PUBLIC_URL_INVALID", AuthMessage.JWKS_FETCH_FAILED
+    )
+    for build in (
+        lambda: auth_mod.AsyncJWKS("https://issuer.example:not-a-port/jwks"),
+        lambda: _client(
+            resource_server_jwks_url="https://issuer.example:not-a-port/jwks"
+        ),
+    ):
+        with pytest.raises(TypeError, match="fields must be exactly") as raised:
+            build()
+        assert "{url}" not in str(raised.value)
+
+
+def test_an_ip_literal_jwks_url_keeps_its_specific_message_through_the_cli(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """claude round 8, N1: `https://10.0.0.5/...` is refused for its
+    non-public host, and says so -- not "must be an absolute http(s) URL"."""
+    for name in _JWKS_ENV_CLEAN:
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(SystemExit) as exc:
+        _run_cli(
+            monkeypatch, [*_CLI_BASE, "--oauth-jwks-url", "https://10.0.0.5/jwks.json"]
+        )
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert err == f"error: {AuthMessage.PUBLIC_URL_NOT_PUBLIC}\n"
+
+
+def test_an_https_metadata_url_with_a_credential_like_query_starts() -> None:
+    """claude round 8, N2: pins today's behaviour. `normalize_auth_metadata`
+    keeps an https URL with `?token=…` (redacted where it is shown), so it is
+    not one of the URLs refused at startup; the route is served."""
+    client = _client(
+        auth_mode="none",
+        resource_server_issuer=None,
+        resource_server_jwks_url=None,
+        resource_server_audience=None,
+        protected_resource_metadata_url=_META + "?token=secret",
+    )
+    resp = client.get("/.well-known/oauth-protected-resource")
+    assert resp.status_code == 200
+    assert "secret" not in resp.text
 ````
