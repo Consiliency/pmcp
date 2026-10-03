@@ -106,6 +106,8 @@ tenant run/task IDs.
 The tenant server should treat `pollInterval` and `ttl` as hints and lifecycle
 metadata. PMCP forwards them when supplied and may surface returned values to
 clients, but PMCP does not persist task records past gateway process lifetime.
+A returned value PMCP cannot use is surfaced as `null` and named in the task's
+`unusable_fields`.
 
 ## Metadata Forwarding Contract
 

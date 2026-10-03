@@ -70,6 +70,7 @@ from pmcp.scoped_advisor_audit import (
 from pmcp.subscriptions import BusCatalogEventSink
 from pmcp.summary import generate_capability_summary
 from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
+from pmcp.tools.schema import GATE_VALIDATOR
 from pmcp.types import (
     DescriptionsCache,
     GatewayDiagnosticsInfo,
@@ -310,7 +311,9 @@ class GatewayServer:
         audited_arguments: dict[str, Any] | None = None
         if tool is not None and allowed:
             try:
-                jsonschema.validate(instance=arguments, schema=tool.input_schema)
+                jsonschema.validate(
+                    instance=arguments, schema=tool.input_schema, cls=GATE_VALIDATOR
+                )
             except jsonschema.ValidationError as e:
                 try:
                     if self._scoped_advisor_audit is not None:
