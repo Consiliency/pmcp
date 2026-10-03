@@ -6,6 +6,16 @@
 > The spike was then removed; this PR carries only this file. The spike's
 > source patch and its test module are reproduced verbatim at the end
 > (*Verbatim bodies*).
+>
+> **Round 2** (after the round-1 panel on Consiliency/pmcp#332): fixed two
+> blocking findings -- B1 (claude, codex): a cancel caught in a handshake
+> handler was lost when the teardown then raised; B2 (codex): loop shutdown
+> cancelled the private teardown task and left a SIGTERM-ignoring server
+> alive. The helper's shield loop is replaced by a gate future that does not
+> wake a cancelled caller (F2), a cancelled caller skips the graceful remote
+> close (F3), the bounds are restated (F3), the auto-reconnect revival is
+> stated as a follow-up (F4), and the structural test and census are fixed
+> (F5). All numbers re-measured on the round-2 spike on 3.10, 3.11, 3.12.
 
 ## Task
 
@@ -62,7 +72,9 @@ is red against it).
 Found by an AST walk of `src/pmcp/**/*.py` for `except` clauses naming
 `CancelledError` or `BaseException` (or bare `except:`; there are none), plus
 `grep -rn 'suppress(' src/pmcp` (every `contextlib.suppress` is
-`suppress(OSError)`, none touches cancellation). 22 handlers on main. "Absorbs"
+`suppress(OSError)`, none touches cancellation). **23** handlers on main
+(round 1 said 22: the table's last row covers four sync sites). The round-2
+patch adds one, in `_terminate_process_tree` (Design decision 9). "Absorbs"
 means the handler body contains no `raise`.
 
 | # | Site (main) | Kind | Whose cancel can arrive | Verdict |
@@ -140,160 +152,253 @@ the same task. The design below touches neither count.
 
 ## Design decisions (made explicitly)
 
-### 1. One primitive: run the teardown in a private task and defer the caller's cancel
+### 1. One primitive: run the teardown in a private task; the caller parks on a gate that defers its cancel
 
-**Decision:** add `_finish_then_reraise_cancel(cleanup)` to `manager.py`. It
-wraps the teardown coroutine in a task nobody else holds, and awaits it through
-`asyncio.shield` in a loop:
+**Decision (round 2):** `_finish_then_reraise_cancel(cleanup, *, pending=None)`
+in `manager.py`:
+- it wraps the teardown coroutine in a task nobody else holds, named
+  `pmcp-teardown:<qualname>` so the 60 s async watchdog
+  (`tests/runtime/_hang_watchdog.py`) names the teardown a hang is parked in;
+- the caller parks on a `_DeferredCancelGate`, an `asyncio.Future` subclass
+  whose `cancel()` returns **False**, resolved by the private task's
+  done-callback;
+- `Task.cancel()` on a task parked on a future first calls that future's
+  `cancel()`; when it returns False, CPython only sets the task's
+  `_must_cancel` flag and leaves it parked, then throws **one**
+  `CancelledError` into it when the future resolves. So a cancel does not wake
+  the caller at all, a thousand cancels cost no wake-ups, and the cancel is
+  delivered exactly once, after the teardown -- including one that arrives in
+  the same loop iteration the teardown finishes (the race a `task.done()`
+  check gets wrong);
+- `pending` is a cancellation the caller already caught before calling (a
+  handshake handler): it is re-raised after the teardown exactly like one that
+  arrives during it (Design decision 3);
+- a caller cancellation wins over a teardown error; the displaced error is
+  logged at WARNING **by type only** (`teardown error displaced by the
+  caller's cancellation: OSError`), never by value, and never re-raised;
+- each cancel request also sets a "hurry" `asyncio.Event`, which the private
+  task sees through a `ContextVar` (`_TEARDOWN_HURRY`) set in its own context
+  copy; `_close_remote_transport` uses it (Design decision 6).
 
-- a `CancelledError` out of the shield is the caller's (the private task is
-  unreferenced, so only loop shutdown could cancel it, and then the caller is
-  being cancelled too): remember the first one, and keep waiting while the
-  private task runs;
-- when the private task is done, re-raise the remembered cancel exactly once;
-  otherwise return the teardown's result or raise its error;
-- if both a cancel and a teardown error happened, the cancel wins and the
-  error is logged at WARNING through `describe_exception` (the
-  `_close_remote_transport` precedent of "logged rather than silently
-  dropped"), never discarded;
-- the private task is named `pmcp-teardown:<qualname>` so the 60 s async
-  watchdog (`tests/runtime/_hang_watchdog.py`) names the teardown a hang is
-  parked in.
+It never calls `uncancel()`, so on 3.11+ the caller's cancel count is left as
+the canceller set it and `asyncio.timeout()` still converts its own cancel to
+`TimeoutError` (Design decision 8). The gate relies on CPython's documented-in-
+source `Task.cancel` protocol (call the waiter's `cancel()`, fall back to
+`_must_cancel`), identical in the C and pure-Python tasks on 3.10, 3.11 and
+3.12; mutant M9 (a gate whose `cancel()` returns True) is red on all three.
 
-**Why not the alternatives:**
-- *Re-raise at the await* (the obvious fix): skips terminate/close/pop; this is
-  the constraint the issue states, and the terminate-point probe above shows
-  the stale entry and the live owner it leaves.
+**Round 1 used a shield loop** (`while not task.done(): await
+asyncio.shield(task)`, remembering the first `CancelledError`). It was
+correct but woke the caller on every cancel: inside an anyio cancel scope,
+which re-delivers `task.cancel()` on every loop iteration until the task
+leaves the scope, that was one wake-up and one new shield per iteration
+(Design decision 10).
+
+**Why not the other alternatives:**
+- *Re-raise at the await:* skips terminate/close/pop -- the constraint the
+  issue states.
 - *Check `child.done()` after the shield raises:* wrong in the same-iteration
-  race (Research summary). Measured as mutant M10: red on
-  `test_helper_caller_cancel_in_the_completion_step_is_kept`.
+  race; `test_helper_caller_cancel_in_the_completion_step_is_kept` pins it.
 - *`Task.cancelling()`:* 3.11+ only.
-- *Reading the private `Task._must_cancel`:* a CPython implementation detail,
-  and the C task does not expose it on every version.
-- *Detach the teardown and raise immediately* (the caller does not linger):
-  then `_clients` removal lands after the caller has seen `CancelledError`,
-  and the issue and the brief both ask for "re-raise once cleanup completes".
+- *Detach the teardown and raise immediately:* the `_clients` removal would
+  land after the caller has seen `CancelledError`; the issue and the brief ask
+  for "re-raise once cleanup completes".
 
 ### 2. The absorbing waits move into named teardown bodies that run only under the primitive
 
 Each defective sequence becomes a method whose whole body runs inside the
-private task, so the only cancellation its child waits can see is the child's:
+private task, so the only cancellation its child waits can see is the child's
+(or loop shutdown's, Design decision 9):
 
 | Sequence | New body | Called as |
 |---|---|---|
-| stdio handshake failure | `_abort_stdio_handshake(name, managed, process)` | `await _finish_then_reraise_cancel(self._abort_stdio_handshake(...))` |
+| stdio handshake failure | `_abort_stdio_handshake(name, managed, process)` | `await _finish_then_reraise_cancel(self._abort_stdio_handshake(...), pending=_caught_cancel(e))` |
 | remote handshake failure | `_abort_remote_handshake(name, managed)` | same |
 | `disconnect_server` from the read task to the status reset | `_finish_disconnect(name, managed, cancelled, *, caller)` | `return await _finish_then_reraise_cancel(...)` |
-| `_cleanup_client` | `_cleanup_client_body(name, managed)` | `_cleanup_client` is now that one line |
+| `_cleanup_client` | `_cleanup_client_body(name, managed)` | `_cleanup_client(name, managed, *, pending=None)` is now that one call |
 
-The child waits become one helper, `_reap_cancelled_child(task, *,
-timeout=None)`: cancel, await through `shield` (or `wait_for(shield(...),
-timeout)`), absorb whatever it ends with. Its docstring states it is correct
-only inside the primitive. `_teardown_outbound` keeps its contract (refs
-dropped before the await, never raises for a non-cancellation failure) and
-calls `_reap_cancelled_child(writer, timeout=timeout)`.
+The child waits become `_reap_cancelled_child(task, *, timeout=None)`:
+cancel, await through `shield` (or `wait_for(shield(...), timeout)`), absorb
+whatever it ends with; its docstring states it is correct only inside the
+primitive. `_teardown_outbound` keeps its contract and calls
+`_reap_cancelled_child(writer, timeout=timeout)`.
 
-Two tests pin the shape so a later edit cannot quietly reintroduce the defect:
-`test_every_cancellation_handler_is_classified` (every `CancelledError` /
-`BaseException` handler in `src/pmcp`, with its count, must match a reasoned
-allowlist) and `test_absorbing_teardown_only_runs_inside_the_private_task`
-(`_reap_cancelled_child` and `_teardown_outbound` are called only from the
-four bodies, and each body only as an argument of
-`_finish_then_reraise_cancel`).
+Two tests pin the shape:
+- `test_every_cancellation_handler_is_classified`: every
+  `CancelledError`/`BaseException` handler in `src/pmcp`, with its count, must
+  match a reasoned allowlist.
+- `test_absorbing_teardown_only_runs_inside_the_private_task` (round 2,
+  per call site): every call of `_reap_cancelled_child` /
+  `_teardown_outbound` is attributed to its **innermost** enclosing function
+  (a nested function's calls are no longer charged to its parent) and must be
+  in a scoped body; and **every** call of a scoped body must itself be an
+  argument of `_finish_then_reraise_cancel(...)` -- round 1 let one wrapped
+  call excuse a bare one elsewhere. `test_the_structural_check_sees_a_bare_call_beside_a_wrapped_one`
+  proves both on a synthetic module.
 
-### 3. The handshake `except` also catches `CancelledError` (a cancel *during* the handshake gets the same teardown)
+### 3. The handshake `except` also catches `CancelledError`, and hands it to the primitive as `pending`
 
-**Decision:** widen the three handshake handlers — `_connect_stdio`,
-`_connect_remote_stream`, `adopt_process` — from `except Exception` to
-`except (Exception, asyncio.CancelledError)`. Not `BaseException`:
-`KeyboardInterrupt`/`SystemExit` are not delivered into these coroutines by
-asyncio and should not run a teardown. The status becomes `ERROR` with
-`last_error = "Connection cancelled"` (new helper `_handshake_error`;
-`describe_exception(CancelledError())` returns `''`, measured), where today it
-stays `CONNECTING` forever. The handler ends with `raise`, so the caller's
-`CancelledError` propagates after the teardown. Measured leak on main, above;
-falsifiers M5–M7.
+**Decision:** the three handshake handlers -- `_connect_stdio`,
+`_connect_remote_stream`, `adopt_process` -- catch
+`(Exception, asyncio.CancelledError)`, not `BaseException`
+(`KeyboardInterrupt`/`SystemExit` are not delivered into these coroutines by
+asyncio). The status becomes `ERROR` with `last_error = "Connection
+cancelled"` (`_handshake_error`; `describe_exception(CancelledError())` is
+`''`, measured), where on main it stays `CONNECTING` forever.
 
-### 4. The `_clients` removal moves into a `finally` in both abort bodies
+**Round-2 fix (B1, claude and codex):** a handler that caught the caller's
+`CancelledError` must pass it to the primitive:
+`pending=_caught_cancel(e)` (the `CancelledError`, or None). Round 1 did not,
+so the primitive knew only of cancels that arrived *during* the teardown; a
+teardown that then raised (`_close_remote_transport` deliberately re-raises a
+genuine transport failure; `_terminate_process_tree` can raise) replaced the
+cancel, escaped past the handler's `raise`, and `_connect_with_retry` started
+attempts 2 and 3. Measured on the round-1 spike, 3.10:
+`AssertionError: stdio-terminate: the cancel was lost: raised OSError(...)`
+(also `remote-close`, `adopt-terminate`), and `raised
+RuntimeError('second attempt started') attempts=3`. Main is not affected (its
+`except Exception` never catches the cancel). `adopt_process` threads it
+through `_cleanup_client(name, managed, pending=...)`.
 
-**Decision:** `_abort_stdio_handshake` and `_abort_remote_handshake` pop the
-stale entry in a `finally`, so a teardown step that raises
-(`_terminate_process_tree`, or `_close_remote_transport`, which never swallows
-a genuine failure by design) no longer leaves the `ERROR` entry behind. The
-exception still propagates, as today. Measured on main:
-`assert 'srv' not in {'srv': ManagedClient(...)}` with a raising terminate, and
-the same for `remote` with a raising close. Falsifiers M14, M15.
+### 4. The `_clients` removal moves into a `finally` in every teardown body
+
+`_abort_stdio_handshake`, `_abort_remote_handshake` and (round 2)
+`_cleanup_client_body`'s stdio branch clear the registries in a `finally`, so
+a teardown step that raises no longer leaves the stale entry behind. The
+exception still propagates, unless a caller cancel displaces it. Measured on
+main: `assert 'srv' not in {'srv': ManagedClient(...)}` with a raising
+terminate, the same for `remote` with a raising close; round 2 found the same
+for `adopt_process` (B1's adopt case). Falsifiers M14, M15, M17.
 
 ### 5. `disconnect_server` passes its caller to the background-task sweep (load-bearing)
 
-`_cancel_background_tasks` excludes `asyncio.current_task()` so a caller
-scoped to the server name never cancels itself. Inside the private task,
-`current_task()` is the private task, not the caller. **Without an explicit
-exclusion this is a deadlock, not a lost cancel:** the private task cancels
-the caller and then `gather`s it, while the caller waits on the private task.
-Measured as mutant M11 on the real sweep: the test module hung until the
-300 s subprocess timeout killed it (the 60 s watchdog would have fired in CI).
-**Decision:** `disconnect_server` captures `asyncio.current_task()` and
-`_finish_disconnect` passes `exclude={caller}`. The test for it
-(`test_disconnect_server_does_not_cancel_its_own_caller`) tracks the caller as
-a background task under the server name and wraps the sweep so the mutant
-fails with an `AssertionError` instead of hanging the suite. (That test is
-also red on main, by construction of its guard: main's sweep is called with
-`exclude=None` and relies on `current_task()`. Its real falsifier is M11.)
+Unchanged from round 1. `_cancel_background_tasks` excludes
+`asyncio.current_task()`; inside the private task that is the private task,
+not the caller. Without an explicit exclusion this is a **deadlock**: the
+private task cancels the caller and gathers it while the caller waits on the
+private task. `disconnect_server` captures `asyncio.current_task()` and
+`_finish_disconnect` passes `exclude={caller}`.
+`test_disconnect_server_does_not_cancel_its_own_caller` wraps the sweep so the
+mutant (M11) fails instead of hanging.
 
-The same cycle cannot form in the other bodies: none of them sweeps or awaits
-a task that could be its caller. A *different* task sweeping a connect task
-that is itself parked in `_finish_then_reraise_cancel` is not a cycle: that
-private task waits for nothing outside itself, finishes its bounded teardown,
-and the connect task then raises.
+### 6. Bounds, stated honestly; a cancelled caller skips the graceful remote close
 
-### 6. No new timeouts; the linger is the teardown's own bound
-
-A cancelled caller now waits for its teardown instead of escaping it. That is
-bounded by the teardown, not by anything new:
-
-- child reaps: every reaped child is cancel-responsive. `_read_stdout`,
-  `_read_stderr`, `_read_sse` and `_drain_outbound` have **no**
-  `CancelledError`/`BaseException` handler (the AST scan; they are absent from
-  the 22-row table), so each ends at its next await once cancelled.
-  `test_every_cancellation_handler_is_classified` keeps that true: adding one
-  fails the test until someone classifies it.
-- `_terminate_process_tree`: ≤ 5 s SIGTERM wait + ≤ 3 s SIGKILL wait
-  (`manager.py:312, 324`).
-- `_close_remote_transport`: ≤ 5 s graceful, then cancel the owner and await
-  it; unbounded only for an `__aexit__` that ignores cancellation, which the
-  method already documents as pre-existing (`manager.py:2627-2635`) and which
-  a cancelled caller hit on main as well (its caller-cancel branch also awaits
-  the cancelled owner unbounded).
-- `disconnect_server` holds `_lifecycle_lock` through the teardown, cancelled
-  or not, as it does today; the lock is released when the caller re-raises
-  (asserted: `assert not mgr._lifecycle_lock.locked()`).
-
-Adding a bound to the child reaps would change the non-cancelled path, which
-today waits unbounded for a cancel-responsive child, for no measured benefit.
+A cancelled caller now waits for its teardown instead of escaping it. The
+bounds (round-1 F3 corrected them):
+- **child reaps:** unbounded only for a child that ignores cancellation.
+  pmcp's own children (`_read_stdout`, `_read_stderr`, `_read_sse`,
+  `_drain_outbound`) have no `CancelledError`/`BaseException` handler (the
+  AST scan) and end at their next await; the classification test keeps that
+  true. **This is a real trade-off:** on main a cancelled caller ran past a
+  child that ignored cancellation (with its cancel lost); now it waits. No
+  pmcp child does that, and bounding the reaps would change the non-cancelled
+  path too.
+- **`_terminate_process_tree`:** ≤ 5 s SIGTERM wait + ≤ 3 s SIGKILL wait +
+  ≤ ~3 s group reap (`for _ in range(30): ... sleep(0.1)`) = **~11 s**, not 8.
+  stdio keeps its SIGTERM grace for a cancelled caller too: a server may need
+  it to release a browser profile, which is why the group reap exists.
+- **`_close_remote_transport` (round 2, F3):** a cancelled caller no longer
+  waits out the 5 s graceful close. `_close_remote_transport` reads
+  `_TEARDOWN_HURRY`; once it is set (a cancel during the teardown, or a
+  `pending` one), the graceful wait ends at once (`_wait_unless_hurried`) and
+  the owner is escalated. Because the hurried escalation can cancel the owner
+  *before* it has started to unwind, the owner may enter its transport's
+  `__aexit__` with that cancellation already consumed; `_cancel_until_done`
+  therefore re-cancels it every 0.5 s (`_HURRY_RECANCEL_S`) until it ends.
+  The non-hurried path is unchanged (graceful wait, then one cancel, as on
+  main). Measured: with a transport whose `__aexit__` blocks until cancelled
+  and the graceful budget raised to 3600 s, a cancelled `disconnect_server`
+  returns `CancelledError` with the owner escalated, and a cancel during the
+  remote handshake does too in ~0.5 s; with the hurry removed (M19) both hit
+  the 10 s hang guard, and with a single cancel (M20) the handshake case hangs.
+- `disconnect_server` holds `_lifecycle_lock` through the teardown, as today;
+  the lock is released when the caller re-raises (asserted).
 
 ### 7. `_cleanup_client`'s contract changes for cancellation only
 
-Its docstring says "All exceptions are suppressed so callers always complete
-successfully". After this plan, a non-cancellation failure is still
-suppressed; a caller's cancellation now propagates *after* the full teardown
-(today it was swallowed at a child wait, or propagated mid-teardown at
-terminate/close). Rewrite the sentence to say so. Callers: the two reconnect
-pre-cleans and `adopt_process`'s handshake handler; all are already prepared
-for `CancelledError` (it propagates out of a connect today whenever the cancel
-lands outside the child waits).
+Docstring (in the patch): a remote close failure is logged and suppressed; a
+terminate failure propagates after the registries are cleared; a cancellation
+of the caller -- one that arrives during the teardown, or one passed as
+`pending` -- is re-raised after the whole teardown.
 
 ### 8. Not lost, not doubled, and `asyncio.timeout()` still works
 
-The primitive never calls `cancel()` or `uncancel()`. Pinned by
-`test_one_caller_cancel_is_delivered_exactly_once` (the caller catches one
-`CancelledError`, then `await asyncio.sleep(0)` succeeds, so no second cancel
-is queued; on 3.11+ `current_task().cancelling() == 1`) and, on 3.11+,
-`test_a_timeout_scope_around_the_teardown_still_reports_timeout`
-(`asyncio.timeout()` fired while the caller is parked in the terminate step
-still surfaces as `TimeoutError`, and the terminate completes). Repeated
-cancels during one teardown are delivered as one
-(`test_helper_completes_cleanup_across_repeated_caller_cancels`).
+The primitive never calls `cancel()` or `uncancel()` on the caller. Pinned by
+`test_one_caller_cancel_is_delivered_exactly_once` (one `CancelledError`, then
+`await asyncio.sleep(0)` succeeds; on 3.11+ `cancelling() == 1`),
+`test_a_timeout_scope_around_the_teardown_still_reports_timeout` (3.11+), and
+`test_helper_completes_cleanup_across_repeated_caller_cancels`.
+
+### 9. Loop shutdown cannot leave the process tree alive (round 2, B2)
+
+`asyncio.shield` and the gate protect against the *caller's* cancellation
+only. CPython's shutdown (`asyncio.run` -> `_cancel_all_tasks`) cancels every
+pending task, the private teardown task included. Codex's repro: a real
+SIGTERM-ignoring server whose handshake fails, shutdown while
+`_terminate_process_tree` waits on its exit: the loop closes with the server
+alive (`returncode=None`) because the SIGKILL escalation is skipped.
+
+**Decision: a synchronous last-resort kill that cannot be skipped.**
+`_terminate_process_tree` wraps everything after its SIGTERM in `try: ...
+except asyncio.CancelledError:` that, before re-raising, SIGKILLs the leader
+(only if `process.returncode is None`, so a reaped and reusable pid is never
+signalled) and the process group (if `_group_alive()`). It runs whoever
+cancelled the wait -- a caller, a sweep, or loop shutdown -- with no await, so
+nothing can skip it. It adds one handler to the census (classified
+`reraises`).
+
+**Rejected:** an `atexit` hook (runs after the loop is gone, misses
+non-exiting loops, and would need a process registry) and a `finally` that
+always SIGKILLs (it would also fire on the normal path after a clean SIGTERM
+exit, where the group is already gone -- the `except CancelledError` is
+exactly the case to cover).
+
+**Measured** with `test_loop_shutdown_mid_terminate_still_kills_the_process_tree`
+(a subprocess running `asyncio.run` around a real `_connect_stdio` whose child
+ignores SIGTERM and spawns a grandchild; `main()` returns while terminate is
+parked): **main** and the **round-1 spike**: `process tree outlived shutdown:
+leader=... grandchild=...` on 3.10 (main measured on all three as part of the
+module run); **round-2 spike**: both gone, on 3.10, 3.11 and 3.12. The same
+handler also closes the pre-existing gap for every other cancelled terminate
+(`_shutdown_one`, the update probe in `tools/handlers.py`).
+
+### 10. anyio's re-delivered cancel: pmcp's spin removed, anyio's own remains (round-1 F2)
+
+The MCP SDK runs request handlers in anyio scopes, and anyio's
+`CancelScope._deliver_cancellation` reschedules itself with `call_soon` on
+**every** loop iteration while any task in the scope is alive (`should_retry
+= True` even for a task with `_must_cancel` set; anyio 4.14.2,
+`anyio/_backends/_asyncio.py:581-629`). Measured (`probe_cpu.py`: a 0.3 s
+teardown inside a cancelled anyio scope):
+
+| | helper wake-ups | loop iterations | CPU / wall |
+|---|---|---|---|
+| round 1, 3.10 / 3.11 / 3.12 | 38,416 / 50,635 / 75,045 | same + 1 | 0.30 s / 0.30 s |
+| round 2, 3.10 / 3.11 / 3.12 | **0 / 0 / 0** | 81,606 / 109,224 / 114,683 | 0.30 s / 0.30 s |
+
+The gate removes every pmcp wake-up (the caller stays parked on one future;
+`test_a_cancel_scope_does_not_wake_the_caller_during_the_teardown` asserts the
+waiter object never changes across 200 re-deliveries), and each loop iteration
+becomes about twice as cheap. **The core stays busy** because anyio's delivery
+loop itself spins until the task leaves the scope; no pmcp-side change can
+stop that without opening an anyio `CancelScope(shield=True)` around the wait,
+which would hide the scope's cancel from the teardown and re-deliver it only
+at the caller's next await -- turning a handshake error raised in between into
+a converted cancel, the defect this plan removes. The window is bounded by the
+teardown (remote: ~0 s plus re-cancels thanks to Design decision 6; stdio:
+≤ ~11 s). Stated, not fixed.
+
+### 11. Auto-reconnect after a cancelled reconnect: pre-existing, not fixed here (round-1 F4)
+
+Reaping an old client's read task while its status is still `ONLINE` runs
+`_read_stdout`'s `finally` -> `_schedule_reconnect`, and `_reconnect_loop`
+spawns a new process about 5 s later. Main does the same; the cancelled
+*caller* spawns nothing (fixed by Design decision 2), but the server can
+still come back. Marking the client `OFFLINE` before the reap would change
+every reconnect path (the reconnect loop itself pre-cleans through
+`_cleanup_client`), so it belongs in its own issue. **For the coordinator to
+file**, suggested title: "a cancelled reconnect is revived by auto-reconnect:
+reaping an ONLINE client's read task schedules a reconnect".
 
 ## Corrections to the issue description
 
@@ -310,84 +415,93 @@ cancels during one teardown are delivered as one
 - At the terminate/close step the cancel does propagate, but the teardown is
   abandoned: stale `ERROR` entry, and on the remote path a live transport
   owner.
+- (Round 2) On main *and* on any design that only shields from the caller,
+  loop shutdown during `_terminate_process_tree` leaves a SIGTERM-ignoring
+  server running (Design decision 9).
 
 ## Changes
 
-Line numbers are main `89559db`. The spike diff is
-`src/pmcp/client/manager.py | 316 +++++----` (216 insertions, 100 deletions;
+Line numbers are main `89559db`. The round-2 spike diff is
+`src/pmcp/client/manager.py | 544 +++++----` (404 insertions, 140 deletions;
 about 60 of the deletions are the `disconnect_server` body dedented into
-`_finish_disconnect`).
+`_finish_disconnect`, and about 40 are `_terminate_process_tree`'s body
+re-indented under its new `try`).
 
 ### `src/pmcp/client/manager.py` (modify)
 
-- Imports: `from collections.abc import Awaitable, Callable, Collection`.
-- After `_TaskT` (`manager.py:145`): add `_T = TypeVar("_T")`,
-  `_finish_then_reraise_cancel` (Design decision 1), `_reap_cancelled_child`
-  (Design decision 2), `_handshake_error` (Design decision 3).
-- `disconnect_server` (`manager.py:1349`): inside the `async with
-  self._lifecycle_lock:` block, after the `if not managed:` early return,
-  replace the body from `config = managed.config` to `return (True, cancelled,
-  None)` with `return await _finish_then_reraise_cancel(self._finish_disconnect(
-  name, managed, cancelled, caller=asyncio.current_task()))`.
-- New `_finish_disconnect` (after `disconnect_server`): the moved body,
-  unchanged except: the read-task wait (`manager.py:1397-1406`) becomes
-  `await _reap_cancelled_child(managed.read_task, timeout=1.0)` (same 1 s
-  bound), and `await self._cancel_background_tasks(server_name=name)` becomes
-  `await self._cancel_background_tasks(server_name=name, exclude={caller} if
-  caller is not None else None)` (Design decision 5).
-- `_connect_stdio` handshake handler (`manager.py:2461-2480`): `except
-  (Exception, asyncio.CancelledError) as e:`; `status.last_error =
-  _handshake_error(e)`; `await _finish_then_reraise_cancel(
-  self._abort_stdio_handshake(name, managed, process))`; `raise`.
-- New `_abort_stdio_handshake`: reap `read_task`, reap `stderr_task`,
-  `_teardown_outbound`, `_terminate_process_tree`, with the `_clients` pop in a
-  `finally` (Design decision 4).
-- `_connect_remote_stream` handshake handler (`manager.py:2789-2805`): same
-  shape, calling new `_abort_remote_handshake` (reap `read_task`,
-  `_teardown_outbound`, `_close_remote_transport`, pop in `finally`).
-- `_teardown_outbound` (`manager.py:3258-3270`): after dropping the refs,
-  `await _reap_cancelled_child(writer, timeout=timeout)`, with a comment that
-  every caller runs it under the primitive. The early return for a missing or
-  finished writer moves into the helper.
-- `_cleanup_client` (`manager.py:3652`): the body becomes `await
-  _finish_then_reraise_cancel(self._cleanup_client_body(name, managed))`; new
-  `_cleanup_client_body` holds the old body with the child loop as
-  `for task in (...): await _reap_cancelled_child(task)`. Update the
-  docstring's "callers always complete successfully" sentence (Design
-  decision 7).
+- Imports: `import contextvars`; `from collections.abc import Awaitable,
+  Callable, Collection`.
+- After `_TaskT` (`manager.py:145`): `_T`, `_HURRY_RECANCEL_S = 0.5`,
+  `_DeferredCancelGate`, `_TEARDOWN_HURRY`, `_finish_then_reraise_cancel`
+  (Design decision 1), `_reap_cancelled_child` (2), `_wait_unless_hurried`
+  and `_cancel_until_done` (6), `_caught_cancel` and `_handshake_error` (3).
+- `_terminate_process_tree` (`manager.py:244`): everything after the first
+  `_signal(kill=False)` moves under `try: ... except asyncio.CancelledError:`
+  with the synchronous last-resort SIGKILL (Design decision 9).
+- `disconnect_server` (`manager.py:1349`) and new `_finish_disconnect`: as in
+  round 1 (Design decision 5); the read-task wait becomes
+  `_reap_cancelled_child(managed.read_task, timeout=1.0)`.
+- `_connect_stdio` / `_connect_remote_stream` handshake handlers
+  (`manager.py:2461`, `:2789`): `except (Exception, asyncio.CancelledError)
+  as e:`; `_handshake_error(e)`; `await _finish_then_reraise_cancel(
+  self._abort_*_handshake(...), pending=_caught_cancel(e))`; `raise`.
+- New `_abort_stdio_handshake` / `_abort_remote_handshake`: the old bodies,
+  child waits as `_reap_cancelled_child`, the `_clients` pop in a `finally`.
+- `_close_remote_transport` (`manager.py:2596`): reads `_TEARDOWN_HURRY`;
+  graceful wait via `_wait_unless_hurried` when inside a teardown; hurried
+  escalation via `_cancel_until_done`; an INFO line instead of the "did not
+  close within" WARNING when hurried. Unchanged outside a teardown.
+- `_teardown_outbound` (`manager.py:3258-3270`): `_reap_cancelled_child(writer,
+  timeout=timeout)` after dropping the refs.
+- `_cleanup_client(name, managed, *, pending=None)` (`manager.py:3652`): one
+  call to the primitive with `pending`; new `_cleanup_client_body` (old body,
+  child loop as `_reap_cancelled_child`, the stdio branch's registry clears in
+  a `finally`); docstring per Design decision 7.
 - `adopt_process` handshake handler (`manager.py:3817`): `except (Exception,
-  asyncio.CancelledError) as e:` and `_handshake_error(e)`. Its teardown is
-  `_cleanup_client`, already scoped.
+  asyncio.CancelledError) as e:`; `await self._cleanup_client(name, managed,
+  pending=_caught_cancel(e))`.
 
-Unchanged on purpose: `_shutdown_one` (row 6), `_close_remote_transport`
-(rows 7–9), `_own_remote_transport` (row 10), the task roots (rows 14–17).
+Unchanged on purpose: `_shutdown_one` (row 6), `_own_remote_transport`
+(row 10), the task roots (rows 14–17).
 
 ### `tests/test_cancel_teardown.py` (create)
 
-The module in *Verbatim bodies*: 32 tests (31 on 3.10, where the
-`asyncio.timeout` test skips).
+The module in *Verbatim bodies*: **41 tests** (40 on 3.10, where the
+`asyncio.timeout` test skips); ~2.3–3.3 s per run, the slowest item the
+0.8 s real-subprocess shutdown test.
 
 | Test | Pins |
 |---|---|
-| `test_stdio_handshake_teardown_keeps_caller_cancel[read_task, stderr_task, outbound_writer, terminate]` | row 1 + 3, every await of the stdio teardown |
-| `test_remote_handshake_teardown_keeps_caller_cancel[read_task, outbound_writer, close_transport]` | row 2 + 3, every await of the remote teardown; owner task done |
+| `test_stdio_handshake_teardown_keeps_caller_cancel[read_task, stderr_task, outbound_writer, terminate]` | rows 1 + 3 |
+| `test_remote_handshake_teardown_keeps_caller_cancel[read_task, outbound_writer, close_transport]` | rows 2 + 3 |
 | `test_a_lost_cancel_does_not_start_another_connect_attempt` | the retry consequence |
-| `test_cleanup_client_keeps_caller_cancel[read_task, stderr_task, outbound_writer, terminate]` | row 5 |
-| `test_disconnect_server_keeps_caller_cancel[read_task, outbound_writer, terminate]` | row 4 (+ status `LAZY`, lock released) |
+| `test_cleanup_client_keeps_caller_cancel[...]` (4) | row 5 |
+| `test_disconnect_server_keeps_caller_cancel[...]` (3) | row 4 (+ `LAZY`, lock released) |
 | `test_disconnect_server_does_not_cancel_its_own_caller` | Design decision 5 |
 | `test_child_cancellation_is_still_absorbed_without_a_caller_cancel`, `..._on_disconnect` | the child's cancel is still absorbed |
 | `test_one_caller_cancel_is_delivered_exactly_once` | not lost, not doubled |
-| `test_helper_completes_cleanup_across_repeated_caller_cancels`, `test_helper_returns_the_cleanup_result_and_raises_its_error`, `test_helper_cancel_wins_over_a_cleanup_error` (asserts the log), `test_helper_caller_cancel_in_the_completion_step_is_kept` | the primitive |
+| `test_helper_completes_cleanup_across_repeated_caller_cancels`, `..._returns_the_cleanup_result_and_raises_its_error`, `..._cancel_wins_over_a_cleanup_error` (logged by type, never by value), `..._caller_cancel_in_the_completion_step_is_kept` | the primitive |
 | `test_a_failing_terminate_still_drops_the_stale_client`, `test_a_failing_transport_close_still_drops_the_stale_client` | Design decision 4 |
 | `test_stdio_cancel_during_handshake_still_tears_down`, `test_remote_...`, `test_adopt_...` | Design decision 3 |
+| **round 2:** `test_a_cancel_caught_in_the_handshake_survives_a_failing_teardown[stdio-terminate, remote-close, adopt-terminate]` | B1, each site × its failing step: `CancelledError`, the step ran once, the displaced error logged by type, no value, no stale entry |
+| **round 2:** `test_a_cancel_caught_in_the_handshake_is_not_retried_after_a_failing_teardown` | B1's retry consequence |
+| **round 2:** `test_a_cancel_scope_does_not_wake_the_caller_during_the_teardown` | Design decision 10 (anyio) |
+| **round 2:** `test_a_cancelled_disconnect_skips_the_graceful_remote_close`, `test_a_cancel_caught_in_the_remote_handshake_skips_the_graceful_close` | Design decision 6 |
+| **round 2:** `test_loop_shutdown_mid_terminate_still_kills_the_process_tree` | B2, real subprocesses |
 | `test_disconnect_all_redelivers_a_cancel_absorbed_by_shutdown_one` | row 6 stays safe |
 | `test_a_timeout_scope_around_the_teardown_still_reports_timeout` (3.11+) | Design decision 8 |
-| `test_every_cancellation_handler_is_classified`, `test_absorbing_teardown_only_runs_inside_the_private_task` | the class guard |
+| `test_every_cancellation_handler_is_classified`, `test_absorbing_teardown_only_runs_inside_the_private_task`, **round 2:** `test_the_structural_check_sees_a_bare_call_beside_a_wrapped_one` | the class guard |
 
-No timed sleeps. `await asyncio.sleep(0)` is used only as a single yield, and
-`asyncio.wait_for(..., 10.0)` only as a hang guard (`tests/_timing.py`'s rule).
-The cancel is ordered against the gate's release by the FIFO ready queue
-(`_cancel_while_parked`'s docstring), not by a yield count.
+Determinism: every suspension point is reached through an `asyncio.Event`
+gate, and `asyncio.wait_for(..., 10.0)` is a hang guard only. Round-1 F5
+was right that two tests count yields: `test_helper_caller_cancel_in_the_completion_step_is_kept`
+uses two `sleep(0)`s to put the caller's cancel between the teardown's
+completion and the gate's callback (deterministic on CPython 3.10–3.12; the
+order of the ready queue is FIFO), and the anyio test samples the caller's
+waiter over 200 `sleep(0)`s. The two remote-close tests release their
+blocked transport in a `finally`, so a failing run (main, or mutants M19/M20)
+fails at the hang guard instead of hanging the loop's own teardown -- round 2
+found that it otherwise did.
 
 ## Documentation impact
 
@@ -395,32 +509,26 @@ The cancel is ordered against the gate's release by the FIFO ready queue
   "see Consiliency/pmcp#324" (no closing keyword): a caller cancelled while a
   server connection is being torn down (a failed or cancelled handshake,
   `disconnect_server`, a reconnect's cleanup) now keeps its cancellation and
-  still gets the whole teardown; before, the cancellation could be lost (the
-  connect was retried) or the teardown abandoned (a stale entry, a running
-  process or an open remote transport).
-- `SECURITY.md`: no change. No ledger claim covers cancellation;
-  `scripts/check_security_claims.py` reports `OK … 129 cited node id(s)` on
-  the spike.
-- `_cleanup_client`'s docstring (Design decision 7).
+  still gets the whole teardown; a cancelled caller no longer waits out the
+  graceful remote close; and a stdio server's process tree is SIGKILLed even
+  when its termination is cancelled, including by event-loop shutdown.
+- `SECURITY.md`: no change; `scripts/check_security_claims.py` reports
+  `OK … 129 cited node id(s)` on the spike.
 
 ## Dependencies & order
 
-1. Add the primitive and `_reap_cancelled_child`.
-2. Move the bodies (handshake ×2, disconnect, cleanup), then widen the three
-   handshake handlers.
-3. Add the test module; update the allowlist only if line-level code moved.
-4. CHANGELOG last.
+1. `_terminate_process_tree`'s last-resort kill (independent).
+2. The gate, the primitive and `_reap_cancelled_child`.
+3. Move the bodies, widen the three handshake handlers, thread `pending`.
+4. The hurry path in `_close_remote_transport`.
+5. The test module; CHANGELOG last.
 
 **Touch points with open work.** Plan PR Consiliency/pmcp#329 (for
 Consiliency/pmcp#298) changes `manager.py` around `_send_request`'s write
 path and task-hint parsing; its patch adds no `CancelledError`/`BaseException`
-handler (checked: `grep '^+.*except.*(CancelledError|BaseException)'` is
-empty for it and for plan PRs Consiliency/pmcp#314, #295, #331), so there is no
-semantic overlap and only a possible textual rebase. The class guard
-`test_every_cancellation_handler_is_classified` is deliberately src-wide: any
-later PR that adds a cancellation handler anywhere in `src/pmcp` fails it until
-the handler is classified in the allowlist with a reason. That is the point of
-the test, and the failure message names the handler.
+handler, so only a textual rebase. The class guard is deliberately src-wide:
+any later PR that adds a cancellation handler anywhere in `src/pmcp` fails it
+until the handler is classified with a reason.
 
 ## Verification
 
@@ -431,179 +539,160 @@ git -C ~/code/pmcp worktree add -b fix/324-cancel-teardown "$WORKTREE_ROOT/pmcp-
 cd "$WORKTREE_ROOT/pmcp-324-fix"
 uv sync --all-extras -p 3.10      # without --all-extras, `uv run` silently uses the system pytest
 unset npm_config_cache npm_config_store_dir pnpm_config_store_dir
-```
-
-Apply *Verbatim bodies* (`git apply` the patch, write the test module, edit
-the `_cleanup_client` docstring sentence and CHANGELOG by hand), then:
-
-```bash
-# 1. the new module (spike: 31 passed, 1 skipped on 3.10; 32 passed on 3.11 and 3.12; ~1.2 s)
-uv run pytest tests/test_cancel_teardown.py --cov-fail-under=0 -p no:cacheprovider -q
-# 2. the same module, plus the client-manager suites, on all three Pythons
-#    (spike: 305 passed, 1 skipped on 3.10; 306 passed on 3.11; 306 passed on 3.12)
 uv python install 3.11 3.12
 for v in 3.11 3.12; do UV_PROJECT_ENVIRONMENT=.venv-$v uv sync --all-extras -p $v -q; done
+```
+
+Apply *Verbatim bodies* (`git apply` the patch, write the test module, add the
+CHANGELOG bullet by hand), then:
+
+```bash
+# 1+2. the new module plus the client-manager suites, on all three Pythons
+#      (round-2 spike: 314 passed, 1 skipped on 3.10; 315 passed on 3.11; 315 passed on 3.12)
 for v in 3.10 3.11 3.12; do E=.venv; [ $v != 3.10 ] && E=.venv-$v
-  UV_PROJECT_ENVIRONMENT=$E uv run --no-sync -p $v pytest tests/test_cancel_teardown.py \
-    tests/test_client_manager.py tests/test_client_manager_reconnect.py \
-    --cov-fail-under=0 -p no:cacheprovider -q; done
-# 3. every module that exercises a changed function (spike, before the last two
-#    helper refinements: 1193 passed, 3 skipped, 0 failed, 346 s; slowest item
-#    60.06 s is the pre-existing tests/test_progressive_disclosure.py network test)
-uv run pytest tests/mcp2x/test_catalog_publishers.py tests/mcp2x/test_client_transport.py \
-  tests/runtime/test_downstream_handshake_era.py tests/runtime/test_downstream_remote.py \
-  tests/runtime/test_downstream_stdio.py tests/runtime/test_emitter_harness.py \
-  tests/runtime/test_hang_diagnostics.py tests/runtime/test_publisher_coverage.py \
-  tests/runtime/test_subscriptions_e2e.py tests/test_baseline_constraints.py \
-  tests/test_cancel_teardown.py tests/test_client_manager.py tests/test_client_manager_reconnect.py \
-  tests/test_cli_p4.py tests/test_cli.py tests/test_exception_group_diagnostics.py \
-  tests/test_fresh_operator_baseline.py tests/test_gateway_tool_schemas.py tests/test_integration.py \
-  tests/test_package_identity_gate.py tests/test_pkgid_panel_fixes.py tests/test_pkgid_spawn_logging.py \
-  tests/test_progressive_disclosure.py tests/test_provision_validation.py tests/test_server_lifecycle.py \
-  tests/test_server.py tests/test_startup_resolver.py tests/test_tools.py \
-  tests/test_trust_boundaries_composition.py tests/test_trust_boundaries_e2e.py \
-  --cov-fail-under=0 -p no:cacheprovider -q --durations=5
-# 4. CI gates the plan's own list would otherwise miss (spike: all clean)
+  $E/bin/python -m pytest tests/test_cancel_teardown.py tests/test_client_manager.py \
+    tests/test_client_manager_reconnect.py --cov-fail-under=0 -p no:cacheprovider -q -o timeout=120; done
+# 3. CI gates (round-2 spike: all clean)
 uv run ruff check src tests && uv run ruff format --check src tests
 uv run mypy src/pmcp/client/manager.py
 python3 scripts/check_security_claims.py          # expect OK, 129 cited node ids
 python3 scripts/check_plan_consistency.py .consiliency/plans/detailed-324-cancel-teardown-20261003-0213.md
-#   measured on this file: "consistent … blocking inconsistencies: 0", exit 0 (a detailed plan has no roadmap pin)
-# 5. the full suite: once, detached, with a notifying waiter (memory on dev0 is shared)
-nohup uv run pytest -q -p no:cacheprovider > "$WORKTREE_ROOT/pmcp-324-full.log" 2>&1 &
+#   measured on this file: "consistent ... blocking inconsistencies: 0", exit 0
+# 4. the full suite: once, alone, detached, with a notifying waiter (memory on dev0 is shared)
+#    (round-2 spike, run alone on 3.10: 4969 passed, 4 skipped, 80 deselected, 0 failed, 552 s)
+nohup .venv/bin/python -m pytest -q -p no:cacheprovider > "$WORKTREE_ROOT/pmcp-324-full.log" 2>&1 &
 ```
 
-**Hang guard.** No test in the new module comes near the diagnostics: the
-whole module runs in ~1.2 s on every version, every await in it is behind an
-`Event` gate or a 10 s `wait_for` hang guard, and none of the 60 s watchdog,
-700 s pytest-timeout or 720 s faulthandler thresholds is approached. The one
-way this change could hang (Design decision 5, mutant M11) is a deadlock the
-dedicated test turns into an assertion.
+Use the venv's own interpreter (`$E/bin/python -m pytest`) for 3.11/3.12:
+round 2 found `.venv-3.11` recreated empty under `uv run -p 3.11`, which then
+fails on `import anyio` instead of testing anything.
+
+**Hang guard.** The module runs in ~2.3–3.3 s on every version; the slowest
+item is the 0.8 s shutdown subprocess (its own `subprocess.run(timeout=60)`).
+Every mutant below ran under `-o timeout=60` and a 300 s subprocess cap; none
+hung. The 60 s watchdog, 700 s pytest-timeout and 720 s faulthandler are never
+approached.
 
 **Red on main.** The final module against `89559db`'s `manager.py`:
-**3.10: 28 failed, 3 passed, 1 skipped; 3.11: 29 failed, 3 passed; 3.12: 29
-failed, 3 passed.** The 3 that pass on main are the ones that must: the two
-"child cancellation is still absorbed" tests and the `_shutdown_one`
-gather-redelivery test. First assertion on main per group:
-
-| Test (group) | First assertion on main |
-|---|---|
-| stdio/remote `..._keeps_caller_cancel[<child>]` | `caller cancelled at read_task lost its cancellation: raised RuntimeError('handshake failed')` |
-| stdio `[terminate]`, remote `[close_transport]` | `teardown abandoned the terminate wait` / `... close_transport wait` |
-| `test_a_lost_cancel_does_not_start_another_connect_attempt` | `cancelled connect retried: raised RuntimeError('second attempt started'), attempts=3` |
-| `test_cleanup_client_keeps_caller_cancel[<child>]` | `... lost its cancellation: returned None` |
-| `test_disconnect_server_keeps_caller_cancel[<child>]` | `... lost its cancellation: returned (True, 0, None)` |
-| `..._cancel_during_handshake_still_tears_down` (stdio/remote/adopt) | `process left running after a cancelled handshake` / `transport left open ...` / `assert [] == ['terminated']` |
-| `test_a_failing_terminate/transport_close_still_drops_the_stale_client` | `assert 'srv' not in {'srv': ManagedClient(...)}` |
-| `test_one_caller_cancel_is_delivered_exactly_once` | `('raised', RuntimeError('handshake failed')) == ('returned', 'caught once')` |
-| `test_a_timeout_scope_around_the_teardown_still_reports_timeout` (3.11+) | `assert [] == ['terminated']` (timeout reported, terminate abandoned) |
-| the 4 helper tests | `_finish_then_reraise_cancel is missing` |
-| `test_every_cancellation_handler_is_classified` | the six defective handlers listed as unclassified |
-| `test_disconnect_server_does_not_cancel_its_own_caller` | `the sweep would cancel and await its own caller` (guard artifact; see Design decision 5) |
+**3.10: 35 failed, 5 passed, 1 skipped; 3.11: 36 failed, 5 passed; 3.12: 36
+failed, 5 passed.** The 5 that pass on main are the ones that must: the two
+"child cancellation is still absorbed" tests, the `_shutdown_one`
+gather-redelivery test, the synthetic structural test, and
+`test_a_cancel_caught_in_the_handshake_is_not_retried_after_a_failing_teardown`
+(main never catches the cancel, so it never retries; the test guards against
+round 1's regression). **Against the round-1 spike** (3.10), every round-2
+test is red: the three B1 sites (`the cancel was lost: raised OSError(...)`),
+the retry (`attempts=3`), the anyio test (`the caller woke during the
+teardown: 200 waiters`), both graceful-close tests (hang guard
+`TimeoutError`), and the shutdown test (`process tree outlived shutdown`).
 
 ## Acceptance criteria
 
-- [ ] A caller cancelled at **every** await of the stdio, remote,
+- [ ] A caller cancelled at every await of the stdio, remote,
   `disconnect_server` and `_cleanup_client` teardowns sees `CancelledError`,
-  the teardown completes (process tree terminated / transport closed, owner
-  task done) and the server is gone from `_clients`. Proven by the 14
-  parametrized `..._keeps_caller_cancel[...]` cases.
-- [ ] A cancelled connect is not retried. Proven by
-  `test_a_lost_cancel_does_not_start_another_connect_attempt`.
-- [ ] A cancel during the handshake itself tears down on all three handshake
-  paths, and `last_error` reads `Connection cancelled`. Proven by the three
+  the teardown completes and the server is gone from `_clients`. Proven by the
+  14 parametrized `..._keeps_caller_cancel[...]` cases.
+- [ ] A cancelled connect is not retried, whether the cancel lands during the
+  teardown or during the handshake with a teardown that then raises. Proven
+  by `test_a_lost_cancel_does_not_start_another_connect_attempt` and
+  `test_a_cancel_caught_in_the_handshake_is_not_retried_after_a_failing_teardown`.
+- [ ] A cancel caught in any of the three handshake handlers survives a
+  teardown that raises; the displaced error is logged by type only. Proven by
+  `test_a_cancel_caught_in_the_handshake_survives_a_failing_teardown[...]` (3).
+- [ ] A cancel during the handshake itself tears down on all three paths, and
+  `last_error` reads `Connection cancelled`. Proven by the three
   `..._cancel_during_handshake_still_tears_down` tests.
-- [ ] A child's own cancellation is still absorbed: a failed handshake still
-  raises its own error, a disconnect still returns `(True, 0, None)`. Proven
-  by the two `test_child_cancellation_is_still_absorbed_...` tests.
+- [ ] A child's own cancellation is still absorbed. Proven by the two
+  `test_child_cancellation_is_still_absorbed_...` tests.
 - [ ] One cancel in, one `CancelledError` out; the 3.11+ cancel count is 1;
-  `asyncio.timeout()` still reports `TimeoutError`. Proven by
-  `test_one_caller_cancel_is_delivered_exactly_once` and
-  `test_a_timeout_scope_around_the_teardown_still_reports_timeout`.
-- [ ] The primitive keeps a cancel delivered in the teardown's completion
-  step, survives repeated cancels, and logs a teardown error that a cancel
-  displaces. Proven by the four `test_helper_...` tests.
-- [ ] `disconnect_server` never sweeps its own caller. Proven by
-  `test_disconnect_server_does_not_cancel_its_own_caller` (M11).
+  `asyncio.timeout()` still reports `TimeoutError`; a cancelled caller is not
+  woken during the teardown, even by anyio's per-iteration re-delivery.
+  Proven by the exactly-once, timeout-scope and cancel-scope tests.
+- [ ] A cancelled caller skips the graceful remote close, and a hurried owner
+  that blocks in `__aexit__` is re-cancelled until it ends. Proven by the two
+  graceful-close tests.
+- [ ] Loop shutdown during a stdio terminate still kills the process tree.
+  Proven by `test_loop_shutdown_mid_terminate_still_kills_the_process_tree`.
+- [ ] `disconnect_server` never sweeps its own caller (M11).
 - [ ] Every `CancelledError`/`BaseException` handler in `src/pmcp` is
-  classified, and the absorbing primitives run only inside the private task.
-  Proven by the two class-guard tests.
-- [ ] Verification steps 1–5 pass on 3.10, and step 2 on 3.11 and 3.12.
-- [ ] Every mutant below is red, for the reason stated.
+  classified; the absorbing primitives run only inside the private task, per
+  call site. Proven by the three class-guard tests.
+- [ ] Verification steps 1–4 pass on 3.10, and steps 1–2 on 3.11 and 3.12.
+- [ ] Every mutant below is red, for the reason stated, on all three Pythons.
 
 ## Mutation table
 
-Each mutant was measured on the spiked tree (`mutants.py`: apply one string
-replacement to `manager.py`, run `tests/test_cancel_teardown.py` on 3.10 with
-`-o timeout=60` and a 300 s subprocess cap, restore the file from a saved copy
-in a `finally`). All 15 are red. After the run, `diff manager.py
-manager.spike.py` was empty.
+Each mutant was measured on the round-2 spike (`mutants2.py`: apply one string
+replacement to `manager.py`, run `tests/test_cancel_teardown.py` with the
+target version's own interpreter under `-o timeout=60` and a 300 s cap,
+restore the file from a saved copy in a `finally`). **All 21 are red on
+3.10, 3.11 and 3.12**; red counts are 3.10's (3.11/3.12 add the
+`asyncio.timeout` test where it applies). After each run, `diff manager.py
+manager.spike2.py` was empty.
 
-| # | Rule | Mutant | Red tests (measured) |
+| # | Rule | Mutant | Red tests (3.10) |
 |---|---|---|---|
-| M1 | stdio teardown is scoped | `await self._abort_stdio_handshake(...)` directly | 7: the 4 stdio `[point]` cases, the retry test, the exactly-once test, the structural test |
-| M2 | remote teardown is scoped | `await self._abort_remote_handshake(...)` directly | 4: the 3 remote `[point]` cases, the structural test |
-| M3 | disconnect teardown is scoped | `return await self._finish_disconnect(...)` directly | 4: the 3 disconnect `[point]` cases, the structural test |
-| M4 | `_cleanup_client` is scoped | `await self._cleanup_client_body(...)` directly | 5: the 4 cleanup `[point]` cases, the structural test |
-| M5 | cancel during stdio handshake | handler back to `except Exception` | `test_stdio_cancel_during_handshake_still_tears_down`, the classification test |
-| M6 | cancel during remote handshake | same, remote | `test_remote_cancel_during_handshake_still_tears_down`, the classification test |
-| M7 | cancel during adopt handshake | same, `adopt_process` | `test_adopt_cancel_during_handshake_still_tears_down`, the classification test |
-| M8 | primitive re-raises | `raise caller_cancel` → `return task.result()` | 19: every `[point]` case, retry, exactly-once, 3 helper tests |
-| M9 | primitive keeps waiting | `while not task.done()` → `if not task.done()` (one shield await) | 18: every `[point]` case, retry, exactly-once, 2 helper tests |
-| M10 | completion-step race | remember the cancel only `if not task.done()` | `test_helper_caller_cancel_in_the_completion_step_is_kept` **only**. This is the `task.done()` discriminator the Research summary rejects |
-| M11 | sweep excludes the caller | drop `exclude=` in `_finish_disconnect` | `test_disconnect_server_does_not_cancel_its_own_caller`. Against the real sweep (no guard) this mutant **deadlocks**; the guard is why the test fails instead of hanging |
-| M12 | displaced error is logged | `logger.warning(...)` → `pass` | `test_helper_cancel_wins_over_a_cleanup_error` |
-| M13 | reap only inside the private task | `_shutdown_one`'s read wait → `await _reap_cancelled_child(...)` | the classification test, the structural test |
-| M14 | stdio pop in `finally` | `finally:` → `except BaseException: raise` / `else:` | `test_a_failing_terminate_still_drops_the_stale_client`, the classification test |
-| M15 | remote pop in `finally` | same, remote | `test_a_failing_transport_close_still_drops_the_stale_client`, the classification test |
+| M1 | stdio teardown is scoped | `await self._abort_stdio_handshake(...)` directly | 9 (every stdio point, retry, exactly-once, B1 stdio, structural) |
+| M2 | remote teardown is scoped | `await self._abort_remote_handshake(...)` directly | 6 |
+| M3 | disconnect teardown is scoped | `return await self._finish_disconnect(...)` directly | 5 |
+| M4 | `_cleanup_client` is scoped | `await self._cleanup_client_body(...)` directly | 6 |
+| M5 | cancel during stdio handshake | handler back to `except Exception` | 3 (handshake-cancel, B1 stdio, classification) |
+| M6 | cancel during remote handshake | same, remote | 4 |
+| M7 | cancel during adopt handshake | same, `adopt_process` | 3 |
+| M8 | primitive re-raises | `raise caller_cancel` → `return task.result()` | 25 |
+| M9 | the gate does not wake the caller | `_DeferredCancelGate.cancel` returns `super().cancel(msg)` | 20 -- a woken caller leaves the helper at the first cancel, so every deferred-cancel case fails, and the anyio test |
+| M10 | `pending` is honoured (B1) | `caller_cancel = pending` → `= None` | 4 (the three B1 sites, the B1 retry) |
+| M11 | sweep excludes the caller | drop `exclude=` | `test_disconnect_server_does_not_cancel_its_own_caller` |
+| M12 | displaced error is logged | `logger.warning(...)` → `pass` | 4 (helper test, the three B1 sites) |
+| M13 | logged by type, never by value | `type(displaced).__name__` → `describe_exception(displaced)` | 4 (same tests: the value appears) |
+| M14 | stdio pop in `finally` | `finally:` → `except BaseException: raise` / `else:` | 3 |
+| M15 | remote pop in `finally` | same, remote | 3 |
+| M16 | `_cleanup_client` forwards `pending` | drop `pending=pending` | B1 `[adopt-terminate]` |
+| M17 | `_cleanup_client_body` clears in `finally` | `finally:` → `except BaseException: raise` / `else:` | 2 (B1 adopt, classification) |
+| M18 | last-resort kill (B2) | the two kill statements → `if False:` | `test_loop_shutdown_mid_terminate_still_kills_the_process_tree` |
+| M19 | hurried remote close | `hurry = _TEARDOWN_HURRY.get()` → `hurry = None` | both graceful-close tests (hang guard) |
+| M20 | hurried owner re-cancelled | `await _cancel_until_done(task)` → `await task` | the remote-handshake graceful-close test (hang guard) |
+| M21 | reap only inside the private task | `_shutdown_one`'s read wait → `_reap_cancelled_child` | classification, structural |
 
-The implementer re-runs the same 15 on the final tree, restoring from a saved
-copy (never `git checkout --`), and confirms `git diff --stat` matches the
-pre-mutation state. Mutants were measured on 3.10 only; the module itself is
-green on 3.11 and 3.12 and red on main on all three.
+The implementer re-runs all 21 on the final tree with `mutants2.py`'s
+`finally`-restore (never `git checkout --`).
 
 ## Non-goals
 
-- **`disconnect_all`'s bookkeeping after a cancel.** A cancel absorbed in
-  `_shutdown_one` is re-raised by the `gather` (measured, row 6), and the
-  dict clears after the gather are then skipped. Shielding `disconnect_all`
-  the same way would defeat the shutdown budget: `server.py:1017` wraps it in
-  `asyncio.wait_for(..., timeout=10.0)`, and `wait_for` waits out an inner
-  that defers its cancel. At shutdown the process exits anyway. If a
-  non-shutdown caller of a cancelled `disconnect_all` ever matters, that is
-  its own issue.
-- **`_own_remote_transport` forwarding its own pre-handoff cancel into
-  `ready`** (row 10). A sweep that cancels only the owner hands the connect
-  caller a `CancelledError` it did not receive. In practice the same sweep
-  cancels the connect task too, and nothing here is absorbed. Not this class.
-- **Task roots** (rows 14–17): they absorb their own cancel and end; no caller
-  runs on.
-- **Bounding the child reaps.** Design decision 6.
-- **Propagate-early sites outside the five** (`handlers.py:3409`'s
-  `_terminate_process_tree` after a cancel can itself be cancelled again):
-  they propagate rather than absorb, and the probe they would need is a
-  second cancel during process reaping. Not observed; not in scope.
+- **`disconnect_all`'s bookkeeping after a cancel.** Unchanged from round 1:
+  shielding it would defeat `server.py:1017`'s 10 s shutdown budget.
+- **`_own_remote_transport` forwarding its own pre-handoff cancel** (row 10).
+- **Task roots** (rows 14–17).
+- **Bounding the child reaps** (Design decision 6).
+- **anyio's own delivery spin** (Design decision 10).
+- **Skipping stdio's SIGTERM grace for a cancelled caller** (Design decision 6).
+- **The auto-reconnect revival** (Design decision 11; a follow-up issue).
+- **A remote transport left open by loop shutdown.** Shutdown cancels the
+  private task inside `_close_remote_transport`, whose caller-cancel branch
+  escalates to the owner, which shutdown cancels as well; sockets close with
+  the loop. Only process trees outlive a loop, which is why Design decision 9
+  covers terminate only.
 
 ## Unverified
 
-- **A real downstream process.** All probes use fakes for the process and the
-  transport; `_terminate_process_tree`'s 5 s + 3 s bound is read from the
-  code, not measured under a cancelled caller.
-- **The full suite on the final spike.** Step 3's 30-module run (1193 passed)
-  was before the last two helper refinements (logging the displaced error,
-  naming the task). After them, the new module plus the two client-manager
-  suites were re-run on 3.10/3.11/3.12 (305/306/306 passed). Verification
-  step 5 runs the full suite once.
-- **Mutants on 3.11/3.12.** Measured on 3.10 only.
+- **Python 3.13+.** The gate relies on `Task.cancel` calling the waiter's
+  `cancel()` and falling back to `_must_cancel`; that was measured on 3.10,
+  3.11 and 3.12 only.
+- **A real remote transport under the hurried close.** Measured with a fake
+  transport whose `__aexit__` blocks until cancelled.
+- **The 11 s terminate bound under a cancelled caller.** Read from the code;
+  the shutdown test uses a real SIGTERM-ignoring server but measures that the
+  tree dies, not the time.
 
 ## Execution Policy
 
 - execute: effort=medium.
-- reason: one file of source (`manager.py`, about 216/100 lines, mostly moved
-  code), but on the connection lifecycle that every server uses, with a
-  deadlock available to a one-line mistake (M11). Small surface, sharp edges.
-- Re-run the mutation table, verification steps 1–4 on all three Pythons, ruff
-  and mypy before requesting review.
+- reason: one file of source (`manager.py`, about 404/140 lines, much of it
+  moved), on the connection lifecycle every server uses; one-line mistakes
+  here are a deadlock (M11), a lost cancel (M10) or an orphaned process
+  (M18). Small surface, sharp edges.
+- Re-run the mutation table on all three Pythons, verification steps 1–3,
+  ruff and mypy before requesting review.
 - Get a cross-vendor panel CR before merge, as for every PR to main.
 
 ## Verbatim bodies
@@ -613,17 +702,25 @@ green on 3.11 and 3.12 and red on main on all three.
 1. Save the source patch below (between the ```` fences) to `324-src.patch`,
    then run `git apply 324-src.patch` on `89559db`.
 2. Write the test module below to `tests/test_cancel_teardown.py`.
-3. Edit `_cleanup_client`'s docstring sentence (Design decision 7) and add the
-   `CHANGELOG.md` bullet by hand.
+3. Add the `CHANGELOG.md` bullet by hand (the `_cleanup_client` docstring is
+   in the patch).
 
 ### Patch — `src/pmcp/client/manager.py`
 
 ````diff
 diff --git a/src/pmcp/client/manager.py b/src/pmcp/client/manager.py
-index 57a563e..f15acab 100644
+index 57a563e..9f8b959 100644
 --- a/src/pmcp/client/manager.py
 +++ b/src/pmcp/client/manager.py
-@@ -15,7 +15,7 @@ import traceback
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import contextvars
+ from contextlib import AsyncExitStack
+ import json
+ import logging
+@@ -15,7 +16,7 @@ import traceback
  import string
  import time
  from collections import deque
@@ -632,14 +729,51 @@ index 57a563e..f15acab 100644
  from dataclasses import dataclass, field
  from types import ModuleType
  from typing import Any, Iterator, TypeVar
-@@ -143,6 +143,95 @@ def describe_exception(exc: BaseException) -> str:
+@@ -143,6 +144,187 @@ def describe_exception(exc: BaseException) -> str:
  
  
  _TaskT = TypeVar("_TaskT", bound=asyncio.Task[Any])
 +_T = TypeVar("_T")
++# How often a hurried remote close re-cancels a transport owner that has not
++# ended (`_cancel_until_done`).
++_HURRY_RECANCEL_S = 0.5
 +
 +
-+async def _finish_then_reraise_cancel(cleanup: Awaitable[_T]) -> _T:
++class _DeferredCancelGate(asyncio.Future[None]):
++    """The future a caller parks on while its teardown runs.
++
++    ``Task.cancel()`` on a task parked on a future first calls that future's
++    ``cancel()``; when it returns False the task only sets its own
++    ``_must_cancel`` flag and stays parked, and asyncio throws the
++    ``CancelledError`` into it once, when the future resolves. So the caller
++    is not woken by a cancel at all: one request or a thousand (anyio
++    re-delivers a scope's cancel on every loop iteration) cost no wake-up and
++    are delivered exactly once, after the teardown. That is what keeps a
++    cancelled caller off the CPU for the whole teardown (Consiliency/pmcp#324,
++    round 2). Each request is reported through ``on_cancel`` so the teardown
++    can hurry.
++    """
++
++    def __init__(self, on_cancel: Callable[[], None]) -> None:
++        super().__init__(loop=asyncio.get_running_loop())
++        self._on_cancel = on_cancel
++
++    def cancel(self, msg: Any | None = None) -> bool:
++        self._on_cancel()
++        return False
++
++
++# Set inside a teardown's private task: an Event that is set once the caller
++# has asked to be cancelled. `_close_remote_transport` skips its graceful wait
++# when it is set (Consiliency/pmcp#324, round 2).
++_TEARDOWN_HURRY: contextvars.ContextVar[asyncio.Event | None] = contextvars.ContextVar(
++    "pmcp_teardown_hurry", default=None
++)
++
++
++async def _finish_then_reraise_cancel(
++    cleanup: Awaitable[_T], *, pending: asyncio.CancelledError | None = None
++) -> _T:
 +    """Run ``cleanup`` to completion even if the calling task is cancelled
 +    while it runs, then re-raise that cancellation (Consiliency/pmcp#324).
 +
@@ -649,46 +783,58 @@ index 57a563e..f15acab 100644
 +    from the caller's, so a cancelled caller ran on. Re-raising at the await
 +    instead would skip the process-tree termination, transport close and
 +    ``_clients`` removal that follow. So the teardown runs in a private task
-+    that nobody else holds a reference to, and the caller waits on it
-+    through a shield:
++    nobody else holds, and the caller parks on a `_DeferredCancelGate` that
++    resolves when the private task is done:
 +
-+    * a ``CancelledError`` out of the shield while the private task is still
-+      running can only be the caller's -- remember it and keep waiting;
-+    * one that arrives in the same loop iteration the private task finishes
-+      is also the caller's (the private task was not cancelled), which is
-+      the race a ``task.done()`` check alone gets wrong;
-+    * the remembered cancellation is re-raised exactly once, after the
-+      teardown, and wins over a teardown error.
++    * a cancel of the caller does not wake it; asyncio throws it in once,
++      when the gate resolves -- also when it arrives in the same loop
++      iteration the teardown finishes;
++    * ``pending`` is a cancellation the caller already caught before calling
++      (a handshake handler that caught ``CancelledError``): it is re-raised
++      after the teardown, exactly like one that arrives during it;
++    * a caller cancellation wins over a teardown error; the displaced error
++      is logged by type only (no value) and never re-raised.
 +
-+    Python 3.10 has no ``Task.cancelling()``/``uncancel()``, so this does
-+    not count cancellations; it never calls ``uncancel()`` either, so on
-+    3.11+ the caller's cancel count is left exactly as the canceller set it
-+    and ``asyncio.timeout()`` still converts its own cancel to
-+    ``TimeoutError``.
++    Never calls ``uncancel()``, so on 3.11+ the caller's cancel count is left
++    as the canceller set it and ``asyncio.timeout()`` still converts its own
++    cancel to ``TimeoutError``. Works the same on 3.10, which has no
++    ``cancelling()``.
 +    """
-+    task = asyncio.ensure_future(cleanup)
++    hurry = asyncio.Event()
++    if pending is not None:
++        hurry.set()
++
++    async def run() -> _T:
++        _TEARDOWN_HURRY.set(hurry)  # this task's own context copy only
++        return await cleanup
++
++    task = asyncio.ensure_future(run())
 +    # Named so the 60 s async watchdog (tests/runtime/_hang_watchdog.py) can
 +    # say which teardown a hang is parked in.
 +    task.set_name(f"pmcp-teardown:{getattr(cleanup, '__qualname__', 'cleanup')}")
-+    caller_cancel: asyncio.CancelledError | None = None
-+    while not task.done():
-+        try:
-+            await asyncio.shield(task)
-+        except asyncio.CancelledError as exc:
-+            # Deferred, not absorbed: re-raised below once `task` is done.
-+            if caller_cancel is None:
-+                caller_cancel = exc
-+        except Exception:
-+            pass  # the teardown's own failure; read from `task` below
++    gate = _DeferredCancelGate(hurry.set)
++
++    def _release(_task: asyncio.Future[_T]) -> None:
++        if not gate.done():
++            gate.set_result(None)
++
++    task.add_done_callback(_release)
++    caller_cancel = pending
++    try:
++        await gate
++    except asyncio.CancelledError as exc:
++        # Deferred, not absorbed: thrown in once the gate resolved, i.e.
++        # after the teardown. Re-raised below.
++        if caller_cancel is None:
++            caller_cancel = exc
 +    if caller_cancel is not None:
 +        displaced = None if task.cancelled() else task.exception()
 +        if displaced is not None:
-+            # The caller's cancellation wins, but the teardown failure it
-+            # displaces is logged rather than dropped (the
-+            # `_close_remote_transport` precedent).
++            # The cancellation wins; the failure it displaces is logged, by
++            # type only, rather than dropped.
 +            logger.warning(
-+                f"teardown error displaced by the caller's cancellation: "
-+                f"{describe_exception(displaced)}"
++                "teardown error displaced by the caller's cancellation: "
++                f"{type(displaced).__name__}"
 +            )
 +        raise caller_cancel
 +    return task.result()
@@ -718,6 +864,49 @@ index 57a563e..f15acab 100644
 +        pass
 +
 +
++async def _wait_unless_hurried(
++    task: asyncio.Task[Any], hurry: asyncio.Event, timeout: float
++) -> None:
++    """`wait_for(shield(task), timeout)`, except that it raises
++    `asyncio.TimeoutError` as soon as ``hurry`` is set. Never cancels
++    ``task``; its outcome is re-raised as the shield would."""
++    if not hurry.is_set():
++        waiter = asyncio.ensure_future(hurry.wait())
++        try:
++            await asyncio.wait(
++                {task, waiter}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
++            )
++        finally:
++            waiter.cancel()
++    if not task.done():
++        raise asyncio.TimeoutError
++    task.result()
++
++
++async def _cancel_until_done(
++    task: asyncio.Task[Any], *, interval: float = _HURRY_RECANCEL_S
++) -> None:
++    """Await a task already cancelled, re-cancelling it every ``interval``
++    until it ends; re-raise its outcome.
++
++    The hurried close cancels the owner before it has started to unwind, so
++    the owner may enter its transport's ``__aexit__`` with that cancellation
++    already consumed; an exit that then blocks (a dead peer) would otherwise
++    hang. The graceful path never has this problem, because it cancels an
++    owner that is already inside ``__aexit__``."""
++    while not task.done():
++        await asyncio.wait({task}, timeout=interval)
++        if not task.done():
++            task.cancel()
++    task.result()
++
++
++def _caught_cancel(exc: BaseException) -> asyncio.CancelledError | None:
++    """The cancellation a handshake handler caught, to hand to
++    `_finish_then_reraise_cancel` as ``pending``; None for an ordinary error."""
++    return exc if isinstance(exc, asyncio.CancelledError) else None
++
++
 +def _handshake_error(exc: BaseException) -> str:
 +    """`last_error` for a failed handshake. A cancellation renders as an
 +    empty string through `describe_exception`, so name it."""
@@ -728,7 +917,93 @@ index 57a563e..f15acab 100644
  
  # The three catalog kinds, in the order reconciliation fetches and applies them.
  # Iterating this rather than three hand-written branches is what keeps
-@@ -1390,71 +1479,85 @@ class ClientManager:
+@@ -309,39 +491,55 @@ async def _terminate_process_tree(
+ 
+     _signal(kill=False)
+     try:
+-        await asyncio.wait_for(process.wait(), timeout=5.0)
+-        leader_exited = True
+-    except asyncio.TimeoutError:
+-        leader_exited = False
+-
+-    # If the leader is still alive, SIGKILL it (and, when it leads a group, the
+-    # whole group). The leader exiting is NOT sufficient: a grandchild (e.g. a
+-    # SIGTERM-ignoring browser) can outlive the leader inside the group and keep
+-    # the profile SingletonLock — so we still escalate to a group SIGKILL below.
+-    if not leader_exited:
+-        _signal(kill=True)
+         try:
+-            await asyncio.wait_for(process.wait(), timeout=3.0)
++            await asyncio.wait_for(process.wait(), timeout=5.0)
++            leader_exited = True
+         except asyncio.TimeoutError:
+-            logger.warning(
+-                f"[{name}] Process PID={process.pid} did not exit after SIGKILL "
+-                "(possible D-state / uninterruptible I/O wait)"
+-            )
++            leader_exited = False
++
++        # If the leader is still alive, SIGKILL it (and, when it leads a group, the
++        # whole group). The leader exiting is NOT sufficient: a grandchild (e.g. a
++        # SIGTERM-ignoring browser) can outlive the leader inside the group and keep
++        # the profile SingletonLock — so we still escalate to a group SIGKILL below.
++        if not leader_exited:
++            _signal(kill=True)
++            try:
++                await asyncio.wait_for(process.wait(), timeout=3.0)
++            except asyncio.TimeoutError:
++                logger.warning(
++                    f"[{name}] Process PID={process.pid} did not exit after SIGKILL "
++                    "(possible D-state / uninterruptible I/O wait)"
++                )
+ 
+-    if _group_alive():
+-        try:
+-            os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
+-        except (ProcessLookupError, PermissionError, OSError):
+-            pass
+-        for _ in range(30):  # up to ~3s for the OS to reap the group
+-            if not _group_alive():
+-                break
+-            await asyncio.sleep(0.1)
+-        else:
+-            logger.warning(
+-                f"[{name}] process group {group_pgid} survived SIGKILL "
+-                "(possible orphaned grandchild / D-state)"
+-            )
++        if _group_alive():
++            try:
++                os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
++            except (ProcessLookupError, PermissionError, OSError):
++                pass
++            for _ in range(30):  # up to ~3s for the OS to reap the group
++                if not _group_alive():
++                    break
++                await asyncio.sleep(0.1)
++            else:
++                logger.warning(
++                    f"[{name}] process group {group_pgid} survived SIGKILL "
++                    "(possible orphaned grandchild / D-state)"
++                )
++    except asyncio.CancelledError:
++        # Last resort, synchronous, cannot be skipped: whoever cancelled this
++        # wait -- a caller, or loop shutdown cancelling every task
++        # (`asyncio.run` -> `_cancel_all_tasks`) -- the tree is SIGKILLed
++        # before the cancellation propagates. Without this a SIGTERM-ignoring
++        # server outlived shutdown with `returncode=None`
++        # (Consiliency/pmcp#324, round 2).
++        if process.returncode is None:  # never signal a reaped (reusable) pid
++            _signal(kill=True)
++        if _group_alive():
++            try:
++                os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
++            except (ProcessLookupError, PermissionError, OSError):
++                pass
++        raise
+ 
+ 
+ # Heartbeat thresholds for health monitoring
+@@ -1390,71 +1588,85 @@ class ClientManager:
                      status.pending_request_count = 0
                  return (True, cancelled, None)
  
@@ -876,7 +1151,7 @@ index 57a563e..f15acab 100644
  
      async def restart_server(
          self, config: ResolvedServerConfig, force: bool = False
-@@ -2458,26 +2561,38 @@ class ClientManager:
+@@ -2458,26 +2670,42 @@ class ClientManager:
                  f"{resource_count} resources, {prompt_count} prompts indexed"
              )
  
@@ -895,8 +1170,12 @@ index 57a563e..f15acab 100644
 -                    except (asyncio.CancelledError, Exception):
 -                        pass
 +            status.last_error = _handshake_error(e)
++            # `pending`: a cancel caught here must survive a teardown that
++            # raises -- the helper re-raises it after the teardown, whatever
++            # the teardown ends with (round 2).
 +            await _finish_then_reraise_cancel(
-+                self._abort_stdio_handshake(name, managed, process)
++                self._abort_stdio_handshake(name, managed, process),
++                pending=_caught_cancel(e),
 +            )
 +            raise
 +
@@ -925,7 +1204,48 @@ index 57a563e..f15acab 100644
  
      async def _connect_sse(self, config: ResolvedServerConfig) -> None:
          """Connect to a remote SSE MCP server."""
-@@ -2786,23 +2901,28 @@ class ClientManager:
+@@ -2622,8 +2850,15 @@ class ClientManager:
+                 if exc is not None:
+                     raise exc
+             return
++        # Inside a teardown whose caller has been cancelled, skip the graceful
++        # wait and escalate at once: a cancelled caller must not wait out the
++        # 5 s budget (Consiliency/pmcp#324, round 2).
++        hurry = _TEARDOWN_HURRY.get()
+         try:
+-            await asyncio.wait_for(asyncio.shield(task), timeout)
++            if hurry is None:
++                await asyncio.wait_for(asyncio.shield(task), timeout)
++            else:
++                await _wait_unless_hurried(task, hurry, timeout)
+         except asyncio.TimeoutError:
+             # The 5s budget bounds this graceful wait only, not the
+             # escalation below: awaiting the cancelled owner is itself
+@@ -2635,12 +2870,19 @@ class ClientManager:
+             # failure surfacing *while* the owner unwinds under our cancel
+             # must still propagate, so only the CancelledError our own
+             # cancel() causes is swallowed below.
+-            logger.warning(
+-                f"[{name}] remote transport did not close within {timeout}s; cancelling"
+-            )
++            if hurry is not None and hurry.is_set():
++                logger.info(f"[{name}] caller cancelled; closing remote transport now")
++            else:
++                logger.warning(
++                    f"[{name}] remote transport did not close within {timeout}s; "
++                    "cancelling"
++                )
+             task.cancel()
+             try:
+-                await task
++                if hurry is not None and hurry.is_set():
++                    await _cancel_until_done(task)
++                else:
++                    await task
+             except asyncio.CancelledError:
+                 pass
+         except asyncio.CancelledError:
+@@ -2786,23 +3028,29 @@ class ClientManager:
                  f"{resource_count} resources, {prompt_count} prompts indexed"
              )
  
@@ -942,7 +1262,8 @@ index 57a563e..f15acab 100644
 -                    pass
 +            status.last_error = _handshake_error(e)
 +            await _finish_then_reraise_cancel(
-+                self._abort_remote_handshake(name, managed)
++                self._abort_remote_handshake(name, managed),
++                pending=_caught_cancel(e),
 +            )
 +            raise
 +
@@ -963,7 +1284,7 @@ index 57a563e..f15acab 100644
  
      async def _read_stderr(self, name: str, stderr: asyncio.StreamReader) -> None:
          """Read stderr from a server process."""
-@@ -3258,16 +3378,10 @@ class ClientManager:
+@@ -3258,16 +3506,10 @@ class ClientManager:
          writer = managed.outbound_writer
          managed.outbound = None
          managed.outbound_writer = None
@@ -984,11 +1305,38 @@ index 57a563e..f15acab 100644
  
      async def _drain_outbound(self, managed: ManagedClient) -> None:
          """The one writer task per client: drain the bounded outbound queue.
-@@ -3665,13 +3779,14 @@ class ClientManager:
+@@ -3649,11 +3891,21 @@ class ClientManager:
+         if had_prompts:
+             self._catalog_events.note_prompts_changed()
+ 
+-    async def _cleanup_client(self, name: str, managed: ManagedClient) -> None:
++    async def _cleanup_client(
++        self,
++        name: str,
++        managed: ManagedClient,
++        *,
++        pending: asyncio.CancelledError | None = None,
++    ) -> None:
+         """Cancel a client's read task, kill its process, and remove it from registries.
+ 
+-        Safe to call on any managed client regardless of state. All exceptions are
+-        suppressed so callers always complete successfully.
++        Safe to call on any managed client regardless of state. A remote
++        close failure is logged and suppressed; a terminate failure propagates
++        after the registries are cleared. A cancellation of the caller --
++        one that arrives during the teardown, or one the caller already caught
++        and passes as ``pending`` -- is re-raised after the whole teardown
++        (Consiliency/pmcp#324).
+ 
+         Cancels only *this* client's own read/stderr tasks — not every background
+         task scoped to the server name. A reconnect runs its connect inside a task
+@@ -3665,13 +3917,16 @@ class ClientManager:
          # `while True` writer is not a background-task sweep target on this path
          # (`_cleanup_client` deliberately does NOT call `_cancel_background_tasks`),
          # so without this it leaked one writer task per reconnect generation.
-+        await _finish_then_reraise_cancel(self._cleanup_client_body(name, managed))
++        await _finish_then_reraise_cancel(
++            self._cleanup_client_body(name, managed), pending=pending
++        )
 +
 +    async def _cleanup_client_body(self, name: str, managed: ManagedClient) -> None:
 +        """`_cleanup_client`'s teardown. Runs only under
@@ -1005,7 +1353,24 @@ index 57a563e..f15acab 100644
          # Reset the outbound path so nothing survives onto a next generation.
          # The writer was cancelled above, but the Queue -- and any reply /
          # notifications/cancelled frames the dead connection left buffered,
-@@ -3814,9 +3929,10 @@ class ClientManager:
+@@ -3704,7 +3959,15 @@ class ClientManager:
+                     f"[{name}] Error closing remote transport: {describe_exception(e)}"
+                 )
+         else:
+-            await _terminate_process_tree(managed.process, name)
++            try:
++                await _terminate_process_tree(managed.process, name)
++            finally:
++                # In a `finally`, as in the handshake bodies: a terminate
++                # that raises must not leave the entry behind (#324 round 2).
++                self._clients.pop(name, None)
++                self._servers.pop(name, None)
++                self._remove_server_indexes(name)
++            return
+         self._clients.pop(name, None)
+         self._servers.pop(name, None)
+         self._remove_server_indexes(name)
+@@ -3814,10 +4077,11 @@ class ClientManager:
  
              logger.info(f"Adopted {name}: {indexed} tools indexed")
  
@@ -1014,10 +1379,12 @@ index 57a563e..f15acab 100644
 +            # CancelledError too, as in `_connect_stdio` (Consiliency/pmcp#324).
              status.status = ServerStatusEnum.ERROR
 -            status.last_error = describe_exception(e)
+-            await self._cleanup_client(name, managed)
 +            status.last_error = _handshake_error(e)
-             await self._cleanup_client(name, managed)
++            await self._cleanup_client(name, managed, pending=_caught_cancel(e))
              raise
  
+     async def call_tool(
 ````
 
 ### File — `tests/test_cancel_teardown.py`
@@ -1507,8 +1874,8 @@ async def test_helper_returns_the_cleanup_result_and_raises_its_error() -> None:
 async def test_helper_cancel_wins_over_a_cleanup_error(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The cancel is re-raised; the teardown error it displaces is logged,
-    not dropped (the `_close_remote_transport` precedent)."""
+    """The cancel is re-raised; the teardown error it displaces is logged by
+    type, never by value, and not dropped."""
     helper = _helper()
     gate = _Gate()
 
@@ -1522,7 +1889,8 @@ async def test_helper_cancel_wins_over_a_cleanup_error(
         await _cancel_while_parked(task, gate)
         kind, _ = await _outcome(task)
     assert kind == "cancelled"
-    assert "cleanup failed" in caplog.text, caplog.text
+    assert "teardown error displaced" in caplog.text and "ValueError" in caplog.text
+    assert "cleanup failed" not in caplog.text, "the displaced error's value was logged"
 
 
 async def test_helper_caller_cancel_in_the_completion_step_is_kept() -> None:
@@ -1645,6 +2013,336 @@ async def test_adopt_cancel_during_handshake_still_tears_down() -> None:
     assert "srv" not in mgr._clients
 
 
+# --- round 2: a cancel caught in the handshake survives a failing teardown ----
+
+
+def _adopt_task(mgr: ClientManager, gate: _Gate) -> asyncio.Task[None]:
+    process = MagicMock()
+    process.returncode = None
+    process.stderr = None
+
+    async def _read_stdout(name: str, managed: ManagedClient) -> None:
+        await asyncio.Event().wait()
+
+    mgr._read_stdout = _read_stdout  # type: ignore[method-assign]
+    mgr._send_initialize = _parking_handshake(gate)  # type: ignore[method-assign]
+    return asyncio.create_task(mgr.adopt_process("srv", process, _stdio_config()))
+
+
+@pytest.mark.parametrize("site", ["stdio-terminate", "remote-close", "adopt-terminate"])
+async def test_a_cancel_caught_in_the_handshake_survives_a_failing_teardown(
+    site: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round-1 B1 (claude and codex): the handler caught the CancelledError
+    before entering the helper, so a teardown that raised replaced it and the
+    cancel was lost. `pending=` hands it to the helper."""
+    mgr = ClientManager()
+    gate, record = _Gate(), []
+    failing = AsyncMock(side_effect=OSError("secret-ish detail"))
+    with caplog.at_level("WARNING", logger="pmcp.client.manager"):
+        if site == "remote-close":
+            task = await _remote_handshake_failure(mgr, None, gate, record)
+            mgr._send_initialize = _parking_handshake(gate)  # type: ignore[method-assign]
+            mgr._close_remote_transport = failing  # type: ignore[method-assign]
+            await _cancel_while_parked(task, gate)
+            kind, detail = await _outcome(task)
+            for t in list(mgr._background_tasks):
+                t.cancel()
+            await asyncio.gather(*mgr._background_tasks, return_exceptions=True)
+        else:
+            with patch("pmcp.client.manager._terminate_process_tree", failing):
+                if site == "stdio-terminate":
+                    spawn, _term = _stdio_harness(mgr, None, gate, record)
+                    mgr._send_initialize = _parking_handshake(gate)  # type: ignore[method-assign]
+                    with spawn:
+                        task = asyncio.create_task(mgr._connect_stdio(_stdio_config()))
+                        await _cancel_while_parked(task, gate)
+                        kind, detail = await _outcome(task)
+                else:
+                    task = _adopt_task(mgr, gate)
+                    await _cancel_while_parked(task, gate)
+                    kind, detail = await _outcome(task)
+
+    assert kind == "cancelled", f"{site}: the cancel was lost: {kind} {detail!r}"
+    assert failing.await_count == 1
+    assert "teardown error displaced" in caplog.text and "OSError" in caplog.text
+    assert "secret-ish detail" not in caplog.text
+    name = "remote" if site == "remote-close" else "srv"
+    assert name not in mgr._clients
+
+
+async def test_a_cancel_caught_in_the_handshake_is_not_retried_after_a_failing_teardown() -> (
+    None
+):
+    mgr = ClientManager()
+    gate, record = _Gate(), []
+    spawn, _term = _stdio_harness(mgr, None, gate, record)
+    mgr._send_initialize = _parking_handshake(gate)  # type: ignore[method-assign]
+    attempts = 0
+    real_connect = mgr._connect_server
+
+    async def _counting(config: ResolvedServerConfig) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts > 1:
+            raise RuntimeError("second attempt started")
+        await real_connect(config)
+
+    mgr._connect_server = _counting  # type: ignore[method-assign]
+    with (
+        spawn,
+        patch(
+            "pmcp.client.manager._terminate_process_tree",
+            AsyncMock(side_effect=OSError("kill failed")),
+        ),
+        patch.object(manager_mod, "RETRY_DELAYS", [0.0, 0.0, 0.0]),
+    ):
+        task = asyncio.create_task(mgr._connect_with_retry(_stdio_config()))
+        await _cancel_while_parked(task, gate)
+        kind, detail = await _outcome(task)
+
+    assert (kind, attempts) == ("cancelled", 1), (
+        f"{kind} {detail!r} attempts={attempts}"
+    )
+
+
+# --- round 2: anyio re-delivers a scope's cancel every iteration ---------------
+
+
+async def test_a_cancel_scope_does_not_wake_the_caller_during_the_teardown() -> None:
+    """Round-1 F2: anyio re-delivers a cancelled scope's cancel on every loop
+    iteration, and the round-1 helper woke and re-awaited a fresh shield each
+    time (measured ~62,500 wake-ups in 0.3 s). The gate's `cancel()` returns
+    False, so the caller stays parked on ONE waiter for the whole teardown
+    and the cancel is thrown in once at the end."""
+    import anyio
+
+    helper = _helper()
+    release = asyncio.Event()
+    holder: dict[str, Any] = {}
+
+    async def cleanup() -> str:
+        await release.wait()
+        return "done"
+
+    async def caller() -> bool:
+        with anyio.CancelScope() as scope:
+            holder["scope"] = scope
+            await helper(cleanup())
+        return scope.cancelled_caught
+
+    task = asyncio.create_task(caller())
+    while "scope" not in holder or task._fut_waiter is None:  # type: ignore[attr-defined]
+        await asyncio.sleep(0)
+    holder["scope"].cancel()
+    waiters = []
+    for _ in range(200):  # 200 loop iterations: 200 anyio re-deliveries
+        await asyncio.sleep(0)
+        waiters.append(task._fut_waiter)  # type: ignore[attr-defined]
+    release.set()
+    kind, value = await _outcome(task)
+
+    assert (kind, value) == ("returned", True)
+    assert all(w is waiters[0] for w in waiters), (
+        f"the caller woke during the teardown: {len({id(w) for w in waiters})} waiters"
+    )
+
+
+# --- round 2: a cancelled caller does not wait out the graceful remote close --
+
+
+class _HangingExit:
+    """A transport whose `__aexit__` never returns unless cancelled."""
+
+    def __init__(self) -> None:
+        self.exit_entered = asyncio.Event()
+        self.exit_cancelled = False
+        self.release = asyncio.Event()  # test cleanup only, never the code
+
+    async def __aenter__(self) -> tuple[Any, Any]:
+        return (MagicMock(), MagicMock())
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        self.exit_entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.exit_cancelled = True
+            raise
+
+
+async def _release_owner(mgr: ClientManager, transport: _HangingExit) -> None:
+    """Let a hung owner finish, so a failing run (main, or a mutant) cannot
+    hang the loop's own teardown after the test."""
+    transport.release.set()
+    for t in list(mgr._background_tasks):
+        t.cancel()
+    await asyncio.wait_for(
+        asyncio.gather(*mgr._background_tasks, return_exceptions=True), _HANG_GUARD_S
+    )
+
+
+def _no_graceful_budget(mgr: ClientManager) -> None:
+    """Make the graceful phase effectively unbounded, so a run that waits it
+    out hits the hang guard instead of passing slowly."""
+    real = mgr._close_remote_transport
+
+    async def _close(name: str, managed: ManagedClient, timeout: float = 5.0) -> None:
+        await real(name, managed, 3600.0)
+
+    mgr._close_remote_transport = _close  # type: ignore[method-assign]
+
+
+async def test_a_cancelled_disconnect_skips_the_graceful_remote_close() -> None:
+    mgr = ClientManager()
+    transport = _HangingExit()
+
+    async def _read_sse(name: str, managed: ManagedClient, read_stream: Any) -> None:
+        await asyncio.Event().wait()
+
+    mgr._read_sse = _read_sse  # type: ignore[method-assign]
+    mgr._send_initialize = AsyncMock()  # type: ignore[method-assign]
+    mgr._index_capabilities = AsyncMock(return_value=(0, 0, 0))  # type: ignore[method-assign]
+    _no_graceful_budget(mgr)
+    await asyncio.wait_for(
+        mgr._connect_remote_stream(_remote_config(), transport, transport_name="t"),
+        _HANG_GUARD_S,
+    )
+    task = asyncio.create_task(mgr.disconnect_server("remote", force=True))
+    try:
+        await asyncio.wait_for(transport.exit_entered.wait(), _HANG_GUARD_S)
+        task.cancel()
+        kind, detail = await _outcome(task)
+    finally:
+        await _release_owner(mgr, transport)
+
+    assert kind == "cancelled", f"{kind} {detail!r}"
+    assert transport.exit_cancelled, "the owner was not escalated"
+    assert "remote" not in mgr._clients
+
+
+async def test_a_cancel_caught_in_the_remote_handshake_skips_the_graceful_close() -> (
+    None
+):
+    mgr = ClientManager()
+    gate = _Gate()
+    transport = _HangingExit()
+
+    async def _read_sse(name: str, managed: ManagedClient, read_stream: Any) -> None:
+        await asyncio.Event().wait()
+
+    mgr._read_sse = _read_sse  # type: ignore[method-assign]
+    mgr._send_initialize = _parking_handshake(gate)  # type: ignore[method-assign]
+    _no_graceful_budget(mgr)
+    task = asyncio.create_task(
+        mgr._connect_remote_stream(_remote_config(), transport, transport_name="t")
+    )
+    try:
+        await _cancel_while_parked(task, gate)
+        kind, detail = await _outcome(task)
+    finally:
+        await _release_owner(mgr, transport)
+
+    assert kind == "cancelled", f"{kind} {detail!r}"
+    assert transport.exit_cancelled
+    assert "remote" not in mgr._clients
+
+
+# --- round 2: loop shutdown still kills the process tree -----------------------
+
+_SHUTDOWN_SCRIPT = r"""
+import asyncio, os, sys
+from pmcp.client import manager as m
+from pmcp.client.manager import ClientManager
+from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+
+pidfile = sys.argv[1]
+child = (
+    "import os, signal, subprocess, sys, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "g = subprocess.Popen(['sleep', '300'])\n"
+    "open(sys.argv[1], 'w').write(f'{os.getpid()} {g.pid}')\n"
+    "time.sleep(300)\n"
+)
+
+async def main():
+    parked = asyncio.Event()
+    real = m._terminate_process_tree
+
+    async def term(process, name):
+        parked.set()
+        await real(process, name)
+
+    m._terminate_process_tree = term
+    mgr = ClientManager()
+
+    async def handshake(managed):
+        while not (os.path.exists(pidfile) and open(pidfile).read().strip()):
+            await asyncio.sleep(0.01)
+        raise RuntimeError("handshake failed")
+
+    mgr._send_initialize = handshake
+    cfg = ResolvedServerConfig(
+        name="srv", source="project",
+        config=LocalMcpServerConfig(command=sys.executable, args=["-c", child, pidfile]),
+    )
+    asyncio.ensure_future(mgr._connect_stdio(cfg))
+    await asyncio.wait_for(parked.wait(), 20)
+    for _ in range(3):
+        await asyncio.sleep(0)  # SIGTERM sent (ignored); terminate parked on its wait
+    # main returns: asyncio.run cancels every task still pending, the teardown too
+
+asyncio.run(main())
+print("shutdown-complete", flush=True)
+"""
+
+
+def test_loop_shutdown_mid_terminate_still_kills_the_process_tree(
+    tmp_path: Path,
+) -> None:
+    """Round-1 B2 (codex): `asyncio.run`'s shutdown cancels every task, the
+    private teardown task included, while `_terminate_process_tree` waits on a
+    SIGTERM-ignoring server. On main and on the round-1 patch the tree
+    outlived the loop (`returncode=None`). The cancellation now SIGKILLs the
+    tree synchronously before it propagates."""
+    import os
+    import signal
+    import subprocess
+
+    from tests._timing import eventually_sync
+
+    pidfile = tmp_path / "pids"
+    result = subprocess.run(
+        [sys.executable, "-c", _SHUTDOWN_SCRIPT, str(pidfile)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert "shutdown-complete" in result.stdout, result.stderr[-2000:]
+    leader, grandchild = (int(x) for x in pidfile.read_text().split())
+
+    def gone(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        return False
+
+    try:
+        eventually_sync(
+            lambda: gone(leader) and gone(grandchild),
+            timeout=5.0,
+            interval=0.05,
+            message=f"process tree outlived shutdown: leader={leader} grandchild={grandchild}",
+        )
+    finally:
+        for pid in (leader, grandchild):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 # --- the sites that stay as they are ---------------------------------------------
 
 
@@ -1760,6 +2458,10 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         "re-raise",
     ),
     ("client/manager.py", "ClientManager._send_request", "reraises"): (1, "re-raise"),
+    ("client/manager.py", "_terminate_process_tree", "reraises"): (
+        1,
+        "the tree's own cancel: SIGKILLs synchronously, then re-raises (round 2)",
+    ),
     ("env_store.py", "write_env_file", "reraises"): (1, "sync temp-file cleanup"),
     ("manifest/installer.py", "JobManager._handle_task_exception", "absorbs"): (
         1,
@@ -1854,37 +2556,84 @@ def _callee(call: ast.Call) -> str:
     return f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
 
 
+def _calls_by_innermost_function(
+    tree: ast.Module,
+) -> list[tuple[str, ast.Call, ast.AST]]:
+    """(innermost enclosing function name, call, the call's parent node) for
+    every call: a call in a nested function belongs to the nested function,
+    not to the one around it."""
+    out: list[tuple[str, ast.Call, ast.AST]] = []
+
+    def visit(node: ast.AST, fn: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            inner = (
+                child.name
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else fn
+            )
+            if isinstance(child, ast.Call):
+                out.append((fn, child, node))
+            visit(child, inner)
+
+    visit(tree, "<module>")
+    return out
+
+
 def test_absorbing_teardown_only_runs_inside_the_private_task() -> None:
+    """Every call site, checked on its own: `_reap_cancelled_child` and
+    `_teardown_outbound` are called only from the scoped bodies, and EVERY
+    call of a scoped body is itself an argument of
+    `_finish_then_reraise_cancel(...)` -- one wrapped call elsewhere does not
+    excuse a bare one."""
     tree = dict(_modules())["client/manager.py"]
     misplaced: list[str] = []
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for call in (n for n in ast.walk(fn) if isinstance(n, ast.Call)):
-            name = _callee(call)
-            if name == "_reap_cancelled_child" and fn.name not in _REAP_CALLERS:
-                misplaced.append(f"{fn.name} calls _reap_cancelled_child")
-            if name == "_teardown_outbound" and fn.name not in _SCOPED_BODIES:
-                misplaced.append(f"{fn.name} calls _teardown_outbound")
-    wrapped: set[str] = set()
-    bare: list[str] = []
-    for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
-        if _callee(call) == "_finish_then_reraise_cancel":
-            for arg in call.args:
-                if isinstance(arg, ast.Call):
-                    wrapped.add(_callee(arg))
-    for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
+    for fn, call, parent in _calls_by_innermost_function(tree):
         name = _callee(call)
-        if name in _SCOPED_BODIES and name not in wrapped:
-            bare.append(name)
-    direct = [
-        _callee(c)
-        for p in ast.walk(tree)
-        if isinstance(p, ast.Await) and isinstance(p.value, ast.Call)
-        for c in [p.value]
-        if _callee(c) in _SCOPED_BODIES
-    ]
+        if name == "_reap_cancelled_child" and fn not in _REAP_CALLERS:
+            misplaced.append(f"{fn} calls _reap_cancelled_child")
+        if name == "_teardown_outbound" and fn not in _SCOPED_BODIES:
+            misplaced.append(f"{fn} calls _teardown_outbound")
+        if name in _SCOPED_BODIES and not (
+            isinstance(parent, ast.Call)
+            and _callee(parent) == "_finish_then_reraise_cancel"
+            and call in parent.args
+        ):
+            misplaced.append(f"{fn} calls {name} outside the helper")
+    wrapped = {
+        _callee(call)
+        for _fn, call, parent in _calls_by_innermost_function(tree)
+        if isinstance(parent, ast.Call)
+        and _callee(parent) == "_finish_then_reraise_cancel"
+    }
     assert misplaced == [], misplaced
     assert wrapped >= _SCOPED_BODIES, f"never wrapped: {_SCOPED_BODIES - wrapped}"
-    assert direct == [] and bare == [], f"awaited outside the helper: {direct or bare}"
+
+
+def test_the_structural_check_sees_a_bare_call_beside_a_wrapped_one() -> None:
+    """The round-1 check let one wrapped call excuse a bare one elsewhere,
+    and charged a nested function's calls to its parent."""
+    source = (
+        "class C:\n"
+        "    async def a(self):\n"
+        "        await _finish_then_reraise_cancel(self._cleanup_client_body(1, 2))\n"
+        "    async def b(self):\n"
+        "        task = self._cleanup_client_body(1, 2)\n"
+        "    async def _abort_stdio_handshake(self):\n"
+        "        async def nested():\n"
+        "            await _reap_cancelled_child(None)\n"
+    )
+    calls = _calls_by_innermost_function(ast.parse(source))
+    by_fn = {(fn, _callee(c)) for fn, c, _p in calls}
+    assert ("nested", "_reap_cancelled_child") in by_fn
+    assert ("_abort_stdio_handshake", "_reap_cancelled_child") not in by_fn
+    bare = [
+        fn
+        for fn, c, parent in calls
+        if _callee(c) == "_cleanup_client_body"
+        and not (
+            isinstance(parent, ast.Call)
+            and _callee(parent) == "_finish_then_reraise_cancel"
+        )
+    ]
+    assert bare == ["b"]
 ````
