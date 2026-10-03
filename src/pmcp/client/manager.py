@@ -39,6 +39,8 @@ from pmcp.subscriptions import CatalogEventSink
 from pmcp.validation import normalized_executable_name
 from pmcp.types import (
     LocalMcpServerConfig,
+    UNUSABLE_TASK_VALUE,
+    task_hint_is_usable,
     McpTaskInfo,
     McpTaskRecord,
     PromptArgumentInfo,
@@ -187,6 +189,33 @@ _RECONCILE_RERUN_DEBOUNCE_S = 0.25
 # one kind is already pathological by any honest reading, while leaving real
 # small-page servers well inside it.
 _MAX_LISTING_PAGES = 500
+
+
+class OutboundFrameNotJson(ValueError):
+    """An outbound frame is not strict JSON (Consiliency/pmcp#298)."""
+
+
+_OUTBOUND_NOT_JSON = "outbound frame is not strict JSON"
+
+
+def _encode_outbound_frame(payload: dict[str, Any]) -> str:
+    """One JSON-RPC frame as strict JSON, or a value-free refusal.
+
+    NaN and +-Infinity are not JSON: stdio would write them as bare literals a
+    strict peer cannot parse, and the SDK's HTTP and SSE clients would
+    silently send them as ``null``. A value ``json`` cannot encode at all
+    (``TypeError``), a cycle (``ValueError``) or runaway nesting
+    (``RecursionError``) is refused the same way, on every transport, with a
+    message that carries nothing from the frame (Consiliency/pmcp#298).
+    """
+    try:
+        return json.dumps(payload, allow_nan=False)
+    except (ValueError, TypeError, RecursionError):
+        pass
+    # Raised OUTSIDE the handler: `from None` would still leave the json
+    # error attached as `__context__`, whose text can carry the value
+    # (`...: nan` on 3.12+, a dict key on 3.13).
+    raise OutboundFrameNotJson(_OUTBOUND_NOT_JSON)
 
 
 class DownstreamError(Exception):
@@ -1088,6 +1117,8 @@ class ClientManager:
         # first once this many accumulate, so the registry can't grow unbounded
         # between full teardowns.
         self._max_terminal_tasks = 100
+        # Increments on every `_record_task`: the terminal-eviction order.
+        self._record_order = 0
 
     async def connect_all(
         self, configs: list[ResolvedServerConfig], retry: bool = True
@@ -1681,19 +1712,54 @@ class ClientManager:
         if not isinstance(task_id, str) or not task_id:
             return None
         status_message = payload.get("statusMessage", payload.get("status_message"))
-        poll_interval = payload.get("pollInterval", payload.get("poll_interval"))
+
+        def pick(name: str, keys: tuple[str, ...], values: tuple[Any, ...]) -> Any:
+            # One field, several wire aliases (`values` is `payload.get(key)`
+            # for each of `keys`, in precedence order). The first USABLE
+            # value wins, so `updatedAt: null` next to a usable
+            # `lastUpdatedAt` does not hide it. With none usable, the first
+            # value sent is passed on for the model to flag. A JSON `null`
+            # the downstream SENT is not an absent value: only `ttl: null`
+            # means something in MCP ("unlimited"), so for these hints it is
+            # unusable -- it must not read as "not sent", or `_record_task`
+            # would substitute the current time (Consiliency/pmcp#298).
+            sent = [value for key, value in zip(keys, values) if key in payload]
+            for value in sent:
+                if task_hint_is_usable(name, value):
+                    return value
+            for value in sent:
+                if value is not None:
+                    return value
+            return UNUSABLE_TASK_VALUE if sent else None
+
+        status = pick("status", ("status",), (payload.get("status"),))
+        created_at = pick(
+            "created_at",
+            ("createdAt", "created_at"),
+            (payload.get("createdAt"), payload.get("created_at")),
+        )
+        updated_at = pick(
+            "updated_at",
+            ("updatedAt", "updated_at", "lastUpdatedAt", "last_updated_at"),
+            (
+                payload.get("updatedAt"),
+                payload.get("updated_at"),
+                payload.get("lastUpdatedAt"),
+                payload.get("last_updated_at"),
+            ),
+        )
+        poll_interval = pick(
+            "poll_interval",
+            ("pollInterval", "poll_interval"),
+            (payload.get("pollInterval"), payload.get("poll_interval")),
+        )
+
         return McpTaskInfo(
             task_id=task_id,
-            status=payload.get("status"),
+            status=status,
             status_message=status_message if isinstance(status_message, str) else None,
-            created_at=payload.get("createdAt", payload.get("created_at")),
-            updated_at=payload.get(
-                "updatedAt",
-                payload.get(
-                    "updated_at",
-                    payload.get("lastUpdatedAt", payload.get("last_updated_at")),
-                ),
-            ),
+            created_at=created_at,
+            updated_at=updated_at,
             ttl=payload.get("ttl"),
             poll_interval=poll_interval,
             raw=payload,
@@ -1708,22 +1774,42 @@ class ClientManager:
         requestor_context: dict[str, Any] | None = None,
     ) -> McpTaskRecord:
         existing = self._tasks.get((server_name, task_info.task_id))
+        now = time.time()
+        # created_at: the first usable value pmcp saw (Consiliency/pmcp#298).
+        created_at = (
+            existing.created_at
+            if existing is not None and existing.created_at is not None
+            else task_info.created_at
+        )
+        unusable = [
+            name
+            for name in task_info.unusable_fields
+            if not (name == "created_at" and created_at is not None)
+        ]
+        # updated_at: the downstream's usable value; None when it was unusable
+        # (named in `unusable_fields`); pmcp's observation time only when the
+        # downstream sent none at all -- `is None`, not `or`, so a usable 0.0
+        # is kept (Consiliency/pmcp#298).
+        updated_at = task_info.updated_at
+        if updated_at is None and "updated_at" not in task_info.unusable_fields:
+            updated_at = now
         record = McpTaskRecord(
             task_id=task_info.task_id,
             status=task_info.status,
             status_message=task_info.status_message,
-            created_at=task_info.created_at
-            if existing is None
-            else existing.created_at,
-            updated_at=task_info.updated_at or time.time(),
+            created_at=created_at,
+            updated_at=updated_at,
             ttl=task_info.ttl,
             poll_interval=task_info.poll_interval,
+            unusable_fields=unusable,
             raw=task_info.raw,
             server_name=server_name,
             tool_id=tool_id or (existing.tool_id if existing else None),
             requestor_context=requestor_context
             or (existing.requestor_context if existing else None),
         )
+        self._record_order += 1
+        record._recorded_order = self._record_order
         self._tasks[(server_name, task_info.task_id)] = record
         self._evict_terminal_tasks()
         return record
@@ -1732,8 +1818,8 @@ class ClientManager:
         """Prune oldest terminal task records past the retention cap.
 
         Only completed/failed/cancelled records are candidates; active tasks are
-        left untouched. Eviction targets the oldest records by ``updated_at`` so
-        recently-finished tasks remain queryable.
+        left untouched. Eviction targets the records pmcp recorded least
+        recently (``_recorded_order``), so recently-seen tasks remain queryable.
         """
         terminal = [
             (key, record)
@@ -1743,7 +1829,11 @@ class ClientManager:
         excess = len(terminal) - self._max_terminal_tasks
         if excess <= 0:
             return
-        terminal.sort(key=lambda item: (item[1].updated_at or 0.0, item[0]))
+        # Least recently recorded by pmcp first. The downstream's own
+        # timestamps play no part: a far-future `lastUpdatedAt` cannot keep one
+        # server's records past another's, and an honest server whose clock
+        # runs behind cannot lose its records early (Consiliency/pmcp#298).
+        terminal.sort(key=lambda item: item[1]._recorded_order)
         for key, _record in terminal[:excess]:
             self._tasks.pop(key, None)
 
@@ -3166,9 +3256,16 @@ class ClientManager:
                     raise message
 
                 try:
+                    # `mode="python"`, not "json": the SDK already parsed the
+                    # frame (`validate_json`, which reads `NaN`, `Infinity` and
+                    # `1e400` as floats), and a JSON-mode dump would turn those
+                    # into `None` -- indistinguishable from a sent `null` (MCP's
+                    # "unlimited" `ttl`). Python mode hands the dispatcher the
+                    # same values the stdio path's `json.loads` does, so task
+                    # normalisation sees them (Consiliency/pmcp#298).
                     payload = message.message.model_dump(
                         by_alias=True,
-                        mode="json",
+                        mode="python",
                         exclude_none=True,
                     )
                 except Exception as e:
@@ -3220,12 +3317,13 @@ class ClientManager:
             if managed.is_remote:
                 if managed.write_stream is None:
                     return
+                _encode_outbound_frame(payload)
                 msg = mcp_types.jsonrpc_message_adapter.validate_python(payload)
                 await managed.write_stream.send(SessionMessage(msg))
             else:
                 if not managed.process or not managed.process.stdin:
                     return
-                data = json.dumps(payload) + "\n"
+                data = _encode_outbound_frame(payload) + "\n"
                 managed.process.stdin.write(data.encode())
                 await managed.process.stdin.drain()
         except Exception as e:
@@ -3417,13 +3515,14 @@ class ClientManager:
                 # JSONRPCNotification | JSONRPCResponse | JSONRPCError), not a
                 # pydantic model, so it has no .model_validate(); construct via
                 # its published TypeAdapter instead.
+                _encode_outbound_frame(request)
                 msg = mcp_types.jsonrpc_message_adapter.validate_python(request)
                 await managed.write_stream.send(SessionMessage(msg))
             else:
                 if not managed.process or not managed.process.stdin:
                     raise RuntimeError("Process not running")
 
-                data = json.dumps(request) + "\n"
+                data = _encode_outbound_frame(request) + "\n"
                 managed.process.stdin.write(data.encode())
                 await managed.process.stdin.drain()
 
@@ -3547,7 +3646,7 @@ class ClientManager:
             msg = mcp_types.jsonrpc_message_adapter.validate_python(notification)
             await managed.write_stream.send(SessionMessage(msg))
         elif managed.process and managed.process.stdin:
-            data = json.dumps(notification) + "\n"
+            data = _encode_outbound_frame(notification) + "\n"
             managed.process.stdin.write(data.encode())
             await managed.process.stdin.drain()
 

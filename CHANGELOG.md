@@ -561,6 +561,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Changed
+- **`gateway.invoke`'s `task.ttl` and `task.poll_interval` are bounded, and
+  NaN/Infinity are refused at the gate (see Consiliency/pmcp#298).**
+  - `task.ttl` must be an integer from 1 to 2^53−1. Zero and negative values,
+    which were forwarded downstream unchanged, are now rejected with
+    `Input validation error: …`, and so is any value above 2^53−1.
+  - `task.poll_interval` must be a finite number greater than 0 and at most
+    2^53−1. Zero, negative values, `NaN`, `Infinity` and `-Infinity` are now
+    rejected; they were previously accepted and forwarded.
+  - The transport gate now treats `NaN` and `±Infinity` as non-numbers for
+    every numeric argument. Both transports can deliver them, even though they
+    are not JSON. Until Consiliency/pmcp#297 lands, a rejection message may
+    repeat the caller's own number back to that caller, as every numeric bound
+    already did.
+  - A downstream task's `ttl`, `pollInterval`, `createdAt`,
+    `lastUpdatedAt`/`updatedAt` or `status` that pmcp cannot use is now
+    reported as `null`, and its field name is listed in the task's new
+    `unusable_fields` array. "Cannot use" covers:
+    - non-finite numbers and out-of-range values;
+    - a boolean;
+    - a string where a number is expected;
+    - a non-string or blank status;
+    - a blank timestamp;
+    - a `null` the downstream sent.
+
+    Before, such a value was coerced (`"5"` became 5, `true` became 1),
+    stored as given, or it failed the call after the downstream had already
+    created the task. A `null` `ttl` that is *not* listed in `unusable_fields`
+    keeps its MCP meaning: unlimited. When a field arrives under more than one
+    name (`updatedAt`/`lastUpdatedAt`, `createdAt`/`created_at`,
+    `pollInterval`/`poll_interval`), the first usable one wins, so a `null`
+    `updatedAt` no longer hides a good `lastUpdatedAt`. The task's `raw` holds
+    what the downstream sent, except that non-finite numbers appear there as
+    `null`. A task whose `lastUpdatedAt` was unusable now reports
+    `updatedAt: null` instead of the time pmcp recorded it. A downstream that
+    leaves the field out entirely still gets pmcp's observation time, as
+    before.
+  - Over HTTP and SSE, downstream replies are now read as the server sent
+    them: `NaN`, `Infinity` and `1e400` used to arrive as `null`. This has two
+    side effects, both matching what stdio servers already got:
+    - **A `nextCursor` of `NaN` now makes that listing unreadable.** pmcp keeps
+      the previous tools/resources/prompts and publishes no change, instead of
+      treating page one as the whole listing.
+    - **A `NaN` inside a tool result now reaches the caller as a `NaN` token
+      instead of `null`.** Fixing that for every transport is tracked as
+      Consiliency/pmcp#335.
+  - Finished tasks past the 100-record cap are now evicted in the order pmcp
+    last recorded them. A downstream's own timestamps play no part: a
+    far-future `lastUpdatedAt` can no longer keep one server's tasks while
+    another's are dropped, and a server whose clock runs behind no longer
+    loses its tasks first.
+  - pmcp no longer sends a downstream server anything that is not strict JSON:
+    `NaN`, `±Infinity`, or a value JSON cannot encode. A request whose
+    `arguments` or task metadata contain one now fails with `outbound frame is
+    not strict JSON`. A fire-and-forget frame (a reply or a notification pmcp
+    originates) that contains one is dropped and logged, never written. Before,
+    stdio servers received a non-JSON `NaN` literal, and HTTP/SSE servers
+    silently received `null`.
+  - **Known follow-up:** pmcp documents `ttl` and `poll_interval` in seconds,
+    but MCP defines both in milliseconds, and pmcp forwards them unchanged.
+    Tracked as Consiliency/pmcp#330.
 - **`pmcp startup add/set --source project` now carries your prior trust approval forward when it rewrites `.mcp.json`.** Setting the startup policy changes the file's bytes, and trust approval is content-keyed, so the edit used to silently invalidate your own `pmcp trust approve` of that file and the next startup refused it. When the pre-write bytes were approved, pmcp now re-records the approval for the exact bytes it writes — keyed on the opened descriptor's verified identity (the resolved key must name the same file the descriptor holds open), never re-approving a file that was not already approved, and never approving a substituted file. A target swapped or unlinked mid-operation is refused rather than mis-bound, and on POSIX a symlinked `.mcp.json` is refused up front. If re-recording ever fails because the trust store is unusable, the edit is still written and the failure is surfaced as a diagnostic rather than crashing (an unusable store also fails the approval check, so nothing is silently carried forward). See [#253](https://github.com/Consiliency/pmcp/issues/253).
 - **`pmcp trust approve` now refuses a store resident in the checkout containing the file being approved**, matching what `serve --project` enforces — so approve no longer reports success for an approval that serve will then refuse. See [#252](https://github.com/Consiliency/pmcp/issues/252).
 - **Every install spawn now logs the command it runs, at WARNING, before it
