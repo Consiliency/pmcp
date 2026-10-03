@@ -25,15 +25,15 @@ newline and pydantic's Rust `$` does not -- closed for the one `pattern` field
 (`evidence_label_digest`) by length bounds, pinned by
 `test_digest_pattern_agrees_between_gate_and_model`.
 Nor on an integer's range: pydantic refuses a float outside int64, so an
-unbounded integer field (`task.ttl`) gets bounds on both sides -- -2**63 + 1
-(one short of int64's minimum, because `float(-2**63)` is exact and refused)
-to 2**63 - 1 -- pinned by `test_ttl_range_agrees_between_gate_and_model`.
-Two classes stay open, both refused by the model and deferred: a lone
-surrogate in a length-limited string passes the gate on every transport, and
-the SDK's newer-protocol HTTP entry is the one that delivers it to the model,
-which echoes it (Consiliency/pmcp#297); and an unbounded float
-(`task.poll_interval`: a JSON integer with |n| >= 2**1024 - 2**970, either sign)
-passes the gate (Consiliency/pmcp#298).
+unbounded integer field (`task.ttl`) gets bounds on both sides -- now
+[1, 2**53 - 1] (Consiliency/pmcp#298) -- pinned by
+`test_ttl_range_agrees_between_gate_and_model`.
+`task.poll_interval` is bounded on both sides and finite-checked at the gate
+by `GATE_VALIDATOR` (Consiliency/pmcp#298; `tests/test_task_numeric_bounds.py`).
+One class stays open, refused by the model and deferred: a lone surrogate in
+a length-limited string passes the gate on every transport, and the SDK's
+newer-protocol HTTP entry is the one that delivers it to the model, which
+echoes it (Consiliency/pmcp#297).
 """
 
 from __future__ import annotations

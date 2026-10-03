@@ -388,7 +388,7 @@ class TestHttpObservabilityContracts:
         )
 
     def test_resource_server_insufficient_scope_gets_403_challenge(self) -> None:
-        from pmcp.auth import ResourceServerAuthError
+        from pmcp.auth import AuthMessage, ResourceServerAuthError
 
         with (
             patch(
@@ -398,7 +398,7 @@ class TestHttpObservabilityContracts:
             patch(
                 "pmcp.transport.http.validate_resource_server_token",
                 side_effect=ResourceServerAuthError(
-                    "insufficient_scope", "Missing required scope(s): write"
+                    "insufficient_scope", AuthMessage.MISSING_SCOPES, scopes="write"
                 ),
             ),
         ):
@@ -441,12 +441,13 @@ class TestHttpObservabilityContracts:
             )
 
     def test_resource_server_jwks_failure_gets_503_challenge(self) -> None:
-        from pmcp.auth import ResourceServerJWKSUnavailable
+        from pmcp.auth import AuthMessage, ResourceServerJWKSUnavailable
 
         with patch(
             "pmcp.transport.http.AsyncJWKS.get_for_token",
             side_effect=ResourceServerJWKSUnavailable(
-                "JWKS fetch failed for https://issuer.example/jwks.json?token=secret."
+                AuthMessage.JWKS_FETCH_FAILED,
+                url="https://issuer.example/jwks.json?token=secret",
             ),
         ):
             client = _make_contract_client(

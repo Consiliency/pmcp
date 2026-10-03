@@ -184,19 +184,20 @@ class TestAuthGuardHttp:
     def test_invalid_metadata_url_does_not_create_route_or_challenge_header(
         self,
     ) -> None:
-        client = _make_app(
-            auth_token="mysecret",
-            protected_resource_metadata_url=(
-                "http://auth.example/.well-known/oauth-protected-resource?token=secret"
-            ),
-        )
-
-        unauth = client.post("/mcp", content=b"{}")
-        metadata = client.get("/.well-known/oauth-protected-resource")
-
-        assert unauth.status_code == 401
-        assert "www-authenticate" not in unauth.headers
-        assert metadata.status_code == 404
+        # Consiliency/pmcp#326 round 8: refused because it is plain http://
+        # to a non-loopback host -- normalisation would drop it and silently
+        # omit the route. (The `?token=` query alone is not a reason: an
+        # https URL with one starts and serves its route.) The message is
+        # the registry's and carries none of the URL.
+        with pytest.raises(ValueError, match="only allows http:// URLs") as refused:
+            _make_app(
+                auth_token="mysecret",
+                protected_resource_metadata_url=(
+                    "http://auth.example/.well-known/oauth-protected-resource?token=secret"
+                ),
+            )
+        assert "secret" not in str(refused.value)
+        assert "auth.example" not in str(refused.value)
 
     def test_wrong_token_returns_401(self) -> None:
         client = _make_app(auth_token="mysecret")

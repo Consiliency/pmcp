@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import string
 import time
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from itertools import product
@@ -24,6 +25,274 @@ from pmcp.redaction_additive import redact_additive
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
 
+class AuthText(str):
+    """One fixed operator-facing auth/HTTP message. Instances exist only as
+    `AuthMessage` attributes (Consiliency/pmcp#326): the auth error classes
+    and the HTTP 401/403/503 response helper refuse anything else, so a
+    message cannot be written inline in a shape a review cannot see."""
+
+    __slots__ = ()
+
+
+_PYJWT_MINT = object()  # held only by `pyjwt_text`
+
+
+class PyJwtText(str):
+    """pyjwt's own text for an error class pmcp keeps verbatim
+    (`_FIXED_TEXT_CLAIM_ERRORS`). Minted only by `pyjwt_text`: the
+    constructor wants a private token, and `render_auth_message` refuses an
+    instance that does not carry it (so `str.__new__(PyJwtText, ...)` does
+    not get through either)."""
+
+    _minted: object
+
+    def __new__(cls, text: str, *, _mint: object = None) -> "PyJwtText":
+        if _mint is not _PYJWT_MINT:
+            raise TypeError("PyJwtText is minted only by pyjwt_text()")
+        obj = super().__new__(cls, text)
+        obj._minted = _PYJWT_MINT
+        return obj
+
+
+class AuthMessage:
+    """The registry of every fixed operator-facing message that `pmcp.auth`
+    and `pmcp.transport.http` raise or send as an auth rejection -- the auth
+    error descriptions, the 401/403/503 bodies, the startup refusals and the
+    redirect `HTTPError` (Consiliency/pmcp#326). Out of scope, as the plan's
+    non-goals say: the metadata diagnostics lists, `UNVERIFIED_URL_CAVEAT`,
+    `fetch_json_metadata`'s strings, the plain 413/429/504 bodies and the log
+    templates.
+
+    Each one comes through `sanitize_auth_diagnostic` -- the redactor's own
+    rules and the additive rules (#234) -- unchanged; the test module checks
+    every member. `{url}` and `{scopes}` are filled from configuration by the
+    constructor that takes them (`ResourceServerAuthError(..., url=...)`).
+    Add a message here, never inline: the auth error classes and
+    `_auth_response` raise `TypeError` for anything that is not a member, and
+    a static check in the test module requires every raise and `_reject`
+    site to name one.
+    """
+
+    # -- token validation (401 `invalid_token` / 403 `insufficient_scope`) --
+    # Four texts were reworded because the sanitiser rewrote them (#326):
+    # "Missing bearer token." -> "Missing bearer [REDACTED]" (Bearer rule);
+    # "Unsupported token algorithm." -> "Unsupported token [REDACTED]";
+    # "Token could not be verified with the published key." -> "Token
+    # [REDACTED] not be verified..." (keyword rule, `token <word>`); and
+    # "shared-secret auth mode requires auth_token." -> "shared-secret
+    # [REDACTED] mode..." (keyword rule, `secret <word>`).
+    EMPTY_TOKEN = AuthText("Empty token.")
+    TOKEN_ALGORITHM_UNSUPPORTED = AuthText("The token's algorithm is not supported.")
+    JWKS_URL_REQUIRED = AuthText("JWKS URL is required.")
+    KEY_CANNOT_VERIFY_TOKEN = AuthText("The published key cannot verify this token.")
+    NO_MATCHING_JWK = AuthText("No matching JWK found.")
+    INVALID_AUDIENCE = AuthText("Invalid audience.")
+    INVALID_TOKEN = AuthText("Invalid token.")
+    MISSING_SCOPES = AuthText("Missing required scope(s): {scopes}")
+    RS_JWKS_NOT_CONFIGURED = AuthText("Resource Server JWKS is not configured.")
+    # -- JWKS availability (503 `temporarily_unavailable`) --
+    JWKS_BACKING_OFF = AuthText("JWKS refresh recently failed for {url}; backing off.")
+    JWKS_FETCH_FAILED = AuthText("JWKS fetch failed for {url}.")
+    JWKS_REDIRECT_REFUSED = AuthText(
+        "JWKS endpoint returned a redirect for {url}; refusing to follow."
+    )
+    JWKS_TOO_LARGE = AuthText("JWKS response too large for {url}.")
+    JWKS_INVALID_JSON = AuthText("Invalid JWKS JSON from {url}.")
+    JWKS_INVALID_OBJECT = AuthText("Invalid JWKS object from {url}.")
+    JWKS_NO_USABLE_KEYS = AuthText("JWKS contains no usable signing keys.")
+    # -- public auth URL validation --
+    REDIRECTS_NOT_ALLOWED = AuthText("Redirects are not allowed.")
+    PUBLIC_URL_INVALID = AuthText("Invalid public auth URL.")
+    PUBLIC_URL_NOT_ABSOLUTE = AuthText(
+        "Public auth URL must be an absolute HTTP(S) URL."
+    )
+    PUBLIC_URL_HTTP_LOOPBACK_ONLY = AuthText(
+        "Public auth URL only allows http:// URLs for loopback hosts."
+    )
+    PUBLIC_URL_NOT_PUBLIC = AuthText(
+        "Public auth URL host is a non-public IP literal or loopback name."
+    )
+    ELICITATION_URL_INVALID = AuthText("Invalid URL-mode elicitation URL.")
+    # -- HTTP transport startup refusals --
+    UNSUPPORTED_AUTH_MODE = AuthText("Unsupported auth mode.")
+    SHARED_SECRET_NEEDS_TOKEN = AuthText(
+        "auth_token is required when auth_mode is shared-secret."
+    )
+    RESOURCE_SERVER_NEEDS_CONFIG = AuthText(
+        "resource-server auth mode requires issuer, JWKS URL, and audience."
+    )
+    JWKS_URL_NOT_USABLE = AuthText(
+        "The JWKS URL must be an absolute http(s) URL without whitespace."
+    )
+    METADATA_URL_NOT_USABLE = AuthText(
+        "The protected-resource metadata URL must be an absolute http(s) URL "
+        "without whitespace."
+    )
+    REQUIRED_SCOPE_INVALID = AuthText(
+        "Each required scope must be a single RFC 6749 scope (printable ASCII, "
+        "no space, quote or backslash)."
+    )
+    METADATA_NEEDS_RESOURCE = AuthText(
+        "Protected-resource metadata needs a canonical resource: set "
+        "resource_server_audience (--oauth-audience) or an absolute "
+        "protected_resource_metadata_url."
+    )
+    # -- HTTP 401/403/503 response bodies (`_auth_response`) --
+    UNAUTHORIZED = AuthText("Unauthorized")
+    FORBIDDEN = AuthText("Forbidden")
+    SERVICE_UNAVAILABLE = AuthText("Service Unavailable")
+
+
+def auth_messages() -> dict[str, AuthText]:
+    """Every registry member, by name."""
+    return {
+        name: value
+        for name, value in vars(AuthMessage).items()
+        if isinstance(value, AuthText)
+    }
+
+
+# Membership is identity, not type: an `AuthText` minted anywhere else --
+# `AuthText("...")` or `str.__new__(AuthText, ...)` -- is not a member.
+_MEMBER_IDS = frozenset(id(value) for value in auth_messages().values())
+# Each member's placeholder names, which its fields must match exactly.
+_MEMBER_FIELDS = {
+    id(value): frozenset(f for _, f, _, _ in string.Formatter().parse(value) if f)
+    for value in auth_messages().values()
+}
+# Note: `_MEMBER_IDS` holds the identities of THIS import's members. A test
+# that `importlib.reload`s `pmcp.auth` must reload `pmcp.transport.http` too,
+# or http.py keeps passing the old registry's members and every auth
+# response is refused.
+
+# RFC 6749 section 3.3: scope = scope-token *( SP scope-token ),
+# scope-token = 1*NQCHAR, NQCHAR = %x21 / %x23-5B / %x5D-7E.
+_SCOPE_LIST = re.compile(r"[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*")
+
+
+def _is_absolute_http(parsed: Any) -> bool:
+    """The absolute-HTTP(S) rule `sanitize_public_auth_url` applies to every
+    configured auth URL: an http(s) scheme, a netloc and a hostname."""
+    return (
+        parsed.scheme in {"https", "http"}
+        and bool(parsed.netloc)
+        and bool(parsed.hostname)
+    )
+
+
+def _url_field(value: object) -> bool:
+    """A `{url}` field: an absolute http(s) URL with no whitespace -- what a
+    configured JWKS URL is. Prose ("Token expired.") is not."""
+    if not isinstance(value, str) or any(c.isspace() for c in value):
+        return False
+    try:
+        parsed = urlparse(value)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return _is_absolute_http(parsed)
+
+
+def _scopes_field(value: object) -> bool:
+    """A `{scopes}` field: an RFC 6749 scope list (space-separated
+    scope-tokens), what `required_scopes` minus the token's scopes is."""
+    return isinstance(value, str) and _SCOPE_LIST.fullmatch(value) is not None
+
+
+# Every placeholder the registry uses, and the shape its value must have.
+# Code-introduced prose in a field fails here at construction, wherever the
+# value came from (a literal, a variable, a constant).
+_FIELD_VALIDATORS: dict[str, Callable[[object], bool]] = {
+    "url": _url_field,
+    "scopes": _scopes_field,
+}
+
+
+def _stored_url_ok(url: str) -> bool:
+    """True if `url`, sanitised the way every caller stores it, has the
+    renderer's `{url}` shape. A value `sanitize_public_auth_url` refuses
+    raises ITS registry message (non-public IP literal, plain http, not
+    absolute ...), which is more specific than ours (round 9, claude N1)."""
+    return _url_field(sanitize_public_auth_url(url))
+
+
+def check_auth_config(
+    *,
+    jwks_url: str | None = None,
+    metadata_url: str | None = None,
+    required_scopes: Iterable[str] | None = None,
+) -> None:
+    """Refuse at startup any configuration value that a rejection would later
+    have to carry in a registry field, if it lacks that field's shape -- with
+    the SAME validators the renderer applies (Consiliency/pmcp#326). Without
+    this, a JWKS URL with a raw space or a required scope such as `a"b`
+    passed startup and made every rejection that names it fail to build (a
+    500 instead of the 503/403). One validator, two callers: here, and
+    `render_auth_message`.
+
+    A URL is checked as it will be *stored*: `sanitize_public_auth_url`
+    first (as `AsyncJWKS` and `normalize_auth_metadata` do), so a value they
+    would clean -- a trailing newline from a file-backed secret, a leading
+    space -- starts as it does on main, and a value they would refuse or
+    silently drop (relative, non-http(s), a non-public IP literal) is
+    refused here instead (round 8)."""
+    if jwks_url is not None and not _stored_url_ok(jwks_url):
+        raise ValueError(render_auth_message(AuthMessage.JWKS_URL_NOT_USABLE))
+    if metadata_url is not None and not _stored_url_ok(metadata_url):
+        raise ValueError(render_auth_message(AuthMessage.METADATA_URL_NOT_USABLE))
+    for scope in required_scopes or ():
+        if not _scopes_field(scope) or " " in scope:
+            raise ValueError(render_auth_message(AuthMessage.REQUIRED_SCOPE_INVALID))
+
+
+def _check_registry_fields() -> None:
+    """Fail at import if a registry member uses a placeholder that has no
+    validator: every field's shape must be checked."""
+    unvalidated = set().union(*_MEMBER_FIELDS.values()) - set(_FIELD_VALIDATORS)
+    if unvalidated:  # pragma: no cover - a registry edit without a validator
+        raise TypeError(f"AuthMessage placeholders without a validator: {unvalidated}")
+
+
+_check_registry_fields()
+
+
+def pyjwt_text(exc: BaseException) -> PyJwtText:
+    """The one narrow pass-through: pyjwt's text for a class in
+    `_FIXED_TEXT_CLAIM_ERRORS`, whose texts are fixed (the test module
+    generates and checks every one). Anything else is a `TypeError`."""
+    if not isinstance(exc, _FIXED_TEXT_CLAIM_ERRORS):
+        raise TypeError(
+            f"pyjwt_text() takes a fixed-text pyjwt error, not {type(exc).__name__}"
+        )
+    return PyJwtText(str(exc), _mint=_PYJWT_MINT)
+
+
+def render_auth_message(message: AuthText | PyJwtText, **fields: str) -> str:
+    """The text of a registry member with its configuration fields filled,
+    or a pyjwt pass-through. `TypeError` for anything else: a non-member
+    (checked by identity), an unminted `PyJwtText`, or fields that are not
+    exactly the member's placeholders -- a missing field would publish a
+    literal `{url}`, a misnamed one would raise `KeyError` deep in a fetch."""
+    if isinstance(message, PyJwtText):
+        if getattr(message, "_minted", None) is not _PYJWT_MINT or fields:
+            raise TypeError("PyJwtText must come from pyjwt_text(), with no fields")
+        return str(message)
+    if id(message) not in _MEMBER_IDS:
+        raise TypeError(
+            f"auth messages must be an AuthMessage member, not {type(message).__name__}"
+        )
+    expected = _MEMBER_FIELDS[id(message)]
+    if set(fields) != expected:
+        raise TypeError(
+            f"AuthMessage fields must be exactly {sorted(expected)}, "
+            f"got {sorted(fields)}"
+        )
+    bad = sorted(k for k, v in fields.items() if not _FIELD_VALIDATORS[k](v))
+    if bad:
+        raise TypeError(f"AuthMessage field(s) {bad} do not have the expected shape")
+    return message.format(**fields)
+
+
 class _NoRedirectHandler(HTTPRedirectHandler):
     """Refuse HTTP redirects so a public URL cannot 3xx to an internal host."""
 
@@ -36,7 +305,13 @@ class _NoRedirectHandler(HTTPRedirectHandler):
         headers: Any,
         newurl: str,
     ) -> Request | None:
-        raise HTTPError(newurl, code, "Redirects are not allowed.", headers, fp)
+        raise HTTPError(
+            newurl,
+            code,
+            render_auth_message(AuthMessage.REDIRECTS_NOT_ALLOWED),
+            headers,
+            fp,
+        )
 
 
 _NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler)
@@ -332,22 +607,20 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> 
         hostname = parsed.hostname
         _ = parsed.port
     except ValueError as exc:
-        raise ValueError("Invalid public auth URL.") from exc
+        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_INVALID)) from exc
 
-    if parsed.scheme not in {"https", "http"} or not parsed.netloc or not hostname:
-        raise ValueError("Public auth URL must be an absolute HTTP(S) URL.")
+    if not _is_absolute_http(parsed) or not hostname:
+        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_NOT_ABSOLUTE))
 
     if parsed.scheme == "http" and (
         not allow_loopback_http or not _is_loopback_host(hostname)
     ):
-        raise ValueError("Public auth URL only allows http:// URLs for loopback hosts.")
+        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_HTTP_LOOPBACK_ONLY))
     if not (
         allow_loopback_http and parsed.scheme == "http" and _is_loopback_host(hostname)
     ):
         if not _is_public_auth_host(hostname):
-            raise ValueError(
-                "Public auth URL host is a non-public IP literal or loopback name."
-            )
+            raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_NOT_PUBLIC))
 
     return redact_auth_url(url)
 
@@ -364,19 +637,29 @@ class ResourceServerTokenClaims:
 
 
 class ResourceServerAuthError(Exception):
-    """Raised for failed Resource Server token validation."""
+    """Raised for failed Resource Server token validation.
 
-    def __init__(self, error: str, description: str) -> None:
+    ``description`` must be an `AuthMessage` member (with its ``url`` /
+    ``scopes`` fields as keywords) or a `pyjwt_text` pass-through; anything
+    else is a `TypeError` at construction (Consiliency/pmcp#326), which a
+    subclass cannot avoid either -- whatever it passes up arrives here.
+    """
+
+    def __init__(
+        self, error: str, description: AuthText | PyJwtText, **fields: str
+    ) -> None:
         self.error = error
-        self.description = sanitize_auth_diagnostic(description)
+        self.description = sanitize_auth_diagnostic(
+            render_auth_message(description, **fields)
+        )
         super().__init__(self.description)
 
 
 class ResourceServerJWKSUnavailable(ResourceServerAuthError):
     """Raised when Resource Server JWKS cannot be fetched."""
 
-    def __init__(self, description: str) -> None:
-        super().__init__("temporarily_unavailable", description)
+    def __init__(self, description: AuthText, **fields: str) -> None:
+        super().__init__("temporarily_unavailable", description, **fields)
 
 
 class AsyncJWKS:
@@ -393,6 +676,9 @@ class AsyncJWKS:
         refresh_failure_backoff_seconds: float = 5.0,
     ) -> None:
         self.url = sanitize_public_auth_url(url)
+        # The display URL is what a 503 carries in `{url}`: refuse here, not
+        # per request, a URL that could not be rendered (#326).
+        check_auth_config(jwks_url=self.url)
         self._raw_url = url
         self._ttl_seconds = ttl_seconds
         self._max_bytes = max_bytes
@@ -460,7 +746,7 @@ class AsyncJWKS:
                 if cached is not None:
                     return cached
                 raise ResourceServerJWKSUnavailable(
-                    f"JWKS refresh recently failed for {self.url}; backing off."
+                    AuthMessage.JWKS_BACKING_OFF, url=self.url
                 )
             # (3) A fetch is about to be attempted: the only place the
             # forced-refresh window advances (success or failure alike).
@@ -471,6 +757,11 @@ class AsyncJWKS:
                 jwks = await self._fetch()
             except ResourceServerJWKSUnavailable:
                 self._last_refresh_failure = time.monotonic()
+                raise
+            except (TypeError, KeyError):
+                # A programming error (e.g. a refused auth message), not an
+                # endpoint failure: never a 503, never a backoff window
+                # (Consiliency/pmcp#326).
                 raise
             except Exception as exc:
                 # Any other failure is still a failed refresh: it opens the
@@ -483,7 +774,7 @@ class AsyncJWKS:
                 # stays, because the attempt was made.
                 self._last_refresh_failure = time.monotonic()
                 raise ResourceServerJWKSUnavailable(
-                    f"JWKS fetch failed for {self.url}."
+                    AuthMessage.JWKS_FETCH_FAILED, url=self.url
                 ) from exc
             self._last_refresh_failure = float("-inf")
             self._jwks = jwks
@@ -511,20 +802,21 @@ class AsyncJWKS:
                 ) as response:
                     if 300 <= response.status < 400:
                         raise ResourceServerJWKSUnavailable(
-                            f"JWKS endpoint returned a redirect for {self.url}; "
-                            "refusing to follow."
+                            AuthMessage.JWKS_REDIRECT_REFUSED, url=self.url
                         )
                     response.raise_for_status()
                     content = await response.content.read(self._max_bytes + 1)
-        except ResourceServerJWKSUnavailable:
+        except (ResourceServerJWKSUnavailable, TypeError, KeyError):
+            # TypeError/KeyError: a programming error, not a fetch failure
+            # (Consiliency/pmcp#326).
             raise
         except Exception as exc:
             raise ResourceServerJWKSUnavailable(
-                f"JWKS fetch failed for {self.url}."
+                AuthMessage.JWKS_FETCH_FAILED, url=self.url
             ) from exc
         if len(content) > self._max_bytes:
             raise ResourceServerJWKSUnavailable(
-                f"JWKS response too large for {self.url}."
+                AuthMessage.JWKS_TOO_LARGE, url=self.url
             )
         try:
             jwks = json.loads(content.decode("utf-8"))
@@ -532,10 +824,12 @@ class AsyncJWKS:
             # ValueError covers JSONDecodeError and UnicodeDecodeError; a
             # deeply nested body under the size cap raises RecursionError.
             raise ResourceServerJWKSUnavailable(
-                f"Invalid JWKS JSON from {self.url}."
+                AuthMessage.JWKS_INVALID_JSON, url=self.url
             ) from exc
         if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
-            raise ResourceServerJWKSUnavailable(f"Invalid JWKS object from {self.url}.")
+            raise ResourceServerJWKSUnavailable(
+                AuthMessage.JWKS_INVALID_OBJECT, url=self.url
+            )
         return jwks
 
 
@@ -557,9 +851,7 @@ def _select_jwk_key(token: str, jwks: Mapping[str, Any]) -> Any:
         # InvalidTokenError, so unmapped it escaped as a 500 (see
         # Consiliency/pmcp#320). Fixed text: never echo pyjwt's message or any
         # JWKS content.
-        raise ResourceServerJWKSUnavailable(
-            "JWKS contains no usable signing keys."
-        ) from exc
+        raise ResourceServerJWKSUnavailable(AuthMessage.JWKS_NO_USABLE_KEYS) from exc
     keys = key_set.keys
     if kid:
         for key in keys:
@@ -567,7 +859,7 @@ def _select_jwk_key(token: str, jwks: Mapping[str, Any]) -> Any:
                 return key.key
     if len(keys) == 1:
         return keys[0].key
-    raise ResourceServerAuthError("invalid_token", "No matching JWK found.")
+    raise ResourceServerAuthError("invalid_token", AuthMessage.NO_MATCHING_JWK)
 
 
 def _claim_scopes(claims: Mapping[str, Any]) -> list[str]:
@@ -626,7 +918,7 @@ def _decode_with_key(
         raise
     except (jwt.PyJWTError, TypeError, ValueError) as exc:
         raise ResourceServerAuthError(
-            "invalid_token", "Token could not be verified with the published key."
+            "invalid_token", AuthMessage.KEY_CANNOT_VERIFY_TOKEN
         ) from exc
 
 
@@ -641,16 +933,18 @@ def validate_resource_server_token(
 ) -> ResourceServerTokenClaims:
     """Validate an AS-issued JWT for PMCP Resource Server mode."""
     if not token:
-        raise ResourceServerAuthError("invalid_token", "Missing bearer token.")
+        raise ResourceServerAuthError("invalid_token", AuthMessage.EMPTY_TOKEN)
     try:
         header = jwt.get_unverified_header(token)
         algorithm = header.get("alg")
         if not isinstance(algorithm, str) or algorithm.lower() == "none":
             raise ResourceServerAuthError(
-                "invalid_token", "Unsupported token algorithm."
+                "invalid_token", AuthMessage.TOKEN_ALGORITHM_UNSUPPORTED
             )
         if jwks is None:
-            raise ResourceServerAuthError("invalid_token", "JWKS URL is required.")
+            raise ResourceServerAuthError(
+                "invalid_token", AuthMessage.JWKS_URL_REQUIRED
+            )
         signing_key = _select_jwk_key(token, jwks)
         claims = _decode_with_key(
             token,
@@ -662,22 +956,26 @@ def validate_resource_server_token(
     except ResourceServerAuthError:
         raise
     except jwt.InvalidAudienceError as exc:
-        raise ResourceServerAuthError("invalid_token", "Invalid audience.") from exc
+        raise ResourceServerAuthError(
+            "invalid_token", AuthMessage.INVALID_AUDIENCE
+        ) from exc
     except _FIXED_TEXT_CLAIM_ERRORS as exc:
         # pyjwt's text for these is fixed (or names a claim from PMCP's own
         # required list), so it is safe to keep as the description.
-        raise ResourceServerAuthError("invalid_token", str(exc)) from exc
+        raise ResourceServerAuthError("invalid_token", pyjwt_text(exc)) from exc
     except jwt.InvalidTokenError as exc:
         # Every other token error may quote the token back (pyjwt names an
         # unknown `crit` extension, for one), so the description is fixed.
-        raise ResourceServerAuthError("invalid_token", "Invalid token.") from exc
+        raise ResourceServerAuthError(
+            "invalid_token", AuthMessage.INVALID_TOKEN
+        ) from exc
 
     scopes = _claim_scopes(claims)
     missing_scopes = sorted(set(required_scopes or []) - set(scopes))
     if missing_scopes:
+        scope_names = " ".join(missing_scopes)
         raise ResourceServerAuthError(
-            "insufficient_scope",
-            "Missing required scope(s): " + " ".join(missing_scopes),
+            "insufficient_scope", AuthMessage.MISSING_SCOPES, scopes=scope_names
         )
     raw_audience = claims.get("aud")
     audiences = raw_audience if isinstance(raw_audience, list) else [raw_audience]
@@ -718,7 +1016,9 @@ def sanitize_url_elicitation_url(
             url, allow_loopback_http=provenance == "operator"
         )
     except ValueError as exc:
-        raise ValueError("Invalid URL-mode elicitation URL.") from exc
+        raise ValueError(
+            render_auth_message(AuthMessage.ELICITATION_URL_INVALID)
+        ) from exc
 
 
 def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> str:
