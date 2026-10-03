@@ -4,6 +4,42 @@
 > `plan/298-task-bounds`. Every number below was measured on that tree, or on
 > the spike of this plan applied to it. The spike was then removed, and this PR
 > carries only this file.
+>
+> **Revision 2 (2026-10-03), on main `89559db`.** This revision answers
+> board round 1 on PR 329. Codex raised two blocking findings, B1 and B2. The
+> claude seat raised seven non-blocking ones, N1 to N7, and all seven are
+> taken. The rest of this note lists what changed and where.
+>
+> **B1, #297 composition.** #297's tests expected a malformed task hint to
+> raise. Under this plan it is dropped instead, so 75 of those tests failed,
+> and two passed without exercising anything.
+> - The fixes are in Design decision 10: each fixture moves to a field that
+>   still rejects, and the downstream sweep flips to the new invariant.
+> - Measured: #297 + #298 was applied to a fresh main in both orders. Both
+>   produce byte-identical trees, and 12 modules give 1506 passed, 0 failed.
+>
+> **B2, recording.** An unusable `lastUpdatedAt` used to become the current
+> time when the task was recorded. It now stays `null` through recording, and
+> eviction has a stated rule (Design decision 6).
+>
+> **The seven non-blocking findings:**
+> - **N1:** a non-string `status` is dropped instead of raising.
+> - **N2:** a whole-number float `ttl` (`300000.0`) is kept as an int.
+> - **N3:** a new `unusable_fields` list tells "unusable" apart from the MCP
+>   `null`, which means "unlimited". The `raw` claim is corrected.
+> - **N4:** the fire-and-forget writer and `_send_initialize` now have tests
+>   and mutants, and so do non-finite *string* timestamps.
+> - **N5:** the M6 claim is corrected.
+> - **N6:** a note for Consiliency/pmcp#330.
+> - **N7:** the encoder now fails closed on anything that is not strict JSON.
+>
+> Re-measured:
+> - the spike, the new module (on the patched tree and on main), and the 7
+>   touched modules;
+> - the mutation table, now 25 mutants, all killed;
+> - the full suite, once.
+>
+> Revision 1 was `b0bfe07`.
 
 ## Task
 
@@ -161,6 +197,37 @@ The rules:
     keeps a NaN in a `float` field as a Python NaN, which the server then
     writes as `NaN` with `json.dumps(result)` (`server.py:464`). In the
     `dict[str, Any]` `raw`, the same dump turns NaN into `None`.
+- **A non-numeric field fails the same way (rev 2, N1).** `status` reaches
+  `McpTaskInfo` unguarded. `status_message` is guarded with `isinstance(…,
+  str)`. A downstream `status: 5` (or NaN, `true`, a list or an object)
+  raises `ValidationError` after the downstream created the task. The effects
+  are:
+  - the record is lost;
+  - the error echoes `input_value=5`;
+  - a whole `tasks/list` fails because of one bad entry;
+  - so does `tasks_cancel`.
+
+  No other non-numeric task field can raise this way:
+  - `taskId` is checked with `isinstance(…, str)`, and the payload is
+    dropped if it fails;
+  - `statusMessage` is guarded the same way;
+  - `raw` is the payload `dict` itself.
+- **Recording substitutes a value (rev 2, B2).**
+  - `_record_task` (`manager.py:1736`) writes
+    `updated_at=task_info.updated_at or time.time()`. With the field-level
+    drop, an unusable `lastUpdatedAt` (NaN) would become `None` and then the
+    *current time*. Callers would see that time, and it would drive eviction.
+    The `or` also replaces a legitimate `0.0`.
+  - `_evict_terminal_tasks` (`manager.py:1764`) sorts on
+    `updated_at or 0.0`.
+  - `created_at` keeps the *first* recorded value, even when that one was
+    `None` and a later payload carries a usable one.
+  - `ttl` and `poll_interval` are copied as they are. The other `or`s in
+    `_record_task` (`tool_id`, `requestor_context`) are not task hints.
+- **A whole-number float `ttl` (rev 2, N2).** On main, a downstream
+  `ttl: 300000.0` is stored as `300000`, because pydantic accepts an integral
+  float for `int`. Draft 2020-12 calls it an integer too. A plain
+  `type(value) is int` rule would wrongly drop it.
 
 ### Out of the class (stated so nobody re-derives it)
 
@@ -209,7 +276,12 @@ The downstream `McpTaskInfo` fields are measured through
 |---|---|---|---|---|---|---|---|---|---|---|
 | `ttl` → `ttl` | kept −5 | kept 0 | **ValidationError** (call fails, task lost) | kept as 1 | kept (401 digits) | **ValidationError** | kept as 5 | n/a | **ValidationError** | non-bool int in [0, 2^63−1] is kept; anything else becomes `None` |
 | `pollInterval` → `poll_interval` | kept −5.0 | kept 0.0 | **kept nan / ±inf** | kept as 1.0 | **ValidationError** | kept | kept as 5.0 | n/a | kept | non-bool int/float, finite and > 0, is kept; anything else becomes `None` |
-| `createdAt` / `lastUpdatedAt` → `created_at` / `updated_at` | kept | kept | **kept nan / ±inf** | kept as 1.0 | **bare `OverflowError`** | kept | kept as 5.0 | parsed | kept | finite number or parseable string is kept; NaN, ±Inf, bool, overflow, unparseable or a non-scalar becomes `None` |
+| `createdAt` / `lastUpdatedAt` → `created_at` / `updated_at` | kept | kept | **kept nan / ±inf** | kept as 1.0 | **bare `OverflowError`** | kept | kept as 5.0 | parsed | kept | finite number or parseable (finite) string is kept; NaN, ±Inf, `"nan"`/`"1e400"`, bool, overflow, unparseable or a non-scalar becomes `None` |
+| `status` → `status` (rev 2, N1) | — | — | **ValidationError** | **ValidationError** | **ValidationError** | **ValidationError** | kept | — | **ValidationError** | any string is kept; anything else becomes `None` |
+
+In every "After" cell, "becomes `None`" also means the field is named in
+`unusable_fields` (rev 2, Design decision 6). A whole-number float `ttl`
+(`300000.0`) is kept as `300000`, as on main (N2).
 
 ### The test surface this touches
 
@@ -230,6 +302,44 @@ string argument. It found the spike's first version of the new exception,
 whose `__init__` took no argument: 26 red. So a new exception class must keep
 the standard one-argument constructor (Design decision 8).
 
+**#297's tests rely on a malformed task hint raising (rev 2, B1).** The
+affected set was derived by searching every test file that #297 adds or
+changes (`git diff 89559db 0a93265 --name-only -- tests/`) for each task
+field this plan changes:
+- `ttl`, `poll_interval`/`pollInterval`;
+- `created_at`/`createdAt`, `updated_at`/`lastUpdatedAt`;
+- `status`;
+- `McpTaskInfo`, `_task_info_from_payload`, `_record_task`, `parse_timestamp`.
+
+Measured: main + #298 rev 2, then #297 (`0a93265`) applied on top. These 6
+modules failed **75** tests and passed 570:
+- `test_argument_error_echo.py`
+- `test_downstream_frame_echo.py`
+- `test_log_record_scrubber.py`
+- `test_parse_error_echo.py`
+- `test_exception_text_sinks.py`
+- the new module
+
+The failures:
+
+| #297 test | Failed | Why |
+|---|---|---|
+| `test_log_record_scrubber.py::test_exc_info_is_scrubbed_on_any_logger` | 48 | `_validation_error` builds `McpTaskInfo(ttl={"v": s})`, which no longer raises (`AssertionError: no validation error`) |
+| `test_log_record_scrubber.py::test_percent_args_are_scrubbed_however_nested` / `…msg_that_is_an_exception…` / `…stack_info…` | 6 / 1 / 1 | same fixture |
+| `test_argument_error_echo.py::test_describe_exception_renders_a_grouped_validation_error_structurally` | 6 | `pytest.raises(ValidationError)` around `ttl={"v": s}`: DID NOT RAISE |
+| `test_parse_error_echo.py::test_no_timestamp_site_echoes_its_input` | 6 | `McpTaskInfo(created_at="2026-13-99T…")` no longer raises |
+| `test_downstream_frame_echo.py::test_a_wrapped_handler_keeps_the_wire_code` | 3 | `invalid()` uses `ttl: s` ("did not reject") |
+| `test_argument_error_echo.py::test_no_downstream_value_reaches_a_response_log_or_audit` | 2 | `_task_positions()` finds no rejecting position (`assert len(positions) > 10`) |
+| `test_argument_error_echo.py::test_a_validation_error_raised_by_a_handler_is_described_not_echoed` / `…connect_failure…` | 1 / 1 | `created_at: [s]` and `ttl: {"v": s}` no longer raise |
+
+**Two passed without exercising anything.** Both are worse than a failure:
+- `test_exception_text_describes_a_wrapper_that_embeds_a_validation_error`.
+  `McpTaskInfo(ttl=s)` does not raise, so the `except RuntimeError` arm and
+  its assertions never run.
+- `test_no_malformed_frame_value_reaches_pmcps_output` for `tasks/*`.
+  `ttl: s` is now *accepted*, so the sweep's "accepted → the response may
+  carry it" exemption applies, and the rejection path is never reached.
+
 ### Backward compatibility, measured
 
 These existing tests and docs were grepped for values the new bounds refuse
@@ -245,16 +355,23 @@ These existing tests and docs were grepped for values the new bounds refuse
 These behaviour changes are visible:
 1. `invoke.task.ttl` now refuses ≤ 0, and values in (2^53−1, 2^63−1].
 2. `invoke.task.poll_interval` now refuses ≤ 0, NaN, ±Inf and > 2^53−1.
-3. A downstream task hint that cannot be used now reads as `null` instead of:
-   - a coerced value (`"5"` → 5, `true` → 1);
-   - a stored NaN, negative or zero;
-   - a failed call.
-4. Any outbound frame that carries NaN or ±Inf in opaque arguments or metadata
-   now fails the call. Before, such a frame went out as `NaN` on stdio and
-   silently as `null` on remote.
+3. A downstream `ttl`, `pollInterval`, `createdAt`, `lastUpdatedAt` or
+   `status` that cannot be used now reads as `null`, and its field is named in
+   the new `unusable_fields` list. Before, it was one of:
+   - coerced (`"5"` → 5, `true` → 1);
+   - stored as NaN, negative or zero;
+   - a failed call that lost the task.
 
-With the final spike applied, these run 1034 tests: **1030 passed, 4
-skipped, 0 failed** (the 4 skips are the spike's own, Design decision 6):
+   A whole-number float `ttl` stays an int, as on main.
+4. Every task object gains `unusable_fields: []`. This is additive, and no
+   existing test compares a whole task dump.
+5. Any outbound frame that is not strict JSON (NaN, ±Inf, a non-JSON type, a
+   cycle) now fails a request, or is dropped and logged for a fire-and-forget
+   frame. Before, NaN went out as `NaN` on stdio and silently as `null` on
+   remote.
+
+With the rev 2 spike applied, these run 1081 tests: **1081 passed, 0
+skipped, 0 failed**:
 - `tests/test_gateway_tool_schemas.py`
 - `tests/test_tools.py`
 - `tests/test_client_manager.py`
@@ -263,9 +380,8 @@ skipped, 0 failed** (the 4 skips are the spike's own, Design decision 6):
 - `tests/test_server.py`
 - the new module
 
-The spike's first version made 26 scoped-audit tests fail, through the
-exception constructor above. No existing test needed a change, except the
-snapshot, which was regenerated.
+No existing *main* test needed a change, except the snapshot, which was
+regenerated. #297's tests need the migration in Design decision 10.
 
 ## Design decisions (made explicitly)
 
@@ -379,47 +495,81 @@ and echoes.
 Every caller path runs the gate first (`_handle_call_tool`), so `true` cannot
 reach the model from a caller. A test pins the gate's refusal per field.
 
-### 6. Downstream values are dropped to `None` per field: not clamped, not refused
+### 6. Downstream values are dropped to `None` and named in `unusable_fields`: not clamped, not refused
 
-`McpTaskInfo` gains `mode="before"` validators:
-- `_usable_ttl`: keeps a non-bool `int` in [0, 2^63 − 1], and returns `None`
-  otherwise.
-- `_usable_poll_interval`: keeps a non-bool `int`/`float` that is finite and
-  greater than 0, and returns `None` otherwise. A huge int overflows `float()`
-  and becomes `None`.
-- `_normalize_task_timestamp`: keeps a finite number, or a numeric or ISO
-  string that parses to one. It returns `None` for:
-  - a bool;
-  - NaN or ±Inf;
-  - a value that overflows `float()`;
-  - an unparseable string;
-  - any other type. On main, a non-scalar fell through to pydantic and raised.
+**Mechanism (rev 2).** `McpTaskInfo` gets one `model_validator(mode="before")`,
+`_drop_unusable_hints`. It replaces rev 1's three field validators, and it
+runs a check for each field:
 
-The downstream bounds are wider than the caller's. Spec `Task.ttl` 0 can mean
-"already expired", so it is kept, and the upper bound is int64. pmcp only
-reports these values. They are not forwarded, so the I-JSON bound does not
-apply.
+| Field | Kept when | Notes |
+|---|---|---|
+| `ttl` | a non-bool `int` in [0, 2^63 − 1] | Also a **finite whole-number float**, converted to `int`, so `300000.0` → `300000` as on main (N2). The upper bound is int64, not I-JSON: pmcp only reports this value, it does not forward it. Spec `Task.ttl` 0 can mean "already expired", so 0 is kept. |
+| `poll_interval` | a non-bool `int`/`float`, finite and > 0 | A huge int overflows `float()` and is unusable. |
+| `created_at`, `updated_at` | a finite number, or a numeric or ISO 8601 string that parses to one (a `datetime` as is) | Unusable: a bool, NaN, ±Inf, a value that overflows `float()`, a **non-finite numeric string** (`"nan"`, `"1e400"`, `"-inf"`, N4), an unparseable string, or a non-scalar. On main, a non-scalar fell through to pydantic and raised. |
+| `status` (N1) | any `str` | An unknown future status is kept, as the tenant contract requires. A non-string is unusable. |
 
-**Why not refuse.** Refusing the payload is what main does by accident, and
-measured, it loses a task the downstream already created. It also renders the
+A field that holds an unusable value becomes `None`, and its name is
+appended to the new public field `unusable_fields: list[str]`.
+
+An *absent* value is not unusable. Neither is an explicit `None`. In both
+cases the field stays `None` and is **not** named.
+
+The validator is idempotent. `_sanitize_task_for_output` dumps the task and
+validates it again, and `unusable_fields` survives that round trip.
+
+**Representation of "unusable" (N3).** In MCP 2025-11-25, `Task.ttl: null`
+means **unlimited**. Reporting `null` for "the downstream sent something
+pmcp could not read" would therefore mislead. These options were rejected:
+- **Omitting the key.** It changes the output's shape per task, and
+  pydantic's dump has no per-instance exclude.
+- **A sentinel value.** It is not the downstream's value either.
+
+`unusable_fields` keeps every field's type and adds one structural fact: the
+field *names*, never the values. So a `null` `ttl` not named there keeps the
+MCP meaning, and a `null` `ttl` named there means "unusable".
+
+**`raw` is not a faithful copy.** The output path dumps with `mode="json"`,
+so `raw`'s NaN and ±Inf become `null` as well. Rev 1's CHANGELOG said
+otherwise; that is now corrected. `raw` carries the downstream's *finite*
+values as sent.
+
+**Recording (B2).** `_record_task` no longer substitutes values:
+
+| Field | Public value | Rule |
+|---|---|---|
+| `updated_at` | the downstream's usable value | |
+| | `None` | when it was unusable (named in `unusable_fields`) |
+| | pmcp's observation time | **only when the downstream sent none at all.** This is main's behaviour for a non-conformant downstream. It is decided with `is None`, not `or`, so a usable `0.0` is kept. |
+| `created_at` | the **first usable** value pmcp saw | A later usable value fills an earlier `None`, and `created_at` then leaves `unusable_fields`. On main, a first `None` stuck. |
+| `ttl`, `poll_interval`, `status` | as normalised | |
+
+**Eviction rule (B2).**
+- `_evict_terminal_tasks` orders terminal records oldest first by
+  `updated_at` when that is not `None`.
+- Otherwise it uses the record's private `_recorded_at`, a pydantic
+  `PrivateAttr` that is never serialised and is set to `time.time()` on every
+  `_record_task`.
+
+So a task whose `lastUpdatedAt` was unusable sorts as "last seen by pmcp".
+It does not sort as the oldest possible (`or 0.0`), which would evict it
+first. This is the same ordering main's `or time.time()` gave, and it no
+longer leaks into the public field.
+
+The ordering mixes the downstream's clock with pmcp's, as main already did.
+That is stated, not fixed: eviction is a count cap on *terminal* records.
+
+**Why not refuse.** Refusing the payload is what main does by accident. As
+measured, it loses a task the downstream already created, and it renders the
 downstream's value in the error. A hint the downstream got wrong does not
 make the task unusable.
 
 **Why not clamp.** pmcp does not act on `pollInterval` or `ttl` (Research
-summary). It *reports* them. A clamped value would misreport what the
-downstream said. `None` honestly means "the downstream gave no usable hint",
-and `raw` still carries what was sent.
+summary); it only *reports* them. A clamped value would misreport what the
+downstream said.
 
-**`updated_at` is load-bearing, not cosmetic.** It drives
-`_evict_terminal_tasks`' sort, so a NaN would make eviction order undefined.
-
-**No log line.** Dropping is silent by design: logging the value would be an
-echo, and logging only the type adds nothing that `raw` does not already
-show. No validator raises, so nothing can interpolate a value.
-
-The spike's downstream test **skips** 4 cases on purpose: a negative and a
-numeric-string *timestamp* are usable timestamps. The implementer may split
-those into a separate parameter list instead of skipping them.
+**No log line.** A log line would either echo the value or add nothing that
+`unusable_fields` does not already state. No check raises, so nothing can
+interpolate a value.
 
 ### 7. Guard against a future polling loop: no loop exists, so there is no clamp helper
 
@@ -455,72 +605,78 @@ moment to clamp. A loop that sleeps on a downstream hint must use
 The rule is written here, not as code. Nothing would call a helper yet, and a
 helper with no caller has no test that could fail.
 
-Measured: mutant M14 adds `await asyncio.sleep(task_info.poll_interval or 0)`
+Measured: mutant M15 adds `await asyncio.sleep(task_info.poll_interval or 0)`
 to `get_task`. It turns *both* guard tests red (see the mutation table).
 
 ### 8. Outbound frames are strict JSON on every transport, and the scope of that
 
 A module-level `_encode_outbound_frame(payload) -> str` in
-`client/manager.py` runs `json.dumps(payload, allow_nan=False)`. On
-`ValueError` it raises `NonFiniteOutboundNumber(_NON_FINITE_OUTBOUND)`, a
-`ValueError` subclass with the fixed message "outbound frame carries a
-non-finite number".
+`client/manager.py` runs `json.dumps(payload, allow_nan=False)`. Rev 2 (N7)
+widens what it catches to `ValueError` (NaN, ±Inf, a cycle), `TypeError` (a
+value `json` cannot encode, such as a `datetime`, `bytes` or a model) and
+`RecursionError`. Any of them raises `OutboundFrameNotJson(_OUTBOUND_NOT_JSON)`:
+- the class is a `ValueError` subclass;
+- the message is fixed: "outbound frame is not strict JSON";
+- it is raised `from None`, so no chained exception carries the value.
+
+That is the fail-closed, value-free error N7 asked for.
+
+**What N7 changes on remote.** Before, the SDK's `model_dump(mode="json")`
+serialised a non-JSON-native param, for example by turning a `datetime` into
+an ISO string. Now pmcp refuses it. No call site builds such params: a full
+read of the callers found only JSON-parsed caller data and pmcp constants,
+and stdio has always refused them, with a `TypeError` whose message names
+only the type. One encoder rule now covers both transports. On remote, the
+check costs one extra `json.dumps` per frame.
 
 All three writers use it:
-- The stdio branch writes its result.
-- The remote branch calls it first, as a check, before handing the dict to
-  the SDK. The SDK would otherwise turn NaN into `null`.
+- **`_send_request`.** stdio writes the result. Remote calls it first, as a
+  check, before `validate_python`. The write sits inside the `try`, whose
+  `finally` pops the pending entry (C-02). The caller gets the invoke
+  handler's error arm with the fixed message.
+- **`_send_message_to_downstream`** (fire-and-forget: replies to
+  downstream-initiated requests and `notifications/cancelled`). Both branches
+  are encoded the same way. Its contract (its docstring, `manager.py:3206`) is
+  to log and swallow every write failure, so a non-JSON frame is **not
+  written** and does **not raise**. A DEBUG line goes through
+  `describe_exception`, which renders the constant message and echoes
+  nothing. For a relayed *reply*, the downstream waits on its own request.
 
-**Why the encoder and not the gate.** It is the one place every forwarded
-value passes, whatever its origin: caller `arguments`, `task.metadata`,
-`_meta`, `requestor_context`, or a value pmcp computed itself.
+  These frames are built only from a downstream id (already filtered to
+  `str|int`), method-not-found constants, and pmcp's own int request ids. No
+  float can enter them, so this case is unreachable today.
+- **`_send_initialize`.** stdio encodes its constant `notifications/initialized`
+  frame with the encoder. Its remote branch sends that constant without a
+  check.
 
-**It fails cleanly.** The write sits inside `_send_request`'s `try`, whose
-`finally` pops the pending entry (C-02). Measured: nothing is written,
-`pending_requests == {}`, and the caller gets the invoke handler's error arm
-with the fixed message.
+**Tests for every hunk (N4).**
+- `test_a_fire_and_forget_frame_carrying_nan_is_dropped_not_written[stdio|remote]`
+  covers the fire-and-forget writer: NaN → nothing written and no raise; a
+  clean frame → written.
+- `test_every_downstream_writer_encodes_through_the_strict_encoder` is a
+  static check. Every function in `client/manager.py` that calls
+  `stdin.write` must call `_encode_outbound_frame` and never `json.dumps`.
+  It pins `_send_initialize`, whose frame no test can make non-JSON.
+- Mutants M16–M18 cover these hunks; rev 1's C2, C3 and C6 survived.
 
 **This is a behaviour change, and it is the decision the maintainer most
-needs to see.** On main, a caller who puts NaN in `invoke.arguments`:
-- gets it delivered to a *Python* stdio downstream, which accepts the bare
-  `NaN`;
-- gets it delivered to a remote downstream as `null`;
-- gets a hang until timeout from a strict-JSON stdio downstream, such as
+needs to see.** On main, a caller who puts NaN in `invoke.arguments` has it:
+- delivered to a *Python* stdio downstream, which accepts the bare `NaN`;
+- delivered to a remote downstream as `null`;
+- turned into a hang until timeout by a strict-JSON stdio downstream, such as
   Node's `JSON.parse`.
 
-After this plan, all three cases fail at once, with the same error.
-This applies to requests (`_send_request`). The fire-and-forget writer is
-described below.
-JSON-RPC 2.0 is defined over JSON, so the old behaviour was undefined.
+After this plan, all three requests fail at once, with the same error.
+JSON-RPC 2.0 is defined over JSON. To ship #298 without this change, drop
+the `client/manager.py` encoder hunks and their four tests. Decisions 2 to 7
+do not depend on them.
 
-To ship #298 without this change, drop the `client/manager.py` hunk and its
-two tests. Decisions 2 to 7 do not depend on it.
-
-**The fire-and-forget writer is different.** `_send_message_to_downstream`
-carries frames pmcp originates and does not wait on: replies to
-downstream-initiated requests, and `notifications/cancelled`. Its contract
-(its docstring, `manager.py:3206`) is to log and swallow every write failure,
-so that a dead pipe tears nothing down. Its `except Exception` also wraps the
-new encoder call.
-
-On that path, a non-finite number therefore means the frame is **not
-written**, a DEBUG line records it, and the downstream sees nothing. For a
-relayed *reply*, that means the downstream waits on its own request. This is
-consistent with the writer's existing dead-pipe behaviour.
-
-The DEBUG line goes through `describe_exception`, which renders only the
-constant message, so it echoes nothing.
-
-pmcp builds these frames itself, and no caller value reaches them on main, so
-the case is theoretical. The spike leaves the writer's contract unchanged.
-
-**Constructor.** `NonFiniteOutboundNumber` keeps `ValueError`'s standard
+**Constructor.** `OutboundFrameNotJson` keeps `ValueError`'s standard
 constructor. `test_scoped_advisor_audit._raised_exceptions` builds every
-raised class with one string argument, and the spike's first version, with
-`__init__(self)` taking no argument, turned 26 of those red. The message is a
-module constant passed at the raise.
+raised class with one string argument, and rev 1's first version, with
+`__init__(self)` taking no argument, made 26 of those tests fail.
 
-### 9. Units (seconds in pmcp, milliseconds in MCP 2025-11-25) are out of scope; open a follow-up issue
+### 9. Units (seconds in pmcp, milliseconds in MCP 2025-11-25) are out of scope: Consiliency/pmcp#330
 
 Every bound above is unit-agnostic on purpose:
 - `ge=1` and `gt=0`;
@@ -535,66 +691,98 @@ Changing what pmcp *means* by `ttl` and `poll_interval` touches three things:
 That is a separate behaviour change with its own compatibility question,
 which is why this plan does not make it.
 
-**Recommended follow-up issue:** "task.ttl / task.poll_interval are
-documented in seconds but forwarded unchanged into MCP fields defined in
-milliseconds". The plan does not file it, because filing is outward-facing.
-`gh issue list --search "milliseconds ttl"` found no existing issue.
+**Follow-up:** rev 1 recommended an issue, and it is now filed as
+Consiliency/pmcp#330.
 
-### 10. Messages: no new validator interpolates a value, under either merge order
+**For Consiliency/pmcp#330 (N6).** Only the *lower* bounds (`ge=1`, `gt=0`)
+are unit-agnostic. If #330 converts seconds to milliseconds by multiplying by
+1000 before forwarding, the caller's upper bound must fall to
+`floor((2^53 − 1) / 1000)` = 9,007,199,254,740 for both fields. Otherwise
+the forwarded value leaves the I-JSON range. Note this on #330.
 
-Every caller-side rule here is a `Field` constraint (`ge`, `gt`, `le`,
-`allow_inf_nan`) or the gate's type checker. **No custom validator raises.**
-The downstream validators return `None`, and the encoder raises with a
-constant.
+### 10. Composition with Consiliency/pmcp#297: messages, conflicts and test migrations, in both orders
 
-So the plan adds nothing to #297's `argument_error(TYPE)` constants. The one
-interaction is a phrase.
+**Messages.** Every caller-side rule in this plan is one of:
+- a `Field` constraint (`ge`, `gt`, `le`, `allow_inf_nan`);
+- the gate's type checker.
 
-**If #297 (PR 314) lands first:**
-- **Gate.** `describe_schema_error` already renders the new keywords from the
-  gateway's own schema node, with no value:
-  - `exclusiveMinimum`: `$.task.poll_interval: must be greater than 0`;
-  - `minimum`: `$.task.ttl: must be greater than or equal to 1`;
-  - `maximum`: `… must be less than or equal to 9007199254740991`;
-  - the finite check (`type`): `$.task.poll_interval: must be of type number,
-    null`.
-- **Model** (in-process callers only, such as `_task_wire_metadata`'s
-  `model_validate(dict)`). #297's `_FIXED_PHRASES` has no `finite_number`
-  entry, so it falls to `is invalid`. **Add `"finite_number": "must be a
-  finite number"` to `_FIXED_PHRASES` in `src/pmcp/argument_errors.py`.** It
-  is one line.
-- **Gate call.** #297's `server.py` patch rewrites the `except` body after
-  `jsonschema.validate(...)` (`describe_schema_error(e, tool.input_schema,
-  arguments)`). Re-apply `cls=GATE_VALIDATOR` on the `validate` line itself,
-  because #297 leaves that line alone.
-- **Timestamp validator.** #297 changes `_normalize_task_timestamp`'s ISO
-  branch to `parse_timestamp(candidate, source="task timestamp").timestamp()`.
-  Wrap #297's call in this plan's `try/except (ValueError, OverflowError):
-  return None`. If #297's `parse_timestamp` raises its own subclass, catch
-  that too. `parse_timestamp` is in #297's `src/pmcp/parsing.py`; read it on
-  merge. Keep the finite checks and the final `return None` from this plan.
-- **Sweeps.** #297's sweeps iterate the advertised schema's keywords, so they
-  pick up the new `exclusiveMinimum` and `maximum` with no change. Re-run
-  `tests/test_argument_error_echo.py` after the merge.
+No custom validator raises. The downstream checks return `_UNUSABLE`, and the
+encoder raises with a constant. So the plan adds nothing to #297's
+`argument_error(TYPE)` constants.
 
 **If #298 lands first:**
 - Gate text for the new bounds is jsonschema's `e.message`, for example
-  `Input validation error: -5 is less than the minimum of 1`, or
-  `nan is not of type 'number', 'null'`.
-- That is the same echo profile every existing numeric bound (`timeout_ms`,
-  `limit`) has on main. The value is the caller's own number, returned to
-  that caller only. It is not logged: the gate rejection logs nothing with
-  the value, and the #296 audit record is structural.
-- This plan adds **no new echo class** and does **not** re-implement a
-  renderer. #297 converts these messages when it lands, with the one
-  `finite_number` line above.
-- When #297 lands second, it must also:
-  - keep `cls=GATE_VALIDATOR` on its rewritten gate call;
-  - keep this plan's `try/except`, finite checks and fallthrough `return None`
-    when it changes the timestamp branch;
-  - add the `finite_number` phrase.
+  `-5 is less than the minimum of 1`. That is the echo profile every existing
+  numeric bound has on main: the caller's own number, returned to that caller
+  only, never logged, with a structural #296 audit record.
+- This plan adds **no new echo class**.
+- #297 converts these messages when it lands.
 
-  Put this list in PR 314's merge notes.
+**If #297 lands first:** `describe_schema_error` renders the new keywords
+from the gateway's own schema node, with no value. For example:
+- `$.task.poll_interval: must be greater than 0`;
+- `$.task.ttl: must be greater than or equal to 1`;
+- for NaN (`type`): `$.task.poll_interval: must be of type number, null`.
+
+**Composition, measured (rev 2, B1).**
+1. Two fresh worktrees were made: `pmcp-298-oA` from `0a93265` (#297's
+   code) and `pmcp-298-oB` from `89559db`.
+2. **Order A** applied this plan's rev 2 patch with `git apply --3way` onto
+   #297.
+3. **Order B** applied rev 2 to main, committed it, then applied
+   `git diff 89559db 0a93265` (#297) with `--3way`.
+4. Each order then took the resolutions and the test migration below.
+
+The two final trees are **byte-identical** (`diff -r` of `src/` and
+`tests/`). On each, these 12 modules gave **1506 passed, 0 failed**, in 304 s
+(A) and 313 s (B):
+- `test_argument_error_echo`, `test_downstream_frame_echo`,
+  `test_log_record_scrubber`, `test_parse_error_echo`,
+  `test_exception_text_sinks`;
+- the new module, `test_gateway_tool_schemas`, `test_client_manager`,
+  `test_tools`, `test_scoped_advisor_audit`, `test_server`,
+  `test_phase6_tenant_code_mode`.
+
+**Source resolutions.** These are the same in both orders. Only the side
+that "lands second" differs.
+
+| File | Conflict | Resolution |
+|---|---|---|
+| `src/pmcp/server.py` | #297 widens the `from pmcp.tools.handlers import (...)` line (adds `GATEWAY_TOOL_INPUT_MODELS`); #298 adds `from pmcp.tools.schema import GATE_VALIDATOR` after it | Keep #297's import block and add #298's line after it. The `jsonschema.validate(..., cls=GATE_VALIDATOR)` call merges cleanly: #297 rewrites only the `except` body |
+| `src/pmcp/types.py` | #297 rewrites `_normalize_task_timestamp`'s ISO branch to `parse_timestamp(...)`; #298 removes that validator (rev 2's `_usable_task_timestamp` replaces it) | Keep #298's `_drop_unusable_hints` and helpers, and drop #297's field validator. In `_usable_task_timestamp`, call `parse_timestamp(candidate, source="task timestamp").timestamp()` inside `try … except (ValueError, OverflowError, OSError): return _UNUSABLE`. `TimestampParseError` subclasses `ParseError(ValueError)`, so it is caught (read in `0a93265:src/pmcp/parsing.py`), and #297's helpers-only rule for parse sites stays satisfied |
+| `src/pmcp/argument_errors.py` | — | Add `"finite_number": "must be a finite number"` to `_FIXED_PHRASES`, after `float_parsing`. Without it, an in-process `finite_number` reads `is invalid` |
+
+The sink guard `tests/test_exception_text_sinks.py` passes with the encoder's
+`except (ValueError, TypeError, RecursionError)`. That arm renders nothing:
+it raises a constant `from None`.
+
+**Test migration** (*Verbatim bodies → #297 test migration*). The rule is to
+keep every rejection test rejecting, by moving its input to a `McpTaskInfo`
+field that still refuses:
+- `task_id`, which must be a string;
+- `status_message`, which is `str | None` in the model;
+- `raw`, which must be a dict.
+
+Where a test's subject is no longer a rejection, it asserts the new
+invariant instead of passing without exercising anything.
+
+| #297 test | Migration |
+|---|---|
+| `test_log_record_scrubber.py::_validation_error` and its 4 users | `{"task_id": "t", "ttl": {"v": s}}` → `{"task_id": {"v": s}}`; `$.ttl` → `$.task_id` |
+| `test_argument_error_echo.py::_handler_validation_errors` | `"created_at": [s]` → `"status_message": [s]`; the expected text's `$.created_at` → `$.status_message` |
+| `…::test_exception_text_describes_a_wrapper…`, `…::test_describe_exception_renders_a_grouped…`, `…::test_a_connect_failure_carrying_a_validation_error…` | `ttl` fixtures → `{"task_id": {"v": s}}`; `$.ttl: must be an integer` → `$.task_id: must be a string`. The first was a pass that exercised nothing; it now exercises its assertions |
+| `test_downstream_frame_echo.py::test_a_wrapped_handler_keeps_the_wire_code` | `{"task_id": "t", "ttl": s}` → `{"task_id": "t", "raw": s}`. The rejected input must be `s` *itself*: `mcp_data_carries` drops `data` only when it carries the rejected input. With `task_id: {"v": s}`, that case failed 3/3 (measured) |
+| `test_downstream_frame_echo.py` `invalid_payload` for `tasks/*` | `"ttl": s` → `"taskId": bad`. A malformed `taskId` is still refused (`tasks/get` → `Task not found: …`, with the caller's ids only) or skipped (`tasks/list`), and it is never rendered. That is stronger than rev 1's input, whose sentinel was accepted and exempted as the response product |
+| `test_parse_error_echo.py::test_no_timestamp_site_echoes_its_input` | The `McpTaskInfo(created_at=s)` lambda → `parse_timestamp(s, source="task timestamp")`, which keeps the parse helper's coverage. A new assertion states that the task site no longer raises at all: `created_at is None` and `unusable_fields == ["created_at"]` |
+| `test_argument_error_echo.py::_task_positions` and `test_no_downstream_value_reaches_a_response_log_or_audit` | The sweep's subject flips. Before: "a rejected downstream task value renders structurally". After: "**no** key × shape the parser reads is rejected, and no channel but the response carries the value". `_task_positions` returns every (key, shape) except the identifier keys `taskId`/`task_id` (§9: identifiers are kept and audited by design). Per call, the sweep asserts: the downstream was reached; `"validation error" not in` the response; no leak in log, streams, warnings, audit or the audit-event buffer; and a pair differential on every channel except the response and the audit's `redacted_result_digest`, which is a digest of the accepted result by design (`_audit_without_result`). Both exclusions were found by running: `taskId` = string leaked into the event buffer as the task id, and the result digest differed for `createdAt`. Measured: the counts assertion `expected > len(calls) × len(positions)` holds |
+
+**Who carries the migration:**
+- **If #297 lands first**, #298's implementation PR carries the migration
+  patch and the `finite_number` line, and resolves `types.py` and
+  `server.py` as above.
+- **If #298 lands first**, #297's PR (314) must carry the same migration
+  patch and phrase, and resolve the same two conflicts. Put the table above
+  in PR 314's merge notes.
 
 ### 11. Consiliency/pmcp#236 piece B (`extra="forbid"`)
 
@@ -609,11 +797,14 @@ Piece B's own test that the gate and model agree on unknown keys runs through
 
 ## Changes
 
-These are the spike's patches, verbatim under *Verbatim bodies*. Source:
-5 files, +119 / −19. The new test module is ~500 lines.
+These are the rev 2 spike's patches, verbatim under *Verbatim bodies*.
+- Source and fixture: 5 files, +233 / −42.
+- The new test module: 651 lines, 20 tests (215 cases).
+- The #297 test migration is a separate patch: 5 files, +63 / −45. It
+  applies in whichever order lands second (Design decision 10).
 
-### `src/pmcp/types.py` (modify, +64 / −13)
-- `import math`.
+### `src/pmcp/types.py` (modify, +140 / −31)
+- `import math`, and `PrivateAttr` added to the pydantic import.
 - Constant `MAX_FORWARDED_TASK_NUMBER = 2**53 - 1`, above
   `GatewayArguments`, with a comment citing RFC 7493.
 - `TaskMetadataInput.ttl`: `ge=1, le=MAX_FORWARDED_TASK_NUMBER`. This
@@ -621,14 +812,19 @@ These are the spike's patches, verbatim under *Verbatim bodies*. Source:
   issues.
 - `TaskMetadataInput.poll_interval`: `gt=0, le=MAX_FORWARDED_TASK_NUMBER,
   allow_inf_nan=False`, with a comment.
-- `_INT64_MAX = 2**63 - 1`, and on `McpTaskInfo` the before-validators
-  `_usable_ttl` and `_usable_poll_interval`. `McpTaskRecord` inherits both.
-- `McpTaskInfo._normalize_task_timestamp`:
-  - refuse a bool;
-  - a non-finite or overflowing number becomes `None`;
-  - a numeric string must parse finite;
-  - the ISO parse is wrapped (`ValueError`/`OverflowError` → `None`);
-  - the fallthrough returns `None` instead of the raw value.
+- Before `McpTaskInfo`:
+  - `_INT64_MAX`;
+  - the `_UNUSABLE` sentinel;
+  - the checks `_usable_task_ttl`, `_usable_poll_interval`,
+    `_usable_task_timestamp` and `_usable_task_status`;
+  - the table `_TASK_HINT_CHECKS`.
+- `McpTaskInfo`:
+  - a docstring stating the `None`/`unusable_fields` meaning;
+  - a new field `unusable_fields: list[str] = Field(default_factory=list)`;
+  - `@model_validator(mode="before") _drop_unusable_hints`. It replaces the
+    old `_normalize_task_timestamp` field validator, whose ISO parse moves
+    into `_usable_task_timestamp`.
+- `McpTaskRecord`: `_recorded_at: float = PrivateAttr(default=0.0)`.
 
 ### `src/pmcp/tools/schema.py` (modify, +24)
 - `import math` and `import jsonschema`.
@@ -639,20 +835,28 @@ These are the spike's patches, verbatim under *Verbatim bodies*. Source:
 - `jsonschema.validate(instance=arguments, schema=tool.input_schema,
   cls=GATE_VALIDATOR)` at `server.py:313`.
 
-### `src/pmcp/client/manager.py` (modify, +23 / −3)
+### `src/pmcp/client/manager.py` (modify, +61 / −8)
 - Module level, after `_MAX_LISTING_PAGES`:
-  - `class NonFiniteOutboundNumber(ValueError)`;
-  - `_NON_FINITE_OUTBOUND`;
-  - `_encode_outbound_frame`.
-- `_send_message_to_downstream`, `_send_request` and `_send_initialize`:
-  - stdio: `json.dumps(x)` becomes `_encode_outbound_frame(x)`;
-  - remote: `_encode_outbound_frame(x)` runs as a check before
-    `validate_python`. `_send_initialize`'s remote branch sends a constant
-    pmcp built, and needs no check.
+  - `class OutboundFrameNotJson(ValueError)`;
+  - `_OUTBOUND_NOT_JSON`;
+  - `_encode_outbound_frame`, which catches `ValueError`, `TypeError` and
+    `RecursionError`.
+- The three writers (Design decision 8).
+- `_record_task`:
+  - `now = time.time()`;
+  - `created_at` keeps the first usable value;
+  - `unusable_fields` is carried over, minus a refilled `created_at`;
+  - `updated_at` follows the rule in Design decision 6, using `is None`, not
+    `or`;
+  - `record._recorded_at = now`.
+- `_evict_terminal_tasks`: the sort key is `updated_at`, or `_recorded_at`
+  when that is `None`.
 
 ### `tests/fixtures/gateway_tool_schemas.json` (regenerate, +4 / −2)
 - `poll_interval` gains `"exclusiveMinimum": 0, "maximum": 9007199254740991`.
 - `ttl`'s bounds become `"minimum": 1, "maximum": 9007199254740991`.
+- `unusable_fields` is *output*, not an argument, so the snapshot does not
+  change for it.
 - Generate it with `PMCP_UPDATE_SCHEMA_SNAPSHOT=1 uv run pytest
   tests/test_gateway_tool_schemas.py::test_advertised_schemas_match_snapshot`,
   then review the diff. It must be exactly those six lines.
@@ -663,41 +867,47 @@ These are the spike's patches, verbatim under *Verbatim bodies*. Source:
   sides and finite-checked at the gate by `GATE_VALIDATOR`
   (Consiliency/pmcp#298; `tests/test_task_numeric_bounds.py`)."
 - Change "Two classes stay open" to "One class stays open".
-- Leave every test unchanged. `test_ttl_range_agrees_between_gate_and_model`
-  still passes, as measured.
 
-### `tests/test_task_numeric_bounds.py` (create)
-
-The test file is given verbatim below. It contains:
+### `tests/test_task_numeric_bounds.py` (create, 651 lines)
 - **Caller.**
   - `test_gate_and_model_agree_per_field_and_failure_mode`: 8 fields × 11
     modes.
   - `test_gate_rejects_a_boolean_for_every_numeric_argument`.
-  - `test_task_hint_bounds`: the exact edges of both task fields.
+  - `test_task_hint_bounds`.
   - `test_a_non_finite_poll_interval_off_the_wire_is_refused_at_the_gate`.
-    It parses a real stdio line containing
-    `NaN`/`Infinity`/`-Infinity`/`1e400` with the SDK's
-    `jsonrpc_message_adapter`, then drives `_call_through_gate`.
 - **Schema.**
-  - `test_every_advertised_number_is_bounded_both_sides`, covering `number`
-    and `integer`.
-  - `test_every_float_argument_refuses_non_finite_values_in_the_model`, which
-    requires `AllowInfNan(False)` on every `float` field of every gateway
-    argument model.
+  - `test_every_advertised_number_is_bounded_both_sides`.
+  - `test_every_float_argument_refuses_non_finite_values_in_the_model`.
   - `test_gate_validator_refuses_non_finite_numbers_and_keeps_the_rest`.
-- **Downstream.**
-  - `test_an_unusable_downstream_task_hint_is_dropped_not_raised`: 4 fields ×
-    8 modes.
-  - `test_a_usable_downstream_task_hint_is_kept`.
-  - `test_a_created_task_with_unusable_hints_is_still_recorded`, driven
-    through `call_tool`.
+- **Downstream (rev 2).**
+  - `test_an_unusable_downstream_task_hint_is_dropped_not_raised`: 51
+    cases. It now includes `status` (N1) and non-finite numeric *string*
+    timestamps (N4), and asserts `unusable_fields`. There are no skips any
+    more; rev 1 had 4.
+  - `test_a_usable_downstream_task_hint_is_kept`: 10 cases, including
+    `ttl: 300000.0` → `300000` (N2), timestamps `-5` and `"5"`, an
+    `updated_at` of `0.0`, and a future status.
+  - `test_an_absent_ttl_is_not_an_unusable_one` (N3).
+  - `test_a_task_with_unusable_hints_is_recorded_and_reported_null` (B2):
+    5 cases × the invoke, get, list and cancel paths. It checks the
+    **returned/recorded** task, not the normalised info.
+  - `test_eviction_orders_a_task_without_a_usable_timestamp_by_when_pmcp_saw_it`
+    (B2).
+  - `test_created_at_keeps_the_first_usable_value_pmcp_saw`.
 - **No loop.**
   - `test_a_downstream_poll_interval_never_drives_a_pmcp_loop`.
   - `test_poll_interval_has_no_consumer_outside_the_allowlist`.
 - **Forwarded.**
-  - `test_outbound_frames_refuse_non_finite_numbers`.
-  - `test_a_request_carrying_nan_is_never_written`, for stdio and remote.
+  - `test_outbound_frames_refuse_anything_but_strict_json` (N7: NaN, ±Inf,
+    an object, `bytes`, a cycle; constant message; no chained cause).
+  - `test_a_request_carrying_nan_is_never_written[stdio|remote]`.
+  - `test_a_fire_and_forget_frame_carrying_nan_is_dropped_not_written[stdio|remote]`
+    (N4).
+  - `test_every_downstream_writer_encodes_through_the_strict_encoder` (N4).
   - `test_forwarded_task_hints_are_spec_shaped`.
+
+### #297's tests and `src/pmcp/argument_errors.py` (modify, whichever lands second; +63 / −45)
+- See Design decision 10 and *Verbatim bodies → #297 test migration*.
 
 ## Documentation impact
 
@@ -715,48 +925,65 @@ The test file is given verbatim below. It contains:
   > - The transport gate now treats `NaN` and `±Infinity` as non-numbers for
   >   every numeric argument. Both transports can deliver them, even though
   >   they are not JSON.
-  > - A downstream task's `ttl`, `pollInterval`, `createdAt` or `updatedAt`
-  >   that pmcp cannot use (non-finite, negative where that is meaningless, a
-  >   boolean, a string where a number is expected, or out of range) is now
-  >   reported as `null`. Before, it was coerced (`"5"` became 5, `true`
-  >   became 1), stored as given, or it failed the call after the downstream
-  >   had already created the task. The original value remains in the task's
-  >   `raw`.
-  > - pmcp no longer sends `NaN` or `±Infinity` to a downstream server. A
-  >   request whose `arguments` or task metadata contain one now fails with
-  >   `outbound frame carries a non-finite number`. A fire-and-forget frame
-  >   (a reply or a notification pmcp originates) that contains one is
-  >   dropped and logged, never written. Before, stdio servers
-  >   received a non-JSON `NaN` literal and HTTP/SSE servers silently received
-  >   `null`.
+  > - A downstream task's `ttl`, `pollInterval`, `createdAt`,
+  >   `lastUpdatedAt`/`updatedAt` or `status` that pmcp cannot use is now
+  >   reported as `null`, and its field name is listed in the task's new
+  >   `unusable_fields` array. "Cannot use" means non-finite, out of range, a
+  >   boolean, a string where a number is expected, or a non-string status.
+  >   Before, such a value was coerced (`"5"` became 5, `true` became 1),
+  >   stored as given, or it failed the call after the downstream had already
+  >   created the task.
+  >
+  >   A `null` `ttl` that is *not* listed in `unusable_fields` keeps its MCP
+  >   meaning: unlimited. The task's `raw` holds what the downstream sent,
+  >   except that non-finite numbers appear there as `null` too.
+  >
+  >   A task whose `lastUpdatedAt` was unusable now reports `updatedAt: null`
+  >   instead of the time pmcp recorded it.
+  > - pmcp no longer sends a downstream server anything that is not strict
+  >   JSON: `NaN`, `±Infinity`, or a value JSON cannot encode. A request whose
+  >   `arguments` or task metadata contain one now fails with `outbound frame
+  >   is not strict JSON`. A fire-and-forget frame (a reply or a notification
+  >   pmcp originates) that contains one is dropped and logged, never written.
+  >   Before, stdio servers received a non-JSON `NaN` literal, and HTTP/SSE
+  >   servers silently received `null`.
 
   Never write a closing keyword next to the number.
 - **`README.md`.** No change. Its task paragraph (`README.md:1401-1408`)
   names the fields without values or units.
-- **`specs/tenant-code-mode-host-contract.md`.** No change in this plan; the
-  units are the follow-up of Design decision 9. Optionally, at `:106`, add
-  that pmcp reports an unusable `pollInterval`/`ttl` as `null`. That is a
-  one-line clarification of what a tenant server sees, and not a contract
-  change.
+- **`specs/tenant-code-mode-host-contract.md`.** At `:106`, after "PMCP
+  forwards them when supplied and may surface returned values to clients",
+  add: "A returned value PMCP cannot use is surfaced as `null` and named in
+  the task's `unusable_fields`." This is a clarification of what a tenant
+  server's clients see, not a contract change. The units are the follow-up in
+  Design decision 9, Consiliency/pmcp#330.
 - **`SECURITY.md`.** No ledger row changes. Run
   `scripts/check_security_claims.py` and expect `OK`.
 
 ## Dependencies & order
 
 1. Independent of `main`. It applies to `89559db` as is.
-2. It is **independent of #297, in both orders.** Design decision 10 gives the
-   exact touch points: the `cls=` line, the timestamp `try`, and the
-   `finite_number` phrase. Prefer landing #297 first. Then this plan's gate
-   messages are structural from the first commit, and the merge is a
-   one-line phrase addition plus `cls=`.
+2. **Composes with #297 in both orders, but not for free.** Whichever lands
+   second carries:
+   - the two source resolutions (`server.py` import, `types.py` timestamp);
+   - the `finite_number` phrase;
+   - the #297 test migration.
+
+   All are given and measured in Design decision 10. Prefer landing #297
+   first: then this plan's gate messages are structural from the first
+   commit, and #298's implementation PR carries the migration. That migration
+   is a test-only patch to #297's modules plus one phrase line.
 3. It is **independent of #236 piece B.** Only the snapshot collides, and it
    is regenerated by whichever lands second.
-4. Within this plan, any order works. The `client/manager.py` hunk (Design
-   decision 8) is separable: if the maintainer declines the outbound
-   behaviour change, drop that hunk and
-   `test_outbound_frames_refuse_non_finite_numbers` and
-   `test_a_request_carrying_nan_is_never_written`. Nothing else depends on
-   them.
+4. Within this plan, any order works. The outbound encoder (Design decision 8)
+   is separable. If the maintainer declines that behaviour change, drop its
+   `client/manager.py` hunks and these four tests:
+   - `test_outbound_frames_refuse_anything_but_strict_json`;
+   - `test_a_request_carrying_nan_is_never_written`;
+   - `test_a_fire_and_forget_frame_carrying_nan_is_dropped_not_written`;
+   - `test_every_downstream_writer_encodes_through_the_strict_encoder`.
+
+   Keep the `_record_task` and `_evict_terminal_tasks` hunks.
 5. Write the documentation last.
 
 ## Verification
@@ -773,14 +1000,16 @@ unset npm_config_cache npm_config_store_dir pnpm_config_store_dir
 Apply *Verbatim bodies*:
 - `git apply` the source patch;
 - write the test module;
-- edit the docstring and the CHANGELOG by hand.
+- edit the docstring and the CHANGELOG by hand;
+- if #297 has landed, also apply the migration and the resolutions in Design
+  decision 10.
 
 Then:
 
 ```bash
-# 1. the new module (measured on the spike: 164 passed, 4 skipped)
+# 1. the new module (rev 2 spike: 215 passed, 0 skipped)
 uv run pytest tests/test_task_numeric_bounds.py --cov-fail-under=0 -p no:cacheprovider -q
-# 2. the suites the change touches (measured on the spike: 1030 passed, 4 skipped, 0 failed)
+# 2. the suites the change touches (rev 2 spike: 1081 passed, 0 failed)
 uv run pytest tests/test_gateway_tool_schemas.py tests/test_tools.py tests/test_client_manager.py \
   tests/test_phase6_tenant_code_mode.py tests/test_scoped_advisor_audit.py tests/test_server.py \
   tests/test_task_numeric_bounds.py --cov-fail-under=0 -p no:cacheprovider -q
@@ -791,39 +1020,44 @@ PMCP_UPDATE_SCHEMA_SNAPSHOT=1 uv run pytest tests/test_gateway_tool_schemas.py::
 uv run ruff check src tests && uv run ruff format --check src tests
 uv run mypy src/pmcp/types.py src/pmcp/tools/schema.py src/pmcp/client/manager.py src/pmcp/server.py
 python3 scripts/check_security_claims.py          # expect OK
-# 5. the full suite: once, detached, with a notifying waiter (memory on dev0 is shared)
+# 5. if #297 is in the tree: its modules, with the migration (measured, both orders: 1506 passed with the rest)
+uv run pytest tests/test_argument_error_echo.py tests/test_downstream_frame_echo.py tests/test_log_record_scrubber.py \
+  tests/test_parse_error_echo.py tests/test_exception_text_sinks.py --cov-fail-under=0 -p no:cacheprovider -q
+# 6. the full suite: once, detached, with a notifying waiter (memory on dev0 is shared)
 nohup uv run pytest -q -p no:cacheprovider > /tmp/pmcp-298-full.log 2>&1 &
 ```
 
-Step 1 needs the 4 skips to be the downstream timestamp cases only (Design
-decision 6). Check with `-rs`.
+**Red on main.** The rev 2 module was run against `89559db`'s sources with
+an import shim:
+- `OutboundFrameNotJson` → a local `ValueError`;
+- `_encode_outbound_frame` → `json.dumps`;
+- `GATE_VALIDATOR` → `Draft202012Validator`;
+- `MAX_FORWARDED_TASK_NUMBER` → `2**53 − 1`.
 
-If #297 has landed, also run `uv run pytest tests/test_argument_error_echo.py
-tests/test_exception_text_sinks.py --cov-fail-under=0 -q`. Then confirm that
-`describe_pydantic_error` on a `finite_number` error reads `must be a finite
-number`.
+The result was **109 failed, 106 passed**. Main has no `unusable_fields`, so
+every downstream assertion on it fails. The table names the substantive cause
+where there is one:
 
-**Red on main.** The new module was run against `89559db`'s sources with an
-import shim (`NonFiniteOutboundNumber` → `ValueError`, `GATE_VALIDATOR` →
-`Draft202012Validator`, `MAX_FORWARDED_TASK_NUMBER` → `2**53 − 1`). Result:
-**53 failed, 111 passed, 4 skipped**. The failures:
-
-| Test | Red | First assertion on main |
+| Test | Failed | Cause on main |
 |---|---|---|
-| `test_an_unusable_downstream_task_hint_is_dropped_not_raised` | 28 | stored `-5`, `nan`, `1`; `ValidationError`; bare `OverflowError: int too large to convert to float` |
+| `test_an_unusable_downstream_task_hint_is_dropped_not_raised` | 51 | stored `-5`, `nan` or `1`; `ValidationError`; bare `OverflowError`; `status: 5` raises |
+| `test_a_task_with_unusable_hints_is_recorded_and_reported_null` | 20 | `ValidationError` or `OverflowError` after the task was created; NaN `lastUpdatedAt` recorded as given |
 | `test_task_hint_bounds` | 10 | `ttl` 0/−5 accepted; `poll_interval` 0/−0.5/NaN/±Inf/±10^400 accepted at the gate |
-| `test_a_non_finite_poll_interval_off_the_wire_is_refused_at_the_gate` | 4 | `NaN`, `Infinity`, `-Infinity` and `1e400` reached the handler, so `is_error` was not true |
-| `test_gate_and_model_agree_per_field_and_failure_mode` | 2 | `poll_interval` ±10^400: gate PASS, model `float_type` |
-| `test_a_created_task_with_unusable_hints_is_still_recorded` | 2 | `[fraction]`: `ValidationError … int_from_float, input_value=1.5`; `[huge_timestamp]`: `OverflowError` |
-| `test_a_request_carrying_nan_is_never_written` | 2 | the frame was written, then `TimeoutError: Request tools/call timed out` (30.03 s each on main; the plan's test passes `timeout_ms=1000`) |
-| `test_every_advertised_number_is_bounded_both_sides` | 1 | `['gateway.invoke.task.poll_interval']` |
-| `test_every_float_argument_refuses_non_finite_values_in_the_model` | 1 | `['TaskMetadataInput.poll_interval']` |
-| `test_gate_validator_refuses_non_finite_numbers_and_keeps_the_rest` | 1 | the stock validator accepts NaN |
-| `test_outbound_frames_refuse_non_finite_numbers` | 1 | `json.dumps` wrote `NaN` |
-| `test_forwarded_task_hints_are_spec_shaped` | 1 | `{"ttl": 0}` was forwarded |
+| `test_a_usable_downstream_task_hint_is_kept` | 10 | no `unusable_fields` attribute |
+| `test_a_non_finite_poll_interval_off_the_wire_is_refused_at_the_gate` | 4 | the literals reached the handler |
+| `test_gate_and_model_agree_per_field_and_failure_mode` | 2 | `poll_interval` ±10^400: the gate passes, the model raises `float_type` |
+| `test_a_request_carrying_nan_is_never_written` | 2 | the frame was written, then the request timed out |
+| `test_a_fire_and_forget_frame_carrying_nan_is_dropped_not_written` | 2 | the NaN frame was written |
+| `test_every_downstream_writer_encodes_through_the_strict_encoder` | 1 | `json.dumps` in all three writers |
+| `test_outbound_frames_refuse_anything_but_strict_json` | 1 | `json.dumps` wrote `NaN` |
+| `test_every_advertised_number_is_bounded_both_sides`, `test_every_float_argument_refuses_non_finite_values_in_the_model`, `test_gate_validator_refuses_…`, `test_forwarded_task_hints_are_spec_shaped`, `test_created_at_keeps_the_first_usable_value_pmcp_saw`, `test_an_absent_ttl_is_not_an_unusable_one` | 1 each | unbounded `poll_interval`; no `AllowInfNan`; the stock validator; `{"ttl": 0}` forwarded; `created_at` raised or stuck; no `unusable_fields` |
 
-The two no-loop guards **pass on main**. That is by design: pmcp has no loop
-(Design decision 7), and mutant M14 is what proves they can fail.
+These pass on main, by design:
+- the two no-loop guards (Design decision 7; mutant M15 proves they can
+  fail);
+- the eviction test. On main, a NaN `updated_at` is truthy and happens to
+  sort last. Under rev 2 the field is `None`, and mutant M22 (`or 0.0`)
+  proves that the test pins the new rule.
 
 ## Acceptance criteria
 
@@ -832,75 +1066,93 @@ The two no-loop guards **pass on main**. That is by design: pmcp has no loop
   and accepts its legitimate example. Proven by
   `test_gate_and_model_agree_per_field_and_failure_mode`.
 - [ ] `task.ttl` ∈ [1, 2^53−1] and `task.poll_interval` ∈ (0, 2^53−1],
-  finite, at both the gate and the model. `1e-300`, `0.1` and the maximum are
-  accepted. Proven by `test_task_hint_bounds`.
-- [ ] `NaN`, `Infinity`, `-Infinity` and `1e400`, read off a real stdio line
-  by the SDK's parser, are refused at the gate with `Input validation error:`
-  before any handler runs. Proven by
+  finite, at both the gate and the model. Proven by `test_task_hint_bounds`.
+- [ ] `NaN`, `Infinity`, `-Infinity` and `1e400` read off a real stdio line
+  are refused at the gate. Proven by
   `test_a_non_finite_poll_interval_off_the_wire_is_refused_at_the_gate`.
 - [ ] The gate refuses `true` for every numeric argument. Proven by
   `test_gate_rejects_a_boolean_for_every_numeric_argument`.
 - [ ] Every advertised `number`/`integer` is bounded on both sides, and every
-  `float` argument field carries `allow_inf_nan=False`. Proven by
+  `float` argument carries `allow_inf_nan=False`. Proven by
   `test_every_advertised_number_is_bounded_both_sides` and
   `test_every_float_argument_refuses_non_finite_values_in_the_model`.
 - [ ] The advertised schema equals the model's projection. Proven by the
-  existing `test_advertised_schema_is_derived_from_registered_model`, and the
-  snapshot diff is the six lines above. None of the existing schema-drift
-  tests changes, other than the docstring.
-- [ ] A downstream `ttl`, `pollInterval`, `createdAt` or `lastUpdatedAt` that
-  cannot be used becomes `None` and never raises. Usable values are kept.
-  Proven by `test_an_unusable_downstream_task_hint_is_dropped_not_raised` and
-  `test_a_usable_downstream_task_hint_is_kept`.
-- [ ] A task created with unusable hints is still recorded. Proven by
-  `test_a_created_task_with_unusable_hints_is_still_recorded`.
+  existing schema-drift tests, unchanged except the docstring, and the
+  snapshot diff is the six lines.
+- [ ] A downstream `ttl`, `pollInterval`, `createdAt`, `lastUpdatedAt` or
+  `status` that cannot be used becomes `None`, is named in `unusable_fields`,
+  and never raises. Usable values are kept, including `ttl: 300000.0` as an
+  int. An absent `ttl` is not named. Proven by
+  `test_an_unusable_downstream_task_hint_is_dropped_not_raised`,
+  `test_a_usable_downstream_task_hint_is_kept` and
+  `test_an_absent_ttl_is_not_an_unusable_one`.
+- [ ] On the invoke, get, list and cancel paths, the **returned/recorded**
+  task reports the unusable field as `null` and names it. That includes
+  `updated_at`, with no substitution of the current time. Proven by
+  `test_a_task_with_unusable_hints_is_recorded_and_reported_null`.
+- [ ] Eviction orders a task without a usable `updated_at` by pmcp's record
+  time. `created_at` keeps the first usable value. Proven by
+  `test_eviction_orders_…` and `test_created_at_keeps_…`.
 - [ ] No downstream `pollInterval` makes pmcp sleep, spin or send more than
-  one request per call, and no new reader of `.poll_interval` appears
-  unnoticed. Proven by
-  `test_a_downstream_poll_interval_never_drives_a_pmcp_loop` and
-  `test_poll_interval_has_no_consumer_outside_the_allowlist`.
-- [ ] No outbound frame carries NaN or ±Inf, on stdio or remote. Nothing is
-  written, and the pending entry is popped. Forwarded task hints are an
-  integer `ttl` and a finite `pollInterval`. Proven by
-  `test_outbound_frames_refuse_non_finite_numbers`,
-  `test_a_request_carrying_nan_is_never_written[stdio|remote]` and
-  `test_forwarded_task_hints_are_spec_shaped`.
-- [ ] Every mutant in the table below is red, for the reason stated.
-- [ ] Verification steps 2 to 5 pass. The CHANGELOG entry is present, with
+  one request per call. Proven by the two no-loop guards.
+- [ ] No outbound frame that is not strict JSON is written, by
+  `_send_request` or by the fire-and-forget writer, on stdio or remote. Every
+  stdio writer encodes through `_encode_outbound_frame`. The refusal is
+  value-free. Proven by `test_outbound_frames_refuse_anything_but_strict_json`,
+  `test_a_request_carrying_nan_is_never_written`,
+  `test_a_fire_and_forget_frame_carrying_nan_is_dropped_not_written` and
+  `test_every_downstream_writer_encodes_through_the_strict_encoder`.
+- [ ] Composed with #297 in the order they land: the 12 modules of Design
+  decision 10 pass with the migration, and none of the migrated tests passes
+  without exercising its assertions.
+- [ ] All 25 mutants are killed.
+- [ ] Verification steps 2 to 6 pass. The CHANGELOG entry is present, with
   no closing keyword.
 
 ## Mutation table
 
-Each mutant was measured on the spiked tree (`mutants.py`: apply one string
-replacement, run `tests/test_task_numeric_bounds.py`, restore the file from a
-copy saved in memory). All 14 are red. After the run, the tree was
-byte-identical to the spike: `diff <(git diff) spike-final.patch` was empty.
+All 25 mutants were measured on the rev 2 spike with `mutants2.py`: apply one
+string replacement, run `tests/test_task_numeric_bounds.py`, then restore
+the file from a copy saved in memory. **All 25 are killed.** Afterwards the
+tree was byte-identical to the spike: `diff <(git diff) spike-r2b.patch` was
+empty. New since rev 1: M12 and M16–M25.
 
-| # | Rule | Mutant | Red tests (measured) |
+| # | Rule | Mutant | Failed (measured) |
 |---|---|---|---|
-| M1 | `ttl` lower bound | `ge=1` → `ge=0` | `test_task_hint_bounds`, `test_forwarded_task_hints_are_spec_shaped` |
-| M2 | `ttl` I-JSON upper bound | `le=MAX_FORWARDED_TASK_NUMBER` → int64 max | `test_task_hint_bounds[…9007199254740992-False]` |
-| M3 | `poll_interval` lower bound | drop `gt=0` | `test_task_hint_bounds`, `test_gate_and_model_agree…`, `test_every_advertised_number_is_bounded_both_sides`, `test_forwarded_task_hints_are_spec_shaped` |
-| M4 | `poll_interval` upper bound | drop `le=` | `test_every_advertised_number_is_bounded_both_sides`, `test_gate_and_model_agree…` (±10^400), `test_task_hint_bounds` |
-| M5 | model refuses non-finite | drop `allow_inf_nan=False` | `test_every_float_argument_refuses_non_finite_values_in_the_model` **only**. pydantic's own `gt`/`le` already refuse NaN and ±Inf (`NaN > 0` is false), so the flag changes the error type to `finite_number`. It does not change the verdict. The class test is the pin, and it is why that test exists |
-| M6 | gate uses the finite validator | drop `cls=GATE_VALIDATOR` in `server.py` | `test_a_non_finite_poll_interval_off_the_wire_is_refused_at_the_gate` (all 4 literals) |
-| M7 | finite type check | `_is_json_number` returns the stock `number` check | `test_gate_validator_refuses…`, `…off_the_wire…`, `test_gate_and_model_agree…`, `test_task_hint_bounds` |
-| M8 | downstream `ttl` sanitized | `_usable_ttl` returns `value` | `test_an_unusable_downstream_task_hint_is_dropped_not_raised`, `test_a_created_task…[fraction]` |
-| M9 | downstream `pollInterval` finite | drop `math.isfinite(number) and` | `test_an_unusable_downstream…[pollInterval-…-inf]` |
-| M10 | timestamp overflow | drop the `try/except OverflowError` around `float(value)` | `test_an_unusable_downstream…`, `test_a_created_task…[huge_timestamp]` |
-| M11 | timestamp finite | return `number` without `isfinite` | `test_an_unusable_downstream…[lastUpdatedAt-updated_at--inf]` |
-| M12 | strict outbound JSON | `allow_nan=False` → default | `test_outbound_frames_refuse_non_finite_numbers`, `test_a_request_carrying_nan_is_never_written` |
-| M13 | remote path checked too | drop `_encode_outbound_frame(request)` before `validate_python` in `_send_request` | `test_a_request_carrying_nan_is_never_written[remote]` |
-| M14 | no loop on a downstream hint | add `await asyncio.sleep(task_info.poll_interval or 0)` to `get_task` | `test_poll_interval_has_no_consumer_outside_the_allowlist`, `test_a_downstream_poll_interval_never_drives_a_pmcp_loop` |
+| M1 | `ttl` lower bound | `ge=1` → `ge=0` | 2: `test_task_hint_bounds`, `test_forwarded_task_hints_are_spec_shaped` |
+| M2 | `ttl` I-JSON upper bound | `le=` → int64 max | 1: `test_task_hint_bounds[…9007199254740992-False]` |
+| M3 | `poll_interval` lower bound | drop `gt=0` | 6: `test_task_hint_bounds`, `test_gate_and_model_agree…`, `test_every_advertised_number…`, `test_forwarded…` |
+| M4 | `poll_interval` upper bound | drop `le=` | 3: `test_every_advertised_number…`, `test_gate_and_model_agree…` (±10^400), `test_task_hint_bounds` |
+| M5 | the model refuses non-finite values | drop `allow_inf_nan=False` | 1: `test_every_float_argument_refuses_non_finite_values_in_the_model` **only**. pydantic's `gt`/`le` already refuse NaN and ±Inf, so the flag changes the error type, not the verdict. The class test is the pin |
+| M6 | the gate uses the finite validator | drop `cls=GATE_VALIDATOR` | 1: `…off_the_wire…[NaN]` **only** (N5; rev 1 wrongly said all 4 literals). With `exclusiveMinimum`/`maximum` advertised, the stock validator already refuses `Infinity`, `-Infinity` and `1e400`. NaN in a `number` field is the sole pin at the `server.py` call site |
+| M7 | the finite type check | `_is_json_number` → the stock `number` check | 4: `test_gate_validator…`, `…off_the_wire…`, `test_gate_and_model_agree…`, `test_task_hint_bounds` |
+| M8 | downstream `ttl` range/type | `_usable_task_ttl` keeps any value | 18: `…dropped_not_raised`, `…recorded_and_reported_null`, `test_an_absent_ttl…` |
+| M9 | downstream `pollInterval` finite | drop `math.isfinite(number) and` | 1: `…dropped_not_raised[pollInterval=inf]` |
+| M10 | timestamp overflow | drop the `try/except OverflowError` around `float(value)` | 6: `…dropped_not_raised`, `…recorded_and_reported_null[created-overflow]` |
+| M11 | numeric timestamp finite | numeric branch returns `number` without `isfinite` | 11: `…dropped_not_raised`, `…recorded…`, `test_created_at_keeps…` |
+| M12 | numeric-*string* timestamp finite (N4, rev 1's C5) | string branch returns `number` without `isfinite` | 6: `…dropped_not_raised[createdAt='nan'/'1e400'/'-inf', …]` |
+| M13 | strict outbound JSON | `allow_nan=False` → default | 5: `test_outbound_frames…`, `test_a_request_carrying_nan…`, `test_a_fire_and_forget…` |
+| M14 | the remote request path is checked too | drop `_encode_outbound_frame(request)` in `_send_request`'s remote branch | 1: `test_a_request_carrying_nan_is_never_written[remote]` |
+| M15 | no loop on a downstream hint | add `await asyncio.sleep(task_info.poll_interval or 0)` to `get_task` | 6: `test_poll_interval_has_no_consumer…`, `test_a_downstream_poll_interval_never_drives_a_pmcp_loop` |
+| M16 | fire-and-forget remote check (N4, rev 1's C2) | drop `_encode_outbound_frame(payload)` in `_send_message_to_downstream`'s remote branch | 1: `test_a_fire_and_forget…[remote]` |
+| M17 | fire-and-forget stdio (N4, rev 1's C3) | stdio branch back to `json.dumps(payload)` | 2: `test_a_fire_and_forget…[stdio]`, `test_every_downstream_writer…` |
+| M18 | `_send_initialize` stdio (N4, rev 1's C6) | back to `json.dumps(notification)` | 1: `test_every_downstream_writer_encodes_through_the_strict_encoder` |
+| M19 | `status` guard (N1) | `_usable_task_status` keeps any value | 9: `…dropped_not_raised[status=…]`, `…recorded…[status-number]` |
+| M20 | whole-number float `ttl` kept (N2) | drop the `is_integer()` → `int` conversion | 1: `test_a_usable_downstream_task_hint_is_kept[ttl=300000.0]` |
+| M21 | no substitution of `updated_at` (B2) | `if updated_at is None and "updated_at" not in …` → `if not updated_at:` | 4: `…recorded_and_reported_null[updated-nan-*]` |
+| M22 | eviction fallback (B2) | sort key → `updated_at or 0.0` | 1: `test_eviction_orders_a_task_without_a_usable_timestamp…` |
+| M23 | `unusable_fields` recorded (N3) | never append to `dropped` | 73: `…dropped_not_raised`, `…recorded…`, `test_an_absent_ttl…`, `test_created_at_keeps…` |
+| M24 | the encoder fails closed on non-JSON types (N7) | `except (ValueError, TypeError, RecursionError)` → `except ValueError` | 1: `test_outbound_frames_refuse_anything_but_strict_json` |
+| M25 | `created_at` keeps the first *usable* value | `existing is not None and existing.created_at is not None` → `existing is not None` | 1: `test_created_at_keeps_the_first_usable_value_pmcp_saw` |
 
-The implementer re-runs the same 14 mutants on the final tree. After each
-one, restore the file from a saved copy, never with `git checkout --`, and
-confirm `git diff --stat` matches the pre-mutation state.
+The implementer re-runs the same 25 mutants on the final tree. Restore each
+file from a saved copy, never with `git checkout --`, and confirm that
+`git diff --stat` matches the pre-mutation state.
 
 ## Non-goals
 
 - **Units** (seconds versus the spec's milliseconds). See Design decision 9;
-  it is a follow-up issue.
+  it is a follow-up, Consiliency/pmcp#330.
 - **NaN inside a downstream tool *result*.** pmcp passes it through, and
   `server.py:464` writes it with `json.dumps(result)` as `NaN` inside a text
   block. That is the downstream's content, not a task hint. A strict
@@ -909,8 +1161,8 @@ confirm `git diff --stat` matches the pre-mutation state.
 - **A clamp helper for a polling loop that does not exist.** See Design
   decision 7.
 - **`Strict()` on numeric fields.** See Design decision 5.
-- **Echo rendering.** That is Consiliency/pmcp#297. This plan only states
-  its touch points (Design decision 10).
+- **Echo rendering.** That is Consiliency/pmcp#297. This plan states its
+  touch points and its test migration (Design decision 10).
 
 ## Unverified
 
@@ -918,68 +1170,149 @@ confirm `git diff --stat` matches the pre-mutation state.
   "hangs until timeout" claim rests on `JSON.parse` refusing the bare literal
   and on the spike's fake, which wrote and then timed out. No live Node
   server was run.
-- **#297's `parse_timestamp` exception type.** The resolution in Design
-  decision 10 says to catch it; read `src/pmcp/parsing.py` on that branch
-  when merging.
-- **The full suite.** It was not run on the spike, because memory on dev0 is
-  shared with a parallel planner. The 7 modules that touch the change were
-  run: 1030 passed, 4 skipped, 0 failed. Verification step 5 runs the full suite once.
+- **#297 beyond `0a93265`.** The composition was measured against #297's
+  rev 12 code (`wip/297-code` @ `0a93265`). A later #297 revision that adds
+  task-field fixtures needs the same search, as Design decision 10 describes.
+
+**Measured in rev 2:**
+- the full suite, once, alone and detached, with the npm variables unset, on
+  the rev 2 spike: **5144 passed, 3 skipped, 80 deselected, 0 failed**
+  (650 s);
+- the 7 touched modules: **1081 passed**;
+- `ruff check`, `ruff format --check`, `mypy src/pmcp` (52 files) and
+  `scripts/check_security_claims.py` (OK, 129 nodes): all clean.
 
 ## Execution Policy
 
 - execute: effort=medium.
-- reason: a small, contained change (4 source files, about 120 lines), but
-  on the trust edge, in both directions, and with one maintainer-visible
-  behaviour change: the outbound strict JSON of Design decision 8, which is
-  separable.
+- reason: a contained change (4 source files, about 230 lines), but on the
+  trust edge, in both directions, with:
+  - one maintainer-visible behaviour change, the strict outbound JSON of
+    Design decision 8, which is separable;
+  - one new public output field, `unusable_fields`;
+  - a test migration in #297's modules, carried by whichever PR lands
+    second.
 - Re-run the mutation table, the 7-module run, ruff and mypy before
-  requesting review.
+  requesting review. If #297 is in the tree, re-run its 5 modules as well.
 - Get a cross-vendor panel CR before merge, as for every PR to main.
 
 ## Verbatim bodies
 
 ### How to apply
 
-1. Save the source patch below (between the ```` fences) to
-   `298-src.patch`, then run `git apply 298-src.patch` on `89559db`.
-   It also regenerates the snapshot fixture.
+1. Save the source patch below (between the ```` fences) as `298-src.patch`,
+   then run `git apply 298-src.patch` on `89559db`. It also regenerates the
+   snapshot fixture.
 2. Write the test module below to `tests/test_task_numeric_bounds.py`.
 3. Edit the docstring of `tests/test_gateway_tool_schemas.py` and add the
    `CHANGELOG.md` entry by hand, as in *Changes* and *Documentation impact*.
+4. **Only when #297 is in the tree** (in either order):
+   - resolve `server.py` and `types.py` as in Design decision 10's table;
+   - then `git apply` the *#297 test migration* patch, which is relative to
+     #297's `0a93265` versions of those files.
 
 ### Patch — `src/pmcp/{types.py, tools/schema.py, server.py, client/manager.py}` and `tests/fixtures/gateway_tool_schemas.json`
 
 ````diff
 diff --git a/src/pmcp/client/manager.py b/src/pmcp/client/manager.py
-index 57a563e..f4a71a3 100644
+index 57a563e..580f688 100644
 --- a/src/pmcp/client/manager.py
 +++ b/src/pmcp/client/manager.py
-@@ -189,6 +189,24 @@ _RECONCILE_RERUN_DEBOUNCE_S = 0.25
+@@ -189,6 +189,29 @@ _RECONCILE_RERUN_DEBOUNCE_S = 0.25
  _MAX_LISTING_PAGES = 500
  
  
-+class NonFiniteOutboundNumber(ValueError):
-+    """An outbound frame carries NaN or +-Infinity (Consiliency/pmcp#298)."""
++class OutboundFrameNotJson(ValueError):
++    """An outbound frame is not strict JSON (Consiliency/pmcp#298)."""
 +
 +
-+_NON_FINITE_OUTBOUND = "outbound frame carries a non-finite number"
++_OUTBOUND_NOT_JSON = "outbound frame is not strict JSON"
 +
 +
 +def _encode_outbound_frame(payload: dict[str, Any]) -> str:
-+    """One JSON-RPC frame as strict JSON. NaN and +-Infinity are not JSON:
-+    stdio would write them as bare literals a strict peer cannot parse, and the
-+    SDK's HTTP and SSE clients would silently send them as ``null``. Refuse
-+    instead, on every transport (Consiliency/pmcp#298)."""
++    """One JSON-RPC frame as strict JSON, or a value-free refusal.
++
++    NaN and +-Infinity are not JSON: stdio would write them as bare literals a
++    strict peer cannot parse, and the SDK's HTTP and SSE clients would
++    silently send them as ``null``. A value ``json`` cannot encode at all
++    (``TypeError``), a cycle (``ValueError``) or runaway nesting
++    (``RecursionError``) is refused the same way, on every transport, with a
++    message that carries nothing from the frame (Consiliency/pmcp#298).
++    """
 +    try:
 +        return json.dumps(payload, allow_nan=False)
-+    except ValueError:
-+        raise NonFiniteOutboundNumber(_NON_FINITE_OUTBOUND) from None
++    except (ValueError, TypeError, RecursionError):
++        raise OutboundFrameNotJson(_OUTBOUND_NOT_JSON) from None
 +
 +
  class DownstreamError(Exception):
      """A JSON-RPC `error` object returned by a downstream MCP server.
  
-@@ -3220,12 +3238,13 @@ class ClientManager:
+@@ -1708,22 +1731,41 @@ class ClientManager:
+         requestor_context: dict[str, Any] | None = None,
+     ) -> McpTaskRecord:
+         existing = self._tasks.get((server_name, task_info.task_id))
++        now = time.time()
++        # created_at: the first usable value pmcp saw (Consiliency/pmcp#298).
++        created_at = (
++            existing.created_at
++            if existing is not None and existing.created_at is not None
++            else task_info.created_at
++        )
++        unusable = [
++            name
++            for name in task_info.unusable_fields
++            if not (name == "created_at" and created_at is not None)
++        ]
++        # updated_at: the downstream's usable value; None when it was unusable
++        # (named in `unusable_fields`); pmcp's observation time only when the
++        # downstream sent none at all -- `is None`, not `or`, so a usable 0.0
++        # is kept (Consiliency/pmcp#298).
++        updated_at = task_info.updated_at
++        if updated_at is None and "updated_at" not in task_info.unusable_fields:
++            updated_at = now
+         record = McpTaskRecord(
+             task_id=task_info.task_id,
+             status=task_info.status,
+             status_message=task_info.status_message,
+-            created_at=task_info.created_at
+-            if existing is None
+-            else existing.created_at,
+-            updated_at=task_info.updated_at or time.time(),
++            created_at=created_at,
++            updated_at=updated_at,
+             ttl=task_info.ttl,
+             poll_interval=task_info.poll_interval,
++            unusable_fields=unusable,
+             raw=task_info.raw,
+             server_name=server_name,
+             tool_id=tool_id or (existing.tool_id if existing else None),
+             requestor_context=requestor_context
+             or (existing.requestor_context if existing else None),
+         )
++        record._recorded_at = now
+         self._tasks[(server_name, task_info.task_id)] = record
+         self._evict_terminal_tasks()
+         return record
+@@ -1743,7 +1785,16 @@ class ClientManager:
+         excess = len(terminal) - self._max_terminal_tasks
+         if excess <= 0:
+             return
+-        terminal.sort(key=lambda item: (item[1].updated_at or 0.0, item[0]))
++        # Oldest first by the downstream's `updated_at`; a record without a
++        # usable one sorts by when pmcp recorded it (Consiliency/pmcp#298).
++        terminal.sort(
++            key=lambda item: (
++                item[1].updated_at
++                if item[1].updated_at is not None
++                else item[1]._recorded_at,
++                item[0],
++            )
++        )
+         for key, _record in terminal[:excess]:
+             self._tasks.pop(key, None)
+ 
+@@ -3220,12 +3271,13 @@ class ClientManager:
              if managed.is_remote:
                  if managed.write_stream is None:
                      return
@@ -994,7 +1327,7 @@ index 57a563e..f4a71a3 100644
                  managed.process.stdin.write(data.encode())
                  await managed.process.stdin.drain()
          except Exception as e:
-@@ -3417,13 +3436,14 @@ class ClientManager:
+@@ -3417,13 +3469,14 @@ class ClientManager:
                  # JSONRPCNotification | JSONRPCResponse | JSONRPCError), not a
                  # pydantic model, so it has no .model_validate(); construct via
                  # its published TypeAdapter instead.
@@ -1010,7 +1343,7 @@ index 57a563e..f4a71a3 100644
                  managed.process.stdin.write(data.encode())
                  await managed.process.stdin.drain()
  
-@@ -3547,7 +3567,7 @@ class ClientManager:
+@@ -3547,7 +3600,7 @@ class ClientManager:
              msg = mcp_types.jsonrpc_message_adapter.validate_python(notification)
              await managed.write_stream.send(SessionMessage(msg))
          elif managed.process and managed.process.stdin:
@@ -1086,10 +1419,10 @@ index 4315cd7..162dd75 100644
  
  
 diff --git a/src/pmcp/types.py b/src/pmcp/types.py
-index 7dc8e7c..dba185a 100644
+index 7dc8e7c..a9ff0a8 100644
 --- a/src/pmcp/types.py
 +++ b/src/pmcp/types.py
-@@ -4,6 +4,7 @@ from __future__ import annotations
+@@ -4,10 +4,18 @@ from __future__ import annotations
  
  from datetime import datetime
  from enum import Enum
@@ -1097,7 +1430,19 @@ index 7dc8e7c..dba185a 100644
  import re
  from typing import Annotated, Any, Literal
  
-@@ -77,6 +78,11 @@ DEFAULT_AUTH_STATE_SEMANTICS: dict[AuthState, AuthStateSemanticsInfo] = {
+-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
++from pydantic import (
++    BaseModel,
++    ConfigDict,
++    Field,
++    PrivateAttr,
++    field_validator,
++    model_validator,
++)
+ 
+ from pmcp.validation import is_valid_package_name, version_separator_index
+ 
+@@ -77,6 +85,11 @@ DEFAULT_AUTH_STATE_SEMANTICS: dict[AuthState, AuthStateSemanticsInfo] = {
  }
  
  
@@ -1109,82 +1454,161 @@ index 7dc8e7c..dba185a 100644
  class GatewayArguments(BaseModel):
      """Base for every model that parses arguments an agent sends to a gateway
      tool, and for every model nested inside one. The advertised ``inputSchema``
-@@ -518,6 +524,9 @@ class ServerStatus(BaseModel):
+@@ -518,8 +531,90 @@ class ServerStatus(BaseModel):
      avg_response_time_ms: float | None = None  # Rolling average response time
  
  
 +_INT64_MAX = 2**63 - 1
 +
++#: Stands in for a downstream task value pmcp cannot use.
++_UNUSABLE: Any = object()
++
++
++def _usable_task_ttl(value: Any) -> Any:
++    """A non-bool integer in [0, int64], or a finite whole-number float there
++    (``300000.0``: JSON Schema calls it an integer too)."""
++    if type(value) is float and math.isfinite(value) and value.is_integer():
++        value = int(value)
++    if type(value) is int and 0 <= value <= _INT64_MAX:
++        return value
++    return _UNUSABLE
++
++
++def _usable_poll_interval(value: Any) -> Any:
++    """A non-bool, finite number greater than 0."""
++    if type(value) in (int, float):
++        try:
++            number = float(value)
++        except OverflowError:
++            return _UNUSABLE
++        if math.isfinite(number) and number > 0:
++            return number
++    return _UNUSABLE
++
++
++def _usable_task_timestamp(value: Any) -> Any:
++    """Epoch seconds from a finite number, a numeric string or an ISO 8601
++    string; a datetime as is."""
++    if isinstance(value, datetime):
++        return value.timestamp()
++    if isinstance(value, bool):
++        return _UNUSABLE
++    if isinstance(value, int | float):
++        try:
++            number = float(value)
++        except OverflowError:
++            return _UNUSABLE
++        return number if math.isfinite(number) else _UNUSABLE
++    if isinstance(value, str):
++        candidate = value.strip()
++        if not candidate:
++            return None
++        try:
++            number = float(candidate)
++        except ValueError:
++            pass
++        else:
++            return number if math.isfinite(number) else _UNUSABLE
++        if candidate.endswith("Z"):
++            candidate = f"{candidate[:-1]}+00:00"
++        try:
++            return datetime.fromisoformat(candidate).timestamp()
++        except (ValueError, OverflowError):
++            return _UNUSABLE
++    return _UNUSABLE
++
++
++def _usable_task_status(value: Any) -> Any:
++    """Any string: unknown future statuses are kept (the tenant contract)."""
++    return value if isinstance(value, str) else _UNUSABLE
++
++
++_TASK_HINT_CHECKS: dict[str, Any] = {
++    "status": _usable_task_status,
++    "created_at": _usable_task_timestamp,
++    "updated_at": _usable_task_timestamp,
++    "ttl": _usable_task_ttl,
++    "poll_interval": _usable_poll_interval,
++}
++
 +
  class McpTaskInfo(BaseModel):
-     """Public view of a downstream MCP task."""
+-    """Public view of a downstream MCP task."""
++    """Public view of a downstream MCP task.
++
++    A downstream value pmcp cannot use is reported as ``None`` and its field
++    is named in ``unusable_fields`` (Consiliency/pmcp#298). So a ``None``
++    ``ttl`` not named there keeps the MCP meaning "unlimited", and one named
++    there means the downstream sent something pmcp could not read. Nothing is
++    refused: refusing would fail a call whose task the downstream had already
++    created, and pmcp only reports these values.
++    """
  
-@@ -530,6 +539,28 @@ class McpTaskInfo(BaseModel):
+     task_id: str
+     status: McpTaskStatus | str | None = None
+@@ -528,29 +623,31 @@ class McpTaskInfo(BaseModel):
+     updated_at: float | None = None
+     ttl: int | None = None
      poll_interval: float | None = None
++    unusable_fields: list[str] = Field(default_factory=list)
      raw: dict[str, Any] = Field(default_factory=dict)
  
-+    # Downstream hints are kept only when usable, else dropped to None, field by
-+    # field (Consiliency/pmcp#298): refusing the payload would fail a call whose
-+    # task the downstream already created, and pmcp only reports these values.
-+    @field_validator("ttl", mode="before")
-+    @classmethod
-+    def _usable_ttl(cls, value: Any) -> int | None:
-+        if type(value) is int and 0 <= value <= _INT64_MAX:
-+            return value
-+        return None
-+
-+    @field_validator("poll_interval", mode="before")
-+    @classmethod
-+    def _usable_poll_interval(cls, value: Any) -> float | None:
-+        if type(value) in (int, float):
-+            try:
-+                number = float(value)
-+            except OverflowError:
-+                return None
-+            if math.isfinite(number) and number > 0:
-+                return number
-+        return None
-+
-     @field_validator("created_at", "updated_at", mode="before")
+-    @field_validator("created_at", "updated_at", mode="before")
++    @model_validator(mode="before")
      @classmethod
-     def _normalize_task_timestamp(cls, value: Any) -> float | None:
-@@ -537,20 +568,31 @@ class McpTaskInfo(BaseModel):
-             return None
-         if isinstance(value, datetime):
-             return value.timestamp()
-+        if isinstance(value, bool):
-+            return None
-         if isinstance(value, int | float):
+-    def _normalize_task_timestamp(cls, value: Any) -> float | None:
+-        if value is None:
+-            return None
+-        if isinstance(value, datetime):
+-            return value.timestamp()
+-        if isinstance(value, int | float):
 -            return float(value)
-+            try:
-+                number = float(value)
-+            except OverflowError:
-+                return None
-+            return number if math.isfinite(number) else None
-         if isinstance(value, str):
-             candidate = value.strip()
-             if not candidate:
-                 return None
-             try:
+-        if isinstance(value, str):
+-            candidate = value.strip()
+-            if not candidate:
+-                return None
+-            try:
 -                return float(candidate)
-+                number = float(candidate)
-             except ValueError:
-                 pass
-+            else:
-+                return number if math.isfinite(number) else None
-             if candidate.endswith("Z"):
-                 candidate = f"{candidate[:-1]}+00:00"
+-            except ValueError:
+-                pass
+-            if candidate.endswith("Z"):
+-                candidate = f"{candidate[:-1]}+00:00"
 -            return datetime.fromisoformat(candidate).timestamp()
 -        return value
-+            try:
-+                return datetime.fromisoformat(candidate).timestamp()
-+            except (ValueError, OverflowError):
-+                return None
-+        return None
++    def _drop_unusable_hints(cls, data: Any) -> Any:
++        if not isinstance(data, dict):
++            return data
++        out = dict(data)
++        unusable = out.get("unusable_fields")
++        dropped = list(unusable) if isinstance(unusable, list) else []
++        for name, check in _TASK_HINT_CHECKS.items():
++            value = out.get(name)
++            if value is None:
++                continue
++            usable = check(value)
++            if usable is _UNUSABLE:
++                out[name] = None
++                if name not in dropped:
++                    dropped.append(name)
++            else:
++                out[name] = usable
++        if dropped or "unusable_fields" in out:
++            out["unusable_fields"] = dropped
++        return out
  
  
  class McpTaskRecord(McpTaskInfo):
-@@ -573,18 +615,27 @@ class TaskMetadataInput(GatewayArguments):
+@@ -560,6 +657,9 @@ class McpTaskRecord(McpTaskInfo):
+     tool_id: str | None = None
+     local_request_id: str | None = None
+     requestor_context: dict[str, Any] | None = None
++    #: When pmcp last recorded this task (epoch seconds; not public). The
++    #: eviction order falls back to it when ``updated_at`` is None.
++    _recorded_at: float = PrivateAttr(default=0.0)
+ 
+ 
+ class TaskMetadataInput(GatewayArguments):
+@@ -573,18 +673,27 @@ class TaskMetadataInput(GatewayArguments):
      )
      ttl: int | None = Field(
          default=None,
@@ -1279,7 +1703,7 @@ from pydantic.fields import FieldInfo
 from pmcp.client.manager import (
     ClientManager,
     ManagedClient,
-    NonFiniteOutboundNumber,
+    OutboundFrameNotJson,
     _encode_outbound_frame,
 )
 from pmcp.tools.handlers import GATEWAY_TOOL_INPUT_MODELS, get_gateway_tool_definitions
@@ -1530,60 +1954,84 @@ def test_gate_validator_refuses_non_finite_numbers_and_keeps_the_rest() -> None:
 
 # --- downstream -> pmcp ---------------------------------------------------------
 
-DOWNSTREAM_BAD: dict[str, Any] = {
-    "negative": -5,
+# (wire key, attribute, unusable value) -- every value the downstream parser
+# must drop, never raise on. Usable look-alikes are in the next table.
+_HINTS = [("ttl", "ttl"), ("pollInterval", "poll_interval")]
+_STAMPS = [("createdAt", "created_at"), ("lastUpdatedAt", "updated_at")]
+_NUMERIC_BAD: dict[str, Any] = {
     "nan": float("nan"),
     "inf": float("inf"),
     "-inf": float("-inf"),
     "bool": True,
     "huge_int": BIG,
-    "string": "5",
     "list": [1],
+    "object": {"v": 1},
 }
+UNUSABLE: list[tuple[str, str, Any]] = [
+    *[(w, a, v) for w, a in _HINTS + _STAMPS for v in _NUMERIC_BAD.values()],
+    *[(w, a, v) for w, a in _HINTS for v in (-5, "5", "")],
+    ("ttl", "ttl", 2.5),
+    ("ttl", "ttl", 1e300),
+    ("ttl", "ttl", 2**63),
+    ("pollInterval", "poll_interval", 0),
+    *[(w, a, v) for w, a in _STAMPS for v in ("nan", "1e400", "-inf", "2026-13-99T")],
+    *[("status", "status", v) for v in (5, float("nan"), True, ["working"], {"v": 1})],
+]
+USABLE: list[tuple[str, str, Any, Any]] = [
+    ("ttl", "ttl", 0, 0),
+    ("ttl", "ttl", 60000, 60000),
+    ("ttl", "ttl", 300000.0, 300000),
+    ("pollInterval", "poll_interval", 2, 2.0),
+    ("pollInterval", "poll_interval", 2.5, 2.5),
+    ("createdAt", "created_at", "2025-11-25T10:00:00Z", 1764064800.0),
+    ("createdAt", "created_at", -5, -5.0),
+    ("createdAt", "created_at", "5", 5.0),
+    ("lastUpdatedAt", "updated_at", 0.0, 0.0),
+    ("status", "status", "some_future_status", "some_future_status"),
+]
 
 
-@pytest.mark.parametrize("mode", list(DOWNSTREAM_BAD))
 @pytest.mark.parametrize(
-    ("wire", "attr"),
-    [
-        ("ttl", "ttl"),
-        ("pollInterval", "poll_interval"),
-        ("createdAt", "created_at"),
-        ("lastUpdatedAt", "updated_at"),
-    ],
+    ("wire", "attr", "value"), UNUSABLE, ids=[f"{w}={v!r}"[:40] for w, _, v in UNUSABLE]
 )
 def test_an_unusable_downstream_task_hint_is_dropped_not_raised(
-    wire: str, attr: str, mode: str
-) -> None:
-    value = DOWNSTREAM_BAD[mode]
-    if attr in ("created_at", "updated_at") and mode in ("negative", "string"):
-        pytest.skip("a negative or numeric-string timestamp is a usable timestamp")
-    manager = ClientManager()
-    info = manager._task_info_from_payload(
-        {"taskId": "t1", "status": "working", wire: value}
-    )
-    assert info is not None
-    assert getattr(info, attr) is None
-    McpTaskInfo.model_validate(info.model_dump(mode="json"))
-
-
-@pytest.mark.parametrize(
-    ("wire", "attr", "value"),
-    [
-        ("ttl", "ttl", 0),
-        ("ttl", "ttl", 60000),
-        ("pollInterval", "poll_interval", 2),
-        ("pollInterval", "poll_interval", 2.5),
-        ("createdAt", "created_at", "2025-11-25T10:00:00Z"),
-    ],
-)
-def test_a_usable_downstream_task_hint_is_kept(
     wire: str, attr: str, value: Any
 ) -> None:
     info = ClientManager()._task_info_from_payload(
         {"taskId": "t1", "status": "working", wire: value}
     )
-    assert info is not None and getattr(info, attr) is not None
+    assert info is not None
+    assert getattr(info, attr) is None
+    assert info.unusable_fields == [attr]
+    again = McpTaskInfo.model_validate(info.model_dump(mode="json"))
+    assert again.unusable_fields == [attr] and getattr(again, attr) is None
+
+
+@pytest.mark.parametrize(
+    ("wire", "attr", "value", "kept"),
+    USABLE,
+    ids=[f"{w}={v!r}"[:40] for w, _, v, _ in USABLE],
+)
+def test_a_usable_downstream_task_hint_is_kept(
+    wire: str, attr: str, value: Any, kept: Any
+) -> None:
+    info = ClientManager()._task_info_from_payload(
+        {"taskId": "t1", "status": "working", wire: value}
+    )
+    assert info is not None
+    assert getattr(info, attr) == kept and type(getattr(info, attr)) is type(kept)
+    assert info.unusable_fields == []
+
+
+def test_an_absent_ttl_is_not_an_unusable_one() -> None:
+    """MCP's `ttl: null` means unlimited: only a value pmcp could not read is
+    named in `unusable_fields`."""
+    manager = ClientManager()
+    absent = manager._task_info_from_payload({"taskId": "t", "ttl": None})
+    unusable = manager._task_info_from_payload({"taskId": "t", "ttl": -1})
+    assert absent is not None and unusable is not None
+    assert absent.ttl is None and absent.unusable_fields == []
+    assert unusable.ttl is None and unusable.unusable_fields == ["ttl"]
 
 
 def _task_server(manager: ClientManager, reply: dict[str, Any]) -> ManagedClient:
@@ -1622,22 +2070,89 @@ def _task_server(manager: ClientManager, reply: dict[str, Any]) -> ManagedClient
     return managed
 
 
-@pytest.mark.parametrize("mode", ["fraction", "nan", "huge_timestamp"])
+RECORDED_CASES: dict[str, dict[str, Any]] = {
+    "ttl-fraction": {"ttl": 1.5},
+    "poll-nan": {"pollInterval": float("nan")},
+    "created-overflow": {"createdAt": BIG},
+    "updated-nan": {"lastUpdatedAt": float("nan")},
+    "status-number": {"status": 5},
+}
+
+
+@pytest.mark.parametrize("case", list(RECORDED_CASES))
+@pytest.mark.parametrize("path", ["invoke", "get", "list", "cancel"])
 @pytest.mark.asyncio
-async def test_a_created_task_with_unusable_hints_is_still_recorded(mode: str) -> None:
-    """Before #298 a downstream `ttl: 1.5` raised after the downstream had
-    created the task, so the caller got an error and pmcp lost the task."""
-    task: dict[str, Any] = {"taskId": "t1", "status": "working"}
-    if mode == "fraction":
-        task["ttl"] = 1.5
-    elif mode == "nan":
-        task["pollInterval"] = float("nan")
-    else:
-        task["createdAt"] = BIG
+async def test_a_task_with_unusable_hints_is_recorded_and_reported_null(
+    case: str, path: str
+) -> None:
+    """Before #298, `ttl: 1.5`, `createdAt: 10**400` or `status: 5` raised
+    after the downstream had created the task: the caller got an error and pmcp
+    lost the task. Now it is recorded, and the RETURNED task -- what a caller
+    sees -- reports the field as null and names it in `unusable_fields`."""
+    ((wire, value),) = RECORDED_CASES[case].items()
+    attr = {
+        "ttl": "ttl",
+        "pollInterval": "poll_interval",
+        "createdAt": "created_at",
+        "lastUpdatedAt": "updated_at",
+        "status": "status",
+    }[wire]
+    task: dict[str, Any] = {"taskId": "t1", "status": "working", wire: value}
     manager = ClientManager()
-    _task_server(manager, {"task": task})
-    await manager.call_tool("tasks::run", {}, task={"ttl": 300})
-    assert manager.get_task_record("tasks", "t1") is not None
+    if path == "list":
+        _task_server(manager, {"tasks": [task]})
+        listed = await manager.list_tasks("tasks")
+        returned: Any = listed["tasks"][0]
+    else:
+        _task_server(manager, {"task": task})
+        if path == "invoke":
+            await manager.call_tool("tasks::run", {}, task={"ttl": 300})
+        elif path == "get":
+            await manager.get_task("tasks", "t1")
+        else:
+            manager._record_task("tasks", McpTaskInfo(task_id="t1", status="working"))
+            await manager.cancel_task("tasks", "t1")
+        returned = manager.get_task_record("tasks", "t1")
+        assert returned is not None
+        returned = returned.model_dump()
+    assert returned[attr] is None, returned
+    assert attr in returned["unusable_fields"], returned
+
+
+@pytest.mark.asyncio
+async def test_eviction_orders_a_task_without_a_usable_timestamp_by_when_pmcp_saw_it() -> (
+    None
+):
+    """A terminal task whose `lastUpdatedAt` was unusable sorts by pmcp's own
+    record time, not as the oldest possible (`or 0.0`): an old task with a
+    real timestamp is evicted first."""
+    manager = ClientManager()
+    manager._max_terminal_tasks = 1
+    manager._record_task(
+        "s", McpTaskInfo(task_id="old", status="completed", updated_at=1.0)
+    )
+    manager._record_task(
+        "s", McpTaskInfo(task_id="new", status="completed", updated_at=float("nan"))
+    )
+    assert [t.task_id for t in manager.get_tracked_tasks("s")] == ["new"]
+
+
+def test_created_at_keeps_the_first_usable_value_pmcp_saw() -> None:
+    """A first payload with an unusable `createdAt` leaves it null; a later
+    usable one fills it, and the field is no longer named unusable."""
+    manager = ClientManager()
+    first = manager._record_task(
+        "s", McpTaskInfo(task_id="t", status="working", created_at=float("nan"))
+    )
+    assert first.created_at is None and first.unusable_fields == ["created_at"]
+    second = manager._record_task(
+        "s", McpTaskInfo(task_id="t", status="working", created_at=5.0)
+    )
+    assert second.created_at == 5.0 and second.unusable_fields == []
+    third = manager._record_task(
+        "s", McpTaskInfo(task_id="t", status="working", created_at=float("nan"))
+    )
+    assert third.created_at == 5.0 and third.unusable_fields == []
 
 
 # --- no polling loop ------------------------------------------------------------
@@ -1690,20 +2205,24 @@ def test_poll_interval_has_no_consumer_outside_the_allowlist() -> None:
 # --- pmcp -> downstream ---------------------------------------------------------
 
 
-def test_outbound_frames_refuse_non_finite_numbers() -> None:
+class _NotJson:
+    pass
+
+
+def test_outbound_frames_refuse_anything_but_strict_json() -> None:
     assert _encode_outbound_frame({"a": 1.5, "b": [1, 2]}) == '{"a": 1.5, "b": [1, 2]}'
-    for value in (float("nan"), float("inf"), float("-inf")):
-        with pytest.raises(NonFiniteOutboundNumber) as raised:
+    cycle: list[Any] = []
+    cycle.append(cycle)
+    for value in (float("nan"), float("inf"), float("-inf"), _NotJson(), b"x", cycle):
+        with pytest.raises(OutboundFrameNotJson) as raised:
             _encode_outbound_frame({"params": {"arguments": {"x": [value]}}})
-        assert str(raised.value) == "outbound frame carries a non-finite number"
+        assert str(raised.value) == "outbound frame is not strict JSON"
+        assert raised.value.__cause__ is None and raised.value.__suppress_context__
 
 
-@pytest.mark.parametrize("remote", [False, True], ids=["stdio", "remote"])
-@pytest.mark.asyncio
-async def test_a_request_carrying_nan_is_never_written(remote: bool) -> None:
-    manager = ClientManager()
+def _managed(remote: bool) -> ManagedClient:
     if remote:
-        managed = ManagedClient(
+        return ManagedClient(
             config=ResolvedServerConfig(
                 name="s",
                 source="custom",
@@ -1715,29 +2234,81 @@ async def test_a_request_carrying_nan_is_never_written(remote: bool) -> None:
             write_stream=AsyncMock(),
             status=ServerStatus(name="s", status=ServerStatusEnum.ONLINE, tool_count=0),
         )
-    else:
-        process = MagicMock()
-        process.stdin.write = MagicMock()
-        process.stdin.drain = AsyncMock()
-        managed = ManagedClient(
-            config=ResolvedServerConfig(
-                name="s", source="custom", config=LocalMcpServerConfig(command="x")
-            ),
-            process=process,
-            status=ServerStatus(name="s", status=ServerStatusEnum.ONLINE, tool_count=0),
-        )
-    with pytest.raises(NonFiniteOutboundNumber):
+    process = MagicMock()
+    process.stdin.write = MagicMock()
+    process.stdin.drain = AsyncMock()
+    return ManagedClient(
+        config=ResolvedServerConfig(
+            name="s", source="custom", config=LocalMcpServerConfig(command="x")
+        ),
+        process=process,
+        status=ServerStatus(name="s", status=ServerStatusEnum.ONLINE, tool_count=0),
+    )
+
+
+def _written(managed: ManagedClient) -> int:
+    if managed.is_remote:
+        return managed.write_stream.send.await_count  # type: ignore[union-attr]
+    return managed.process.stdin.write.call_count  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("remote", [False, True], ids=["stdio", "remote"])
+@pytest.mark.asyncio
+async def test_a_request_carrying_nan_is_never_written(remote: bool) -> None:
+    manager = ClientManager()
+    managed = _managed(remote)
+    with pytest.raises(OutboundFrameNotJson):
         await manager._send_request(
             managed,
             "tools/call",
             {"name": "t", "arguments": {"x": float("nan")}},
             timeout_ms=1000,
         )
-    if remote:
-        managed.write_stream.send.assert_not_called()  # type: ignore[union-attr]
-    else:
-        managed.process.stdin.write.assert_not_called()  # type: ignore[union-attr]
+    assert _written(managed) == 0
     assert managed.pending_requests == {}
+
+
+@pytest.mark.parametrize("remote", [False, True], ids=["stdio", "remote"])
+@pytest.mark.asyncio
+async def test_a_fire_and_forget_frame_carrying_nan_is_dropped_not_written(
+    remote: bool,
+) -> None:
+    """`_send_message_to_downstream` swallows write failures by contract: a
+    non-JSON frame is not written and does not raise. A clean one is."""
+    manager = ClientManager()
+    managed = _managed(remote)
+    await manager._send_message_to_downstream(
+        managed, {"jsonrpc": "2.0", "id": 1, "result": {"x": float("nan")}}
+    )
+    assert _written(managed) == 0
+    await manager._send_message_to_downstream(
+        managed, {"jsonrpc": "2.0", "id": 1, "result": {"x": 1.5}}
+    )
+    assert _written(managed) == 1
+
+
+def test_every_downstream_writer_encodes_through_the_strict_encoder() -> None:
+    """Every function in `client/manager.py` that writes to a stdio pipe
+    encodes with `_encode_outbound_frame`, never `json.dumps` -- including
+    `_send_initialize`, whose frame is a constant no test can make non-JSON."""
+    tree = ast.parse((SRC / "client" / "manager.py").read_text())
+    writers = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        calls = [
+            ast.unparse(node.func)
+            for node in ast.walk(func)
+            if isinstance(node, ast.Call)
+        ]
+        if any(c.endswith("stdin.write") for c in calls):
+            writers[func.name] = calls
+    assert {"_send_message_to_downstream", "_send_request", "_send_initialize"} <= set(
+        writers
+    ), sorted(writers)
+    for name, calls in writers.items():
+        assert "_encode_outbound_frame" in calls, name
+        assert "json.dumps" not in calls, name
 
 
 def test_forwarded_task_hints_are_spec_shaped() -> None:
@@ -1754,4 +2325,290 @@ def test_forwarded_task_hints_are_spec_shaped() -> None:
     ):
         with pytest.raises(ValidationError):
             manager._task_wire_metadata(bad)
+````
+
+### Patch — #297 test migration and the `finite_number` phrase (relative to `0a93265`)
+
+````diff
+diff --git a/src/pmcp/argument_errors.py b/src/pmcp/argument_errors.py
+index 7a5d1b1..9906ce8 100644
+--- a/src/pmcp/argument_errors.py
++++ b/src/pmcp/argument_errors.py
+@@ -96,6 +96,7 @@ _FIXED_PHRASES: dict[str, str] = {
+     "int_from_float": "must be an integer",
+     "float_type": "must be a number",
+     "float_parsing": "must be a number",
++    "finite_number": "must be a finite number",
+     "bool_type": "must be a boolean",
+     "bool_parsing": "must be a boolean",
+     "dict_type": "must be an object",
+diff --git a/tests/test_argument_error_echo.py b/tests/test_argument_error_echo.py
+index 7058d8b..cef1c58 100644
+--- a/tests/test_argument_error_echo.py
++++ b/tests/test_argument_error_echo.py
+@@ -749,7 +749,7 @@ def _handler_validation_errors(s: str) -> list[BaseException]:
+     pydantic error from an argument model, and a jsonschema error."""
+     errors: list[BaseException] = []
+     for model, data in (
+-        (McpTaskInfo, {"task_id": {s: s}, "created_at": [s]}),
++        (McpTaskInfo, {"task_id": {s: s}, "status_message": [s]}),
+         (InvokeInput, {"tool_id": {s: s}, "options": s, "_meta": [s]}),
+     ):
+         try:
+@@ -781,7 +781,7 @@ class _RaisingTools:
+ #: What `exception_text` makes of each of `_handler_validation_errors`.
+ _HANDLER_ERROR_TEXT = (
+     re.compile(
+-        r"2 validation errors for McpTaskInfo: \$\.task_id: must be a string; \$\.created_at: "
++        r"2 validation errors for McpTaskInfo: \$\.task_id: must be a string; \$\.status_message: "
+     ),
+     re.compile(r"3 validation errors for InvokeInput: \$\.tool_id: must be a string; "),
+     # `x` is no name pmcp's models declare, so it reads as `*`.
+@@ -1050,13 +1050,13 @@ def test_exception_text_describes_a_wrapper_that_embeds_a_validation_error() ->
+     s = _SENTINELS[1]
+     try:
+         try:
+-            McpTaskInfo.model_validate({"task_id": "t", "ttl": s})
++            McpTaskInfo.model_validate({"task_id": {"v": s}})
+         except ValidationError as inner:
+             raise RuntimeError(f"task parse failed: {inner}") from inner
+     except RuntimeError as outer:
+         text = exception_text(outer)
+         assert text.startswith(
+-            "RuntimeError: 1 validation error for McpTaskInfo: $.ttl: must be an integer"
++            "RuntimeError: 1 validation error for McpTaskInfo: $.task_id: must be a string"
+         ), text
+         assert not any(form in text for form in _forbidden(s))
+         assert safe_exc_info(outer) is None
+@@ -1082,14 +1082,14 @@ def test_describe_exception_renders_a_grouped_validation_error_structurally(
+         from exceptiongroup import ExceptionGroup as group_type
+     s = _FAMILIES[family][1]
+     with pytest.raises(ValidationError) as raised:
+-        McpTaskInfo.model_validate({"task_id": "t", "ttl": {"v": s}})
++        McpTaskInfo.model_validate({"task_id": {"v": s}})
+     leaf = raised.value
+     for group in (
+         group_type("unhandled errors in a TaskGroup", [leaf]),
+         group_type("unhandled errors in a TaskGroup", [RuntimeError("boom"), leaf]),
+     ):
+         text = describe_exception(group)
+-        assert "validation error for McpTaskInfo: $.ttl: must be an integer" in text
++        assert "validation error for McpTaskInfo: $.task_id: must be a string" in text
+         assert not any(form in text for form in _forbidden(s)), text
+ 
+ 
+@@ -1150,8 +1150,9 @@ def _bad_values(s: str) -> dict[str, Any]:
+ 
+ 
+ def _task_positions() -> list[tuple[str, str]]:
+-    """(payload key, bad-value shape) pairs the real task parser rejects with
+-    a `ValidationError` -- found by running it, not by listing fields."""
++    """(payload key, bad-value shape) for every key the real task parser reads
++    -- found from its source, not by listing fields. Since Consiliency/pmcp#298
++    the parser drops a value it cannot use and raises on none of them."""
+     from pmcp.client.manager import ClientManager
+ 
+     manager = ClientManager()
+@@ -1165,9 +1166,9 @@ def _task_positions() -> list[tuple[str, str]]:
+                 if key not in ("taskId", "task_id")
+                 else {key: value}
+             )
+-            try:
+-                manager._task_info_from_payload(payload)
+-            except ValidationError:
++            manager._task_info_from_payload(payload)  # never raises (#298)
++            if key not in ("taskId", "task_id"):
++                # an identifier pmcp keeps and audits by design (section 9)
+                 positions.append((key, shape))
+     assert len(positions) > 10, positions
+     return positions
+@@ -1242,6 +1243,14 @@ def _task_server(
+     return server, audit_path, state
+ 
+ 
++def _audit_without_result(observed: _Observed) -> list[dict[str, Any]]:
++    """The audit records minus the digest of the accepted result (#298)."""
++    return [
++        {k: v for k, v in record.items() if k != "redacted_result_digest"}
++        for record in observed.audit
++    ]
++
++
+ def _task_calls() -> list[tuple[str, dict[str, Any], str]]:
+     """(gateway tool, arguments, downstream method) for every gateway tool
+     that parses a downstream task payload."""
+@@ -1278,22 +1287,18 @@ async def test_no_downstream_value_reaches_a_response_log_or_audit(
+     positions = _task_positions()
+     parser = server._client_manager._task_info_from_payload
+ 
+-    def rejects(key: str, value: Any) -> bool:
+-        try:
+-            parser({"taskId": "t", "status": "working", key: value})
+-        except ValidationError:
+-            return True
+-        return False
+-
+     rejected = expected = 0
+     for name, arguments, method in _task_calls():
+         for key, shape in positions:
+             for family, sentinels in _FAMILIES.items():
+-                # A value the parser accepts (a digits-only `createdAt` is a
+-                # number) is downstream data pmcp returns by design, not a
+-                # rejection; only rejected values are this sweep's subject.
+-                if not all(rejects(key, _bad_values(s)[shape]) for s in sentinels):
+-                    continue
++                # Since #298 every value is accepted (a usable one kept, an
++                # unusable one dropped), and the task's `raw` returns it to the
++                # caller by design: the response is the product. The log, the
++                # streams, the warnings and the audit must not carry it.
++                for s in sentinels:
++                    parser(
++                        {"taskId": "t", "status": "working", key: _bad_values(s)[shape]}
++                    )
+                 expected += 1
+                 seen = []
+                 for s in sentinels:
+@@ -1314,23 +1319,27 @@ async def test_no_downstream_value_reaches_a_response_log_or_audit(
+                     response = "".join(block.text for block in result.content)
+                     observed = tap.since(mark, response)
+                     assert method in state["methods"], (name, state["methods"])
+-                    assert observed.leaks(s) == [], (name, key, shape, family, observed)
++                    leaks = [c for c in observed.leaks(s) if c != "response"]
++                    assert leaks == [], (name, key, shape, family, observed)
+                     seen.append(observed)
+-                # No vacuous pass: the payload was rejected, and said so.
+-                assert re.search(
+-                    r"validation errors? for McpTaskInfo: \$", seen[0].response
+-                ), (
++                # No vacuous pass: the call reached the downstream (above), and
++                # nothing was refused as a validation error.
++                assert "validation error" not in seen[0].response, (
+                     name,
+                     key,
+                     seen[0].response,
+                 )
+-                assert not seen[0].differs(seen[1]), (
+-                    name,
+-                    key,
+-                    shape,
+-                    family,
+-                    seen[0].differs(seen[1]),
+-                )
++                # The response and the audit's digest of it are the accepted
++                # result; every other channel must not tell the pair apart.
++                differs = [
++                    d
++                    for d in seen[0].differs(seen[1])
++                    if d[0] not in ("response", "audit")
++                ]
++                assert not differs, (name, key, shape, family, differs)
++                assert _audit_without_result(seen[0]) == _audit_without_result(
++                    seen[1]
++                ), (name, key, shape, family)
+                 assert _event_shape(seen[0].events) == _event_shape(seen[1].events)
+                 rejected += 1
+     assert rejected == expected > len(_task_calls()) * len(positions), (
+@@ -1485,7 +1494,7 @@ async def test_a_connect_failure_carrying_a_validation_error_is_described(
+         for s in sentinels:
+ 
+             async def connect(_config: Any, s: str = s) -> None:
+-                McpTaskInfo.model_validate({"task_id": "t", "ttl": {"v": s}})
++                McpTaskInfo.model_validate({"task_id": {"v": s}})
+ 
+             monkeypatch.setattr(manager, "_connect_server", connect)
+             mark = tap.start()
+@@ -1496,7 +1505,7 @@ async def test_a_connect_failure_carrying_a_validation_error_is_described(
+             observed = tap.since(mark, json.dumps(errors) + health)
+             assert observed.leaks(s) == [], (family, observed)
+             assert (
+-                "validation error for McpTaskInfo: $.ttl: must be an integer"
++                "validation error for McpTaskInfo: $.task_id: must be a string"
+                 in (errors[0])
+             ), errors
+             seen.append((json.dumps(errors), observed.log))
+diff --git a/tests/test_downstream_frame_echo.py b/tests/test_downstream_frame_echo.py
+index 789f083..a97152f 100644
+--- a/tests/test_downstream_frame_echo.py
++++ b/tests/test_downstream_frame_echo.py
+@@ -160,10 +160,12 @@ _DOWNSTREAM_LOGIC = textwrap.dedent(
+             "tools/call": {"content": [{"type": "text", "text": bad}]},
+             "resources/read": {"contents": [{"uri": "x://r", "text": bad}]},
+             "prompts/get": {"messages": [{"role": bad, "content": {"type": "text", "text": "m"}}]},
+-            "tasks/list": {"tasks": [{"taskId": "t", "status": "working", "ttl": s}]},
+-            "tasks/get": {"task": {"taskId": "t", "status": "working", "ttl": s}},
+-            "tasks/cancel": {"task": {"taskId": "t", "status": "working", "ttl": s}},
+-            "tasks/result": {"task": {"taskId": "t", "status": "completed", "ttl": s}, "result": {"content": []}},
++            # A malformed task hint is dropped, not rejected (#298); a malformed
++            # `taskId` is still refused, and never rendered.
++            "tasks/list": {"tasks": [{"taskId": bad, "status": "working"}]},
++            "tasks/get": {"task": {"taskId": bad, "status": "working"}},
++            "tasks/cancel": {"task": {"taskId": bad, "status": "working"}},
++            "tasks/result": {"task": {"taskId": bad, "status": "completed"}, "result": {"content": []}},
+         }[method]
+ 
+     def reply(request, state):
+@@ -1026,7 +1028,7 @@ async def test_a_wrapped_handler_keeps_the_wire_code(family: str) -> None:
+ 
+     def invalid() -> ValidationError:
+         try:
+-            McpTaskInfo.model_validate({"task_id": "t", "ttl": s})
++            McpTaskInfo.model_validate({"task_id": "t", "raw": s})
+         except ValidationError as error:
+             return error
+         raise AssertionError("did not reject")
+diff --git a/tests/test_log_record_scrubber.py b/tests/test_log_record_scrubber.py
+index a0dca03..c3790c8 100644
+--- a/tests/test_log_record_scrubber.py
++++ b/tests/test_log_record_scrubber.py
+@@ -36,7 +36,8 @@ _LOGGERS = (
+ 
+ def _validation_error(s: str) -> ValidationError:
+     try:
+-        McpTaskInfo.model_validate({"task_id": "t", "ttl": {"v": s}})
++        # `task_id` still rejects; a malformed task hint is dropped (#298)
++        McpTaskInfo.model_validate({"task_id": {"v": s}})
+     except ValidationError as error:
+         return error
+     raise AssertionError("no validation error")
+@@ -92,7 +93,7 @@ def test_exc_info_is_scrubbed_on_any_logger(
+         )
+     (record,) = capture.records
+     assert record.exc_info is None
+-    assert "validation error for McpTaskInfo: $.ttl" in record.getMessage()
++    assert "validation error for McpTaskInfo: $.task_id" in record.getMessage()
+     assert _clean(record, s)
+ 
+ 
+diff --git a/tests/test_parse_error_echo.py b/tests/test_parse_error_echo.py
+index b12fe09..8d740a7 100644
+--- a/tests/test_parse_error_echo.py
++++ b/tests/test_parse_error_echo.py
+@@ -712,6 +712,7 @@ def test_no_timestamp_site_echoes_its_input(family: str) -> None:
+     """``datetime.fromisoformat`` quotes a bad timestamp (rev 7, N1)."""
+     from pmcp import package_approvals, trust_store
+     from pmcp.argument_errors import exception_text, safe_traceback_text
++    from pmcp.parsing import parse_timestamp
+     from pmcp.types import McpTaskInfo
+ 
+     s = "2026-13-99T" + _FAMILIES[family][1]
+@@ -736,7 +737,9 @@ def test_no_timestamp_site_echoes_its_input(family: str) -> None:
+                 "recorded_at": s,
+             }
+         ),
+-        lambda: McpTaskInfo(task_id="t", created_at=s),
++        # The task-timestamp site no longer raises (#298): its parse is
++        # covered here directly, and the site itself below.
++        lambda: parse_timestamp(s, source="task timestamp"),
+     ]
+     for call in calls:
+         with pytest.raises(Exception) as caught:
+@@ -748,6 +751,8 @@ def test_no_timestamp_site_echoes_its_input(family: str) -> None:
+         calls[0]()
+     except Exception as error:  # noqa: BLE001 -- inspected
+         assert "could not parse timestamp trust store record" in str(error)
++    task = McpTaskInfo(task_id="t", created_at=s)
++    assert task.created_at is None and task.unusable_fields == ["created_at"]
+ 
+ 
+ def test_parse_error_is_rendered_as_its_own_text() -> None:
 ````
