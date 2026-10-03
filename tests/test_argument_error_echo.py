@@ -642,8 +642,18 @@ class _Observed(typing.NamedTuple):
         ]
 
     def stable(self) -> tuple[Any, ...]:
-        """What must be identical for two sentinels of different length."""
-        return (self.response, self.log, self.streams, self.warnings, self.audit)
+        """What must be identical for two sentinels of different length. A
+        task time pmcp itself records (the current time, for a timestamp it
+        dropped as unusable; Consiliency/pmcp#298) is not the pair's."""
+        response = re.sub(
+            r'"(created_at|updated_at)": [0-9.eE+-]+', r'"\1": <time>', self.response
+        )
+        # ...and so is the digest of a result holding that time.
+        audit = [
+            {k: v for k, v in entry.items() if k != "redacted_result_digest"}
+            for entry in self.audit
+        ]
+        return (response, self.log, self.streams, self.warnings, audit)
 
     def differs(self, other: _Observed) -> list[tuple[str, Any, Any]]:
         """The channels where `self` and `other` differ, for a readable failure."""
@@ -749,7 +759,7 @@ def _handler_validation_errors(s: str) -> list[BaseException]:
     pydantic error from an argument model, and a jsonschema error."""
     errors: list[BaseException] = []
     for model, data in (
-        (McpTaskInfo, {"task_id": {s: s}, "created_at": [s]}),
+        (McpTaskInfo, {"task_id": {s: s}, "raw": [s]}),
         (InvokeInput, {"tool_id": {s: s}, "options": s, "_meta": [s]}),
     ):
         try:
@@ -781,7 +791,7 @@ class _RaisingTools:
 #: What `exception_text` makes of each of `_handler_validation_errors`.
 _HANDLER_ERROR_TEXT = (
     re.compile(
-        r"2 validation errors for McpTaskInfo: \$\.task_id: must be a string; \$\.created_at: "
+        r"2 validation errors for McpTaskInfo: \$\.task_id: must be a string; \$\.raw: "
     ),
     re.compile(r"3 validation errors for InvokeInput: \$\.tool_id: must be a string; "),
     # `x` is no name pmcp's models declare, so it reads as `*`.
@@ -1050,13 +1060,13 @@ def test_exception_text_describes_a_wrapper_that_embeds_a_validation_error() -> 
     s = _SENTINELS[1]
     try:
         try:
-            McpTaskInfo.model_validate({"task_id": "t", "ttl": s})
+            McpTaskInfo.model_validate({"task_id": {"v": s}})
         except ValidationError as inner:
             raise RuntimeError(f"task parse failed: {inner}") from inner
     except RuntimeError as outer:
         text = exception_text(outer)
         assert text.startswith(
-            "RuntimeError: 1 validation error for McpTaskInfo: $.ttl: must be an integer"
+            "RuntimeError: 1 validation error for McpTaskInfo: $.task_id: must be a string"
         ), text
         assert not any(form in text for form in _forbidden(s))
         assert safe_exc_info(outer) is None
@@ -1082,14 +1092,14 @@ def test_describe_exception_renders_a_grouped_validation_error_structurally(
         from exceptiongroup import ExceptionGroup as group_type
     s = _FAMILIES[family][1]
     with pytest.raises(ValidationError) as raised:
-        McpTaskInfo.model_validate({"task_id": "t", "ttl": {"v": s}})
+        McpTaskInfo.model_validate({"task_id": {"v": s}})
     leaf = raised.value
     for group in (
         group_type("unhandled errors in a TaskGroup", [leaf]),
         group_type("unhandled errors in a TaskGroup", [RuntimeError("boom"), leaf]),
     ):
         text = describe_exception(group)
-        assert "validation error for McpTaskInfo: $.ttl: must be an integer" in text
+        assert "validation error for McpTaskInfo: $.task_id: must be a string" in text
         assert not any(form in text for form in _forbidden(s)), text
 
 
@@ -1165,12 +1175,25 @@ def _task_positions() -> list[tuple[str, str]]:
                 if key not in ("taskId", "task_id")
                 else {key: value}
             )
-            try:
-                manager._task_info_from_payload(payload)
-            except ValidationError:
+            if _task_outcome(manager._task_info_from_payload, payload):
                 positions.append((key, shape))
     assert len(positions) > 10, positions
     return positions
+
+
+def _task_outcome(parser: Any, payload: dict) -> str | None:
+    """How the task parser refuses a value in `payload`: it raises
+    (`rejected`), or -- since Consiliency/pmcp#298 -- drops it and names the
+    field in `unusable_fields` (`dropped`). None if it accepts the value, or
+    finds no task at all (no string `taskId`: the answer is then not a task,
+    and is returned as the downstream's data, as before)."""
+    try:
+        task = parser(payload)
+    except ValidationError:
+        return "rejected"
+    if task is not None and task.unusable_fields:
+        return "dropped"
+    return None
 
 
 def _task_server(
@@ -1279,11 +1302,8 @@ async def test_no_downstream_value_reaches_a_response_log_or_audit(
     parser = server._client_manager._task_info_from_payload
 
     def rejects(key: str, value: Any) -> bool:
-        try:
-            parser({"taskId": "t", "status": "working", key: value})
-        except ValidationError:
-            return True
-        return False
+        payload = {"taskId": "t", "status": "working", key: value}
+        return _task_outcome(parser, payload) is not None
 
     rejected = expected = 0
     for name, arguments, method in _task_calls():
@@ -1316,9 +1336,13 @@ async def test_no_downstream_value_reaches_a_response_log_or_audit(
                     assert method in state["methods"], (name, state["methods"])
                     assert observed.leaks(s) == [], (name, key, shape, family, observed)
                     seen.append(observed)
-                # No vacuous pass: the payload was rejected, and said so.
+                # No vacuous pass: the payload was rejected, and said so --
+                # or (Consiliency/pmcp#298) the value was dropped, and the
+                # field is named as unusable.
                 assert re.search(
-                    r"validation errors? for McpTaskInfo: \$", seen[0].response
+                    r"validation errors? for McpTaskInfo: \$|\"unusable_fields\": \[\s*\"|"
+                    r"[Tt]ask not found",
+                    seen[0].response,
                 ), (
                     name,
                     key,
@@ -1485,7 +1509,7 @@ async def test_a_connect_failure_carrying_a_validation_error_is_described(
         for s in sentinels:
 
             async def connect(_config: Any, s: str = s) -> None:
-                McpTaskInfo.model_validate({"task_id": "t", "ttl": {"v": s}})
+                McpTaskInfo.model_validate({"task_id": {"v": s}})
 
             monkeypatch.setattr(manager, "_connect_server", connect)
             mark = tap.start()
@@ -1496,7 +1520,7 @@ async def test_a_connect_failure_carrying_a_validation_error_is_described(
             observed = tap.since(mark, json.dumps(errors) + health)
             assert observed.leaks(s) == [], (family, observed)
             assert (
-                "validation error for McpTaskInfo: $.ttl: must be an integer"
+                "validation error for McpTaskInfo: $.task_id: must be a string"
                 in (errors[0])
             ), errors
             seen.append((json.dumps(errors), observed.log))

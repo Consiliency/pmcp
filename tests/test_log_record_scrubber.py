@@ -36,7 +36,7 @@ _LOGGERS = (
 
 def _validation_error(s: str) -> ValidationError:
     try:
-        McpTaskInfo.model_validate({"task_id": "t", "ttl": {"v": s}})
+        McpTaskInfo.model_validate({"task_id": {"v": s}})
     except ValidationError as error:
         return error
     raise AssertionError("no validation error")
@@ -92,7 +92,7 @@ def test_exc_info_is_scrubbed_on_any_logger(
         )
     (record,) = capture.records
     assert record.exc_info is None
-    assert "validation error for McpTaskInfo: $.ttl" in record.getMessage()
+    assert "validation error for McpTaskInfo: $.task_id" in record.getMessage()
     assert _clean(record, s)
 
 

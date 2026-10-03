@@ -20,14 +20,38 @@ accepting ``null`` exactly where the model does.
 from __future__ import annotations
 
 from copy import deepcopy
+import math
 from typing import Any
 
+import jsonschema
 from pydantic import BaseModel
 
 #: Advertised for gateway tools that take no arguments at all.
 NO_ARGUMENTS_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
 
 _REF_PREFIX = "#/$defs/"
+
+
+def _is_json_number(checker: Any, instance: Any) -> bool:
+    """JSON Schema's ``number``, minus NaN and +-Infinity (Consiliency/pmcp#298).
+
+    Neither is a JSON number (RFC 8259 s6), yet Python's ``json`` and pydantic's
+    parser both read ``NaN``/``Infinity``/``1e400`` off the wire, and no bound
+    keyword refuses NaN: every comparison with it is false. ``integer`` needs no
+    change -- its check is ``float.is_integer()``, which both already fail.
+    """
+    return jsonschema.Draft202012Validator.TYPE_CHECKER.is_type(
+        instance, "number"
+    ) and not (isinstance(instance, float) and not math.isfinite(instance))
+
+
+#: The validator the transport gate runs every advertised ``inputSchema`` with.
+GATE_VALIDATOR = jsonschema.validators.extend(
+    jsonschema.Draft202012Validator,
+    type_checker=jsonschema.Draft202012Validator.TYPE_CHECKER.redefine(
+        "number", _is_json_number
+    ),
+)
 _NULL_SCHEMA: dict[str, Any] = {"type": "null"}
 
 

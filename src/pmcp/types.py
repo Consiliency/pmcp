@@ -4,10 +4,18 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+import math
 import re
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 from pmcp.argument_errors import (
     CORRELATION_ID_CHARSET,
@@ -82,6 +90,11 @@ DEFAULT_AUTH_STATE_SEMANTICS: dict[AuthState, AuthStateSemanticsInfo] = {
         evidence_fields=["error", "next_step"],
     ),
 }
+
+
+#: The largest integer every JSON peer reads exactly (RFC 7493 s2.2, I-JSON):
+#: the upper bound on numeric task hints pmcp forwards downstream.
+MAX_FORWARDED_TASK_NUMBER = 2**53 - 1
 
 
 class GatewayArguments(BaseModel):
@@ -525,8 +538,102 @@ class ServerStatus(BaseModel):
     avg_response_time_ms: float | None = None  # Rolling average response time
 
 
+_INT64_MAX = 2**63 - 1
+
+#: Stands in for a downstream task value pmcp cannot use. The downstream
+#: parser also passes it for a hint the downstream sent as JSON `null`.
+UNUSABLE_TASK_VALUE: Any = object()
+_UNUSABLE = UNUSABLE_TASK_VALUE
+
+
+def _usable_task_ttl(value: Any) -> Any:
+    """A non-bool integer in [0, int64], or a finite whole-number float there
+    (``300000.0``: JSON Schema calls it an integer too)."""
+    if type(value) is float and math.isfinite(value) and value.is_integer():
+        value = int(value)
+    if type(value) is int and 0 <= value <= _INT64_MAX:
+        return value
+    return _UNUSABLE
+
+
+def _usable_poll_interval(value: Any) -> Any:
+    """A non-bool, finite number greater than 0."""
+    if type(value) in (int, float):
+        try:
+            number = float(value)
+        except OverflowError:
+            return _UNUSABLE
+        if math.isfinite(number) and number > 0:
+            return number
+    return _UNUSABLE
+
+
+def _usable_task_timestamp(value: Any) -> Any:
+    """Epoch seconds from a finite number, a numeric string or an ISO 8601
+    string; a datetime as is."""
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, bool):
+        return _UNUSABLE
+    if isinstance(value, int | float):
+        try:
+            number = float(value)
+        except OverflowError:
+            return _UNUSABLE
+        return number if math.isfinite(number) else _UNUSABLE
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            # sent, but empty: unusable, not "not sent" (Consiliency/pmcp#298)
+            return _UNUSABLE
+        try:
+            number = float(candidate)
+        except ValueError:
+            pass
+        else:
+            return number if math.isfinite(number) else _UNUSABLE
+        if candidate.endswith("Z"):
+            candidate = f"{candidate[:-1]}+00:00"
+        try:
+            # Through the parse helper (Consiliency/pmcp#297): its failure
+            # is value-free; the value itself is dropped, as main drops it.
+            return parse_timestamp(candidate, source="task timestamp").timestamp()
+        except (ValueError, OverflowError, OSError):
+            return _UNUSABLE
+    return _UNUSABLE
+
+
+def _usable_task_status(value: Any) -> Any:
+    """Any non-blank string: unknown future statuses are kept (the tenant
+    contract); a blank one says nothing and is unusable."""
+    return value if isinstance(value, str) and value.strip() else _UNUSABLE
+
+
+_TASK_HINT_CHECKS: dict[str, Any] = {
+    "status": _usable_task_status,
+    "created_at": _usable_task_timestamp,
+    "updated_at": _usable_task_timestamp,
+    "ttl": _usable_task_ttl,
+    "poll_interval": _usable_poll_interval,
+}
+
+
+def task_hint_is_usable(name: str, value: Any) -> bool:
+    """Whether ``value`` passes the check for task field ``name`` -- for the
+    downstream parser choosing among a field's wire aliases."""
+    return value is not None and _TASK_HINT_CHECKS[name](value) is not _UNUSABLE
+
+
 class McpTaskInfo(BaseModel):
-    """Public view of a downstream MCP task."""
+    """Public view of a downstream MCP task.
+
+    A downstream value pmcp cannot use is reported as ``None`` and its field
+    is named in ``unusable_fields`` (Consiliency/pmcp#298). So a ``None``
+    ``ttl`` not named there keeps the MCP meaning "unlimited", and one named
+    there means the downstream sent something pmcp could not read. Nothing is
+    refused: refusing would fail a call whose task the downstream had already
+    created, and pmcp only reports these values.
+    """
 
     task_id: str
     status: McpTaskStatus | str | None = None
@@ -535,29 +642,36 @@ class McpTaskInfo(BaseModel):
     updated_at: float | None = None
     ttl: int | None = None
     poll_interval: float | None = None
+    unusable_fields: list[str] = Field(default_factory=list)
     raw: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("created_at", "updated_at", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def _normalize_task_timestamp(cls, value: Any) -> float | None:
-        if value is None:
-            return None
-        if isinstance(value, datetime):
-            return value.timestamp()
-        if isinstance(value, int | float):
-            return float(value)
-        if isinstance(value, str):
-            candidate = value.strip()
-            if not candidate:
-                return None
-            try:
-                return float(candidate)
-            except ValueError:
-                pass
-            if candidate.endswith("Z"):
-                candidate = f"{candidate[:-1]}+00:00"
-            return parse_timestamp(candidate, source="task timestamp").timestamp()
-        return value
+    def _drop_unusable_hints(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        unusable = out.get("unusable_fields")
+        dropped = (
+            {name for name in unusable if isinstance(name, str)}
+            if isinstance(unusable, list)
+            else set()
+        )
+        for name, check in _TASK_HINT_CHECKS.items():
+            value = out.get(name)
+            if value is None:
+                continue
+            usable = check(value)
+            if usable is _UNUSABLE:
+                out[name] = None
+                dropped.add(name)
+            else:
+                out[name] = usable
+        if dropped or "unusable_fields" in out:
+            # Only the known field names, in table order: value-free by
+            # construction, whatever a caller of the model passed in.
+            out["unusable_fields"] = [n for n in _TASK_HINT_CHECKS if n in dropped]
+        return out
 
 
 class McpTaskRecord(McpTaskInfo):
@@ -567,6 +681,10 @@ class McpTaskRecord(McpTaskInfo):
     tool_id: str | None = None
     local_request_id: str | None = None
     requestor_context: dict[str, Any] | None = None
+    #: The order in which pmcp last recorded this task (not public): the
+    #: eviction key. pmcp's own sequence, so neither a downstream's clock nor
+    #: pmcp's wall clock can reorder it (Consiliency/pmcp#298, R3-N4).
+    _recorded_order: int = PrivateAttr(default=0)
 
 
 class TaskMetadataInput(GatewayArguments):
@@ -580,18 +698,27 @@ class TaskMetadataInput(GatewayArguments):
     )
     ttl: int | None = Field(
         default=None,
-        # int64, both sides: pydantic already refuses a float outside it
-        # (`int_parsing_size`), so advertise the range and let the gate refuse
-        # `1e20` and `-1e20` too, rather than passing them on to the model
-        # (Consiliency/pmcp#236, board rounds 4 and 5)
-        # -2**63 + 1: `float(-2**63)` is exactly representable, and pydantic
-        # refuses it (board round 6, N6-1), so the inclusive bound stops one short
-        ge=-9_223_372_036_854_775_807,
-        le=9_223_372_036_854_775_807,
+        # [1, 2**53 - 1] (Consiliency/pmcp#298): a zero or negative retention is
+        # meaningless, and the value is forwarded downstream as the MCP
+        # `TaskMetadata.ttl` integer, which a JavaScript peer reads as a double
+        # -- above 2**53 - 1 it is no longer the integer the caller sent. The
+        # bound also keeps the gate and the model agreeing on floats outside
+        # int64 (Consiliency/pmcp#236).
+        ge=1,
+        le=MAX_FORWARDED_TASK_NUMBER,
         description="Requested task TTL in seconds",
     )
     poll_interval: float | None = Field(
-        default=None, description="Seconds between task status polls"
+        default=None,
+        # finite and positive, both sides bounded (Consiliency/pmcp#298): NaN and
+        # +-Infinity are not JSON numbers, and an unbounded float lets a JSON
+        # integer of |n| >= 2**1024 - 2**970 past the gate to a model that
+        # cannot hold it. `allow_inf_nan` is not projected into the schema;
+        # the gate's validator refuses non-finite numbers itself.
+        gt=0,
+        le=MAX_FORWARDED_TASK_NUMBER,
+        allow_inf_nan=False,
+        description="Seconds between task status polls",
     )
     requestor_context: dict[str, Any] | None = Field(
         default=None, description="Opaque requestor context forwarded downstream"

@@ -666,7 +666,25 @@ def _rejected_texts(error: BaseException) -> list[str]:
         elif isinstance(linked, jsonschema.ValidationError):
             inputs = [linked.instance]
         for value in inputs:
-            for text in (value, json.dumps(value, default=str)):
+            # The input whole (as itself, JSON and repr), and every string
+            # inside a container input: a message built from `{'v': '<s>'}`
+            # renders neither form of the whole (rev 13, on Consiliency/
+            # pmcp#298's merge, whose task fields no longer raise).
+            candidates: list[Any] = [value, json.dumps(value, default=str), repr(value)]
+            stack: list[tuple[Any, int]] = [(value, 0)]
+            while stack:
+                item, depth = stack.pop()
+                if depth > 8:
+                    continue
+                if isinstance(item, dict):
+                    for key, inner in item.items():
+                        candidates.append(key)
+                        stack.append((inner, depth + 1))
+                elif isinstance(item, (list, tuple, set)):
+                    stack.extend((inner, depth + 1) for inner in item)
+                elif depth and isinstance(item, str):
+                    candidates.append(item)
+            for text in candidates:
                 if isinstance(text, str) and len(text) >= 4:
                     texts.append(text)
     return texts

@@ -292,6 +292,8 @@
      },
      "poll_interval": {
       "description": "Seconds between task status polls",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991,
       "type": [
        "number",
        "null"
@@ -307,8 +309,8 @@
      },
      "ttl": {
       "description": "Requested task TTL in seconds",
-      "maximum": 9223372036854775807,
-      "minimum": -9223372036854775807,
+      "maximum": 9007199254740991,
+      "minimum": 1,
       "type": [
        "integer",
        "null"

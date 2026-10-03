@@ -736,8 +736,12 @@ def test_no_timestamp_site_echoes_its_input(family: str) -> None:
                 "recorded_at": s,
             }
         ),
-        lambda: McpTaskInfo(task_id="t", created_at=s),
     ]
+    # Since Consiliency/pmcp#298 a task timestamp pmcp cannot use is dropped,
+    # not raised: it is `None`, named in `unusable_fields`, and not kept.
+    task = McpTaskInfo(task_id="t", created_at=s)
+    assert task.created_at is None and task.unusable_fields == ["created_at"]
+    assert not any(form in task.model_dump_json() for form in forbidden)
     for call in calls:
         with pytest.raises(Exception) as caught:
             call()

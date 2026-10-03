@@ -1070,7 +1070,7 @@ async def test_a_wrapped_handler_keeps_the_wire_code(family: str) -> None:
 
     def invalid() -> ValidationError:
         try:
-            McpTaskInfo.model_validate({"task_id": "t", "ttl": s})
+            McpTaskInfo.model_validate({"task_id": {"v": s}})
         except ValidationError as error:
             return error
         raise AssertionError("did not reject")
@@ -1096,7 +1096,9 @@ async def test_a_wrapped_handler_keeps_the_wire_code(family: str) -> None:
 
     async def mcp_data_carries() -> None:
         error = invalid()
-        raise MCPError(-32602, "bad input", {"input": s}) from error
+        raise MCPError(
+            -32602, "bad input", {"input": error.errors()[0]["input"]}
+        ) from error
 
     async def mcp_partial_message() -> None:
         error = invalid()

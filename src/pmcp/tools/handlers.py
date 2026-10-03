@@ -1683,8 +1683,17 @@ class GatewayTools:
                 else task_info is not None
             )
 
+            # A task answer is returned as the task record, whose `raw`
+            # holds only what pmcp could use: size and summarise that, not
+            # the answer, whose size followed a hint pmcp dropped
+            # (Consiliency/pmcp#297 on Consiliency/pmcp#298).
+            sized = (
+                {**result, "task": task_info.raw}
+                if task_info is not None and isinstance(result, dict)
+                else result
+            )
             processed = self._policy_manager.process_output(
-                result, redact=redact, max_bytes=max_bytes
+                sized, redact=redact, max_bytes=max_bytes
             )
             public_task = (
                 self._sanitize_task_for_output(task_info)
