@@ -1,8 +1,17 @@
 # Detailed plan: cache the parsed manifest, and parse pmcp's own manifest with libyaml (P-01; Consiliency/pmcp#233)
 
+> **Revision 2** (2026-10-03): board round 1 on `4584302` (Consiliency/pmcp#331). Codex raised two
+> blocking defects; the claude seat's F1 overlaps the second, and gemini found nothing blocking.
+> **B1**: pickling a deeply aliased overlay raised `RecursionError` where main loads fine. Now a
+> result that cannot be serialized or read back is returned uncached (D4.4). **B2 / F1**: a
+> transition back into a state still held in the LRU was silent. Warnings are now owed per
+> *transition*, and the refusal's identity is part of the key (D5). The claude nits are taken:
+> the parser-equality test compares exact types, and the fallback test covers
+> `_shipped_manifest_entries()`. See "Round 1 board findings".
+
 > **Bounded-plan verdict: within threshold.** One source file changes
-> (`src/pmcp/manifest/loader.py`, +208/−59). One test file is new
-> (`tests/test_manifest_cache.py`, 31 tests), and two test files change: `tests/conftest.py`
+> (`src/pmcp/manifest/loader.py`, +282/−59). One test file is new
+> (`tests/test_manifest_cache.py`, 37 tests), and two test files change: `tests/conftest.py`
 > gets one reset line, and `tests/test_version_pin.py` loses PR 327's `_memoized_yaml` fixture.
 > The docs change is one CHANGELOG bullet and one README sentence. It is one conceptual
 > change: `load_manifest()` returns a cached result keyed by everything it reads, and pmcp's
@@ -20,6 +29,18 @@
 > is a separate concurrency change in a different subsystem, with its own failure modes. It
 > is a non-goal here. Recommendation: its own plan, linked from Consiliency/pmcp#233 (see
 > Non-goals).
+
+## Round 1 board findings (Consiliency/pmcp#331 @ `4584302`)
+
+| finding | seat | reproduced on the round-1 spike | resolution |
+|---|---|---|---|
+| **B1** pickling breaks a manifest main loads | codex (F041–F044) | yes: 500 chained anchors (11 KB) → `RecursionError` while pickling. Main returns 108 servers at depth 500 and 2000. The pickle limit is nesting **496** on 3.10.21 (recursion limit 1000), and the C unpickler loads what it dumped | D4.4: `_serialize` / `_deserialize` contain **any** exception. The result is returned uncached, the log line is DEBUG and names only the exception class, and a failed read-back rebuilds. The second-level cache's `pickle.loads` was unguarded too; round 2's read-back test found it, and it is now guarded |
+| **B2** a consent transition into a cached state is silent | codex (F045–F047), claude F1 | yes: unapproved → approve → revoke warned `[1, 0, 0]` (main `[1, 0, 1]`); retargeting a symlink between two unapproved files warned once | D5: `_last_served_key`. A call whose key differs from the previous call's is rebuilt, which emits its warnings, even when the key is in the LRU. The key gains the refusal identity: resolved path, reason, remediation |
+| N1 `==` treats `1 == True == 1.0` | claude | yes, by reading | the equality test compares type-tagged trees |
+| N2 the fallback test misses `_shipped_manifest_entries()` | claude | yes, by reading | that test clears the `lru_cache` and runs the fallback parse |
+
+The claude seat's 18 stale-result and concurrency attack tests (`scratchpad/331/seat1/test_seat_attacks.py`)
+were re-run against the round-2 spike: **18 passed**.
 
 ## Task
 
@@ -48,8 +69,8 @@ time it. Figures are per search, averaged over 3 warm searches.
 
 | `catalog_search` input | `load_manifest` calls | `yaml.safe_load` calls | main (pure Python) | main + libyaml only (no cache) | spike (cache + libyaml) |
 |---|---|---|---|---|---|
-| query + `include_offline` (worst case) | **13** | 26 | **1556–1589 ms** | 355–403 ms | **25–37 ms** |
-| query only | 6 | 12 | 674–768 ms | 155–186 ms | 3 ms |
+| query + `include_offline` (worst case) | **13** | 26 | **1556–1589 ms** | 355–403 ms | **25–37 ms** (round 2: 31–39 ms) |
+| query only | 6 | 12 | 674–768 ms | 155–186 ms | 3 ms (round 2: 5–11 ms) |
 | no query | 0 | 0 | 0 ms | 0 ms | 0 ms |
 
 Where the 13 calls come from, worst case:
@@ -77,9 +98,10 @@ one is a full parse on main.
 |---|---|---|
 | main, every call (pure-Python `SafeLoader`) | 102.5–124.6 ms | 92.4 ms |
 | main with `yaml.safe_load` → `CSafeLoader` (no cache) | 11.4–13.0 ms | 9.4 ms |
-| spike, **hit** | **0.65–0.67 ms** | 0.42 ms |
-| spike, miss with the shipped parse cached (an overlay or consent change) | 1.9–2.4 ms | 1.8 ms |
-| spike, cold miss (process start: parses the shipped manifest) | 12.9–20.8 ms | 10.0 ms |
+| spike, **hit** | **0.65–0.67 ms** (round 2: 0.46–0.50 ms) | 0.42 ms |
+| spike, miss with the shipped parse cached (an overlay or consent change), which is also the cost of a transition (D5) | 1.9–2.4 ms (round 2: 1.21–1.23 ms) | 1.16 ms |
+| spike, cold miss (process start: parses the shipped manifest) | 12.9–20.8 ms (round 2: 12.2–18.9 ms) | 10.0 ms |
+| a result that cannot be pickled (500 chained anchors), round 2: returned uncached, every call | 34.4 ms (main on the same overlay: **189.0 ms**) | — |
 | raw `yaml.safe_load(shipped bytes)` / `yaml.load(…, CSafeLoader)` | 301 / 41 ms (median, 15 runs) | 278 / 19 ms |
 
 So libyaml alone is a ~9–10× win per call, and the cache takes the steady state to under
@@ -158,14 +180,17 @@ Nothing else: `_parse_server_config`, `_parse_overlay_document` and
   saw **1048 `load_manifest` calls and 888 misses, 8.53 s total in builds**. Most tests load
   once after the per-test reset, so most calls are misses. Each miss parses only the
   overlays: the shipped document is cached by its bytes across tests (D7).
-  **What that run covered:** it used the spike revision before the final one. That revision
+  **Round 2:** the full suite was re-run, alone, on the **embedded round-2 text**: **4966 passed,
+  3 skipped, 80 deselected in 605.40 s, coverage 89.88%**. The plugin counted 1162 calls and 973
+  builds, which includes transitions. The round-1 note follows.
+  **What the round-1 run covered:** it used the spike revision before the final one. That revision
   had D1–D9 and D7, but it picked the loader with a module constant rather than
   `_trusted_yaml_loader()`, it still contained the then-dead `_load_overlay_file`, and
   `_memoized_yaml` was still in place. The final, embedded text was then run on all 28 files
   that name `load_manifest` (2103 passed, the A/B below), on `test_version_pin.py` with the new
   tests (196 passed), and through all 17 mutants. The implementing PR re-runs the full suite
   on the final text.
-- **Controlled before/after, with coverage, on every test file that names `load_manifest`** (28 files, 2103 tests; `ab.sh`, appendix; main then spike, back to back, same window): **main 252.49 s → spike 103.91 s** (2103 passed, 1 skipped, 24 deselected both times; −148.6 s, 2.4×; peak RSS 138 MB → 136 MB). Tests that reach `load_manifest` only indirectly are outside that set: for example, `test_offline_discovery.py` and `test_progressive_disclosure.py` drive `catalog_search`. In the full run a plugin counted 1048 calls suite-wide; the A/B did not count. So −148.6 s is a **lower bound** on the saving at this host's speed, not a model of CI. CI timing is reported in the implementing PR, not gated on (see Verification).
+- **Controlled before/after, with coverage, on every test file that names `load_manifest`** (28 files, 2103 tests; `ab.sh`, appendix; main then spike, back to back, same window): **main 252.49 s → spike 103.91 s** (2103 passed, 1 skipped, 24 deselected both times; −148.6 s, 2.4×; peak RSS 138 MB → 136 MB). **Round 2, on the embedded text, same procedure: main 212.38 s → spike 79.72 s** (−132.7 s, 2.7×; 2103 passed both times). Tests that reach `load_manifest` only indirectly are outside that set: for example, `test_offline_discovery.py` and `test_progressive_disclosure.py` drive `catalog_search`. In the full run a plugin counted 1048 calls suite-wide; the A/B did not count. So −148.6 s is a **lower bound** on the saving at this host's speed, not a model of CI. CI timing is reported in the implementing PR, not gated on (see Verification).
 - PR 327's two exhaustive tests (`test_the_invalid_pin_text_is_true_*`, 432
   `load_manifest()` calls), no coverage:
 
@@ -202,11 +227,15 @@ Nothing else: `_parse_server_config`, `_parse_overlay_document` and
 
 ### D1. Cache the merged `Manifest`, keyed by the content of every input, not by mtime
 **Decision:** a process-global LRU maps a key to the pickled `Manifest`. The key is
-`(base path, apply_overlays, sha256(base bytes), ((label, path, state, sha256(bytes)) per
-overlay), notices, _on_windows())`, where:
+`(base path, apply_overlays, sha256(base bytes), ((label, path, state, sha256(bytes),
+consent identity) per overlay), notices, _on_windows())`, where:
 - `state` is `"read"` for the user and env overlays. For the project overlay it is
   `"approved"`, or the consent refusal reason. It is `"unreadable"` when the read failed.
 - `notices` is the ignored-`PMCP_MANIFEST_PATH` text, when there is one.
+- the consent identity (round 2, B2) is `(resolved path, reason, remediation)` of the project
+  overlay's `ConsentDecision`, or `None` for the user and env overlays. A symlink retargeted
+  from one unapproved file to another is a different refusal with a different remediation,
+  and the unresolved path alone cannot tell them apart. Mutant **M21** drops it, and it is red.
 
 **Why bytes, not `(mtime_ns, size)`:**
 1. Each call has to read every overlay's bytes anyway: the consent gate judges the bytes it
@@ -290,46 +319,110 @@ is covered.
 3. **Per-entry validation results are cached.** Examples are a bad `server_version` pin, an
    invalid `servers:` entry, or a `server_env` patch for an unknown server. These are pure
    functions of the bytes in the key, not failures to read the source.
+4. **The cache can never make a successful load fail (round 2, B1).** Storing is
+   `_serialize(manifest)`, which wraps `pickle.dumps` and contains **any** exception. If it
+   fails, the result is returned as built and not stored, and one DEBUG line names only the
+   exception class: never a value, a path or a key. Reading back is `_deserialize(blob)`, the
+   same for `pickle.loads`: on failure the entry is dropped and the call rebuilds. The
+   second-level shipped-document cache (D7) uses the same two helpers.
 
-### D5. Warnings: once per miss, which is once per distinct input state
-**Decision:** every warning and INFO line `load_manifest` produces is emitted on a miss and not
-on a hit:
-- the merge-time warnings: overrides, unknown-server patches, refused pins;
+   **What breaks pickle:** a user or env overlay whose YAML anchors chain values into each
+   other parses with `SafeLoader`, because aliases are not parser recursion. But
+   `raw_discovery_metadata` then nests as deep as the chain, and `pickle.dumps` recurses once
+   per level. On 3.10.21 the largest nesting that pickles is **496** levels (bisected), and the
+   C unpickler loads it back. Codex's 11 KB document (500 anchors) crosses that.
+
+   **Measured, 500 anchors:** main takes **189.0 ms** per call; round 2 takes **34.4 ms** per
+   call, uncached, re-building every time, with 0 cache entries. A normal overlay still hits
+   at 0.5 ms; at 300 anchors it is cached.
+
+   **Why not reject deep results up front** with a depth check before pickling: it would add a
+   walk over every result on every miss, and duplicate a limit that depends on the Python
+   version. Containing the exception is exact and free when nothing fails.
+
+   Tests:
+   - `test_a_result_that_cannot_be_pickled_is_returned_uncached[500/2000]`: both calls succeed,
+     with 2 builds and 0 entries, and the DEBUG line carries no value;
+   - `test_a_cached_result_that_cannot_be_read_back_is_rebuilt`.
+
+   Mutants **M18** (raw `pickle.dumps`) and **M19** (raw `pickle.loads`) are red.
+
+### D5. Warnings: once per transition (revised in round 2)
+**Decision:** a warning is owed once each time the inputs change, whether or not the new
+state is still cached. `load_manifest` remembers, under the lock, the key it served last
+(`_last_served_key`).
+- A call with the **same** key as the previous call, and a cache entry, is a silent hit.
+- A call with a **different** key is built, even if its key is still in the LRU: a miss,
+  or a *transition* into a state seen before. The build emits every warning for that state
+  once, exactly the lines main would emit, and it costs **1.2 ms** with the shipped document
+  cached (D7, round-2 measurement). The rebuilt entry replaces the stored one.
+
+The lines this governs:
+- merge-time warnings: overrides, unknown-server patches, refused pins;
 - the project consent refusal (`log_refusal`);
-- the ignored-`PMCP_MANIFEST_PATH` notice.
+- the ignored-`PMCP_MANIFEST_PATH` notice. This one is collected during key derivation and
+  logged only when the call builds.
 
-The last two are computed during key derivation, so they are deferred: the notice is
-collected in a list and logged on a miss, and the refusal is logged by `_build_manifest`.
-They are part of the key, so a state that differs only in them is still a miss. Mutant
-**M3** drops the notice from the key, and it is red: an ignored redirect after a clean load
-would never be reported.
+All three are functions of the key. The key includes the notice text (mutant **M3**) and the
+refusal's identity (**M21**), so a change in either is a transition.
 
-**Why once per miss, not on every call:**
-- On main the same warnings fire up to 13 times per `catalog_search`. An operator with a
-  bad pin or an unapproved project overlay gets the same line 13 times a search, which
-  trains them to ignore it.
-- Once per state means: told at startup, told again when the file, the consent or the env
-  changes, and quiet otherwise. That is what an operator acts on.
+**Round 1 showed why "once per distinct state" was wrong.** The round-1 code warned once per
+*cache miss*. An unapproved → approved → revoked sequence returned to a key still in the
+8-slot LRU, and the revocation was silent (`[1, 0, 0]`; main `[1, 0, 1]`). A pin broken,
+fixed and broken again with the same bytes was silent the second time. A symlink retargeted
+from one unapproved file to another was silent, because the key lacked the resolved path.
+That contradicted this plan's own acceptance criterion and CHANGELOG text. It also narrowed
+SECURITY C-12 ("a refusal … reaches the operator as exactly one warning"): a refusal entered
+again reached the operator as zero warnings.
+
+**Why per transition, not on every call:**
+- On main the same warnings fire up to 13 times per `catalog_search`. An operator with a bad
+  pin or an unapproved project overlay gets the same line 13 times a search, which trains
+  them to ignore it.
+- Per transition means: told at startup, told again every time the file, the consent or the
+  env changes (including back to an earlier state), and quiet while nothing changes. A
+  refusal reaches the operator as exactly one warning per transition into it, which is what
+  C-12's tests pin (`test_refusal_remedies.py`, `test_project_consent_gate.py`: both pass).
 - While a source is broken, the warning repeats every call (D4.2), as on main, because that
   state is never cached.
+- Alternating states, two callers in different cwds in one process for example, rebuild on
+  every alternation. That costs about 1.2 ms each and logs each state's lines each time, as
+  main does. A gateway serves one project, so it does not alternate.
 
 **Test impact, measured:** every existing warning test passes unchanged. Each test starts with
-an empty cache (D8), and PR 327's exhaustive tests write different bytes per case, so every
-case is a miss. That covers the 15-file subset, all of `test_version_pin.py`, and the full
-suite.
+an empty cache and no last-served key (D8). PR 327's exhaustive tests write different bytes
+per case, so every case is a transition. That covers the 28 `load_manifest` files and the
+full suite.
 
 **New tests:**
-- `test_warnings_are_emitted_once_per_miss`: miss warns, hit is silent, an edit warns
-  again;
+- `test_warnings_are_emitted_once_per_miss`: the first load warns, the same state is silent,
+  an edit warns again;
 - `test_a_consent_refusal_is_logged_once_per_state`;
 - `test_an_ignored_redirect_is_logged_once_per_state`;
-- `test_clearing_the_cache_warns_again`.
+- `test_clearing_the_cache_warns_again`;
+- round 2, `test_every_consent_transition_warns_even_when_the_state_is_still_cached`.
+  Unapproved, again, approve, revoke, again, approve, revoke gives `[1, 0, 0, 1, 0, 0, 1]`;
+- round 2, `test_retargeting_a_project_overlay_symlink_is_a_new_refusal`. One, two, two, one
+  gives `[1, 1, 0, 1]`, and each line names its own target;
+- round 2, `test_breaking_fixing_and_breaking_again_warns_each_time`. Bad, bad, good, bad,
+  bad with identical bytes gives `[1, 0, 0, 1, 0]`.
 
-Mutant **M8** logs the notices on every call, and it is red.
+**Mutants:**
+- **M8** logs the notices on every call.
+- **M20** makes a transition into a cached state a silent hit; this is the round-1 code.
+- **M21** drops the refusal identity from the key.
+- **M22** never records the last-served key, so every call rebuilds and warns.
 
-**Rejected:** replaying the captured log records on each hit. It would keep main's log volume
-exactly, which is the problem P-01's reviewers flagged, and it adds a log-capture mechanism
-inside the loader.
+All four are red.
+
+**Rejected:**
+- Replaying the captured log records on each hit. It would keep main's 13× log volume, and it
+  adds a log-capture mechanism inside the loader.
+- Replaying stored records only on a transition hit. That is equivalent to rebuilding, but
+  needs a second store; rebuilding costs 1.2 ms.
+- Rewording the promise down to "once per distinct state while it stays cached" (the claude
+  seat's option b). It narrows C-12 in practice, and an operator who revokes trust a second
+  time gets nothing.
 
 ### D6. libyaml only for pmcp's own shipped manifest; overlays keep `SafeLoader`
 **Decision:** `_parse_trusted_yaml(content)` is used only for the shipped manifest. It calls
@@ -372,7 +465,8 @@ from the outer key, and it is red.
 **Decision:** module globals in `src/pmcp/manifest/loader.py`:
 - `_manifest_cache: OrderedDict[tuple, bytes]`, an LRU of **8** slots;
 - `_manifest_cache_lock: threading.RLock`;
-- a public `clear_manifest_cache()`.
+- a public `clear_manifest_cache()`, which also forgets the last-served key;
+- `_last_served_key` (round 2, D5).
 
 `tests/conftest.py`'s existing autouse `_reset_process_global_state` calls
 `manifest_loader.clear_manifest_cache()` before and after every test. It sits next to
@@ -515,7 +609,10 @@ exceptions are never pickled or cached (D4.1).
 - `_parse_overlay_document(path, content, failures=None)`: appends `"parse"` or
   `"not-a-mapping"` on those two failures (D4.2). Its return type is unchanged.
 - `_manifest_cache`, `_manifest_cache_lock`, `_MANIFEST_CACHE_SLOTS`, `clear_manifest_cache()`
-  (new): D8.
+  (new): D8. `_last_served_key` (new, round 2): D5.
+- `_serialize()`, `_deserialize()` (new, round 2): D4.4. They are used by the manifest cache
+  and by `_parse_trusted_document`.
+- `_source_key()` (new, round 2): one overlay's key part, with the consent identity (D1, D5).
 - `_OverlaySource`, `_gather_overlay_sources()`, `_digest()` (new): D1 and D2.
 - `load_manifest`: key derivation, lookup, notices on a miss, build, store if cacheable,
   return. The docstring states the cache contract.
@@ -535,7 +632,7 @@ deviation from a byte-identical apply (Verification step 10 compares before it i
 
 Delete `_memoized_yaml` and its two parameter uses (D11).
 
-### `tests/test_manifest_cache.py` (new, 31 tests; verbatim below)
+### `tests/test_manifest_cache.py` (new, 37 tests; verbatim below)
 
 ## Documentation impact
 
@@ -549,17 +646,19 @@ Delete `_memoized_yaml` and its two parameter uses (D11).
   > overlay, each project overlay's consent decision, the `PMCP_MANIFEST_PATH` redirect and
   > its provenance, and the platform. Editing an overlay, approving or revoking one, or
   > changing the env takes effect on the next call, as before. Warnings about a manifest
-  > are now logged once each time its inputs change, not on every load. A file that cannot
-  > be read or parsed is still reported on every load until it is fixed. Overlays are still
-  > parsed with the pure-Python loader. See
+  > are now logged once each time its inputs change (including a change back to an earlier
+  > state), not on every load. A file that cannot be read or parsed is still reported on
+  > every load until it is fixed. Overlays are still parsed with the pure-Python loader. See
   > [Consiliency/pmcp#233](https://github.com/Consiliency/pmcp/issues/233).
 
   Never use a closing keyword next to the number.
 - `README.md` § "Private manifest overlay", after the "fail-soft" paragraph (`README.md:1125`),
   add one sentence: "pmcp re-reads overlay files on every manifest load, so edits apply
   without a restart, and logs each warning once per change rather than on every load."
-- No `SECURITY.md` change. Consent semantics are unchanged: the gate runs on every call and
-  its decision is part of the key. `scripts/check_security_claims.py` must still report OK.
+- No `SECURITY.md` change. Consent semantics are unchanged: the gate runs on every call, and
+  its decision, with the refusal's identity, is part of the key. C-12's "exactly one warning"
+  holds per transition into a refusal (D5); its three cited tests pass. Run
+  `scripts/check_security_claims.py`: OK, 129 nodes.
 
 ## Dependencies & order
 
@@ -580,9 +679,10 @@ first, or `uv run` silently uses the system pytest. On dev0, first run
 tests fail (109F/106E). Subset runs need `--cov-fail-under=0`.
 
 ```bash
-# 1. The new tests
+# 1. The new tests (37 in round 2)
 uv run pytest tests/test_manifest_cache.py -q -p no:cacheprovider --no-cov --cov-fail-under=0
-#   -> 31 passed in 1.84s   (with test_version_pin.py: 196 passed in 6.27s)
+#   -> 37 passed   (round 2; with test_version_pin.py: 202 passed in 5.68s)
+#   -> the claude seat's 18 attack tests (scratchpad/331/seat1) against round 2: 18 passed in 2.71s
 
 # 2. Lint, format, types
 uv run ruff check src/pmcp/manifest/loader.py tests/test_manifest_cache.py tests/conftest.py tests/test_version_pin.py
@@ -609,16 +709,18 @@ uv run pytest tests/test_version_pin.py -k invalid_pin_text_is_true -q --duratio
 
 # 5. Every file that names load_manifest (28 files; indirect callers excluded, so a lower bound), WITH coverage, main vs spike,
 #    same window, detached (ab.sh, appendix)
-bash $S/ab.sh   # swaps loader/conftest/test_version_pin between main and spike copies
-#   A main:  2103 passed, 1 skipped, 24 deselected in 252.49s (0:04:12)
-#   B spike: 2103 passed, 1 skipped, 24 deselected in 103.91s (0:01:43)
+bash $S/ab2.sh   # swaps loader/conftest/test_version_pin between main and spike copies, then step 6
+#   round 1: A main 252.49s / B spike 103.91s
+#   round 2: A main:  2103 passed, 1 skipped, 24 deselected in 212.38s (0:03:32)
+#   round 2: B spike: 2103 passed, 1 skipped, 24 deselected in 79.72s (0:01:19)
 
 # 6. The full suite, once, WITH coverage (the CI command minus -v), detached with a counting plugin
 PYTHONPATH=$S/plug LOADCOUNT_OUT=$S/loadcount.json nohup uv run pytest tests/ -q --tb=short \
   --cov --cov-report= -p loadcount -p no:cacheprovider --durations=25 > $S/full_spike.log 2>&1 & disown
 #   -> Required test coverage of 60.0% reached. Total coverage: 89.75%
-#   -> 4929 passed, 3 skipped, 80 deselected in 610.19s (0:10:10)
-#   -> {"calls": 1048, "misses": 888, "miss_s": 8.53}
+#   round 1 (pre-final text): 4929 passed, 3 skipped, 80 deselected in 610.19s (0:10:10)
+#   round 2 (THE EMBEDDED TEXT, alone, npm vars unset): 4966 passed, 3 skipped, 80 deselected in 605.40s (0:10:05); coverage gate met
+#   round 2 plugin: {"calls": 1162, "builds": 973}
 
 # 7. catalog_search and per-call timings, main vs main+libyaml vs spike (count2.py, percall.py)
 SCR=$S uv run python $S/count2.py py ; SCR=$S uv run python $S/count2.py C ; SCR=$S uv run python $S/percall.py main|mainC|spike
@@ -627,7 +729,7 @@ SCR=$S uv run python $S/count2.py py ; SCR=$S uv run python $S/count2.py C ; SCR
 # 8. Mutation driver (17 mutants, appendix): each applied to loader.py, test_manifest_cache.py
 #    run, file restored from a saved copy and cmp-checked
 uv run python $S/mutants.py "$PWD"
-#   -> 17 of 17 red, every restore identical (table below)
+#   -> 22 of 22 red, every restore identical (table below)
 
 # 9. Unchanged gates
 python3 scripts/check_security_claims.py                         # -> OK
@@ -638,7 +740,7 @@ python3 scripts/check_plan_consistency.py .consiliency/plans/detailed-233-manife
 #     block after "## Test bodies" from THIS file; on re-fetched origin/main (89559db):
 git apply --check emb.diff && git apply emb.diff && cp emb_test.py tests/test_manifest_cache.py
 cmp src/pmcp/manifest/loader.py spike_loader.py   # and conftest.py, test_version_pin.py, the test file
-#   -> apply-check clean; all four cmp-identical; 31 passed in 1.74s
+#   -> apply-check clean; all four cmp-identical; 37 passed (round 2)
 ```
 
 **Targets for the implementing PR**, measured the same way and back to back with main:
@@ -647,10 +749,12 @@ cmp src/pmcp/manifest/loader.py spike_loader.py   # and conftest.py, test_versio
 |---|---|---|
 | worst-case `catalog_search` (query + `include_offline`, 13 loads) | 1556–1589 ms | ≤ 50 ms (spike: 25–37 ms) |
 | `catalog_search`, query only | 674–768 ms | ≤ 10 ms (spike: 3 ms) |
-| `load_manifest()` hit | 102–125 ms (every call is a parse) | ≤ 2 ms (spike: 0.65 ms) |
+| `load_manifest()` hit | 102–125 ms (every call is a parse) | ≤ 2 ms (spike: 0.65 ms; round 2: 0.46–0.50 ms) |
+| a state transition (D5) | — (main parses every call) | ≤ 5 ms (round 2: 1.2 ms) |
+| 500 chained anchors, a result that cannot be pickled | 189.0 ms per call | loads, uncached; ≤ main (round 2: 34.4 ms) |
 | cold miss (process start) | same as above | ≤ 30 ms (spike: 13–21 ms) |
 | `catalog_search` builds per 2 searches | 26 parses | exactly 1 build (test) |
-| 28 `load_manifest` files, with coverage | 252.49 s | ≤ 130 s (spike: 103.91 s) |
+| 28 `load_manifest` files, with coverage | 252.49 s (round 2 window: 212.38 s) | ≤ 45% of main in the same window (spike: 103.91 s, round 2: 79.72 s) |
 | CI "Run tests with coverage", 3.11 | 11m05s–15m45s (two consecutive main runs) | no regression beyond that run-to-run spread; the 28-file A/B is the controlled measure |
 
 CI wall time is reported in the PR but is not a gate: its run-to-run variance is larger than
@@ -660,7 +764,8 @@ the effect.
 
 - [ ] `load_manifest()` returns a result equal to main's for every input state. The full
   suite passes with no existing test changed except the D11 fixture removal. Measured on the
-  pre-final spike: 4929 passed, 3 skipped; the final text adds 31 tests.
+  pre-final spike: 4929 passed, 3 skipped. Round 2, on the embedded text: 4966 passed, 3
+  skipped (+37 new tests).
 - [ ] **Stale-cache tests** pass, and each mutant that blinds the key to one input is red:
   - an overlay edit at the same size and mtime (user, env): M1;
   - a consent change (approve, revoke, re-approve, edit after approval): M2;
@@ -677,8 +782,8 @@ the effect.
     next call;
   - an unparseable overlay (YAML error, non-mapping) and an unreadable one are recomputed
     and re-warned on every call, and the fix applies on the next call. M7 is red.
-- [ ] **Warnings once per miss:** a hit is silent, and an edit, a consent change or
-  `clear_manifest_cache()` warns again. The consent refusal and the ignored-redirect notice
+- [ ] **Warnings once per transition:** a repeated state is silent, and an edit, a consent
+  change (including back to an earlier state) or `clear_manifest_cache()` warns again. The consent refusal and the ignored-redirect notice
   are logged once per state. M8 and M15 are red.
 - [ ] **Parsers:**
   - the shipped manifest parses identically under both loaders;
@@ -691,6 +796,15 @@ the effect.
 - [ ] **Request path:** two worst-case `catalog_search`es do 1 build. M15 is red. The
   timing targets above are met and reported in the PR body, with main measured in the same
   window.
+- [ ] **Round 2, B1:** an overlay whose result cannot be pickled (500 and 2000 chained
+  anchors) loads as on main, uncached, with no value in any log line. A cached blob that
+  cannot be read back is rebuilt. M18 and M19 are red.
+- [ ] **Round 2, B2:** every consent transition warns, even into a state still in the LRU
+  (`[1, 0, 0, 1, 0, 0, 1]`). A symlink retarget between unapproved files warns for each
+  target. Break, fix, break with identical bytes warns at each break. M20, M21 and M22 are
+  red.
+- [ ] The shipped manifest's two parses are equal with exact scalar types. The fallback test
+  runs both shipped parse sites.
 - [ ] PR 327's `_memoized_yaml` is removed and its two tests still pass.
 - [ ] ruff, ruff format and mypy are clean. `scripts/check_security_claims.py` reports OK.
   `scripts/check_plan_consistency.py` reports 0 blocking. The CHANGELOG and README text is as
@@ -698,7 +812,7 @@ the effect.
 
 ## Mutation table
 
-Each mutant is an exact-text replacement in `src/pmcp/manifest/loader.py` (M5 and M6 replace two
+Each mutant is an exact-text replacement in `src/pmcp/manifest/loader.py` (M5 and M6 replace several
 sites: they store the object instead of the pickle, so the failure is the sharing, not a
 type error). The driver (`mutants.py`, appendix) applies it, runs `tests/test_manifest_cache.py`,
 restores the file from a saved copy, never with `git checkout`, and checks the restore with `cmp`. It was run on the final spike text
@@ -706,28 +820,32 @@ restores the file from a saved copy, never with `git checkout`, and checks the r
 
 | id | mutant (the rule it breaks) | result | first failure | failing tests |
 |---|---|---|---|---|
-| M1 | key on (mtime_ns, size), not content | **RED** 2 failed, 29 passed in 2.25s (restored=True) | AssertionError: assert '3.25.5' == '3.25.6' | test_a_user_overlay_edit_is_seen_even_with_size_and_mtime_unchanged, test_an_env_overlay_edit_is_seen |
-| M2 | project overlay (consent) left out of the key | **RED** 2 failed, 29 passed in 1.81s (restored=True) | AssertionError: assert None == '2.0.1' | test_a_consent_change_is_seen, test_a_cwd_change_is_seen |
-| M3 | ignored-redirect notice left out of the key | **RED** 1 failed, 30 passed in 1.69s (restored=True) | assert False | test_an_ignored_redirect_after_a_clean_load_is_still_reported |
-| M4 | platform left out of the key | **RED** 1 failed, 30 passed in 1.76s (restored=True) | AssertionError: assert None == '1.0.0' | test_a_platform_change_is_seen |
-| M5 | the cached object itself is returned (store the object, no copy) | **RED** 4 failed, 27 passed in 1.82s (restored=True) | AssertionError: assert (Manifest(vers...y_queue.json') == Manifest(vers...y_queue.json') | test_a_hit_parses_nothing, test_no_two_callers_share_a_mutable_object, test_mutating_a_result_never_reaches_the_next_caller, test_concurrent_cold_callers_build_once |
-| M6 | shallow copy: new dicts, shared ServerConfig objects | **RED** 2 failed, 29 passed in 2.38s (restored=True) | assert (not ({137229851394304, 137229851394752, 137229851394944, 137229851395392, 137229851396032, 13722985139 | test_no_two_callers_share_a_mutable_object, test_mutating_a_result_never_reaches_the_next_caller |
-| M7 | a degraded result (unreadable/unparseable source) is cached | **RED** 3 failed, 28 passed in 2.12s (restored=True) | assert ([1] == [1, 1] | test_an_unparseable_overlay_is_recomputed_every_call[yaml-error], test_an_unparseable_overlay_is_recomputed_every_call[not-a-mapping], test_an_unreadable_overlay_is_recomputed_every_call |
-| M8 | notices logged on every call, not once per miss | **RED** 1 failed, 30 passed in 1.85s (restored=True) | assert 2 == 1 | test_an_ignored_redirect_is_logged_once_per_state |
-| M9 | no lock around lookup+build | **RED** 1 failed, 30 passed in 2.06s (restored=True) | assert [1, 1, 1, 1, 1, 1] == [1] | test_concurrent_cold_callers_build_once |
-| M10 | overlays parsed with libyaml | **RED** 1 failed, 30 passed in 2.12s (restored=True) | AssertionError: assert '3.25.5' is None | test_an_overlay_is_still_parsed_by_the_pure_python_safeloader |
-| M11 | shipped manifest parsed with the pure-Python SafeLoader | **RED** 1 failed, 30 passed in 2.91s (restored=True) | AssertionError: assert <class 'yaml.loader.SafeLoader'> is <class 'yaml.cyaml.CSafeLoader'> | test_the_shipped_manifest_uses_libyaml_when_available |
-| M12 | parsed-shipped (L1) cache ignores the digest | **RED** 1 failed, 30 passed in 1.73s (restored=True) | AssertionError: assert 'Firecrawl MC...nd extraction' == 'edited in place' | test_the_parsed_shipped_document_is_keyed_by_its_bytes |
-| M13 | overlay re-read at parse time (not the keyed bytes) | **RED** 1 failed, 30 passed in 2.28s (restored=True) | AssertionError: assert '9.9.9' == '3.25.5' | test_the_bytes_hashed_are_the_bytes_parsed |
-| M14 | cache unbounded | **RED** 1 failed, 30 passed in 2.06s (restored=True) | AssertionError: assert 13 == 8 | test_the_cache_is_bounded |
-| M15 | no cache at all | **RED** 6 failed, 25 passed in 3.52s (restored=True) | assert ([1, 1] == [1] | test_a_hit_parses_nothing, test_warnings_are_emitted_once_per_miss, test_a_consent_refusal_is_logged_once_per_state, test_an_ignored_redirect_is_logged_once_per_state, test_concurrent_cold_callers_build_once, test_a_catalog_search_builds_the_manifest_at_most_once |
-| M16 | shipped bytes left out of the key | **RED** 1 failed, 30 passed in 1.88s (restored=True) | AssertionError: assert 'Firecrawl MC...nd extraction' == 'edited in place' | test_the_parsed_shipped_document_is_keyed_by_its_bytes |
-| M17 | fallback missing: CSafeLoader required | **RED** 1 failed, 30 passed in 1.86s (restored=True) | AttributeError: module 'yaml' has no attribute 'CSafeLoader'. Did you mean: 'SafeLoader'? | test_without_libyaml_the_shipped_manifest_falls_back_to_safeloader |
+| M1 | key on (mtime_ns, size), not content | **RED** 3 failed, 34 passed in 2.47s (restored=True) | AssertionError: assert '3.25.5' == '3.25.6' | test_a_user_overlay_edit_is_seen_even_with_size_and_mtime_unchanged, test_an_env_overlay_edit_is_seen, test_breaking_fixing_and_breaking_again_warns_each_time |
+| M2 | project overlay (consent) left out of the key | **RED** 4 failed, 33 passed in 2.53s (restored=True) | AssertionError: assert None == '2.0.1' | test_a_consent_change_is_seen, test_a_cwd_change_is_seen, test_every_consent_transition_warns_even_when_the_state_is_still_cached, test_retargeting_a_project_overlay_symlink_is_a_new_refusal |
+| M3 | ignored-redirect notice left out of the key | **RED** 1 failed, 36 passed in 2.88s (restored=True) | assert False | test_an_ignored_redirect_after_a_clean_load_is_still_reported |
+| M4 | platform left out of the key | **RED** 1 failed, 36 passed in 2.58s (restored=True) | AssertionError: assert None == '1.0.0' | test_a_platform_change_is_seen |
+| M5 | the cached object itself is returned (store the object, no copy) | **RED** 7 failed, 30 passed in 1.84s (restored=True) | AssertionError: assert (Manifest(vers...y_queue.json') == Manifest(vers...y_queue.json') | test_a_hit_parses_nothing, test_no_two_callers_share_a_mutable_object, test_mutating_a_result_never_reaches_the_next_caller, test_a_result_that_cannot_be_pickled_is_returned_uncached[500], test_a_result_that_cannot_be_pickled_is_returned_uncached[2000], test_a_cached_result_that_cannot_be_read_back_is_rebuilt, test_concurrent_cold_callers_build_once |
+| M6 | shallow copy: new dicts, shared ServerConfig objects | **RED** 5 failed, 32 passed in 1.98s (restored=True) | assert (not ({124531762888832, 124531762888960, 124531762889280, 124531762889344, 124531762889728, 12453176288 | test_no_two_callers_share_a_mutable_object, test_mutating_a_result_never_reaches_the_next_caller, test_a_result_that_cannot_be_pickled_is_returned_uncached[500], test_a_result_that_cannot_be_pickled_is_returned_uncached[2000], test_a_cached_result_that_cannot_be_read_back_is_rebuilt |
+| M7 | a degraded result (unreadable/unparseable source) is cached | **RED** 3 failed, 34 passed in 2.57s (restored=True) | assert ([1] == [1, 1] | test_an_unparseable_overlay_is_recomputed_every_call[yaml-error], test_an_unparseable_overlay_is_recomputed_every_call[not-a-mapping], test_an_unreadable_overlay_is_recomputed_every_call |
+| M8 | notices logged on every call, not once per transition | **RED** 1 failed, 36 passed in 2.20s (restored=True) | assert 2 == 1 | test_an_ignored_redirect_is_logged_once_per_state |
+| M9 | no lock around lookup+build | **RED** 1 failed, 36 passed in 2.16s (restored=True) | assert [1, 1, 1, 1, 1, 1] == [1] | test_concurrent_cold_callers_build_once |
+| M10 | overlays parsed with libyaml | **RED** 1 failed, 36 passed in 1.79s (restored=True) | AssertionError: assert '3.25.5' is None | test_an_overlay_is_still_parsed_by_the_pure_python_safeloader |
+| M11 | shipped manifest parsed with the pure-Python SafeLoader | **RED** 1 failed, 36 passed in 2.94s (restored=True) | AssertionError: assert <class 'yaml.loader.SafeLoader'> is <class 'yaml.cyaml.CSafeLoader'> | test_the_shipped_manifest_uses_libyaml_when_available |
+| M12 | parsed-shipped (L1) cache ignores the digest | **RED** 1 failed, 36 passed in 2.02s (restored=True) | AssertionError: assert 'Firecrawl MC...nd extraction' == 'edited in place' | test_the_parsed_shipped_document_is_keyed_by_its_bytes |
+| M13 | overlay re-read at parse time (not the keyed bytes) | **RED** 1 failed, 36 passed in 2.20s (restored=True) | AssertionError: assert '9.9.9' == '3.25.5' | test_the_bytes_hashed_are_the_bytes_parsed |
+| M14 | cache unbounded | **RED** 1 failed, 36 passed in 2.13s (restored=True) | AssertionError: assert 13 == 8 | test_the_cache_is_bounded |
+| M15 | no cache at all | **RED** 9 failed, 28 passed in 3.13s (restored=True) | assert ([1, 1] == [1] | test_a_hit_parses_nothing, test_warnings_are_emitted_once_per_miss, test_a_consent_refusal_is_logged_once_per_state, test_an_ignored_redirect_is_logged_once_per_state, test_every_consent_transition_warns_even_when_the_state_is_still_cached, test_retargeting_a_project_overlay_symlink_is_a_new_refusal, test_breaking_fixing_and_breaking_again_warns_each_time, test_concurrent_cold_callers_build_once, test_a_catalog_search_builds_the_manifest_at_most_once |
+| M16 | shipped bytes left out of the key | **RED** 1 failed, 36 passed in 2.21s (restored=True) | AssertionError: assert 'Firecrawl MC...nd extraction' == 'edited in place' | test_the_parsed_shipped_document_is_keyed_by_its_bytes |
+| M17 | fallback missing: CSafeLoader required | **RED** 1 failed, 36 passed in 1.81s (restored=True) | AttributeError: module 'yaml' has no attribute 'CSafeLoader'. Did you mean: 'SafeLoader'? | test_without_libyaml_the_shipped_manifest_falls_back_to_safeloader |
+| M18 | B1: serialization failure not contained (raw pickle.dumps) | **RED** 2 failed, 35 passed in 2.18s (restored=True) | RecursionError: maximum recursion depth exceeded while pickling an object | test_a_result_that_cannot_be_pickled_is_returned_uncached[500], test_a_result_that_cannot_be_pickled_is_returned_uncached[2000] |
+| M19 | B1: read-back failure not contained (raw pickle.loads) | **RED** 1 failed, 36 passed in 2.19s (restored=True) | RecursionError: maximum recursion depth exceeded | test_a_cached_result_that_cannot_be_read_back_is_rebuilt |
+| M20 | B2: a transition into a cached state is a silent hit | **RED** 3 failed, 34 passed in 2.16s (restored=True) | assert [1, 0, 0, 0, 0, 0, ...] == [1, 0, 0, 1, 0, 0, ...] | test_every_consent_transition_warns_even_when_the_state_is_still_cached, test_retargeting_a_project_overlay_symlink_is_a_new_refusal, test_breaking_fixing_and_breaking_again_warns_each_time |
+| M21 | B2: the refusal's identity (resolved path, remediation) left out of the key | **RED** 1 failed, 36 passed in 2.36s (restored=True) | assert [1, 0, 0, 0] == [1, 1, 0, 1] | test_retargeting_a_project_overlay_symlink_is_a_new_refusal |
+| M22 | B2: the last-served state is never recorded | **RED** 9 failed, 28 passed in 3.50s (restored=True) | assert ([1, 1] == [1] | test_a_hit_parses_nothing, test_warnings_are_emitted_once_per_miss, test_a_consent_refusal_is_logged_once_per_state, test_an_ignored_redirect_is_logged_once_per_state, test_every_consent_transition_warns_even_when_the_state_is_still_cached, test_retargeting_a_project_overlay_symlink_is_a_new_refusal, test_breaking_fixing_and_breaking_again_warns_each_time, test_concurrent_cold_callers_build_once, test_a_catalog_search_builds_the_manifest_at_most_once |
 
-**17 of 17 mutants red; every restore byte-identical.** M5's first run (returning the pickle
-without storing the object) went red for the wrong reason, an `AttributeError` on `bytes`, and was
-corrected to the two-site form above before the table was recorded.
-## Execution Policy
+**22 of 22 mutants red; every restore byte-identical** (round 2, on the embedded text). M1–M17 are
+round 1's, retargeted at the round-2 code: the key is built by `_source_key`, and the store and
+return go through `_serialize`/`_deserialize`. M18–M22 are round 2's.
 
 - execute: effort=medium. Reason: the change is small and mechanical, but it sits under every
   request path and the consent gate, and a cache fails silently, by serving a stale manifest.
@@ -741,7 +859,7 @@ corrected to the two-site form above before the table was recorded.
 
 ````diff
 diff --git a/src/pmcp/manifest/loader.py b/src/pmcp/manifest/loader.py
-index 6e7704e..b6845f3 100644
+index 6e7704e..d33cfb5 100644
 --- a/src/pmcp/manifest/loader.py
 +++ b/src/pmcp/manifest/loader.py
 @@ -3,10 +3,14 @@
@@ -759,7 +877,7 @@ index 6e7704e..b6845f3 100644
  from collections.abc import Iterable, Mapping
  from dataclasses import dataclass, field, replace
  from pathlib import Path
-@@ -24,6 +28,45 @@ from pmcp.validation import (
+@@ -24,6 +28,49 @@ from pmcp.validation import (
  logger = logging.getLogger(__name__)
  
  
@@ -796,16 +914,20 @@ index 6e7704e..b6845f3 100644
 +    digest = hashlib.sha256(content).digest()
 +    cached = _trusted_document
 +    if cached is not None and cached[0] == digest:
-+        return pickle.loads(cached[1])
++        data = _deserialize(cached[1])
++        if data is not None:
++            return data
 +    data = _parse_trusted_yaml(content)
-+    _trusted_document = (digest, pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL))
++    blob = _serialize(data)
++    if blob is not None:
++        _trusted_document = (digest, blob)
 +    return data
 +
 +
  @functools.lru_cache(maxsize=1)
  def _shipped_manifest_entries() -> dict[str, dict[str, Any]]:
      """pmcp's OWN shipped ``manifest.yaml``, read directly.
-@@ -32,9 +75,9 @@ def _shipped_manifest_entries() -> dict[str, dict[str, Any]]:
+@@ -32,9 +79,9 @@ def _shipped_manifest_entries() -> dict[str, dict[str, Any]]:
      or ``$PMCP_MANIFEST_PATH`` overlay can add a name or a declared key here.
      The file ships with pmcp and does not change under a running process.
      """
@@ -817,7 +939,7 @@ index 6e7704e..b6845f3 100644
      except (OSError, yaml.YAMLError, AttributeError):
          return {}
      return {
-@@ -1063,7 +1106,9 @@ def _find_project_manifest() -> Path | None:
+@@ -1063,7 +1110,9 @@ def _find_project_manifest() -> Path | None:
      return None
  
  
@@ -828,7 +950,7 @@ index 6e7704e..b6845f3 100644
      """Return existing overlay manifest paths in precedence order (low → high).
  
      Order: user (``~/.pmcp/manifest.yaml``), then project
-@@ -1108,9 +1153,11 @@ def _overlay_manifest_paths() -> list[tuple[str, Path]]:
+@@ -1108,9 +1157,11 @@ def _overlay_manifest_paths() -> list[tuple[str, Path]]:
              if env_path.exists():
                  paths.append(("env", env_path))
          else:
@@ -843,7 +965,7 @@ index 6e7704e..b6845f3 100644
  
      return paths
  
-@@ -1123,25 +1170,9 @@ _OverlayDocument = tuple[
+@@ -1123,25 +1174,9 @@ _OverlayDocument = tuple[
  ]
  
  
@@ -872,7 +994,7 @@ index 6e7704e..b6845f3 100644
      """Parse overlay bytes, fail-soft. ``path`` is for messages only.
  
      Returns ``(servers, cli_alternatives, server_env, server_version)``. A YAML error or a
-@@ -1165,12 +1196,16 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
+@@ -1165,12 +1200,16 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
          data = yaml.safe_load(content)
      except yaml.YAMLError as exc:
          logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
@@ -889,7 +1011,7 @@ index 6e7704e..b6845f3 100644
          return {}, {}, {}, {}
  
      servers: dict[str, ServerConfig] = {}
-@@ -1233,6 +1268,80 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
+@@ -1233,6 +1272,141 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
      return servers, cli_alternatives, server_env, server_version
  
  
@@ -905,12 +1027,50 @@ index 6e7704e..b6845f3 100644
 +_MANIFEST_CACHE_SLOTS = 8
 +_manifest_cache: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
 +_manifest_cache_lock = threading.RLock()
++# The key of the state the previous call served. Warnings are owed per
++# TRANSITION, not per retained entry: a call whose key differs from this one is
++# rebuilt (about 2 ms with the shipped document cached) even when its key is
++# still in the LRU, so returning to an earlier state -- trust revoked again, a
++# pin broken again with the same bytes -- warns exactly as main does.
++_last_served_key: tuple[Any, ...] | None = None
 +
 +
 +def clear_manifest_cache() -> None:
 +    """Drop every cached manifest (tests; never needed for correctness)."""
++    global _last_served_key
 +    with _manifest_cache_lock:
 +        _manifest_cache.clear()
++        _last_served_key = None
++
++
++def _serialize(value: Any) -> bytes | None:
++    """``pickle.dumps(value)``, or None when it cannot be serialized.
++
++    A result that loads fine must never fail because of the cache: a deeply
++    aliased overlay (500 chained YAML anchors, 11 KB) parses with SafeLoader
++    but exceeds pickle's recursion limit on Python 3.10/3.11. Such a result is
++    returned uncached. The log line names only the exception class.
++    """
++    try:
++        return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
++    except Exception as exc:  # noqa: BLE001 - any failure means "do not cache"
++        logger.debug(
++            "Manifest result not cached: it could not be serialized (%s)",
++            type(exc).__name__,
++        )
++        return None
++
++
++def _deserialize(blob: bytes) -> Any | None:
++    """``pickle.loads(blob)``, or None when it fails (the caller rebuilds)."""
++    try:
++        return pickle.loads(blob)
++    except Exception as exc:  # noqa: BLE001 - any failure means "rebuild"
++        logger.debug(
++            "Cached manifest could not be read back (%s); rebuilding",
++            type(exc).__name__,
++        )
++        return None
 +
 +
 +@dataclass(frozen=True)
@@ -967,19 +1127,44 @@ index 6e7704e..b6845f3 100644
 +    return None if content is None else hashlib.sha256(content).digest()
 +
 +
++def _source_key(source: _OverlaySource) -> tuple[Any, ...]:
++    """One overlay's part of the cache key.
++
++    A project overlay's consent decision is keyed by its identity -- the
++    resolved path the gate judged, the reason and the remediation -- not only
++    its state: retargeting a symlink from one unapproved file to another is a
++    new refusal with a new remediation, and must be told (SECURITY C-12).
++    """
++    decision = source.decision
++    identity = (
++        None
++        if decision is None
++        else (str(decision.path), str(decision.reason), decision.remediation)
++    )
++    return (
++        source.label,
++        str(source.path),
++        source.state,
++        _digest(source.content),
++        identity,
++    )
++
++
  def load_manifest(manifest_path: Path | None = None) -> Manifest:
      """Load and parse the manifest.yaml file.
  
-@@ -1244,16 +1353,58 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
+@@ -1244,16 +1418,67 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
      ``extra_env`` on an existing server without replacing it. An explicit
      ``manifest_path`` loads only that file and applies no overlays. Overlay
      parsing is fail-soft and never raises.
 +
 +    The result is cached by the bytes of every source, each overlay's consent
-+    decision, the ignored-redirect notice and the platform; a change to any of
-+    them is a miss. Warnings are emitted once per miss. A result in which a
-+    source could not be read or parsed is never cached, and an exception is
-+    never cached. Every call returns its own deep copy.
++    decision (with the refusal's identity), the ignored-redirect notice and the
++    platform; a change to any of them is a miss. Warnings are emitted once per
++    transition: whenever the inputs differ from those of the previous call,
++    even if that state is still cached. A result in which a source could not be
++    read or parsed, or that cannot be serialized, is never cached, and an
++    exception is never cached. Every call returns its own deep copy.
      """
      apply_overlays = manifest_path is None
 -    if manifest_path is None:
@@ -994,24 +1179,31 @@ index 6e7704e..b6845f3 100644
 +        str(base_path),
 +        apply_overlays,
 +        _digest(base),
-+        tuple((o.label, str(o.path), o.state, _digest(o.content)) for o in overlays),
++        tuple(_source_key(o) for o in overlays),
 +        tuple(notices),
 +        _on_windows(),
 +    )
++    global _last_served_key
 +    with _manifest_cache_lock:
++        steady = key == _last_served_key
++        _last_served_key = key
 +        blob = _manifest_cache.get(key)
-+        if blob is not None:
++        if blob is not None and steady:
 +            _manifest_cache.move_to_end(key)
-+            return cast(Manifest, pickle.loads(blob))
++            cached = _deserialize(blob)
++            if cached is not None:
++                return cast(Manifest, cached)
++        # A miss, or a transition into a state the LRU still holds: build, so
++        # every warning for this state is emitted once, now.
++        _manifest_cache.pop(key, None)
 +        for notice in notices:
 +            logger.warning(notice)
 +        manifest, cacheable = _build_manifest(
 +            base_path, base, overlays, trusted=manifest_path is None
 +        )
-+        if cacheable:
-+            _manifest_cache[key] = pickle.dumps(
-+                manifest, protocol=pickle.HIGHEST_PROTOCOL
-+            )
++        stored = _serialize(manifest) if cacheable else None
++        if stored is not None:
++            _manifest_cache[key] = stored
 +            while len(_manifest_cache) > _MANIFEST_CACHE_SLOTS:
 +                _manifest_cache.popitem(last=False)
 +        return manifest
@@ -1035,7 +1227,7 @@ index 6e7704e..b6845f3 100644
  
      # Parse CLI alternatives
      cli_alternatives: dict[str, CLIAlternative] = {}
-@@ -1267,36 +1418,34 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
+@@ -1267,36 +1492,34 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
  
      # Merge private/custom overlays over the shipped manifest (default path only).
      if apply_overlays:
@@ -1097,7 +1289,7 @@ index 6e7704e..b6845f3 100644
              if (
                  overlay_servers
                  or overlay_clis
-@@ -1368,4 +1517,4 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
+@@ -1368,4 +1591,4 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
          f"{len(servers)} servers ({len(manifest.get_auto_start_servers())} auto-start)"
      )
  
@@ -1273,10 +1465,21 @@ def test_a_hit_parses_nothing(
     assert second == first and second is not first
 
 
+def _typed(value: Any) -> Any:
+    """``value`` with every scalar paired with its exact type: ``==`` treats
+    ``1 == True == 1.0``, so a plain comparison would miss an int/bool/float
+    divergence between the two parsers."""
+    if isinstance(value, dict):
+        return ("dict", [(_typed(k), _typed(v)) for k, v in value.items()])
+    if isinstance(value, list):
+        return ("list", [_typed(v) for v in value])
+    return (type(value).__name__, value)
+
+
 def test_the_shipped_manifest_is_identical_under_both_loaders() -> None:
     content = _SHIPPED.read_bytes()
-    assert loader._parse_trusted_yaml(content) == yaml.load(
-        content, Loader=yaml.SafeLoader
+    assert _typed(loader._parse_trusted_yaml(content)) == _typed(
+        yaml.load(content, Loader=yaml.SafeLoader)
     )
 
 
@@ -1292,6 +1495,13 @@ def test_without_libyaml_the_shipped_manifest_falls_back_to_safeloader(
     monkeypatch.setattr(loader, "_trusted_document", None)
     assert loader._trusted_yaml_loader() is yaml.SafeLoader
     assert load_manifest().servers["firecrawl"].command == "npx"
+    # The second shipped parse: its lru_cache is never reset, so clear it to
+    # make the fallback actually run, and clear it again afterwards.
+    loader._shipped_manifest_entries.cache_clear()
+    try:
+        assert "firecrawl" in loader._shipped_manifest_entries()
+    finally:
+        loader._shipped_manifest_entries.cache_clear()
 
 
 def test_an_overlay_is_still_parsed_by_the_pure_python_safeloader(
@@ -1646,6 +1856,148 @@ def test_clearing_the_cache_warns_again(caplog: pytest.LogCaptureFixture) -> Non
     assert any(m.startswith("Ignoring a '") for m in _warnings(caplog))
 
 
+def _refusals(caplog: pytest.LogCaptureFixture) -> int:
+    return len([m for m in _warnings(caplog) if "pmcp trust approve" in m])
+
+
+def _count_per_load(caplog: pytest.LogCaptureFixture, count: Any, step: Any) -> int:
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        step()
+        load_manifest()
+    return int(count(caplog))
+
+
+def test_every_consent_transition_warns_even_when_the_state_is_still_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    approve_project_file: Any,
+) -> None:
+    """Round 1 (Consiliency/pmcp#331, codex B2 / claude F1): unapproved ->
+    approve -> revoke reused the first state's LRU entry and was silent. One
+    warning per transition into a refusal, none while it stays (C-12)."""
+    project = tmp_path / "proj" / ".pmcp" / "manifest.yaml"
+    project.parent.mkdir(parents=True)
+    project.write_text(_pin("2.0.1"))
+    monkeypatch.chdir(tmp_path / "proj")
+
+    def nothing() -> None:
+        return None
+
+    def approve() -> None:
+        approve_project_file(project)
+
+    def revoke() -> None:
+        assert trust_store.revoke(project)
+
+    steps = [nothing, nothing, approve, revoke, nothing, approve, revoke]
+    counts = [_count_per_load(caplog, _refusals, step) for step in steps]
+    assert counts == [1, 0, 0, 1, 0, 0, 1]
+
+
+def test_retargeting_a_project_overlay_symlink_is_a_new_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round 1 (codex B2): one unapproved target, then another. The refusal
+    names the resolved file, so its identity must be part of the key."""
+    pmcp_dir = tmp_path / "proj" / ".pmcp"
+    pmcp_dir.mkdir(parents=True)
+    (pmcp_dir / "one.yaml").write_text(_pin("2.0.1"))
+    (pmcp_dir / "two.yaml").write_text(_pin("2.0.1"))
+    link = pmcp_dir / "manifest.yaml"
+    link.symlink_to(pmcp_dir / "one.yaml")
+    monkeypatch.chdir(tmp_path / "proj")
+
+    def nothing() -> None:
+        return None
+
+    def retarget(name: str) -> Any:
+        def step() -> None:
+            link.unlink()
+            link.symlink_to(pmcp_dir / name)
+
+        return step
+
+    named: list[str] = []
+
+    def refusals_naming(caplog: pytest.LogCaptureFixture) -> int:
+        lines = [m for m in _warnings(caplog) if "pmcp trust approve" in m]
+        named.extend(lines)
+        return len(lines)
+
+    steps = [nothing, retarget("two.yaml"), nothing, retarget("one.yaml")]
+    counts = [_count_per_load(caplog, refusals_naming, step) for step in steps]
+    assert counts == [1, 1, 0, 1]
+    assert "one.yaml" in named[0] and "two.yaml" in named[1]
+
+
+def test_breaking_fixing_and_breaking_again_warns_each_time(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round 1 (claude F1): the same broken bytes twice, with a fix between."""
+    bad, good = 'server_version:\n  firecrawl: "^3"\n', _pin("3.25.5")
+    path = _user_overlay(bad)
+
+    def bad_pins(caplog: pytest.LogCaptureFixture) -> int:
+        return len([m for m in _warnings(caplog) if m.startswith("Ignoring a '")])
+
+    def write(text: str) -> Any:
+        return lambda: path.write_text(text)
+
+    steps = [write(bad), write(bad), write(good), write(bad), write(bad)]
+    assert [_count_per_load(caplog, bad_pins, step) for step in steps] == [
+        1,
+        0,
+        0,
+        1,
+        0,
+    ]
+
+
+def _deep_alias_overlay(depth: int) -> str:
+    """Round 1 (codex B1): chained anchors. 11 KB at depth 500; parses with
+    SafeLoader, but the result nests deeper than pickle can recurse."""
+    text = "d0: &d0 {v: 0}\n" + "".join(
+        f"d{i}: &d{i} {{v: *d{i - 1}}}\n" for i in range(1, depth + 1)
+    )
+    return text + (
+        "servers:\n"
+        "  custom:\n"
+        "    description: deep\n"
+        "    command: echo\n"
+        f"    discovery_metadata: *d{depth}\n"
+    )
+
+
+@pytest.mark.parametrize("depth", [500, 2000])
+def test_a_result_that_cannot_be_pickled_is_returned_uncached(
+    depth: int, builds: list[int], caplog: pytest.LogCaptureFixture
+) -> None:
+    _user_overlay(_deep_alias_overlay(depth))
+    with caplog.at_level(logging.DEBUG, logger="pmcp.manifest.loader"):
+        first, second = load_manifest(), load_manifest()
+    assert "custom" in first.servers and "custom" in second.servers
+    assert len(first.servers) == len(second.servers)
+    assert builds == [1, 1] and len(loader._manifest_cache) == 0
+    debug = [r.getMessage() for r in caplog.records if "not cached" in r.getMessage()]
+    assert debug and all("'v'" not in m and "d0" not in m for m in debug)
+
+
+def test_a_cached_result_that_cannot_be_read_back_is_rebuilt(
+    monkeypatch: pytest.MonkeyPatch, builds: list[int]
+) -> None:
+    _user_overlay(_pin("3.25.5"))
+    load_manifest()
+
+    def broken(_blob: bytes) -> Any:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(loader.pickle, "loads", broken)
+    assert _firecrawl_version() == "3.25.5"
+    assert builds == [1, 1]
+
+
 # ---------------------------------------------------------------------------
 # Threads, bound, and the request path
 # ---------------------------------------------------------------------------
@@ -1878,11 +2230,11 @@ PRISTINE = TARGET.read_bytes()
 
 MUTANTS: list[tuple] = [
     ("M1", "key on (mtime_ns, size), not content",
-     "tuple((o.label, str(o.path), o.state, _digest(o.content)) for o in overlays),",
-     "tuple((o.label, str(o.path), o.state, (o.path.stat().st_mtime_ns, o.path.stat().st_size) if o.content is not None else None) for o in overlays),"),
+     "        _digest(source.content),\n        identity,",
+     "        (source.path.stat().st_mtime_ns, source.path.stat().st_size) if source.content is not None else None,\n        identity,"),
     ("M2", "project overlay (consent) left out of the key",
-     "tuple((o.label, str(o.path), o.state, _digest(o.content)) for o in overlays),",
-     "tuple((o.label, str(o.path), o.state, _digest(o.content)) for o in overlays if o.label != 'project'),"),
+     "        tuple(_source_key(o) for o in overlays),",
+     "        tuple(_source_key(o) for o in overlays if o.label != 'project'),"),
     ("M3", "ignored-redirect notice left out of the key",
      "        tuple(notices),\n        _on_windows(),",
      "        _on_windows(),"),
@@ -1890,23 +2242,24 @@ MUTANTS: list[tuple] = [
      "        tuple(notices),\n        _on_windows(),",
      "        tuple(notices),"),
     ("M5", "the cached object itself is returned (store the object, no copy)",
-     [("            return cast(Manifest, pickle.loads(blob))", "            return cast(Manifest, blob)"),
-      ('            _manifest_cache[key] = pickle.dumps(\n                manifest, protocol=pickle.HIGHEST_PROTOCOL\n            )', '            _manifest_cache[key] = manifest  # type: ignore')], None),
+     [("                return cast(Manifest, cached)", "                return cast(Manifest, blob)"),
+      ("            cached = _deserialize(blob)", "            cached = blob"),
+      ("        stored = _serialize(manifest) if cacheable else None", "        stored = manifest if cacheable else None")], None),
     ("M6", "shallow copy: new dicts, shared ServerConfig objects",
-     [("            return cast(Manifest, pickle.loads(blob))", "            m = cast(Manifest, blob)\n            return replace(m, servers=dict(m.servers), cli_alternatives=dict(m.cli_alternatives))"),
-      ('            _manifest_cache[key] = pickle.dumps(\n                manifest, protocol=pickle.HIGHEST_PROTOCOL\n            )', '            _manifest_cache[key] = manifest  # type: ignore')], None),
+     [("            cached = _deserialize(blob)", "            cached = replace(blob, servers=dict(blob.servers), cli_alternatives=dict(blob.cli_alternatives))"),
+      ("        stored = _serialize(manifest) if cacheable else None", "        stored = manifest if cacheable else None")], None),
     ("M7", "a degraded result (unreadable/unparseable source) is cached",
-     "        if cacheable:\n",
-     "        if True:\n"),
-    ("M8", "notices logged on every call, not once per miss",
-     "    with _manifest_cache_lock:\n        blob = _manifest_cache.get(key)",
-     "    for notice in notices:\n        logger.warning(notice)\n    notices = []\n    with _manifest_cache_lock:\n        blob = _manifest_cache.get(key)"),
+     "        stored = _serialize(manifest) if cacheable else None",
+     "        stored = _serialize(manifest)"),
+    ("M8", "notices logged on every call, not once per transition",
+     "    global _last_served_key\n    with _manifest_cache_lock:\n        steady",
+     "    global _last_served_key\n    for notice in notices:\n        logger.warning(notice)\n    notices = []\n    with _manifest_cache_lock:\n        steady"),
     ("M9", "no lock around lookup+build",
-     "    with _manifest_cache_lock:\n        blob = _manifest_cache.get(key)",
-     "    if True:\n        blob = _manifest_cache.get(key)"),
+     "    global _last_served_key\n    with _manifest_cache_lock:\n        steady",
+     "    global _last_served_key\n    if True:\n        steady"),
     ("M10", "overlays parsed with libyaml",
-     "        data = yaml.safe_load(content)\n    except yaml.YAMLError as exc:\n        logger.warning(f\"Skipping unreadable manifest overlay",
-     "        data = _parse_trusted_yaml(content)\n    except yaml.YAMLError as exc:\n        logger.warning(f\"Skipping unreadable manifest overlay"),
+     "        data = yaml.safe_load(content)\n    except yaml.YAMLError as exc:",
+     "        data = _parse_trusted_yaml(content)\n    except yaml.YAMLError as exc:"),
     ("M11", "shipped manifest parsed with the pure-Python SafeLoader",
      "    return getattr(yaml, \"CSafeLoader\", None) or yaml.SafeLoader",
      "    return yaml.SafeLoader"),
@@ -1928,6 +2281,21 @@ MUTANTS: list[tuple] = [
     ("M17", "fallback missing: CSafeLoader required",
      "    return getattr(yaml, \"CSafeLoader\", None) or yaml.SafeLoader",
      "    return yaml.CSafeLoader"),
+    ("M18", "B1: serialization failure not contained (raw pickle.dumps)",
+     "    try:\n        return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)\n    except Exception as exc:  # noqa: BLE001 - any failure means \"do not cache\"",
+     "    return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)\n    try:\n        pass\n    except Exception as exc:  # noqa: BLE001 - any failure means \"do not cache\""),
+    ("M19", "B1: read-back failure not contained (raw pickle.loads)",
+     "    try:\n        return pickle.loads(blob)\n    except Exception as exc:  # noqa: BLE001 - any failure means \"rebuild\"",
+     "    return pickle.loads(blob)\n    try:\n        pass\n    except Exception as exc:  # noqa: BLE001 - any failure means \"rebuild\""),
+    ("M20", "B2: a transition into a cached state is a silent hit",
+     "        if blob is not None and steady:",
+     "        if blob is not None:"),
+    ("M21", "B2: the refusal's identity (resolved path, remediation) left out of the key",
+     "        identity,\n    )",
+     "        None,\n    )"),
+    ("M22", "B2: the last-served state is never recorded",
+     "        _last_served_key = key\n        blob",
+     "        blob"),
 ]
 
 only = set(sys.argv[2:])
@@ -1963,7 +2331,7 @@ for mid, desc, old, new in MUTANTS:
 print(f"{red} of {len(only or MUTANTS)} red")
 ````
 
-## Appendix: 28-file A/B (`ab.sh`)
+## Appendix: 28-file A/B, then the full suite (`ab2.sh`, round 2)
 
 ````bash
 #!/bin/bash
@@ -1975,8 +2343,13 @@ mv tests/test_manifest_cache.py /tmp/claude-1000/-home-viperjuice-code-pmcp/ade0
 cp /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/loader.orig.py src/pmcp/manifest/loader.py; cp /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/conftest.orig.py tests/conftest.py; cp /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/test_version_pin.orig.py tests/test_version_pin.py
 echo "A main start $(date +%T)"; /usr/bin/time -f "A wall %e s maxrss %M KB" uv run pytest tests/test_baseline_constraints.py tests/test_cli.py tests/test_credential_gates_handlers.py tests/test_credential_gates_startup.py tests/test_credential_optionality_e2e.py tests/test_env_overlay_provenance.py tests/test_fresh_operator_baseline.py tests/test_install_child_env_project_root.py tests/test_integration.py tests/test_lazy_start.py tests/test_manifest_overlay.py tests/test_manifest_provision.py tests/test_manifest.py tests/test_package_identity_gate.py tests/test_phase4_e2e.py tests/test_phase6_tenant_code_mode.py tests/test_pkgid_manifest_npx_selectors.py tests/test_pkgid_panel_fixes.py tests/test_project_source_consent_config.py tests/test_project_source_consent_manifest.py tests/test_provision_validation.py tests/test_refresher.py tests/test_refusal_remedies.py tests/test_server_lifecycle.py tests/test_tools.py tests/test_trust_boundaries_composition.py tests/test_trust_boundaries_e2e.py tests/test_version_pin.py  -q -p no:cacheprovider --cov --cov-report= --cov-fail-under=0 2>&1 | tail -3
 # B: spike
-cp /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/loader.final.py src/pmcp/manifest/loader.py; cp /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/conftest.spike.py tests/conftest.py; cp /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/test_version_pin.spike.py tests/test_version_pin.py
+cp /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/loader.r2.py src/pmcp/manifest/loader.py; cp /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/conftest.spike.py tests/conftest.py; cp /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/test_version_pin.spike.py tests/test_version_pin.py
 echo "B spike start $(date +%T)"; /usr/bin/time -f "B wall %e s maxrss %M KB" uv run pytest tests/test_baseline_constraints.py tests/test_cli.py tests/test_credential_gates_handlers.py tests/test_credential_gates_startup.py tests/test_credential_optionality_e2e.py tests/test_env_overlay_provenance.py tests/test_fresh_operator_baseline.py tests/test_install_child_env_project_root.py tests/test_integration.py tests/test_lazy_start.py tests/test_manifest_overlay.py tests/test_manifest_provision.py tests/test_manifest.py tests/test_package_identity_gate.py tests/test_phase4_e2e.py tests/test_phase6_tenant_code_mode.py tests/test_pkgid_manifest_npx_selectors.py tests/test_pkgid_panel_fixes.py tests/test_project_source_consent_config.py tests/test_project_source_consent_manifest.py tests/test_provision_validation.py tests/test_refresher.py tests/test_refusal_remedies.py tests/test_server_lifecycle.py tests/test_tools.py tests/test_trust_boundaries_composition.py tests/test_trust_boundaries_e2e.py tests/test_version_pin.py  -q -p no:cacheprovider --cov --cov-report= --cov-fail-under=0 2>&1 | tail -3
 mv /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/test_manifest_cache.held.py tests/test_manifest_cache.py
 echo AB-DONE
+# then the full suite, alone, on the round-2 spike
+free -h | sed -n 2p
+echo "FULL start $(date +%T)"
+cd /home/viperjuice/workspace/worktrees/pmcp-233 && PYTHONPATH=/tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/plug LOADCOUNT_OUT=/tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/loadcount.r2.json uv run pytest tests/ -q --tb=short --cov --cov-report= -p loadcount -p no:cacheprovider --durations=10 > /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/full_r2.log 2>&1
+echo "FULL exit $?"; tail -3 /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/full_r2.log; cat /tmp/claude-1000/-home-viperjuice-code-pmcp/ade04d67-62c9-4ed6-b91f-982cd0fee7a1/scratchpad/233/loadcount.r2.json; echo ALL-DONE
 ````
