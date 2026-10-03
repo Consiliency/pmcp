@@ -162,10 +162,10 @@ Nothing else: `_parse_server_config`, `_parse_overlay_document` and
   had D1–D9 and D7, but it picked the loader with a module constant rather than
   `_trusted_yaml_loader()`, it still contained the then-dead `_load_overlay_file`, and
   `_memoized_yaml` was still in place. The final, embedded text was then run on all 28 files
-  that call `load_manifest` (2103 passed, the A/B below), on `test_version_pin.py` with the new
+  that name `load_manifest` (2103 passed, the A/B below), on `test_version_pin.py` with the new
   tests (196 passed), and through all 17 mutants. The implementing PR re-runs the full suite
   on the final text.
-- **Controlled before/after, with coverage, on every test file that calls `load_manifest`** (28 files, 2103 tests; `ab.sh`, appendix; main then spike, back to back, same window): **main 252.49 s → spike 103.91 s** (2103 passed, 1 skipped, 24 deselected both times; −148.6 s, 2.4×; peak RSS 138 MB → 136 MB). Those 28 files hold every `load_manifest` call in the suite, so −148.6 s is the expected saving on a CI test job at this host's speed: roughly 11–16 min → 9–13 min on 3.11. CI timing is reported in the implementing PR, not gated on (see Verification).
+- **Controlled before/after, with coverage, on every test file that names `load_manifest`** (28 files, 2103 tests; `ab.sh`, appendix; main then spike, back to back, same window): **main 252.49 s → spike 103.91 s** (2103 passed, 1 skipped, 24 deselected both times; −148.6 s, 2.4×; peak RSS 138 MB → 136 MB). Tests that reach `load_manifest` only indirectly are outside that set: for example, `test_offline_discovery.py` and `test_progressive_disclosure.py` drive `catalog_search`. In the full run a plugin counted 1048 calls suite-wide; the A/B did not count. So −148.6 s is a **lower bound** on the saving at this host's speed, not a model of CI. CI timing is reported in the implementing PR, not gated on (see Verification).
 - PR 327's two exhaustive tests (`test_the_invalid_pin_text_is_true_*`, 432
   `load_manifest()` calls), no coverage:
 
@@ -525,10 +525,11 @@ exceptions are never pickled or cached (D4.1).
 ### `tests/conftest.py` (modify, +2)
 
 Import `pmcp.manifest.loader as manifest_loader`, and call
-`manifest_loader.clear_manifest_cache()` in `_reset_process_global_state._reset`. The
-implementer adds the one-line bullet to that fixture's docstring list:
-"`loader._manifest_cache` — the parsed manifest; a cached result would hide a later test's
-once-per-miss warnings."
+`manifest_loader.clear_manifest_cache()` in `_reset_process_global_state._reset`; those two
+lines are the embedded diff. **On top of the diff**, the implementer adds one bullet to that
+fixture's docstring list: "`loader._manifest_cache` — the parsed manifest; a cached result
+would hide a later test's once-per-miss warnings." It is docstring-only, and the only planned
+deviation from a byte-identical apply (Verification step 10 compares before it is added).
 
 ### `tests/test_version_pin.py` (modify, −31)
 
@@ -606,7 +607,7 @@ uv run pytest tests/test_version_pin.py -k invalid_pin_text_is_true -q --duratio
   -p no:cacheprovider --no-cov --cov-fail-under=0
 #   spike, no fixture: 1.68s + 0.73s call; 2 passed in 2.49s   (main with fixture: 1.70s)
 
-# 5. Every file that calls load_manifest (28 files), WITH coverage, main vs spike,
+# 5. Every file that names load_manifest (28 files; indirect callers excluded, so a lower bound), WITH coverage, main vs spike,
 #    same window, detached (ab.sh, appendix)
 bash $S/ab.sh   # swaps loader/conftest/test_version_pin between main and spike copies
 #   A main:  2103 passed, 1 skipped, 24 deselected in 252.49s (0:04:12)
