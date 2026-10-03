@@ -20,6 +20,18 @@
 > form), N4 (the tripwire also asserts the literal path serves 200), and the
 > loopback-normalisation nit. All numbers below were re-measured on the
 > round-2 spike.
+>
+> **Round 3** (after the round-2 panel; codex marked these blocking against
+> the plan's own fail-closed criterion, and the coordinator agreed): the walk
+> still failed open on four more shapes -- `message += ...` (rendered the
+> first assignment's text), an exception built and then raised by name, an
+> alias raised by name, and a subclass whose message sits in
+> `super().__init__` -- and the log tripwire missed a redacting *text*
+> formatter selected in `setup_logging`. The walk now discovers exception
+> classes at test time, collects `super().__init__` messages, resolves
+> `raise <name>`, and refuses any name with a binding other than one plain
+> assignment; the log test is behavioural. All numbers re-measured on the
+> round-3 spike.
 
 ## Task
 
@@ -92,7 +104,7 @@ Measured by reading every sink, because round 1 disagreed on it:
 | `describe_exception(exc)` (used by `ClientManager`, `cli.py`, tool handlers for `last_error`, warnings, CLI output) | the whole exception text | `manager.py:111` and callers |
 | CLI and `doctor` output | the values interpolated through `sanitize_auth_diagnostic(...)` at each call site | `cli.py:1050-1520`, `cli_commands/doctor.py:66, 87` |
 | `policy.py` output | `redact_additive` on its result | `policy.py:794-799` |
-| **log records** | **nothing as a whole.** `setup_logging` (`cli.py:70-105`) installs a plain `logging.Formatter` or `_JsonFormatter` (which emits `record.getMessage()` verbatim) on a stderr handler and a `RotatingFileHandler`; no `Filter`, no record factory (`grep -rn 'addFilter\|logging.Filter\|setLogRecordFactory' src/pmcp` is empty); `pmcp logs` (`cli.py:1575`) prints the file raw. A log line is redacted only where its call site sanitises an interpolated value. | — |
+| **log records** | **nothing as a whole.** Measured behaviourally (round 3): the real `setup_logging` in `text` and `json` mode installs two handlers (stderr and a `RotatingFileHandler`), and each of the 16 pinned log templates, rendered with sample args, comes out of each handler's filters and formatter verbatim. `pmcp logs` (`cli.py:1575`) prints the file raw. A log line is redacted only where its call site sanitises an interpolated value. | — |
 
 So the claude seat was right that pmcp never sanitises a log record, and
 codex's `Streamable-HTTP session [REDACTED] started` is what the text becomes
@@ -109,33 +121,56 @@ checked as if sanitised, the conservative choice.
 
 ### The class, derived from the code
 
-The walk (`_Walk` in the test module) reads `auth.py` and `transport/http.py`:
-- **Message calls:** every call to a callee in `_MESSAGE_CALLS` --
-  `ResourceServerAuthError` (arg 1 or `description=`),
-  `ResourceServerJWKSUnavailable` (arg 0 or `description=`), `ValueError`,
-  `RuntimeError`, `TypeError` (arg 0), urllib's `HTTPError` (arg 2 or
-  `msg=`), `_reject` (arg 1 or `body=`) and `Response` (arg 0 or
-  `content=`) -- reading the positional argument **and** the keyword.
-- **Every `raise <Call>`:** a callee not in that table is reported as
-  unclassified and fails, so a new exception type cannot slip past.
+The walk (`_Walk` in the test module) reads `auth.py` and `transport/http.py`
+with the imported module's globals as its namespace:
+- **Message calls, discovered at test time (round 3):** every call whose
+  callee resolves -- directly, through an attribute chain, or through an
+  alias assigned once -- to an exception class (builtin, imported, or a class
+  defined in the walked module), plus the two response calls `_reject`
+  (arg 1 or `body=`) and `Response` (arg 0 or `content=`). Message position:
+  `_KNOWN_SPECS` for the three classes that do not take it first
+  (`ResourceServerAuthError` arg 1 / `description=`,
+  `ResourceServerJWKSUnavailable` arg 0 / `description=`, urllib's
+  `HTTPError` arg 2 / `msg=`), arg 0 for a class that does not override
+  `__init__`, and for a class defined in the module the parameter its
+  `__init__` passes to `super().__init__`. An imported class that overrides
+  `__init__` without a known spec is unclassified. Positional **and**
+  keyword arguments are read.
+- **`super().__init__(...)` inside an exception subclass** is a message call
+  at the base class's position (round 3, claude F2b). A pass-through (an
+  `__init__` parameter, or `self.<attr>`) is not a message -- the
+  constructor's callers are collected instead; a class whose `__init__`
+  passes a literal is "message-carried", so `raise _TokenRejected()` is
+  neither unrendered nor unclassified, and its text is checked at the
+  `super().__init__` call. A subclass whose `__init__` never calls super is
+  unclassified.
+- **Every `raise`:** `raise <Call>` must be an exception call; `raise <name>`
+  is either a re-raise of a name bound only by an `except ... as name`, or
+  resolves to its one constructing assignment, whose call must be an
+  exception call (round 3, codex). Anything else -- an unknown callee, a
+  parameter, an attribute -- is unclassified and fails.
 - **Logger calls:** `logger|log|logging.<level>(msg, ...)`, positional or
   `msg=`; collected as templates and pinned (see the sinks section).
 - **Rendering:** string constants; f-strings; `+`; `%` with a constant
-  template; `.format` with a constant template; and a name assigned exactly
-  once in the enclosing function or module, resolved to its value. Holes
-  filled from config (`{self.url}`, `" ".join(missing_scopes)`) take a
-  sample from `_HOLE_SAMPLES`; any other hole makes the message unrenderable.
+  template; `.format` with a constant template; and a name. **A name is
+  resolved only if, in the innermost scope that binds it, its only binding is
+  one plain `x = ...` or `x: T = ...` (round 3).** Any other binding --
+  `+=`, a parameter, a `for`/`with` target, `:=`, tuple unpacking,
+  `global`/`nonlocal`, an import, an `except` name, a second assignment --
+  makes it unrenderable, so the walk refuses rather than renders a guess.
+  Holes filled from config (`{self.url}`, `" ".join(missing_scopes)`) take a
+  sample from `_HOLE_SAMPLES`.
 - **Fail-closed:** everything the walk cannot render is recorded as (module,
   function, source) and must equal a reviewed exemption list, as a multiset.
-  On the spike it is five entries: `str(exc)` in
-  `validate_resource_server_token` (pyjwt's text, checked by the pyjwt
-  half); `body` in `_reject` (its callers' literals are collected);
+  On the spike it is seven entries: `str(exc)` in
+  `validate_resource_server_token` (pyjwt's text, checked by the pyjwt half);
+  `body` in `_reject` (its callers' literals are collected);
   `_generate_latest()` and `'\n'.join(lines) + '\n'` in `handle_metrics`
-  (Prometheus exposition, not a message); and the body-less `Response(
-  status_code=202)` in `handle_mcp`.
-- **Pinned:** the derived (module, text) multiset must equal
-  `_PINNED_FIXED` exactly (39 texts on the spike), and the log templates
-  `_PINNED_LOGS` (16). A floor such as `>= 28` let the round-1 list shrink.
+  (Prometheus exposition); and three body-less responses in `handle_mcp`
+  (`Response(status_code=202)` and two `_NullResponse()`s -- a `Response`
+  subclass, which the round-3 discovery now sees).
+- **Pinned:** the derived (module, text) multiset must equal `_PINNED_FIXED`
+  exactly (39 texts), and the log templates `_PINNED_LOGS` (16).
 
 pyjwt's own texts are generated from pyjwt itself for every class in
 `_FIXED_TEXT_CLAIM_ERRORS` (`auth.py:585`), whose text pmcp keeps verbatim:
@@ -282,6 +317,36 @@ a `%`/`.format` template or a non-`ValueError` startup refusal, and the
 - `test_every_kept_pyjwt_class_has_a_producer` fails when a class is added
   to `_FIXED_TEXT_CLAIM_ERRORS` without a generator.
 
+**Round 3 closes the shapes the round-2 panel found, as classes, not
+instances:**
+- **Which calls are messages** is no longer a hand-written table of names: it
+  is every call that resolves to an exception class at test time (aliases,
+  attribute chains and module-defined subclasses included), so `raise
+  LookupError(...)`, `_Err = ResourceServerAuthError` and a new subclass are
+  all seen without anyone listing them.
+- **Where a subclass keeps its message** is followed into `super().__init__`.
+  Claude's trap -- registering `_TokenRejected` leaves a message-less
+  `_TokenRejected()` call that an exemption would then hide for good -- cannot
+  happen: the class is classified as message-carried and its literal is
+  checked at the super call; nothing needs exempting.
+- **`raise <name>`** resolves to its one constructing assignment or fails.
+- **The resolver refuses rather than guesses.** It renders a name only when
+  the innermost binding scope has exactly one plain assignment of it.
+  Round 2's resolver took the first `Assign` it found, so `message = "Empty
+  token."` followed by `message += " Token expired."` rendered as `Empty
+  token.` -- the pin showed that text, and a developer updating the pin got a
+  green test while the stored text was `Empty token. Token [REDACTED]`.
+- Regression tests on synthetic modules:
+  `test_the_walk_renders_every_message_shape` (8: the five round-1 shapes plus
+  `raise_name`, `alias`, `subclass_super`),
+  `test_the_walk_refuses_a_name_it_cannot_resolve_exactly` (8: `augmented`,
+  `for_target`, `walrus`, `unpacked`, `with_target`,
+  `parameter_shadows_module`, `global`, `reassigned`),
+  `test_the_walk_reports_every_raise_it_cannot_classify` (5:
+  `unknown_callee`, `unresolved_name`, `built_by_unknown`, `attribute`,
+  `subclass_without_super`) and
+  `test_re_raising_a_caught_exception_is_not_a_message`.
+
 Pinning texts means a PR that adds or rewords a message in these two files
 updates `_PINNED_FIXED` (or `_PINNED_LOGS`). That is deliberate: it is the
 one-line review step that makes the derivation unable to shrink silently.
@@ -392,7 +457,8 @@ embedders, and the working configuration uses `resource_server_audience`
 
 ## Changes
 
-The round-2 spike diff is 3 files, 47 insertions and 9 deletions: `auth.py`
+The spike diff (unchanged since round 2; round 3 changes only the test
+module) is 3 files, 47 insertions and 9 deletions: `auth.py`
 13 lines, `transport/http.py` 14 lines and `README.md` 29 lines. It also
 adds a new test module.
 
@@ -416,7 +482,7 @@ adds a new test module.
   decision 4 (verbatim below).
 
 ### `tests/test_auth_operator_messages.py` (create)
-98 tests on 3.10 (about 0.3 s), no network, no timed sleeps:
+117 tests on 3.10 (about 0.3–1.0 s), no network, no timed sleeps:
 
 | Test | Count | Pins |
 |---|---|---|
@@ -424,8 +490,9 @@ adds a new test module.
 | `test_a_stored_description_is_the_text_written[...]` | 16 | the end-to-end `.description` for each distinct auth-error description (the `{self.url}` texts with the sample URL filled in) |
 | `test_the_derived_set_is_exactly_the_pinned_set`, `test_the_log_templates_are_exactly_the_pinned_set`, `test_the_pin_and_the_exemptions_are_exact_not_floors` | 3 | exact pins, as multisets |
 | `test_every_message_the_walk_cannot_render_is_reviewed`, `test_every_raised_callee_is_classified` | 2 | fail-closed walk |
-| `test_the_walk_renders_every_message_shape[format, keyword, percent, runtime_error, variable]`, `test_the_walk_fails_closed_on_what_it_cannot_render` | 5 + 1 | the round-1 shapes, on synthetic modules |
-| `test_no_log_sink_applies_the_sanitiser` | 1 | the sink finding: logs are not sanitised |
+| `test_the_walk_renders_every_message_shape[...]`, `test_the_walk_refuses_a_name_it_cannot_resolve_exactly[...]`, `test_the_walk_reports_every_raise_it_cannot_classify[...]`, `test_re_raising_a_caught_exception_is_not_a_message`, `test_the_walk_fails_closed_on_what_it_cannot_render` | 8 + 8 + 5 + 1 + 1 | the shapes of rounds 1 and 2, on synthetic modules |
+| `test_no_log_sink_applies_the_sanitiser[text, json]` | 2 | behavioural: the real `setup_logging`, every handler, every pinned template verbatim |
+| `test_no_redacting_log_hook_in_the_source` | 1 | supplement: no `addFilter`/`logging.Filter`/`setLogRecordFactory` |
 | `test_every_kept_pyjwt_class_has_a_producer`, `test_every_kept_pyjwt_text_survives_the_sanitiser[...]` | 1 + 9 | pyjwt's kept texts |
 | `test_the_challenges_cover_401_403_503`, `test_challenge_parameters_survive_the_sanitiser[...]`, `test_pmcp_reads_its_own_challenge_back[...]` | 1 + 8 + 8 | `WWW-Authenticate` |
 | `test_the_whole_header_is_redacted_by_the_base_bearer_rule_by_design` | 1 | the deliberate exception |
@@ -483,9 +550,9 @@ Apply *Verbatim bodies*: `git apply` both patches, write the test module, and
 add the CHANGELOG bullet by hand. Then:
 
 ```bash
-# 1. the new module (round-2 spike: 98 passed, ~0.3 s)
+# 1. the new module (round-3 spike: 117 passed, ~0.3-1.0 s)
 uv run pytest tests/test_auth_operator_messages.py --cov-fail-under=0 -p no:cacheprovider -q
-# 2. the suites that touch auth, the HTTP transport and the redactor (round-2 spike: 644 passed, 55 deselected, 0 failed, 60 s)
+# 2. the suites that touch auth, the HTTP transport and the redactor (round-3 spike: 663 passed, 55 deselected, 0 failed, 61 s)
 uv run pytest tests/test_auth.py tests/test_transport_http.py tests/test_auth_origin_wiring.py \
   tests/test_redaction_additive.py tests/test_auth_operator_messages.py tests/test_cli.py tests/test_server.py \
   --cov-fail-under=0 -p no:cacheprovider -q
@@ -496,12 +563,12 @@ python3 scripts/check_security_claims.py          # expect OK, 129 cited node id
 python3 scripts/check_plan_consistency.py .consiliency/plans/detailed-326-auth-messages-20261003-0226.md
 #   measured on this file: "consistent ... blocking inconsistencies: 0", exit 0 (a detailed plan has no roadmap pin)
 # 4. the full suite: once, detached, with a notifying waiter (memory on dev0 is shared)
-#    (round-2 spike, run alone: 5027 passed, 3 skipped, 80 deselected, 0 failed, 552 s)
+#    (round-3 spike, run alone: 5046 passed, 3 skipped, 80 deselected, 0 failed, 579 s)
 nohup uv run pytest -q -p no:cacheprovider > "$WORKTREE_ROOT/pmcp-326-full.log" 2>&1 &
 ```
 
 **Red on main.** The module against `89559db`'s `auth.py` and `http.py`
-(README is not imported): **9 failed, 88 passed** (the derivation finds no
+(README is not imported): **9 failed, 107 passed** (the derivation finds no
 metadata startup text on main, so one fewer case). The ids below are main's
 line numbers (`auth.py:628`). The mutation table uses the spike's
 (`auth.py:631`), because the comments the patch adds move the lines. Both are
@@ -534,9 +601,15 @@ behaviour this plan keeps, and the mutants below show each can fail.
   names, f-strings, `%` and `.format`, classifies every `raise`, and fails on
   any message it cannot render outside the reviewed exemptions. Proven by
   the walk-guard tests and the five shape tests; mutants C1–C9 and K1–K9.
-- [ ] No log sink applies the sanitiser, and the log templates are pinned.
-  Proven by `test_no_log_sink_applies_the_sanitiser` and
-  `test_the_log_templates_are_exactly_the_pinned_set`.
+- [ ] The walk discovers exception classes at test time (aliases and
+  module-defined subclasses included), follows a subclass's message into
+  `super().__init__`, resolves `raise <name>`, and refuses any name with a
+  binding other than one plain assignment. Proven by the three synthetic
+  shape families; mutants R1–R5 and K10–K13.
+- [ ] No log sink applies the sanitiser, measured through the real
+  `setup_logging` in text and JSON mode, and the log templates are pinned.
+  Proven by `test_no_log_sink_applies_the_sanitiser[text|json]` and
+  `test_the_log_templates_are_exactly_the_pinned_set`; mutant R6.
 - [ ] Every pyjwt text pmcp keeps comes through unchanged, and every kept class
   has a producer. Proven by the two pyjwt tests.
 - [ ] Every `WWW-Authenticate` parameter of the eight 401/403/503 challenges
@@ -555,47 +628,60 @@ behaviour this plan keeps, and the mutants below show each can fail.
   embedding-only premise (Design decision 4).
 - [ ] Verification steps 1–3 pass. The CHANGELOG entry is present, with no
   closing keyword.
-- [ ] Every mutant below is red.
+- [ ] Every mutant below is red, except K7 and K14, which delete an assertion
+  and are shown by their double mutants.
 
 ## Mutation table
 
-Each mutant was measured on the round-2 spike (`mutants.py`: apply one
-string replacement to a source file or to the test module, run
-`tests/test_auth_operator_messages.py` with a 300 s cap, restore from the
-saved copy in a `finally`). **24 of 25 are red; K7 survives by construction
-(below).** After the run, all three files were byte-identical to the spike.
-Ids in brackets are the spike's line numbers.
+Each mutant was measured on the round-3 spike (`mutants3.py`: apply one or
+more string edits to a source file, `cli.py` or the test module, run
+`tests/test_auth_operator_messages.py` under `-o timeout=60` and a 300 s cap,
+restore every touched file from its saved copy in a `finally`). **34 of 36 are
+red; K7 and K14 survive by construction** (each deletes an assertion; their
+double mutants below show what they would hide). After the run, every file
+was byte-identical to the spike. Ids in brackets are the spike's line numbers.
 
 | # | Rule | Mutant | Red tests (measured) |
 |---|---|---|---|
-| B1 | the 401 text is clean | revert to `Token could not be verified…` | 3: the pin, `…survives_the_sanitiser[auth.py:631]`, `…stored_description…[Token could…]` |
-| B2 | the empty-token text is clean | revert to `Missing bearer token.` | 3: the pin, `…[auth.py:649]`, `…stored_description…[Missing…]` |
-| B3 | the algorithm text is clean | revert to `Unsupported token algorithm.` | 3: the pin, `…[auth.py:656]`, `…stored_description…[Unsupported…]` |
+| B1 | the 401 text is clean | revert to `Token could not be verified…` | 3: the pin, `…survives_the_sanitiser[auth.py:631]`, `…stored_description…` |
+| B2 | the empty-token text is clean | revert to `Missing bearer token.` | 3 |
+| B3 | the algorithm text is clean | revert to `Unsupported token algorithm.` | 3 |
 | B4 | the shared-secret text is clean | revert | 2: the pin, `…[transport/http.py:318]` |
 | B5 | no empty `resource` | the startup check → `if False:` | `test_metadata_route_refuses_to_start_without_a_canonical_resource` |
-| B6 | a new positional description is checked | `Invalid audience.` → `Token audience mismatch.` | 3: the pin, `…[auth.py:672]`, `…stored_description…` |
-| B7 | challenge parameters are covered | `_auth_headers` adds `error_description="token expired"` | 6: `test_challenge_parameters_survive_the_sanitiser[{401-invalid,403-scope,503-jwks}-{audience,metadata}]` |
-| C1 | keyword argument (codex's example) | `ResourceServerAuthError("invalid_token", description="Token audience mismatch.")` | 3: the pin, `…[auth.py:672]`, `…stored_description…` |
-| C2 | text in a variable (claude) | `message = "Token could not be verified."` then `…(…, message)` | 3: the pin, `…[auth.py:661]`, `…stored_description…` |
-| C3 | `%` template (claude) | `"JWKS URL is required for token %s." % "checks"` | 3: the pin, `…[auth.py:660]`, `…stored_description…` |
-| C4 | non-`ValueError` refusal (claude) | `raise RuntimeError("Unsupported secret mode.")` | 2: the pin, `…[transport/http.py:314]` |
-| C5 | unknown exception class | `raise ConfigError("Unsupported auth mode.")` | 2: the pin, `test_every_raised_callee_is_classified` |
-| C6 | unrenderable message | `f"Invalid token {exc}."` | 3: the pin, `test_every_message_the_walk_cannot_render_is_reviewed`, `…exact_not_floors` |
-| C7 | a message hidden from the walk | `_reject(*(403, "Forbidden"))` (a second `<no message>` in a function with an exempt one) | 2: the pin, the exemption check (multiset) |
-| C8 | a new log line (codex) | add `logger.info("Streamable-HTTP session manager ready")` | `test_the_log_templates_are_exactly_the_pinned_set` |
-| C9 | a message moves to an unknown callee | `Response("Too Many Requests", …)` → `PlainTextResponse(…)` | the pin **only** -- the case the pin exists for |
-| K1 | walk reads keywords | ignore `call.keywords` | `test_the_walk_renders_every_message_shape[keyword]` |
-| K2 | walk resolves names | skip `ast.Name` | `…[variable]` |
+| B6 | a new positional description is checked | `Invalid audience.` → `Token audience mismatch.` | 3 |
+| B7 | challenge parameters are covered | `_auth_headers` adds `error_description="token expired"` | 6 challenge cases |
+| C1 | keyword argument (codex r1) | `…(…, description="Token audience mismatch.")` | 3 |
+| C2 | text in a variable (claude r1) | `message = "Token could not be verified."` then `…(…, message)` | 3 |
+| C3 | `%` template (claude r1) | `"JWKS URL is required for token %s." % "checks"` | 3 |
+| C4 | non-`ValueError` refusal (claude r1) | `raise RuntimeError("Unsupported secret mode.")` | 2 |
+| C5 | unknown callee | `raise ConfigError("Unsupported auth mode.")` | 2: the pin, `test_every_raised_callee_is_classified` |
+| C6 | unrenderable message | `f"Invalid token {exc}."` | 3: the pin, the exemption check, `…exact_not_floors` |
+| C7 | a message hidden from the walk | `_reject(*(403, "Forbidden"))` | 2: the pin, the exemption check |
+| C8 | a new log line (codex r1) | add `logger.info("Streamable-HTTP session manager ready")` | the log pin |
+| C9 | a message moves to an unknown callee | `Response(…)` → `PlainTextResponse(…)` | the pin **only** |
+| R1 | augmented assignment (codex r2) | `message = "Empty token."`; `message += " Token expired."`; raise with `message` | 3: the pin, the exemption check, `…exact_not_floors` (refused, not rendered as `Empty token.`) |
+| R2 | built, then raised by name (codex r2) | `error = LookupError("Token expired.")`; `raise error` | 2: the pin, `…survives_the_sanitiser[transport/http.py:314]` |
+| R3 | alias raised by name (claude r2 F2a) | `_AuthErr = ResourceServerAuthError` at module level; `err = _AuthErr("invalid_token", "Token expired.")`; `raise err from exc` | 3: the pin, `…survives…[auth.py:680]`, `…stored_description…` |
+| R4 | subclass with the message in `super().__init__` (claude r2 F2b) | `class _TokenRejected(ResourceServerAuthError)` whose `__init__` passes `"Token expired."`; `raise _TokenRejected() from exc` | 3: the pin, `…survives…[auth.py:1062]` (the super call), `…stored_description…` |
+| R5 | `for`-target binding (claude r2 F2c) | `for message in ("Token expired.",): raise …(…, message)` | 3: the pin, the exemption check, `…exact_not_floors` |
+| R6 | redacting text formatter (codex r2) | `_RedactingFormatter.format` returns `sanitize_auth_diagnostic(super().format(record))`, used by `setup_logging`'s text mode | `test_no_log_sink_applies_the_sanitiser[text]` |
+| K1 | walk reads keywords | ignore `call.keywords` | `…renders_every_message_shape[keyword]` |
+| K2 | walk resolves names | skip `ast.Name` in `_render` | `…[variable]` |
 | K3 | walk renders `%` | match `Pow` instead of `Mod` | `…[percent]` |
 | K4 | walk renders `.format` | match `.never` | `…[format]` |
-| K5 | unknown `raise` reported | drop the report | `test_the_walk_fails_closed_on_what_it_cannot_render` |
-| K6 | comparison counts multiplicity | compare `set(found)` | 2: the pin, `…exact_not_floors` |
-| K7 | the pin is exact | replace the pin assertion with `len(...) >= 28` | **survives** on the spike tree: it deletes an assertion, and only a tree with a dropped message can show it. Measured double mutant K7 + C9: **97 passed** -- with the floor, a message moving to an unknown callee goes unseen, which is exactly the round-1 defect and why the pin is exact |
+| K5 | raises are classified | the classification check → `if False:` | 3: `…reports_every_raise…[built_by_unknown, subclass_without_super, unknown_callee]` |
+| K6 | comparison counts multiplicity | compare `set(found)` | 2: the pin, the exemption check |
+| K7 | the pin is exact | pin assertion → `len(...) >= 28` | **survives**; double mutant K7 + C9: **116 passed** -- a message moving to an unknown callee goes unseen, the round-1 defect |
 | K8 | log calls collected | drop `self.logs.append` | 2: the log pin, `…fails_closed…` |
-| K9 | comparison is equality, not subset | report only missing items | `…exact_not_floors` |
+| K9 | comparison is equality | report only missing items | `…exact_not_floors` |
+| K10 | resolver refuses multiple bindings | drop the `len(found) != 1` refusal | 2: `…refuses…[global, reassigned]` |
+| K11 | `raise <name>` resolved | return before resolving | 2: `…reports_every_raise…[built_by_unknown, unresolved_name]` |
+| K12 | `super().__init__` collected | skip the super branch | `…renders_every_message_shape[subclass_super]` |
+| K13 | exception classes discovered at run time | non-known classes → `("ignore",)` | 5: the pin, `test_every_raised_callee_is_classified`, `…renders…[format, raise_name, runtime_error]` |
+| K14 | the log test is behavioural | `return` before `setup_logging` | **survives**; double mutant K14 + R6: **117 passed** -- with only the source check, the redacting text formatter goes unseen, which is exactly what codex reported |
 
-The implementer re-runs all 25 on the final tree, restoring from a saved copy
-(never `git checkout --`).
+The implementer re-runs all 36 (and the two double mutants) on the final
+tree, restoring from a saved copy (never `git checkout --`).
 
 ## Non-goals
 
@@ -623,8 +709,8 @@ The implementer re-runs all 25 on the final tree, restoring from a saved copy
   nginx.
 - **Python 3.11 / 3.12.** The module was run on 3.10 only. It is pure string
   and AST work plus `TestClient`, with no version-specific asyncio.
-- **The full suite** was run once on the round-2 spike, alone and detached
-  (5027 passed, 3 skipped, 80 deselected, 0 failed, 552 s; the 80 deselected are the default marker exclusions).
+- **The full suite** was run once on the round-3 spike, alone and detached
+  (5046 passed, 3 skipped, 80 deselected, 0 failed, 579 s).
 
 ## Execution Policy
 
@@ -802,8 +888,10 @@ change there is a collection error for this module, not one red test.
 from __future__ import annotations
 
 import ast
+import builtins
 from pathlib import Path
 import time
+import urllib.error
 from typing import Any, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -832,21 +920,20 @@ _HOLE_SAMPLES = {
     "' '.join(missing_scopes)": "mcp:read mcp:write",
 }
 
-# Every call that carries a message: callee -> (positional index, keyword
-# names). Both are read. A `raise` of a callee missing here is reported as
-# unclassified, so a new exception type cannot slip past the walk.
-_MESSAGE_CALLS: dict[str, tuple[int, tuple[str, ...]]] = {
-    "ResourceServerAuthError": (1, ("description",)),
-    "ResourceServerJWKSUnavailable": (0, ("description",)),
-    "ValueError": (0, ()),
-    "RuntimeError": (0, ()),
-    "TypeError": (0, ()),
-    "HTTPError": (2, ("msg",)),  # urllib's (url, code, msg, hdrs, fp)
+# Exception classes whose constructor does not take the message first.
+# Every other exception class -- builtin, imported, or defined in the walked
+# module, found at test time, aliases included -- is classified by
+# `_Walk._spec`; one it cannot classify fails the walk.
+_KNOWN_SPECS: dict[type[BaseException], tuple[int, tuple[str, ...]]] = {
+    ResourceServerAuthError: (1, ("description",)),
+    ResourceServerJWKSUnavailable: (0, ("description",)),
+    urllib.error.HTTPError: (2, ("msg",)),  # (url, code, msg, hdrs, fp)
+}
+# Non-exception calls that put a fixed text on the wire.
+_RESPONSE_CALLS: dict[str, tuple[int, tuple[str, ...]]] = {
     "_reject": (1, ("body",)),  # http.py: the 401/403/503 response body
     "Response": (0, ("content",)),  # http.py: 413/429/504 bodies
 }
-# The descriptions an auth error stores (sanitised in `__init__`).
-_STORED = {"ResourceServerAuthError", "ResourceServerJWKSUnavailable"}
 
 _LOG_LEVELS = {"debug", "info", "warning", "warn", "error", "exception", "critical"}
 _LOGGERS = {"logger", "log", "logging"}
@@ -867,7 +954,10 @@ _EXEMPT_UNRENDERED = sorted(
             "create_http_app.handle_metrics",
             "'\\n'.join(lines) + '\\n'",
         ),
-        # `202 Accepted` with no body.
+        # `202 Accepted` with no body, and the two body-less `_NullResponse()`s
+        # (a `Response` subclass, so the walk sees them as response calls).
+        ("transport/http.py", "create_http_app.handle_mcp", "<no message>"),
+        ("transport/http.py", "create_http_app.handle_mcp", "<no message>"),
         ("transport/http.py", "create_http_app.handle_mcp", "<no message>"),
     ]
 )
@@ -875,38 +965,146 @@ _EXEMPT_UNRENDERED = sorted(
 _MODULES = {"auth.py": auth_mod, "transport/http.py": http_mod}
 
 
+_Spec = tuple  # ("call", index, keywords, stored) | ("carried",) | ("ignore",) | ("unclassified", why)
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
 class _Walk:
     """One pass over a module: the messages it renders, the ones it cannot,
-    the `raise`s of unclassified callees, and the log templates."""
+    the `raise`s it cannot classify, and the log templates.
 
-    def __init__(self, rel: str, tree: ast.Module) -> None:
+    ``namespace`` resolves callee names at test time (the imported module's
+    globals for the real modules; a chosen mapping for synthetic ones)."""
+
+    def __init__(
+        self, rel: str, tree: ast.Module, namespace: dict[str, Any] | None = None
+    ) -> None:
         self.rel = rel
-        self.fixed: list[tuple[str, str, str]] = []  # (where, callee, text)
+        self.tree = tree
+        self.namespace = dict(namespace or {})
+        self.classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+        self.fixed: list[tuple[str, bool, str]] = []  # (where, stored, text)
         self.unrendered: list[tuple[str, str, str]] = []
         self.unclassified: list[str] = []
         self.logs: list[str] = []
-        self._visit(tree, [], [tree])
+        self._visit(tree, [], [tree], None)
 
-    def _visit(self, node: ast.AST, scope: list[str], frames: list[ast.AST]) -> None:
+    # -- classification ---------------------------------------------------------
+
+    def _spec(self, func: ast.expr, frames: list[ast.AST], depth: int = 0) -> _Spec:
+        if depth > 8:
+            return ("unclassified", "alias chain too deep")
+        if isinstance(func, ast.Name):
+            name = func.id
+            if name in _RESPONSE_CALLS:
+                return ("call", *_RESPONSE_CALLS[name], False)
+            obj = self.namespace.get(name, getattr(builtins, name, None))
+            if isinstance(obj, type) and obj in _KNOWN_SPECS:
+                return self._runtime_spec(obj)
+            if name in self.classes:
+                return self._class_spec(self.classes[name], depth)
+            if obj is not None:
+                return self._runtime_spec(obj)
+            value = _resolve(name, frames)
+            if isinstance(value, (ast.Name, ast.Attribute)):
+                return self._spec(value, frames, depth + 1)  # an alias
+            return ("ignore",)
+        if isinstance(func, ast.Attribute):
+            obj: Any = None
+            chain: list[str] = []
+            node: ast.expr = func
+            while isinstance(node, ast.Attribute):
+                chain.insert(0, node.attr)
+                node = node.value
+            if isinstance(node, ast.Name) and node.id in self.namespace:
+                obj = self.namespace[node.id]
+                for attr in chain:
+                    obj = getattr(obj, attr, None)
+            return self._runtime_spec(obj)
+        return ("ignore",)
+
+    def _runtime_spec(self, obj: Any) -> _Spec:
+        if not (isinstance(obj, type) and issubclass(obj, BaseException)):
+            return ("ignore",)
+        stored = issubclass(obj, ResourceServerAuthError)
+        for klass in obj.__mro__:
+            if klass in _KNOWN_SPECS:
+                if klass is not obj and "__init__" in vars(obj):
+                    return ("unclassified", f"{obj.__name__} overrides __init__")
+                return ("call", *_KNOWN_SPECS[klass], stored)
+        if "__init__" in vars(obj) and obj.__module__ != "builtins":
+            return ("unclassified", f"{obj.__name__} overrides __init__")
+        return ("call", 0, (), stored)
+
+    def _class_spec(self, cls: ast.ClassDef, depth: int) -> _Spec:
+        """A class defined in the walked module: follow its `__init__`'s
+        `super().__init__` to see where the message comes from."""
+        if not cls.bases:
+            return ("ignore",)
+        base = self._spec(cls.bases[0], [self.tree], depth + 1)
+        init = next(
+            (
+                n
+                for n in cls.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.name == "__init__"
+            ),
+            None,
+        )
+        if base[0] != "call" or init is None:
+            return base
+        params = [a.arg for a in init.args.args[1:]]
+        sup = next((c for c in ast.walk(init) if _is_super_init(c)), None)
+        if sup is None:
+            return ("unclassified", f"{cls.name}.__init__ never calls super")
+        arg = _message_arg(sup, base[1], base[2])
+        if isinstance(arg, ast.Name) and arg.id in params:
+            return ("call", params.index(arg.id), (arg.id,), base[3])
+        return ("carried",)  # its message is in `super().__init__`, collected there
+
+    # -- the walk ------------------------------------------------------------
+
+    def _visit(
+        self, node: ast.AST, scope: list[str], frames: list[ast.AST], cls: Any
+    ) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                self._visit(child, [*scope, child.name], [*frames, child])
+                self._visit(child, [*scope, child.name], [*frames, child], cls)
                 continue
             if isinstance(child, ast.ClassDef):
-                self._visit(child, [*scope, child.name], frames)
+                self._visit(child, [*scope, child.name], frames, child)
                 continue
-            if isinstance(child, ast.Raise) and isinstance(child.exc, ast.Call):
-                name = _callee(child.exc)
-                if name not in _MESSAGE_CALLS:
-                    self.unclassified.append(
-                        f"{self.rel}:{child.lineno} raise {name}(...)"
-                    )
+            if isinstance(child, ast.Raise) and child.exc is not None:
+                self._raise(child, frames)
             if isinstance(child, ast.Call):
-                self._call(child, scope, frames)
-            self._visit(child, scope, frames)
+                self._call(child, scope, frames, cls)
+            self._visit(child, scope, frames, cls)
 
-    def _call(self, call: ast.Call, scope: list[str], frames: list[ast.AST]) -> None:
+    def _raise(self, node: ast.Raise, frames: list[ast.AST]) -> None:
+        exc = node.exc
+        assert exc is not None
+        where = f"{self.rel}:{node.lineno}"
+        if isinstance(exc, ast.Name):
+            if _bound_by_except(exc.id, frames):
+                return  # re-raising a caught exception
+            value = _resolve(exc.id, frames)
+            if not isinstance(value, ast.Call):
+                self.unclassified.append(f"{where} raise {exc.id}: unresolved")
+                return
+            exc = value
+        if not isinstance(exc, ast.Call):
+            self.unclassified.append(f"{where} raise {ast.unparse(exc)}")
+            return
+        spec = self._spec(exc.func, frames)
+        if spec[0] not in ("call", "carried"):
+            why = spec[1] if spec[0] == "unclassified" else "not an exception class"
+            self.unclassified.append(f"{where} raise {ast.unparse(exc.func)}: {why}")
+
+    def _call(
+        self, call: ast.Call, scope: list[str], frames: list[ast.AST], cls: Any
+    ) -> None:
         func = call.func
+        where = ".".join(scope)
         if (
             isinstance(func, ast.Attribute)
             and isinstance(func.value, ast.Name)
@@ -916,12 +1114,40 @@ class _Walk:
             arg = _message_arg(call, 0, ("msg",))
             self.logs.append(ast.unparse(arg) if arg is not None else "<no message>")
             return
-        name = _callee(call)
-        if name not in _MESSAGE_CALLS:
+        if _is_super_init(call):
+            if cls is None or not cls.bases:
+                return
+            base = self._spec(cls.bases[0], [self.tree])
+            if base[0] != "call":
+                return
+            arg = _message_arg(call, base[1], base[2])
+            fn = frames[-1]
+            params = (
+                {a.arg for a in fn.args.args}
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else set()
+            )
+            if (isinstance(arg, ast.Name) and arg.id in params) or (
+                isinstance(arg, ast.Attribute)
+                and isinstance(arg.value, ast.Name)
+                and arg.value.id == "self"
+            ):
+                return  # pass-through: the constructor's callers are collected
+            self._record(call, arg, base[3], where, frames)
             return
-        index, keywords = _MESSAGE_CALLS[name]
-        arg = _message_arg(call, index, keywords)
-        where = ".".join(scope)
+        spec = self._spec(func, frames)
+        if spec[0] != "call":
+            return
+        self._record(call, _message_arg(call, spec[1], spec[2]), spec[3], where, frames)
+
+    def _record(
+        self,
+        call: ast.Call,
+        arg: ast.expr | None,
+        stored: bool,
+        where: str,
+        frames: list[ast.AST],
+    ) -> None:
         if arg is None:
             self.unrendered.append((self.rel, where, "<no message>"))
             return
@@ -929,7 +1155,18 @@ class _Walk:
         if text is None:
             self.unrendered.append((self.rel, where, ast.unparse(arg)))
         else:
-            self.fixed.append((f"{self.rel}:{call.lineno}", name, text))
+            self.fixed.append((f"{self.rel}:{call.lineno}", stored, text))
+
+
+def _is_super_init(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "__init__"
+        and isinstance(node.func.value, ast.Call)
+        and isinstance(node.func.value.func, ast.Name)
+        and node.func.value.func.id == "super"
+    )
 
 
 def _callee(call: ast.Call) -> str:
@@ -948,24 +1185,81 @@ def _message_arg(
     return None
 
 
+def _scope_nodes(frame: ast.AST) -> list[ast.AST]:
+    """Every node in ``frame``'s own scope: nested functions, lambdas, classes
+    and comprehensions are their own scopes and are not entered (their
+    names, which bind here, are still reported)."""
+    out: list[ast.AST] = []
+    todo = list(ast.iter_child_nodes(frame))
+    while todo:
+        node = todo.pop()
+        out.append(node)
+        if isinstance(
+            node, (*_SCOPES, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        ):
+            continue
+        todo.extend(ast.iter_child_nodes(node))
+    return out
+
+
+def _bindings(name: str, frame: ast.AST) -> list[ast.AST]:
+    """Every node that binds ``name`` in ``frame``'s own scope, of any kind."""
+    found: list[ast.AST] = []
+    if isinstance(frame, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        a = frame.args
+        params = [*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg]
+        found += [p for p in params if p is not None and p.arg == name]
+    for node in _scope_nodes(frame):
+        if (
+            isinstance(node, ast.Name)
+            and node.id == name
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+        ):
+            found.append(node)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            found.append(node)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+            (al.asname or al.name.split(".")[0]) == name for al in node.names
+        ):
+            found.append(node)
+        elif isinstance(node, ast.ExceptHandler) and node.name == name:
+            found.append(node)
+        elif isinstance(node, _SCOPES) and getattr(node, "name", None) == name:
+            found.append(node)
+    return found
+
+
 def _resolve(name: str, frames: list[ast.AST]) -> ast.expr | None:
-    """The value of a local or module name assigned exactly once."""
+    """The value of ``name`` if, in the innermost scope that binds it, the
+    ONLY binding is one plain assignment (`x = ...` or `x: T = ...`). Any
+    other binding -- `+=`, a parameter, a `for`/`with` target, `:=`,
+    unpacking, `global`/`nonlocal`, an import, a second assignment -- and
+    the resolver refuses (None) rather than guess."""
     for frame in reversed(frames):
-        values = [
-            node.value
-            for node in ast.walk(frame)
-            if isinstance(node, (ast.Assign, ast.AnnAssign))
-            and node.value is not None
-            and any(
-                isinstance(t, ast.Name) and t.id == name
-                for t in (
-                    node.targets if isinstance(node, ast.Assign) else [node.target]
-                )
-            )
-        ]
-        if values:
-            return values[0] if len(values) == 1 else None
+        found = _bindings(name, frame)
+        if not found:
+            continue
+        if len(found) != 1:
+            return None
+        parent = next(
+            (
+                n
+                for n in _scope_nodes(frame)
+                if isinstance(n, (ast.Assign, ast.AnnAssign))
+                and (n.targets if isinstance(n, ast.Assign) else [n.target])
+                == [found[0]]
+            ),
+            None,
+        )
+        if parent is None or parent.value is None:
+            return None
+        return parent.value
     return None
+
+
+def _bound_by_except(name: str, frames: list[ast.AST]) -> bool:
+    found = _bindings(name, frames[-1])
+    return bool(found) and all(isinstance(n, ast.ExceptHandler) for n in found)
 
 
 def _render(node: ast.expr, frames: list[ast.AST]) -> str | None:
@@ -1019,12 +1313,12 @@ def _walk_all() -> list[_Walk]:
     walks = []
     for rel, module in _MODULES.items():
         path = Path(module.__file__ or "")
-        walks.append(_Walk(rel, ast.parse(path.read_text())))
+        walks.append(_Walk(rel, ast.parse(path.read_text()), vars(module)))
     return walks
 
 
 _WALKS = _walk_all()
-_FIXED = [(where, text) for w in _WALKS for where, _name, text in w.fixed]
+_FIXED = [(where, text) for w in _WALKS for where, _stored, text in w.fixed]
 
 # The exact derived set, as (module, text) with multiplicity. A message that
 # drops out of the walk -- or a new one -- changes this, so the derivation
@@ -1175,14 +1469,66 @@ def test_the_log_templates_are_exactly_the_pinned_set() -> None:
     assert sorted(t for w in _WALKS for t in w.logs) == _PINNED_LOGS
 
 
-def test_no_log_sink_applies_the_sanitiser() -> None:
-    """Which sinks redact log records: none. `setup_logging` (`cli.py`)
-    installs a plain `logging.Formatter` or `_JsonFormatter` (which emits
-    `record.getMessage()` as is) on a stderr and a rotating-file handler, no
-    filter; `pmcp logs` prints the file raw. Values are sanitised where a call
-    site interpolates them (`describe_exception`, `sanitize_auth_diagnostic`),
-    never the whole record. If a filter, a record factory or a formatter that
-    redacts is ever added, log templates join the sanitiser check above."""
+def _log_messages() -> list[str]:
+    """Each pinned log template rendered with representative args."""
+    out = []
+    for source in _PINNED_LOGS:
+        template = ast.literal_eval(source)
+        holes = template.count("%s") + template.count("%r")
+        out.append(template % tuple(["req-1"] * holes) if holes else template)
+    return out
+
+
+@pytest.mark.parametrize("log_format", ["text", "json"])
+def test_no_log_sink_applies_the_sanitiser(
+    log_format: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Behavioural (round 3): run the real `setup_logging` and send every
+    pinned log template through every handler it installs (stderr and the
+    rotating file), with their filters and formatters. Each message must come
+    out verbatim. Any sink that redacts -- a filter, a record factory, a
+    formatter subclass, whatever its shape -- turns this red, and then the log
+    templates must join the sanitiser check (and the two `session manager`
+    lines be reworded: through the sanitiser they read `session [REDACTED]`).
+    Today no sink redacts a record; values are sanitised only where a call
+    site interpolates them (`describe_exception`, `sanitize_auth_diagnostic`)."""
+    import json
+    import logging
+
+    from pmcp import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(cli, "LOG_FILE", tmp_path / "logs" / "gateway.log")
+    root = logging.getLogger()
+    before, level = list(root.handlers), root.level
+    try:
+        cli.setup_logging("DEBUG", log_to_file=True, log_format=log_format)
+        added = [h for h in root.handlers if h not in before]
+        assert len(added) == 2, added  # stderr + rotating file
+        factory = logging.getLogRecordFactory()
+        for message in _log_messages():
+            record = factory(
+                "pmcp.transport.http", logging.INFO, __file__, 1, message, None, None
+            )
+            assert root.filter(record) and logging.getLogger(
+                "pmcp.transport.http"
+            ).filter(record)
+            for handler in added:
+                assert handler.filter(record), f"{handler} dropped {message!r}"
+                out = handler.format(record)
+                shown = json.loads(out)["msg"] if log_format == "json" else out
+                assert message in shown, f"{type(handler).__name__}: {out!r}"
+    finally:
+        for handler in [h for h in root.handlers if h not in before]:
+            root.removeHandler(handler)
+            handler.close()
+        root.setLevel(level)
+
+
+def test_no_redacting_log_hook_in_the_source() -> None:
+    """Supplement to the behavioural test: the hooks that would redact a
+    record without going through `setup_logging`."""
     src = Path(auth_mod.__file__ or "").parent
     hits = [
         f"{p.relative_to(src)}: {needle}"
@@ -1191,62 +1537,121 @@ def test_no_log_sink_applies_the_sanitiser() -> None:
         if needle in p.read_text()
     ]
     assert hits == []
-    from pmcp import cli
-
-    tree = ast.parse(Path(cli.__file__ or "").read_text())
-    formatter = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.ClassDef) and n.name == "_JsonFormatter"
-    )
-    assert "sanitize" not in ast.unparse(formatter)
-    assert "redact" not in ast.unparse(formatter)
 
 
-_SHAPES = {
-    # Claude's four review shapes and codex's keyword example: each carries a
-    # text the sanitiser really rewrites, so on the real tree each turns
-    # `test_every_fixed_message_survives_the_sanitiser` red.
-    "keyword": 'raise ResourceServerAuthError("invalid_token", '
-    'description="Token audience mismatch.")',
-    "variable": 'message = "Token could not be verified."\n'
-    'raise ResourceServerAuthError("invalid_token", message)',
-    "percent": 'raise ResourceServerAuthError("invalid_token", '
-    '"JWKS URL is required for token %s." % "checks")',
-    "format": 'raise ValueError("Token {} rejected.".format("checks"))',
-    "runtime_error": 'raise RuntimeError("Unsupported secret mode.")',
+# Module-level source shapes. Each carries a text the sanitiser really
+# rewrites, so on the real tree it would turn
+# `test_every_fixed_message_survives_the_sanitiser` red -- provided the walk
+# renders it. Rounds 1 and 2 of the panel each found shapes the walk skipped.
+_RENDERED_SHAPES = {
+    # round 1 (claude, codex)
+    "keyword": 'def f():\n    raise ResourceServerAuthError("invalid_token", '
+    'description="Token audience mismatch.")\n',
+    "variable": 'def f():\n    message = "Token could not be verified."\n'
+    '    raise ResourceServerAuthError("invalid_token", message)\n',
+    "percent": 'def f():\n    raise ResourceServerAuthError("invalid_token", '
+    '"JWKS URL is required for token %s." % "checks")\n',
+    "format": 'def f():\n    raise ValueError("Token {} rejected.".format("checks"))\n',
+    "runtime_error": 'def f():\n    raise RuntimeError("Unsupported secret mode.")\n',
+    # round 2 (codex F-raise-name; claude F2a, F2b)
+    "raise_name": 'def f():\n    error = LookupError("Token expired.")\n'
+    "    raise error\n",
+    "alias": "_Err = ResourceServerAuthError\n"
+    'def f():\n    err = _Err("invalid_token", "Token expired.")\n    raise err\n',
+    "subclass_super": "class _TokenRejected(ResourceServerAuthError):\n"
+    "    def __init__(self):\n"
+    '        super().__init__("invalid_token", "Token expired.")\n'
+    "def f():\n    raise _TokenRejected()\n",
+}
+
+# Shapes the walk must REFUSE to render: each binds the message name in a way
+# a single-assignment resolver would get wrong (round 2: codex's `+=`; claude
+# F2c). Refused means recorded as unrendered, which fails the real-tree
+# exemption check -- never rendered as the wrong text.
+_REFUSED_SHAPES = {
+    "augmented": 'def f():\n    message = "Empty token."\n'
+    '    message += " Token expired."\n'
+    '    raise ResourceServerAuthError("invalid_token", message)\n',
+    "for_target": 'def f():\n    for message in ("Token expired.",):\n'
+    '        raise ResourceServerAuthError("invalid_token", message)\n',
+    "walrus": 'def f():\n    if (message := "Token expired."):\n'
+    '        raise ResourceServerAuthError("invalid_token", message)\n',
+    "unpacked": 'def f():\n    message, _ = "Token expired.", 1\n'
+    '    raise ResourceServerAuthError("invalid_token", message)\n',
+    "with_target": "def f(cm):\n    with cm as message:\n"
+    '        raise ResourceServerAuthError("invalid_token", message)\n',
+    "parameter_shadows_module": 'message = "Fine."\n'
+    'def f(message="Token expired."):\n'
+    '    raise ResourceServerAuthError("invalid_token", message)\n',
+    "global": 'message = "Fine."\ndef f():\n    global message\n'
+    '    message = "Token expired."\n'
+    '    raise ResourceServerAuthError("invalid_token", message)\n',
+    "reassigned": 'def f(x):\n    message = "Fine."\n    if x:\n'
+    '        message = "Token expired."\n'
+    '    raise ResourceServerAuthError("invalid_token", message)\n',
+}
+
+# `raise`s the walk must report as unclassified.
+_UNCLASSIFIED_RAISES = {
+    "unknown_callee": "def f():\n    raise make_error('Token expired.')\n",
+    "unresolved_name": "def f(error):\n    raise error\n",
+    "built_by_unknown": "def f():\n    error = make_error('Token expired.')\n"
+    "    raise error\n",
+    "attribute": "def f(self):\n    raise self.error\n",
+    "subclass_without_super": "class _Bad(ResourceServerAuthError):\n"
+    "    def __init__(self):\n        self.description = 'Token expired.'\n"
+    "def f():\n    raise _Bad()\n",
 }
 
 
-@pytest.mark.parametrize("shape", sorted(_SHAPES))
+def _walk_source(source: str) -> _Walk:
+    return _Walk("auth.py", ast.parse(source), vars(auth_mod))
+
+
+@pytest.mark.parametrize("shape", sorted(_RENDERED_SHAPES))
 def test_the_walk_renders_every_message_shape(shape: str) -> None:
-    source = "def f():\n" + "".join(
-        f"    {line}\n" for line in _SHAPES[shape].split("\n")
+    walk = _walk_source(_RENDERED_SHAPES[shape])
+    assert walk.unclassified == [] and walk.unrendered == [], (
+        walk.unclassified,
+        walk.unrendered,
     )
-    walk = _Walk("auth.py", ast.parse(source))
-    assert walk.unclassified == [] and walk.unrendered == []
-    [(_where, _name, text)] = walk.fixed
+    [(_where, _stored, text)] = walk.fixed
     assert _layers(text) != {k: text for k in ("base", "additive", "composed")}, (
         f"{shape}: the sample text {text!r} should be one the sanitiser rewrites"
     )
 
 
+@pytest.mark.parametrize("shape", sorted(_REFUSED_SHAPES))
+def test_the_walk_refuses_a_name_it_cannot_resolve_exactly(shape: str) -> None:
+    walk = _walk_source(_REFUSED_SHAPES[shape])
+    assert walk.fixed == [], f"{shape}: rendered a guess: {walk.fixed}"
+    assert [u[2] for u in walk.unrendered] == ["message"]
+
+
+@pytest.mark.parametrize("shape", sorted(_UNCLASSIFIED_RAISES))
+def test_the_walk_reports_every_raise_it_cannot_classify(shape: str) -> None:
+    walk = _walk_source(_UNCLASSIFIED_RAISES[shape])
+    assert len(walk.unclassified) == 1, walk.unclassified
+
+
+def test_re_raising_a_caught_exception_is_not_a_message() -> None:
+    walk = _walk_source(
+        "def f():\n    try:\n        g()\n    except ValueError as exc:\n"
+        "        raise exc\n"
+    )
+    assert (walk.unclassified, walk.unrendered, walk.fixed) == ([], [], [])
+
+
 def test_the_walk_fails_closed_on_what_it_cannot_render() -> None:
-    source = (
+    walk = _walk_source(
         "def f(x):\n"
         "    raise ResourceServerAuthError('invalid_token', f'bad {x}')\n"
         "    raise ResourceServerAuthError('invalid_token', compute())\n"
-        "    raise BrandNewError('Token could not be verified.')\n"
         "    logger.info('Streamable-HTTP session manager started')\n"
     )
-    walk = _Walk("auth.py", ast.parse(source))
     assert sorted(walk.unrendered) == sorted(
-        [
-            ("auth.py", "f", "f'bad {x}'"),
-            ("auth.py", "f", "compute()"),
-        ]
+        [("auth.py", "f", "f'bad {x}'"), ("auth.py", "f", "compute()")]
     )
-    assert walk.unclassified == ["auth.py:4 raise BrandNewError(...)"]
     assert walk.logs == ["'Streamable-HTTP session manager started'"]
 
 
@@ -1266,7 +1671,7 @@ def test_every_fixed_message_survives_the_sanitiser(where: str, text: str) -> No
 
 @pytest.mark.parametrize(
     "description",
-    sorted({text for w in _WALKS for _, name, text in w.fixed if name in _STORED}),
+    sorted({text for w in _WALKS for _, stored, text in w.fixed if stored}),
 )
 def test_a_stored_description_is_the_text_written(description: str) -> None:
     """End to end through the class that stores it."""
