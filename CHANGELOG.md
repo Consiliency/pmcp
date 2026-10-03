@@ -612,6 +612,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release path (#221; hash mismatches on download now error instead of warn),
   `astral-sh/setup-uv` v7.6.0 → v10.0.1 (#220). Each release-path bump carries
   its `EXPECTED_USES` update in the same PR.
+- **`load_manifest()` is cached, and pmcp's own manifest is parsed with libyaml.**
+  Each call re-parsed the 78 KB shipped manifest with PyYAML's pure-Python loader, up to
+  13 times per `gateway.catalog_search`: ~1.6 s of event-loop blocking per search, measured.
+  The result is now cached, keyed by the bytes of the shipped manifest and of every
+  overlay, each project overlay's consent decision, the `PMCP_MANIFEST_PATH` redirect and
+  its provenance, and the platform. Editing an overlay, approving or revoking one, or
+  changing the env takes effect on the next call, as before. Warnings about a manifest
+  are now logged once each time its inputs change (including a change back to an earlier
+  state), not on every load. A file that cannot be read or parsed is still reported on
+  every load until it is fixed. If the cache itself fails (it should not), pmcp logs one
+  warning naming the error class and keeps loading without it. Overlays are still parsed
+  with the pure-Python loader. The review's P-02 item (the lifecycle lock held across
+  connect retry sleeps) is not part of this change and remains open on the same issue. See
+  [Consiliency/pmcp#233](https://github.com/Consiliency/pmcp/issues/233).
 
 ## [2.7.3] - 2026-08-31
 

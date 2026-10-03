@@ -377,6 +377,9 @@ def _reset_process_global_state() -> Iterator[None]:
     * ``npm_resolver._resolver`` -- a process-wide singleton holding a spawned
       node child, with sticky-failure and warned flags that must not be
       inherited.
+    * ``loader._manifest_cache`` -- the parsed manifest (and its last-served
+      keys); a cached result would hide a later test's once-per-transition
+      warnings.
 
     Composition lives here rather than in a ``src/`` aggregator by rule, not by
     taste: ``tests/test_feedback_provenance.py:226`` AST-walks ``src/pmcp`` and

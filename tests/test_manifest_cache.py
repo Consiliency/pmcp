@@ -750,6 +750,31 @@ def test_explicit_path_calls_do_not_turn_default_loads_into_transitions(
     assert builds == [1, 1]
 
 
+def test_two_explicit_paths_alternating_are_two_steady_states(
+    tmp_path: Path, builds: list[int]
+) -> None:
+    """Round 3 (claude nit, folded into the implementation): the last-served
+    slot is per explicit path, not per kind of call."""
+    one, two = tmp_path / "one.yaml", tmp_path / "two.yaml"
+    one.write_text("servers: {}\ncli_alternatives: {}\n")
+    two.write_text("version: '2'\nservers: {}\ncli_alternatives: {}\n")
+    for _ in range(3):
+        load_manifest(one)
+        load_manifest(two)
+        load_manifest()
+    assert builds == [1, 1, 1]
+
+
+def test_the_last_served_slots_are_bounded(tmp_path: Path) -> None:
+    load_manifest()
+    for i in range(loader._MANIFEST_CACHE_SLOTS + 5):
+        path = tmp_path / f"m{i}.yaml"
+        path.write_text(f"version: '{i}'\nservers: {{}}\ncli_alternatives: {{}}\n")
+        load_manifest(path)
+    assert len(loader._last_served_keys) == loader._MANIFEST_CACHE_SLOTS
+    assert None in loader._last_served_keys  # the default stream is never evicted
+
+
 # ---------------------------------------------------------------------------
 # Threads, bound, and the request path
 # ---------------------------------------------------------------------------

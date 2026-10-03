@@ -1284,14 +1284,15 @@ def _parse_overlay_document(
 _MANIFEST_CACHE_SLOTS = 8
 _manifest_cache: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
 _manifest_cache_lock = threading.RLock()
-# The key of the state the previous call served, per kind of call (default
-# load with overlays, or an explicit path). Warnings are owed per TRANSITION,
+# The key of the state the previous call served, per caller stream: the
+# default load (slot None) and each explicit path. Warnings are owed per TRANSITION,
 # not per retained entry: a call whose key differs from its slot's is rebuilt
 # (about 1.2 ms with the shipped document cached) even when its key is still in
 # the LRU, so returning to an earlier state -- trust revoked again, a pin broken
 # again with the same bytes -- warns exactly as main does. Separate slots keep
-# an explicit-path caller from turning every default load into a transition.
-_last_served_keys: dict[bool, tuple[Any, ...]] = {}
+# an explicit-path caller (or two) from turning every load into a transition.
+# Bounded like the cache: the oldest explicit-path slot goes first.
+_last_served_keys: dict[str | None, tuple[Any, ...]] = {}
 # Whether this process has already said, at WARNING, that the cache could not
 # store or read back a result for a reason other than recursion depth.
 _cache_failure_reported = False
@@ -1469,8 +1470,15 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
         _on_windows(),
     )
     with _manifest_cache_lock:
-        steady = key == _last_served_keys.get(apply_overlays)
-        _last_served_keys[apply_overlays] = key
+        # One slot per caller stream: the default load, and each explicit path
+        # (keyed as given). Two different explicit paths alternating are two
+        # steady states, not a transition on every call.
+        slot = None if apply_overlays else str(base_path)
+        steady = key == _last_served_keys.get(slot)
+        _last_served_keys[slot] = key
+        while len(_last_served_keys) > _MANIFEST_CACHE_SLOTS:
+            oldest = next(k for k in _last_served_keys if k is not None)
+            del _last_served_keys[oldest]
         blob = _manifest_cache.get(key)
         if blob is not None and steady:
             _manifest_cache.move_to_end(key)
