@@ -780,80 +780,239 @@ def test_the_scanner_passes_the_renderers() -> None:
 
 #: Rejection wording: a message carrying one of these, built with `!r`,
 #: `repr(...)` or `%r` of a non-constant, is a hand-rendered rejection.
+#: Rev 13 (round-12 claude): bad, wrong, failed, cannot, unrecognised and
+#: not found added.
 _REJECTION_WORDS = re.compile(
     r"(?i)(invalid|unusable|unexpected|malformed|reject|refus|ignor|unsupported"
     r"|unknown|unsafe|not a valid|not permitted|not allowed|must be|expected"
     r"|illegal|disallowed|forbidden|denied|blocked|skipping|unparseable"
-    r"|unreadable|repeated|not an? |does not |must match)"
+    r"|unreadable|repeated|not an? |does not |must match|bad|wrong|fail"
+    r"|cannot|can't|unrecogni[sz]|not found)"
 )
+
+
+def _is_repr_call(node: ast.AST) -> bool:
+    """`repr(<non-constant>)` or `ascii(<non-constant>)`."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in ("repr", "ascii")
+        and bool(node.args)
+        and not isinstance(node.args[0], ast.Constant)
+    )
+
+
+_PERCENT = re.compile(
+    r"%(?:\((?P<key>[^)]*)\))?[#0\- +]*(?:\*|\d+)?(?:\.(?:\*|\d+))?[hlL]?(?P<conv>[a-zA-Z%])"
+)
+
+
+def _percent_repr_targets(text: str, args: list[ast.AST]) -> list[ast.AST]:
+    """The arguments a `%`-format renders with `%r` or `%a`, by position (or
+    by key, for a single mapping argument)."""
+    targets: list[ast.AST] = []
+    position = 0
+    for match in _PERCENT.finditer(text):
+        conv = match.group("conv")
+        if conv == "%":
+            continue
+        if match.group("key") is not None:
+            if conv in "ra" and len(args) == 1 and isinstance(args[0], ast.Dict):
+                for k, v in zip(args[0].keys, args[0].values):
+                    if isinstance(k, ast.Constant) and k.value == match.group("key"):
+                        targets.append(v)
+            continue
+        if conv in "ra" and position < len(args):
+            targets.append(args[position])
+        position += 1
+    return [t for t in targets if not isinstance(t, ast.Constant)]
+
+
+def _format_repr_targets(
+    text: str, args: list[ast.AST], keywords: dict[str, ast.AST]
+) -> list[ast.AST]:
+    """The arguments a `str.format` renders with `!r` or `!a`."""
+    import string
+
+    targets: list[ast.AST] = []
+    auto = 0
+    try:
+        fields = list(string.Formatter().parse(text))
+    except ValueError:
+        return []
+    for _, name, _, conversion in fields:
+        if name is None:
+            continue
+        head = name.split(".")[0].split("[")[0]
+        if head == "":
+            index: int | str = auto
+            auto += 1
+        elif head.isdigit():
+            index = int(head)
+        else:
+            index = head
+        if conversion not in ("r", "a"):
+            continue
+        if isinstance(index, int) and index < len(args):
+            targets.append(args[index])
+        elif isinstance(index, str) and index in keywords:
+            targets.append(keywords[index])
+    return [t for t in targets if not isinstance(t, ast.Constant)]
+
+
+def _constant_text(node: ast.AST) -> str:
+    """The literal text of a string expression: a constant, an f-string's
+    constant parts, or the constant operands of a `+` chain."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(_constant_text(v) for v in node.values)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _constant_text(node.left) + _constant_text(node.right)
+    return ""
+
+
+def _repr_sites(source: str) -> list[tuple[int, str]]:
+    """Each value in `source` rendered with its repr inside a message
+    carrying rejection wording, as (line, the rendered expression). Rev 13
+    covers every spelling Python has (round-12 claude):
+
+    - an f-string field with `!r`, or holding `repr(x)`;
+    - `"..." + repr(x)` (a `+` chain);
+    - `"... %r ..." % x`, and `"... %s ..." % repr(x)`;
+    - `"... {!r} ...".format(x)`, and `.format(repr(x))`;
+    - a call whose first argument is the message: `%r` in it, or `repr(x)`
+      as a later argument (`logger.warning("bad %s", repr(x))`).
+    """
+    tree = ast.parse(source)
+    sites: list[tuple[int, str]] = []
+
+    def add(node: ast.AST, value: ast.AST) -> None:
+        sites.append((getattr(node, "lineno", 0), ast.unparse(value)))
+
+    def reprs_in(node: ast.AST) -> list[ast.AST]:
+        return [n.args[0] for n in ast.walk(node) if _is_repr_call(n)]  # type: ignore[attr-defined]
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.JoinedStr):
+            if not _REJECTION_WORDS.search(_constant_text(node)):
+                continue
+            for v in node.values:
+                if not isinstance(v, ast.FormattedValue) or isinstance(
+                    v.value, ast.Constant
+                ):
+                    continue
+                if v.conversion in (ord("r"), ord("a")):
+                    add(node, v.value)
+                elif _is_repr_call(v.value):
+                    add(node, v.value.args[0])  # type: ignore[attr-defined]
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            if isinstance(getattr(node, "_parent_add", None), ast.BinOp):
+                continue
+            if _REJECTION_WORDS.search(_constant_text(node)):
+                operands = []
+                stack: list[ast.AST] = [node]
+                while stack:
+                    current = stack.pop()
+                    if isinstance(current, ast.BinOp) and isinstance(
+                        current.op, ast.Add
+                    ):
+                        current.left._parent_add = current  # type: ignore[attr-defined]
+                        current.right._parent_add = current  # type: ignore[attr-defined]
+                        stack += [current.left, current.right]
+                    else:
+                        operands.append(current)
+                for operand in operands:
+                    if _is_repr_call(operand):
+                        add(node, operand.args[0])  # type: ignore[attr-defined]
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            text = _constant_text(node.left)
+            if not _REJECTION_WORDS.search(text):
+                continue
+            values = (
+                node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+            )
+            for value in _percent_repr_targets(text, values):
+                add(node, value)
+            for value in values:
+                for inner in reprs_in(value):
+                    add(node, inner)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "format"
+                and _REJECTION_WORDS.search(_constant_text(func.value))
+            ):
+                text = _constant_text(func.value)
+                arguments = list(node.args) + [k.value for k in node.keywords]
+                keywords = {k.arg: k.value for k in node.keywords if k.arg}
+                for value in _format_repr_targets(text, list(node.args), keywords):
+                    add(node, value)
+                for value in arguments:
+                    for inner in reprs_in(value):
+                        add(node, inner)
+            elif node.args and _REJECTION_WORDS.search(_constant_text(node.args[0])):
+                text = _constant_text(node.args[0])
+                if isinstance(node.args[0], ast.JoinedStr):
+                    continue  # its fields are the JoinedStr branch's
+                for value in _percent_repr_targets(text, list(node.args[1:])):
+                    add(node, value)
+                for value in node.args[1:]:
+                    for inner in reprs_in(value):
+                        add(node, inner)
+    return sites
+
+
+def _repr_rejections(source: str) -> list[int]:
+    """Lines in `source` that render a non-constant with its repr inside a
+    message carrying rejection wording (`_repr_sites`)."""
+    return sorted({line for line, _ in _repr_sites(source)})
+
 
 #: Sites whose repr'd value is the operator's own (config, environment, CLI
 #: arguments, pmcp's own stores) or pmcp's own child: outside Consiliency/
 #: pmcp#297's caller/downstream class, and tracked in Consiliency/pmcp#315.
 #: A downstream's or a caller's value is described with `describe_value`.
+#: Rev 13 (round-12 claude): keyed by SITE -- the module, the function and
+#: the rendered expression -- not by function, so a new repr inside an
+#: exempt function is a new key, and fails until triaged.
 _REPR_REJECTION_EXEMPT: dict[str, str] = {
-    "cli.py::_exact_package_spec": "operator CLI argument",
-    "cli.py::_run_trust_revoke_package": "operator CLI argument",
-    "client/manager.py::_request_ceiling_ms": "operator environment",
-    "client/manager.py::_stdio_read_limit": "operator environment",
-    "config/loader.py::registry_allow_private_from_config": "operator config",
-    "manifest/npm_resolver.py::_query_locked": "pmcp's own resolver child",
-    "manifest/npm_resolver.py::resolve": "manifest/config command",
-    "manifest/refresher.py::check_staleness": "configured vs cached package",
-    "package_approvals.py::_decode": "pmcp's own approval store",
-    "package_approvals.py::_read_store_and_stale": "pmcp's own approval store",
-    "package_approvals.py::_require_identity_fields": "pmcp's own approval store",
-    "trust_store.py::_decode": "pmcp's own trust store",
-    "trust_store.py::record_resolved": "pmcp's own trust store",
-    "validation.py::parse_package_spec": "config/CLI/manifest package spec",
+    "cli.py::_exact_package_spec::spec": "operator CLI argument",
+    "cli.py::_run_trust_revoke_package::args.spec": "operator CLI argument",
+    "client/manager.py::_request_ceiling_ms::raw": "operator environment",
+    "client/manager.py::_stdio_read_limit::raw": "operator environment",
+    "config/loader.py::registry_allow_private_from_config::value": "operator config",
+    "manifest/npm_resolver.py::_query_locked::status": "pmcp's own resolver child",
+    "manifest/npm_resolver.py::resolve::command": "manifest/config command",
+    "manifest/package_identity.py::_fetch_packument::name": (
+        "an accepted, validated package name; the failure is the registry fetch's"
+    ),
+    "manifest/refresher.py::check_staleness::cfg_name": "configured package",
+    "manifest/refresher.py::check_staleness::desc.package": "cached package",
+    "package_approvals.py::_decode::decision": "pmcp's own approval store",
+    "package_approvals.py::_read_store_and_stale::entry['name']": (
+        "pmcp's own approval store"
+    ),
+    "package_approvals.py::_read_store_and_stale::entry['resolved_version']": (
+        "pmcp's own approval store"
+    ),
+    "package_approvals.py::_require_identity_fields::name": (
+        "pmcp's own approval store"
+    ),
+    "package_approvals.py::_require_identity_fields::registry": (
+        "pmcp's own approval store"
+    ),
+    "provision_gate.py::evaluate_provision::getattr(server_config, 'name', None)": (
+        "a resolved server config's name (operator/manifest config)"
+    ),
+    "trust_store.py::_decode::decision": "pmcp's own trust store",
+    "trust_store.py::record_resolved::decision": "pmcp's own trust store",
+    "validation.py::parse_package_spec::spec": "config/CLI/manifest package spec",
 }
 
 
-def _repr_rejections(source: str) -> list[int]:
-    """Lines in `source` that render a non-constant with `!r`, `repr()` or
-    `%r` inside a message carrying rejection wording."""
-    tree = ast.parse(source)
-    lines = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.JoinedStr):
-            text = "".join(
-                v.value
-                for v in node.values
-                if isinstance(v, ast.Constant) and isinstance(v.value, str)
-            )
-            if _REJECTION_WORDS.search(text) and any(
-                isinstance(v, ast.FormattedValue)
-                and not isinstance(v.value, ast.Constant)
-                and (
-                    v.conversion == ord("r")
-                    or (
-                        isinstance(v.value, ast.Call)
-                        and isinstance(v.value.func, ast.Name)
-                        and v.value.func.id == "repr"
-                    )
-                )
-                for v in node.values
-            ):
-                lines.append(node.lineno)
-        elif (
-            isinstance(node, ast.Call)
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-            and "%r" in node.args[0].value
-            and _REJECTION_WORDS.search(node.args[0].value)
-        ):
-            lines.append(node.lineno)
-    return lines
-
-
-def test_no_rejected_value_is_rendered_with_repr() -> None:
-    """Round-11 codex P1's class, as a static rule (rev 12): `{x!r}`, `repr(x)`
-    or `%r` in a message that rejects something renders the value itself.
-    Every such site in `src/pmcp` is a named exemption with its provenance
-    (none is a caller's or a downstream's value), and every exemption must
-    still exist. The rule cannot see `{x}` without `!r`; those sites were
-    triaged by hand (the plan's table)."""
+def _repr_site_keys() -> set[str]:
     root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
     found: set[str] = set()
     for path in sorted(root.rglob("*.py")):
@@ -866,12 +1025,31 @@ def test_no_rejected_value_is_rendered_with_repr() -> None:
             for n in ast.walk(tree)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
-        for line in _repr_rejections(source):
+        counts: dict[str, int] = {}
+        for line, expression in sorted(_repr_sites(source)):
             owners = [
                 f for f in functions if f.lineno <= line <= (f.end_lineno or f.lineno)
             ]
-            owner = min(owners, key=lambda f: (f.end_lineno or f.lineno) - f.lineno)
-            found.add(f"{path.relative_to(root).as_posix()}::{owner.name}")
+            owner = (
+                min(owners, key=lambda f: (f.end_lineno or f.lineno) - f.lineno).name
+                if owners
+                else "<module>"
+            )
+            key = f"{path.relative_to(root).as_posix()}::{owner}::{expression}"
+            counts[key] = counts.get(key, 0) + 1
+            found.add(key if counts[key] == 1 else f"{key}#{counts[key]}")
+    return found
+
+
+def test_no_rejected_value_is_rendered_with_repr() -> None:
+    """Round-11 codex P1's class, as a static rule (rev 12; rev 13 widened
+    it to every repr spelling and keyed it by site): a repr in a message
+    that rejects something renders the value itself. Every such site in
+    `src/pmcp` is a named exemption with its provenance (none is a caller's
+    or a downstream's value), and every exemption must still exist. The rule
+    cannot see `{x}` or `%s` of `x` itself; those sites were triaged by hand
+    (the plan's table)."""
+    found = _repr_site_keys()
     assert found == set(_REPR_REJECTION_EXEMPT), (
         sorted(found - set(_REPR_REJECTION_EXEMPT)),
         sorted(set(_REPR_REJECTION_EXEMPT) - found),
@@ -884,6 +1062,31 @@ def test_no_rejected_value_is_rendered_with_repr() -> None:
         ('f"unusable cursor ({raw!r})"', True),
         ('f"invalid value {repr(v)}"', True),
         ('logger.warning("Ignoring %s: got %r", k, v)', True),
+        # rev 13 (round-12 claude): every other spelling, and the new words.
+        ('"invalid: " + repr(x)', True),
+        ('"invalid: " + name + " " + repr(x)', True),
+        ('"invalid: %r" % x', True),
+        ('"invalid: %r and %r" % (x, y)', True),
+        ('"invalid: %s" % repr(x)', True),
+        ('"invalid {!r}".format(x)', True),
+        ('"invalid {}".format(repr(x))', True),
+        ('logger.warning("invalid %s", repr(x))', True),
+        ('logger.warning("bad cursor: %r", x)', True),
+        ('f"wrong value {x!r}"', True),
+        ('f"lookup failed for {x!r}"', True),
+        ('f"cannot use {x!r}"', True),
+        ('f"unrecognised {x!r}"', True),
+        ('f"not found: {x!r}"', True),
+        ('"invalid: " + str(x)', False),
+        ('"invalid: %s" % x', False),
+        ('"connected to %r" % x', False),
+        ('logger.debug("fetch failed for %s: %s", name, repr(e))', True),
+        ('logger.debug("fetch failed for %s: %r", name, exception_text(e))', True),
+        ('logger.debug("fetch failed for %r: %s", "pkg", exception_text(e))', False),
+        ('"invalid %(v)r" % {"v": x}', True),
+        ('"invalid {0} {1!r}".format(a, b)', True),
+        ('"invalid {0!r}".format("const")', False),
+        ('f"invalid {x!a}"', True),
         ('f"unusable cursor ({describe_value(raw)})"', False),
         ('f"connected to {name!r}"', False),
         ("f\"invalid {'x'!r}\"", False),

@@ -32,7 +32,11 @@ from pmcp.auth import (
     sanitize_url_elicitation_url,
 )
 
-from pmcp.client.manager import ClientManager, _terminate_process_tree
+from pmcp.client.manager import (
+    ClientManager,
+    _terminate_process_tree,
+    parse_request_id,
+)
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import (
     registry_allow_private_from_config,
@@ -6303,9 +6307,13 @@ class GatewayTools:
             outcome = "refused"
         else:
             outcome = "failure"
-        server_name = (
-            parsed.request_id.rsplit("::", 1)[0] if "::" in parsed.request_id else None
-        )
+        # A request id `cancel_request` rejected for its format is the
+        # caller's rejected value: neither the response nor the audit event
+        # copies it, or any part of it (rev 13, round-12 B1; the auth_connect
+        # rule of rev 12). A well-formed id is accepted; a lookup that then
+        # misses names it, as every lookup miss does (Consiliency/pmcp#315).
+        parsed_id = parse_request_id(parsed.request_id)
+        server_name = parsed_id[0] if parsed_id is not None else None
         self._audit(
             method="gateway.cancel",
             action="cancel",
@@ -6316,7 +6324,7 @@ class GatewayTools:
         )
 
         return CancelOutput(
-            request_id=parsed.request_id,
+            request_id=parsed.request_id if parsed_id is not None else None,
             status=status,
             message=message,
             was_stalled=was_stalled,

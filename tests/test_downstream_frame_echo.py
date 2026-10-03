@@ -87,10 +87,36 @@ _SHAPES = (
     "cursor-object",
     "cursor-list",
     "cursor-repeat",
+    # rev 13 (round-12 codex B2): an error envelope that breaks one rule of
+    # JSON-RPC 2.0 elsewhere, with the sentinel as its `message` -- the text a
+    # caller renders. `jsonrpc` "1.0", no `jsonrpc`, both `result` and
+    # `error`, and a bool `code` (which the SDK's model coerces to 1). The
+    # property test below takes every rule; these four take every caller and
+    # transport.
+    "envelope-version",
+    "envelope-unversioned",
+    "envelope-both",
+    "envelope-code",
 )
-#: The shapes whose frame the parser rejects: stdio then also sends the real
-#: reply, so the request completes instead of timing out.
-_REJECTED_SHAPES = ("not-json", "json-deep", "json-bigint", "json-syntax")
+#: The shapes whose frame pmcp rejects -- the parser, or (rev 13) the
+#: envelope check, which leaves the request waiting: stdio then also sends the
+#: real reply, so the request completes instead of timing out.
+_REJECTED_SHAPES = (
+    # rev 13: the envelope check drops these on stdio too (rev 12's
+    # dispatcher acted on them), so they are followed by the real reply.
+    "result-type",
+    "error-code",
+    "error-message",
+    "jsonrpc",
+    "not-json",
+    "json-deep",
+    "json-bigint",
+    "json-syntax",
+    "envelope-version",
+    "envelope-unversioned",
+    "envelope-both",
+    "envelope-code",
+)
 _METHODS = (
     "initialize",
     "tools/list",
@@ -201,6 +227,17 @@ _DOWNSTREAM_LOGIC = textwrap.dedent(
             frame = {"jsonrpc": "2.0", "id": rid, "result": normal(method, request.get("params") or {})}
         elif state["shape"] == "payload":
             frame = {"jsonrpc": "2.0", "id": rid, "result": invalid_payload(method, s, request.get("params") or {})}
+        elif state["shape"].startswith("envelope-"):
+            error = {"code": -32000, "message": s}
+            frame = {"jsonrpc": "2.0", "id": rid, "error": error}
+            if state["shape"] == "envelope-version":
+                frame["jsonrpc"] = "1.0"
+            elif state["shape"] == "envelope-unversioned":
+                del frame["jsonrpc"]
+            elif state["shape"] == "envelope-both":
+                frame["result"] = {}
+            else:
+                error["code"] = True
         elif state["shape"] == "json-syntax":
             head = '{"jsonrpc":"2.0","id":%s,"error":{"message":"m",,' % json.dumps(rid)
             return (head + '"code":%s}}' % json.dumps(s)).encode()
@@ -541,6 +578,13 @@ async def test_no_malformed_frame_value_reaches_pmcps_output(
                             # asked for this result. Never in the log.
                             leaks = []
                         assert leaks == [], (transport, method, shape, family, observed)
+                        if transport == "stdio" and shape.startswith("envelope-"):
+                            # No vacuous pass: the envelope reached the
+                            # dispatcher and was dropped (rev 13).
+                            assert any(
+                                "dropped invalid frame" in r.getMessage()
+                                for r in records
+                            ), (transport, method, shape, family)
                         if transport == "stdio" and shape.startswith("json-"):
                             # No vacuous pass: the rejected frame reached the
                             # reader and got the fixed record (rev 12).
@@ -1110,18 +1154,145 @@ async def test_a_wrapped_handler_keeps_the_wire_code(family: str) -> None:
 
 
 def _is_valid_frame(line: bytes) -> bool:
-    """The test's own statement of a JSON-RPC message (it parses to an object
-    with `"jsonrpc": "2.0"`, a string `method`, or an id with a result or an
-    error) -- the only kind of stdout line the reader may act on."""
+    """The test's own statement of a JSON-RPC 2.0 message as MCP defines one
+    -- the only kind of stdout line whose content the reader may act on
+    (rev 13: the specification's rules, written here independently of
+    `jsonrpc_envelope_problem`). `"jsonrpc": "2.0"`; a request or
+    notification has a string `method`, an object `params` if any, and no
+    `result`/`error`; a response has an `id` and exactly one of an object
+    `result` or an `error` object with an integer `code` and a string
+    `message`."""
     try:
         value = json.loads(line)
     except Exception:  # noqa: BLE001
         return False
     if not isinstance(value, dict) or value.get("jsonrpc") != "2.0":
         return False
+
+    def request_id(v: Any) -> bool:
+        return type(v) in (str, int)
+
     if "method" in value:
-        return isinstance(value["method"], str)
-    return value.get("id") is not None and ("result" in value or "error" in value)
+        return (
+            isinstance(value["method"], str)
+            and ("id" not in value or request_id(value["id"]))
+            and isinstance(value.get("params", {}), dict)
+            and "result" not in value
+            and "error" not in value
+        )
+    if "id" not in value or ("result" in value) == ("error" in value):
+        return False
+    if "result" in value:
+        return request_id(value["id"]) and isinstance(value["result"], dict)
+    error = value["error"]
+    return (
+        (value["id"] is None or request_id(value["id"]))
+        and isinstance(error, dict)
+        and type(error.get("code")) is int
+        and isinstance(error.get("message"), str)
+    )
+
+
+_MISSING = object()
+
+
+def _envelope_violations(s: str, rid: Any) -> list[tuple[str, dict[str, Any]]]:
+    """Rev 13 (round-12 codex B2): one frame per way a JSON-RPC 2.0 response
+    can break the specification's envelope rules (JSON-RPC 2.0 sections 4-5,
+    MCP's response types), each addressed to pending request `rid` and each
+    carrying the sentinel where a caller would render it -- the error's
+    `message` and `data`, or the result. Derived from the rules, not from the
+    four frames codex sent."""
+    err = {"code": -32000, "message": s, "data": {"detail": s}}
+    base: dict[str, Any] = {"jsonrpc": "2.0", "id": rid, "error": err}
+
+    def with_member(frame: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
+        out = dict(frame)
+        if value is _MISSING:
+            out.pop(key, None)
+        else:
+            out[key] = value
+        return out
+
+    cases: list[tuple[str, dict[str, Any]]] = []
+    # `jsonrpc` MUST be exactly "2.0".
+    for value in (_MISSING, "1.0", "2", "2.0 ", 2.0, 2, None, ["2.0"], {"v": "2.0"}):
+        cases.append(
+            (f"jsonrpc {type(value).__name__}", with_member(base, "jsonrpc", value))
+        )
+    # Exactly one of `result` and `error`.
+    cases.append(("result and error", {**base, "result": {}}))
+    cases.append(
+        (
+            "result and error, result first",
+            {"jsonrpc": "2.0", "id": rid, "result": {"x": s}, "error": err},
+        )
+    )
+    cases.append(
+        ("neither result nor error", {"jsonrpc": "2.0", "id": rid, "message": s})
+    )
+    # `error.code` MUST be an integer.
+    for code in (
+        _MISSING,
+        True,
+        False,
+        1.5,
+        -32000.0,
+        "-32000",
+        None,
+        {},
+        [],
+        {"c": s},
+        [s],
+    ):
+        cases.append(
+            (
+                f"code {type(code).__name__}",
+                {**base, "error": with_member(err, "code", code)},
+            )
+        )
+    # `error.message` MUST be a string (the sentinel then rides in `data`).
+    for message in (_MISSING, 5, None, True, [s], {s: s}):
+        cases.append(
+            (
+                f"message {type(message).__name__}",
+                {**base, "error": with_member(err, "message", message)},
+            )
+        )
+    # `error` MUST be an object.
+    for error in (s, [s], [err], 5, None, True):
+        cases.append((f"error {type(error).__name__}", {**base, "error": error}))
+    # A response's `id` is a string, an integer, or null (an error only):
+    # not a bool, a float, an array or an object -- and it MUST be present.
+    if isinstance(rid, int):
+        for bad_id in (float(rid), [rid], {"id": rid}):
+            cases.append((f"id {type(bad_id).__name__}", {**base, "id": bad_id}))
+        cases.append(("id bool", {**base, "id": rid == 1}))
+    cases.append(("no id", with_member(base, "id", _MISSING)))
+    # `result` MUST be an object (MCP's `Result`).
+    for result in (s, [s], 5, None, True):
+        cases.append(
+            (
+                f"result {type(result).__name__}",
+                {"jsonrpc": "2.0", "id": rid, "result": result},
+            )
+        )
+    cases.append(
+        ("result with null id", {"jsonrpc": "2.0", "id": None, "result": {"x": s}})
+    )
+    # A request or notification carries neither `result` nor `error`, and
+    # its `params` is an object.
+    cases.append(("request with error", {**base, "method": "x"}))
+    cases.append(
+        ("notification with error", {"jsonrpc": "2.0", "method": "x", "error": err})
+    )
+    cases.append(
+        (
+            "request with array params",
+            {"jsonrpc": "2.0", "id": rid, "method": "x", "params": [s]},
+        )
+    )
+    return cases
 
 
 def _stdout_streams(s: str) -> list[tuple[str, list[bytes], int | None]]:
@@ -1143,6 +1314,11 @@ def _stdout_streams(s: str) -> list[tuple[str, list[bytes], int | None]]:
     streams.append(("round-11 interleaved response", [head, reply, tail], None))
     streams.append(("interleaved notification", [head, note, tail], None))
     streams.append(("oversized head", [head + b"A" * 5000, tail, note], 2048))
+    # Rev 13: malformed envelopes addressed to the pending request (id 8).
+    streams += [
+        (f"envelope: {label}", [json.dumps(frame).encode()], None)
+        for label, frame in _envelope_violations(s, 8)
+    ]
     for banner in (
         f"server ready {s}",
         f"INFO: {s}",
@@ -1207,6 +1383,14 @@ async def test_no_record_shows_a_non_protocol_stdout_line(
             assert not shown, (label, sorted(shown)[:3])
         messages = [r.getMessage() for r in records]
         assert not any("Non-JSON output" in m for m in messages), (label, messages)
+        if label.startswith("envelope"):
+            # Rev 13: a malformed envelope never settles the request it names;
+            # only the end of the stream does (a disconnect, not its error).
+            from pmcp.client.manager import DownstreamError
+
+            settled = future.exception() if future.done() else None
+            assert not (future.done() and settled is None), label
+            assert not isinstance(settled, DownstreamError), (label, settled)
         fixed += sum("non-protocol stdout line" in m for m in messages)
     # No vacuous pass: thousands of lines took the fixed record.
     assert fixed > 1000, fixed
@@ -1227,3 +1411,201 @@ def test_a_banner_line_gets_the_fixed_record(caplog: pytest.LogCaptureFixture) -
         "[srv] non-protocol stdout line: could not parse JSON downstream stdio "
         "frame at line 1, column 1 (JSONDecodeError)"
     ]
+
+
+# --- rev 13: a malformed envelope, through the caller waiting on it ------------
+
+
+class _Stdin:
+    """The stdio pipe pmcp writes requests to: each request line is handed
+    to `respond`, which feeds the downstream's answer to the reader."""
+
+    def __init__(self, respond: Any) -> None:
+        self.respond = respond
+
+    def write(self, data: bytes) -> None:
+        for line in data.splitlines():
+            self.respond(json.loads(line))
+
+    async def drain(self) -> None:
+        return None
+
+
+_CONSUMERS = ("tools/list page 2", "tools/call", "tasks/get")
+
+
+async def _through_a_caller(consumer: str, malformed: bytes) -> str:
+    """Run `consumer` -- the code that waits on a request and renders what it
+    gets -- against the REAL `_read_stdout`. The targeted request is answered
+    with `malformed`, then with a valid reply; return what the caller got
+    (its value, or its exception's text)."""
+    from pmcp.types import ServerStatusEnum, ToolInfo
+
+    manager, managed = _stdio_manager()
+    managed.config.name = "srv"
+    managed.status.server_capabilities = {"tasks": {}}
+    manager._clients["srv"] = managed
+    manager._tools["srv::run"] = ToolInfo(
+        tool_id="srv::run",
+        server_name="srv",
+        tool_name="run",
+        description="d",
+        short_description="d",
+        input_schema={"type": "object"},
+        tags=[],
+        risk_hint="low",
+    )
+    reader = asyncio.StreamReader()
+    managed.process.stdout = reader
+    method = consumer.split()[0]
+
+    def respond(request: dict[str, Any]) -> None:
+        rid, params = request["id"], request.get("params") or {}
+        if method == "tools/list" and not params.get("cursor"):
+            result: dict[str, Any] = {
+                "tools": [{"name": "run", "inputSchema": {"type": "object"}}],
+                "nextCursor": "page-2",
+            }
+            reader.feed_data(
+                json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode()
+                + b"\n"
+            )
+            return
+        valid = {
+            "tools/list": {"tools": []},
+            "tools/call": {"content": [{"type": "text", "text": "ok"}]},
+            "tasks/get": {"task": {"taskId": "t", "status": "working"}},
+        }[method]
+        line = malformed.replace(b"@@ID@@", json.dumps(rid).encode())
+        reply = json.dumps({"jsonrpc": "2.0", "id": rid, "result": valid}).encode()
+        reader.feed_data(line + b"\n" + reply + b"\n")
+
+    managed.process.stdin = _Stdin(respond)
+    read_task = asyncio.create_task(manager._read_stdout("srv", managed))
+    try:
+        if method == "tools/list":
+            outcome: Any = await manager._fetch_listing_pages(managed, "tools")
+        elif method == "tools/call":
+            outcome = await manager.call_tool("srv::run", {}, timeout_ms=5000)
+        else:
+            outcome = await manager.get_task("srv", "t")
+        text = repr(outcome)
+    except Exception as error:  # noqa: BLE001 -- what the caller would render
+        text = f"{type(error).__name__}: {error}"
+    finally:
+        managed.config = None  # no reconnect at EOF
+        managed.status.status = ServerStatusEnum.OFFLINE
+        reader.feed_eof()
+        await read_task
+    return text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", sorted(_FAMILIES))
+@pytest.mark.parametrize("consumer", _CONSUMERS)
+async def test_no_malformed_envelope_reaches_its_waiting_caller(
+    caplog: pytest.LogCaptureFixture, consumer: str, family: str
+) -> None:
+    """Round-12 codex B2: `{"jsonrpc": "1.0", "id": 8, "error": {...}}` --
+    or no `jsonrpc`, both `result` and `error`, an object `code` -- resolved
+    the waiting request, and the caller logged `tools/list page 2 failed
+    (<message>)`. The rev 12 property test stopped before any caller ran.
+    Here each envelope violation `_envelope_violations` derives goes to a
+    real caller (listing pagination, `call_tool`, `get_task`) through the real
+    reader: no record and nothing the caller returns or raises carries any
+    part of it, and the caller gets the valid reply that follows."""
+    caplog.set_level(logging.DEBUG)
+    s = _FAMILIES[family][1]
+    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
+    cases = _envelope_violations(s, "@@ID@@")
+    assert len(cases) > 40, len(cases)
+    for label, frame in cases:
+        malformed = json.dumps(frame).encode().replace(b'"@@ID@@"', b"@@ID@@")
+        start = len(caplog.records)
+        outcome = await asyncio.wait_for(_through_a_caller(consumer, malformed), 20)
+        records = "\n".join(_record_text(r) for r in caplog.records[start:])
+        text = records + "\n" + outcome
+        assert not any(f in text for f in forbidden), (consumer, label, text[:600])
+        shown = _windows(malformed.decode()) & (_windows(text))
+        assert not shown, (consumer, label, sorted(shown)[:3])
+        # The valid reply answered the caller: the malformed frame did not.
+        assert "Error" not in outcome.split(":")[0], (consumer, label, outcome)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", _CONSUMERS)
+async def test_a_valid_error_still_reaches_its_caller(consumer: str) -> None:
+    """The control: a well-formed error envelope is the downstream's own
+    message, shown by design -- so the test above would see a leak."""
+    frame = {
+        "jsonrpc": "2.0",
+        "id": "@@ID@@",
+        "error": {"code": -32000, "message": "downstream says no"},
+    }
+    malformed = json.dumps(frame).encode().replace(b'"@@ID@@"', b"@@ID@@")
+    outcome = await asyncio.wait_for(_through_a_caller(consumer, malformed), 20)
+    if consumer.startswith("tools/list"):
+        # Page 2 failed: the whole kind is unreadable (None), and logged.
+        assert outcome == "None", outcome
+    else:
+        assert "downstream says no" in outcome, outcome
+
+
+@pytest.mark.parametrize("family", sorted(_FAMILIES))
+def test_the_sdk_client_transports_check_the_envelope(family: str) -> None:
+    """Round-12 codex B2 on SSE and streamable HTTP: the SDK's models coerce
+    an `error.code` of `true`, `"5"` or `5.0` and ignore a `result` beside an
+    `error`, so those frames validated and their `message` reached pmcp. The
+    SDK's three client transports now validate through the strict adapter
+    (installed on `import pmcp`): every envelope violation is a
+    `ValidationError` whose text carries none of the frame, and a valid
+    frame validates as before."""
+    import mcp.client.sse as sse_module
+    import mcp.client.stdio as stdio_module
+    import mcp.client.streamable_http as streamable_module
+    from pydantic import ValidationError
+
+    s = _FAMILIES[family][1]
+    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
+    adapters = {
+        "sse": sse_module.types.jsonrpc_message_adapter,
+        "stdio": stdio_module.types.jsonrpc_message_adapter,
+        "streamable_http": streamable_module.jsonrpc_message_adapter,
+    }
+    for transport, adapter in adapters.items():
+        for label, frame in _envelope_violations(s, 8):
+            raw = json.dumps(frame)
+            with pytest.raises(ValidationError) as caught:
+                adapter.validate_json(raw, by_name=False)
+            text = str(caught.value)
+            assert not any(f in text for f in forbidden), (transport, label, text)
+            assert not _windows(raw) & _windows(text), (transport, label, text)
+        for frame in (
+            {"jsonrpc": "2.0", "id": 8, "result": {"x": s}},
+            {"jsonrpc": "2.0", "id": 8, "error": {"code": -1, "message": s}},
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -1, "message": s}},
+            {"jsonrpc": "2.0", "method": "notifications/message", "params": {}},
+            {"jsonrpc": "2.0", "id": "a", "method": "ping"},
+        ):
+            assert adapter.validate_json(json.dumps(frame), by_name=False)
+
+
+def test_the_strict_envelope_is_installed_on_import_pmcp() -> None:
+    """`pmcp refresh` reaches downstreams through the SDK's `stdio_client`
+    without importing the client manager: the adapter is installed with the
+    record scrubber, by `import pmcp` alone."""
+    import subprocess
+
+    code = (
+        "import pmcp, mcp.client.sse as a, mcp.client.stdio as b, "
+        "mcp.client.streamable_http as c, mcp.server.sse as d; "
+        "print(type(a.types).__name__, type(b.types).__name__, "
+        "type(c.jsonrpc_message_adapter).__name__, type(d.types).__name__ "
+        "if hasattr(d, 'types') else 'module')"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    ).stdout.split()
+    assert out[:3] == ["_ClientTypesView", "_ClientTypesView", "_StrictMessageAdapter"]
+    # The server side is untouched.
+    assert out[3] != "_ClientTypesView", out

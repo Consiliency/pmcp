@@ -1095,7 +1095,9 @@ class CancelInput(GatewayArguments):
 class CancelOutput(BaseModel):
     """Output for gateway.cancel."""
 
-    request_id: str
+    #: The id cancelled, or null when it was rejected for its format
+    #: (Consiliency/pmcp#297): a rejected value is not copied back.
+    request_id: str | None
     status: str  # "cancelled", "not_found", "already_complete", "refused"
     message: str
     was_stalled: bool  # True if request had no recent heartbeat

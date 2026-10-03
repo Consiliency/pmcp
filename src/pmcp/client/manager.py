@@ -29,6 +29,7 @@ from pydantic import ValidationError
 from pmcp.argument_errors import (
     describe_value,
     exception_text,
+    jsonrpc_envelope_problem,
     safe_traceback_text,
     install_log_scrubber,
 )
@@ -253,6 +254,20 @@ def _downstream_error(error: Any) -> DownstreamError:
         # reject it outright; stdio is parsed without a model).
         return DownstreamError(_MALFORMED_ERROR_MESSAGE, code=code)
     return DownstreamError(message, code=code, data=error.get("data"))
+
+
+def parse_request_id(request_id: str) -> tuple[str, int] | None:
+    """`server_name::local_id` as `gateway.cancel` takes it, or None when the
+    id does not have that format (no `::`, or a local id that is not an
+    integer). The handler uses the same parse, so a rejected id is never
+    copied into the response or the audit event (rev 13, round-12 B1)."""
+    if "::" not in request_id:
+        return None
+    server_name, local_id_str = request_id.rsplit("::", 1)
+    try:
+        return server_name, int(local_id_str)
+    except ValueError:
+        return None
 
 
 class _NullCatalogEventSink:
@@ -2928,34 +2943,32 @@ class ClientManager:
     ) -> None:
         """Classify one frame and act on it. See `_dispatch_downstream_frame`.
 
-        Each guard below exists because a later access depends on it, and each
-        drops the frame with a value-free debug log, as a non-JSON line is
-        dropped:
+        A frame that is not a JSON-RPC 2.0 message (`jsonrpc_envelope_problem`)
+        is dropped with a value-free record, like a line that is not JSON
+        (Consiliency/pmcp#297, rev 13). Before, the guards here were only the
+        ones a later access depended on, so `{"jsonrpc": "1.0", "id": 8,
+        "error": {...}}`, a frame with no `jsonrpc`, one with both `result`
+        and `error`, or one whose `error.code` was an object resolved pending
+        request 8, and its `message` reached the caller's log as the
+        downstream's error. A malformed frame carrying a pending request's id
+        does not settle that request: nothing in a frame that is not a message
+        is acted on, its id included, so the request is answered by a valid
+        frame or times out (idle timeout; `tools/call`'s ceiling). The
+        alternative, failing it with fixed text, would let any line that
+        parses with a colliding id end a caller's request.
 
-        - `frame.get` / `"method" in frame` / `frame["error"]` need a JSON
-          object: `[]`, `42`, `"x"`, `null`, `true` all parse but are not one.
-        - `msg_id in managed.pending_requests` needs a hashable id, and must not
-          match one of our int ids by numeric equality: `True == 1` and
-          `1.0 == 1` both hash equal, so a bool or float id would resolve
-          request 1. JSON-RPC ids are strings, integers or null.
-        - `set_result` / `set_exception` raise `InvalidStateError` on a future
-          that is already settled (a caller cancelled it, and the response
-          raced its `finally` pop).
+        The envelope rules also give the dispatcher what its accesses need: a
+        JSON object; an id that is a string or an integer, so a bool or float
+        cannot resolve request 1 by numeric equality. `set_result` /
+        `set_exception` still raise `InvalidStateError` on a future that is
+        already settled (a caller cancelled it, and the response raced its
+        `finally` pop), which is checked below.
         """
-        if not isinstance(frame, dict):
-            logger.debug(
-                f"[{name}] dropped invalid frame: not a JSON object "
-                f"({type(frame).__name__})"
-            )
+        problem = jsonrpc_envelope_problem(frame)
+        if problem is not None:
+            logger.debug(f"[{name}] dropped invalid frame: {problem}")
             return
         msg_id = frame.get("id")
-        if msg_id is not None and (
-            isinstance(msg_id, bool) or not isinstance(msg_id, (str, int))
-        ):
-            logger.debug(
-                f"[{name}] dropped invalid frame: id of type {type(msg_id).__name__}"
-            )
-            return
         method = frame.get("method")
         # Classify by `method` FIRST (C-01). A frame carrying a `method` can
         # never resolve a pending future, so this both handles server->client
@@ -2963,21 +2976,12 @@ class ClientManager:
         # request whose id happens to collide with one of ours must not be
         # mistaken for that response.
         if isinstance(method, str):
-            if msg_id is None:
+            if "id" not in frame:
                 # Notification: no id, nothing to resolve.
                 self._handle_downstream_notification(name, managed, method)
             else:
                 # Server->client request: reply (ping -> {} else -32601).
                 self._reply_to_downstream_request(name, managed, msg_id, method)
-        elif "method" in frame:
-            # A `method` that is present but not a string is not a valid
-            # JSON-RPC request -- and it is not a response either, so it must
-            # not fall through to the pending lookup, where an id colliding with
-            # one of ours would resolve that future.
-            logger.debug(
-                f"[{name}] dropped invalid frame: non-string method "
-                f"({type(method).__name__})"
-            )
         elif msg_id is not None and msg_id in managed.pending_requests:
             pending = managed.pending_requests.pop(msg_id)
 
@@ -4372,17 +4376,15 @@ class ClientManager:
                 False,
                 None,
             )
-
-        server_name, local_id_str = request_id.rsplit("::", 1)
-        try:
-            local_id = int(local_id_str)
-        except ValueError:
+        parsed_id = parse_request_id(request_id)
+        if parsed_id is None:
             return (
                 "not_found",
-                f"Invalid local_id: expected an integer ({describe_value(local_id_str)})",
+                "Invalid local_id: expected an integer (a string)",
                 False,
                 None,
             )
+        server_name, local_id = parsed_id
 
         managed = self._clients.get(server_name)
         if not managed:

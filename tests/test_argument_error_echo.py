@@ -1522,7 +1522,6 @@ async def test_a_value_rejected_by_hand_is_described(
     in the response's text, its structured fields and the audit-event
     buffer. (A downstream's rejected pagination cursor is in the frame
     sweep's `cursor-*` shapes.)"""
-    from pmcp.client.manager import ClientManager
     from pmcp.manifest.loader import Manifest, ServerConfig
     from pmcp.policy.policy import PolicyManager
     from pmcp.tools.handlers import GatewayTools
@@ -1532,11 +1531,31 @@ async def test_a_value_rejected_by_hand_is_described(
     forbidden = _forbidden(s)
     seen: list[str] = []
 
-    manager = ClientManager()
-    for request_id in (s, f"srv::{s}"):
-        status, message, _, _ = await manager.cancel_request(request_id)
-        assert status == "not_found"
-        seen.append(message)
+    # Rev 13 (round-12 B1): through the real `gateway.cancel`, not
+    # `cancel_request` alone -- the response's `request_id` field and the
+    # audit event's `server_name` copied the id the format check rejected.
+    # Each rejection: the id has no `::`, or its local id is not an integer
+    # (with the value on either side of the separator).
+    server, audit_path = _server(tmp_path, audited=True)
+    for request_id in (s, f"{s}::notint", f"srv::{s}", f"{s}::{s}"):
+        result = await _call(server, "gateway.cancel", {"request_id": request_id})
+        text = "".join(block.text for block in result.content)
+        payload = json.loads(text)
+        assert payload["status"] == "not_found", text
+        assert payload["request_id"] is None, text
+        event = server._gateway_tools._audit_events[-1]
+        assert event.method == "gateway.cancel" and event.server_name is None, event
+        seen.append(text)
+        seen.append(event.model_dump_json())
+    # The control: a well-formed id is accepted and kept (its lookup miss is
+    # Consiliency/pmcp#315's), so the nulling above is the format rule's.
+    result = await _call(server, "gateway.cancel", {"request_id": "nosuch::5"})
+    payload = json.loads("".join(block.text for block in result.content))
+    assert payload["request_id"] == "nosuch::5", payload
+    assert server._gateway_tools._audit_events[-1].server_name == "nosuch"
+    await server.shutdown()
+    assert audit_path is not None
+    seen.append(audit_path.read_text() if audit_path.exists() else "")
 
     manifest = Manifest(
         version="1.0",
@@ -1592,3 +1611,211 @@ async def test_a_value_rejected_by_hand_is_described(
     seen.extend(event.model_dump_json() for event in events)
     text = "\n".join(seen)
     assert not any(form in text for form in forbidden), text[:600]
+
+
+# --- rev 13: every output or audit field that copies a caller input -----------
+
+#: Why each field that copies a caller input may hold it (round-12 B1, as a
+#: class). The rule is rev 12's: a value pmcp *rejects* is not copied back,
+#: into the response or the audit event. A value it accepts may be, and a
+#: lookup of an accepted value that misses is Consiliency/pmcp#315's.
+_NULLED = "rejected for its format: null / None on that path (rev 13, B1)"
+_REFUSED = "refused: null on the refusal paths (rev 12); copied on success"
+_LOOKUP = "accepted (any non-empty string); a miss is a lookup echo, #315"
+_ACCEPTED = "copied only on the path that accepted it"
+_NEVER = "never rejected by hand"
+_DERIVED = "a value pmcp computed from the input, not the input"
+_COPIED_INPUT_TRIAGE: dict[tuple[str, str], str] = {
+    ("cancel", "CancelOutput.request_id"): _NULLED,
+    ("cancel", "GatewayAuditEvent.server_name"): _NULLED,
+    ("auth_connect", "AuthConnectOutput.env_var"): _REFUSED,
+    ("auth_connect", "AuthConnectOutput.server"): _LOOKUP,
+    ("auth_connect", "GatewayAuditEvent.server_name"): _LOOKUP,
+    ("auth_connect", "AuthConnectOutput.url_elicitation"): _ACCEPTED,
+    ("auth_connect", "UrlElicitationInfo.elicitation_id"): _ACCEPTED,
+    ("auth_connect", "UrlElicitationInfo.next_step"): _ACCEPTED,
+    ("auth_connect", "UrlElicitationInfo.url"): _ACCEPTED,
+    ("auth_connect", "UrlElicitationInfo.url_verified"): _DERIVED,
+    ("connect_server", "LifecycleServerOutput.server"): _LOOKUP,
+    ("connect_server", "_lifecycle_output.server"): _LOOKUP,
+    ("connect_server", "_lifecycle_output.message"): _LOOKUP,
+    ("disconnect_server", "LifecycleServerOutput.server"): _LOOKUP,
+    ("disconnect_server", "_lifecycle_output.server"): _LOOKUP,
+    ("disconnect_server", "_lifecycle_output.active_task_count"): _DERIVED,
+    ("disconnect_server", "_lifecycle_output.cancelled_task_count"): _DERIVED,
+    ("restart_server", "LifecycleServerOutput.server"): _LOOKUP,
+    ("restart_server", "_lifecycle_output.server"): _LOOKUP,
+    ("invoke", "InvokeOutput.tool_id"): _LOOKUP,
+    ("invoke", "GatewayAuditEvent.tool_id"): _LOOKUP,
+    ("invoke", "GatewayAuditEvent.error"): _LOOKUP,
+    ("invoke", "InvokeOutput.task"): _DERIVED,
+    ("invoke", "process_output.redact"): _DERIVED,
+    ("provision", "ProvisionOutput.server"): _LOOKUP,
+    ("update_server", "UpdateServerOutput.server"): _LOOKUP,
+    ("provision_status", "ProvisionJobStatus.job_id"): _LOOKUP,
+    ("register_discovered_server", "RegisterDiscoveredServerOutput.server_name"): (
+        "accepted; the refusals are of the package and env vars, described (rev 12)"
+    ),
+    ("register_discovered_server", "ServerConfig.env_var"): _ACCEPTED,
+    ("register_discovered_server", "ServerConfig.name"): _ACCEPTED,
+    ("register_discovered_server", "ServerConfig.package"): _ACCEPTED,
+    ("request_capability", "CapabilityResolution.candidates"): _DERIVED,
+    **{
+        ("request_capability", f"CLIResolution.{field}"): _DERIVED
+        for field in (
+            "available",
+            "check_command",
+            "description",
+            "examples",
+            "help_command",
+            "name",
+            "path",
+            "prefer_mcp_for",
+            "reason",
+        )
+    },
+    ("search_registry", "SearchRegistryOutput.query"): _NEVER,
+    ("submit_feedback", "SubmitFeedbackOutput.issue_title"): (
+        "never rejected; a refusal is of the destination or credential, and "
+        "the text is returned for filing by hand"
+    ),
+    ("submit_feedback", "SubmitFeedbackOutput.issue_body"): (
+        "never rejected; a refusal is of the destination or credential, and "
+        "the text is returned for filing by hand"
+    ),
+    ("submit_feedback", "SubmitFeedbackOutput.issue_url"): _DERIVED,
+    ("submit_feedback", "SubmitFeedbackOutput.repository"): _DERIVED,
+    ("sync_environment", "SyncEnvironmentOutput.platform"): _ACCEPTED,
+    ("sync_environment", "SyncEnvironmentOutput.detected_clis"): _NEVER,
+    ("tasks_list", "GatewayAuditEvent.server_name"): _LOOKUP,
+    ("tasks_get", "GatewayAuditEvent.server_name"): _LOOKUP,
+    ("tasks_get", "GatewayAuditEvent.task_id"): _LOOKUP,
+    ("tasks_result", "GatewayAuditEvent.server_name"): _LOOKUP,
+    ("tasks_result", "GatewayAuditEvent.task_id"): _LOOKUP,
+    ("tasks_result", "process_output.redact"): _DERIVED,
+    ("tasks_cancel", "GatewayAuditEvent.server_name"): _LOOKUP,
+    ("tasks_cancel", "GatewayAuditEvent.task_id"): _LOOKUP,
+}
+
+
+def _gateway_tools_class() -> Any:
+    import ast
+
+    import pmcp.tools.handlers as handlers_module
+
+    tree = ast.parse(Path(handlers_module.__file__).read_text())
+    return next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "GatewayTools"
+    )
+
+
+def _mirrored_fields() -> set[tuple[str, str]]:
+    """By the models: each tool's return model's fields named as one of its
+    input model's fields (`server_name` is returned as `server`)."""
+    import ast
+
+    import pmcp.types as types_module
+
+    found: set[tuple[str, str]] = set()
+    for fn in _gateway_tools_class().body:
+        if not isinstance(fn, ast.AsyncFunctionDef) or fn.name.startswith("_"):
+            continue
+        output = getattr(types_module, ast.unparse(fn.returns), None)
+        if output is None:
+            continue
+        for call in ast.walk(fn):
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "model_validate"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id.endswith("Input")
+            ):
+                continue
+            names = set(getattr(types_module, call.func.value.id).model_fields)
+            if "server_name" in names:
+                names.add("server")
+            found |= {
+                (fn.name, f"{output.__name__}.{field}")
+                for field in output.model_fields
+                if field in names
+            }
+    return found
+
+
+def _copied_inputs() -> set[tuple[str, str]]:
+    """By the code: each keyword of a model construction, an `*_output`
+    helper call or an `_audit` call whose value is the input itself
+    (`parsed.<field>`), a conditional on it, or a local bound from it by an
+    attribute, boolean or conditional expression or a module-level parse
+    function (`parse_request_id(parsed.request_id)`)."""
+    import ast
+
+    def reads(node: ast.AST, bound: dict[str, str]) -> set[str]:
+        out: set[str] = set()
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Attribute)
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id == "parsed"
+            ):
+                out.add(sub.attr)
+            elif isinstance(sub, ast.Name) and sub.id in bound:
+                out.add(bound[sub.id])
+        return out
+
+    found: set[tuple[str, str]] = set()
+    for fn in _gateway_tools_class().body:
+        if not isinstance(fn, ast.AsyncFunctionDef) or fn.name.startswith("_"):
+            continue
+        bound: dict[str, str] = {}
+        for node in ast.walk(fn):
+            if not (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                continue
+            value = node.value
+            if isinstance(value, (ast.Attribute, ast.BoolOp, ast.IfExp)) or (
+                isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+            ):
+                for name in reads(value, dict(bound)):
+                    bound[node.targets[0].id] = name
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id[:1].isupper():
+                label = node.func.id
+            elif isinstance(node.func, ast.Attribute) and node.func.attr == "_audit":
+                label = "GatewayAuditEvent"
+            elif isinstance(node.func, ast.Attribute) and node.func.attr.endswith(
+                "_output"
+            ):
+                label = node.func.attr
+            else:
+                continue
+            for keyword in node.keywords:
+                value = keyword.value
+                if keyword.arg is None or not isinstance(
+                    value, (ast.Attribute, ast.Name, ast.IfExp, ast.Subscript)
+                ):
+                    continue
+                if reads(value, bound):
+                    found.add((fn.name, f"{label}.{keyword.arg}"))
+    return found
+
+
+def test_every_field_that_copies_a_caller_input_is_triaged() -> None:
+    """Round-12 B1 as a class: `gateway.cancel` copied a request id it had
+    rejected into its response and its audit event. Every output or audit
+    field that copies a caller input -- found two ways, by the models and by
+    the code -- has a reason it may hold the value, and the table has no
+    stale entry. A new copy fails here until it is triaged."""
+    found = _mirrored_fields() | _copied_inputs()
+    assert found == set(_COPIED_INPUT_TRIAGE), (
+        sorted(found - set(_COPIED_INPUT_TRIAGE)),
+        sorted(set(_COPIED_INPUT_TRIAGE) - found),
+    )

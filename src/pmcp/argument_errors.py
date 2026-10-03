@@ -42,6 +42,7 @@ import logging
 import sys
 import traceback
 from collections.abc import Iterable, Iterator
+from types import ModuleType
 from typing import Any
 
 import jsonschema
@@ -1048,6 +1049,169 @@ def _scrubbing_factory(previous: Any) -> Any:
     return factory
 
 
+# --- rev 13: the JSON-RPC 2.0 envelope (round-12 codex B2) -------------------
+
+
+def _type_of(value: Any) -> str:
+    return type(value).__name__
+
+
+def _is_request_id(value: Any) -> bool:
+    """MCP's `RequestId`: a string or an integer. Not a bool (`True == 1`
+    would resolve request 1) and not a float (`1.0 == 1` likewise)."""
+    return isinstance(value, (str, int)) and not isinstance(value, bool)
+
+
+def jsonrpc_envelope_problem(frame: Any) -> str | None:
+    """Why `frame` is not a JSON-RPC 2.0 message as MCP defines one, or None.
+
+    Every rule is the specification's, not a list of bad frames
+    (Consiliency/pmcp#297, rev 13): JSON-RPC 2.0 sections 4 and 5, and MCP's
+    `JSONRPCRequest` / `JSONRPCNotification` / `JSONRPCResultResponse` /
+    `JSONRPCErrorResponse`.
+
+    - `jsonrpc` is exactly the string `"2.0"`;
+    - a request has a string `method` and a `RequestId`; a notification has a
+      string `method` and no `id`; `params`, when present, is an object; a
+      request or notification carries neither `result` nor `error`;
+    - a response has an `id` member (a `RequestId`, or null for an error the
+      server could not attribute) and exactly one of `result` and `error`;
+    - `result` is an object (MCP's `Result`);
+    - `error` is an object whose `code` is an integer (not a bool) and whose
+      `message` is a string; `data` is optional and unconstrained.
+
+    Extra members are allowed (neither specification forbids them, and
+    nothing reads them). The reason is value-free: fixed text and JSON type
+    names only, so it can be logged for any frame.
+    """
+    if not isinstance(frame, dict):
+        return f"not a JSON object ({_type_of(frame)})"
+    if frame.get("jsonrpc") != "2.0" or not isinstance(frame.get("jsonrpc"), str):
+        return "the jsonrpc member is not the string 2.0"
+    if "method" in frame:
+        method = frame["method"]
+        if not isinstance(method, str):
+            return f"non-string method ({_type_of(method)})"
+        if "id" in frame and not _is_request_id(frame["id"]):
+            return f"id of type {_type_of(frame['id'])}"
+        if "params" in frame and not isinstance(frame["params"], dict):
+            return f"params of type {_type_of(frame['params'])}"
+        if "result" in frame or "error" in frame:
+            return "a request or notification carrying result or error"
+        return None
+    if "id" not in frame:
+        return "a response without an id"
+    msg_id = frame["id"]
+    if msg_id is not None and not _is_request_id(msg_id):
+        return f"id of type {_type_of(msg_id)}"
+    has_result, has_error = "result" in frame, "error" in frame
+    if has_result == has_error:
+        return "both result and error" if has_result else "neither result nor error"
+    if has_result:
+        if msg_id is None:
+            return "a result with a null id"
+        if not isinstance(frame["result"], dict):
+            return f"result of type {_type_of(frame['result'])}"
+        return None
+    error = frame["error"]
+    if not isinstance(error, dict):
+        return f"error of type {_type_of(error)}"
+    if type(error.get("code")) is not int:
+        return f"error code of type {_type_of(error.get('code'))}"
+    if not isinstance(error.get("message"), str):
+        return f"error message of type {_type_of(error.get('message'))}"
+    return None
+
+
+class _StrictMessageAdapter:
+    """The SDK client transports' `jsonrpc_message_adapter`, with
+    `jsonrpc_envelope_problem` applied first (rev 13, round-12 codex B2).
+
+    The SDK's models are lax where the specification is not: they coerce an
+    `error.code` of `true`, `"5"` or `5.0` to an integer, and ignore an extra
+    member, so a frame with both `result` and `error` validates as an error
+    response. Its `message` then reached pmcp as if it were the downstream's
+    error. A frame this adapter rejects raises a pydantic `ValidationError`
+    whose text is the value-free reason, which each transport already
+    handles as a frame it could not parse: the SSE readers put it on the
+    read stream, where `_read_sse` drops it, and the JSON-response path turns
+    it into a `-32700`, whose message `_downstream_error` replaces.
+    Everything else is the SDK's own adapter.
+    """
+
+    def __init__(self, base: Any) -> None:
+        self._base = base
+
+    def validate_json(self, data: Any, /, *args: Any, **kwargs: Any) -> Any:
+        from pmcp.parsing import JSONParseError, load_json
+
+        try:
+            value = load_json(data, source="downstream JSON-RPC message")
+        except JSONParseError:
+            # Not JSON (or past a parser limit): the SDK's own rejection.
+            return self._base.validate_json(data, *args, **kwargs)
+        problem = jsonrpc_envelope_problem(value)
+        if problem is not None:
+            raise ValidationError.from_exception_data(
+                "JSONRPCMessage",
+                [
+                    {
+                        "type": PydanticCustomError(
+                            "jsonrpc_envelope",
+                            "malformed JSON-RPC envelope: {reason}",
+                            {"reason": problem},
+                        ),
+                        "loc": (),
+                        "input": None,
+                    }
+                ],
+            )
+        return self._base.validate_json(data, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+
+class _ClientTypesView(ModuleType):
+    """`mcp_types` as the SDK's SSE and stdio clients see it: the same module,
+    but with the strict adapter. Those clients read
+    `types.jsonrpc_message_adapter` at call time, and the server side uses the
+    same module, so the module itself is left alone."""
+
+    def __init__(self, base: ModuleType, adapter: Any) -> None:
+        super().__init__(base.__name__)
+        self._base = base
+        self.jsonrpc_message_adapter = adapter
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+
+def _install_strict_client_envelopes() -> None:
+    """Point the SDK's three client transports at the strict adapter: the
+    gateway's remote transports, and `stdio_client`, which `pmcp refresh`
+    and the startup description refresh use. Installed on `import pmcp`
+    with the record scrubber. Idempotent; the server-side transports are
+    untouched."""
+    try:
+        import mcp.client.sse as sse_module
+        import mcp.client.stdio as stdio_module
+        import mcp.client.streamable_http as streamable_module
+    except Exception:  # pragma: no cover - the SDK is a dependency
+        return
+
+    for module in (sse_module, stdio_module):
+        current = getattr(module, "types")
+        if not isinstance(current, _ClientTypesView):
+            strict = _StrictMessageAdapter(current.jsonrpc_message_adapter)
+            setattr(module, "types", _ClientTypesView(current, strict))
+    adapter = getattr(streamable_module, "jsonrpc_message_adapter")
+    if not isinstance(adapter, _StrictMessageAdapter):
+        setattr(
+            streamable_module, "jsonrpc_message_adapter", _StrictMessageAdapter(adapter)
+        )
+
+
 def install_log_scrubber() -> None:
     """Scrub every `LogRecord` at creation, whatever logger creates it.
 
@@ -1068,6 +1232,7 @@ def install_log_scrubber() -> None:
     _install_threading_excepthook()
     _install_handle_error()
     _install_message_rendering()
+    _install_strict_client_envelopes()
 
 
 def _install_handle_error() -> None:
