@@ -1795,3 +1795,159 @@ async def test_a_failed_lazy_start_does_not_stamp_error_over_a_newer_connect(
         await asyncio.wait_for(mgr.disconnect_all(), _HANG_GUARD_S)
         _kill_groups(_spawned(good))
         _kill_groups(_spawned(bad))
+
+
+# --- round 4: a request never adopts an outcome another actor caused ---------------
+
+
+async def test_claude_r4_f001_an_uncancelled_connect_does_not_inherit_a_cancelled_requests_cancel(
+    tmp_path: Path,
+) -> None:
+    """The seat's falsifier: request A is the only waiter on its connect task
+    T and is cancelled mid-spawn; T takes more steps to unwind (a cancelled
+    spawn waits for its child). B, queued on the lock and never cancelled,
+    must not join T and inherit its cancellation: it connects."""
+    mgr = ClientManager()
+    counter = tmp_path / "srv"
+    cfg = _counted("srv", counter)
+    real_exec = asyncio.create_subprocess_exec
+    spawning = asyncio.Event()
+
+    async def noting_exec(*args: Any, **kwargs: Any) -> Any:
+        spawning.set()
+        return await real_exec(*args, **kwargs)
+
+    try:
+        with patch("asyncio.create_subprocess_exec", noting_exec):
+            a = asyncio.create_task(mgr.connect_server(cfg))
+            await asyncio.sleep(0)
+            b = asyncio.create_task(mgr.connect_server(cfg))  # never cancelled
+            await asyncio.wait_for(spawning.wait(), _HANG_GUARD_S)
+            a.cancel()
+            assert (await _outcome(a))[0] == "cancelled"
+            outcome = await _outcome(b)
+        assert outcome == ("returned", []), outcome
+        assert mgr.is_server_online("srv")
+    finally:
+        await asyncio.wait_for(mgr.disconnect_all(), _HANG_GUARD_S)
+        _kill_groups(_spawned(counter))
+
+
+STOPPERS = ["connect_server", "connect_all"]
+JOINER_CELLS = [(s, j) for s in STOPPERS for j in ENTRIES]
+
+
+def _connected(entry: str, outcome: tuple[str, Any]) -> bool:
+    kind, detail = outcome
+    if entry == "reconnect":
+        return kind == "returned"
+    if entry == "ensure_connected":
+        return outcome == ("returned", True)
+    if entry == "restart":
+        return outcome == ("returned", (True, 0, []))
+    return outcome == ("returned", [])
+
+
+@pytest.mark.parametrize(("stopper", "joiner"), JOINER_CELLS)
+async def test_a_joiner_after_the_last_waiter_cancelled_gets_its_own_outcome(
+    stopper: str, joiner: str, tmp_path: Path
+) -> None:
+    """Request A (`stopper`) is the only waiter on connect task T and is
+    cancelled mid-spawn; T is held unwinding. Request B (`joiner`, every
+    entry point), queued before A's cancel and never cancelled, then reaches
+    T's registration while T is still unwinding. B must end in its own
+    outcome -- connected, with its own spawn -- not T's cancellation."""
+    mgr = ClientManager()
+    counter = tmp_path / "srv"
+    cfg = _counted("srv", counter)
+    if joiner == "ensure_connected":
+        mgr.register_lazy_configs([cfg])
+    real_exec = asyncio.create_subprocess_exec
+    parked, unwinding, unwind = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def held_first_spawn(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            parked.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                unwinding.set()
+                await unwind.wait()  # a further cancel ends it
+                raise
+        return await real_exec(*args, **kwargs)
+
+    a: Any = None
+    b: Any = None
+    try:
+        with (
+            patch("asyncio.create_subprocess_exec", held_first_spawn),
+            patch.object(manager_mod, "RECONNECT_DELAYS", (0.0, 0.0, 0.0)),
+        ):
+            a = asyncio.create_task(
+                mgr.connect_server(cfg)
+                if stopper == "connect_server"
+                else mgr.connect_all([cfg])
+            )
+            await asyncio.wait_for(parked.wait(), _HANG_GUARD_S)
+            t = mgr._connect_tasks["srv"]
+            b = _start(mgr, joiner, [cfg])
+            await _yields(5)
+            assert not b.done()
+            a.cancel()
+            assert (await _outcome(a))[0] == "cancelled"
+            assert unwinding.is_set()
+            b_outcome = await _outcome(b)
+            unwind.set()
+            await asyncio.wait_for(asyncio.wait({t}), _HANG_GUARD_S)
+        assert t.cancelled()
+        assert _connected(joiner, b_outcome), b_outcome
+        assert mgr.is_server_online("srv"), _end_state(mgr)
+        assert len(_spawned(counter)) == 1  # B's own; T never reached exec
+    finally:
+        unwind.set()
+        for task in (a, b):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.wait_for(mgr.disconnect_all(), _HANG_GUARD_S)
+        _kill_groups(_spawned(counter))
+
+
+async def test_a_request_waiting_on_a_swept_connect_gets_its_own_outcome(
+    tmp_path: Path,
+) -> None:
+    """A lazy start's connect task T is queued on the lock when an
+    uncancelled `disconnect_server` holding the lock tears the server down
+    and sweeps its tasks, T among them. The lazy caller, not cancelled, gets
+    its own outcome (False: its connect was stopped by a disconnect), not
+    T's cancellation, and writes nothing over the disconnect's state."""
+    mgr = ClientManager()
+    counter = tmp_path / "srv"
+    cfg = _counted("srv", counter)
+    await asyncio.wait_for(mgr._connect_stdio(cfg), _HANG_GUARD_S)
+    # A client that is not ONLINE (e.g. crashed), with a lazy config.
+    mgr._servers["srv"].status = ServerStatusEnum.ERROR
+    mgr._lazy_configs["srv"] = cfg
+    try:
+        await mgr._lifecycle_lock.acquire()
+        lazy = asyncio.create_task(mgr.ensure_connected("srv"))
+        await _yields()
+        disconnecting = asyncio.create_task(mgr.disconnect_server("srv", force=True))
+        await _yields()
+        # Queue: lazy, disconnect. The lazy start starts T and releases; the
+        # disconnect takes the lock ahead of T and sweeps it.
+        mgr._lifecycle_lock.release()
+        lazy_outcome = await _outcome(lazy)
+        assert (await _outcome(disconnecting))[0] == "returned"
+        assert lazy_outcome == ("returned", False), lazy_outcome
+        assert mgr._clients == {}
+        assert mgr._servers["srv"].status == ServerStatusEnum.LAZY
+        assert mgr._servers["srv"].last_error is None
+        assert mgr._lazy_configs.get("srv") is cfg
+    finally:
+        if mgr._lifecycle_lock.locked():
+            mgr._lifecycle_lock.release()
+        await asyncio.wait_for(mgr.disconnect_all(), _HANG_GUARD_S)
+        _kill_groups(_spawned(counter))

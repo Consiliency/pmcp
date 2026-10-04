@@ -401,6 +401,15 @@ class _ManagerAbandoned(_ConnectRefused):
     implementation)."""
 
 
+class _ConnectStopped(_ConnectRefused):
+    """A connect whose per-name task was cancelled by an actor other than
+    this request -- a disconnect's or a teardown's sweep -- while this
+    request, not cancelled itself, was waiting on it. Reported as this
+    request's refusal, never as a cancellation it did not receive
+    (Consiliency/pmcp#324, round 4). Like abandonment, it writes nothing:
+    the actor that stopped the connect owns the server's state."""
+
+
 class _ConnectSuperseded(_ConnectRefused):
     """A connect refused because it was requested before a
     `disconnect_server(name)` that was cancelled before it took the lifecycle
@@ -1442,6 +1451,11 @@ class ClientManager:
         # Requests currently awaiting each per-name connect task: a request's
         # own cancel cancels the task only when it is the last of them.
         self._connect_waiters: dict[asyncio.Task[None], int] = {}
+        # Per-name connect tasks their last waiter cancelled (its own cancel):
+        # never joined again, though they may still be unwinding.
+        self._stopped_connect_tasks: weakref.WeakSet[asyncio.Task[None]] = (
+            weakref.WeakSet()
+        )
         # Per-name connect tasks that take the lifecycle lock themselves (lazy
         # start's): a request that holds the lock must not join one.
         self._lock_taking_tasks: weakref.WeakSet[asyncio.Task[None]] = weakref.WeakSet()
@@ -1538,11 +1552,14 @@ class ClientManager:
     ) -> asyncio.Task[None] | None:
         """The per-name connect task in flight, unless it was started by a
         request that is staler than the admitted caller (that task will be
-        refused, and joining it would refuse a request that is current), or
-        the caller holds the lifecycle lock and the task needs it (a lazy
-        start's: the caller would wait on it forever)."""
+        refused, and joining it would refuse a request that is current), its
+        last waiter has cancelled it (it is unwinding; joining it would hand
+        this request a cancellation it never received), or the caller holds
+        the lifecycle lock and the task needs it (a lazy start's: the caller
+        would wait on it forever). The caller then starts its own."""
         task = self._connect_tasks.get(name)
-        if task is None or task.done():
+        if task is None or task.done() or task in self._stopped_connect_tasks:
+            # A cancelled task is not this request's to adopt (round 4).
             return None
         if holding_lock and task in self._lock_taking_tasks:
             return None
@@ -1617,7 +1634,9 @@ class ClientManager:
           ONLINE, if this request's task is the latest for `name` (or it held
           the lock throughout: `task` None).
         * Another exception (failed): stamp ERROR, on the same ownership.
-        * `_ManagerAbandoned`, or a cancel that was not superseded: nothing.
+        * `_ManagerAbandoned`, `_ConnectStopped` (the actor that stopped the
+          connect owns the state), or a cancel that was not superseded:
+          nothing.
         """
         final = outcome
         if outcome is True or isinstance(outcome, asyncio.CancelledError):
@@ -1635,7 +1654,9 @@ class ClientManager:
             if config is not None and name not in self._clients and not newer:
                 self._settle_disconnected(name, config)
             return final
-        if isinstance(outcome, (_ManagerAbandoned, asyncio.CancelledError)):
+        if isinstance(
+            outcome, (_ManagerAbandoned, _ConnectStopped, asyncio.CancelledError)
+        ):
             return final
         owner = self._ticket_is_current(name, self._current_ticket()) and (
             task is None or latest is task
@@ -1755,8 +1776,9 @@ class ClientManager:
         is not the cancelled caller's alone), then propagates. A task that
         ended cancelled while this request was not was stopped from outside:
         by a cancelled `disconnect_server` superseding it or by abandonment,
-        which `_admit_connect` reports as the refusal, or by a sweep, whose
-        cancellation is re-raised as before (Consiliency/pmcp#324). On its
+        which `_admit_connect` reports as the refusal, or by a disconnect's
+        sweep, reported as `_ConnectStopped` -- never as a cancellation this
+        request did not receive (Consiliency/pmcp#324). On its
         own cancel it settles here; otherwise its caller settles
         (`_settle_request`)."""
         self._connect_waiters[task] = self._connect_waiters.get(task, 0) + 1
@@ -1771,6 +1793,9 @@ class ClientManager:
             # settles (grok round 3 F001: superseded, it leaves the server as
             # the disconnect would have) and stays cancelled.
             if self._connect_waiters.get(task, 0) <= 1 and not task.done():
+                # Unjoinable from this step on, though it may take more
+                # steps to unwind (a cancelled spawn waits for its child).
+                self._stopped_connect_tasks.add(task)
                 task.cancel()
                 self._abandon_task_client(task, name)
             self._settle_request(name, task=task, config=config, outcome=e)
@@ -1782,7 +1807,14 @@ class ClientManager:
             else:
                 self._connect_waiters.pop(task, None)
         if task.cancelled():
+            # Stopped by someone else while this request was not cancelled:
+            # superseded or abandoned -> that refusal; otherwise a sweep ->
+            # `_ConnectStopped`. Never the task's cancellation (round 4).
             self._admit_connect(name)
+            raise _ConnectStopped(
+                f"Not connecting {name}: its connect was stopped by a "
+                "disconnect while this request waited for it"
+            )
         task.result()
 
     def _track_background_task(

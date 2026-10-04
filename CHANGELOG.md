@@ -476,7 +476,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller cancelled after the supersession stays cancelled while the server
   is still settled. A caller cancelled while its connect is in flight now
   has that connect's client killed and dropped before the cancellation
-  reaches it. `restart_server` disconnects and reconnects in one hold of the
+  reaches it, and that connect can no longer be joined while it unwinds: a
+  request that arrives meanwhile starts its own connect instead of
+  inheriting a cancellation it never received. A request whose connect is
+  stopped by a disconnect while it waits reports that as its own result
+  ("its connect was stopped by a disconnect"), never as a cancellation. `restart_server` disconnects and reconnects in one hold of the
   lifecycle lock, as one request: a disconnect queued during a restart runs
   after the whole restart, and if it is cancelled it supersedes the
   restart's reconnect. (Gateway-level operations that release the lock
