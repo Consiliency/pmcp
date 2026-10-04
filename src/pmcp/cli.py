@@ -118,7 +118,7 @@ def parse_args() -> argparse.Namespace:
   pmcp setup --client opencode --mode http --write
   pmcp doctor
   pmcp upgrade
-  pmcp secrets set API_TOKEN my-token --scope user
+  pmcp secrets set API_TOKEN --scope user
   pmcp secrets sync --from-scope user --to-scope project --overwrite
   pmcp status --json
   pmcp refresh --force
@@ -300,8 +300,11 @@ Environment overrides:
     refresh_parser = subparsers.add_parser(
         "refresh",
         help="Refresh capability descriptions for MCP servers",
-        description="Pre-generate L1/L2 descriptions for MCP servers. "
-        "This avoids LLM calls on every startup.",
+        description="Connect to MCP servers, fetch their tool lists and cache "
+        "keyword-derived capability summaries in <cache-dir>/descriptions.yaml. "
+        "The gateway reads .mcp-gateway/descriptions.yaml relative to its working "
+        "directory, so pass --cache-dir .mcp-gateway to refresh the cache it uses "
+        "(see Consiliency/pmcp#352).",
     )
     refresh_parser.add_argument(
         "--server",
@@ -324,7 +327,7 @@ Environment overrides:
         "--cache-dir",
         type=Path,
         default=Path(".pmcp"),
-        help="Cache directory (default: .pmcp)",
+        help="Cache directory (default: .pmcp; the gateway reads .mcp-gateway)",
     )
     refresh_parser.add_argument(
         "-l",
@@ -477,7 +480,9 @@ Environment overrides:
         "capabilities",
         help="Print machine-readable PMCP capability/version metadata",
     )
-    capabilities_parser.add_argument("--json", action="store_true")
+    capabilities_parser.add_argument(
+        "--json", action="store_true", help="Output JSON instead of text"
+    )
 
     # Setup command
     setup_parser = subparsers.add_parser(
@@ -493,7 +498,10 @@ Environment overrides:
         "--mode",
         choices=["stdio", "sse", "http"],
         default="http",
-        help="Connection mode to configure (default: http)",
+        help=(
+            "Connection mode to configure (default: http). sse is an alias for "
+            "http: both render the streamable HTTP endpoint at /mcp"
+        ),
     )
     setup_parser.add_argument(
         "--client",
@@ -526,20 +534,36 @@ Environment overrides:
     config_status_parser = config_subparsers.add_parser(
         "status", help="Show effective local configuration status"
     )
-    config_status_parser.add_argument("--json", action="store_true")
+    config_status_parser.add_argument("--json", action="store_true", help="Output JSON")
     config_policy_parser = config_subparsers.add_parser(
         "startup-policy", help="Show persisted startup policy"
     )
-    config_policy_parser.add_argument("--json", action="store_true")
+    config_policy_parser.add_argument("--json", action="store_true", help="Output JSON")
     config_set_parser = config_subparsers.add_parser(
         "set-startup-policy", help="Preview or apply an autoStart mutation"
     )
-    config_set_parser.add_argument("operation", choices=["add", "remove", "set"])
-    config_set_parser.add_argument("names", nargs="*")
-    config_set_parser.add_argument("--source", choices=["project", "user", "custom"])
-    config_set_parser.add_argument("--path")
-    config_set_parser.add_argument("--apply", action="store_true")
-    config_set_parser.add_argument("--json", action="store_true")
+    config_set_parser.add_argument(
+        "operation",
+        choices=["add", "remove", "set"],
+        help="Mutation to apply to the autoStart list",
+    )
+    config_set_parser.add_argument(
+        "names", nargs="*", help="Server names the operation applies to"
+    )
+    config_set_parser.add_argument(
+        "--source",
+        choices=["project", "user", "custom"],
+        help="Config source to edit",
+    )
+    config_set_parser.add_argument(
+        "--path", help="Explicit config file path (instead of --source)"
+    )
+    config_set_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the change (without it, only a preview is printed)",
+    )
+    config_set_parser.add_argument("--json", action="store_true", help="Output JSON")
 
     # Guidance command
     guidance_parser = subparsers.add_parser(
@@ -1720,7 +1744,8 @@ async def run_init(args: argparse.Namespace) -> None:
                     else:
                         print(
                             f"    Note: store the credential with "
-                            f"`pmcp secrets set {storage_key} <value>`"
+                            f"`pmcp secrets set {storage_key}` (it prompts for "
+                            f"the value)"
                         )
                 else:
                     print(

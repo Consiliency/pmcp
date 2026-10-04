@@ -1,5 +1,20 @@
 > **Status: IMPLEMENTED** — All phases shipped as of v1.8.0. Retained as historical
 > specification. See CHANGELOG.md for release notes.
+>
+> **Read as history, not as a description of today's code.** Since this plan:
+> - The HTTP daemon serves MCP streamable HTTP at `/mcp`; the HTTP/SSE wording
+>   below predates the 1.8.0 move off SSE.
+> - Downstream servers are no longer stdio-only: remote `sse` and
+>   `streamable-http` downstreams are supported.
+> - The gateway tool surface has grown well past the 10 tools counted below
+>   (26 `gateway.*` tool definitions in `src/pmcp/tools/handlers.py`), so the
+>   "do not add/remove gateway tools" constraint applied to this plan only.
+> - The suggested test files landed under other names:
+>   `tests/test_lazy_start.py`, `tests/test_singleton_lock_scope.py`,
+>   `tests/test_http_transport.py` and `tests/test_transport_http.py`.
+> - `--lock-dir` / `PMCP_LOCK_DIR`, `PMCP_TRANSPORT` / `PMCP_HOST` /
+>   `PMCP_PORT`, `GatewayTransport`, `ClientManager.ensure_connected()` and
+>   `catalog_search`'s `include_offline` all exist as planned.
 
 # PMCP Gateway Orchestration Fix Plan (Specification)
 

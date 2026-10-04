@@ -942,7 +942,7 @@ def _materialize_version_pin(server: ServerConfig) -> ServerConfig:
             "'version'/'server_version' pins servers launched as bare `npx` "
             "only (not uvx/pip/cargo/docker, and not a path to a program named "
             "npx); pin any other server with explicit command and args in "
-            ".mcp.json or .pmcp.json instead"
+            ".mcp.json (or the file passed with --config) instead"
         )
     env_keys = [*server.extra_env, *([server.env_var] if server.env_var else [])]
     if npm_env_may_redirect(server.name, env_keys):

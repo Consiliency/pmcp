@@ -6,6 +6,7 @@ Returns a static template for the tool, or None when none exists.
 
 from __future__ import annotations
 
+import ast
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -85,15 +86,32 @@ class CodeSnippetsLoader:
         snippet = self._snippets.get(tool_id)
 
         if snippet:
-            # Trim static template to max lines
-            lines = snippet.split("\n")
-            if len(lines) > max_lines:
-                lines = lines[:max_lines]
-                snippet = "\n".join(lines)
-            return snippet
+            return _trim_to_valid_python(snippet, max_lines)
 
         # No static template available
         return None
+
+
+def _trim_to_valid_python(snippet: str, max_lines: int) -> str | None:
+    """The longest prefix of at most ``max_lines`` lines that is valid Python.
+
+    Agents run these snippets, so a cut must never leave a dangling block
+    (e.g. an ``except:`` with no body). Returns None when no non-empty prefix
+    parses, rather than shipping broken code.
+    """
+    lines = snippet.rstrip("\n").split("\n")
+    for n in range(min(len(lines), max_lines), 0, -1):
+        candidate = "\n".join(lines[:n])
+        if not candidate.strip() or all(
+            not line.strip() or line.lstrip().startswith("#") for line in lines[:n]
+        ):
+            continue
+        try:
+            ast.parse(candidate)
+        except SyntaxError:
+            continue
+        return candidate
+    return None
 
 
 # Global instance (lazy-loaded)

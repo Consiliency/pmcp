@@ -4,9 +4,15 @@
 
 | Version | Supported |
 |---------|-----------|
-| 2.0.x   | ✅ Active  |
+| 2.8.x   | ✅ Active  |
+| 2.0.x – 2.7.x | ❌ No longer supported; upgrade to 2.8.x |
 | 1.22.x  | ✅ Security fixes only |
 | < 1.22  | ❌ No longer supported |
+
+2.8.0 is the release that implements the v13 trust boundary described below.
+Several things 2.7.x accepted are refused from 2.8.0 on, among them unapproved
+project configuration files, unapproved discovered packages and non-canonical
+auth URLs; the CHANGELOG's *Upgrade notes* for 2.8.0 list them all.
 
 2.0.0 is a breaking release: `GET /mcp` is retired (405) and the
 `PMCP_KEEPALIVE_MAX_SECONDS` lifetime cap is removed with no replacement by
@@ -37,7 +43,10 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   `RS256`/`ES256`); the token's own `alg` header is never trusted. The mode
   fails closed at startup without an issuer, JWKS URL, and audience, and the
   JWKS URL must be `https` and is rejected when its host is a non-public IP
-  literal (see the DNS-name limitation below). JWKS is fetched asynchronously and
+  literal or the name `localhost`, when the host is not in canonical form
+  (for example a trailing dot, non-ASCII characters, a legacy numeric address
+  or an IPv6 zone id), or when the URL contains a backslash or a control
+  character (see the DNS-name limitation below). JWKS is fetched asynchronously and
   cached so validation never blocks the event loop; an unreachable JWKS endpoint,
   or a key set with no usable keys, returns `503` while an invalid or
   wrong-audience token returns `401`. The fetch is bounded by a total timeout,
@@ -88,8 +97,11 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   or JWKS URL is rejected when its host is a non-public IP literal — private,
   CGNAT, link-local, loopback, multicast, site-local or unspecified, including
   IPv4 addresses embedded in IPv6 literals (RFC 4291 mapped and compatible,
-  RFC 6052 NAT64, RFC 3056 6to4, RFC 4380 Teredo, RFC 5214 ISATAP) and legacy
-  numeric forms such as `2852039166` or `0177.0.0.1`. **A DNS name is accepted
+  RFC 6052 NAT64 including the local-use `64:ff9b:1::/48`, the IPv4-translated
+  `::ffff:0:0:0/96`, RFC 3056 6to4, RFC 4380 Teredo, RFC 5214 ISATAP), and an
+  IPv6 host must itself be public as well. Legacy numeric forms such as
+  `2852039166` or `0177.0.0.1` are refused outright as non-canonical, whatever
+  address they name. **A DNS name is accepted
   without being resolved**, so a name pointing at an internal address is not
   caught. PMCP does not resolve names deliberately: a lookup is
   TOCTOU-vulnerable and is not SSRF defence without connection-time IP pinning.
@@ -162,8 +174,9 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   deployment controls.
 - **No audit log persistence**: the per-call audit log (`tool_call tool=... ok=...`) is
   written to stderr/stdout, and structured `gateway.health.audit_events` are
-  bounded in memory. There is no database, log rotation, or tamper-evident
-  storage.
+  bounded in memory. The opt-in `--audit-jsonl` file (`PMCP_AUDIT_JSONL`)
+  records scoped-advisor tool calls and `tools/call` gate rejections, but has no
+  rotation and no tamper evidence. There is no database.
 - **Trace context is metadata, not identity**: PMCP preserves accepted
   `traceparent`, `tracestate`, and `baggage` strings only through explicit
   PMCP-owned fields or request metadata. Do not put bearer tokens, API keys,
@@ -236,6 +249,7 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 - A checkout-supplied token or repository override is refused and a malformed or hostile override is rendered inert, so the destination stays the packaged repository [C-23].
 - No egress door survives in the handler beyond the gated path, and a dispatched post is reported as submitted only when its creation is observed, never when the outcome is unconfirmed [C-24].
 - Feedback provenance is tracked by an additive registry that records what the gateway wrote at runtime and does not widen the `.env` strip [C-25].
+- The credential store is written atomically, through a temporary file that is synced and then renamed over the store, so an interrupted write leaves the previous store intact [C-35].
 
 #### Limitations
 
@@ -246,8 +260,7 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 - **Limitation.** A credential store written and removed out of band, that this process never read, is invisible to every provenance source [C-31].
 - **Limitation.** Secrets the operator exports into the shell that starts the gateway are still inherited by spawned servers, deliberately and out of scope [C-32].
 - **Limitation.** A store resident in the served checkout is genuinely refused, but the refusal is raised per read and surfaces through the consent gate's not-approved message naming `pmcp trust approve`, rather than as a distinct abort at startup [C-33].
-- **Limitation.** The npm version-check User-Agent still names the old repository, tracked as a follow-up rather than as a trust-boundary property [C-34].
-- **Limitation.** The approval-store write is not atomic and can truncate before it finishes, tracked as a follow-up to the durability of the operator's own records [C-35].
+- **Limitation.** The MCP registry identity (the README `mcp-name` comment and the `name` in `server.json`) still uses the pre-rename namespace, tracked as a follow-up rather than as a trust-boundary property [C-34].
 - **Limitation.** The `pmcp trust approve` verb now also refuses a store resident in the checkout containing the file being approved -- closing the case where approve wrote into a checkout-resident store that `serve --project` then refused, and aligning nested and sibling checkout layouts of that shape through the shared enclosing-checkout walk -- leaving a narrow residual only because serve treats the served root itself as a boundary verbatim while approve keys on the checkout enclosing the approved path, so the two are not guaranteed identical for a served root that is not itself a marked checkout [C-36].
 - **Limitation.** PMCP spawns a child process for every downstream server, and although a project configuration entry is gated by consent and a discovered package is bound to an approved identity, a server an operator approves still runs, so configure only servers you trust [C-37].
 - **Limitation.** The carry-forward closes the byte-content and path-identity races — a target swapped or unlinked between the open and the resolve is refused because the resolved key is verified against the opened descriptor's inode, and on POSIX a symlinked project `.mcp.json` is refused up front — leaving only the accepted, not-fail-safe residual that a swap racing the atomic write itself, or a symlinked final component where `O_NOFOLLOW` is unavailable, could still bind a file whose bytes equal those written [C-38].
@@ -289,7 +302,7 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 | C-32 | limitation | characterizes: `tests/test_env_leak_229.py::test_a_shell_provided_variable_sharing_a_name_is_not_stripped`, `tests/test_env_overlay_provenance.py::test_predicate_true_for_a_shell_exported_var` |
 | C-33 | limitation | — |
 | C-34 | limitation | — |
-| C-35 | limitation | — |
+| C-35 | guarantee | `tests/test_env_store_atomic_write.py::test_an_interrupted_write_leaves_the_existing_store_intact`, `tests/test_env_store_atomic_write.py::test_a_successful_write_replaces_content_at_0600_with_no_temp_left` |
 | C-36 | limitation | characterizes: `tests/test_trust_store_residency_root.py::test_trust_approve_verb_inside_a_checkout_uses_cwd`, `tests/test_trust_store_residency_root.py::test_trust_approve_verb_still_refuses_a_checkout_resident_store`, `tests/test_trust_store_residency_root.py::test_trust_approve_from_outside_refuses_a_store_in_the_approved_paths_checkout`, `tests/test_trust_store_residency_root.py::test_trust_approve_from_outside_with_a_store_outside_still_approves` |
 | C-37 | limitation | — |
 | C-38 | limitation | characterizes: `tests/test_startup_policy_reapproval.py::test_a_post_write_symlink_swap_does_not_transfer_and_a_symlink_is_refused`, `tests/test_startup_policy_reapproval.py::test_a_capture_vs_resolve_swap_does_not_transfer_approval`, `tests/test_startup_policy_reapproval.py::test_an_unlink_after_open_is_refused_not_resurrected` |

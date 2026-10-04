@@ -95,11 +95,17 @@ preserves unknown future-compatible values in raw task metadata:
 - `failed`
 - `cancelled`
 
-PMCP records downstream tasks in transient gateway memory. These records can be
-listed and refreshed through `gateway.tasks_list` and `gateway.tasks_get`, task
-results can be fetched through `gateway.tasks_result`, and cancellation can be
-requested through `gateway.tasks_cancel`. `gateway.tasks_cancel` uses the
-downstream MCP task ID, not a PMCP request ID. `gateway.list_pending` and
+PMCP records downstream tasks in transient gateway memory. `gateway.tasks_list`
+proxies downstream `tasks/list` (for one `server_name`, or every connected
+server) and `gateway.tasks_get` proxies `tasks/get`; both refresh the transient
+records. Task results are fetched through `gateway.tasks_result`, and
+cancellation is requested through `gateway.tasks_cancel`. Every `gateway.tasks_*`
+call takes a `server_name` (optional for `tasks_list`) and the downstream MCP
+task ID, not a PMCP request ID. `gateway.tasks_cancel` acts only on a task PMCP
+has already recorded: an unknown task ID is reported as not found without a
+downstream call, and a task already recorded as terminal is answered locally
+without a downstream call. Active records are never evicted; at most 100
+terminal records are retained, oldest pruned first. `gateway.list_pending` and
 `gateway.cancel` remain PMCP request controls and must not be confused with
 tenant run/task IDs.
 
@@ -138,17 +144,21 @@ Raw stdout/stderr, stack traces, dependency logs, and debug bundles must be
 bounded, redacted when possible, and represented as artifact/resource
 references when they exceed a small response envelope.
 
-PMCP applies gateway output truncation and optional secret redaction to
-`gateway.invoke` and `gateway.tasks_result` responses. That processing is a
+PMCP applies gateway output truncation (`options.max_output_chars`) and secret
+redaction to `gateway.invoke` and `gateway.tasks_result` responses. Redaction is
+on by default for task results when the caller passes no `options` at all; when
+`options` is passed, `options.redact_secrets` (default `false`) decides it. A
+plain non-task `gateway.invoke` with no `options` is not redacted. That processing is a
 host-side safety layer, not a substitute for tenant-server output hygiene. The
 tenant server should avoid secret-bearing telemetry, secret-bearing artifact
 names, and unbounded diagnostic fields.
 
 PMCP does not provide durable sandbox-log storage. Large or durable execution
 artifacts belong to the tenant server and should be exposed through MCP
-resources or tenant-owned storage references. PMCP may proxy `gateway.read_resource`
-for resources discovered from downstream metadata, subject to normal gateway
-configuration and policy.
+resources or tenant-owned storage references. PMCP proxies the MCP
+`resources/read` request (there is no `gateway.read_resource` tool) for
+resources it discovered from downstream servers, subject to normal gateway
+configuration and resource policy.
 
 ## Compatibility Assumptions
 
@@ -180,19 +190,27 @@ This contract maps to current PMCP host surfaces:
 - `_server_supports_tasks`, `_tool_task_support`, `_task_wire_metadata`,
   `list_tasks`, `get_task`, `get_task_result`, and `cancel_task` define PMCP's
   task gate and proxy behavior.
-- `ResourceInfo` and `read_resource` define host-side resource discovery and
-  resource reads.
+- `ResourceInfo`, `ClientManager.read_resource`, and the server's
+  `resources/list` / `resources/read` handlers define host-side resource
+  discovery and resource reads.
 - `gateway.invoke`, `gateway.tasks_result`, policy checks, truncation,
-  optional redaction, and bounded `gateway.health.audit_events` define
+  redaction, and the bounded (64-entry, in-memory) `audit_events` list in the
+  `gateway.health` result define
   host-side output safety and diagnostics.
 - README and SECURITY document the local-first trust model, streamable HTTP
   compatibility, trace metadata, transient task records, redaction, and the
   absence of durable audit storage or multi-tenant authorization in PMCP.
 
-## Future Mock-Server Fixture Notes
+## Mock-Server Fixture Notes (historical)
 
-Later HOSTMETA and HOSTSOAK phases should use a deterministic mock tenant MCP
-server fixture rather than live infrastructure. The fixture should:
+These notes guided the v6 HOSTMETA and HOSTSOAK phases, which have shipped.
+What landed is narrower than the list below: `tests/test_phase6_tenant_code_mode.py`
+drives `GatewayTools` against an in-process `ClientManager` whose downstream
+requests are faked, covering discovery, describe, task-mode invoke, `working` /
+`input_required` statuses, task list/get/result/cancel, and policy denial
+before dispatch. It
+does not start a separate mock server over `stdio` or streamable HTTP. The
+original guidance was that the fixture should:
 
 - advertise server task capability and a task-capable submission tool;
 - expose one synchronous metadata tool and one asynchronous code-mode run tool;

@@ -7,16 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+Things 2.7.3 accepted that 2.8.0 refuses, and defaults or output that changed.
+Each is described in full in the section named at the end of the line.
+
+- **Project files need approval.** A repository's `.pmcp/manifest.yaml`, `.mcp.json`
+  and `.mcp-gateway-policy.yaml` are ignored (with a WARNING naming the command) until
+  you run `pmcp trust approve <absolute path>`; editing an approved file revokes it. A
+  project policy can now only narrow `~/.claude/gateway-policy.yaml`, never replace it.
+  User-scoped files and explicit `--config`/`--policy` paths are unaffected. *Security*
+- **`PMCP_MANIFEST_PATH`, `PMCP_CONFIG` and `PMCP_POLICY` must be exported in your
+  shell.** A value that came from `.env`, `.env.pmcp` or `~/.config/pmcp/pmcp.env` is
+  ignored as if unset. *Security*
+- **Spawned servers no longer inherit the keys pmcp loaded from `.env`**, except a
+  server's own declared `env_var`. Shell-exported variables are still inherited.
+  *Security*
+- **Discovered servers are default-deny.** `gateway.register_discovered_server` resolves
+  and pins the package (and refuses one it cannot pin, or an `env_vars` name that is not
+  credential-shaped); `provision`, `connect_server` and `restart_server` refuse it until
+  `pmcp trust approve-package <name>@<version>` or a `packages.allowlist` match; and
+  `gateway.update_server` refuses every discovered server. *Security*
+- **New `packages:` policy section.** A `packages.denylist` entry also refuses a
+  manifest server whose npm package it names, and, while any denylist is in force, a
+  manifest entry whose npx packages pmcp cannot determine. A version-bearing glob such
+  as `pkg@1.2.3` makes the policy file invalid. *Added*, *Security*
+- **Feedback submission is off by default.** `gateway.submit_feedback` posts only after
+  `pmcp guidance --feedback-submission on` and with a shell-exported
+  `PMCP_FEEDBACK_TOKEN`; `confirm_submission=true` alone now returns a preview.
+  `GITHUB_TOKEN`, `GH_TOKEN` and the `gh issue create` fallback are gone, a
+  `PMCP_FEEDBACK_REPO` from a checkout's `.env` is refused, the default repository is
+  `Consiliency/pmcp`, a preview reports `repository_visibility: "unknown"`, and the
+  output gains `submission_outcome`. *Added*, *Removed*, *Security*, *Fixed*
+- **Auth URLs must be canonical.** A JWKS URL, protected-resource metadata URL or
+  URL-mode elicitation URL whose host is not a canonical DNS name, dotted-quad IPv4 or
+  bracketed IPv6 address is refused, as is one containing a control character or a
+  backslash, or an IPv6 host that is not public itself or embeds a non-public IPv4
+  address. In HTTP resource-server mode pmcp refuses to start on an unusable JWKS URL or
+  required scope, and `create_http_app` refuses a bad metadata URL instead of dropping
+  the route. *Fixed*
+- **Auth responses changed.** Some 401 descriptions are reworded (`Empty token.`, `The
+  token's algorithm is not supported.`), as is the shared-secret startup error. An
+  unknown `kid` refetches the JWKS at most once per 10 s, and any JWKS failure, including
+  a key set with no usable keys, is a `503` instead of a `500`. The metadata route's
+  `resource` is `--oauth-audience`, or the metadata URL's origin plus `/mcp`, and no
+  longer the request `Host`. *Security*, *Fixed*
+- **The `tools/call` gate enforces the schemas pmcp advertises.** Constraints the
+  argument models always had are now rejected at the gate as an `isError`
+  `Input validation error: …` result instead of an `{"error": true}` payload. Lax
+  coercion (`1` for a boolean, `"5"` for an integer) on `invoke.task` is refused, and
+  an explicit `null` for an optional argument is now accepted. Policy is judged before
+  the schema, and gate rejections are recorded as `audit.rejection` events. *Changed*
+- **Task numbers are bounded.** `invoke.task.ttl` must be an integer from 1 to 2^53−1,
+  and `invoke.task.poll_interval` a finite number above 0 and at most 2^53−1. `NaN` and
+  `±Infinity` are refused for every numeric argument, and a request carrying a value
+  that is not strict JSON fails with `outbound frame is not strict JSON`. A downstream
+  task field pmcp cannot use is reported as `null` and named in `unusable_fields`.
+  *Changed*
+- **Redaction removes more.** `sanitize_auth_diagnostic`, `PolicyManager.redact_secrets`
+  and `process_output` now also replace vendor token shapes, JWTs, PEM private keys,
+  high-entropy runs, URL userinfo and secret query values with `[REDACTED]`. Existing
+  markers are unchanged. *Security*
+- **Manifest version pins.** A manifest entry's `version:`, or an overlay's
+  `server_version:`, now pins an npx server to that exact version; an invalid pin is
+  ignored with a warning. `gateway.update_server` does not move a pinned server, and
+  `pmcp update` prints `[PINNED]` for it. *Added*
+- **Downstream servers see more from pmcp.** A server→client request now gets an
+  answer (`ping` gets an empty result, anything else `-32601`), cancellation is sent as
+  `notifications/cancelled`, and a malformed frame is dropped instead of ending the
+  connection. *Fixed*
+- **Logs.** Every install spawn, package-runner start and update probe logs a
+  secret-safe command line at WARNING. A manifest's warnings are logged once each time
+  its inputs change, not on every load. *Changed*
+- **Dependency floors.** `pyjwt[crypto]>=2.15.0` (was `>=2.10.0`) and
+  `aiohttp>=3.14.2` (was `>=3.9.0`). *Security*
+- **Agent-facing hints.** The `try/catch` code hint is now `try`, and the Playwright
+  screenshot pattern and example name `browser_take_screenshot` with `filename`.
+  *Changed*
+- **Known issues in 2.8.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
+  but the gateway reads `.mcp-gateway`; until that is fixed, run
+  `pmcp refresh --cache-dir .mcp-gateway`
+  ([Consiliency/pmcp#352](https://github.com/Consiliency/pmcp/issues/352)).
+  Tenant-aware header resolution for remote servers is not wired yet
+  ([Consiliency/pmcp#353](https://github.com/Consiliency/pmcp/issues/353)).
+
 ### Added
 - **Version pinning, piece 1: pins only.** A manifest entry's `version:`, or an
   overlay's `server_version: {<server>: <version>}`, holds an npx-launched server at one
   exact version. pmcp writes the pin into the server's `args` and every platform's
   `install` argv, keeping the package name, all or nothing. A pin is ignored with a
   warning, and the entry is left unchanged, when it is not one exact version, the package
-  slot is not a plain registry spec, the launcher is not a bare `npx`, or the entry's own
-  env could redirect npm. Refusal warnings never include the pin value or an argv, and
+  slot is not a plain registry spec, the launcher is not a bare `npx`, the server is
+  remote (`url`), or the entry's own env could redirect npm. Build metadata (`+…`) is not
+  an exact version. Refusal warnings never include the pin value or an argv, and
   name a server only if pmcp ships it. `gateway.update_server` does not move a pinned
-  server, and `pmcp update` reports it as `[PINNED]`. See
+  server, and `pmcp update` reports it as `[PINNED]`. A refused pin's warning states
+  its consequence by the loader's merge order, still with no pin values: a refused
+  `server_version` says any earlier pin stands unless a `servers:` entry for that server
+  in the same or a later source replaced it, or a later source set another pin; a refused
+  `version:` says its whole entry replaced any earlier pin, so the server is unpinned
+  unless that source's `server_version` or a later source pins it. `pmcp update` prints
+  `[FAILED] … Could not determine a registry package` for a pinned server, and moves
+  nothing, when the entry sets an npm setting, when the gateway's own environment sets
+  any `npm_config_*` variable or `NODE_OPTIONS`, or when the directory the gateway runs
+  in, or any directory above it, contains a `package.json` or a `node_modules`
+  directory; the pin is still in every argv, and the README lists the three cases
+  ([Consiliency/pmcp#322](https://github.com/Consiliency/pmcp/issues/322)). See
   [Consiliency/pmcp#294](https://github.com/Consiliency/pmcp/issues/294); the plan merged
   in [Consiliency/pmcp#317](https://github.com/Consiliency/pmcp/pull/317).
 - **`pmcp guidance --feedback-submission on|off`, and the
@@ -37,7 +132,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an unconfirmed call. Telemetry still outranks it: `enable_telemetry: false`
   refuses before the submission flag is consulted, and says so rather than telling
   you to turn on a switch telemetry would override. See
-  [#230](https://github.com/Consiliency/pmcp/issues/230).
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **`gateway.submit_feedback` output gains `submission_outcome`.** Optional, absent
   (`null`) on every preview and on every refusal made before a request — so no
   existing field changes and no existing reading of `submitted` breaks. When pmcp did
@@ -49,7 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be filed — handing back a compose URL after a possible success is how the same
   issue gets filed twice. `refused` is a real negative: GitHub itself answered, so
   the compose URL is safe. See
-  [#230](https://github.com/Consiliency/pmcp/issues/230).
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **`pmcp trust approve-package|list-packages|revoke-package`, and a `packages:`
   section in the gateway policy.** These are the two ways an operator opts a
   discovered package in (see *Security* below). `pmcp trust approve-package
@@ -76,7 +171,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   approval is recorded, and also refuses a manifest-backed server whose npm
   package it names. A project `.mcp-gateway-policy.yaml` can add a denial
   but its allowlist never grants on its own. See
-  [#230](https://github.com/Consiliency/pmcp/issues/230).
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **`pmcp trust approve|list|revoke`, and a user-scoped trust store at
   `~/.config/pmcp/trust.json`.** The store records one decision per absolute
   path — the file's SHA-256, the scope, the decision and when it was taken —
@@ -89,16 +184,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history); `list` prints decision, digest, timestamp and path; `revoke` drops
   the record, returning the path to *absent*, and exits non-zero if there was
   nothing to drop.
-  **Nothing consults the store yet, and this release changes no existing
-  behaviour.** These verbs and the record shape are the contract the
-  project-consent and package-identity work is written against, published ahead
-  of the code that will read them so those changes can be built in parallel; a
-  gateway that never runs `pmcp trust` behaves exactly as it did before, and
-  approving a file today gates nothing today.
+  The store is what the project-consent gate reads (see *Security*): an
+  unapproved project `.pmcp/manifest.yaml`, `.mcp.json` or
+  `.mcp-gateway-policy.yaml` is ignored until `pmcp trust approve <path>`
+  records its current bytes. Package approvals live in a sibling file under the
+  same rules.
   Two properties are worth knowing before you rely on it. The store must live
   **outside** the checkout it judges — a store path that resolves inside the
-  current repository, directly or through a symlink, is refused rather than
-  read, because a repository that ships its own approval record must not be
+  current repository (or, under `pmcp serve --project`, the served project),
+  directly or through a symlink, is refused rather than
+  read, and `pmcp trust approve` also refuses a store inside the checkout that
+  contains the file being approved, so it never reports an approval that
+  `pmcp serve --project` would then refuse
+  ([Consiliency/pmcp#252](https://github.com/Consiliency/pmcp/issues/252)),
+  because a repository that ships its own approval record must not be
   believed. And every read failure is a refusal: a missing, unreadable or
   corrupt store makes `is_approved` answer `False` rather than raise, so a
   broken file can never be mistaken for permission. The operator-facing verbs
@@ -108,8 +207,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(registry, name, resolved_version, integrity)` from the registry's metadata
   document alone — no install, no `npx`, no subprocess — and returns nothing at
   all for a range, an unknown dist-tag or any spec it cannot pin to one
-  concrete published version. It has no caller in this release either. See
-  [#230](https://github.com/Consiliency/pmcp/issues/230).
+  concrete published version. `gateway.register_discovered_server` uses it to
+  resolve and pin a discovered package before storing it (see *Security*). See
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 
 ### Removed
 - **The `gh issue create` fallback in `gateway.submit_feedback` is gone.** When the
@@ -122,7 +222,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stored credentials provide, so pmcp could not say — and could not tell you —
   which identity posted. The handler's last `asyncio.create_subprocess_exec` and the
   file's last `shutil` use went with it: this path now spawns nothing. See
-  [#230](https://github.com/Consiliency/pmcp/issues/230).
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **`GITHUB_TOKEN` and `GH_TOKEN` are no longer read anywhere on the feedback
   path.** Previously an ambient `GITHUB_TOKEN` was accepted as the posting
   credential, so an agent that asked to submit could publish under an operator's
@@ -133,7 +233,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token the call previews and names the variable; it does not fall back to anything.
   `GITHUB_TOKEN` still appears in `gateway.register_discovered_server`'s schema
   example for a downstream server's own credentials, which is unrelated and
-  unchanged. See [#230](https://github.com/Consiliency/pmcp/issues/230).
+  unchanged. See [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 
 ### Security
 - **Unknown-`kid` tokens can no longer drive an outbound JWKS fetch per request.**
@@ -172,7 +272,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extension) now get a fixed description. See
   [Consiliency/pmcp#231](https://github.com/Consiliency/pmcp/issues/231).
 - **pyjwt raised to 2.15.** The dependency floor is now `pyjwt[crypto]>=2.15.0`
-  (was `>=2.13.0`) and the lock resolves 2.15.1, picking up the fixes for the
+  (2.7.3 declared `>=2.10.0`; the D-01 entry below first raised it to `>=2.13.0`) and the lock resolves 2.15.1, picking up the fixes for the
   12 advisories `pip-audit` reports against 2.13.0 (GHSA-w6j9-cwv2-h6wq,
   GHSA-2gx3-rcp4-g85q, GHSA-w2cx-738m-mc7w, GHSA-hxm8-2xgr-2p9m,
   GHSA-9v7f-9g4p-ffgj, GHSA-ffc3-869f-jxw9, GHSA-r6x4-923q-g947,
@@ -194,11 +294,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PolicyManager.redact_secrets`, and `process_output` on a string and on a
   structured result. A new `slow` pytest marker holds the large
   differentials and regex sweeps (`pytest -m 'slow and not live'`). The
-  residual classes are listed in the plan. See Consiliency/pmcp#234.
+  residual classes are listed in the plan,
+  `.consiliency/plans/detailed-234-redactor-shape-based-20260923-0921.md`. See
+  [Consiliency/pmcp#234](https://github.com/Consiliency/pmcp/issues/234).
+- **Bumped `httpx2` and `httpcore2` 2.9.1 → 2.12.0** to clear PYSEC-2026-3844
+  (httpcore2) and PYSEC-2026-3845 to PYSEC-2026-3849 (httpx2). Lockfile-only; the
+  declared `httpx2>=2.5.0,<3.0.0` range already admitted the fix. The lock gains
+  `httpx2-jsfetch`, a transitive of httpx2 2.12.0 that installs only on
+  `sys_platform == 'emscripten'`.
 - **Bumped `anyio` 4.12.0 → 4.14.2** to clear advisories `GHSA-82r6-8w77-94w6` and `GHSA-5p39-cfhj-2xmp`. Lockfile-only; the D-01 `pip-audit --strict` gate is green again.
 - **`SECURITY.md` now states the v13 trust boundary, and every claim in it is
   bound to a test that proves it.** A new *The v13 trust boundary* section
-  describes the implemented model as 25 guarantees and 12 labelled limitations,
+  describes the implemented model as 27 guarantees and 11 labelled limitations,
   each carrying a machine-checkable citation to the test(s) that prove it, inside
   a delimited claim region and ledger. `scripts/check_security_claims.py` (run by
   the normal CI suite) fails the build if a sentence in that region makes a claim
@@ -207,7 +314,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   document cannot drift from the code without turning CI red. The
   vulnerability-report address in that file now points at **this project's own**
   GitHub security advisories (`Consiliency/pmcp`) rather than the old
-  repository's. See [#230](https://github.com/Consiliency/pmcp/issues/230).
+  repository's. See [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **An install spawn now strips PMCP-managed credentials using the project root
   the gateway was given, not the directory it happens to be running in.** When a
   gateway started with `pmcp serve --project X` ran from a different working
@@ -218,7 +325,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another server's secret. The strip now resolves the store from the gateway's
   project root, matching where the credential was written; a gateway with no
   `--project`, or run from its project root, is unchanged. See
-  [#230](https://github.com/Consiliency/pmcp/issues/230).
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **A checkout can no longer redirect the gateway's manifest, config or policy by
   planting `PMCP_MANIFEST_PATH`, `PMCP_CONFIG` or `PMCP_POLICY` in a `.env`
   file.** These three variables choose a manifest overlay, an explicit config, or
@@ -228,11 +335,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could set any of the three through its own checked-in dotenv file and choose the
   gateway's manifest, config or policy with no consent gate — the S-03 and S-11
   boundaries through a back door. Each variable is now honoured only when
-  provenance shows the operator exported it into their own shell; a value a
-  project `.env`/`.env.pmcp` introduced is ignored exactly as if unset, at both
+  provenance shows the operator exported it into their own shell; a value that
+  reached the process through any file pmcp loads on the operator's behalf (`.env`,
+  the project `.env.pmcp`, or `~/.config/pmcp/pmcp.env`) is ignored exactly as if
+  unset, at both
   the startup and runtime doors, and the skip is logged operator-safe naming the
   variable and path. A value the operator genuinely exported still applies. See
-  [#230](https://github.com/Consiliency/pmcp/issues/230), #250.
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230), [Consiliency/pmcp#250](https://github.com/Consiliency/pmcp/issues/250).
 - **The trust store's checkout-residency guard now keys on the project the
   gateway serves, not only the directory it was launched from.** A trust store
   that resolves inside a checkout is refused, because a repository must not ship
@@ -244,8 +353,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the served root, never replacing the cwd walk, so a store resident in a second
   checkout the operator launches from stays refused too). `pmcp status --project`
   gets the same binding; the `pmcp trust` verbs and a bare `pmcp serve` keep
-  their previous cwd-derived behaviour. See
-  [#230](https://github.com/Consiliency/pmcp/issues/230), #251.
+  the cwd-derived guard, and `pmcp trust approve` additionally refuses a store
+  inside the approved file's checkout (see the trust-store entry under *Added*). See
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230), [Consiliency/pmcp#251](https://github.com/Consiliency/pmcp/issues/251).
 - **`gateway.submit_feedback` will not post under a credential or to a destination
   that PMCP itself introduced.** Every submission is now decided by one
   fail-closed gate (`src/pmcp/feedback_egress.py`) before any network call, and the
@@ -256,8 +366,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stored one through that tool and had pmcp post with it. So is a token a `.env` in
   the current checkout supplied, and so is one PMCP loaded at startup from its own
   credential stores — recorded as PMCP-introduced when the load happens, because
-  store membership alone can be erased afterwards by an unrelated
-  `auth_connect`. **Export the value in the shell that starts pmcp**; the refusal
+  the store entry can disappear afterwards (another process rewriting the store,
+  or the operator deleting it) while the variable it planted stays in the
+  environment. **Export the value in the shell that starts pmcp**; the refusal
   names both store paths (`~/.config/pmcp/pmcp.env` and the project `.env.pmcp`) and
   says so. The check is deliberately over-strict in one direction: if you export the
   variable *and* the same key sits in a PMCP store, the two cannot be told apart
@@ -268,9 +379,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override that a checkout's `.env` introduced is refused, as is one that is not
   `owner/repo` shaped, and the refusal renders the offending value inert rather than
   echoing it. A refusal that cannot establish authority or destination returns no
-  payload and no URL at all. Any error while consulting the provenance records
+  built issue payload and no URL at all; only the caller's own title and
+  description are echoed back. Any error while consulting the provenance records
   denies rather than raising, so a failed lookup can never read as permission. See
-  [#230](https://github.com/Consiliency/pmcp/issues/230).
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **A discovered server no longer runs an agent-chosen package without an
   operator's approval, and its registration is pinned to one resolved version.**
   Before this release, `gateway.register_discovered_server` stored whatever
@@ -304,6 +416,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gateway.register_discovered_server` again with the same name and package
   (which resolves and pins the current version), approve that version, then
   connect it.
+  "Exactly one valid version" follows npm's own classification of package
+  specs: a version ending in `.tgz`, `.tar` or `.tar.gz` (any case) is refused,
+  matching npm-package-arg's `isFileType` rule, and so is a version whose major,
+  minor or patch exceeds 2^53 − 1 (JavaScript's `Number.MAX_SAFE_INTEGER`),
+  which npm reads as a dist-tag. pmcp uses npm 10's pattern, a superset of
+  npm 11's, since it runs whichever `npx` is on `PATH`; registration, the
+  provision gate, package approvals and the CLI all share this check.
   A refusal reports `auth_state="policy_denied"` only when a
   `packages.denylist` entry matched. Every other refusal from this gate (not
   approved, unresolvable identity, or argv not pinned to the approved version)
@@ -329,7 +448,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a gateway restart, so the first provision of a discovered server after
   upgrading is refused with the command that approves it. Found by the
   2026-09-01 codebase review (S-01); see
-  [#230](https://github.com/Consiliency/pmcp/issues/230).
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **A discovered server may now declare only credential-shaped environment
   variable names.** `gateway.register_discovered_server` refuses, before it
   contacts the registry, any `env_vars` entry that is not credential-shaped (it
@@ -352,7 +471,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that declares a non-credential name such as `POSTGRES_URL` works as before. A
   server that needs any other kind of variable should be configured in
   `.mcp.json` rather than registered. Found by the PKGID phase review; see
-  [#230](https://github.com/Consiliency/pmcp/issues/230).
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **A repository's own configuration files no longer configure PMCP until you
   approve them, and an approved project policy can only *narrow* the operator's
   policy.** The behaviour an existing operator will feel first is the policy one.
@@ -378,7 +497,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PMCP ships. An unapproved project `.mcp.json` is not applied by any of its five
   readers — servers, config sources, `disableAutoStart`, `autoStart` and
   `allowPrivateRegistry` — all of which now pass through one choke point rather
-  than gating themselves.
+  than gating themselves. The project overlay search stops at `$HOME`, as the
+  `.mcp.json` search already did, so your user-scoped `~/.pmcp/manifest.yaml`
+  is never mistaken for a project overlay that needs approval.
   **User-scoped and explicitly-configured sources are unaffected.** `~/.mcp.json`,
   `~/.claude/.mcp.json`, `~/.claude/gateway-policy.yaml`, an explicit `--config`
   path and an explicit `--policy` path all apply with no trust record at all,
@@ -395,10 +516,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   approval. Every failure refuses — an unreadable source, an unreadable or corrupt
   trust store, any error out of the store — because a store that cannot be
   consulted has granted nothing. Found by the 2026-09-01 codebase review (S-03,
-  S-11); see [#230](https://github.com/Consiliency/pmcp/issues/230).
+  S-11); see [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **The operator's project `.env` no longer reaches the servers PMCP spawns.**
-  `pmcp`'s entry point loads `<project>/.env` into its own environment at
-  startup, and `_check_api_key_available` loads whole env files to answer a
+  `pmcp`'s entry point loads a `.env` (found by python-dotenv's default upward
+  search) into its own environment at startup, and `_check_api_key_available` loads whole env files to answer a
   boolean — while `sanitized_subprocess_env` builds every downstream server's
   environment from `os.environ.copy()`. Every key in the operator's `.env`, not
   just PMCP's own, was therefore inherited by every third-party MCP server the
@@ -414,7 +535,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the strip, so that key reaches that server and nothing else in the file
   does. Shell-exported secrets are still inherited, deliberately. Found by the
   2026-09-01 codebase review (S-02); see
-  [#229](https://github.com/Consiliency/pmcp/issues/229).
+  [Consiliency/pmcp#229](https://github.com/Consiliency/pmcp/issues/229).
 - **Dependency advisories on the auth path are closed, and CI now fails on new
   ones.** `pip-audit` reported nine advisories against the shipped lockfile; the
   one that mattered most was **PYSEC-2026-176 in PyJWT 2.10.1, a verifier-side
@@ -424,17 +545,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `alg` header is never trusted"). Also closed: PYSEC-2026-175 (`PyJWKClient`
   passing its URI straight to `urllib.request.urlopen`) and PYSEC-2026-177 (an
   unknown-`kid` token forcing a JWKS refetch), both adjacent to the auth work in
-  [#210](https://github.com/Consiliency/pmcp/issues/210) /
-  [#211](https://github.com/Consiliency/pmcp/issues/211); advisories in
+  [Consiliency/pmcp#210](https://github.com/Consiliency/pmcp/issues/210) /
+  [Consiliency/pmcp#211](https://github.com/Consiliency/pmcp/issues/211); advisories in
   `cryptography` (which performs the signature verification) and `aiohttp` (the
   JWKS fetch client); plus `starlette`, `python-multipart`, `python-dotenv`,
   `click` and `pytest`. `aiohttp`'s declared floor is raised to `>=3.14.2` and
-  PyJWT's to `>=2.13.0`, because a floor that admits a vulnerable range is not a
+  PyJWT's to `>=2.13.0` (raised again to `>=2.15.0` later in this release; see
+  the pyjwt entry above), because a floor that admits a vulnerable range is not a
   pin. A new blocking `audit` CI job runs `pip-audit --strict` against the
   resolved environment, so the next advisory is a red X rather than something a
   manual review finds months later. Found by the 2026-09-01 codebase review
-  (D-01); see [#224](https://github.com/Consiliency/pmcp/issues/224).
-
+  (D-01); see [Consiliency/pmcp#228](https://github.com/Consiliency/pmcp/pull/228).
 
 ### Fixed
 - **A rejected gateway-tool argument no longer echoes its value into the response, the log or the scoped audit (Consiliency/pmcp#297).** Both validation layers rendered the value that failed: the input-schema gate returned jsonschema's message (`Input validation error: 'Bearer sk-…' is not of type 'object', 'null'`), and an argument model's pydantic error — returned as `str(e)[:400]` and logged as `Tool execution error: …` — carried `input_value=…` (the full value for `InvokeInput`'s correlation-ID charset check and a non-dict `meta`, a truncated repr of the whole argument dict for the all-or-none correlation check). Rejections are now described from their structure, as `<JSON path>: <reason>` — e.g. `Input validation error: $.options: must be of type object or null`, `Invalid arguments: $.run_correlation_id: correlation IDs may contain only alphanumerics and ._:-` — where the reason is a fixed phrase filled only from the tool's own schema or model (a type, a length, a pattern, the allowed values) and a key the caller chose is shown as `*`. The log line is `Tool execution error: invalid arguments for <tool>: <same description>`. **The same rule now holds wherever pmcp turns an exception into text** — tool responses, log lines and tracebacks, the in-memory audit-event buffer `gateway.health` exposes, and error fields such as `gateway.tasks_*` `errors`: a pydantic or jsonschema validation error (or an exception whose text embeds one) reads `N validation error(s) for <Model>: $.<path>: <reason>`, and a traceback whose chain holds one is not logged. This covers downstream data too: a task-capable server answering `tasks/get` with `{"taskId": "t", "ttl": "<secret>"}` used to get that value echoed back in `errors` and stored in the audit-event buffer. Operators see the same form for their own config files (policy, trust store, package approvals, `.mcp.json`): the failing field and why, not the value. A downstream that answers with a malformed JSON-RPC frame no longer has it echoed: the MCP SDK turns such a frame into a JSON-RPC `-32700` whose message is pydantic's text, and pmcp now replaces any `-32700` message (and a non-string `error.message`) with fixed text (`downstream sent a response that could not be parsed`), and, from the moment the `pmcp` package is imported (so in the gateway, every `pmcp` CLI command such as `pmcp refresh`, `python -m pmcp` and any embedder), scrubs every log record at creation, whatever logger makes it -- the MCP SDK's `ClientSession` (logger `client`) and third parties included -- when its traceback, `%`-arguments or an exception passed as the message carry a validation error (the traceback is dropped and the structural description appended). Text a library has already formatted into a message string is not scrubbed. This covers the gateway's startup description refresh and `pmcp refresh`, where a downstream's malformed notification used to put its value in the log. **Parse errors of structured text are rendered the same way:** a YAML, JSON (or, on Python 3.11+, TOML) file pmcp could not parse -- a policy, the manifest or an overlay, guidance, code patterns or snippets, a cache, the trust store or package approvals -- is reported as `could not parse YAML policy file at line L, column C (ParserError)`, never with PyYAML's snippet of the offending line (which could hold a secret) or the parser's message -- including a value a YAML tag made PyYAML convert (`k: !!int <value>` used to raise `invalid literal for int() with base 10: '<value>'`), an undefined or duplicate anchor, or nesting too deep to parse; every parse of structured text, and every ISO timestamp pmcp reads from a store or a downstream task (`Unparseable trust timestamp: could not parse timestamp trust store record (ValueError)`), goes through one helper per format that reports only the format, what was being read, the position and the failure's class; and an uncaught error whose chain holds a validation or parse error (a fatal explicit policy, say) is printed with its frames and that description instead of its text. A downstream's own, well-formed error message is still returned as before. **Wording change:** the text after `Input validation error: ` is no longer jsonschema's message; a client matching on phrases such as `is not of type` or `is too short` must match the new form. A call rejected by the tool's argument model (not the gate) is now recorded in the scoped audit as an `audit.rejection` like a gate rejection, with `rejected_argument_validator: null`, instead of an `audit.invocation` `failure` that copied its unvalidated correlation fields. An unregistered tool name is no longer written to the log (`Tool execution error: unknown gateway tool`); the response still names it. `gateway.provision_status` validates its arguments before its catch-all, which logged a traceback of the validation error. An HTTP request whose `Origin` header has a non-numeric or out-of-range port (`Origin: http://host:<text>`) is now refused with 403 like any other rejected origin, instead of failing with a 500 whose logged traceback quoted the port. **A stdio downstream's stdout line that is not a JSON-RPC message is no longer logged with its content:** it gets one fixed DEBUG record, `[<server>] non-protocol stdout line: could not parse JSON downstream stdio frame at line L, column C (<Class>)`, whatever it holds -- a malformed or broken frame, or a banner. MCP's stdio transport allows only newline-delimited messages on stdout; a server's own log belongs on stderr, which is logged as before, so a non-conforming server's stdout banners are no longer visible. A value pmcp rejects by hand is described by its type rather than shown: a downstream's unusable or repeated pagination cursor, a `gateway.cancel` request id that is not `server::number` (whose response `request_id` is now `null`, and whose audit event names no server), an `auth_connect` env var that is not permitted or not a valid name (no longer echoed in `env_var` either), and the env vars `register_discovered_server` may not declare. **The MCP SDK's own traffic logging no longer shows message contents:** with DEBUG logging on, the SDK logs each JSON-RPC message its transports receive and send (`Received server message: …`, `SSE message: …`, `Sending client message: …`), payload included -- a downstream's result before pmcp has validated it, and the caller's own tool arguments on the way out. pmcp now makes every rendering of an SDK message object show its structure instead, such as `<JSON-RPC request: method 'tools/call', id: int, params: object (2 keys)>`, and describes a dict shaped like a message in any log call's arguments. An error a gateway request handler lets escape keeps the wire code the MCP SDK gives it, and an `MCPError`'s `data`, unless the message or `data` carries what was rejected; if it holds a validation error its message is now the structural description: a bare validation error stays `-32602` (it used to carry no text at all), and an exception that wrapped one (`code 0`) no longer carries its text. A catalog entry that could not be parsed is named by its structure when it has no string name, not by its content. **A downstream frame that is not a JSON-RPC 2.0 message is no longer acted on:** stdio frames, and frames on the SSE and streamable-HTTP transports (whose MCP SDK models coerce a bool or string `error.code` and ignore a `result` sent alongside an `error`), are checked against the JSON-RPC 2.0 and MCP envelope rules -- `"jsonrpc": "2.0"`, exactly one of an object `result` or an `error` object with an integer `code` and a string `message`, a string or integer id -- and a frame that breaks one is dropped with a value-free DEBUG record (`dropped invalid frame: <rule>`). Such a frame carrying a pending request's id no longer settles that request: it is answered by a valid frame or times out, where before its `error.message` reached the caller as the downstream's error. A task hint pmcp drops as unusable (Consiliency/pmcp#298) is no longer returned in the task's `raw` by the `gateway.tasks_*` tools, and no longer counts toward `gateway.invoke`'s `raw_size_estimate` for a task answer; the answer itself is reduced the same way, whether the task comes nested under `task` or flat, so `gateway.invoke`'s `result` and `gateway.tasks_result`'s `result` no longer carry it either. A frame with `params: null` is read as having no `params`. `pmcp refresh` and the startup description refresh now bound each request to the downstream (30 s) and the whole refresh of one server (120 s): a downstream that never sends a valid reply used to hang them.
@@ -475,16 +596,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused at startup with "Public auth URL only allows http:// URLs for
   loopback hosts." -- untrue there, since these URLs never accept plain
   `http://`. The message is now "Plain http:// is not accepted for this
-  public auth URL." (registry member `PUBLIC_URL_PLAIN_HTTP_REFUSED`, was
-  `PUBLIC_URL_HTTP_LOOPBACK_ONLY`). The README now states which auth URLs
+  public auth URL." (registry member `PUBLIC_URL_PLAIN_HTTP_REFUSED`). The README now states which auth URLs
   are accepted, with a table of examples that a test checks against the
   code. See [Consiliency/pmcp#341](https://github.com/Consiliency/pmcp/issues/341).
 - **Auth operator messages come through pmcp's own sanitiser intact, and
-  invalid auth configuration refuses startup.** Four auth and startup
-  messages were reworded because pmcp's own sanitiser rewrote them (`Token
-  could not be verified with the published key.` was stored as `Token
-  [REDACTED] not be verified…`; likewise `Missing bearer token.`,
-  `Unsupported token algorithm.` and the shared-secret startup error). Every
+  invalid auth configuration refuses startup.** Three auth and startup
+  messages were reworded because pmcp's own sanitiser rewrote them:
+  `Missing bearer token.` is now `Empty token.`, `Unsupported token
+  algorithm.` is now `The token's algorithm is not supported.`, and the
+  shared-secret startup error `shared-secret auth mode requires auth_token.`
+  is now `auth_token is required when auth_mode is shared-secret.`. Every
   fixed message `pmcp.auth` and the HTTP transport raise or send as an auth
   rejection -- error descriptions, 401/403/503 bodies, startup refusals --
   now comes from one registry, `AuthMessage`, and is rendered through a
@@ -500,7 +621,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata route -- any URL that is not an absolute `https://` URL to a
   public IP address or a DNS name other than `localhost`, with its host in
   canonical form, no backslash or control character, and a valid port (the
-  #341 entry above states the full rule)
+  [Consiliency/pmcp#341](https://github.com/Consiliency/pmcp/issues/341) entry above states the full rule)
   (so plain `http://` to any host, loopback included, is refused too; see
   [Consiliency/pmcp#341](https://github.com/Consiliency/pmcp/issues/341)).
   The metadata route also refuses to
@@ -523,53 +644,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately does not open the backoff, because the caller went away, not the
   endpoint; the next waiter fetches. See
   [Consiliency/pmcp#231](https://github.com/Consiliency/pmcp/issues/231).
-- **Version pinning: the invalid-pin warning now names the right consequence, and the
-  README says when `[PINNED]` becomes `[FAILED]`.** The warning used to say "a pin from an
-  earlier source, if any, stands" for every refused pin, which was false whenever a
-  `servers:` entry replaced the server. The text now follows the loader's merge order, and
-  is still fixed, with no pin values.
-  - A refused `server_version` says any earlier pin stands, unless a `servers:` entry for
-    that server in the same or a later source replaced it, or a later source set another
-    pin.
-  - A refused `version:` says its whole entry replaced any earlier pin, so the server is
-    unpinned unless that source's `server_version` or a later source pins it.
-
-  The README now lists all three cases in which `pmcp update` prints `[FAILED] … Could not
-  determine a registry package` for a pinned server:
-  - the entry sets an npm setting;
-  - the gateway's own environment sets any `npm_config_*` variable or `NODE_OPTIONS`,
-    which turns off package detection for the whole process;
-  - the directory the gateway runs in, or any directory above it, contains a
-    `package.json` or a `node_modules` directory.
-
-  Nothing is moved in any of these cases, and the pin is still in every argv. See
-  [Consiliency/pmcp#322](https://github.com/Consiliency/pmcp/issues/322) and
-  [Consiliency/pmcp#294](https://github.com/Consiliency/pmcp/issues/294).
-- **`tools/call` input-schema rejections are now recorded in the scoped-advisor audit, without argument values (Consiliency/pmcp#296).** A call the transport gate rejects used to return `Input validation error: …` before the audit was reached, so an operator saw no attempt at all. It is now written as a new `audit.rejection` event (not an `audit.invocation`: nothing was invoked, and a reader that correlates invocations to a run skips it) with the tool name, `terminal_status: "invalid_arguments"`, `rejected_argument_path`, the failing location as a JSON array (a key the schema declares, an array index, or `null` for a key the caller chose, since that key can itself be a secret), and `rejected_argument_validator`, the failing JSON Schema keyword (`type`, `pattern`, `required`, …). The record never contains the validation message, the rejected value, correlation IDs, or any digest of the arguments. The capability stays `scoped_advisor_audit.v1`; readers that dispatch on `event` are unaffected. Policy is now judged **before** the schema: a call to a policy-blocked gateway tool is refused with "Gateway tool blocked by policy" and recorded `denied` whatever its arguments, instead of getting an `Input validation error` that described the blocked tool's schema. If the audit sink has failed, a malformed call now gets "Scoped advisor audit channel failed" like every other call, instead of its validation error. The response to a rejected call from an allowed tool is unchanged. An `audit.invocation` record now reads nothing the schema gate did not vouch for: a call refused by policy, or made to an unregistered name, is recorded `denied` with every argument-derived field (`run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`, `evidence_label_digest`, `source_reference_hash`) `null`, a result digest that no longer covers the caller's tool name, and a `gateway_tool_digest` of the registered name (for an unregistered name, of nothing) — previously a correlation-shaped value or a public URL anywhere in such a call's arguments was copied or hashed into the audit. Every other invocation record reads only the top-level arguments the tool's schema declares, so a correlation-shaped key a tool does not declare (e.g. `run_correlation_id` on `gateway.describe`) is no longer recorded; `gateway.invoke` declares every field the record reads, so its records are unchanged.
 - **`sanitize_auth_diagnostic` does its keyword and URL-punctuation work in linear time.** The keyword rule now runs through `pmcp.keyword_matcher` (the same matches as the regular expression it replaces, pinned by a seeded corpus), and trailing punctuation is split off a URL in one pass. Output is unchanged.
-- **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree (Consiliency/pmcp#236).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` now advertises its range on both sides, so `1e20`, `-1e20` and `float(±2**63)` are rejected at the gate, and so is any integer outside [−2^63+1, 2^63−1] (including `-2**63` itself), which the handler previously accepted. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. Inputs the gate now rejects that previously reached the handler were recorded in the scoped-advisor audit as `failure`; they are now recorded as `audit.rejection` events with `terminal_status: "invalid_arguments"` (see the Consiliency/pmcp#296 entry above). Unknown keys are still ignored in this release — see the following entry once B lands. Argument descriptions agents already saw are unchanged, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description.
-- **Exact-version validation follows npm's classification of package specs.** `is_valid_package_version` now refuses a version ending in `.tgz`, `.tar` or `.tar.gz` (any case), matching npm-package-arg's `isFileType` rule, which npm applies before reading a selector as a registry version; and a version whose major, minor or patch exceeds 2^53 - 1 (JavaScript's `Number.MAX_SAFE_INTEGER`), which node-semver refuses and npm-package-arg then reads as a dist-tag. It uses npm 10's pattern (npm-package-arg 12.x, whose `.` before `gz` is unescaped), a superset of npm 11's, since pmcp runs whichever `npx` is on PATH. The provision gate, package approvals, the CLI and the `gateway.provision` handler inherit it. **Upgrade note:** a package approval recorded earlier at either kind of version now approves nothing; it is ignored with a warning naming it (the rest of the store keeps working) and dropped on the next write to the store; re-approving the package at a registry version is that write. (`pmcp trust revoke-package <name>` also clears it, but a bare name revokes that package's valid approvals too.) A record with any other defect still fails the store closed.
-- **A downstream MCP server can no longer hang a caller by sending a request, being cancelled, or timing out — the remaining "the server hangs" runtime gaps are closed.** A server→client JSON-RPC request (a frame carrying both `method` and `id`) is now answered rather than dropped: `ping` gets an empty result and any other method a `-32601` "Method not found" refusal (the gateway advertises no client capabilities, so it does not forward an untrusted server's request to the agent), and classifying by `method` first also stops a downstream request whose id collides with one of ours from being misrouted as our response. `_send_request` no longer leaks a `pending_requests` entry when the caller is cancelled or the write itself raises — the entry is popped in a `finally` and a mid-write error still propagates. Cancellation is now propagated downstream as `notifications/cancelled` on `gateway.cancel`, on idle/ceiling timeout, and on caller cancellation (never for `initialize`, per spec; exactly once per cancellation). Replies and cancellation notifications go through a bounded per-server outbound queue drained by a single writer task whose lifecycle is torn down with the connection, so a downstream that stalls its own sink cannot make the gateway allocate unbounded tasks or buffer unbounded frames (review findings C-01, C-02, C-04). See [#232](https://github.com/Consiliency/pmcp/issues/232).
-- **A failed handshake no longer leaves the connection's outbound writer task running, and a malformed downstream frame no longer drops the connection (Consiliency/pmcp#287).** The handshake-failure paths of `_connect_stdio` and `_connect_remote_stream` cancelled only the read and stderr tasks, so an outbound writer started before the handshake failed (for example by answering a `ping` sent during `initialize`) survived the failed connect — at most a few leaked tasks per reconnect cycle, since retries are capped and the leaked writer held the discarded client. Every teardown path (`_cleanup_client`, `disconnect_server`, and both handshake-failure paths) now cancels the writer and resets `outbound`/`outbound_writer`. Malformed downstream frames no longer drop the connection, on any transport. **Legacy SSE and streamable HTTP** (including the server-pushed GET stream): the mcp library validates every incoming frame and, when validation fails, hands pmcp the `ValidationError` in place of the message; pmcp re-raised it, which ended the read loop, set the server to ERROR, failed every in-flight request with `ConnectionError`, triggered a reconnect, and logged the error text, which carries the frame's contents. That error is now dropped with a debug line naming only its type, and the loop keeps reading; any other exception on the stream is still a transport failure and still ends the loop. (The mcp library's own `mcp.client.*` loggers still log the rejected frame at ERROR; that is outside pmcp.) **Stdio**: pmcp parses frames itself, and the stdio and remote paths now share one frame dispatcher that drops, with a debug line naming only the offending type, a frame that parses as JSON but is not an object (`[]`, `42`, `"x"`, `null`, `true` used to raise `AttributeError` and drop the connection); an `id` that is not a string, integer or null (a list or dict id raised `TypeError` in the pending lookup, and a `true` or `1.0` id resolved our request `1` by numeric equality); a `method` that is present but not a string (it fell through to the pending lookup, where a colliding id resolved our request); and a response to a request whose caller already gave up (`InvalidStateError`). A line that fails to parse without a `JSONDecodeError` (an integer over Python's digit limit raises `ValueError`, deep nesting raises `RecursionError`) is dropped the same way. Anything these checks miss is caught per frame and logged as a warning with only the exception type. The existing debug line for a non-JSON stdout line still echoes that line. See [#232](https://github.com/Consiliency/pmcp/issues/232).
-- **A non-ASCII `Authorization` header no longer turns any request into a 500.** `hmac.compare_digest` raises `TypeError` on `str` containing non-ASCII, so an unauthenticated caller could crash any request with one header byte; the shared-secret comparison now happens on bytes and a bad header is simply unauthorized (review finding S-09). See [#231](https://github.com/Consiliency/pmcp/issues/231).
-- **A non-UTF-8 byte on a downstream server's stdout no longer drops the connection.** The decode raised `UnicodeDecodeError`, which is not a `json.JSONDecodeError`, so it escaped that handler, exited the stdout read loop and marked the server unexpectedly disconnected — the "the server hangs" report. The line is now decoded with replacement characters and discarded as an ordinary parse failure, and a warning names the server when undecodable bytes arrive (review finding C-03). See [#232](https://github.com/Consiliency/pmcp/issues/232).
-- **The operator's policy locations are resolved when a `PolicyManager` is built, not when the module is imported.** `~/.claude/gateway-policy.{yaml,json}` were joined to `Path.home()` at import, so a `HOME` changed afterwards — the test suite's isolation, or a re-homed process — was ignored and the discovery search list could not follow it. They are now resolved at call time, while a monkeypatched `USER_POLICY_PATHS` / `DEFAULT_POLICY_PATHS` is still honoured verbatim, so the ungated-vs-gated decision is unchanged. See [#262](https://github.com/Consiliency/pmcp/issues/262).
-- **A hung `gateway.update_server` probe is reported as a timeout again on Python 3.10.** `_run_update_probe_command` bounds the probe with `asyncio.wait_for`, whose `asyncio.TimeoutError` is not the builtin `TimeoutError` and not a subclass of it before 3.11 — so the caller's handler never fired and a real 60-second hang surfaced through the generic branch as `Failed to run update probe: ` with an empty reason. The helper now normalises to the builtin before the exception reaches a caller (the contract `ClientManager._send_request` already provides), and the caller accepts either class. See [#269](https://github.com/Consiliency/pmcp/issues/269).
-- **Tests: the idle-timeout tests no longer depend on wall time.** `ClientManager` now
-  takes an injected request clock (`clock=`, wall time by default) that stamps and
-  compares every request heartbeat, and the idle re-check interval is capped by a constant
-  (`IDLE_POLL_SLICE_S`); the heartbeat-vs-idle-window and ceiling tests drive a fake
-  clock one idle check at a time instead of sleeping 0.05–0.1 s against 0.2–0.3 s
-  windows, and finish in ~10 ms each (slice C3). No production behaviour changes: the
-  default clock is still `time.time()`, because `gateway.list_pending` and
-  `pmcp status` render `started_at` as an epoch. See
-  [#235](https://github.com/Consiliency/pmcp/issues/235).
-- **Tests: the last wall-clock-window assertions are gone.** Three tests counted work inside a real window (`ticks >= 10` during a blocking fetch, `ticks > 5` during a blocking submit, a reconcile count in 0.6 s) and so failed on a starved runner even when the code was correct. Two now prove the blocking call runs off the event loop with a thread↔loop handshake that has no window at all; the third asserts that consecutive reconcile re-runs are spaced by at least the debounce — a lower bound on a real timer (slice C2c). See [#235](https://github.com/Consiliency/pmcp/issues/235).
-- **Tests: the suite's hand-rolled deadline pollers are consolidated onto one helper.** Eight private poll loops (`_poll_until`, `_await_status`, `_wait_for`, `_wait_for_health` ×2, two startup polls and a retry loop) now call `tests/_timing.py`, so the suite has one poller instead of eight copies (slice C2b). Behaviour change: a startup poll that never succeeds now fails as `AssertionError` rather than `RuntimeError`. See [#235](https://github.com/Consiliency/pmcp/issues/235).
-- **Tests: the fixed `sleep`-then-assert sites now wait for the property.** The install-job, subscription-sink, listen-registration and update-probe tests poll with `eventually` instead of sleeping a fixed interval, and the two tautological `elapsed >` bounds in the listen-timeout tests are now a static sleep-vs-`request_timeout` relation checked at import time (slice C2a). See [#235](https://github.com/Consiliency/pmcp/issues/235).
-- **Tests no longer assert upper bounds on wall-clock time.** The parallel-connection test proves concurrency with a rendezvous instead of a 0.2 s margin, and the suite's ten other `elapsed < X` assertions are replaced by the deterministic property each stood in for. New `tests/_timing.py` (`eventually`, `eventually_sync`, `Rendezvous`) is the shared wait primitive. See [#235](https://github.com/Consiliency/pmcp/issues/235), see [#226](https://github.com/Consiliency/pmcp/issues/226).
-- **The credential store is written atomically** (temp file → `fsync` → `os.replace`), so an interrupted `write_env_file` no longer truncates the file and loses its other entries. See [#248](https://github.com/Consiliency/pmcp/issues/248).
-- **The npm version-check User-Agent now names `github.com/Consiliency/pmcp`** instead of the pre-rename `ViperJuice/pmcp`. See [#247](https://github.com/Consiliency/pmcp/issues/247).
+- **A downstream MCP server can no longer hang a caller by sending a request, being cancelled, or timing out — the remaining "the server hangs" runtime gaps are closed.** A server→client JSON-RPC request (a frame carrying both `method` and `id`) is now answered rather than dropped: `ping` gets an empty result and any other method a `-32601` "Method not found" refusal (the gateway advertises no client capabilities, so it does not forward an untrusted server's request to the agent), and classifying by `method` first also stops a downstream request whose id collides with one of ours from being misrouted as our response. `_send_request` no longer leaks a `pending_requests` entry when the caller is cancelled or the write itself raises — the entry is popped in a `finally` and a mid-write error still propagates. Cancellation is now propagated downstream as `notifications/cancelled` on `gateway.cancel`, on idle/ceiling timeout, and on caller cancellation (never for `initialize`, per spec; exactly once per cancellation). Replies and cancellation notifications go through a bounded per-server outbound queue drained by a single writer task that every teardown path cancels (`_cleanup_client`, `disconnect_server`, and a failed handshake on stdio or a remote transport; [Consiliency/pmcp#287](https://github.com/Consiliency/pmcp/issues/287)), so a downstream that stalls its own sink cannot make the gateway allocate unbounded tasks or buffer unbounded frames (review findings C-01, C-02, C-04). See [Consiliency/pmcp#232](https://github.com/Consiliency/pmcp/issues/232).
+- **A malformed downstream frame no longer drops the connection ([Consiliency/pmcp#287](https://github.com/Consiliency/pmcp/issues/287)).** Malformed downstream frames no longer drop the connection, on any transport. **Legacy SSE and streamable HTTP** (including the server-pushed GET stream): the mcp library validates every incoming frame and, when validation fails, hands pmcp the `ValidationError` in place of the message; pmcp re-raised it, which ended the read loop, set the server to ERROR, failed every in-flight request with `ConnectionError`, triggered a reconnect, and logged the error text, which carries the frame's contents. That error is now dropped with a debug line naming only its type, and the loop keeps reading; any other exception on the stream is still a transport failure and still ends the loop. (The mcp library's own `mcp.client.*` loggers still log the rejected frame at ERROR; that is outside pmcp.) **Stdio**: pmcp parses frames itself, and the stdio and remote paths now share one frame dispatcher that drops, with a debug line naming only the offending type, a frame that parses as JSON but is not an object (`[]`, `42`, `"x"`, `null`, `true` used to raise `AttributeError` and drop the connection); an `id` that is not a string, integer or null (a list or dict id raised `TypeError` in the pending lookup, and a `true` or `1.0` id resolved our request `1` by numeric equality); a `method` that is present but not a string (it fell through to the pending lookup, where a colliding id resolved our request); and a response to a request whose caller already gave up (`InvalidStateError`). A line that fails to parse without a `JSONDecodeError` (an integer over Python's digit limit raises `ValueError`, deep nesting raises `RecursionError`) is dropped the same way. Anything these checks miss is caught per frame and logged as a warning with only the exception type. The existing debug line for a non-JSON stdout line still echoes that line. See [Consiliency/pmcp#232](https://github.com/Consiliency/pmcp/issues/232).
+- **A non-ASCII `Authorization` header no longer turns any request into a 500.** `hmac.compare_digest` raises `TypeError` on `str` containing non-ASCII, so an unauthenticated caller could crash any request with one header byte; the shared-secret comparison now happens on bytes and a bad header is simply unauthorized (review finding S-09). See [Consiliency/pmcp#231](https://github.com/Consiliency/pmcp/issues/231).
+- **A non-UTF-8 byte on a downstream server's stdout no longer drops the connection.** The decode raised `UnicodeDecodeError`, which is not a `json.JSONDecodeError`, so it escaped that handler, exited the stdout read loop and marked the server unexpectedly disconnected — the "the server hangs" report. The line is now decoded with replacement characters and discarded as an ordinary parse failure, and a warning names the server when undecodable bytes arrive (review finding C-03). See [Consiliency/pmcp#232](https://github.com/Consiliency/pmcp/issues/232).
+- **The operator's policy locations are resolved when a `PolicyManager` is built, not when the module is imported.** `~/.claude/gateway-policy.{yaml,json}` were joined to `Path.home()` at import, so a `HOME` changed afterwards — the test suite's isolation, or a re-homed process — was ignored and the discovery search list could not follow it. They are now resolved at call time, while a monkeypatched `USER_POLICY_PATHS` / `DEFAULT_POLICY_PATHS` is still honoured verbatim, so the ungated-vs-gated decision is unchanged. See [Consiliency/pmcp#262](https://github.com/Consiliency/pmcp/issues/262).
+- **A hung `gateway.update_server` probe is reported as a timeout again on Python 3.10.** `_run_update_probe_command` bounds the probe with `asyncio.wait_for`, whose `asyncio.TimeoutError` is not the builtin `TimeoutError` and not a subclass of it before 3.11 — so the caller's handler never fired and a real 60-second hang surfaced through the generic branch as `Failed to run update probe: ` with an empty reason. The helper now normalises to the builtin before the exception reaches a caller (the contract `ClientManager._send_request` already provides), and the caller accepts either class. See [Consiliency/pmcp#269](https://github.com/Consiliency/pmcp/issues/269).
+- **The credential store is written atomically** (temp file → `fsync` → `os.replace`), so an interrupted `write_env_file` no longer truncates the file and loses its other entries. See [Consiliency/pmcp#248](https://github.com/Consiliency/pmcp/issues/248).
+- **The npm version-check User-Agent now names `github.com/Consiliency/pmcp`** instead of the pre-rename `ViperJuice/pmcp`. See [Consiliency/pmcp#247](https://github.com/Consiliency/pmcp/issues/247).
 - **The default feedback repository was `ViperJuice/pmcp`, a repository this
   project does not own.** Every unconfigured gateway that submitted feedback — or
   merely previewed it — named that repository in its output and in the browser URL
@@ -577,7 +660,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Consiliency/pmcp`, the project's real remote, asserted in the tests against the
   distribution's own `Project-URL: Repository` metadata rather than against a
   duplicated literal, so the same drift cannot recur silently. See
-  [#230](https://github.com/Consiliency/pmcp/issues/230).
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **A feedback submission no longer blocks the gateway's event loop, and it is
   bounded.** Both HTTP calls used to run inline inside the async handler, so for as
   long as they took — up to 15 s of socket timeouts, and unbounded in the worst case
@@ -592,24 +675,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repository-visibility probe now runs *after* a created issue instead of before the
   post, and a preview no longer claims `repository_visibility: "public"` on a path
   that made no request; it reports `"unknown"`, which is what it knows. See
-  [#230](https://github.com/Consiliency/pmcp/issues/230).
-- **Starting pmcp from inside your home directory no longer asks you to approve
-  your own `~/.pmcp/manifest.yaml`.** The project overlay search walks up from the
-  working directory, and from any subdirectory of `$HOME` with no closer overlay it
-  reached `$HOME` and treated `~/.pmcp/manifest.yaml` — your user-scoped overlay —
-  as a project one. Since project sources now need approval, every such startup
-  logged "Ignoring project manifest overlay … To use it, run: pmcp trust approve
-  ~/.pmcp/manifest.yaml". Your overlay was still applied through the user path, so
-  nothing was broken, but a false approval prompt on every launch is exactly the
-  kind that teaches you to approve without reading. The search now stops at
-  `$HOME`, matching the `.mcp.json` search, which already did. Neither `.mcp.json`
-  nor the gateway policy was affected. Regression from #242; see #230.
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **Downstream failures no longer log `unhandled errors in a TaskGroup` and
   nothing else.** Every remote-transport path in `ClientManager` runs inside an
   anyio task group, and `str(ExceptionGroup)` names neither the type nor the
   message of what actually failed — so twenty log sites reported only that
   string for any failure. A week of CI hangs
-  ([#200](https://github.com/Consiliency/pmcp/issues/200)) produced exactly it,
+  ([Consiliency/pmcp#200](https://github.com/Consiliency/pmcp/issues/200)) produced exactly it,
   which is why the cause stayed unknown. `describe_exception()` flattens a
   group to its leaf exceptions (`ConnectionResetError: peer went away`), and is
   used at every site that logs a caught exception, including
@@ -621,20 +693,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   redacted now. `last_error` (surfaced by `pmcp status`, `pmcp doctor` and
   health output) and the error strings `connect_server` and `disconnect_server`
   return to their callers were rendering the group string too, and are fixed as
-  well. An AST guard fails CI if a caught exception is interpolated into an
-  f-string or passed to `str()` anywhere inside its handler — not merely inside
+  well. An AST guard over `pmcp.client.manager` fails CI if a caught exception is
+  interpolated into an f-string or passed to `str()` anywhere inside its handler — not merely inside
   a `logger` call, which was the guard's first, too-narrow form. The one
-  `exc_info=` call site is gone too: `exc_info` hands the raw exception to the
+  `exc_info=` call site in `ClientManager` is gone too: `exc_info` hands the raw exception to the
   logging machinery, which appends the unredacted exception tree *after* the
   sanitized message, so a bearer token in a transport error reached the log in
   full. The traceback is now formatted in-process and sanitized, keeping the
   frames. See
-  [#224](https://github.com/Consiliency/pmcp/issues/224).
-
+  [Consiliency/pmcp#224](https://github.com/Consiliency/pmcp/issues/224).
 
 ### Changed
+- **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree ([Consiliency/pmcp#236](https://github.com/Consiliency/pmcp/issues/236)).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` and `invoke.task.poll_interval` are now range-checked at the gate; the ranges are given in the [Consiliency/pmcp#298](https://github.com/Consiliency/pmcp/issues/298) entry below. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. Inputs the gate now rejects that previously reached the handler were recorded in the scoped-advisor audit as `failure`; they are now recorded as `audit.rejection` events with `terminal_status: "invalid_arguments"` (see the [Consiliency/pmcp#296](https://github.com/Consiliency/pmcp/issues/296) entry below). Unknown keys are still accepted and ignored, as before; forbidding them is tracked on [Consiliency/pmcp#236](https://github.com/Consiliency/pmcp/issues/236). Argument descriptions agents already saw were unchanged by this entry, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description. (Several more descriptions are corrected later in this release; see the agent-visible text entry under Changed.)
+- **`tools/call` input-schema rejections are now recorded in the scoped-advisor audit, without argument values ([Consiliency/pmcp#296](https://github.com/Consiliency/pmcp/issues/296)).** A call the transport gate rejects used to return `Input validation error: …` before the audit was reached, so an operator saw no attempt at all. It is now written as a new `audit.rejection` event (not an `audit.invocation`: nothing was invoked, and a reader that correlates invocations to a run skips it) with the tool name (for the scoped-advisor tools; any other tool is recorded with `gateway_tool: null` and a `gateway_tool_digest`), `terminal_status: "invalid_arguments"`, `rejected_argument_path`, the failing location as a JSON array (a key the schema declares, an array index, or `null` for a key the caller chose, since that key can itself be a secret), and `rejected_argument_validator`, the failing JSON Schema keyword (`type`, `pattern`, `required`, …). The record never contains the validation message, the rejected value, correlation IDs, or any digest of the arguments. The capability stays `scoped_advisor_audit.v1`; readers that dispatch on `event` are unaffected. Policy is now judged **before** the schema: a call to a policy-blocked gateway tool is refused with "Gateway tool blocked by policy" and recorded `denied` whatever its arguments, instead of getting an `Input validation error` that described the blocked tool's schema. If the audit sink has failed, a malformed call now gets "Scoped advisor audit channel failed" like every other call, instead of its validation error. The response to a rejected call from an allowed tool is unchanged. An `audit.invocation` record now reads nothing the schema gate did not vouch for: a call refused by policy, or made to an unregistered name, is recorded `denied` with every argument-derived field (`run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`, `evidence_label_digest`, `source_reference_hash`) `null`, a result digest that no longer covers the caller's tool name, and a `gateway_tool_digest` of the registered name (for an unregistered name, of nothing) — previously a correlation-shaped value or a public URL anywhere in such a call's arguments was copied or hashed into the audit. Every other invocation record reads only the top-level arguments the tool's schema declares, so a correlation-shaped key a tool does not declare (e.g. `run_correlation_id` on `gateway.describe`) is no longer recorded; `gateway.invoke` declares every field the record reads, so its records are unchanged.
 - **`gateway.invoke`'s `task.ttl` and `task.poll_interval` are bounded, and
-  NaN/Infinity are refused at the gate (see Consiliency/pmcp#298).**
+  NaN/Infinity are refused at the gate (see [Consiliency/pmcp#298](https://github.com/Consiliency/pmcp/issues/298)).**
   - `task.ttl` must be an integer from 1 to 2^53−1. Zero and negative values,
     which were forwarded downstream unchanged, are now rejected with
     `Input validation error: …`, and so is any value above 2^53−1.
@@ -643,13 +716,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     rejected; they were previously accepted and forwarded.
   - The transport gate now treats `NaN` and `±Infinity` as non-numbers for
     every numeric argument. Both transports can deliver them, even though they
-    are not JSON. Until Consiliency/pmcp#297 lands, a rejection message may
+    are not JSON. Until [Consiliency/pmcp#297](https://github.com/Consiliency/pmcp/issues/297) lands, a rejection message may
     repeat the caller's own number back to that caller, as every numeric bound
     already did.
   - A downstream task's `ttl`, `pollInterval`, `createdAt`,
     `lastUpdatedAt`/`updatedAt` or `status` that pmcp cannot use is now
-    reported as `null`, and its field name is listed in the task's new
-    `unusable_fields` array. "Cannot use" covers:
+    reported as `null`, and the field is named in the task's new
+    `unusable_fields` array, using pmcp's names (`status`, `created_at`,
+    `updated_at`, `ttl`, `poll_interval`). "Cannot use" covers:
     - non-finite numbers and out-of-range values;
     - a boolean;
     - a string where a number is expected;
@@ -666,7 +740,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `updatedAt` no longer hides a good `lastUpdatedAt`. The task's `raw` holds
     what the downstream sent, except that non-finite numbers appear there as
     `null`. A task whose `lastUpdatedAt` was unusable now reports
-    `updatedAt: null` instead of the time pmcp recorded it. A downstream that
+    `updated_at: null` instead of the time pmcp recorded it. A downstream that
     leaves the field out entirely still gets pmcp's observation time, as
     before.
   - Over HTTP and SSE, downstream replies are now read as the server sent
@@ -677,12 +751,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       treating page one as the whole listing.
     - **A `NaN` inside a tool result now reaches the caller as a `NaN` token
       instead of `null`.** Fixing that for every transport is tracked as
-      Consiliency/pmcp#335.
+      [Consiliency/pmcp#335](https://github.com/Consiliency/pmcp/issues/335).
   - Finished tasks past the 100-record cap are now evicted in the order pmcp
     last recorded them. A downstream's own timestamps play no part: a
     far-future `lastUpdatedAt` can no longer keep one server's tasks while
     another's are dropped, and a server whose clock runs behind no longer
-    loses its tasks first.
+    loses its tasks first. (The cap is still shared across servers;
+    [Consiliency/pmcp#338](https://github.com/Consiliency/pmcp/issues/338).)
   - pmcp no longer sends a downstream server anything that is not strict JSON:
     `NaN`, `±Infinity`, or a value JSON cannot encode. A request whose
     `arguments` or task metadata contain one now fails with `outbound frame is
@@ -692,9 +767,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     silently received `null`.
   - **Known follow-up:** pmcp documents `ttl` and `poll_interval` in seconds,
     but MCP defines both in milliseconds, and pmcp forwards them unchanged.
-    Tracked as Consiliency/pmcp#330.
-- **`pmcp startup add/set --source project` now carries your prior trust approval forward when it rewrites `.mcp.json`.** Setting the startup policy changes the file's bytes, and trust approval is content-keyed, so the edit used to silently invalidate your own `pmcp trust approve` of that file and the next startup refused it. When the pre-write bytes were approved, pmcp now re-records the approval for the exact bytes it writes — keyed on the opened descriptor's verified identity (the resolved key must name the same file the descriptor holds open), never re-approving a file that was not already approved, and never approving a substituted file. A target swapped or unlinked mid-operation is refused rather than mis-bound, and on POSIX a symlinked `.mcp.json` is refused up front. If re-recording ever fails because the trust store is unusable, the edit is still written and the failure is surfaced as a diagnostic rather than crashing (an unusable store also fails the approval check, so nothing is silently carried forward). See [#253](https://github.com/Consiliency/pmcp/issues/253).
-- **`pmcp trust approve` now refuses a store resident in the checkout containing the file being approved**, matching what `serve --project` enforces — so approve no longer reports success for an approval that serve will then refuse. See [#252](https://github.com/Consiliency/pmcp/issues/252).
+    Tracked as [Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330).
+- **`pmcp config set-startup-policy add|remove|set --source project --apply` now carries your prior trust approval forward when it rewrites `.mcp.json`.** Setting the startup policy changes the file's bytes, and trust approval is content-keyed, so the edit used to silently invalidate your own `pmcp trust approve` of that file and the next startup refused it. When the pre-write bytes were approved, pmcp now re-records the approval for the exact bytes it writes — keyed on the opened descriptor's verified identity (the resolved key must name the same file the descriptor holds open), never re-approving a file that was not already approved, and never approving a substituted file. A target swapped or unlinked mid-operation is refused rather than mis-bound, and on POSIX a symlinked `.mcp.json` is refused up front. If re-recording ever fails because the trust store is unusable, the edit is still written and the failure is surfaced as a diagnostic rather than crashing (an unusable store also fails the approval check, so nothing is silently carried forward). See [Consiliency/pmcp#253](https://github.com/Consiliency/pmcp/issues/253).
 - **Every install spawn now logs the command it runs, at WARNING, before it
   runs.** `start_install`, the legacy `install_server` and `verify_installation`
   each log a rendered command line immediately before the subprocess is
@@ -716,12 +790,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   found by its position, not by its shape, because a bare token is
   indistinguishable from a package name. **Expect `<redacted>` in the package
   position for manifest installs**: the shipped manifest's install commands are
-  not pinned to exact versions (for example `@playwright/mcp@latest`), so only
-  a pinned discovered server's spawn shows its package. See
-  [#230](https://github.com/Consiliency/pmcp/issues/230).
-- **Every GitHub Action is pinned to a commit SHA.** All 30 remote `uses:`
-  references — 29 across the five workflows and the one inside the local
-  composite action `.github/actions/pipeline-bootstrap-setup` — now read
+  not pinned to exact versions (for example `@playwright/mcp@latest`), so a
+  manifest install shows its package only when you pin it with `version:` or
+  `server_version:`; a discovered server's spawn, which is always pinned, shows it. See
+  [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
+- **Every GitHub Action is pinned to a commit SHA.** Every remote `uses:`
+  reference in the five workflows and in the local composite action
+  `.github/actions/pipeline-bootstrap-setup` now reads
   `owner/action@<40-hex-sha> # vX.Y.Z`. Every pin is the commit its previous
   mutable ref resolved to on the day, so **no action runs a different version
   after this change**: the PyPI publish action is pinned to v1.14.2, the commit
@@ -737,14 +812,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is rejected too. Dependabot gains an entry for the composite action's
   directory, which its root entry had never scanned. Six new mutants prove
   each of those catches (`.consiliency/evidence/mutation-217.md`); see
-  [#217](https://github.com/Consiliency/pmcp/issues/217).
-- CI: `actions/setup-node` v4 → v7 in the workflows (Dependabot, #216).
+  [Consiliency/pmcp#217](https://github.com/Consiliency/pmcp/issues/217).
+- CI: `actions/setup-node` v4 → v7 in the workflows (Dependabot, [Consiliency/pmcp#216](https://github.com/Consiliency/pmcp/pull/216)).
 - CI: pinned actions moved by Dependabot — the composite's `actions/setup-node`
-  v4.4.0 → v7.0.0 (#219), `actions/download-artifact` v7.0.0 → v8.0.1 on the
-  release path (#221; hash mismatches on download now error instead of warn),
-  `astral-sh/setup-uv` v7.6.0 → v10.0.1 (#220). Each release-path bump carries
-  its `EXPECTED_USES` update in the same PR.
-- **`load_manifest()` is cached, and pmcp's own manifest is parsed with libyaml.**
+  v4.4.0 → v7.0.0 ([Consiliency/pmcp#219](https://github.com/Consiliency/pmcp/pull/219)), `actions/download-artifact` v7.0.0 → v8.0.1 on the
+  release path ([Consiliency/pmcp#221](https://github.com/Consiliency/pmcp/pull/221); hash mismatches on download now error instead of warn),
+  `astral-sh/setup-uv` v7.6.0 → v10.0.1 ([Consiliency/pmcp#220](https://github.com/Consiliency/pmcp/pull/220)) → v10.1.0 ([Consiliency/pmcp#245](https://github.com/Consiliency/pmcp/pull/245)) → v10.2.0 ([Consiliency/pmcp#313](https://github.com/Consiliency/pmcp/pull/313)),
+  `docker/build-push-action` v7.3.0 → v7.4.0 ([Consiliency/pmcp#275](https://github.com/Consiliency/pmcp/pull/275)) and `docker/setup-buildx-action`
+  v4.3.0 → v4.4.1 ([Consiliency/pmcp#276](https://github.com/Consiliency/pmcp/pull/276)). Each release-path bump carries its `EXPECTED_USES` update in
+  the same PR.
+- **Test harness (contributors only).** `pytest-timeout` is now in the `dev` extra:
+  a test that runs past 700 s fails with a thread dump (`timeout_method = "signal"`),
+  and `faulthandler` is a last resort at 720 s that dumps and exits the process, so a
+  hung CI job is a red X with a stack rather than a silent cancel; the CI `test` job cap
+  is 30 minutes ([Consiliency/pmcp#200](https://github.com/Consiliency/pmcp/issues/200)). An autouse fixture runs every test from a
+  private directory under pytest's temp root (opt out with the new `real_cwd` marker),
+  and the session stops with one named error if that temp root's ancestors contain a
+  `package.json` or `node_modules`. Process-global caches (the registry's in-process
+  cache, the HTTP rate-limit buckets and request metrics) are reset between tests
+  through test-only seams that production never calls ([Consiliency/pmcp#235](https://github.com/Consiliency/pmcp/issues/235),
+  [Consiliency/pmcp#261](https://github.com/Consiliency/pmcp/issues/261)). The suite no longer asserts on wall-clock windows:
+  `tests/_timing.py` (`eventually`, `eventually_sync`, `Rendezvous`) is the one
+  shared wait primitive, eight private pollers and the fixed `sleep`-then-assert
+  sites now wait for the property, the `elapsed < X` assertions are replaced by
+  the property each stood in for (fixing the [Consiliency/pmcp#226](https://github.com/Consiliency/pmcp/issues/226) flake), and the
+  idle-timeout tests drive an injected request clock: `ClientManager` takes
+  `clock=` (wall time by default, so `started_at` is still an epoch) and caps the
+  idle re-check at `IDLE_POLL_SLICE_S`.
+- **Shipped code snippets are always valid Python.** `gateway.describe`'s L2 snippets are cut to `max_snippet_lines` (default 4); four `try`/`except` templates lost their `except` body at that budget and were invalid. The loader now returns the longest prefix that parses (or no snippet), and those four templates now show the real pattern: `gateway.invoke` and `gateway.provision` report failure as `ok: false`, not by raising. Six more snippets misread the gateway's responses and are fixed: the GitHub, Postgres, SQLite and filesystem filters now unwrap `result` (the downstream `tools/call` result) before filtering, `gateway.describe`'s example checks `annotations`/`safety_notes` (it never returned `risk_hint`), and `provision_status` is polled by `job_id` until its `status` leaves `pending`/`installing`. Every snippet is now executed in tests against responses built from the gateway's own output models.
+- **Agent-visible data and help text.** The `try/catch` code hint is now `try`: at the
+  default `max_hint_length` of 8 it was being cut to `try/catc`. The Playwright
+  screenshot entries in `code_patterns.yaml` and `code_examples.yaml` now name the
+  server's real tool, `browser_take_screenshot`, with its `filename` argument. Gateway
+  tool and argument descriptions and the CLI help are clearer; the `pmcp secrets set`
+  example no longer puts the secret on the command line, and `pmcp refresh --help`
+  documents that its default cache directory differs from the one the gateway reads
+  ([Consiliency/pmcp#352](https://github.com/Consiliency/pmcp/issues/352)).
+- **`load_manifest()` is cached, and pmcp's own manifest is parsed with libyaml.** (`CSafeLoader`, when PyYAML
+  was built with it; otherwise the pure-Python `SafeLoader` as before.)
   Each call re-parsed the 78 KB shipped manifest with PyYAML's pure-Python loader, up to
   13 times per `gateway.catalog_search`: ~1.6 s of event-loop blocking per search, measured.
   The result is now cached, keyed by the bytes of the shipped manifest and of every

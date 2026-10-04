@@ -48,8 +48,8 @@ class GuidanceConfig(BaseModel):
         description=(
             "Guidance level: "
             "'off' = no guidance, "
-            "'minimal' = L0+L1 (~200 tokens), "
-            "'standard' = L0+L1+L2 (~320 tokens)"
+            "'minimal' = L0+L1 (~230 tokens for a 15-card search), "
+            "'standard' = L0+L1+L2 (~290 tokens with one describe)"
         ),
     )
     layers: GuidanceLayers = Field(default_factory=GuidanceLayers)

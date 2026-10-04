@@ -1,9 +1,12 @@
 # Pipeline Bootstrap Harness Shims
 
-RS installs three executable shims named `codex`, `claude`, and `gemini` so
-`pipeline-init` and governed-pipeline harness dispatch can find the expected
-binary names on `PATH` while routing agent execution through the workers
-subscription host.
+The pipeline-bootstrap workflow (`.github/workflows/pipeline-bootstrap.yml`,
+step "Install agent shims") copies three shims named `codex`, `claude`, and
+`gemini` into `$RUNNER_TEMP/agent-bin`, marks them executable, and puts that
+directory on `PATH`, so `pipeline-init` and governed-pipeline harness dispatch
+can find the expected binary names while routing agent execution through the
+workers subscription host. The files are tracked without the executable bit
+(mode 100644), so outside the workflow run them with `node`.
 
 The shims use Node stdlib only. They do not require an npm install, do not add
 package dependencies, and can run anywhere the bootstrap runner already has
@@ -31,8 +34,10 @@ to stderr as frames arrive.
 
 ## Supported Argv
 
-Supported forms match the governed-pipeline runtime contract in
-`docs/architecture/agent-shim-argv.md`.
+Supported forms match the governed-pipeline runtime contract in that
+project's `docs/architecture/agent-shim-argv.md` (it is not in this
+repository). The parser is `lib/worker-shim.mjs`; any flag outside its
+`VALUE_FLAGS` / `BOOLEAN_FLAGS` sets exits 2.
 
 Codex:
 
@@ -76,7 +81,7 @@ Use a command-scoped real-worker smoke only after an operator has supplied the
 worker URL and key outside logs:
 
 ```sh
-WORKER_BASE_URL=<url> WORKER_API_KEY=<redacted> ./scripts/pipeline-bootstrap/shims/codex -p "say hello"
+WORKER_BASE_URL=<url> WORKER_API_KEY=<redacted> node scripts/pipeline-bootstrap/shims/codex -p "say hello"
 ```
 
 Subscription swapping is an operator action performed by changing workers auth
