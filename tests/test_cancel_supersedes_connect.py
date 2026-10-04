@@ -115,11 +115,15 @@ def _end_state(mgr: ClientManager) -> tuple[list[str], str | None, bool]:
 
 
 ENTRIES = ["connect_server", "connect_all", "refresh", "ensure_connected", "reconnect"]
-# "holder": the entry point holds the lifecycle lock but has not started its
-# per-name connect task. Only `refresh` has such a window (its disconnect
-# phase); every other entry point starts its per-name task in the same step
-# it acquires the lock (`ensure_connected` starts it under its first lock
-# hold, and the task then queues on the lock: that is the "queued" state).
+# "holder": the entry point holds the lifecycle lock, with awaits still to
+# come before it starts its per-name connect task. Only `refresh` has such a
+# window (its disconnect phase). `connect_server` and the reconnect loop
+# start the per-name task in the step they acquire the lock; `connect_all`
+# starts a request task per server in that step, which starts the per-name
+# task in its first step, after admission (a cancel in between leaves the
+# request task stale, and `_connect_singleflight` refuses it); and
+# `ensure_connected` starts it under its first lock hold, after which the
+# task queues on the lock again: the "queued" state.
 STATES = ["queued", "holder", "backoff", "midspawn"]
 TRIGGERS = ["cancelled_disconnect", "abandon_all_now"]
 CELLS = [
@@ -502,6 +506,70 @@ async def test_claude_f001_a_cancelled_disconnect_during_a_refresh_is_not_undone
     assert got["spawned_after"] == 0, "srv was respawned after its forced disconnect"
     assert "srv" not in got["end"][0]
     assert got["end"][1:] == ("lazy", True), got
+
+
+async def test_a_callers_own_cancel_is_kept_when_it_lands_after_the_supersession(
+    tmp_path: Path,
+) -> None:
+    """`connect_server`'s connect task is parked mid-spawn when a forced
+    disconnect waiting for the lock is cancelled; its handler cancels that
+    task, and in the very next step -- before the task has unwound -- the
+    `connect_server` caller is cancelled too. The caller must end cancelled:
+    its own cancel is not the supersession's refusal. (A cancel-message
+    heuristic got this wrong on 3.10, where the task's message-bearing
+    `CancelledError` reached the caller either way.)"""
+    mgr = ClientManager()
+    counter = tmp_path / "srv"
+    cfg = _counted("srv", counter)
+    try:
+        with _instrumented(counter, park_spawn=True) as probe:
+            connecting = asyncio.create_task(mgr.connect_server(cfg))
+            await asyncio.wait_for(probe.parked.wait(), _HANG_GUARD_S)
+            disconnecting = asyncio.create_task(
+                mgr.disconnect_server("srv", force=True)
+            )
+            await _yields(3)
+            assert not disconnecting.done()
+            disconnecting.cancel()
+            await asyncio.sleep(0)  # its handler runs: the connect task is cancelled
+            assert disconnecting.done() and not connecting.done()
+            connecting.cancel()
+            kind, detail = await _outcome(connecting)
+            assert kind == "cancelled", f"{kind} {detail!r}"
+            probe.gate.set()
+            await _yields(10)
+        assert _spawned(counter) == [] and mgr._clients == {}
+        assert not mgr._lifecycle_lock.locked()
+    finally:
+        await asyncio.wait_for(mgr.disconnect_all(), _HANG_GUARD_S)
+        _kill_groups(_spawned(counter))
+
+
+async def test_a_cancelled_caller_still_stops_its_connect(tmp_path: Path) -> None:
+    """The other direction, unchanged by the refusal reporting: cancelling the
+    `connect_server` caller while its connect task is parked mid-spawn
+    cancels that task too (as `await task` did), so nothing spawns once the
+    spawn is released and no client is registered."""
+    mgr = ClientManager()
+    counter = tmp_path / "srv"
+    cfg = _counted("srv", counter)
+    try:
+        with _instrumented(counter, park_spawn=True) as probe:
+            connecting = asyncio.create_task(mgr.connect_server(cfg))
+            await asyncio.wait_for(probe.parked.wait(), _HANG_GUARD_S)
+            task = mgr._connect_tasks["srv"]
+            connecting.cancel()
+            kind, detail = await _outcome(connecting)
+            assert kind == "cancelled", f"{kind} {detail!r}"
+            probe.gate.set()
+            await asyncio.wait_for(asyncio.wait({task}), _HANG_GUARD_S)
+            assert task.cancelled()
+            await _yields(10)
+        assert _spawned(counter) == [] and mgr._clients == {}
+        assert mgr._connect_tasks == {} and not mgr._lifecycle_lock.locked()
+    finally:
+        await asyncio.wait_for(mgr.disconnect_all(), _HANG_GUARD_S)
+        _kill_groups(_spawned(counter))
 
 
 # --- what a supersession does not refuse ----------------------------------------

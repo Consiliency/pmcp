@@ -2174,19 +2174,15 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         "ClientManager._disconnect_all_unlocked._shutdown_one",
         "reraises",
     ): (1, "abandons synchronously, then re-raises into the gather"),
-    ("client/manager.py", "ClientManager._connect_singleflight", "reraises"): (
+    ("client/manager.py", "ClientManager._await_connect_task", "reraises"): (
         1,
-        "round 2: a supersession cancel of the awaited connect task becomes "
-        "the refusal (sync `_admit_connect`); any other cancel re-raises",
+        "round 2: the request's own cancel (out of `asyncio.wait`) is "
+        "forwarded to the connect task, as `await task` did, then re-raised",
     ),
-    (
-        "client/manager.py",
-        "ClientManager._ensure_connected_requested",
-        "reraises",
-    ): (1, "round 2: as `_connect_singleflight`"),
     ("client/manager.py", "ClientManager._reconnect_loop", "reraises"): (
         1,
-        "round 2: a superseded reconnect settles synchronously, then re-raises",
+        "round 2: a superseded reconnect settles synchronously (sync "
+        "`_admit_connect`; a no-op unless superseded), then re-raises",
     ),
     ("client/manager.py", "ClientManager._health_monitor_loop", "absorbs"): (
         1,

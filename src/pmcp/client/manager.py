@@ -180,40 +180,10 @@ def _retrieve_outcome(task: asyncio.Future[Any]) -> None:
         logger.debug(f"abandoned task ended with {type(exc).__name__}")
 
 
-def _cancel_without_waiting(
-    task: asyncio.Future[Any] | None, msg: str | None = None
-) -> None:
+def _cancel_without_waiting(task: asyncio.Future[Any] | None) -> None:
     if task is not None and not task.done():
-        task.cancel(msg)
+        task.cancel()
         task.add_done_callback(_retrieve_outcome)
-
-
-# The cancel message `abandon_all_now()` and a cancelled `disconnect_server`
-# give the connect tasks they stop, so that a request awaiting one of them --
-# itself not cancelled -- reports a refusal instead of a cancellation it never
-# received (`_cancelled_by_supersession`).
-_SUPERSEDED_CANCEL = "pmcp: connect superseded (Consiliency/pmcp#324)"
-
-
-def _cancelled_by_supersession(exc: asyncio.CancelledError) -> bool:
-    """True when `exc`, raised by awaiting a per-name connect task, is that
-    task's supersession cancel and not the awaiting task's own cancel.
-
-    The awaited task's cancel message reaches the awaiting task as the
-    `CancelledError`'s args on 3.11+, and as its `__context__`'s on 3.10. A
-    cancel of the awaiting task itself carries no message either way: while
-    it awaits, the cancel is forwarded into the connect task without one,
-    which replaces the message; once that task is done, the awaiting task
-    gets a fresh `CancelledError` of its own. On 3.11+ the awaiting task is
-    then also `cancelling()`."""
-    cancelling = getattr(asyncio.current_task(), "cancelling", None)
-    if cancelling is not None and cancelling():
-        return False
-    marked = (_SUPERSEDED_CANCEL,)
-    context = exc.__context__
-    return exc.args[:1] == marked or (
-        isinstance(context, asyncio.CancelledError) and context.args[:1] == marked
-    )
 
 
 # How often an abandoned transport owner is re-cancelled until it ends.
@@ -1658,16 +1628,32 @@ class ClientManager:
             )
 
         try:
-            await task
-        except asyncio.CancelledError as e:
-            # The connect task was stopped because this request was
-            # superseded (or the manager abandoned): report the refusal.
-            if _cancelled_by_supersession(e):
-                self._admit_connect(name, config)
-            raise
+            await self._await_connect_task(task, name, config)
         finally:
             if self._connect_tasks.get(name) is task:
                 self._connect_tasks.pop(name, None)
+
+    async def _await_connect_task(
+        self, task: asyncio.Task[None], name: str, config: ResolvedServerConfig
+    ) -> None:
+        """Await a per-name connect task on behalf of one request of it.
+
+        Through `asyncio.wait`, which never raises the task's outcome, so a
+        `CancelledError` out of the wait is this request's own: it is
+        forwarded to the task, as `await task` did, and propagates. A task
+        that ended cancelled while this request was not was stopped from
+        outside: by a cancelled `disconnect_server` superseding it or by
+        abandonment, which `_admit_connect` reports as the refusal (and
+        settles), or by a sweep, whose cancellation is re-raised as before
+        (Consiliency/pmcp#324)."""
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if task.cancelled():
+            self._admit_connect(name, config)
+        task.result()
 
     def _track_background_task(
         self, task: _TaskT, server_name: str | None = None
@@ -1704,20 +1690,20 @@ class ClientManager:
                 self._background_task_servers.pop(task, None)
 
     def _cancel_background_tasks_now(
-        self, *, server_name: str | None = None, msg: str | None = None
+        self, *, server_name: str | None = None, spare_requests: bool = False
     ) -> None:
         """`_cancel_background_tasks` without the wait: for a cancelled
         teardown, which must not await (Consiliency/pmcp#324).
 
-        With `msg` (`_SUPERSEDED_CANCEL`: connects are being superseded), the
-        request tasks of a `connect_all`/`refresh` are spared: each is
+        With `spare_requests` (connects are being superseded), the request
+        tasks of a `connect_all`/`refresh` are spared: each is
         awaiting a per-name connect task this cancels, or has not started and
         will be refused by `_admit_connect`, so it reports a refusal rather
         than ending cancelled and missing from the result."""
         for task in self._background_tasks_for(server_name=server_name):
-            if msg is not None and task in self._connect_request_tasks:
+            if spare_requests and task in self._connect_request_tasks:
                 continue
-            _cancel_without_waiting(task, msg)
+            _cancel_without_waiting(task)
 
     def _background_tasks_for(
         self,
@@ -1833,13 +1819,7 @@ class ClientManager:
                 )
 
         try:
-            try:
-                await task
-            except asyncio.CancelledError as e:
-                # As in `_connect_singleflight`.
-                if _cancelled_by_supersession(e):
-                    self._admit_connect(server_name, config)
-                raise
+            await self._await_connect_task(task, server_name, config)
             async with self._lifecycle_lock:
                 self._lazy_configs.pop(server_name, None)
             return True
@@ -1959,10 +1939,11 @@ class ClientManager:
             # Outside the `if`: a connect for this server may be in flight
             # with no client registered yet (e.g. in its retry backoff,
             # holding the lock). Cancel it either way, or its next attempt
-            # spawns after this disconnect. (Its `_connect_singleflight`
-            # drops the `_connect_tasks` entry as the cancel unwinds, and
+            # spawns after this disconnect, and drop its `_connect_tasks`
+            # entry now, so nothing can join it. (`_await_connect_task`
             # reports the refusal to the request awaiting it.)
-            self._cancel_background_tasks_now(server_name=name, msg=_SUPERSEDED_CANCEL)
+            self._cancel_background_tasks_now(server_name=name, spare_requests=True)
+            self._connect_tasks.pop(name, None)
             raise
         try:
             return await self._disconnect_server_locked(name, cancelled)
@@ -3224,7 +3205,7 @@ class ClientManager:
         self._all_superseded_at = _ABANDONED_AT
         for name, managed in list(self._clients.items()):
             self._abandon_client_io(name, managed)
-        self._cancel_background_tasks_now(msg=_SUPERSEDED_CANCEL)
+        self._cancel_background_tasks_now(spare_requests=True)
         self._clients.clear()
         self._connect_tasks.clear()
         self._reconnect_tasks.clear()
@@ -3883,19 +3864,16 @@ class ClientManager:
         )
         try:
             await self._reconnect_attempts(name, config)
-        except asyncio.CancelledError as e:
+        except asyncio.CancelledError:
             # Stopped by a cancelled `disconnect_server(name)` requested after
             # this reconnect: leave what that disconnect would have left, had
-            # it run after the reconnect (`_admit_connect` settles a
-            # superseded request; it raises the refusal, which is moot here).
-            if e.args[:1] == (_SUPERSEDED_CANCEL,) or (
-                isinstance(e.__context__, asyncio.CancelledError)
-                and e.__context__.args[:1] == (_SUPERSEDED_CANCEL,)
-            ):
-                try:
-                    self._admit_connect(name, config)
-                except _ConnectRefused:
-                    pass
+            # it run after the reconnect. `_admit_connect` settles only a
+            # superseded request (a sweep or abandonment leaves it a no-op);
+            # the refusal it raises is moot here.
+            try:
+                self._admit_connect(name, config)
+            except _ConnectRefused:
+                pass
             raise
         finally:
             _CONNECT_TICKET.reset(token)
