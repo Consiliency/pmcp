@@ -2349,3 +2349,177 @@ def test_abandon_is_synchronous_and_child_waits_never_absorb() -> None:
         isinstance(c, ast.Call) and ast.unparse(c.func) == "asyncio.shield"
         for c in ast.walk(reap)
     )
+
+
+# --- codex, round 1 on the implementation (PR #345) ---------------------------------
+
+_COUNTING_FAILURE = (
+    "import sys; open(sys.argv[1], 'a').write('spawn\\n')"  # then exit: no handshake
+)
+
+
+def _spawns(path: Path) -> int:
+    return len(path.read_text().splitlines()) if path.exists() else 0
+
+
+async def test_a_cancelled_disconnect_stops_a_connect_in_its_retry_backoff(
+    tmp_path: Path,
+) -> None:
+    """Codex F045-F047: `connect_server` is in its retry backoff -- holding
+    the lifecycle lock, with no client registered -- when a forced
+    `disconnect_server` waiting for that lock is cancelled. The pre-lock
+    handler cancelled the connect task only inside `if client registered`,
+    so `_connect_tasks['srv']` survived and attempt 2 spawned the server
+    after the disconnect. Now: the entry is gone at once, attempt 2 never
+    spawns (real processes; the backoff is shortened to 0.5 s)."""
+    mgr = ClientManager()
+    counter = tmp_path / "spawns"
+    cfg = ResolvedServerConfig(
+        name="srv",
+        source="project",
+        config=LocalMcpServerConfig(
+            command=sys.executable, args=["-c", _COUNTING_FAILURE, str(counter)]
+        ),
+    )
+    in_backoff = asyncio.Event()
+    real_warning = manager_mod.logger.warning
+
+    def noting_warning(msg: Any, *args: Any, **kwargs: Any) -> None:
+        if "retrying in" in str(msg):
+            in_backoff.set()
+        real_warning(msg, *args, **kwargs)
+
+    with (
+        patch.object(manager_mod, "RETRY_DELAYS", [0.5, 0.5, 0.5]),
+        patch.object(manager_mod.logger, "warning", noting_warning),
+    ):
+        connecting = asyncio.create_task(mgr.connect_server(cfg))
+        try:
+            await asyncio.wait_for(in_backoff.wait(), _HANG_GUARD_S)
+            assert _spawns(counter) == 1
+            assert "srv" not in mgr._clients and "srv" in mgr._connect_tasks
+            assert mgr._lifecycle_lock.locked()
+            disconnecting = asyncio.create_task(
+                mgr.disconnect_server("srv", force=True)
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+            disconnecting.cancel()
+            kind, detail = await _outcome(disconnecting)
+            assert kind == "cancelled", f"{kind} {detail!r}"
+            assert mgr._connect_tasks == {}, list(mgr._connect_tasks)
+            await asyncio.wait({connecting}, timeout=_HANG_GUARD_S)
+            await asyncio.sleep(1.0)  # past the shortened backoff
+            assert _spawns(counter) == 1, "attempt 2 spawned after the disconnect"
+            assert "srv" not in mgr._clients
+        finally:
+            connecting.cancel()
+            await _drain(mgr)
+
+
+@pytest.mark.parametrize("how", ["abandon_all_now", "gateway_shutdown"])
+async def test_a_refresh_in_flight_through_abandonment_spawns_nothing(
+    how: str, tmp_path: Path
+) -> None:
+    """Codex F042-F044: a `refresh()` holds the lifecycle lock inside
+    `_disconnect_all_unlocked` (its SIGTERM-ignoring server keeps it in the
+    terminate grace, entered once the group SIGTERM is sent) when the gateway abandons every client -- directly, or
+    through the real `GatewayServer.shutdown()` whose budget (shortened to
+    0.5 s) runs out waiting for that lock. `abandon_all_now` cancelled the
+    background tasks but not the lock holder, which went on to
+    `_connect_all_unlocked(configs)` and respawned the server after
+    shutdown. Now nothing spawns and no client is registered."""
+    from pmcp import server as server_mod
+    from pmcp.server import GatewayServer
+
+    gateway = GatewayServer()
+    mgr = gateway._client_manager
+    pidfile = tmp_path / "srv.pids"
+    cfg = ResolvedServerConfig(
+        name="srv",
+        source="project",
+        config=LocalMcpServerConfig(
+            command=sys.executable, args=["-c", _MCP_SERVER, str(pidfile)]
+        ),
+    )
+    await asyncio.wait_for(mgr._connect_stdio(cfg), _HANG_GUARD_S)
+    pids = [int(p) for p in pidfile.read_text().split()]
+    spawns: list[str] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def counting_exec(*args: Any, **kwargs: Any) -> Any:
+        spawns.append("spawn")
+        return await real_exec(*args, **kwargs)
+
+    terminating = asyncio.Event()
+    real_killpg = os.killpg
+
+    def noting_killpg(pgid: int, sig: int) -> None:
+        real_killpg(pgid, sig)
+        if sig == signal.SIGTERM:
+            terminating.set()
+
+    try:
+        with (
+            patch("asyncio.create_subprocess_exec", counting_exec),
+            patch.object(manager_mod.os, "killpg", noting_killpg),
+        ):
+            refreshing = asyncio.create_task(mgr.refresh([cfg]))
+            await asyncio.wait_for(terminating.wait(), _HANG_GUARD_S)
+            assert mgr._lifecycle_lock.locked()
+            if how == "abandon_all_now":
+                mgr.abandon_all_now()
+            else:
+                real_wait = server_mod.bounded_wait
+
+                async def short_budget(aw: Any, timeout: float | None) -> Any:
+                    return await real_wait(aw, timeout=0.5)
+
+                with (
+                    patch.object(server_mod, "bounded_wait", short_budget),
+                    patch.object(server_mod, "release_singleton_lock", lambda: None),
+                ):
+                    await asyncio.wait_for(gateway.shutdown(), _HANG_GUARD_S)
+            kind, detail = await _outcome(refreshing)
+            for _ in range(10):
+                await asyncio.sleep(0)
+        assert kind in ("returned", "cancelled"), f"{kind} {detail!r}"
+        if kind == "returned":
+            assert detail == [], detail
+        assert spawns == [], spawns
+        assert mgr._clients == {}, list(mgr._clients)
+        await eventually(
+            lambda: not any(_pid_alive(p) for p in pids),
+            timeout=_HANG_GUARD_S,
+            message=f"{how}: the tree survived",
+        )
+    finally:
+        _kill_pids(pids)
+        await _drain(mgr)
+
+
+async def test_a_connect_after_abandonment_is_refused_without_retrying(
+    tmp_path: Path,
+) -> None:
+    """The other half of F042-F044: an operation queued behind the lock
+    holder, or started after `abandon_all_now`, reaches `_connect_server`
+    and is refused there -- at once, not after the retry backoff
+    (`_connect_with_retry` re-raises the refusal), and without spawning."""
+    mgr = ClientManager()
+    counter = tmp_path / "spawns"
+    cfg = ResolvedServerConfig(
+        name="srv",
+        source="project",
+        config=LocalMcpServerConfig(
+            command=sys.executable, args=["-c", _COUNTING_FAILURE, str(counter)]
+        ),
+    )
+    mgr.abandon_all_now()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    errors = await asyncio.wait_for(mgr.connect_server(cfg), _HANG_GUARD_S)
+    elapsed = loop.time() - started
+    assert len(errors) == 1 and "abandoned" in errors[0], errors
+    assert elapsed < manager_mod.RETRY_DELAYS[0], f"retried: {elapsed:.2f}s"
+    assert _spawns(counter) == 0
+    assert mgr._clients == {} and mgr._connect_tasks == {}

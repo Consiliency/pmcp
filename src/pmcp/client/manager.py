@@ -382,6 +382,12 @@ def _downstream_error(error: Any) -> DownstreamError:
     )
 
 
+class _ManagerAbandoned(Exception):
+    """A connect refused because `ClientManager.abandon_all_now()` ran: the
+    gateway is shutting down, and nothing may spawn or register a client
+    after it (Consiliency/pmcp#324, codex round 1 on the implementation)."""
+
+
 class _NullCatalogEventSink:
     """No-op `CatalogEventSink` used when `ClientManager` is constructed with
     no `catalog_events` (IF-0-P3B-2's default). Keeps every pre-P3B
@@ -1369,6 +1375,9 @@ class ClientManager:
         self._project_root = project_root
         self._spawn_semaphore = asyncio.Semaphore(max_concurrent_spawns)
         self._lifecycle_lock = asyncio.Lock()
+        # Set once by `abandon_all_now()` and never cleared: see
+        # `_connect_server`.
+        self._abandoned = False
         self._connect_tasks: dict[str, asyncio.Task[None]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._background_task_servers: dict[asyncio.Task[Any], str | None] = {}
@@ -1415,6 +1424,11 @@ class ClientManager:
     ) -> list[str]:
         """Connect to all configured servers while caller owns lifecycle lock."""
         if not configs:
+            return []
+        if self._abandoned:
+            # A refresh that held the lock across `abandon_all_now()` ends
+            # here rather than logging one refused connect per server.
+            logger.info("Not connecting: the client manager was abandoned")
             return []
 
         # Connect to all servers concurrently, sharing work for duplicate names.
@@ -1702,8 +1716,13 @@ class ClientManager:
             if before_lock is not None:
                 before_lock.status.status = ServerStatusEnum.OFFLINE
                 self._abandon_client_io(name, before_lock)
-                self._cancel_background_tasks_now(server_name=name)
                 self._forget_disconnected(name, before_lock.config)
+            # Outside the `if`: a connect for this server may be in flight
+            # with no client registered yet (e.g. in its retry backoff,
+            # holding the lock). Cancel it either way, or its next attempt
+            # spawns after this disconnect. (Its `_connect_singleflight`
+            # drops the `_connect_tasks` entry as the cancel unwinds.)
+            self._cancel_background_tasks_now(server_name=name)
             raise
         try:
             return await self._disconnect_server_locked(name, cancelled)
@@ -1844,6 +1863,8 @@ class ClientManager:
             try:
                 await self._connect_server(config)
                 return  # Success
+            except _ManagerAbandoned:
+                raise  # Not a failure to retry: the gateway is shutting down.
             except Exception as e:
                 last_error = e
                 if attempt < MAX_CONNECTION_RETRIES - 1:
@@ -1860,7 +1881,17 @@ class ClientManager:
             raise last_error
 
     async def _connect_server(self, config: ResolvedServerConfig) -> None:
-        """Connect to a single MCP server."""
+        """Connect to a single MCP server.
+
+        Every connect path -- startup, `connect_server`, `refresh`, lazy
+        start, reconnect -- ends here, so this one check is what stops an
+        operation that was already in flight when `abandon_all_now()` ran
+        (e.g. a `refresh` holding the lifecycle lock through shutdown) from
+        spawning a server afterwards (Consiliency/pmcp#324)."""
+        if self._abandoned:
+            raise _ManagerAbandoned(
+                f"Not connecting {config.name}: the client manager was abandoned"
+            )
         if isinstance(config.config, RemoteMcpServerConfig):
             if config.config.type in ("http", "streamable-http"):
                 await self._connect_streamable_http(config)
@@ -2940,7 +2971,12 @@ class ClientManager:
         calls this and re-raises. Repeating it for clients `disconnect_all`
         already abandoned is harmless (see `_disconnect_all_unlocked`).
         Catalogs are left to `disconnect_all` (the publisher-coverage guard
-        keeps catalog writes there); the process is exiting."""
+        keeps catalog writes there); the process is exiting.
+
+        It is terminal: `_abandoned` stays set, so a lifecycle operation
+        already in flight (a `refresh` holding the lock) or queued behind
+        one cannot spawn a server afterwards (`_connect_server`)."""
+        self._abandoned = True
         for name, managed in list(self._clients.items()):
             self._abandon_client_io(name, managed)
         self._cancel_background_tasks_now()
