@@ -1,125 +1,70 @@
 # Detailed plan: describe validation errors from their structure, never their value — everywhere pmcp turns an exception into text
 
-> **Revision 12 (2026-10-01), on main `89559db`** (re-fetched; unchanged
-> since rev 10, during which it moved from `d5a3cda` by Consiliency/pmcp#327 (tests only)
-> and Consiliency/pmcp#325 (JWKS refresh and backoff in `auth.py` and
-> `transport/http.py`). Those were merged into `wip/297-code`:
-> - the one conflict, the JWKS body parse, keeps `load_json` with Consiliency/pmcp#325's
->   `except (ValueError, RecursionError)`;
-> - the static guards found no new parse site or sink in Consiliency/pmcp#325's code;
-> - the verification below is on the merged tree.
->
-> Rev 8 had moved main from `7680445` by six commits, as follows. Two of them touch patched files:
-> - Consiliency/pmcp#294 piece 1 (version pinning, Consiliency/pmcp#319): `manifest/loader.py`,
->   `tools/handlers.py`, `types.py`, the CHANGELOG and the README;
-> - PR 321 (Consiliency/pmcp#321, for Consiliency/pmcp#287): the stdio and SSE read loops in
->   `client/manager.py`.
->
-> Main was merged into `wip/297-code`. The conflicts were resolved like this:
-> - the overlay's unreadable-document return keeps `exception_text` and
->   takes main's 4-tuple;
-> - the stdio reader keeps PR 321's dispatcher with rev 8's parse split
->   (§12);
-> - both CHANGELOG entries are kept.
->
-> Main's one new direct parse, `_shipped_manifest_entries`, was caught by
-> the helpers-only rule and is routed through `load_yaml`, and the sink guard
-> found no new sink. PR 321 now drops a legacy-SSE frame that fails
-> validation instead of ending the loop, so the frame sweep's downstream
-> follows such a frame with the real reply, as it already did on stdio.
-> The other commits are a pyjwt bump, a Consiliency/pmcp#294 plan document,
-> a CI action bump, and Consiliency/pmcp#323 (`manifest/loader.py` warnings).
+> **Revision 13 (2026-10-03), on main `c9206a9`**, which moved from
+> `89559db` by Consiliency/pmcp#337 (Consiliency/pmcp#298: an unusable task
+> hint is dropped and named in `unusable_fields`, not raised),
+> Consiliency/pmcp#340 (auth messages through a checked registry),
+> Consiliency/pmcp#339 (manifest cache, libyaml) and plan documents. Merged
+> into `wip/297-code`: the task timestamp check, the shipped-manifest libyaml
+> parse and the manifest parse go through `pmcp.parsing` (a `safe_yaml_loader`
+> and a safe-only `loader=` for `load_yaml`); two new sinks (the cache-failure
+> reporter, the auth-config startup error) are rendered; Consiliency/pmcp#340's "no log
+> hook" check allows this plan's record scrubber, whose pass-through of every
+> auth message its own sink test shows. The merge with Consiliency/pmcp#337 exposed two
+> paths of this plan's class, now closed: a dropped task hint stayed in the
+> task's `raw`, which `gateway.tasks_*` return, and in `gateway.invoke`'s
+> `raw_size_estimate`. Earlier merges: rev 12 (`48b7a89`).
 >
 > Consiliency/pmcp#297, the prerequisite for piece B
 > (`extra="forbid"`) of Consiliency/pmcp#236. The change is **embedded, not
 > described**: the 45 blocks under *Verbatim bodies* are `git apply` patches
-> against `origin/main` @ `89559db`, byte-identical to the verified code on
-> the local-only branch `wip/297-code` @ `0a93265`, which was never pushed
-> (rev 1 was `19dac95`, rev 2 `929f693`, rev 3 `026aadc`, rev 4 `ee644a9`, rev 5 `1824a09`, rev 6 `9b24daa`, rev 7 `dd3f707`, rev 8 `2d9e736`, rev 9 `8d33b49`, rev 10 `6078419`, rev 11 `46c4904`). *Embedding
+> against `origin/main` @ `c9206a9`, byte-identical to the verified code on
+> the local-only branch `wip/297-code` @ `ebcf4fc`, which was never pushed
+> (rev 1 was `19dac95`, rev 2 `929f693`, rev 3 `026aadc`, rev 4 `ee644a9`, rev 5 `1824a09`, rev 6 `9b24daa`, rev 7 `dd3f707`, rev 8 `2d9e736`, rev 9 `8d33b49`, rev 10 `6078419`, rev 11 `46c4904`, rev 12 `0a93265`; rev 13 before the merge `5d8c463`). *Embedding
 > proof* extracts them from this file with its own extractor, `git apply
-> --check`s them on a fresh `89559db` worktree, applies them and compares
-> the whole tree with `0a93265`.
+> --check`s them on a fresh `c9206a9` worktree, applies them and compares
+> the whole tree with `ebcf4fc`.
 >
-> **What rev 12 changes** (round-11 board on Consiliency/pmcp#314 @
-> `97e6973`: codex two BLOCKING; gemini AGREE; claude notes (a), (b); see
-> *Rev 11 board findings*):
-> - **No non-protocol stdout line is logged with its content** (§12). Each
->   gets one fixed record. That replaces the rev 8–11 output/frame
->   classifier and describe mode, which an interleaved valid response beat.
-> - **Values pmcp rejects by hand are described, not shown** (§14): a
->   downstream's pagination cursor, and a caller's `gateway.cancel` id,
->   `auth_connect` env var and `register_discovered_server` env names.
->   This is a class found by an AST detector and triaged by provenance,
->   with a static rule for the `repr` spelling.
-> - **An `MCPError`'s `data` is dropped only when it carries the rejected
->   value** (claude (b)); partial copies are covered as stated in §13
->   (claude (a)).
+> **What rev 13 changes:** see *Rev 12 board findings* (round-12 board on
+> Consiliency/pmcp#314 @ `48b7a89`; gemini AGREE).
 >
-> **Revs 2–11** (each answering the previous board; rev 11's full account,
-> with the round-10 table, is in rev 11 of this plan, `97e6973`; rev 10's in
-> `b7eacbe`; rev 9's in `a449dd9`; rev 8's in `4bafa47`; rev 7's in
-> `4d4b186`; revs 2–6 in `8d03712`):
-> - rev 11: the handler wrapper keeps the SDK's wire codes; §13 names the
->   serving side;
-> - rev 10: the SDK's traffic logging shows message structure; a frame
->   broken across stdio lines stays described (round-9 codex P1, N1-r9);
-> - rev 9: stdio output decided by where JSON can start, and shown only up
->   to a frame opener (round-8 codex P1, claude N1);
-> - rev 8: rejected stdio frames described, not logged (round-7 codex);
->   the static rule covers parser submodules; built on PR 321
->   (Consiliency/pmcp#287);
-> - rev 7: parse failures classified by origin through `pmcp.parsing`; a
->   malformed `Origin` port is a 403; timestamps through the helper;
->   `threading.excepthook` wrapped;
-> - rev 6: parse errors rendered structurally; `sys.excepthook` and
->   `handleError` wrapped; the CLI inside the static guard;
-> - rev 5: the scrubber is installed on `import pmcp` (every entry point,
->   including `pmcp refresh`);
-> - rev 4: the record-factory scrubber (every logger, including the SDK's
->   `"client"`);
-> - rev 3: malformed downstream frames on every transport; a dataflow-aware
->   static guard;
-> - rev 2: every exception-to-text sink through `exception_text`; the log
->   oracle sees everything; constraints read from pmcp's own schema.
->
-> Decisions (rev 1's stand; each argued in *Design*):
-> - One renderer module, `pmcp.argument_errors`, for both libraries. The
->   failing location is shown with caller-chosen keys as `*`. The reason is a
->   fixed phrase, and it never reads jsonschema's
->   `message`/`instance`/`validator_value`/`context`/`cause`/`schema` or
->   pydantic's `msg`/`input`/`ctx`.
-> - pmcp's three custom validators raise fixed-message
->   `PydanticCustomError`s.
-> - Same rule for the log and the audit. A call rejected by the tool's own
->   argument model is an `audit.rejection`. An unregistered tool name is not
->   logged.
-> - Responses keep their prefixes (`Input validation error: $...`,
->   `Invalid arguments: $...`).
-## Rev 11 board findings — before/after
+> **Revs 1–12**, each answering the previous board, are summarised under
+> *Research and design* and given in full in rev 12 of this plan
+> (`48b7a89`; earlier accounts in `97e6973`, `b7eacbe`, `a449dd9`,
+> `4bafa47`, `4d4b186`, `8d03712`). Rev 1's decisions stand: one renderer
+> module for both libraries; caller-chosen keys shown as `*`; fixed reason
+> phrases; fixed-message `PydanticCustomError`s in pmcp's validators; one
+> rule for the response, the log and the audit; response prefixes kept.
 
-The round-11 board on Consiliency/pmcp#314 @ `97e6973`: codex two BLOCKING
-(F027–F037); gemini AGREE; the claude seat found nothing blocking, with
-notes (a) and (b). Earlier rounds' tables are in rev 11 of this plan
-(`97e6973`) and before.
+## Rev 12 board findings — before/after
 
-**Reproduced** (`r12/test_repro12.py`, run unchanged on both trees: the
-real `_fetch_listing_pages`, the real `_read_stdout` with request 8
-pending, and the real `cancel_request`):
+Round 12 on Consiliency/pmcp#314 @ `48b7a89`: B1 from the claude seat and
+codex (F022–F029), B2 from codex; gemini AGREE. Both rev 12 class fixes
+held (no stdout content in any record; cursors 27/27 clean). Earlier
+tables are in rev 12 (`48b7a89`) and before.
 
-| Case | Rev 11 (`46c4904`) | Rev 12 (`0a93265`) |
+**Reproduced** (`r13/test_repro13.py`, unchanged on both trees: the real
+`gateway.cancel` through the tool surface and its audit buffer; the real
+`_fetch_listing_pages` and `_read_stdout` with page 2 waiting; the SDK
+client transports' adapter):
+
+| Case | Rev 12 (`0a93265`) | Rev 13 (`ebcf4fc`) |
 |---|---|---|
-| cursor: tools/resources/prompts × `nextCursor`/`next_cursor` × object/list (12 cases) | leak: log in 12 of 12 | clean in 12 of 12 |
-| stdio: broken head, response for pending id 8, continuation | leak: log (request 8 resolved: True) | clean (request 8 resolved: True) |
-| caller: gateway.cancel request_id | leak: response | clean |
-| **total** | **14 of 14 leak** | **0 of 14 leak** |
+| B2 stdio, page 2 waiting: `"jsonrpc": "1.0"` / no `jsonrpc` / `result` and `error` / object `code`, message `<S>` (4) | leak: log, 4 of 4 (`page 2 failed (<S>)`); the frame settled page 2 | clean, 4 of 4; the valid reply settles it |
+| B2 SSE / streamable HTTP, the SDK client adapter: `result` and `error`; a bool, string or float `code` (4) | accepted as an error response carrying `<S>`, 4 of 4 | rejected, value-free, 4 of 4 |
+| B1 `gateway.cancel`: `<S>`, `<S>::notint`, `x::<S>` (3) | leak: response `request_id`, 3 of 3; audit `server_name` for `<S>::notint` | clean, 3 of 3 |
+| **total** | **11 of 11 leak** | **0 of 11** |
 
-| Finding | Rev 11 | Rev 12 | Proven by |
-|---|---|---|---|
-| **codex P1: a rejected pagination cursor at WARNING.** `_fetch_listing_pages` logged `({raw_cursor!r})`, so `nextCursor: {"token": <S>}` leaked. That was 12/12 across 3 listing kinds × 2 spellings × object/list. | `!r`. | **The class** (§14): an AST detector found every message that interpolates a non-renderer value next to rejection wording (139 sites). Each was triaged by provenance, and every caller or downstream value is now described by `describe_value`: the cursor, `gateway.cancel`'s id, `auth_connect`'s env var (also no longer echoed in `env_var`, nor in the audit `error`) and `register_discovered_server`'s env names. A static rule fails on any `!r`/`repr()`/`%r` in a rejection message; its 14 operator-config exemptions are named. The cursor moves here from Consiliency/pmcp#315. | The frame sweep's `cursor-object`, `cursor-list` and `cursor-repeat` shapes (every listing kind, 4 transports, nothing exempt); `test_a_value_rejected_by_hand_is_described`; `test_no_rejected_value_is_rendered_with_repr` and its spelling test. Mutants M68–M72, M75. |
-| **codex P1: an interleaved valid response ended describe mode.** A broken head, a real response for pending request 8, then `API_KEY=<S> "}`, logged as `Non-JSON output: API_KEY=<S>`. | Describe mode. | **The class** (§12, the claude seat's round-11 proposal): a stdout line that is not a JSON-RPC message is never logged with its content. It gets `[srv] non-protocol stdout line: <parse description>`. The classifier and describe mode are removed. | `test_no_record_shows_a_non_protocol_stdout_line` × 6 families: every rev 8–11 generator's streams plus both codex streams and banners, through the real `_read_stdout`, with no 12-character window of any non-frame line in any record. `test_a_banner_line_gets_the_fixed_record`. Mutant M67. |
-| **claude (a):** `message_text` matches validation text only whole. | Unstated. | §13 states that the static guard covers `e.errors()`/`str(e)[:N]` copies, and `carries_rejected_value` matches a rejected input on its own. | `mcp_partial_message` in the wire-code test. |
-| **claude (b):** `data` was dropped from any `MCPError` raised while a validation error was handled. | Dropped. | Dropped only when it carries what was rejected. | `mcp_data_kept`, `mcp_data_carries`; M73, M74. |
+End to end on every transport: the red run on rev 12 (*Acceptance
+criteria*).
 
+| Finding | Rev 13 | Proven by |
+|---|---|---|
+| **B1** a rejected `gateway.cancel` id copied into `request_id` and the audit `server_name` | `null` / no server, one parse for manager and handler; every field that copies a caller input derived and triaged (§14) | hand-rejection test through the tool; triage test; M76–M78, M89 |
+| **B2** a parseable malformed envelope dispatched, its `message` logged by the waiting caller | the JSON-RPC 2.0 / MCP envelope gates dispatch on stdio and, via a strict adapter, the SDK's client transports; a violation settles nothing (§12) | property test (49 violations); waiting-caller test and control; `envelope-*` sweep shapes; adapter tests; M79–M84, M90 |
+| **claude** repr-rule gaps | every spelling, six words, exemptions by site (§14) | the rule and its 30-case spelling test; M75, M85–M88 |
+| **claude** `(N bytes)`; "any stdout line"; `<token>::5` | §12 quotes the record and scopes the claim to the protocol reader; `<token>::5` stays Consiliency/pmcp#315's (§14) | — |
+| **merge** of Consiliency/pmcp#337 (Consiliency/pmcp#298): an unusable task hint is dropped, not raised | the dropped value is kept out of the task's `raw` (returned by every `gateway.tasks_*` tool) and out of `invoke`'s `raw_size_estimate`; `_rejected_texts` matches strings inside a container input (a task fixture's new shape exposed it) | the downstream task sweep, now counting drops; the wire-code test; M91–M93. Since the drop rule no sweep drives a validation error into `tasks_get`'s `except`, so M19/M20 now die only on the static guard |
 
 ## Task
 
@@ -134,715 +79,196 @@ validator keyword), never text; keep errors useful; and pin it with a
 property test whose axes come from the code. Must land before piece B of
 Consiliency/pmcp#236, whose `extra_forbidden` error carries `input_value`.
 
-## Research summary (measured on main `7680445`)
-
-### Where rejection text reaches a caller, a log or the audit
-
-Read on `7680445`. The full table, with the text each site leaked, is in
-rev 10 of this plan (`b7eacbe`):
-- L1: the schema gate's `Input validation error: {e.message}` (response);
-- L2/L3: `call_tool`'s `Tool execution error: {e}` (log) and `str(e)[:400]`
-  (response), carrying pydantic's `input_value`;
-- L4/L5: the scoped `InvokeInput` and `RegisterDiscoveredServerInput`
-  validators feeding L2/L3;
-- L6: the audit recording a model-rejected call as an invocation;
-- L7: `provision_status` validating inside a `try` that logs `exc_info`;
-- L8: the unknown-tool name into the log;
-- L9: downstream data rejected inside a handler (`McpTaskInfo`, the
-  listing parsers) into `errors`, the audit-event buffer and the log.
-
-Not leaking, measured:
-- #296's `record_rejected_arguments` (path and keyword only);
-- the SDK's own params validation, which maps a pydantic error to
-  `INVALID_PARAMS` with `data=""`;
-- `GatewayException.__str__`, which is its message only.
-
-### Every exception-to-text sink (rev 2)
-
-Measured on `7680445` and unchanged since; how the static guard defines a sink, and its counts on main (89 findings in 20 modules) are in rev 6 of this plan (`8d03712`).
-
-### Downstream frames (rev 3)
-
-Measured on `7680445` and unchanged since; how each MCP SDK client transport turns a malformed frame into an error are in rev 6 of this plan (`8d03712`).
-
-### Not leaking except to the sender (rev 2, N4)
-
-`mcp/server/streamable_http.py:550` (SDK, legacy streamable-HTTP transport)
-answers a malformed JSON-RPC *envelope* (e.g. `"params": "<string>"`) with
-HTTP 400 `Validation error: {str(e)}`, pydantic text included. Only the
-sender of that malformed envelope sees it, and no tool argument can reach
-it, because any `params` object passes the envelope. It is SDK-owned. See
-*Non-goals*.
-
-### The probe (before)
-
-`probe.py` sent a wrong-type / pattern / length / enum value carrying a
-sentinel to every declared property of every registered tool. On
-`7680445` it found **97 leaking cases**, every one in the response and
-the three validator cases in the log too; `count_leaks.py` found 225 gate
-and 6 model response leaks. The outputs and both scripts are in rev 5 of
-this plan (`91562e6`). On the patched tree both report zero.
-
-### Library facts the design rests on
-
-Measured on `7680445` and unchanged since; the measured jsonschema and pydantic behaviours the renderers rely on are in rev 6 of this plan (`8d03712`).
-
-### Echo of *valid* argument values (enumerated; see *Non-goals*)
-
-Enumerated site by site in rev 9 of this plan (`a449dd9`) and in
-Consiliency/pmcp#315: a value that *passes* validation is echoed where a
-handler looks it up or refuses it. That is not this plan's class.
-
-## Design
-
-### 1. Where: a JSON path with caller-chosen keys as `*`
-
-`schema_error_path` / `declared_property_names` move verbatim from
-`scoped_advisor_audit.py` (Consiliency/pmcp#296) into the new module, which
-the audit now imports, so one implementation decides both the audit's
-`rejected_argument_path` and the text: a segment survives only as an index
-into a list or as a key some `properties` map declares; anything else is
-`None` in the record and `*` in the text (JSONPath's wildcard: "some key").
-The pydantic location gets the same rule, with the declared set widened to
-every field name and alias of every `GatewayArguments` model (author
-strings, so `$.meta` for the `populate_by_name` spelling is still named).
-An `int` segment survives only when the argument walk shows a list at that
-point, so an in-process `int` dict key is redacted as in #296.
-
-### 2. Why: a fixed phrase, filled from the gateway's own constraint
-
-Unchanged since rev 2; the full rules are in rev 10 of this plan
-(`b7eacbe`). In short:
-- A **jsonschema** error's keyword, and a **pydantic** error's `type`
-  (read with `include_input=False, include_context=False`), select a fixed
-  phrase.
-- A constraint (type, enum, pattern, a length or a bound) is read from the
-  gateway's **own schema node** at the error's location, never from
-  `validator_value`/`schema`/`ctx`. With no node, the phrase names no
-  constraint.
-- `required` names the first missing schema key. `additionalProperties`
-  names no key.
-- Unknown kinds read `is invalid`.
-- pmcp's three validators raise `argument_error(<TYPE>)`, a
-  `PydanticCustomError` with a constant message.
-- Up to five errors are joined.
-- Rendering itself fails closed to `$: is invalid`.
-
-### 3. The three channels
-
-Unchanged since rev 2; the full text, with the tests that pin each
-prefix, is in rev 10 of this plan (`b7eacbe`):
-- **Response.** `Input validation error: <description>` at the gate, and
-  `Invalid arguments: <description>` for the tool's own model (other
-  exceptions go through `exception_text`).
-- **Log.** `Tool execution error: invalid arguments for <tool>:
-  <description>`. An unregistered name logs `unknown gateway tool`.
-- **Audit.** A model rejection is an `audit.rejection` (`invalid_arguments`,
-  the first error's redacted path, `rejected_argument_validator: null`),
-  not an invocation failure.
-
-### 4. `provision_status`
-
-`ProvisionStatusInput.model_validate` moves above the `try` (L7), so a
-rejection raises into `call_tool`'s arm like every other handler instead of
-being logged with a traceback; the arm's fallback `job_id=` now uses the
-validated id.
-
-### 5. Why not a regex scrub of `str(e)`
-
-Stripping `input_value=...` from rendered text is a denylist over a format
-pydantic owns (and a validator's own message has no marker at all);
-Consiliency/pmcp#296's lesson is that a denylist fails open. Rendering from
-structure has no text to scrub.
-
-### 6. The sweep and why its axes cover the class
-
-Each axis is stated in full in rev 10 of this plan (`b7eacbe`). Every
-sweep runs × 6 sentinel families (hex, letters, a provider-token shape,
-spaced, non-ASCII, digits) and checks, with nothing exempt except where
-stated:
-- the response;
-- every log record at DEBUG in full (message, args, `extra=`, `exc_info`,
-  `stack_info`);
-- stdout/stderr, warnings, the audit JSONL and the audit-event buffer.
-
-It looks for any 12-character window or hash of the sentinel, and adds a
-pair differential over two lengths. The sweeps:
-- **caller arguments** (rev 1–2): every gateway tool × every declared
-  position × every shape the node rejects (type, pattern, length, enum,
-  `required`, every custom validator), decorated with extra keys and open
-  containers, on a plain and a scoped-audit server. Each case must be a
-  rejection, so there is no vacuous pass.
-- **inside handlers** (rev 2): stub handlers raising each validation-error
-  type.
-- **downstream payloads through the real handlers** (rev 2):
-  `_task_info_from_payload`'s keys and the listing parsers' keys, with
-  `_send_request` replaced.
-- **static** (rev 2; dataflow-aware in rev 3): 44 construct tests, plus a
-  renderer-passes test.
-- **the SDK's `ClientSession`** (rev 4): the real `refresh_server` against
-  9 malformed message kinds.
-- **malformed frames on every real transport** (rev 3; `json-*` shapes
-  rev 8): 4 transports × 11 methods.
-- **valid envelopes, rejected payloads, real transports** (rev 10): the
-  `payload` shape for every method, plus a caller sentinel sent out through
-  `gateway.invoke`.
-- **parse errors** (rev 6–7): 15 file-reading sites × every rejected YAML
-  and JSON shape (tags, anchors, nesting), the helpers directly, the
-  timestamp sites, and fresh-interpreter hooks.
-- **stdio lines** (rev 12): every stream the rev 8–11 generators produce
-  (grammar-derived rejected frames, every value-start and prefix class ×
-  15 leads, broken frames, non-frame and interleaved middles, an oversized
-  head, banners) through the real `_read_stdout`. No record may carry any
-  12-character window of a non-frame line.
-- **values rejected by hand** (rev 12): the frame sweep's `cursor-*`
-  shapes, plus the caller-side refusals (§14).
-- **every entry point** (rev 5): a fresh interpreter per entry point, and
-  the real `pmcp refresh`.
-
-### 7. Every other exception-to-text sink (rev 2, B1)
-
-Unchanged since rev 6; the full text is in rev 10 of this plan
-(`b7eacbe`):
-- `exception_text(e)` is `str(e)`, except for a validation or raw parse
-  error, or an exception whose text embeds one it chains. Those are
-  described structurally (`N validation error(s) for <Model>: $.<path>:
-  <phrase>`, with only pmcp-declared names in the path). The embedding
-  check is an exact-substring backstop; pmcp never builds a truncated copy,
-  and the guard flags one.
-- `safe_exc_info(e)` withholds a traceback whose chain holds one.
-- `safe_traceback_text(e)` renders frames plus `Type: exception_text`.
-- They are applied at the three shared renderers and at every sink the
-  static guard finds: `{e}`, `str(e)`, logging arguments, `exc_info=True`
-  and `logger.exception`. The CLI has been inside the guard since rev 6.
-- `server.py`'s arm describes the tool model's own rejection against its
-  schema (`Invalid arguments: …`).
-
-### 8. Why sinks and not one choke point
-
-pydantic's `ValidationError.__str__` is a C type, so there is no global
-hook. `hide_input_in_errors` exists only per model, and the SDK's and
-jsonschema's errors have no such switch. A logging filter sees only records
-routed to the handlers it is attached to, and never sees a string built
-with `f"{e}"` before logging. What *is* one place is the rule, and the
-static test enforces it at every sink.
-
-### 9. Text that originates outside pmcp (rev 3; rev 4)
-
-Unchanged since rev 6; full text in rev 9 of this plan (`a449dd9`):
-- **The SDK's synthesised parse errors.** `_downstream_error` replaces any
-  `-32700` message, and any malformed `error`, with fixed text.
-- **Downstream-authored text the SDK quotes is kept:** a downstream's own
-  well-formed error `message`; `Unexpected content type: <header>`;
-  `Unknown SSE event: <event>`; `dropping tool %r: invalid
-  x-mcp-header`. Since rev 10, the method and id identifiers in §13's
-  table join them.
-- **Every log record is scrubbed at creation** (rev 4).
-  `install_log_scrubber()` wraps `logging`'s record factory, so every
-  record from any logger has its `exc_info`, `%`-args (nested) and
-  exception-valued `msg` scrubbed. Text a library has already formatted
-  into the message string is out of the scrubber's reach, which is why
-  §13 renders SDK message objects themselves. The install runs on `import
-  pmcp` (rev 5), so every entry point has it.
-- **stdio stdout lines that are not frames** get one fixed record (§12,
-  rev 12); stderr is logged as the downstream's own output (*Non-goals*).
-
-### 10. Parse errors (rev 6; classified by origin in rev 7)
-
-Unchanged since rev 8; the full argument is in rev 9 of this plan
-(`a449dd9`). In short:
-- A parser's failure can quote its input: PyYAML's snippet, a tag's
-  constructor raising a plain `ValueError`/`KeyError` (`!!int <S>`),
-  `fromisoformat`, a `bytes.decode`.
-- So every parse of structured text in `src/pmcp` goes through
-  `pmcp.parsing` (`load_yaml`, `load_json`, `load_json_file`,
-  `parse_timestamp`). These catch **any** exception and raise, outside
-  the `except`, a value-free `ParseError(kind, source, line, column,
-  cause)`. `ParseError` subclasses the type callers already catch.
-- `exception_text` renders it as its own text.
-- `sys.excepthook`, `threading.excepthook` and `handleError` print a
-  value-bearing chain structurally.
-- The static rule (`test_no_parser_call_outside_the_helpers`) allows no
-  parser reference outside `parsing.py`. Imports are resolved, including
-  parser submodules, `<x>.yaml.<attr>` and `.json(...)`. There are 8
-  named exemptions: python-dotenv, and a response object's `.json()`.
-
-### 11. An unparseable `Origin` header (rev 7, B2)
-
-`_origin_host_port` reads `urlparse(origin)`, `.hostname` and `.port` inside
-`try/except ValueError`, and returns `None` on failure. Both callers
-already treat `None` as unparseable: the DNS-rebinding check rejects it
-(403), and the allowlist builder skips it. The case the board found is a
-non-numeric port (`Port could not be cast to integer value as '<S>'`); an
-out-of-range port and a malformed IPv6 literal take the same path. The
-other `urllib.parse` `.port` reads in `src/pmcp` were audited: three in
-`auth.py` are guarded, and one in `scoped_advisor_audit.py` is inside
-`except (TypeError, ValueError)`. `.hostname` does not raise.
-
-### 12. Stdout lines that are not JSON-RPC messages (rev 8–11; replaced in rev 12)
-
-Revs 8–11 tried to tell a stdio downstream's own output (a banner) from a
-rejected or broken frame, line by line. Each rule was beaten by a new
-stream:
-- a parser-limit frame (round 7);
-- an unterminated string (round 8);
-- a frame broken across lines (round 9);
-- a non-frame middle line (round 10);
-- an interleaved valid response (round 11: a broken head, a real response
-  for pending request 8, then `API_KEY=<S> "}}`).
-
-Their rules and generators are in rev 11 of this plan (`97e6973`).
-
-Rev 12 fixes the class, as the round-11 claude seat proposed: **the content
-of a stdout line that is not a JSON-RPC message is never logged.**
-- A line that does not parse gets one fixed DEBUG record:
-
-  ```text
-  [<server>] non-protocol stdout line: could not parse JSON downstream stdio frame at line L, column C (<Class>)
-  ```
-
-- A line that parses but is not a valid frame is dropped by the
-  dispatcher's guards (PR 321) with a type-only record.
-- A line over the stdout limit is dropped with the fixed oversized-line
-  warning.
-- There is no aggregation or rate limit: one record per line, the same
-  rate as before. The byte count is left out because it would follow the
-  content's length.
-
-The trade-off: MCP's stdio transport allows only newline-delimited
-messages on stdout, so only a non-conforming server loses visibility. Its
-stdout banners, `INFO:` lines and any other text are no longer shown at
-DEBUG. A server's log belongs on stderr, which is logged as before.
-
-Removed with the rule:
-- the value-start classifier, the cut at frame openers,
-  `_is_downstream_output`, `_output_text`, `_is_protocol_frame` and
-  describe mode (`stdio_frame_broken`);
-- their tests and mutants (M46, M50–M53, M59, M61–M64).
-
-The tests become one property, `test_no_record_shows_a_non_protocol_stdout_line`:
-- every stream the rev 8–11 generators produce, plus codex's two round-11
-  streams and banners of each common shape, goes through the real
-  `_read_stdout`;
-- no record may carry the sentinel, or any 12-character window of any
-  line that is not a valid frame;
-- no record is exempt.
-
-A frame injected through an echoing downstream is Consiliency/pmcp#328's,
-not this plan's.
-
-### 13. The SDK's traffic logging (rev 10, round-9 codex P1)
-
-At DEBUG, the MCP SDK (2.0.0) logs JSON-RPC messages as its transports move
-them. A message is logged **after** the transport accepts its envelope and
-**before** pmcp validates its payload, so a downstream value pmcp then
-rejects was already in the log. An outgoing request carries the caller's
-arguments. The sites, from a grep of every `logger.*(` call in
-`mcp/client`, `mcp/shared` and `mcp_types`:
-
-| Site | Renders | Rev 10 |
-|---|---|---|
-| `client/sse.py:99` | `f"Received server message: {message}"` | structural (object render) |
-| `client/sse.py:123` | `f"Sending client message: {session_message}"` (with metadata) | structural |
-| `client/streamable_http.py:165` | `f"SSE message: {message}"` | structural |
-| `client/streamable_http.py:562` | `f"Sending client message: {message}"` | structural |
-| `client/__main__.py:26/:29` | `"Error: %s"` / `"…from server: %s"` of a message (the SDK's example CLI; pmcp never runs it) | structural |
-| `shared/jsonrpc_dispatcher.py:540` | `"transport yielded exception: %r"` | scrubbed when the exception holds a validation error (rev 4) |
-| `client/stdio.py:166/:223`, `client/sse.py:101/:110/:113`, `client/streamable_http.py:186/:406`, … | `logger.exception(...)` | traceback scrubbed (rev 4) |
-| `shared/jsonrpc_dispatcher.py:159/:462/:474`, `client/session.py:1414/:1419/:1429/:1433/:1447/:505`, `shared/dispatcher.py:243` | a method name | kept: an identifier (below) |
-| `shared/jsonrpc_dispatcher.py:664/:669/:784/:790`, `client/streamable_http.py:294/:473` | a request id | kept: an identifier (below) |
-
-**The fix is at the object, not at the four sites.** They are f-strings, so
-the record holds preformatted text and no object a record scrubber could
-match. `install_log_scrubber()` therefore installs, idempotently, a
-structural `__str__`/`__repr__` on:
-- the SDK's `JSONRPCRequest`, `JSONRPCNotification`, `JSONRPCResponse` and
-  `JSONRPCError`;
-- `SessionMessage`;
-- `ClientMessageMetadata` / `ServerMessageMetadata`, whose `headers` can
-  carry `Mcp-Param-*` tool-argument values (`x-mcp-header`).
-
-Every rendering (f-string, `%s`, `%r`, a containing dataclass's repr)
-becomes, for example:
-
-```text
-<JSON-RPC request: method 'tools/call', id: int, params: object (2 keys)>
-<JSON-RPC response: id: int, result: object (1 key)>
-<JSON-RPC notification: an undeclared method>
-SessionMessage(<JSON-RPC request: …>, <ClientMessageMetadata headers: Mcp-Method, Mcp-Param-Q>)
-```
-
-- A method is shown only if the SDK's own types declare it. That is 34
-  names, derived from every `method: Literal[...]` in `mcp_types`.
-- An id is shown as its type; a payload as its shape; headers by name.
-- Nothing functional depends on the old rendering. A grep for `str(`,
-  `repr(` and f-string renderings of `message` / `msg` / `session_message`
-  in the SDK and in `src/pmcp` finds only the four logging sites, and
-  serialization uses `model_dump`/`model_dump_json`, which are unchanged.
-  The full suite passes with the rendering installed.
-
-The record scrubber also describes a dict shaped like a message (`jsonrpc`
-plus `method`/`result`/`error`/`params`/`id`) wherever it appears in a log
-call's `%`-arguments. A future SDK site, or any logger, that formats a
-message object or passes one as an argument is covered without being
-listed.
-
-**Identifiers are kept.** The method and id lines above quote one scalar
-identifier, never a payload.
-- On the **client** side, pmcp assigns every request id it sends, as an
-  integer. An id or method a downstream sends is its own identifier, the
-  same class as §9's event names, tool names and headers.
-- On the **serving** side (rev 11, round-10 claude N1-r10), the SDK's
-  dispatcher quotes the *caller's* request ids (e.g. `shutdown error
-  response for request {req.id!r}`): the client software's identifiers,
-  kept likewise.
-
-**The serving side** (N1-r10):
-- `sse_starlette.sse` logs every outbound SSE chunk at DEBUG (`chunk: %s`,
-  bytes). That is the full body of each response pmcp sends its caller,
-  including a proxied downstream result. It never carries a value pmcp
-  *rejected* (a rejection is described before the response is built), so
-  it stays in Consiliency/pmcp#315.
-- `mcp/server/streamable_http_manager` logs a rejected `Mcp-Session-Id`
-  (its first 64 characters) at INFO. That is an HTTP client's transport
-  header, not a value the agent sets (*Non-goals*).
-
-This takes over the SDK-traffic part of Consiliency/pmcp#315's "accepted
-values" (round-8 claude N2).
-
-**Two more rendering points**, now structural:
-- **A request handler's escaping exception.** The SDK maps it with
-  `handler_exception_to_error_data`:
-  - an `MCPError` carries its own `ErrorData`;
-  - a bare `ValidationError` becomes `-32602` with no text;
-  - anything else becomes `code=0, message=str(e)`
-    (`shared/jsonrpc_dispatcher.py:752-757`), which is where a wrapper
-    like `ValueError(f"... {e}") from e` sends the value.
-
-  `_described_errors` wraps every handler pmcp registers. When the chain
-  holds a validation or parse error, it raises a replacement outside the
-  `except` that keeps that mapping's code and changes only the text
-  (rev 11, N2-r10):
-  - `MCPError(code, message, data)`, keeping its own message and `data`
-    unless either carries what the chain rejected (`carries_rejected_value`
-    looks for a validation error's whole text and for each input it
-    recorded, whole or inside a string). Rev 11 dropped `data` whenever the
-    chain held a validation error (round-11 claude note (b)). A message
-    that carries it falls back to `message_text`, then to fixed text;
-  - `MCPError(-32602, <description>)` for a bare `ValidationError`;
-  - `ValueError(<description>)` otherwise.
-
-  The subscriptions `ListenHandler` is not wrapped; the SDK drives it as a
-  stream. Rev 10 called the bare-`ValidationError` case a wire leak; that
-  was a harness artifact (*Rev 10 board findings*).
-- **`_entry_label`'s fallback**, which was `repr(entry)[:120]`, is now
-  `(an entry with N keys)`.
-
-**Partial copies (round-11 claude note (a)).** `message_text` and
-`exception_text` recognise a validation error's text only whole. A copy
-built from `e.errors()` or `str(e)[:N]` is not recognised by them. Two
-things cover it:
-- the static sink guard, which flags every such construction site in
-  `src/pmcp` (none exists);
-- `carries_rejected_value`, which the request-handler wrapper uses and
-  which also matches a rejected input on its own.
-
-### 14. Values pmcp rejects by hand (rev 12, round-11 codex P1)
-
-The class is downstream or caller data that pmcp rejects *without an
-exception* and then renders, with `!r`, `repr()`, `%r` or `{x}` next to
-wording like "unusable", "invalid" or "not permitted". The class was found
-by an AST detector over `src/pmcp`: every f-string or `%`-format call
-carrying rejection wording and interpolating a non-renderer value, 139
-sites. Each site was triaged by provenance. The sites in class, all now
-described with `describe_value` (an object's key count, an array's length,
-a scalar's type; a string as just "a string", since its length would follow
-the value's):
-
-| Site | Rejected value | Was |
-|---|---|---|
-| `client/manager.py` `_fetch_listing_pages` | a downstream's `nextCursor`/`next_cursor` that is not a non-empty string, or that repeats | `({raw_cursor!r})` at WARNING; codex: 12/12 leaked. It moves here from Consiliency/pmcp#315 (filed there as an accepted-value echo; it is a rejected value) |
-| `client/manager.py` `cancel_request` | a caller's `gateway.cancel` request id that is not `server::<int>` | in the response `message` |
-| `tools/handlers.py` `auth_connect` | a caller's `env_var` that is not permitted, or not a valid name | in the response `message`, its `env_var` field (now `null`) and the audit-event `error` |
-| `tools/handlers.py` `register_discovered_server` | the env-var names a discovered server may not declare, and an unsafe package identifier | in the response `message`; now the *rule* each name broke, with a count (`1 in the NPM_CONFIG_* family`, `not credential-shaped`; `discovered_env_var_refusal_reason`). A name allows `[A-Za-z0-9_]`, so it can carry a token. Three tests that expected the name (`test_pkgid_panel_fixes.py` ×2, `test_trust_boundaries_e2e.py`) now expect the rule |
-| `env_store.py` `validate_env_var_name` | an invalid name | quoted with `!r`; reachable by a caller only behind `env_var_allowed` |
-
-The rest are out of class:
-- **operator configuration, environment, CLI arguments and pmcp's own
-  stores** (`PMCP_*` env vars, `allowPrivateRegistry`, trust and approval
-  stores, manifest overlays, CLI specs). Those are Consiliency/pmcp#315's.
-- **lookup echoes of accepted values** (`Unknown tool/server/resource:
-  {x}`, "blocked by policy"), also Consiliency/pmcp#315's.
-- **pmcp-chosen names, paths and type names.**
-- **identifiers** (§9, §13), such as the duplicate-entry id of a
-  downstream's listing.
-
-**Static rule.** `test_no_rejected_value_is_rendered_with_repr` fails on any
-`!r`, `repr(...)` or `%r` of a non-constant inside a message with rejection
-wording. The 14 existing sites are named exemptions, each with its
-provenance (none is a caller's or a downstream's value), and the exemption
-list must equal the found set. The rule cannot see a plain `{x}`: whether
-`x` is the caller's or pmcp's own is provenance, which an AST does not
-carry. Those sites were triaged by hand (above), and the sweeps pin the
-in-class ones:
-- the frame sweep's `cursor-object`, `cursor-list` and `cursor-repeat`
-  shapes, on every listing kind and every transport;
-- `test_a_value_rejected_by_hand_is_described`.
-
+## Research and design §1–§11, §13 (unchanged; full text in rev 12, `48b7a89`)
+
+With their measurements, in one line each: **§1–§2** a rejection reads
+`<JSON path>: <reason>`, caller-chosen keys as `*`, the reason a fixed
+phrase filled only from pmcp's own schema or model; **§3–§5** one rule for
+the response, the log and the audit (`audit.rejection`), no regex scrub;
+**§6** the sweep's axes come from the code; **§7–§8** every
+exception-to-text sink goes through `exception_text` / `safe_exc_info`,
+pinned by a dataflow-aware static guard; **§9** the record-factory scrubber,
+installed on `import pmcp`; **§10–§11** parse errors by format, source,
+position and class (`pmcp.parsing`), an unparseable `Origin` port a 403;
+**§13** SDK message objects render as structure, escaping handler errors
+keep the SDK's wire codes with described text, identifiers are kept.
+
+## Design (rev 13)
+
+### 12. Downstream lines and frames that are not JSON-RPC messages (rev 12; envelope in rev 13)
+
+Rev 12's rule: **on the protocol reader, nothing in a downstream line that
+is not a JSON-RPC message is logged or acted on.** Rev 12 read "not a
+message" as "does not parse"; a parsed line went to PR 321's dispatcher,
+whose guards were only those its accesses needed, so `{"jsonrpc": "1.0",
+"id": 8, "error": {"code": -32000, "message": <S>}}` (or no `jsonrpc`, both
+`result` and `error`, an object `code`) settled request 8 and the caller
+logged `tools/list page 2 failed (<S>)` (round-12 codex B2).
+
+**The envelope rules** (`jsonrpc_envelope_problem`, from JSON-RPC 2.0
+sections 4–5 and MCP's message types, not from bad frames): `jsonrpc` is
+exactly `"2.0"`; a request has a string `method` and a string or integer
+id (not bool or float), a notification no `id`, either an object `params`
+if any and no `result`/`error`; a response has an `id` (null only for an
+error) and exactly one of an object `result` or an `error` object with an
+integer (not bool) `code` and a string `message`. Extra members are
+allowed: neither specification forbids them and nothing reads them.
+
+**Where.** On stdio `_route_downstream_frame` checks every parsed line
+first and drops a violation with `[<server>] dropped invalid frame:
+<rule>` (fixed text and JSON type names). On SSE and streamable HTTP the
+SDK's models are laxer (on `mcp` 2.0.0 an `error.code` of `true`, `"5"` or
+`5.0` is coerced, and a `result` beside an `error` ignored), so the SDK's
+three client transports (`sse`, `streamable_http`, and `stdio`, which
+`pmcp refresh` uses) validate through `_StrictMessageAdapter`: the same
+rules first, then the SDK's adapter; a violation raises a value-free
+`ValidationError`, which each transport already handles as an unparseable
+frame (`_read_sse` drops it; a response path makes it a `-32700`, whose
+text `_downstream_error` replaces). It is installed on `import pmcp` with
+the scrubber; the server-side transports are untouched.
+
+**A malformed frame carrying a pending request's id does not settle it**,
+its id included. The request gets a valid answer or times out: a
+control-plane request (`initialize`, listings, `tasks/*`) after its idle
+timeout (30 s); a `tools/call` after its idle timeout or, while the
+downstream keeps writing (every line counts as liveness), the ceiling (10
+minutes, `PMCP_REQUEST_CEILING_MS`). Failing it with fixed text instead
+would let any parseable line with a colliding id end a caller's request;
+a conforming downstream never sends one. **A well-formed downstream error
+is still shown**, as its own message, only when the whole envelope is
+valid.
+
+**Non-frame lines** (rev 12, unchanged) get one fixed DEBUG record with the
+parser's position and class, not a byte count (the round-12 summary's
+`(N bytes)` was wrong): `[<server>] non-protocol stdout line: could not
+parse JSON downstream stdio frame at line L, column C (<Class>)`.
+**Scope: the protocol reader.** `manifest/installer.py`'s
+`_monitor_install` still logs an installing package's stdout and stderr at
+DEBUG (20 lines kept in `job.output_lines`): package-manager output before
+the server is handed to the reader, with no request sent.
+
+**Tests** (real reader, nothing exempt): the property test takes every
+rev 8–12 stream and the 49 violations `_envelope_violations` derives from
+the rules, addressed to the pending request (no record shows any 12-character
+window of a non-frame line; none settles the request); the waiting-caller
+test runs each through listing page 2, `call_tool` and `get_task`, with a
+valid-error control; four `envelope-*` sweep shapes run every method and
+transport; the adapter is tested directly and in a fresh `import pmcp`.
+Frame injection through an echoing downstream is Consiliency/pmcp#328's.
+
+### 14. Values pmcp rejects by hand (rev 12; rev 13)
+
+The class (rev 12, full account in `48b7a89`): caller or downstream data
+pmcp rejects *without an exception* and then renders. An AST detector
+found 139 candidate sites, triaged by provenance; the in-class ones are
+described with `describe_value` (a type and size, a string as just "a
+string"): a downstream's unusable or repeated pagination cursor; a
+caller's `gateway.cancel` id that is not `server::<int>`; `auth_connect`'s
+refused `env_var` (also `null` in `env_var`); the env names
+`register_discovered_server` refuses (by rule and count); an invalid env-var
+name. Out of class: operator config, environment, CLI arguments and pmcp's
+own stores, and lookup echoes of accepted values (both Consiliency/pmcp#315's);
+pmcp's own names; identifiers.
+
+**Rev 13 (B1): no structured field copies a rejected value.** A rejected
+`gateway.cancel` id is now `null` in `request_id` and names no server in
+the audit. As a class, `test_every_field_that_copies_a_caller_input_is_triaged`
+derives every output or audit field holding a caller input two ways --
+by the models (a tool's return-model fields named as its input model's,
+`server_name` as `server`) and by the code (a keyword of a model
+construction, an `*_output` helper or an `_audit` call whose value is
+`parsed.<field>`, a conditional on it, or a local bound from it by an
+attribute, boolean or conditional expression or a module-level parse) --
+56 fields (15 by the models, 51 by the code, 10 by both), which must equal
+a table of reasons: nulled when rejected (cancel, rev 13; `env_var`,
+rev 12), copied only where accepted, never rejected by hand, computed from
+the input, or accepted and then missed by a lookup. No other copy of a
+rejected value was found.
+
+**The boundary with Consiliency/pmcp#315.** The format rule is
+`server::<int>`; an id that meets it is accepted, whatever its prefix holds.
+`<token>::5` then misses the lookup (`Server not found: <token>`, and
+`<token>` as the audit `server_name`): a lookup echo of an accepted value,
+the class of `Unknown tool: <id>`, kept with Consiliency/pmcp#315 so every lookup miss
+changes together. The line is thin -- the prefix is free text, and only the
+format rule makes a value rejected. `int()` also accepts `" 5"`, `"+5"` and
+`"5_0"`, so those ids are accepted.
+
+**Static rule** (rev 12; every spelling in rev 13).
+`test_no_rejected_value_is_rendered_with_repr` fails on a value rendered
+with its repr in a message carrying rejection wording, in any spelling: an
+f-string field with `!r`/`!a` or holding `repr(x)`/`ascii(x)`; a `+` chain
+with `repr(x)`; `%`-formatting with `%r`/`%a` mapped to its argument by
+position or key, or a `repr(x)` argument; `str.format` with `{!r}`/`{!a}`
+mapped likewise, or a `repr(x)` argument; a call whose first argument is
+the message (`logger.warning("bad %s", repr(x))`). The words gained bad,
+wrong, fail, cannot, unrecognised and not found. Exemptions are keyed by
+site (module, function, rendered expression), so a new repr inside an
+exempt function fails: 19 sites, each with its provenance, none a caller's
+or a downstream's; the two the new words found are an accepted package name
+whose registry fetch failed (`package_identity._fetch_packument`) and a
+resolved server config's name (`provision_gate.evaluate_provision`). A
+plain `{x}` or `%s` of `x` is provenance, which an AST does not carry; those
+sites were triaged by hand, and the sweeps pin the in-class ones (the
+`cursor-*` sweep shapes; the hand-rejection test through the real tools).
 
 ## Changes
 
-These are the patches under *Verbatim bodies* (`git diff 89559db 0a93265 -- <file>`):
-42 files, +7021 / −447. One concern, rendering validation errors from
-their structure, is applied at every sink. The bounded-plan threshold of
-about 8 files is exceeded on purpose. 19 of the source files carry only the
-mechanical §7 substitution plus an import, and splitting them into another
-plan would leave the class open between the two merges.
+These are the patches under *Verbatim bodies* (`git diff c9206a9 ebcf4fc -- <file>`):
+46 files, +8216 / −506. One concern, rendering rejected values from their
+structure, is applied at every sink, so the bounded-plan threshold of about
+8 files is exceeded on purpose: 19 source files carry only the mechanical
+§7 substitution plus an import, and splitting would leave the class open
+between two merges. Each file's per-revision account is in rev 12 of this
+plan (`48b7a89`); rev 13's changes are marked.
 
-### `src/pmcp/argument_errors.py` (create, +1158)
-- validator errors (rev 1, unchanged):
-  - `CORRELATION_ID_CHARSET`, `SCOPED_CORRELATION_INCOMPLETE`,
-    `PACKAGE_NAME_INVALID`;
-  - `_PMCP_MESSAGES`;
-  - `argument_error()`.
-- pydantic (rev 2, N2):
-  - `_FIXED_PHRASES` and `_CONSTRAINED_PHRASES` replace `_MODEL_PHRASES`
-    and `_CONSTRAINT_CONTEXT`;
-  - `_declared_names()`, cached, over every `pmcp.*` model;
-  - `_schema_node_at()`, `_constraint_text()`, `_model_phrase(type, node)`;
-  - `model_error_path()`, `describe_model_error()`.
-- jsonschema (rev 1): `declared_property_names()`, `schema_error_path()`,
-  `schema_error_keyword()`, `_schema_phrase()`, `describe_schema_error()`.
-- any exception (rev 2, §7): `_chain()`, `_validation_text()`,
-  `exception_text()`, `safe_exc_info()`, `safe_traceback_text()`.
-- every log record (rev 4, §9): `_scrubbed()`, `scrub_record()`,
-  `_scrubbing_factory()` and `install_log_scrubber()` (the record-factory
-  scrubber; it replaces rev 3's `mcp.*` logger filter).
-- parse errors and uncaught chains (rev 6, §10): `_parse_error_types()`,
-  `_is_parse_error()` (rev 7: excludes `ParseError`), `_parse_text()`,
-  `_install_excepthook()` (rev 7: silent with no stderr),
-  `_install_threading_excepthook()` (rev 7), `_install_handle_error()`;
-  `safe_traceback_text()` renders a real traceback with qualified class
-  names (rev 7).
-- `message_text()` (rev 11): an error's own message unless it embeds a
-  validation error's text; rev 12's `describe_value()` and
-  `carries_rejected_value()` (§13, §14).
-- SDK messages as structure (rev 10, §13): `describe_jsonrpc_message()`,
-  `_known_methods()`, `_shape()`, `_message_fields()`,
-  `_install_message_rendering()` (with `_render_message`,
-  `_render_session_message`, `_render_metadata`); `_scrubbed` and
-  `scrub_record` describe a dict-shaped message in `%`-arguments.
-
-### `src/pmcp/__init__.py` (modify, +9 / −0, rev 5)
-- installs `install_log_scrubber()` on package import, before any entry
-  point's first log call.
-
-### `src/pmcp/server.py` (modify, +160 / −19, rev 10)
-- the gate return renders `describe_schema_error` (rev 1);
-- the `call_tool` arm (rev 2): the model rejection is described against the
-  tool schema; everything else goes through `exception_text`; the audit
-  records `audit.rejection` for a model rejection; the unknown-tool log line
-  is fixed text;
-- three startup/shutdown sinks go through `exception_text`;
-- `GatewayServer.__init__` calls `install_log_scrubber()` (rev 4);
-- rev 10: `_described_errors` wraps every request handler pmcp registers
-  (§13); rev 11 keeps the SDK's wire codes (`MCPError`, `-32602`); rev 12
-  keeps an `MCPError`'s message and `data` unless they carry the rejected
-  value.
-
-### `src/pmcp/tools/handlers.py` (modify, +74 / −37, rev 12)
-- `provision_status` validates before its `try` (rev 1);
-- 26 sinks go through `exception_text` / `safe_exc_info` (rev 2). These are
-  the `tasks_*` audit `error=` and `errors`, `auth_connect`, provisioning,
-  handoff, the registry and the update probe.
-- rev 12: `auth_connect` and `register_discovered_server` describe the
-  env var, env names and package they refuse (§14); `env_var` is `null` on
-  a refusal.
-
-### `src/pmcp/client/manager.py` (modify, +77 / −27)
-- `describe_exception` leaves go through `exception_text`;
-- `_connect_all_unlocked` and `_fetch_server_listings` messages go through
-  `exception_text`;
-- the cancellation-unwind traceback goes through `safe_traceback_text`;
-- `_downstream_error` gives every `-32700`, and every malformed `error`,
-  fixed text (rev 3, B1), using `_PARSE_ERROR`, `_PARSE_ERROR_MESSAGE` and
-  `_MALFORMED_ERROR_MESSAGE`;
-- `install_log_scrubber()` runs at import (rev 4);
-- rev 12: `_handle_stdout_line` gives a line that does not parse one fixed
-  record (`non-protocol stdout line: <parse description>`); the rev 8–11
-  classifier and describe mode are removed (§12);
-- rev 12: `_fetch_listing_pages` and `cancel_request` describe the value
-  they reject (`describe_value`, §14);
-- rev 10: `_entry_label` names a nameless entry by its structure (§13).
-
-### `src/pmcp/auth.py` (modify, +13 / −5)
-- `sanitize_auth_diagnostic` renders an exception with `exception_text`.
-
-### `src/pmcp/scoped_advisor_audit.py` (modify, +22 / −69, rev 1)
-- the path helpers moved to `argument_errors`;
-- `record_rejected_arguments` accepts a pydantic error.
-
-### `src/pmcp/types.py` (modify, +11 / −10, rev 1)
-- the three validators raise `argument_error(...)`.
-
-### Mechanical §7 sinks: `exception_text` / `safe_exc_info` plus the import (modify, rev 2)
-- `config/guidance.py`, `config/loader.py`;
-- `manifest/code_patterns_loader.py`, `manifest/environment.py`,
-  `manifest/installer.py` (including `task.exception()` and `exc_info`),
-  `manifest/loader.py`, `manifest/npm_resolver.py`,
-  `manifest/package_identity.py`, `manifest/refresher.py`,
-  `manifest/version_checker.py`;
-- `package_approvals.py`, `policy/policy.py` (including
-  `_warn_unparseable`), `provision_gate.py`;
-- `subscriptions.py` (`logger.exception` → `logger.error(...,
-  exc_info=safe_exc_info(exc))`);
-- `templates/code_snippets_loader.py`, `trust_store.py`.
-
-### `tests/test_argument_error_echo.py` (create, +1594)
-- rev 1: the argument sweep, handler-past-the-gate, and renderer unit tests;
-- rev 2 additions:
-  - `_FAMILIES`, `_Tap` / `_Observed` / `_record_text`;
-  - the N2 custom-error test and the wrapper test;
-  - the static sink guard, which rev 3 moves to its own module;
-  - `test_every_decorated_baseline_passes_the_gate`;
-  - the downstream task sweep and the listing sweep;
-  - rev 3: the connect-retry test.
-
-### `tests/test_exception_text_sinks.py` (create, +895, rev 3; rev 4; rev 6; rev 7; rev 9)
-- the dataflow-aware scanner (`exception_sinks`);
-- the whole-`src/pmcp` check, asserted non-vacuous;
-- 47 construct tests and a renderer-passes test (rev 4 adds a closure
-  inside an `except` and an asyncio loop handler's `context['exception']`,
-  inline and aliased);
-- rev 12: `carries_rejected_value` joins the read callees (a predicate);
-  `test_no_rejected_value_is_rendered_with_repr` and its spelling test (§14).
-
-### `tests/test_downstream_frame_echo.py` (create, +1229, rev 3; rev 4; rev 8; rev 9)
-- `_Downstream` (a streamable-HTTP and legacy-SSE server in one) and a
-  stdio script, sharing their reply logic;
-- 4 transports × 11 requests, each over 5 shapes × 3 families × 2 lengths;
-- rev 4: 9 malformed `ClientSession` messages through the real
-  `refresh_server`;
-- rev 8: the `json-deep`, `json-bigint` and `json-syntax` shapes; rev 10:
-  the `payload` shape and the outgoing caller-argument test; rev 11:
-  `_wire_error`, `_read_stream` and the wire-code test (rev 12 adds its
-  `data` cases);
-- rev 12: the `cursor-*` shapes; the stdout property test
-  `test_no_record_shows_a_non_protocol_stdout_line`, fed by the rev 8–11
-  generators (`_rejected_frames`, `_line_cases`, `_broken_frame_streams`,
-  `_NOT_FRAMES`); `test_a_banner_line_gets_the_fixed_record`. The `_non_json_line`
-  exemption and the classifier's oracle and tests are removed.
-
-### `tests/test_parse_error_echo.py` (create, +875, rev 6; rev 7; rev 8)
-- rev 7: the helpers-only static rule (`test_no_parser_call_outside_the_helpers`,
-  8 named exemptions) and its detector pinned on 30 spellings and 8
-  non-parsers (rev 8: parser submodules, `<x>.yaml.load`, `.json(...)` with
-  arguments);
-- the 15-site × 6-family dynamic sweep, with rev 7's tag and anchor inputs,
-  any-exception rejection and any-case sentinel;
-- rev 7: the helpers swept directly (`load_yaml`, `load_json`), the 3
-  timestamp sites, a `ParseError` rendered as its own text, duplicate keys
-  measured as data;
-- the fatal policy printed uncaught, in a fresh interpreter; rev 7: an
-  uncaught chain holding a raw YAML error or a pydantic error, a thread's
-  uncaught chain, and the hooks with no stderr;
-- a failing log handler while a parse error is handled;
-- the renderer's raw-parse wording.
-
-### `src/pmcp/parsing.py` (create, +156, rev 7)
-- `ParseError` (value-free text, pickles by its fields) and
-  `YAMLParseError` (also a `yaml.YAMLError`), `JSONParseError` (also a
-  `json.JSONDecodeError`, `doc=""`), `TimestampParseError`;
-- `load_yaml`, `load_json`, `load_json_file`, `parse_timestamp`: any
-  exception → a `ParseError` raised outside the `except` (§10).
-
-### Parse sites routed through `pmcp.parsing` (modify, rev 7)
-Each call keeps its caller's `except` clause; the `source` label is fixed text:
-- YAML: `policy/policy.py` (`policy file`), `manifest/loader.py`
-  (`manifest`, `manifest overlay`), `config/guidance.py` (×3),
-  `manifest/code_patterns_loader.py`, `templates/code_snippets_loader.py`,
-  `manifest/refresher.py`;
-- JSON: `policy/policy.py` (×2), `config/loader.py` (×2), `trust_store.py`,
-  `package_approvals.py`, `scoped_advisor_audit.py`, `auth.py` (×4, JWKS
-  and metadata bodies with `encoding="utf-8"`), `feedback_egress.py` (×2),
-  `manifest/registry.py` (×2), `manifest/package_identity.py`,
-  `manifest/npm_resolver.py` (×2), `cli.py` (×3), `tools/handlers.py` (×2),
-  `client/manager.py` (the stdio frame), `transport/http.py` (the request
-  body's `method` probe), `redaction_additive.py`;
-- timestamps: `trust_store.py`, `package_approvals.py`, `types.py`
-  (`McpTaskInfo`'s validator).
-
-### `src/pmcp/transport/http.py` (modify, +18 / −7, rev 7)
-- `_origin_host_port`: a malformed `Origin` authority returns `None`
-  (403), not a 500 (§11, B2);
-- the body `method` probe goes through `load_json`.
-
-### `tests/test_http_transport.py` (modify, +46 / −0, rev 7)
-- `test_malformed_origin_port_is_rejected_without_echo` × 3 configurations.
-
-### `src/pmcp/cli.py` (modify, +14 / −12, rev 6)
-- 8 sinks go through `exception_text` / `safe_exc_info` (the CLI is now in
-  the static guard).
-
-### `src/pmcp/manifest/loader.py` (modify, +11 / −6)
-- rev 2's two sinks, plus rev 6's overlay `except yaml.YAMLError` sink;
-- rev 7: both YAML parses through `load_yaml`; rev 8: main's new
-  `_shipped_manifest_entries` (Consiliency/pmcp#294) through `load_yaml` too.
-
-### `src/pmcp/validation.py` (modify, +13 / −0, rev 12)
-- `discovered_env_var_refusal_reason`: the rule a refused name broke, in
-  pmcp's words (§14).
-
-### `tests/test_pkgid_panel_fixes.py`, `tests/test_trust_boundaries_e2e.py` (modify, +7 / −2 and +3 / −1, rev 12)
-- A refused discovered env var is asserted by its rule, not its name.
-
-### `src/pmcp/env_store.py` (modify, +3 / −1, rev 12)
-- `validate_env_var_name` no longer quotes the rejected name (§14).
-
-### `tests/test_tools.py` (modify, +3 / −1, rev 12)
-- `test_auth_connect_rejects_invalid_explicit_env_var` expects `env_var`
-  `null` and no echoed name.
-
-### `tests/test_log_record_scrubber.py` (create, +429, rev 4; rev 5; rev 10)
-- every branch of `scrub_record`, on 8 logger names; the factory's install;
-- rev 5: every entry point, in a fresh interpreter; the real `pmcp refresh`;
-- rev 10: `test_a_jsonrpc_message_renders_as_its_structure` and
-  `test_a_dict_shaped_message_in_log_arguments_is_described`.
-
-### `tests/test_scoped_advisor_audit.py` (modify, +95 / −176, rev 1; rev 7)
-- the foreign-line exclusions are removed;
-- `_META_REJECTION` and `_assert_against` are added;
-- rev 7: `_EXCEPTION_ARGS` gains `(kind, source)` for the three `ParseError`
-  classes, which its every-raised-exception enumeration now finds.
-
-### `tests/test_gateway_tool_schemas.py` (modify, +7 / −3, rev 1)
-- the three fragments use the new wording.
+- **Source.** `src/pmcp/argument_errors.py` (create, +1341): the
+  renderers, the record scrubber and hooks, the SDK message rendering;
+  **rev 13** the envelope rules, `_StrictMessageAdapter` and its install,
+  and `_rejected_texts` matching the strings inside a container input.
+  `src/pmcp/tools/handlers.py` (modify, +97 / −43): **rev 13** `cancel`
+  parses with `parse_request_id`, a rejected id is `null` / no server;
+  `invoke` sizes a task answer from the usable record.
+  `src/pmcp/client/manager.py` (modify, +153 / −68): **rev 13**
+  `_route_downstream_frame` checks the envelope first; `parse_request_id`;
+  `_usable_task_raw` keeps a dropped task hint out of `raw`.
+  `src/pmcp/types.py` (modify, +16 / −11): **rev 13** `CancelOutput.request_id`
+  is `str | None`; the task timestamp check goes through `parse_timestamp`.
+  **Merge-time (rev 13):** `src/pmcp/parsing.py` (create, +173) gains
+  `safe_yaml_loader` and a safe-only `loader=`; `src/pmcp/manifest/loader.py`
+  (modify, +20 / −12) routes the libyaml and manifest parses through it and
+  reports a cache failure by class; `src/pmcp/cli.py` (modify, +15 / −13)
+  renders the auth-config startup error with `exception_text`. The other
+  source files are unchanged since rev 12.
+- **Tests.** `tests/test_argument_error_echo.py` (create, +1845), **rev 13**
+  cancel through the real tool, the copied-input triage, task fixtures
+  on `task_id`, and the downstream task sweep counting a dropped hint;
+  `tests/test_downstream_frame_echo.py` (create, +1617), **rev 13** the
+  `envelope-*` shapes, `_envelope_violations`, the waiting-caller test and
+  control, the adapter tests; `tests/test_exception_text_sinks.py` (create,
+  +1098), **rev 13** the repr rule in every spelling, keyed by site;
+  `tests/test_log_record_scrubber.py` (create, +429) and
+  `tests/test_parse_error_echo.py` (create, +879), **rev 13** fixtures
+  adapted to Consiliency/pmcp#298 (a bad task `ttl` or timestamp is dropped,
+  not raised); `tests/test_auth_operator_messages.py` (modify, +4 / −1),
+  Consiliency/pmcp#340's log-hook check allows the record scrubber. The
+  other test files are unchanged since rev 12.
 
 ## Documentation impact
-- `CHANGELOG.md` — `[Unreleased]` → `### Fixed`, first entry — modify:
-  - rev 1's fix, the wording change and the audit disposition;
-  - rev 2's sentence that the rule holds wherever pmcp renders an exception
-    (responses, logs and tracebacks, the audit-event buffer, `tasks_*`
-    `errors`), including downstream data and the operator's own config
-    files;
-  - rev 3's sentence on malformed downstream frames, and rev 4's on
-    scrubbing every log record at creation;
-  - rev 6/7's sentence on parse errors (now naming tags, anchors and
-    timestamps) and rev 7's on the `Origin` port.
-- `README.md` (scoped-advisor audit paragraph) — modify (rev 1).
+- `CHANGELOG.md` (`[Unreleased]` → `### Fixed`, first entry): one sentence
+  per revision's rule, rev 13's on `gateway.cancel`'s `request_id` and on
+  malformed envelopes. `README.md`: the scoped-advisor audit paragraph
+  (rev 1).
 
 ## Dependencies & order
-Apply all 45 patches together; they are one `git apply`.
-`pmcp.argument_errors` and `pmcp.parsing` import no `pmcp` module at load time (`_is_parse_error` imports `pmcp.parsing` lazily).
-`_declared_names` imports `pmcp.types` lazily, so there are no import
-cycles: `pmcp.types`, `auth`, `client.manager` and the others import it at
-module level, and `python -c "import pmcp.server, pmcp.cli"` succeeds. No
-migration, no config.
+All 45 patches are one `git apply`. `pmcp.argument_errors` and
+`pmcp.parsing` import no `pmcp` module at load time (later imports are
+lazy), so there are no cycles; no migration, no config.
 
 ## Verification
 
 ```bash
-# from a fresh worktree of origin/main @ 89559db (dev0: team host)
+# from a fresh worktree of origin/main @ c9206a9 (dev0: team host)
 uv sync --all-extras -p 3.10
 # apply (see *Verbatim bodies -> How to apply*)
 uv run ruff check src/ tests/
@@ -853,62 +279,34 @@ unset npm_config_cache npm_config_store_dir pnpm_config_store_dir
 uv run pytest -m 'not live and not slow' -q
 ```
 
-Red on main (and on rev 11's code `46c4904`): copy the eight test files at `0a93265` onto a clean `89559db`
+Red on main (and on rev 12's code merged with it): copy the eight test files at `ebcf4fc` onto a clean `c9206a9`
 tree and run the same modules. The result is under *Acceptance
 criteria*.
 
-## Acceptance criteria — measured this session (on `0a93265`, red on `89559db` and on rev 11's code `46c4904`)
+## Acceptance criteria — measured this session (on `ebcf4fc`, red on `c9206a9` and on rev 12's code merged with it)
 
-- [x] **Revs 1–6, each measured red on main in the revision that added
-  it** (the details are in rev 11 of this plan, `97e6973`): caller
-  arguments; downstream payloads through the real handlers; malformed
-  frames on every transport; the SDK's `ClientSession`; every record
-  scrubbed; every entry point; every exception-to-text sink. All of them
-  pass here (the eight modules' line below), and main's red line below
-  covers them.
-- [x] **No parse error echoes its input, whatever raised it** (rev 6;
-  rev 7): `tests/test_parse_error_echo.py`, all pass. Red on main: every
-  YAML site leaks, the JSON sites fail on wording, and the helpers module
-  is missing. Rev 7's red-on-rev-6 breakdown is in `4d4b186`.
-- [x] **No payload a downstream sends, and no argument a caller sends,
-  reaches the log through the SDK's traffic logging** (rev 10, round-9
-  codex P1).
-  - The frame sweep's `payload` shape: a valid envelope with the sentinel
-    where the handler's model rejects it, for all 11 methods over all 4
-    real transports at DEBUG, with no record exempt.
-  - `test_no_caller_argument_reaches_the_log_through_a_transport`: 4
-    transports × 3 families.
-  - `test_a_jsonrpc_message_renders_as_its_structure` and
-    `test_a_dict_shaped_message_in_log_arguments_is_described` (6
-    families each).
-  - The 12-scenario repro: 12 of 12 leak on rev 9, 0 on rev 10.
-- [x] **No non-protocol stdout line is shown** (rev 12):
-  `test_no_record_shows_a_non_protocol_stdout_line` (6 families × every
-  rev 8–11 stream, both round-11 codex streams, banners; real reader; no
-  record exempt) and `test_a_banner_line_gets_the_fixed_record`.
-- [x] **A value pmcp rejects by hand is described** (rev 12): the frame
-  sweep's `cursor-*` shapes, `test_a_value_rejected_by_hand_is_described`,
-  and the static rule `test_no_rejected_value_is_rendered_with_repr`.
-- [x] **A wrapped handler keeps the SDK's wire code, and `data` unless it
-  carries the value** (rev 11–12): `test_a_wrapped_handler_keeps_the_wire_code`.
-- [x] **The static rule sees parser submodules** (rev 8, claude (3)): 30
-  spellings detected, 8 non-parsers passed.
-- [x] **An unparseable `Origin` is a 403 without echo** (rev 7, B2):
-  `test_malformed_origin_port_is_rejected_without_echo`, 3 passed. Red on
-  main: 3 failed, `assert 500 == 403` (and on rev 6, rev 7's measurement).
+- [x] **Revs 1–12, each measured red in the revision that added it** (the
+  details are in rev 12 of this plan, `48b7a89`, and before): caller
+  arguments; downstream payloads; malformed frames on every transport; the
+  SDK's `ClientSession` and traffic logging; every record scrubbed; every
+  exception-to-text sink; parse errors; the `Origin` port; non-protocol
+  stdout lines; values rejected by hand; wire codes. All pass here (the
+  eight modules' line below); main's red line covers them.
+- [x] **Rev 13** (B1, B2, the repr rule, the merge): the tests named in
+  *Rev 12 board findings*, all passing here; red on rev 12 below.
 - [x] **Gates and the full suite are clean** (lines under *Full suite and
   gates*).
 
-Red on main: the eight test files @ `0a93265` on a clean `89559db`,
+Red on main: the eight test files @ `ebcf4fc` on a clean `c9206a9`,
 `pytest ... -q --tb=line`. Failures are counted per test function, followed
 by the first assertion line per module and the summary line. The errors are
 `test_log_record_scrubber.py`'s fixture, which imports
 `pmcp.argument_errors`.
 
 ```text
-# failing (or erroring) tests on main 89559db, by module
+# failing (or erroring) tests on main c9206a9, by module
      37 tests/test_argument_error_echo.py
-     70 tests/test_downstream_frame_echo.py
+     92 tests/test_downstream_frame_echo.py
       2 tests/test_exception_text_sinks.py
       3 tests/test_gateway_tool_schemas.py
       3 tests/test_http_transport.py
@@ -916,240 +314,172 @@ by the first assertion line per module and the summary line. The errors are
      99 tests/test_parse_error_echo.py
       6 tests/test_scoped_advisor_audit.py
 
-# the first assertion line per module
+# the first assertion line per module (first 3)
 tests/test_exception_text_sinks.py:676: AssertionError: cli.py:939: FormattedValue uses e
-tests/test_argument_error_echo.py:690: AssertionError: ('hex', '$.auth_mode:type-object', _Observed(response="Input validation error: {'Sqfee3b693849c
-tests/test_downstream_frame_echo.py:543: AssertionError: ('http-json', 'initialize', 'result-type', 'hex', _Observed(response='["Failed to connect to 
-tests/test_log_record_scrubber.py:163: ModuleNotFoundError: No module named 'pmcp.argument_errors'
-tests/test_parse_error_echo.py:237: AssertionError: {'auth.py::_fetch': ['530: json.loads'], 'auth.py::parse_url_elicitation_error': ['951: json.loads
-tests/test_scoped_advisor_audit.py:1696: AssertionError: ('top-level correlation', ['[1969-12-31T19:00:00] [ERROR] Tool execution error: 1 validation 
-tests/test_gateway_tool_schemas.py:468: AssertionError: Input validation error: '' should be non-empty
-tests/test_http_transport.py:521: assert 500 == 403
+tests/test_argument_error_echo.py:700: AssertionError: ('hex', '$.auth_mode:type-object', _Observed(response="
+tests/test_downstream_frame_echo.py:580: AssertionError: ('http-json', 'initialize', 'result-type', 'hex', _Ob
 
-243 failed, 556 passed, 57 errors in 92.27s (0:01:32)
+265 failed, 587 passed, 57 errors in 65.28s (0:01:05)
 ```
 
-Red on rev 11: the same eight files on `46c4904` (rev 11's code). There
-are 34 failures, every one in rev 12's new or tightened cases:
-- 20 frame-sweep cases: the `cursor-object` shape on the 3 listing
-  methods × the 3 remote transports, and stdio's `not-json` shape on all
-  11 methods. Rev 11 still showed `<S> is not JSON` up to the opener, and
-  rev 12 removed the exemption that excused it;
-- 6 stdout-property cases;
-- 1 banner-record control;
-- 3 hand-rejection cases;
-- 3 wire-code cases (the `data` rules);
-- 1 static rule, on rev 11's `{raw_cursor!r}`.
-
-Both codex repros are in the 20 and 6 above, and in the repro table.
+Red on rev 12: the same eight files on rev 12's code `0a93265` merged with `c9206a9`.
+(A local throwaway, `3e9bb9e`, conflicts to main's side: the same base as
+rev 13.) 88 failures, all rev 13's new or tightened cases, both repros
+among them. B1: 3 hand-rejection cases. B2: all 44 sweep cases (first leak
+`envelope-version` on stdio, `envelope-both` on the remote three), 15 of
+18 waiting-caller cases (on `tools/list page 2` three token-shaped families
+are masked by pmcp's secret redaction), 6 property, 6 adapter, the import
+check. Merge-time fixes: 13 (task `raw` and size, container strings, the
+two static rules on main's new code, 6 parse sites). The repr rule and the
+triage table pass there (sites rev 13 did not change); their mutants are
+their red evidence.
 
 ```text
-# failing tests on rev 11's code 46c4904, by test function
-      3 FAILED tests/test_argument_error_echo.py::test_a_value_rejected_by_hand_is_described
-      1 FAILED tests/test_downstream_frame_echo.py::test_a_banner_line_gets_the_fixed_record
-      3 FAILED tests/test_downstream_frame_echo.py::test_a_wrapped_handler_keeps_the_wire_code
-     20 FAILED tests/test_downstream_frame_echo.py::test_no_malformed_frame_value_reaches_pmcps_output
-      6 FAILED tests/test_downstream_frame_echo.py::test_no_record_shows_a_non_protocol_stdout_line
-      1 FAILED tests/test_exception_text_sinks.py::test_no_rejected_value_is_rendered_with_repr
+# failing (or erroring) tests on rev 12 0a93265 merged with c9206a9, by module
+      5 tests/test_argument_error_echo.py
+     75 tests/test_downstream_frame_echo.py
+      1 tests/test_exception_text_sinks.py
+      7 tests/test_parse_error_echo.py
 
-# the first assertion line per module
-tests/test_exception_text_sinks.py:875: AssertionError: (['client/manager.py::_fetch_listing_pages', 'env_store.py::validate_env_var_name', 'tools/han
-tests/test_argument_error_echo.py:1594: AssertionError: Invalid request_id format: Sqab180de4ff20de78637b3cec9c956698eb1bc8Zx
-tests/test_downstream_frame_echo.py:543: AssertionError: ('http-json', 'tools/list', 'cursor-object', 'hex', _Observed(response='[]{
+# the first assertion line per module (first 3)
+tests/test_exception_text_sinks.py:676: AssertionError: cli.py:2350: FormattedValue uses exc
+tests/test_argument_error_echo.py:1337: AssertionError: ('gateway.tasks_list', 'createdAt', 'string', 'spaced'
+tests/test_downstream_frame_echo.py:580: AssertionError: ('http-json', 'initialize', 'envelope-both', 'unicode
 
-34 failed, 822 passed in 288.10s (0:04:48)
+88 failed, 821 passed in 240.47s (0:04:00)
 ```
 
-Green (patched): `856 passed in 331.76s (0:05:31)` for the eight modules.
+Green (patched): `909 passed in 274.20s (0:04:34)` for the eight modules.
 
 ## Mutation evidence
 
-`mutants.py` (below) runs on a worktree of `0a93265`:
-- It applies each mutant; the anchor must occur exactly once.
-- It runs the eight test modules with `-x --tb=line`, the dynamic sweeps
-  first and the static guard last, so the named reason is the first
-  **dynamic** failure where there is one.
-- It refuses to start a mutant on a file that already differs from `HEAD`
-  (rev 7: a killed run must not have its mutant saved as the clean copy).
-- It restores the file **from a copy saved before the mutation** and
-  `cmp`-checks it. `git status --short | wc -l` was `0` after each pass.
+`mutants.py` (below) runs on a worktree of `ebcf4fc`. It applies each
+mutant (the anchor must occur exactly once), runs the eight test modules
+with `-x --tb=line` (dynamic sweeps first, static guards last), refuses to
+start on a file that differs from `HEAD`, and restores the file from a copy
+saved before the mutation, `cmp`-checked. `git status --short | wc -l` was
+`0` and `0` after each pass.
 
-Every mutant applied and went red. Each one's purpose, by revision, is in
-rev 9 of this plan (`a449dd9`) for M1–M53, S5–S8 and G1. Rev 8's M47 and
-M49 are retired (their code was replaced in rev 9). The rev 7 run's M34
-gap is closed by `test_an_uncaught_chain_prints_no_input`.
+Each mutant's purpose is in rev 9 of this plan (`a449dd9`) for M1–M53,
+S5–S8 and G1, in rev 11 (`97e6973`) for M54–M66 and in rev 12 (`48b7a89`)
+for M67–M75. Retired: M46, M47, M49–M53, M59, M61–M64 (revs 8–12).
+Rev 13's: M75 re-anchored (`!r`/`!a`); M76–M78 `gateway.cancel`'s field,
+audit and control; M79–M82 the envelope rules (object only, `jsonrpc`,
+`result`+`error`, bool `code`); M83–M84 the strict adapter (not installed,
+checks nothing); M85–M88 the repr rule (concatenation, `%r`, per-function
+keys, the new words); M89 the triage derivation; M90 both message guards
+(two files); M91–M93 the merge fixes (`raw`, size, container strings).
 
-M67–M75 are new for the round-11 board:
-- M67: a non-protocol stdout line logged with its text;
-- M68: a rejected cursor rendered;
-- M69: a rejected `cancel` request id rendered;
-- M70: a refused env var echoed in `auth_connect`'s output;
-- M71: an invalid env-var name quoted;
-- M72: disallowed discovered env vars named;
-- M73: an `MCPError`'s `data` kept though it carries the value;
-- M74: an `MCPError`'s `data` always dropped;
-- M75: the repr-rejection rule ignores `!r`.
-
-Retired with the rev 8–11 classifier: M46, M50–M53, M59, M61–M64.
-
-M54–M66 (rounds 9–10) are listed with their purposes in rev 11 of this
-plan (`97e6973`); those still live are M54–M58, M60, M65 and M66.
-
-The first pass, condensed to fit the size budget: the killed list, then
-the full line of each live rev 8–12 mutant. The full per-mutant lines of
-the others, all killed on the same reasons, are in rev 8 of this plan
-(`4bafa47`), and each mutant's log is kept with the run.
+First pass, all mutants: the killed list and any survivor. Each mutant's full line and log are kept
+with the run; the reasons below are read from those logs.
 
 ```text
-68 mutants applied; 68 killed: M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 M12 M13 M14 M15 M16 M17 M18 M19 M20 M21 M22 M23 M24 M25 M26 M27 M28 M29 M30 M31 M32 M33 M34 M35 M36 M37 M38 M39 M40 M41 M42 M43 M44 M45 M48 M54 M55 M56 M57 M58 M60 M65 M66 M67 M68 M69 M70 M71 M72 M73 M74 M75 G1 S5 S6 S7 S8
-M48 static check ignores parser submodules: applied=yes exit=1 | 1 failed, 242 passed in 183.63s (0:03:03) | E   AssertionError: from yaml.loader import SafeLoader
-M54 SDK message objects render their payload: applied=yes exit=1 | 1 failed, 65 passed in 32.07s | E   AssertionError: ('http-json', 'tools/list', 'cursor-repeat', 'he...
-M55 a dict-shaped message in log arguments not described: applied=yes exit=1 | 1 failed, 213 passed in 183.10s (0:03:03) | E   AssertionError: [2026-10-01T21:44:36] [D...
-M56 an undeclared method shown: applied=yes exit=1 | 1 failed, 207 passed in 178.07s (0:02:58) | E   AssertionError: ('undeclared method', "<JSON-RPC notification: met...
-M57 a handler's escaping validation error reaches the caller: applied=yes exit=1 | 1 failed, 129 passed in 158.78s (0:02:38) | E   AssertionError: ('bare', 'Invalid re...
-M58 a nameless catalog entry labelled by its content: applied=yes exit=1 | 1 failed, 67 passed in 39.57s | E   AssertionError: ('http-json', 'prompts/list', 'payload',...
-M60 metadata headers rendered with their values: applied=yes exit=1 | 1 failed, 207 passed in 188.57s (0:03:08) | E   AssertionError: ('metadata headers', "SessionMess...
-M65 a bare validation error leaves as code 0: applied=yes exit=1 | 1 failed, 129 passed in 175.73s (0:02:55) | E   AssertionError: ('bare', 0, '1 validation error for ...
-M66 an MCPError loses its code: applied=yes exit=1 | 1 failed, 129 passed in 164.26s (0:02:44) | E   AssertionError: ('mcp_inside_except', 0, 'Resource not found')
-M67 a non-protocol stdout line logged with its text: applied=yes exit=1 | 1 failed, 97 passed in 138.29s (0:02:18) | E   AssertionError: ('stdio', 'initialize', 'not-j...
-M68 a rejected cursor rendered: applied=yes exit=1 | 1 failed, 65 passed in 34.70s | E   AssertionError: ('http-json', 'tools/list', 'cursor-object', 'hex', _Observed(...
-M69 a rejected cancel request id rendered: applied=yes exit=1 | 1 failed, 61 passed in 26.96s | E   AssertionError: Invalid request_id format: expected server_name::lo...
-M70 a refused env var echoed in auth_connect's output: applied=yes exit=1 | 1 failed, 61 passed in 26.49s | E   AssertionError: Invalid request_id format: expected ser...
-M71 an invalid env var name quoted: applied=yes exit=1 | 1 failed, 849 passed in 228.26s (0:03:48) | E   AssertionError: (['env_store.py::validate_env_var_name'], [])
-M72 disallowed discovered env vars named: applied=yes exit=1 | 1 failed, 61 passed in 26.41s | E   AssertionError: Invalid request_id format: expected server_name::loc...
-M73 an MCPError's data kept though it carries the value: applied=yes exit=1 | 1 failed, 129 passed in 162.80s (0:02:42) | E   AssertionError: ('mcp_data_carries', 'bad...
-M74 an MCPError's data always dropped: applied=yes exit=1 | 1 failed, 129 passed in 160.95s (0:02:40) | E   AssertionError: None
-M75 the repr-rejection rule ignores !r: applied=yes exit=1 | 1 failed, 849 passed in 218.01s (0:03:38) | E   AssertionError: ([], ['cli.py::_exact_package_spec', 'cli....
+86 mutants applied; 85 killed: M1–M24 M26–M45 M48 M54–M58 M60 M65–M93 G1 S5–S8
+survived: M25 malformed error message kept: applied=yes exit=0 | 909 passed in 269.47s (0:04:29) | 
 ```
 
-The first `E` line the script prints is sometimes a traceback line rather
-than the assertion; each mutant's full log names the failing test (see
-rev 6, `8d03712`, for M18, M21 and G1).
-
-Second pass, with `NO_STATIC=1` (both static checks deselected: the
-sink guard and rev 7's helpers-only rule), all mutants (the killed list,
-the survivors in full, and the two rev 7 helper-bypass mutants):
+Second pass, `NO_STATIC=1` (the sink guard and rev 7's helpers-only rule
+deselected): the killed list and the survivors.
 
 ```text
-68 mutants applied; 66 killed with both static checks deselected: M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 M12 M13 M14 M15 M16 M17 M18 M19 M20 M21 M23 M24 M25 M26 M27 M28 M29 M30 M31 M32 M33 M34 M36 M37 M38 M39 M40 M41 M42 M43 M44 M45 M48 M54 M55 M56 M57 M58 M60 M65 M66 M67 M68 M69 M70 M71 M72 M73 M74 M75 G1 S5 S6 S7 S8
-survived: M22 installer crash message uses raw exc (static guard): applied=yes exit=0 | 854 passed, 2 deselected in 304.78s (0:05:04) | 
-survived: M35 CLI refresh logs the raw exception: applied=yes exit=0 | 854 passed, 2 deselected in 347.06s (0:05:47) | 
-M37 helper bypassed at one site (policy YAML): applied=yes exit=1 | 1 failed, 257 passed, 2 deselected in 279.07s (0:04:39) | E   AssertionError: ('policy yaml, warn',...
-M42 timestamp helper bypassed (trust store): applied=yes exit=1 | 1 failed, 363 passed, 2 deselected in 246.71s (0:04:06) | E   AssertionError: Unparseable trust times...
-M67 a non-protocol stdout line logged with its text: applied=yes exit=1 | 1 failed, 97 passed, 2 deselected in 138.15s (0:02:18) | E   AssertionError: ('stdio', 'initi...
-M71 an invalid env var name quoted: applied=yes exit=1 | 1 failed, 847 passed, 2 deselected in 226.45s (0:03:46) | E   AssertionError: (['env_store.py::validate_env_va...
+86 mutants applied; 81 killed with both sink checks deselected: M1–M18 M21 M23–M24 M26–M34 M36–M45 M48 M54–M58 M60 M65–M93 G1 S5–S8
+survived: M19 tasks_get response uses str(e): applied=yes exit=0 | 907 passed, 2 deselected in 254.38s (0:04:14) | 
+survived: M20 tasks_get audit buffer uses str(e): applied=yes exit=0 | 907 passed, 2 deselected in 266.04s (0:04:26) | 
+survived: M22 installer crash message uses raw exc (static guard): applied=yes exit=0 | 907 passed, 2 deselected in 261.07s (0:...
+survived: M25 malformed error message kept: applied=yes exit=0 | 907 passed, 2 deselected in 265.97s (0:04:25) | 
+survived: M35 CLI refresh logs the raw exception: applied=yes exit=0 | 907 passed, 2 deselected in 275.40s (0:04:35) | 
 ```
 
-- Every mutant but M22 and M35 dies with the two sink checks deselected.
-  M71 and M75 die on rev 12's repr-rejection rule, which is static but not
-  one of the two deselected checks; the rest die on dynamic tests, including
-  M11, M19, M20, **G1**, and rev 7's **M37** (the helper bypassed: the tag
-  sweep, with the helpers-only rule deselected) and **M42** (the timestamp
-  sweep).
-- **M22 survives by design.** No sweep drives a crashing install task, so
-  the static guard is the only check on that sink. That is what the static
-  half is for; in the first pass it kills M22
-  (`manifest/installer.py:256: FormattedValue uses exc`).
-- **M35 survives by design** too: no sweep drives `pmcp refresh` to a
-  failure. In the first pass it is killed (`cli.py:940: FormattedValue
-  uses e`).
+No mutant died on a timeout or cancellation (the check above).
 
-Reasons, by what caught them: M1–M66 as listed in rev 11 of this plan
-(`97e6973`), re-measured in this run (lines above). For rev 12's:
-- rev 12's mutants: M67 (a non-protocol stdout line logged with its
-  text) dies on the stdio `not-json` frame-sweep case (the run stops at the first failure);
-  M68 (a rejected cursor rendered with `!r`) on the sweep's `cursor-object`
-  shape; M69, M70, M72 (the cancel request id, the auth_connect env var, the
-  discovered env vars) on `test_a_value_rejected_by_hand_is_described` (its
-  failure prints the first 600 characters of everything it saw, so the line
-  starts with the cancel message); M73 and M74 (MCPError `data` kept, or always
-  dropped) on the wire-code test; M71 (an invalid env var name quoted with
-  `!r`) on the new static rule `test_no_rejected_value_is_rendered_with_repr`
-  in both passes (that rule is not one of the two deselected sink checks);
-  M75 (the rule blind to `!r`) on the same rule, whose findings must equal its
-  exemption list exactly: blind to `!r`, it no longer sees the exempt sites;
-- **static guard only**: M35 (a CLI sink no dynamic test drives; it
-  survives the second pass by design, like M22);
-- **record scrubber branches**: M27 (a non-`mcp` logger), M28 (`%`-args),
-  M29 (`msg` an exception), M30 (nested containers);
-- **behaviour**: M10;
-- **wording**: M9, M13;
-- **unit tests**: M5, M6, M7 (N2), M16 (group), M18, M21 (wrapper);
-- **static guard**: M11 (also #296's pair differential), M22.
+- **M22 and M35 survive the second pass by design**: no sweep drives a
+  crashing install task or `pmcp refresh` to a failure, so the static sink
+  guard is the only check on those two sinks; the first pass kills both.
+  **M19 and M20** (`tasks_get`'s response and audit-buffer sinks) join them
+  since the merge (and M15 moves to the listing sweep): Consiliency/pmcp#298 made the task parser drop an
+  unusable hint instead of raising, so no sweep drives a validation error
+  into that `except` any more; the static guard covers the sink, and the
+  first pass kills both.
+- Every other mutant but M25 (below) dies with the two sink checks
+  deselected. Those that die on a static test that is *not* deselected
+  are the repr rule's and the triage table's own: M71, M75, M85–M89.
+
+Rev 13's reasons, from each mutant's log:
+- M76–M78: `test_a_value_rejected_by_hand_is_described` (the field, the
+  audit event, the well-formed control);
+- M79, M80: the stdio `envelope-version` sweep case's vacuity check (the
+  frame must be dropped with a record; the token-shaped value itself is
+  masked by pmcp's secret redaction);
+- M81–M84: the http-json `envelope-both` / `envelope-code` sweep cases;
+- M75, M86–M88: `test_no_rejected_value_is_rendered_with_repr` (found ≠
+  the 19 exemptions); M85: its spelling test; M89: the triage test;
+- M91, M92: the downstream task sweep; M93: the wire-code test;
+- **M25 survives both passes, as an equivalent mutant**: rev 13's envelope
+  check makes `_downstream_error`'s non-string-message branch unreachable;
+  it stays as defence in depth, and **M90** (both guards off, across two
+  files) dies in both passes on the stdio `error-message` sweep case;
+- **M65 and M74** each died once, in an earlier run under load, on a
+  timeout in another test (a false kill). In this run both die on their own
+  test, `test_a_wrapped_handler_keeps_the_wire_code`, in both passes; a
+  script compares each mutant's killing test with the previous run's and
+  flags any kill whose first `E` line is a timeout or cancellation: none.
 
 ## Non-goals
 
 - **Consiliency/pmcp#315, echoes of accepted values** (full text in the
-  issue and in rev 9 of this plan, `a449dd9`): a value that *passes*
-  validation, echoed where a handler looks it up or refuses it (`Unknown
-  tool: {x}`, "blocked by policy", a caller's header), and `resources/read`
-  / `prompts/get`'s lookup echo (N5). It also holds:
-  - operator and config echoes: the round-7 N1/N2 ones, the 14 `repr`
-    exemptions of §14, and the env-var `int()` parses;
-  - the serving side's `sse_starlette` DEBUG chunk log, which carries the
-    full body of each response pmcp sends but never a rejected value
-    (§13).
-
-  The rejected pagination cursor moved *out* of #315 into this plan in
-  rev 12 (§14), and the SDK's traffic logging in rev 10 (§13).
-- **Kept by design.**
-  - Downstream data pmcp accepts (a task's fields, a tool's description).
-  - Downstream-authored text the SDK quotes (`Unexpected content type`,
-    `Unknown SSE event`) and identifiers (methods, request ids, a tool's
-    or entry's string name; §9, §13).
-  - An HTTP client's rejected `Mcp-Session-Id` at INFO (§13).
-- **A non-conforming server's stdout** (rev 12, §12): its banners and
-  `INFO:` lines are no longer shown on DEBUG, only the fixed record. Its
-  stderr is logged as before.
+  issue and rev 9, `a449dd9`): lookup and refusal echoes of a value that
+  passed validation (`Unknown tool: {x}`, "blocked by policy", a caller's
+  header, `resources/read` / `prompts/get`'s lookup echo); a well-formed
+  `gateway.cancel` id whose server or request is unknown (§14); operator and
+  config echoes, including the 19 `repr` exemption sites of §14; the
+  serving side's `sse_starlette` chunk log (never a rejected value). The
+  rejected pagination cursor moved *out* of Consiliency/pmcp#315 in rev 12.
+- **Kept by design:** downstream data pmcp accepts; downstream-authored
+  text and identifiers the SDK quotes; an HTTP client's rejected
+  `Mcp-Session-Id` at INFO; a downstream's own well-formed error message.
+- **A non-conforming server's stdout** is no longer shown (rev 12); a
+  malformed envelope is dropped and the request it names waits for a valid
+  answer or its timeout (rev 13). Its stderr is logged as before.
+- **An installing package's output** (`_monitor_install`): before the
+  protocol reader, no caller or frame content (§12).
 - **Consiliency/pmcp#328** (a frame injected through an echoing downstream)
-  stays separate.
-- **Piece B.** B's plan must re-run this sweep (see *Unverified*).
-- **Unchanged since revs 1–6** (full text in rev 10 of this plan,
-  `b7eacbe`): the SDK's malformed-envelope echo to its sender only (N4);
-  `isError: false` on the `call_tool` arm (N7); `RecursionError` from
-  in-process `jsonschema.validate` nesting (Consiliency/pmcp#296's E12); a
-  downstream's own well-formed error message, returned as is.
+  stays separate; **piece B** must re-run this sweep.
+- Unchanged since revs 1–6: see rev 10 (`b7eacbe`).
 
 ## Unverified
 
-- **Under piece B** the sweep's extra-key decorations become
-  `additionalProperties` rejections. jsonschema's `best_match` is expected
-  to prefer the deeper failing error, so the path assertions should hold,
-  and an `additionalProperties`-only failure reads `$...: has a property
-  that is not accepted` without the key. The latter is unit-tested; the
-  former is not measured.
+- **Under piece B**, `additionalProperties` rejections: the path assertions
+  are expected to hold (`best_match` prefers the deeper error), not
+  measured.
 - **The SDK's f-string log lines that render an exception**
-  (`streamable_http.py:532` `Reconnection failed: {e}`, `:636` `Session
-  termination failed: {exc}`) are httpx transport failures, not frame
-  parsing. A message object they rendered would be structural (§13), but
-  an exception's text formatted into the string is out of the scrubber's
-  reach.
-- **A frame broken across lines, and every other non-protocol stdout
-  line**: no longer a residual. Since rev 12 no such line's content is
-  logged (§12). An interleaved frame a caller forges through an echoing
-  downstream is Consiliency/pmcp#328's.
-- **The static rule sees only the `repr` spelling** (§14). A plain `{x}`
-  next to rejection wording was triaged by hand (139 sites), because
-  provenance is not in the AST.
-- **Unchanged since revs 4–8** (each stated in full in rev 10 of this plan,
-  `b7eacbe`):
-  - scalar conversions (`int()`, `float()`, `ip_address()`) outside the
-    parse helpers were not audited one by one;
-  - dynamic parser access (`getattr(yaml, …)`) is not seen by the static
-    rule;
-  - a response's `.json()` is exempt (no constructors; every failure is
-    caught);
-  - TOML is covered only on Python 3.11+;
-  - text a library formats into a message string is out of the
-    scrubber's reach;
-  - code that replaces the record factory after pmcp, and records built
-    with `makeLogRecord`;
-  - readers of `audit.rejection` other than agent-harness;
-  - pydantic error types outside the phrase tables read `is invalid`;
-  - clients that parse jsonschema's old wording;
-  - the legacy-SSE pair differential under heavy parallel load (once, in
-    rev 8);
-  - the `handleError` case, fixed in rev 6.
+  (`streamable_http.py:532`, `:636`): httpx failures; an exception's text
+  formatted into a string is out of the scrubber's reach.
+- **What the static repr rule cannot see** (§14): `{x}` / `%s` of the value
+  itself (provenance; triaged by hand), `str(x)`, a repr bound to a local
+  first (`r = repr(x); f"invalid {r}"`), a message built in one statement
+  and logged in another, wording outside its list. Two identical
+  expressions in one function share a key (numbered `#2`).
+- **The copied-input derivation** (§14) follows one assignment hop and
+  module-level parse calls; a value passed into a helper's parameters and
+  copied there is seen only by the name-based derivation.
+- **A task answer with no usable `taskId`** is not a task: pmcp returns it
+  as the downstream's data (`invoke`'s result, `tasks_cancel`'s `raw`), as
+  before rev 13 and before Consiliency/pmcp#298; the downstream task sweep
+  counts only hints the parser raises on or drops.
+- **`carries_rejected_value` counts a container input's keys** (rev 13):
+  for a model-level error the input is the whole argument dict, so a field
+  name of 4+ characters in a wrapped `MCPError`'s message makes it fall back
+  to fixed text. Keys are caller data (the gate shows caller-chosen keys as
+  `*`); the cost is a conservative fallback, not measured beyond the suite.
+- **Pair differential under load**: in one mutation run (two passes
+  concurrent with other planners on dev0) the `http-sse`
+  `envelope-unversioned` pair differed only in connect-retry lines; the
+  same class as the legacy-SSE note of rev 8. The test is unchanged.
+- **The strict adapter** replaces the SDK client modules' adapter by name
+  (`mcp` 2.0.0; `>=2.0.0,<3`): an SDK that reads it another way bypasses
+  it, which the import test and the remote `envelope-*` cases would catch.
+- Unchanged since revs 4–8: see rev 10 (`b7eacbe`).
+
 ## Execution Policy
 
 - execute: effort=low, reason=the patch is embedded verbatim and proven
@@ -1157,75 +487,30 @@ Reasons, by what caught them: M1–M66 as listed in rev 11 of this plan
   *Verification* and compares with *Acceptance criteria*.
 - Every PR to main needs panel CR + reconcile first (repo rule).
 - Commit/PR text says "see Consiliency/pmcp#297", never a closing keyword.
-
 ## Embedding proof
 
-The patches were generated with `git diff -U1 89559db 0a93265 -- <file>` and embedded. Then, from **this file**, on a fresh worktree `$WORKTREE_ROOT/pmcp-297-proof` of re-fetched `origin/main` (still `89559db`); `p/` is the scratch directory the patches were extracted to, and "identical" means `cmp`-identical to `wip/297-code@0a93265`. Each of the 45 patches was extracted to `p/<path with / as _>.patch` (the per-file line counts are omitted here for size). The proof was run again on the final file, with this section in it, and printed the same listing.
+The patches were generated with `git diff -U0 c9206a9 ebcf4fc -- <file>` and embedded. Then, from **this file**, on a fresh worktree `$WORKTREE_ROOT/pmcp-297-proof` of re-fetched `origin/main` (`c9206a9`); `p/` is the scratch directory the patches were extracted to, and "identical" means `cmp`-identical to `wip/297-code@ebcf4fc`. Each of the 46 patches was extracted to `p/<path with / as _>.patch` (the per-file line counts and the 46 per-file `cmp` lines are summarised here for size). The proof was run again on the final file, with this section in it, and printed the same listing.
 
 ```text
 $ git -C <proof worktree> rev-parse --short HEAD
-89559db
+c9206a9
 x2.py: 25 lines
 extractor self-extract: identical
-$ git apply --check p/*.patch
+$ git apply --unidiff-zero --check p/*.patch
 check: ok
 applied
-cmp CHANGELOG.md: identical
-cmp README.md: identical
-cmp src/pmcp/__init__.py: identical
-cmp src/pmcp/argument_errors.py: identical
-cmp src/pmcp/auth.py: identical
-cmp src/pmcp/cli.py: identical
-cmp src/pmcp/client/manager.py: identical
-cmp src/pmcp/config/guidance.py: identical
-cmp src/pmcp/config/loader.py: identical
-cmp src/pmcp/env_store.py: identical
-cmp src/pmcp/feedback_egress.py: identical
-cmp src/pmcp/manifest/code_patterns_loader.py: identical
-cmp src/pmcp/manifest/environment.py: identical
-cmp src/pmcp/manifest/installer.py: identical
-cmp src/pmcp/manifest/loader.py: identical
-cmp src/pmcp/manifest/npm_resolver.py: identical
-cmp src/pmcp/manifest/package_identity.py: identical
-cmp src/pmcp/manifest/refresher.py: identical
-cmp src/pmcp/manifest/registry.py: identical
-cmp src/pmcp/manifest/version_checker.py: identical
-cmp src/pmcp/package_approvals.py: identical
-cmp src/pmcp/parsing.py: identical
-cmp src/pmcp/policy/policy.py: identical
-cmp src/pmcp/provision_gate.py: identical
-cmp src/pmcp/redaction_additive.py: identical
-cmp src/pmcp/scoped_advisor_audit.py: identical
-cmp src/pmcp/server.py: identical
-cmp src/pmcp/subscriptions.py: identical
-cmp src/pmcp/templates/code_snippets_loader.py: identical
-cmp src/pmcp/tools/handlers.py: identical
-cmp src/pmcp/transport/http.py: identical
-cmp src/pmcp/trust_store.py: identical
-cmp src/pmcp/types.py: identical
-cmp src/pmcp/validation.py: identical
-cmp tests/test_argument_error_echo.py: identical
-cmp tests/test_downstream_frame_echo.py: identical
-cmp tests/test_exception_text_sinks.py: identical
-cmp tests/test_gateway_tool_schemas.py: identical
-cmp tests/test_http_transport.py: identical
-cmp tests/test_log_record_scrubber.py: identical
-cmp tests/test_parse_error_echo.py: identical
-cmp tests/test_pkgid_panel_fixes.py: identical
-cmp tests/test_scoped_advisor_audit.py: identical
-cmp tests/test_tools.py: identical
-cmp tests/test_trust_boundaries_e2e.py: identical
-changed paths == the 45 patched files
+changed paths == the 46 patched files
+cmp: 46 of 46 files identical
 ```
 
 ## Full suite and gates
 
-On `wip/297-code` @ `0a93265`, with `npm_config_cache`, `npm_config_store_dir` and
+On `wip/297-code` @ `ebcf4fc`, with `npm_config_cache`, `npm_config_store_dir` and
 `pnpm_config_store_dir` unset (dev0 is a team host):
 
 ```text
 $ pytest -m 'not live and not slow' -q
-5357 passed, 3 skipped, 80 deselected in 743.61s (0:12:23)
+6004 passed, 3 skipped, 80 deselected in 734.91s (0:12:14)
 EXIT=0
 ```
 
@@ -1233,80 +518,35 @@ EXIT=0
 $ ruff check src/ tests/
 All checks passed!
 $ ruff format --check src/ tests/
-178 files already formatted
+181 files already formatted
 $ mypy src/
 Success: no issues found in 54 source files
 $ pytest (eight modules) -q
-856 passed in 331.76s (0:05:31)
+909 passed in 274.20s (0:04:34)
 ```
 
 ## Verbatim bodies
 
 ### How to apply (and the extractor)
 
-From a fresh worktree of `origin/main` @ `89559db`:
+From a fresh worktree of `origin/main` @ `c9206a9`:
 
 ```bash
 PLAN=.consiliency/plans/detailed-297-validation-echo-20260928-2127.md   # read from branch plan/297-validation-echo
 X=<scratch>/extract_plan_block.py        # bootstrap it: see *Extractor* below
-while read f; do
+sed -n 's/^### Patch — `\(.*\)`$/\1/p' $PLAN | while read f; do   # the 46 files
   python3 $X $PLAN "### Patch — \`$f\`" "<scratch>/$(echo $f | tr / _).patch"
-done <<'LIST'
-CHANGELOG.md
-README.md
-src/pmcp/__init__.py
-src/pmcp/argument_errors.py
-src/pmcp/auth.py
-src/pmcp/cli.py
-src/pmcp/client/manager.py
-src/pmcp/config/guidance.py
-src/pmcp/config/loader.py
-src/pmcp/env_store.py
-src/pmcp/feedback_egress.py
-src/pmcp/manifest/code_patterns_loader.py
-src/pmcp/manifest/environment.py
-src/pmcp/manifest/installer.py
-src/pmcp/manifest/loader.py
-src/pmcp/manifest/npm_resolver.py
-src/pmcp/manifest/package_identity.py
-src/pmcp/manifest/refresher.py
-src/pmcp/manifest/registry.py
-src/pmcp/manifest/version_checker.py
-src/pmcp/package_approvals.py
-src/pmcp/parsing.py
-src/pmcp/policy/policy.py
-src/pmcp/provision_gate.py
-src/pmcp/redaction_additive.py
-src/pmcp/scoped_advisor_audit.py
-src/pmcp/server.py
-src/pmcp/subscriptions.py
-src/pmcp/templates/code_snippets_loader.py
-src/pmcp/tools/handlers.py
-src/pmcp/transport/http.py
-src/pmcp/trust_store.py
-src/pmcp/types.py
-src/pmcp/validation.py
-tests/test_argument_error_echo.py
-tests/test_downstream_frame_echo.py
-tests/test_exception_text_sinks.py
-tests/test_gateway_tool_schemas.py
-tests/test_http_transport.py
-tests/test_log_record_scrubber.py
-tests/test_parse_error_echo.py
-tests/test_pkgid_panel_fixes.py
-tests/test_scoped_advisor_audit.py
-tests/test_tools.py
-tests/test_trust_boundaries_e2e.py
-LIST
-git apply --check <scratch>/*.patch && git apply <scratch>/*.patch
+done
+git apply --unidiff-zero --check <scratch>/*.patch && git apply --unidiff-zero <scratch>/*.patch
 ```
 
-The patches are `git diff -U1 89559db 0a93265 -- <file>` (revs 7 to 12 use 1
-lines of context to stay within the plan's size budget; `git apply` needs
-no more on an exact base). They are fenced with **four** backticks, and the
-extractor closes on the same fence string. Blank context lines carry one
-leading space. The test source is ASCII, with non-ASCII test strings written
-as `\u` escapes. The two doc patches carry pre-existing non-ASCII context.
+The patches are `git diff -U0 c9206a9 ebcf4fc -- <file>`. Rev 13 uses
+0 lines of context to stay within the plan's size budget, so `git apply`
+needs `--unidiff-zero`; on the exact base that is safe, and the *Embedding
+proof* applies them so. They are fenced with **four** backticks, and the
+extractor closes on the same fence string. The test source is ASCII, with
+non-ASCII test strings written as `\u` escapes. The two doc patches carry
+pre-existing non-ASCII text.
 
 #### Extractor
 
@@ -1346,24 +586,21 @@ print(f"{out}: {j - i - 1} lines")
 
 ````diff
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 957a9e0..94aff08 100644
+index 0ae8ba2..813b840 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -439,2 +439,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
- ### Fixed
-+- **A rejected gateway-tool argument no longer echoes its value into the response, the log or the scoped audit (Consiliency/pmcp#297).** Both validation layers rendered the value that failed: the input-schema gate returned jsonschema's message (`Input validation error: 'Bearer sk-…' is not of type 'object', 'null'`), and an argument model's pydantic error — returned as `str(e)[:400]` and logged as `Tool execution error: …` — carried `input_value=…` (the full value for `InvokeInput`'s correlation-ID charset check and a non-dict `meta`, a truncated repr of the whole argument dict for the all-or-none correlation check). Rejections are now described from their structure, as `<JSON path>: <reason>` — e.g. `Input validation error: $.options: must be of type object or null`, `Invalid arguments: $.run_correlation_id: correlation IDs may contain only alphanumerics and ._:-` — where the reason is a fixed phrase filled only from the tool's own schema or model (a type, a length, a pattern, the allowed values) and a key the caller chose is shown as `*`. The log line is `Tool execution error: invalid arguments for <tool>: <same description>`. **The same rule now holds wherever pmcp turns an exception into text** — tool responses, log lines and tracebacks, the in-memory audit-event buffer `gateway.health` exposes, and error fields such as `gateway.tasks_*` `errors`: a pydantic or jsonschema validation error (or an exception whose text embeds one) reads `N validation error(s) for <Model>: $.<path>: <reason>`, and a traceback whose chain holds one is not logged. This covers downstream data too: a task-capable server answering `tasks/get` with `{"taskId": "t", "ttl": "<secret>"}` used to get that value echoed back in `errors` and stored in the audit-event buffer. Operators see the same form for their own config files (policy, trust store, package approvals, `.mcp.json`): the failing field and why, not the value. A downstream that answers with a malformed JSON-RPC frame no longer has it echoed: the MCP SDK turns such a frame into a JSON-RPC `-32700` whose message is pydantic's text, and pmcp now replaces any `-32700` message (and a non-string `error.message`) with fixed text (`downstream sent a response that could not be parsed`), and, from the moment the `pmcp` package is imported (so in the gateway, every `pmcp` CLI command such as `pmcp refresh`, `python -m pmcp` and any embedder), scrubs every log record at creation, whatever logger makes it -- the MCP SDK's `ClientSession` (logger `client`) and third parties included -- when its traceback, `%`-arguments or an exception passed as the message carry a validation error (the traceback is dropped and the structural description appended). Text a library has already formatted into a message string is not scrubbed. This covers the gateway's startup description refresh and `pmcp refresh`, where a downstream's malformed notification used to put its value in the log. **Parse errors of structured text are rendered the same way:** a YAML, JSON (or, on Python 3.11+, TOML) file pmcp could not parse -- a policy, the manifest or an overlay, guidance, code patterns or snippets, a cache, the trust store or package approvals -- is reported as `could not parse YAML policy file at line L, column C (ParserError)`, never with PyYAML's snippet of the offending line (which could hold a secret) or the parser's message -- including a value a YAML tag made PyYAML convert (`k: !!int <value>` used to raise `invalid literal for int() with base 10: '<value>'`), an undefined or duplicate anchor, or nesting too deep to parse; every parse of structured text, and every ISO timestamp pmcp reads from a store or a downstream task (`Unparseable trust timestamp: could not parse timestamp trust store record (ValueError)`), goes through one helper per format that reports only the format, what was being read, the position and the failure's class; and an uncaught error whose chain holds a validation or parse error (a fatal explicit policy, say) is printed with its frames and that description instead of its text. A downstream's own, well-formed error message is still returned as before. **Wording change:** the text after `Input validation error: ` is no longer jsonschema's message; a client matching on phrases such as `is not of type` or `is too short` must match the new form. A call rejected by the tool's argument model (not the gate) is now recorded in the scoped audit as an `audit.rejection` like a gate rejection, with `rejected_argument_validator: null`, instead of an `audit.invocation` `failure` that copied its unvalidated correlation fields. An unregistered tool name is no longer written to the log (`Tool execution error: unknown gateway tool`); the response still names it. `gateway.provision_status` validates its arguments before its catch-all, which logged a traceback of the validation error. An HTTP request whose `Origin` header has a non-numeric or out-of-range port (`Origin: http://host:<text>`) is now refused with 403 like any other rejected origin, instead of failing with a 500 whose logged traceback quoted the port. **A stdio downstream's stdout line that is not a JSON-RPC message is no longer logged with its content:** it gets one fixed DEBUG record, `[<server>] non-protocol stdout line: could not parse JSON downstream stdio frame at line L, column C (<Class>)`, whatever it holds -- a malformed or broken frame, or a banner. MCP's stdio transport allows only newline-delimited messages on stdout; a server's own log belongs on stderr, which is logged as before, so a non-conforming server's stdout banners are no longer visible. A value pmcp rejects by hand is described by its type rather than shown: a downstream's unusable or repeated pagination cursor, a `gateway.cancel` request id that is not `server::number`, an `auth_connect` env var that is not permitted or not a valid name (no longer echoed in `env_var` either), and the env vars `register_discovered_server` may not declare. **The MCP SDK's own traffic logging no longer shows message contents:** with DEBUG logging on, the SDK logs each JSON-RPC message its transports receive and send (`Received server message: …`, `SSE message: …`, `Sending client message: …`), payload included -- a downstream's result before pmcp has validated it, and the caller's own tool arguments on the way out. pmcp now makes every rendering of an SDK message object show its structure instead, such as `<JSON-RPC request: method 'tools/call', id: int, params: object (2 keys)>`, and describes a dict shaped like a message in any log call's arguments. An error a gateway request handler lets escape keeps the wire code the MCP SDK gives it, and an `MCPError`'s `data`, unless the message or `data` carries what was rejected; if it holds a validation error its message is now the structural description: a bare validation error stays `-32602` (it used to carry no text at all), and an exception that wrapped one (`code 0`) no longer carries its text. A catalog entry that could not be parsed is named by its structure when it has no string name, not by its content.
- - **A JWKS with no usable keys is a `503`, not a `500`.** An issuer serving an
+@@ -439,0 +440 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
++- **A rejected gateway-tool argument no longer echoes its value into the response, the log or the scoped audit (Consiliency/pmcp#297).** Both validation layers rendered the value that failed: the input-schema gate returned jsonschema's message (`Input validation error: 'Bearer sk-…' is not of type 'object', 'null'`), and an argument model's pydantic error — returned as `str(e)[:400]` and logged as `Tool execution error: …` — carried `input_value=…` (the full value for `InvokeInput`'s correlation-ID charset check and a non-dict `meta`, a truncated repr of the whole argument dict for the all-or-none correlation check). Rejections are now described from their structure, as `<JSON path>: <reason>` — e.g. `Input validation error: $.options: must be of type object or null`, `Invalid arguments: $.run_correlation_id: correlation IDs may contain only alphanumerics and ._:-` — where the reason is a fixed phrase filled only from the tool's own schema or model (a type, a length, a pattern, the allowed values) and a key the caller chose is shown as `*`. The log line is `Tool execution error: invalid arguments for <tool>: <same description>`. **The same rule now holds wherever pmcp turns an exception into text** — tool responses, log lines and tracebacks, the in-memory audit-event buffer `gateway.health` exposes, and error fields such as `gateway.tasks_*` `errors`: a pydantic or jsonschema validation error (or an exception whose text embeds one) reads `N validation error(s) for <Model>: $.<path>: <reason>`, and a traceback whose chain holds one is not logged. This covers downstream data too: a task-capable server answering `tasks/get` with `{"taskId": "t", "ttl": "<secret>"}` used to get that value echoed back in `errors` and stored in the audit-event buffer. Operators see the same form for their own config files (policy, trust store, package approvals, `.mcp.json`): the failing field and why, not the value. A downstream that answers with a malformed JSON-RPC frame no longer has it echoed: the MCP SDK turns such a frame into a JSON-RPC `-32700` whose message is pydantic's text, and pmcp now replaces any `-32700` message (and a non-string `error.message`) with fixed text (`downstream sent a response that could not be parsed`), and, from the moment the `pmcp` package is imported (so in the gateway, every `pmcp` CLI command such as `pmcp refresh`, `python -m pmcp` and any embedder), scrubs every log record at creation, whatever logger makes it -- the MCP SDK's `ClientSession` (logger `client`) and third parties included -- when its traceback, `%`-arguments or an exception passed as the message carry a validation error (the traceback is dropped and the structural description appended). Text a library has already formatted into a message string is not scrubbed. This covers the gateway's startup description refresh and `pmcp refresh`, where a downstream's malformed notification used to put its value in the log. **Parse errors of structured text are rendered the same way:** a YAML, JSON (or, on Python 3.11+, TOML) file pmcp could not parse -- a policy, the manifest or an overlay, guidance, code patterns or snippets, a cache, the trust store or package approvals -- is reported as `could not parse YAML policy file at line L, column C (ParserError)`, never with PyYAML's snippet of the offending line (which could hold a secret) or the parser's message -- including a value a YAML tag made PyYAML convert (`k: !!int <value>` used to raise `invalid literal for int() with base 10: '<value>'`), an undefined or duplicate anchor, or nesting too deep to parse; every parse of structured text, and every ISO timestamp pmcp reads from a store or a downstream task (`Unparseable trust timestamp: could not parse timestamp trust store record (ValueError)`), goes through one helper per format that reports only the format, what was being read, the position and the failure's class; and an uncaught error whose chain holds a validation or parse error (a fatal explicit policy, say) is printed with its frames and that description instead of its text. A downstream's own, well-formed error message is still returned as before. **Wording change:** the text after `Input validation error: ` is no longer jsonschema's message; a client matching on phrases such as `is not of type` or `is too short` must match the new form. A call rejected by the tool's argument model (not the gate) is now recorded in the scoped audit as an `audit.rejection` like a gate rejection, with `rejected_argument_validator: null`, instead of an `audit.invocation` `failure` that copied its unvalidated correlation fields. An unregistered tool name is no longer written to the log (`Tool execution error: unknown gateway tool`); the response still names it. `gateway.provision_status` validates its arguments before its catch-all, which logged a traceback of the validation error. An HTTP request whose `Origin` header has a non-numeric or out-of-range port (`Origin: http://host:<text>`) is now refused with 403 like any other rejected origin, instead of failing with a 500 whose logged traceback quoted the port. **A stdio downstream's stdout line that is not a JSON-RPC message is no longer logged with its content:** it gets one fixed DEBUG record, `[<server>] non-protocol stdout line: could not parse JSON downstream stdio frame at line L, column C (<Class>)`, whatever it holds -- a malformed or broken frame, or a banner. MCP's stdio transport allows only newline-delimited messages on stdout; a server's own log belongs on stderr, which is logged as before, so a non-conforming server's stdout banners are no longer visible. A value pmcp rejects by hand is described by its type rather than shown: a downstream's unusable or repeated pagination cursor, a `gateway.cancel` request id that is not `server::number` (whose response `request_id` is now `null`, and whose audit event names no server), an `auth_connect` env var that is not permitted or not a valid name (no longer echoed in `env_var` either), and the env vars `register_discovered_server` may not declare. **The MCP SDK's own traffic logging no longer shows message contents:** with DEBUG logging on, the SDK logs each JSON-RPC message its transports receive and send (`Received server message: …`, `SSE message: …`, `Sending client message: …`), payload included -- a downstream's result before pmcp has validated it, and the caller's own tool arguments on the way out. pmcp now makes every rendering of an SDK message object show its structure instead, such as `<JSON-RPC request: method 'tools/call', id: int, params: object (2 keys)>`, and describes a dict shaped like a message in any log call's arguments. An error a gateway request handler lets escape keeps the wire code the MCP SDK gives it, and an `MCPError`'s `data`, unless the message or `data` carries what was rejected; if it holds a validation error its message is now the structural description: a bare validation error stays `-32602` (it used to carry no text at all), and an exception that wrapped one (`code 0`) no longer carries its text. A catalog entry that could not be parsed is named by its structure when it has no string name, not by its content. **A downstream frame that is not a JSON-RPC 2.0 message is no longer acted on:** stdio frames, and frames on the SSE and streamable-HTTP transports (whose MCP SDK models coerce a bool or string `error.code` and ignore a `result` sent alongside an `error`), are checked against the JSON-RPC 2.0 and MCP envelope rules -- `"jsonrpc": "2.0"`, exactly one of an object `result` or an `error` object with an integer `code` and a string `message`, a string or integer id -- and a frame that breaks one is dropped with a value-free DEBUG record (`dropped invalid frame: <rule>`). Such a frame carrying a pending request's id no longer settles that request: it is answered by a valid frame or times out, where before its `error.message` reached the caller as the downstream's error. A task hint pmcp drops as unusable (Consiliency/pmcp#298) is no longer returned in the task's `raw` by the `gateway.tasks_*` tools, and no longer counts toward `gateway.invoke`'s `raw_size_estimate` for a task answer.
 ````
 
 ### Patch — `README.md`
 
 ````diff
 diff --git a/README.md b/README.md
-index 8af5061..19e2f71 100644
+index cfdd1b2..ec1feb8 100644
 --- a/README.md
 +++ b/README.md
-@@ -1584,5 +1584,7 @@ URLs, queries, arguments, credentials, or result bodies—and ends with one
- fsynced completeness marker. A call whose arguments fail the tool's input schema
+@@ -1619,3 +1619,5 @@ fsynced completeness marker. A call whose arguments fail the tool's input schema
 -is recorded as a separate `audit.rejection` event (`terminal_status:
 -"invalid_arguments"`) carrying only the tool, the failing JSON path
 -(caller-chosen keys shown as `null`) and the failing schema keyword. Only
@@ -1372,7 +609,6 @@ index 8af5061..19e2f71 100644
 +path (caller-chosen keys shown as `null`) and the failing schema keyword (`null`
 +for a model rejection). The rejection the caller sees, and the log line, name the
 +same path and a reason taken from the schema, never the rejected value. Only
- arguments that passed the tool's input schema, and only the top-level keys it
 ````
 
 ### Patch — `src/pmcp/__init__.py`
@@ -1382,11 +618,10 @@ diff --git a/src/pmcp/__init__.py b/src/pmcp/__init__.py
 index 5029f42..731fe41 100644
 --- a/src/pmcp/__init__.py
 +++ b/src/pmcp/__init__.py
-@@ -2,2 +2,11 @@
- 
+@@ -2,0 +3,2 @@
 +from pmcp.argument_errors import install_log_scrubber as _install_log_scrubber
 +
- __version__ = "2.7.3"
+@@ -3,0 +6,7 @@ __version__ = "2.7.3"
 +
 +# Every entry point imports this package first -- the gateway, the `pmcp`
 +# CLI (`pmcp refresh` talks to downstreams through the MCP SDK's client),
@@ -1401,10 +636,10 @@ index 5029f42..731fe41 100644
 ````diff
 diff --git a/src/pmcp/argument_errors.py b/src/pmcp/argument_errors.py
 new file mode 100644
-index 0000000..7a5d1b1
+index 0000000..3944203
 --- /dev/null
 +++ b/src/pmcp/argument_errors.py
-@@ -0,0 +1,1158 @@
+@@ -0,0 +1,1341 @@
 +"""Describe a rejected gateway-tool argument without the value that failed.
 +
 +A gateway tool's arguments are checked twice: by the advertised JSON Schema
@@ -1449,6 +684,7 @@ index 0000000..7a5d1b1
 +import sys
 +import traceback
 +from collections.abc import Iterable, Iterator
++from types import ModuleType
 +from typing import Any
 +
 +import jsonschema
@@ -2072,7 +1308,25 @@ index 0000000..7a5d1b1
 +        elif isinstance(linked, jsonschema.ValidationError):
 +            inputs = [linked.instance]
 +        for value in inputs:
-+            for text in (value, json.dumps(value, default=str)):
++            # The input whole (as itself, JSON and repr), and every string
++            # inside a container input: a message built from `{'v': '<s>'}`
++            # renders neither form of the whole (rev 13, on Consiliency/
++            # pmcp#298's merge, whose task fields no longer raise).
++            candidates: list[Any] = [value, json.dumps(value, default=str), repr(value)]
++            stack: list[tuple[Any, int]] = [(value, 0)]
++            while stack:
++                item, depth = stack.pop()
++                if depth > 8:
++                    continue
++                if isinstance(item, dict):
++                    for key, inner in item.items():
++                        candidates.append(key)
++                        stack.append((inner, depth + 1))
++                elif isinstance(item, (list, tuple, set)):
++                    stack.extend((inner, depth + 1) for inner in item)
++                elif depth and isinstance(item, str):
++                    candidates.append(item)
++            for text in candidates:
 +                if isinstance(text, str) and len(text) >= 4:
 +                    texts.append(text)
 +    return texts
@@ -2455,6 +1709,169 @@ index 0000000..7a5d1b1
 +    return factory
 +
 +
++# --- rev 13: the JSON-RPC 2.0 envelope (round-12 codex B2) -------------------
++
++
++def _type_of(value: Any) -> str:
++    return type(value).__name__
++
++
++def _is_request_id(value: Any) -> bool:
++    """MCP's `RequestId`: a string or an integer. Not a bool (`True == 1`
++    would resolve request 1) and not a float (`1.0 == 1` likewise)."""
++    return isinstance(value, (str, int)) and not isinstance(value, bool)
++
++
++def jsonrpc_envelope_problem(frame: Any) -> str | None:
++    """Why `frame` is not a JSON-RPC 2.0 message as MCP defines one, or None.
++
++    Every rule is the specification's, not a list of bad frames
++    (Consiliency/pmcp#297, rev 13): JSON-RPC 2.0 sections 4 and 5, and MCP's
++    `JSONRPCRequest` / `JSONRPCNotification` / `JSONRPCResultResponse` /
++    `JSONRPCErrorResponse`.
++
++    - `jsonrpc` is exactly the string `"2.0"`;
++    - a request has a string `method` and a `RequestId`; a notification has a
++      string `method` and no `id`; `params`, when present, is an object; a
++      request or notification carries neither `result` nor `error`;
++    - a response has an `id` member (a `RequestId`, or null for an error the
++      server could not attribute) and exactly one of `result` and `error`;
++    - `result` is an object (MCP's `Result`);
++    - `error` is an object whose `code` is an integer (not a bool) and whose
++      `message` is a string; `data` is optional and unconstrained.
++
++    Extra members are allowed (neither specification forbids them, and
++    nothing reads them). The reason is value-free: fixed text and JSON type
++    names only, so it can be logged for any frame.
++    """
++    if not isinstance(frame, dict):
++        return f"not a JSON object ({_type_of(frame)})"
++    if frame.get("jsonrpc") != "2.0" or not isinstance(frame.get("jsonrpc"), str):
++        return "the jsonrpc member is not the string 2.0"
++    if "method" in frame:
++        method = frame["method"]
++        if not isinstance(method, str):
++            return f"non-string method ({_type_of(method)})"
++        if "id" in frame and not _is_request_id(frame["id"]):
++            return f"id of type {_type_of(frame['id'])}"
++        if "params" in frame and not isinstance(frame["params"], dict):
++            return f"params of type {_type_of(frame['params'])}"
++        if "result" in frame or "error" in frame:
++            return "a request or notification carrying result or error"
++        return None
++    if "id" not in frame:
++        return "a response without an id"
++    msg_id = frame["id"]
++    if msg_id is not None and not _is_request_id(msg_id):
++        return f"id of type {_type_of(msg_id)}"
++    has_result, has_error = "result" in frame, "error" in frame
++    if has_result == has_error:
++        return "both result and error" if has_result else "neither result nor error"
++    if has_result:
++        if msg_id is None:
++            return "a result with a null id"
++        if not isinstance(frame["result"], dict):
++            return f"result of type {_type_of(frame['result'])}"
++        return None
++    error = frame["error"]
++    if not isinstance(error, dict):
++        return f"error of type {_type_of(error)}"
++    if type(error.get("code")) is not int:
++        return f"error code of type {_type_of(error.get('code'))}"
++    if not isinstance(error.get("message"), str):
++        return f"error message of type {_type_of(error.get('message'))}"
++    return None
++
++
++class _StrictMessageAdapter:
++    """The SDK client transports' `jsonrpc_message_adapter`, with
++    `jsonrpc_envelope_problem` applied first (rev 13, round-12 codex B2).
++
++    The SDK's models are lax where the specification is not: they coerce an
++    `error.code` of `true`, `"5"` or `5.0` to an integer, and ignore an extra
++    member, so a frame with both `result` and `error` validates as an error
++    response. Its `message` then reached pmcp as if it were the downstream's
++    error. A frame this adapter rejects raises a pydantic `ValidationError`
++    whose text is the value-free reason, which each transport already
++    handles as a frame it could not parse: the SSE readers put it on the
++    read stream, where `_read_sse` drops it, and the JSON-response path turns
++    it into a `-32700`, whose message `_downstream_error` replaces.
++    Everything else is the SDK's own adapter.
++    """
++
++    def __init__(self, base: Any) -> None:
++        self._base = base
++
++    def validate_json(self, data: Any, /, *args: Any, **kwargs: Any) -> Any:
++        from pmcp.parsing import JSONParseError, load_json
++
++        try:
++            value = load_json(data, source="downstream JSON-RPC message")
++        except JSONParseError:
++            # Not JSON (or past a parser limit): the SDK's own rejection.
++            return self._base.validate_json(data, *args, **kwargs)
++        problem = jsonrpc_envelope_problem(value)
++        if problem is not None:
++            raise ValidationError.from_exception_data(
++                "JSONRPCMessage",
++                [
++                    {
++                        "type": PydanticCustomError(
++                            "jsonrpc_envelope",
++                            "malformed JSON-RPC envelope: {reason}",
++                            {"reason": problem},
++                        ),
++                        "loc": (),
++                        "input": None,
++                    }
++                ],
++            )
++        return self._base.validate_json(data, *args, **kwargs)
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(self._base, name)
++
++
++class _ClientTypesView(ModuleType):
++    """`mcp_types` as the SDK's SSE and stdio clients see it: the same module,
++    but with the strict adapter. Those clients read
++    `types.jsonrpc_message_adapter` at call time, and the server side uses the
++    same module, so the module itself is left alone."""
++
++    def __init__(self, base: ModuleType, adapter: Any) -> None:
++        super().__init__(base.__name__)
++        self._base = base
++        self.jsonrpc_message_adapter = adapter
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(self._base, name)
++
++
++def _install_strict_client_envelopes() -> None:
++    """Point the SDK's three client transports at the strict adapter: the
++    gateway's remote transports, and `stdio_client`, which `pmcp refresh`
++    and the startup description refresh use. Installed on `import pmcp`
++    with the record scrubber. Idempotent; the server-side transports are
++    untouched."""
++    try:
++        import mcp.client.sse as sse_module
++        import mcp.client.stdio as stdio_module
++        import mcp.client.streamable_http as streamable_module
++    except Exception:  # pragma: no cover - the SDK is a dependency
++        return
++
++    for module in (sse_module, stdio_module):
++        current = getattr(module, "types")
++        if not isinstance(current, _ClientTypesView):
++            strict = _StrictMessageAdapter(current.jsonrpc_message_adapter)
++            setattr(module, "types", _ClientTypesView(current, strict))
++    adapter = getattr(streamable_module, "jsonrpc_message_adapter")
++    if not isinstance(adapter, _StrictMessageAdapter):
++        setattr(
++            streamable_module, "jsonrpc_message_adapter", _StrictMessageAdapter(adapter)
++        )
++
++
 +def install_log_scrubber() -> None:
 +    """Scrub every `LogRecord` at creation, whatever logger creates it.
 +
@@ -2475,6 +1892,7 @@ index 0000000..7a5d1b1
 +    _install_threading_excepthook()
 +    _install_handle_error()
 +    _install_message_rendering()
++    _install_strict_client_envelopes()
 +
 +
 +def _install_handle_error() -> None:
@@ -2569,161 +1987,116 @@ index 0000000..7a5d1b1
 
 ````diff
 diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
-index e929470..8d44c35 100644
+index 51b2d05..e7e56d6 100644
 --- a/src/pmcp/auth.py
 +++ b/src/pmcp/auth.py
-@@ -21,3 +21,5 @@ from jwt import PyJWKSet
- 
+@@ -22,0 +23 @@ from jwt import PyJWKSet
 +from pmcp.argument_errors import exception_text
- from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
+@@ -23,0 +25 @@ from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
 +from pmcp.parsing import load_json
- from pmcp.redaction_additive import redact_additive
-@@ -529,3 +531,3 @@ class AsyncJWKS:
-         try:
+@@ -822 +824 @@ class AsyncJWKS:
 -            jwks = json.loads(content.decode("utf-8"))
 +            jwks = load_json(content, source="JWKS response", encoding="utf-8")
-         except (ValueError, RecursionError) as exc:
-@@ -533,2 +535,5 @@ class AsyncJWKS:
-             # deeply nested body under the size cap raises RecursionError.
+@@ -825,0 +828,3 @@ class AsyncJWKS:
 +            # (`load_json` already classifies all of them as a value-free
 +            # `JSONParseError`, a ValueError; RecursionError stays listed for
 +            # the reader.)
-             raise ResourceServerJWKSUnavailable(
-@@ -731,3 +736,6 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) ->
-     """
+@@ -1032 +1037,4 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) ->
 -    text = redact_additive(_sanitize_base(str(value)))
 +    # An exception goes through `exception_text`: a validation error's own
 +    # text carries the rejected value (Consiliency/pmcp#297).
 +    raw = exception_text(value) if isinstance(value, BaseException) else str(value)
 +    text = redact_additive(_sanitize_base(raw))
-     return text if max_length is None else text[:max_length]
-@@ -950,3 +958,3 @@ def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
-         try:
+@@ -1251 +1259 @@ def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
 -            payload = json.loads(payload_text)
 +            payload = load_json(payload_text, source="URL elicitation payload")
-         except json.JSONDecodeError:
-@@ -956,3 +964,3 @@ def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
-             try:
+@@ -1257 +1265 @@ def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
 -                payload = json.loads(match.group(1))
 +                payload = load_json(match.group(1), source="URL elicitation payload")
-             except json.JSONDecodeError:
-@@ -1044,3 +1052,3 @@ def fetch_json_metadata(
-             return None, f"{safe_url} returned non-JSON content"
+@@ -1345 +1353 @@ def fetch_json_metadata(
 -        data = json.loads(body.decode("utf-8"))
 +        data = load_json(body, source="auth metadata response", encoding="utf-8")
-         if not isinstance(data, dict):
 ````
 
 ### Patch — `src/pmcp/cli.py`
 
 ````diff
 diff --git a/src/pmcp/cli.py b/src/pmcp/cli.py
-index bbaee51..f9f9e2e 100644
+index 2be0ff2..f266f88 100644
 --- a/src/pmcp/cli.py
 +++ b/src/pmcp/cli.py
-@@ -21,2 +21,3 @@ from urllib.parse import urlsplit, urlunsplit
- from dotenv import load_dotenv
+@@ -21,0 +22 @@ from dotenv import load_dotenv
 +from pmcp.argument_errors import exception_text, safe_exc_info
- from pmcp import package_approvals, trust_store
-@@ -46,2 +47,3 @@ from pmcp.validation import is_valid_package_version, parse_package_spec
- from pmcp.manifest.loader import load_manifest
+@@ -46,0 +48 @@ from pmcp.manifest.loader import load_manifest
 +from pmcp.parsing import load_json, load_json_file
- from pmcp.types import StartupPolicyOperation
-@@ -937,4 +939,4 @@ async def run_refresh(args: argparse.Namespace) -> None:
-     except Exception as e:
+@@ -938,2 +940,2 @@ async def run_refresh(args: argparse.Namespace) -> None:
 -        logger.error(f"Refresh failed: {e}")
 -        print(f"Error: {e}", file=sys.stderr)
 +        logger.error(f"Refresh failed: {exception_text(e)}")
 +        print(f"Error: {exception_text(e)}", file=sys.stderr)
-         sys.exit(1)
-@@ -1143,3 +1145,3 @@ def _extract_tool_payload(result: dict[str, object]) -> dict[str, object] | None
-         try:
+@@ -1144 +1146 @@ def _extract_tool_payload(result: dict[str, object]) -> dict[str, object] | None
 -            parsed = json.loads(text)
 +            parsed = load_json(text, source="tool result text")
-         except json.JSONDecodeError:
-@@ -1221,4 +1223,4 @@ async def _query_running_gateway_status(
-         return snapshot
+@@ -1222,2 +1224,2 @@ async def _query_running_gateway_status(
 -    except Exception:
 -        logger.debug("Live gateway status query failed", exc_info=True)
 +    except Exception as exc:
 +        logger.debug("Live gateway status query failed", exc_info=safe_exc_info(exc))
-         return None
-@@ -1873,3 +1875,3 @@ def run_setup(args: argparse.Namespace) -> None:
-         try:
+@@ -1874 +1876 @@ def run_setup(args: argparse.Namespace) -> None:
 -            parsed = json.loads(target_path.read_text())
 +            parsed = load_json(target_path.read_text(), source="client config")
-             if isinstance(parsed, dict):
-@@ -1880,3 +1882,3 @@ def run_setup(args: argparse.Namespace) -> None:
-             print(
+@@ -1881 +1883 @@ def run_setup(args: argparse.Namespace) -> None:
 -                f"Error: Could not parse existing config at {target_path}: {exc}",
 +                f"Error: Could not parse existing config at {target_path}: {exception_text(exc)}",
-                 file=sys.stderr,
-@@ -1993,3 +1995,3 @@ def _load_local_mcp_json(project_root: Path | None) -> tuple[Path, dict | None]:
-         with open(config_path) as f:
+@@ -1994 +1996 @@ def _load_local_mcp_json(project_root: Path | None) -> tuple[Path, dict | None]:
 -            parsed = json.load(f)
 +            parsed = load_json_file(f, source="client config")
-             return config_path, parsed if isinstance(parsed, dict) else None
-@@ -2098,3 +2100,3 @@ async def _probe_http_health(timeout_s: float) -> tuple[bool, str, int | None]:
-             sanitize_auth_diagnostic(
+@@ -2099 +2101 @@ async def _probe_http_health(timeout_s: float) -> tuple[bool, str, int | None]:
 -                f"{safe_url} unreachable ({exc.__class__.__name__}: {exc})"
 +                f"{safe_url} unreachable ({exc.__class__.__name__}: {exception_text(exc)})"
-             ),
-@@ -2510,3 +2512,3 @@ async def run_server(args: argparse.Namespace) -> None:
-     except Exception as e:
+@@ -2348 +2350 @@ def _check_auth_args(args: argparse.Namespace) -> None:
+-        print(f"error: {exc}", file=sys.stderr)
++        print(f"error: {exception_text(exc)}", file=sys.stderr)
+@@ -2537 +2539 @@ async def run_server(args: argparse.Namespace) -> None:
 -        logger.error(f"Fatal error: {e}")
 +        logger.error(f"Fatal error: {exception_text(e)}")
-         raise
-@@ -2741,3 +2743,3 @@ def run_trust(args: argparse.Namespace) -> None:
-     except (trust_store.TrustStoreError, ValueError) as exc:
+@@ -2768 +2770 @@ def run_trust(args: argparse.Namespace) -> None:
 -        _trust_fail(str(exc))
 +        _trust_fail(exception_text(exc))
- 
-@@ -3081,3 +3083,3 @@ def main() -> None:
-     except Exception as e:
+@@ -3108 +3110 @@ def main() -> None:
 -        print(f"Fatal error: {e}", file=sys.stderr)
 +        print(f"Fatal error: {exception_text(e)}", file=sys.stderr)
-         sys.exit(1)
 ````
 
 ### Patch — `src/pmcp/client/manager.py`
 
 ````diff
 diff --git a/src/pmcp/client/manager.py b/src/pmcp/client/manager.py
-index 57a563e..31c5287 100644
+index cae5645..7e34825 100644
 --- a/src/pmcp/client/manager.py
 +++ b/src/pmcp/client/manager.py
-@@ -13,3 +13,2 @@ import re
- import signal
+@@ -14 +13,0 @@ import signal
 -import traceback
- import string
-@@ -29,2 +28,8 @@ from pydantic import ValidationError
- 
+@@ -29,0 +29,7 @@ from pydantic import ValidationError
 +from pmcp.argument_errors import (
 +    describe_value,
 +    exception_text,
++    jsonrpc_envelope_problem,
 +    safe_traceback_text,
 +    install_log_scrubber,
 +)
- from pmcp.auth import sanitize_auth_diagnostic
-@@ -33,2 +38,3 @@ from pmcp.env_store import sanitized_subprocess_env
- from pmcp.manifest.installer import _operator_safe, _render_install_argv
+@@ -33,0 +40 @@ from pmcp.manifest.installer import _operator_safe, _render_install_argv
 +from pmcp.parsing import load_json
- from pmcp.remote_auth import (
-@@ -69,2 +75,5 @@ except ImportError:
- logger = logging.getLogger(__name__)
+@@ -71,0 +79,3 @@ logger = logging.getLogger(__name__)
 +# The SDK logs rejected frames with a traceback (Consiliency/pmcp#297); every
 +# record is scrubbed at creation (`install_log_scrubber`).
 +install_log_scrubber()
- 
-@@ -133,3 +142,5 @@ def describe_exception(exc: BaseException) -> str:
-     rendered = "; ".join(
+@@ -136 +146,3 @@ def describe_exception(exc: BaseException) -> str:
 -        f"{type(leaf).__name__}: {leaf}" if str(leaf) else type(leaf).__name__
 +        f"{type(leaf).__name__}: {exception_text(leaf)}"
 +        if str(leaf)
 +        else type(leaf).__name__
-         for leaf in shown
-@@ -213,11 +224,33 @@ class DownstreamError(Exception):
- 
+@@ -242,0 +255,10 @@ class DownstreamError(Exception):
 +#: JSON-RPC's parse-error code. The SDK's HTTP transports synthesise it for a
 +#: downstream frame their models reject, with `f"Failed to parse ...: {exc}"`
 +#: -- pydantic's text, rejected value included -- as the message
@@ -2734,7 +2107,7 @@ index 57a563e..31c5287 100644
 +_MALFORMED_ERROR_MESSAGE = "downstream sent a malformed JSON-RPC error"
 +
 +
- def _downstream_error(error: Any) -> DownstreamError:
+@@ -244 +266,8 @@ def _downstream_error(error: Any) -> DownstreamError:
 -    """Build a `DownstreamError` from a JSON-RPC `error` member."""
 +    """Build a `DownstreamError` from a JSON-RPC `error` member.
 +
@@ -2744,7 +2117,7 @@ index 57a563e..31c5287 100644
 +    (not an object, or a non-string `message`). Every other error keeps the
 +    downstream's own message string, returned by design.
 +    """
-     if not isinstance(error, dict):
+@@ -246,6 +275,58 @@ def _downstream_error(error: Any) -> DownstreamError:
 -        return DownstreamError(str(error))
 -    return DownstreamError(
 -        str(error.get("message", "Unknown error")),
@@ -2762,54 +2135,90 @@ index 57a563e..31c5287 100644
 +        # reject it outright; stdio is parsed without a model).
 +        return DownstreamError(_MALFORMED_ERROR_MESSAGE, code=code)
 +    return DownstreamError(message, code=code, data=error.get("data"))
- 
-@@ -596,3 +629,7 @@ def _entry_label(entry: Any, key: str = "name") -> str:
-             return repr(identifier)
++
++
++#: Each task field's wire names, for `_usable_task_raw`.
++_TASK_WIRE_KEYS: dict[str, tuple[str, ...]] = {
++    "status": ("status",),
++    "created_at": ("createdAt", "created_at"),
++    "updated_at": ("updatedAt", "updated_at", "lastUpdatedAt", "last_updated_at"),
++    "ttl": ("ttl",),
++    "poll_interval": ("pollInterval", "poll_interval"),
++}
++
++
++def _usable_task_raw(payload: dict[str, Any]) -> dict[str, Any]:
++    """A downstream task payload as `raw`, without the values pmcp found
++    unusable (Consiliency/pmcp#297 on Consiliency/pmcp#298's drop rule).
++
++    The model drops an unusable hint and names the field in
++    `unusable_fields`; the payload it came from is returned to the caller
++    as `raw` by every `gateway.tasks_*` tool, so the rejected value went back
++    out there. A `null` is kept (`ttl: null` means unlimited), and so is
++    every member pmcp does not read."""
++    unusable = {
++        key
++        for name, keys in _TASK_WIRE_KEYS.items()
++        for key in keys
++        if key in payload
++        and payload[key] is not None
++        and not task_hint_is_usable(name, payload[key])
++    }
++    for key in ("statusMessage", "status_message"):
++        if key in payload and not isinstance(payload[key], (str, type(None))):
++            unusable.add(key)
++    return {key: value for key, value in payload.items() if key not in unusable}
++
++
++def parse_request_id(request_id: str) -> tuple[str, int] | None:
++    """`server_name::local_id` as `gateway.cancel` takes it, or None when the
++    id does not have that format (no `::`, or a local id that is not an
++    integer). The handler uses the same parse, so a rejected id is never
++    copied into the response or the audit event (rev 13, round-12 B1)."""
++    if "::" not in request_id:
++        return None
++    server_name, local_id_str = request_id.rsplit("::", 1)
++    try:
++        return server_name, int(local_id_str)
++    except ValueError:
++        return None
+@@ -626 +707,5 @@ def _entry_label(entry: Any, key: str = "name") -> str:
 -    return repr(entry)[:120]
 +        # No usable identifier: describe the entry's structure, never its
 +        # content -- the downstream's data that failed validation
 +        # (Consiliency/pmcp#297, rev 10; it was `repr(entry)[:120]`).
 +        return f"(an entry with {len(entry)} key{'' if len(entry) == 1 else 's'})"
 +    return f"(a {type(entry).__name__} entry)"
- 
-@@ -1135,3 +1172,5 @@ class ClientManager:
-             if isinstance(result, Exception):
+@@ -1167 +1252,3 @@ class ClientManager:
 -                error_msg = f"Failed to connect to {config.name}: {result}"
 +                error_msg = (
 +                    f"Failed to connect to {config.name}: {exception_text(result)}"
 +                )
-                 logger.error(error_msg)
-@@ -1937,3 +1976,5 @@ class ClientManager:
-             if isinstance(result, BaseException):
+@@ -1765 +1852 @@ class ClientManager:
+-            raw=payload,
++            raw=_usable_task_raw(payload),
+@@ -2028 +2115,3 @@ class ClientManager:
 -                logger.debug(f"Server {name} doesn't support {kind}: {result}")
 +                logger.debug(
 +                    f"Server {name} doesn't support {kind}: {exception_text(result)}"
 +                )
-                 listings[kind] = None
-@@ -2026,4 +2067,4 @@ class ClientManager:
-                     f"[{managed.config.name}] {kind}/list returned an unusable "
+@@ -2117,2 +2206,2 @@ class ClientManager:
 -                    f"cursor ({raw_cursor!r}); treating as unreadable rather "
 -                    f"than as the end of the listing"
 +                    f"cursor ({describe_value(raw_cursor)}); treating as "
 +                    f"unreadable rather than as the end of the listing"
-                 )
-@@ -2032,4 +2073,5 @@ class ClientManager:
-                 logger.warning(
+@@ -2123,2 +2212,3 @@ class ClientManager:
 -                    f"[{managed.config.name}] {kind}/list repeated cursor "
 -                    f"{raw_cursor!r}; treating as unreadable rather than looping"
 +                    f"[{managed.config.name}] {kind}/list repeated a cursor "
 +                    f"({describe_value(raw_cursor)}); treating as unreadable "
 +                    f"rather than looping"
-                 )
-@@ -2676,5 +2718,3 @@ class ClientManager:
-                 # framework formats on its own.
+@@ -2767,3 +2857 @@ class ClientManager:
 -                traceback_text = "".join(
 -                    traceback.format_exception(type(exc), exc, exc.__traceback__)
 -                )
 +                traceback_text = safe_traceback_text(exc)
-                 logger.warning(
-@@ -2843,8 +2883,12 @@ class ClientManager:
-                 )
+@@ -2934,6 +3022,10 @@ class ClientManager:
 -            message = json.loads(text)
 -        except json.JSONDecodeError:
 -            # Non-JSON output already counted as a heartbeat by the caller.
@@ -2826,23 +2235,90 @@ index 57a563e..31c5287 100644
 +            # on stderr, which is logged as before. The record is fixed text
 +            # plus the parser's value-free description.
 +            logger.debug(f"[{name}] non-protocol stdout line: {exception_text(error)}")
-             return
-@@ -4325,3 +4369,4 @@ class ClientManager:
-                 "not_found",
+@@ -2977,13 +3069,20 @@ class ClientManager:
+-        Each guard below exists because a later access depends on it, and each
+-        drops the frame with a value-free debug log, as a non-JSON line is
+-        dropped:
+-
+-        - `frame.get` / `"method" in frame` / `frame["error"]` need a JSON
+-          object: `[]`, `42`, `"x"`, `null`, `true` all parse but are not one.
+-        - `msg_id in managed.pending_requests` needs a hashable id, and must not
+-          match one of our int ids by numeric equality: `True == 1` and
+-          `1.0 == 1` both hash equal, so a bool or float id would resolve
+-          request 1. JSON-RPC ids are strings, integers or null.
+-        - `set_result` / `set_exception` raise `InvalidStateError` on a future
+-          that is already settled (a caller cancelled it, and the response
+-          raced its `finally` pop).
++        A frame that is not a JSON-RPC 2.0 message (`jsonrpc_envelope_problem`)
++        is dropped with a value-free record, like a line that is not JSON
++        (Consiliency/pmcp#297, rev 13). Before, the guards here were only the
++        ones a later access depended on, so `{"jsonrpc": "1.0", "id": 8,
++        "error": {...}}`, a frame with no `jsonrpc`, one with both `result`
++        and `error`, or one whose `error.code` was an object resolved pending
++        request 8, and its `message` reached the caller's log as the
++        downstream's error. A malformed frame carrying a pending request's id
++        does not settle that request: nothing in a frame that is not a message
++        is acted on, its id included, so the request is answered by a valid
++        frame or times out (idle timeout; `tools/call`'s ceiling). The
++        alternative, failing it with fixed text, would let any line that
++        parses with a colliding id end a caller's request.
++
++        The envelope rules also give the dispatcher what its accesses need: a
++        JSON object; an id that is a string or an integer, so a bool or float
++        cannot resolve request 1 by numeric equality. `set_result` /
++        `set_exception` still raise `InvalidStateError` on a future that is
++        already settled (a caller cancelled it, and the response raced its
++        `finally` pop), which is checked below.
+@@ -2991,5 +3090,3 @@ class ClientManager:
+-        if not isinstance(frame, dict):
+-            logger.debug(
+-                f"[{name}] dropped invalid frame: not a JSON object "
+-                f"({type(frame).__name__})"
+-            )
++        problem = jsonrpc_envelope_problem(frame)
++        if problem is not None:
++            logger.debug(f"[{name}] dropped invalid frame: {problem}")
+@@ -2998,7 +3094,0 @@ class ClientManager:
+-        if msg_id is not None and (
+-            isinstance(msg_id, bool) or not isinstance(msg_id, (str, int))
+-        ):
+-            logger.debug(
+-                f"[{name}] dropped invalid frame: id of type {type(msg_id).__name__}"
+-            )
+-            return
+@@ -3012 +3102 @@ class ClientManager:
+-            if msg_id is None:
++            if "id" not in frame:
+@@ -3018,9 +3107,0 @@ class ClientManager:
+-        elif "method" in frame:
+-            # A `method` that is present but not a string is not a valid
+-            # JSON-RPC request -- and it is not a response either, so it must
+-            # not fall through to the pending lookup, where an id colliding with
+-            # one of ours would resolve that future.
+-            logger.debug(
+-                f"[{name}] dropped invalid frame: non-string method "
+-                f"({type(method).__name__})"
+-            )
+@@ -4425 +4506,2 @@ class ClientManager:
 -                f"Invalid request_id format: {request_id}",
 +                "Invalid request_id format: expected server_name::local_id "
 +                f"({describe_value(request_id)})",
-                 False,
-@@ -4334,3 +4379,8 @@ class ClientManager:
-         except ValueError:
+@@ -4429,6 +4511,9 @@ class ClientManager:
+-
+-        server_name, local_id_str = request_id.rsplit("::", 1)
+-        try:
+-            local_id = int(local_id_str)
+-        except ValueError:
 -            return ("not_found", f"Invalid local_id: {local_id_str}", False, None)
++        parsed_id = parse_request_id(request_id)
++        if parsed_id is None:
 +            return (
 +                "not_found",
-+                f"Invalid local_id: expected an integer ({describe_value(local_id_str)})",
++                "Invalid local_id: expected an integer (a string)",
 +                False,
 +                None,
 +            )
- 
++        server_name, local_id = parsed_id
 ````
 
 ### Patch — `src/pmcp/config/guidance.py`
@@ -2852,33 +2328,23 @@ diff --git a/src/pmcp/config/guidance.py b/src/pmcp/config/guidance.py
 index 58976f6..c079962 100644
 --- a/src/pmcp/config/guidance.py
 +++ b/src/pmcp/config/guidance.py
-@@ -13,2 +13,4 @@ import yaml
- from pydantic import BaseModel, Field
+@@ -13,0 +14,2 @@ from pydantic import BaseModel, Field
 +from pmcp.argument_errors import exception_text
 +from pmcp.parsing import load_yaml
- 
-@@ -169,3 +171,3 @@ def load_guidance_config(config_path: Path | None = None) -> GuidanceConfig:
-         with open(config_path) as f:
+@@ -170 +172 @@ def load_guidance_config(config_path: Path | None = None) -> GuidanceConfig:
 -            data = yaml.safe_load(f)
 +            data = load_yaml(f, source="guidance config")
- 
-@@ -177,3 +179,5 @@ def load_guidance_config(config_path: Path | None = None) -> GuidanceConfig:
-         # If config is invalid, log warning and use defaults
+@@ -178 +180,3 @@ def load_guidance_config(config_path: Path | None = None) -> GuidanceConfig:
 -        print(f"Warning: Failed to load guidance config from {config_path}: {e}")
 +        print(
 +            f"Warning: Failed to load guidance config from {config_path}: {exception_text(e)}"
 +        )
-         print("Using default guidance config (minimal mode)")
-@@ -234,3 +238,3 @@ def set_telemetry_enabled(
-         try:
+@@ -235 +239 @@ def set_telemetry_enabled(
 -            loaded = yaml.safe_load(config_path.read_text())
 +            loaded = load_yaml(config_path.read_text(), source="guidance config")
-             if isinstance(loaded, dict):
-@@ -274,3 +278,3 @@ def set_feedback_submission_enabled(
-         try:
+@@ -275 +279 @@ def set_feedback_submission_enabled(
 -            loaded = yaml.safe_load(config_path.read_text())
 +            loaded = load_yaml(config_path.read_text(), source="guidance config")
-             if isinstance(loaded, dict):
 ````
 
 ### Patch — `src/pmcp/config/loader.py`
@@ -2888,46 +2354,32 @@ diff --git a/src/pmcp/config/loader.py b/src/pmcp/config/loader.py
 index c71e7f8..f07ea66 100644
 --- a/src/pmcp/config/loader.py
 +++ b/src/pmcp/config/loader.py
-@@ -16,2 +16,4 @@ from typing import TYPE_CHECKING, Any, Literal, cast
- 
+@@ -16,0 +17,2 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 +from pmcp.argument_errors import exception_text
 +from pmcp.parsing import load_json
- from pmcp.types import (
-@@ -281,3 +283,3 @@ def parse_json_file(file_path: Path) -> McpConfigFile | None:
-     except Exception as e:
+@@ -282 +284 @@ def parse_json_file(file_path: Path) -> McpConfigFile | None:
 -        logger.warning(f"Failed to parse config file {file_path}: {e}")
 +        logger.warning(f"Failed to parse config file {file_path}: {exception_text(e)}")
-         return None
-@@ -297,3 +299,3 @@ def parse_config_bytes(content: bytes, file_path: Path) -> McpConfigFile | None:
-     try:
+@@ -298 +300 @@ def parse_config_bytes(content: bytes, file_path: Path) -> McpConfigFile | None:
 -        data = json.loads(content)
 +        data = load_json(content, source="config file")
- 
-@@ -318,3 +320,3 @@ def parse_config_bytes(content: bytes, file_path: Path) -> McpConfigFile | None:
-     except Exception as e:
+@@ -319 +321 @@ def parse_config_bytes(content: bytes, file_path: Path) -> McpConfigFile | None:
 -        logger.warning(f"Failed to parse config file {file_path}: {e}")
 +        logger.warning(f"Failed to parse config file {file_path}: {exception_text(e)}")
-         return None
-@@ -356,3 +358,3 @@ def _read_config_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
-     except Exception as exc:
+@@ -357 +359 @@ def _read_config_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
 -        return None, f"invalid_json: {exc}"
 +        return None, f"invalid_json: {exception_text(exc)}"
-     return _config_object_from_bytes(content)
-@@ -365,5 +367,5 @@ def _config_object_from_bytes(
-     try:
+@@ -366 +368 @@ def _config_object_from_bytes(
 -        data = json.loads(content)
 +        data = load_json(content, source="config file")
-     except Exception as exc:
+@@ -368 +370 @@ def _config_object_from_bytes(
 -        return None, f"invalid_json: {exc}"
 +        return None, f"invalid_json: {exception_text(exc)}"
-     if not isinstance(data, dict):
-@@ -1150,3 +1152,5 @@ def load_configs(
-     except Exception as e:
+@@ -1151 +1153,3 @@ def load_configs(
 -        logger.debug(f"Manifest defaults unavailable during config load: {e}")
 +        logger.debug(
 +            f"Manifest defaults unavailable during config load: {exception_text(e)}"
 +        )
- 
 ````
 
 ### Patch — `src/pmcp/env_store.py`
@@ -2937,13 +2389,11 @@ diff --git a/src/pmcp/env_store.py b/src/pmcp/env_store.py
 index 53e8f3f..adf7b29 100644
 --- a/src/pmcp/env_store.py
 +++ b/src/pmcp/env_store.py
-@@ -22,3 +22,5 @@ def validate_env_var_name(name: str) -> str:
-     if not ENV_VAR_NAME_PATTERN.fullmatch(name):
+@@ -23 +23,3 @@ def validate_env_var_name(name: str) -> str:
 -        raise ValueError(f"Env var name must match ^[A-Za-z_][A-Za-z0-9_]*$: {name!r}")
 +        # The rejected name is not quoted: through `gateway.auth_connect` it is
 +        # a caller's value (Consiliency/pmcp#297, rev 12).
 +        raise ValueError("Env var name must match ^[A-Za-z_][A-Za-z0-9_]*$")
-     return name
 ````
 
 ### Patch — `src/pmcp/feedback_egress.py`
@@ -2953,24 +2403,18 @@ diff --git a/src/pmcp/feedback_egress.py b/src/pmcp/feedback_egress.py
 index 48d4217..9b08312 100644
 --- a/src/pmcp/feedback_egress.py
 +++ b/src/pmcp/feedback_egress.py
-@@ -48,2 +48,3 @@ from pmcp.env_store import (
- )
+@@ -48,0 +49 @@ from pmcp.env_store import (
 +from pmcp.parsing import load_json
- from pmcp.provision_gate import operator_safe
-@@ -524,3 +525,5 @@ def _classify_response(status: int, raw: bytes, search_url: str) -> FeedbackSubm
-     try:
+@@ -525 +526,3 @@ def _classify_response(status: int, raw: bytes, search_url: str) -> FeedbackSubm
 -        document: Any = json.loads(raw.decode("utf-8"))
 +        document: Any = load_json(
 +            raw, source="feedback issue response", encoding="utf-8"
 +        )
-     except Exception:
-@@ -598,3 +601,5 @@ def _probe_repository_visibility(
-             raw = _read_bounded_body(response, bound)
+@@ -599 +602,3 @@ def _probe_repository_visibility(
 -        document: Any = json.loads(raw.decode("utf-8"))
 +        document: Any = load_json(
 +            raw, source="feedback repository response", encoding="utf-8"
 +        )
-     except Exception:
 ````
 
 ### Patch — `src/pmcp/manifest/code_patterns_loader.py`
@@ -2980,22 +2424,16 @@ diff --git a/src/pmcp/manifest/code_patterns_loader.py b/src/pmcp/manifest/code_
 index b89f67a..e0e677b 100644
 --- a/src/pmcp/manifest/code_patterns_loader.py
 +++ b/src/pmcp/manifest/code_patterns_loader.py
-@@ -11,3 +11,4 @@ from typing import Any
- 
+@@ -12 +12,2 @@ from typing import Any
 -import yaml
 +from pmcp.argument_errors import exception_text
 +from pmcp.parsing import load_yaml
- 
-@@ -42,3 +43,3 @@ class CodePatternsLoader:
-             with open(self._patterns_path) as f:
+@@ -43 +44 @@ class CodePatternsLoader:
 -                data = yaml.safe_load(f)
 +                data = load_yaml(f, source="code patterns file")
- 
-@@ -66,3 +67,3 @@ class CodePatternsLoader:
-             print(
+@@ -67 +68 @@ class CodePatternsLoader:
 -                f"Warning: Failed to load code patterns from {self._patterns_path}: {e}"
 +                f"Warning: Failed to load code patterns from {self._patterns_path}: {exception_text(e)}"
-             )
 ````
 
 ### Patch — `src/pmcp/manifest/environment.py`
@@ -3005,20 +2443,14 @@ diff --git a/src/pmcp/manifest/environment.py b/src/pmcp/manifest/environment.py
 index 613559f..6e0bab0 100644
 --- a/src/pmcp/manifest/environment.py
 +++ b/src/pmcp/manifest/environment.py
-@@ -11,2 +11,3 @@ from dataclasses import dataclass, field
- from typing import Literal
+@@ -11,0 +12 @@ from typing import Literal
 +from pmcp.argument_errors import exception_text
- 
-@@ -89,3 +90,3 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
-     except Exception as e:
+@@ -90 +91 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
 -        logger.debug(f"Error checking CLI {name}: {e}")
 +        logger.debug(f"Error checking CLI {name}: {exception_text(e)}")
-         return None
-@@ -113,3 +114,3 @@ async def get_cli_help(
-     except Exception as e:
+@@ -114 +115 @@ async def get_cli_help(
 -        logger.debug(f"Error getting help for {name}: {e}")
 +        logger.debug(f"Error getting help for {name}: {exception_text(e)}")
-         return None
 ````
 
 ### Patch — `src/pmcp/manifest/installer.py`
@@ -3028,104 +2460,95 @@ diff --git a/src/pmcp/manifest/installer.py b/src/pmcp/manifest/installer.py
 index 3454402..29b7ccc 100644
 --- a/src/pmcp/manifest/installer.py
 +++ b/src/pmcp/manifest/installer.py
-@@ -14,2 +14,3 @@ from typing import Literal
- 
+@@ -14,0 +15 @@ from typing import Literal
 +from pmcp.argument_errors import exception_text, safe_exc_info
- from pmcp.env_store import resolve_scope_path, sanitized_subprocess_env
-@@ -239,3 +240,3 @@ class JobManager:
-             job.status = "failed"
+@@ -240 +241 @@ class JobManager:
 -            job.error = str(e)[:300]
 +            job.error = exception_text(e)[:300]
-             logger.error(f"Install job {job_id} failed: {job.error}")
-@@ -249,6 +250,8 @@ class JobManager:
-             if exc:
+@@ -250 +251,3 @@ class JobManager:
 -                logger.error(f"Install job {job.id} task crashed: {exc}")
 +                logger.error(
 +                    f"Install job {job.id} task crashed: {exception_text(exc)}"
 +                )
-                 if job.status == "installing":
-                     job.status = "failed"
+@@ -253 +256 @@ class JobManager:
 -                    job.error = f"Monitor task crashed: {exc}"
 +                    job.error = f"Monitor task crashed: {exception_text(exc)}"
-                 # Kill subprocess if still running (but NOT if server_ready - it's being handed off)
-@@ -262,3 +265,3 @@ class JobManager:
-                     except Exception as e:
+@@ -263 +266 @@ class JobManager:
 -                        logger.debug(f"task cleanup error: {e}")
 +                        logger.debug(f"task cleanup error: {exception_text(e)}")
-         except asyncio.CancelledError:
-@@ -298,3 +301,3 @@ class JobManager:
-             except Exception as e:
+@@ -299 +302 @@ class JobManager:
 -                logger.debug(f"stream reader error: {e}")
 +                logger.debug(f"stream reader error: {exception_text(e)}")
-                 return (name, None)
-@@ -424,3 +427,3 @@ class JobManager:
-                                     logger.warning(
+@@ -425 +428 @@ class JobManager:
 -                                        f"Install {job.id}: Error in server detection: {e}"
 +                                        f"Install {job.id}: Error in server detection: {exception_text(e)}"
-                                     )
-@@ -461,5 +464,8 @@ class JobManager:
-         except Exception as e:
+@@ -462 +465,4 @@ class JobManager:
 -            logger.error(f"Install job {job.id} monitor error: {e}", exc_info=True)
 +            logger.error(
 +                f"Install job {job.id} monitor error: {exception_text(e)}",
 +                exc_info=safe_exc_info(e),
 +            )
-             job.status = "failed"
+@@ -464 +470 @@ class JobManager:
 -            job.error = str(e)
 +            job.error = exception_text(e)
-             # Try to clean up process
-@@ -498,3 +504,5 @@ class JobManager:
-         except Exception as e:
+@@ -499 +505,3 @@ class JobManager:
 -            logger.warning(f"Install {job_id}: Error terminating process: {e}")
 +            logger.warning(
 +                f"Install {job_id}: Error terminating process: {exception_text(e)}"
 +            )
- 
 ````
 
 ### Patch — `src/pmcp/manifest/loader.py`
 
 ````diff
 diff --git a/src/pmcp/manifest/loader.py b/src/pmcp/manifest/loader.py
-index 6e7704e..3ddcb67 100644
+index aa5ec3d..dcbe7af 100644
 --- a/src/pmcp/manifest/loader.py
 +++ b/src/pmcp/manifest/loader.py
-@@ -16,2 +16,4 @@ import yaml
- 
+@@ -20,0 +21,2 @@ import yaml
 +from pmcp.argument_errors import exception_text
-+from pmcp.parsing import load_yaml
- from pmcp.project_consent import log_refusal, read_and_gate
-@@ -36,3 +38,4 @@ def _shipped_manifest_entries() -> dict[str, dict[str, Any]]:
-     try:
--        servers = (yaml.safe_load(path.read_bytes()) or {}).get("servers") or {}
-+        shipped = load_yaml(path.read_bytes(), source="shipped manifest")
-+        servers = (shipped or {}).get("servers") or {}
-     except (OSError, yaml.YAMLError, AttributeError):
-@@ -1164,5 +1167,7 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
-     try:
++from pmcp.parsing import load_yaml, safe_yaml_loader
+@@ -44 +46 @@ def _trusted_yaml_loader() -> Any:
+-    return getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
++    return safe_yaml_loader(fast=True)
+@@ -49 +51,2 @@ def _parse_trusted_yaml(content: bytes) -> Any:
+-    return yaml.load(content, Loader=_trusted_yaml_loader())  # noqa: S506 - safe loaders only
++    # Through the parse helper (Consiliency/pmcp#297): a failure is value-free.
++    return load_yaml(content, source="shipped manifest", loader=_trusted_yaml_loader())
+@@ -1200 +1203 @@ def _parse_overlay_document(
 -        data = yaml.safe_load(content)
 +        data = load_yaml(content, source="manifest overlay")
-     except yaml.YAMLError as exc:
+@@ -1202 +1205,3 @@ def _parse_overlay_document(
 -        logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
 +        logger.warning(
 +            f"Skipping unreadable manifest overlay {path}: {exception_text(exc)}"
 +        )
-         return {}, {}, {}, {}
-@@ -1183,3 +1188,3 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
-                 logger.warning(
+@@ -1223 +1228 @@ def _parse_overlay_document(
 -                    f"Skipping invalid server entry '{name}' in overlay {path}: {exc}"
 +                    f"Skipping invalid server entry '{name}' in overlay {path}: {exception_text(exc)}"
-                 )
-@@ -1197,3 +1202,3 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
-                     f"Skipping invalid cli_alternative '{name}' in overlay "
+@@ -1237 +1242 @@ def _parse_overlay_document(
 -                    f"{path}: {exc}"
 +                    f"{path}: {exception_text(exc)}"
-                 )
-@@ -1255,3 +1260,3 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
-     with open(manifest_path, "r") as f:
--        data = yaml.safe_load(f)
-+        data = load_yaml(f, source="manifest")
- 
+@@ -1310 +1315 @@ def clear_manifest_cache() -> None:
+-def _report_cache_failure(what: str, exc: BaseException) -> None:
++def _report_cache_failure(what: str, kind: type[BaseException]) -> None:
+@@ -1319,2 +1324,3 @@ def _report_cache_failure(what: str, exc: BaseException) -> None:
+-    name = type(exc).__name__
+-    if isinstance(exc, RecursionError) or _cache_failure_reported:
++    # The class only, never the exception (Consiliency/pmcp#297's sink rule).
++    name = kind.__name__
++    if issubclass(kind, RecursionError) or _cache_failure_reported:
+@@ -1343 +1349 @@ def _serialize(value: Any) -> bytes | None:
+-        _report_cache_failure("storing a result", exc)
++        _report_cache_failure("storing a result", type(exc))
+@@ -1352 +1358 @@ def _deserialize(blob: bytes) -> Any | None:
+-        _report_cache_failure("reading back a result", exc)
++        _report_cache_failure("reading back a result", type(exc))
+@@ -1516 +1522,3 @@ def _build_manifest(
+-    data = _parse_trusted_document(base) if trusted else yaml.safe_load(base)
++    data = (
++        _parse_trusted_document(base) if trusted else load_yaml(base, source="manifest")
++    )
 ````
 
 ### Patch — `src/pmcp/manifest/npm_resolver.py`
@@ -3135,28 +2558,20 @@ diff --git a/src/pmcp/manifest/npm_resolver.py b/src/pmcp/manifest/npm_resolver.
 index 3382a1e..85dc7ba 100644
 --- a/src/pmcp/manifest/npm_resolver.py
 +++ b/src/pmcp/manifest/npm_resolver.py
-@@ -64,2 +64,4 @@ from pathlib import Path
- from typing import Literal
+@@ -64,0 +65,2 @@ from typing import Literal
 +from pmcp.argument_errors import exception_text
 +from pmcp.parsing import load_json
- 
-@@ -376,3 +378,3 @@ class NpmResolver:
-         try:
+@@ -377 +379 @@ class NpmResolver:
 -            handshake = json.loads(line)
 +            handshake = load_json(line, source="npm resolver handshake")
-         except ValueError:
-@@ -500,3 +502,5 @@ class NpmResolver:
-             self._terminate()
+@@ -501 +503,3 @@ class NpmResolver:
 -            return _refused(f"npm resolver child died before the query: {exc}")
 +            return _refused(
 +                f"npm resolver child died before the query: {exception_text(exc)}"
 +            )
- 
-@@ -510,3 +514,3 @@ class NpmResolver:
-         try:
+@@ -511 +515 @@ class NpmResolver:
 -            response = json.loads(line)
 +            response = load_json(line, source="npm resolver response")
-         except ValueError:
 ````
 
 ### Patch — `src/pmcp/manifest/package_identity.py`
@@ -3166,30 +2581,22 @@ diff --git a/src/pmcp/manifest/package_identity.py b/src/pmcp/manifest/package_i
 index 29cf145..89ba7d1 100644
 --- a/src/pmcp/manifest/package_identity.py
 +++ b/src/pmcp/manifest/package_identity.py
-@@ -31,3 +31,2 @@ from __future__ import annotations
- 
+@@ -32 +31,0 @@ from __future__ import annotations
 -import json
- import logging
-@@ -42,2 +41,4 @@ import semver
- 
+@@ -42,0 +42,2 @@ import semver
 +from pmcp.argument_errors import exception_text
 +from pmcp.parsing import load_json
- from pmcp.validation import is_valid_package_name
-@@ -121,5 +122,5 @@ def _fetch_packument(name: str) -> dict[str, Any] | None:
-             body = response.read(_MAX_PACKUMENT_BYTES)
+@@ -122 +123 @@ def _fetch_packument(name: str) -> dict[str, Any] | None:
 -        data = json.loads(body.decode("utf-8"))
 +        data = load_json(body, source="npm packument", encoding="utf-8")
-     except Exception as exc:
+@@ -124 +125 @@ def _fetch_packument(name: str) -> dict[str, Any] | None:
 -        logger.debug("npm packument fetch failed for %r: %s", name, exc)
 +        logger.debug("npm packument fetch failed for %r: %s", name, exception_text(exc))
-         return None
-@@ -205,3 +206,5 @@ def resolve_package_identity(spec: str) -> PackageIdentity | None:
-     except Exception as exc:  # pragma: no cover - the fetch handles its own
+@@ -206 +207,3 @@ def resolve_package_identity(spec: str) -> PackageIdentity | None:
 -        logger.debug("npm packument lookup raised for %r: %s", name, exc)
 +        logger.debug(
 +            "npm packument lookup raised for %r: %s", name, exception_text(exc)
 +        )
-         return None
 ````
 
 ### Patch — `src/pmcp/manifest/refresher.py`
@@ -3199,34 +2606,22 @@ diff --git a/src/pmcp/manifest/refresher.py b/src/pmcp/manifest/refresher.py
 index b9bf8ff..2049881 100644
 --- a/src/pmcp/manifest/refresher.py
 +++ b/src/pmcp/manifest/refresher.py
-@@ -18,2 +18,3 @@ import yaml
- 
+@@ -18,0 +19 @@ import yaml
 +from pmcp.argument_errors import exception_text
- from pmcp.manifest.loader import (
-@@ -29,2 +30,3 @@ from pmcp.manifest.version_checker import (
- )
+@@ -29,0 +31 @@ from pmcp.manifest.version_checker import (
 +from pmcp.parsing import load_yaml
- from pmcp.types import (
-@@ -64,3 +66,3 @@ def load_descriptions_cache(cache_path: Path | None = None) -> DescriptionsCache
-         with open(cache_path, "r") as f:
+@@ -65 +67 @@ def load_descriptions_cache(cache_path: Path | None = None) -> DescriptionsCache
 -            data = yaml.safe_load(f)
 +            data = load_yaml(f, source="descriptions cache")
- 
-@@ -91,3 +93,3 @@ def load_descriptions_cache(cache_path: Path | None = None) -> DescriptionsCache
-     except Exception as e:
+@@ -92 +94 @@ def load_descriptions_cache(cache_path: Path | None = None) -> DescriptionsCache
 -        logger.warning(f"Failed to load descriptions cache: {e}")
 +        logger.warning(f"Failed to load descriptions cache: {exception_text(e)}")
-         return None
-@@ -397,3 +399,3 @@ async def refresh_server(
-     except Exception as e:
+@@ -398 +400 @@ async def refresh_server(
 -        logger.error(f"Failed to refresh {server_name}: {e}")
 +        logger.error(f"Failed to refresh {server_name}: {exception_text(e)}")
-         return None
-@@ -495,3 +497,3 @@ async def refresh_all(
-         except Exception as e:
+@@ -496 +498 @@ async def refresh_all(
 -            logger.error(f"Error refreshing {name}: {e}")
 +            logger.error(f"Error refreshing {name}: {exception_text(e)}")
-             if existing:
 ````
 
 ### Patch — `src/pmcp/manifest/registry.py`
@@ -3236,21 +2631,15 @@ diff --git a/src/pmcp/manifest/registry.py b/src/pmcp/manifest/registry.py
 index cc2ed99..765f0e7 100644
 --- a/src/pmcp/manifest/registry.py
 +++ b/src/pmcp/manifest/registry.py
-@@ -19,2 +19,4 @@ import aiohttp
- 
+@@ -19,0 +20,2 @@ import aiohttp
 +from pmcp.parsing import load_json
 +
- logger = logging.getLogger(__name__)
-@@ -491,3 +493,3 @@ async def _fetch_registry_servers_uncached(
-                     break
+@@ -492 +494 @@ async def _fetch_registry_servers_uncached(
 -                payload = json.loads(body.decode("utf-8"))
 +                payload = load_json(body, source="registry response", encoding="utf-8")
-                 cache = _parse_cache_payload(payload, endpoint)
-@@ -690,3 +692,3 @@ def load_registry_cache(cache_path: Path | None = None) -> RegistryCache | None:
-     try:
+@@ -691 +693 @@ def load_registry_cache(cache_path: Path | None = None) -> RegistryCache | None:
 -        payload = json.loads(path.read_text())
 +        payload = load_json(path.read_text(), source="registry cache")
-     except Exception:
 ````
 
 ### Patch — `src/pmcp/manifest/version_checker.py`
@@ -3260,30 +2649,20 @@ diff --git a/src/pmcp/manifest/version_checker.py b/src/pmcp/manifest/version_ch
 index 19e71e6..7419b34 100644
 --- a/src/pmcp/manifest/version_checker.py
 +++ b/src/pmcp/manifest/version_checker.py
-@@ -15,2 +15,3 @@ from semver import Version as SemverVersion
- 
+@@ -15,0 +16 @@ from semver import Version as SemverVersion
 +from pmcp.argument_errors import exception_text
- from pmcp import __version__
-@@ -1414,3 +1415,3 @@ async def get_npm_version(package_name: str, timeout: float = 10.0) -> str | Non
-     except Exception as e:
+@@ -1415 +1416 @@ async def get_npm_version(package_name: str, timeout: float = 10.0) -> str | Non
 -        logger.debug(f"npm lookup error for {package_name}: {e}")
 +        logger.debug(f"npm lookup error for {package_name}: {exception_text(e)}")
-         return None
-@@ -1456,3 +1457,3 @@ async def get_pypi_version(package_name: str, timeout: float = 10.0) -> str | No
-     except Exception as e:
+@@ -1457 +1458 @@ async def get_pypi_version(package_name: str, timeout: float = 10.0) -> str | No
 -        logger.debug(f"PyPI lookup error for {package_name}: {e}")
 +        logger.debug(f"PyPI lookup error for {package_name}: {exception_text(e)}")
-         return None
-@@ -1500,3 +1501,3 @@ async def get_cargo_version(crate_name: str, timeout: float = 10.0) -> str | Non
-     except Exception as e:
+@@ -1501 +1502 @@ async def get_cargo_version(crate_name: str, timeout: float = 10.0) -> str | Non
 -        logger.debug(f"crates.io lookup error for {crate_name}: {e}")
 +        logger.debug(f"crates.io lookup error for {crate_name}: {exception_text(e)}")
-         return None
-@@ -1554,3 +1555,3 @@ async def get_docker_version(image_name: str, timeout: float = 10.0) -> str | No
-     except Exception as e:
+@@ -1555 +1556 @@ async def get_docker_version(image_name: str, timeout: float = 10.0) -> str | No
 -        logger.debug(f"Docker Hub lookup error for {image_name}: {e}")
 +        logger.debug(f"Docker Hub lookup error for {image_name}: {exception_text(e)}")
-         return None
 ````
 
 ### Patch — `src/pmcp/package_approvals.py`
@@ -3293,36 +2672,26 @@ diff --git a/src/pmcp/package_approvals.py b/src/pmcp/package_approvals.py
 index 68d7685..f6d9c34 100644
 --- a/src/pmcp/package_approvals.py
 +++ b/src/pmcp/package_approvals.py
-@@ -43,2 +43,4 @@ from typing import TYPE_CHECKING, Any
- 
+@@ -43,0 +44,2 @@ from typing import TYPE_CHECKING, Any
 +from pmcp.argument_errors import exception_text
 +from pmcp.parsing import load_json, parse_timestamp
- from pmcp.trust_store import TrustStoreError, trust_store_path
-@@ -131,3 +133,5 @@ def _decode(entry: Any) -> PackageApproval:
-     except ValueError as exc:
+@@ -132 +134,3 @@ def _decode(entry: Any) -> PackageApproval:
 -        raise PackageApprovalError(f"Invalid package approval entry: {exc}") from exc
 +        raise PackageApprovalError(
 +            f"Invalid package approval entry: {exception_text(exc)}"
 +        ) from exc
-     if integrity is not None and not isinstance(integrity, str):
-@@ -137,6 +141,6 @@ def _decode(entry: Any) -> PackageApproval:
-     try:
+@@ -138 +142 @@ def _decode(entry: Any) -> PackageApproval:
 -        parsed_at = datetime.fromisoformat(str(recorded_at))
 +        parsed_at = parse_timestamp(str(recorded_at), source="package approval record")
-     except ValueError as exc:
-         raise PackageApprovalError(
+@@ -141 +145 @@ def _decode(entry: Any) -> PackageApproval:
 -            f"Unparseable package approval timestamp: {exc}"
 +            f"Unparseable package approval timestamp: {exception_text(exc)}"
-         ) from exc
-@@ -175,6 +179,6 @@ def _read_store_and_stale(
-     try:
+@@ -176 +180 @@ def _read_store_and_stale(
 -        data = json.loads(raw)
 +        data = load_json(raw, source="package approvals")
-     except ValueError as exc:
-         raise PackageApprovalError(
+@@ -179 +183 @@ def _read_store_and_stale(
 -            f"Cannot parse package approvals {path}: {exc}"
 +            f"Cannot parse package approvals {path}: {exception_text(exc)}"
-         ) from exc
 ````
 
 ### Patch — `src/pmcp/parsing.py`
@@ -3330,10 +2699,10 @@ index 68d7685..f6d9c34 100644
 ````diff
 diff --git a/src/pmcp/parsing.py b/src/pmcp/parsing.py
 new file mode 100644
-index 0000000..8fc809d
+index 0000000..e39480b
 --- /dev/null
 +++ b/src/pmcp/parsing.py
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,173 @@
 +"""Parse structured text without ever echoing it (Consiliency/pmcp#297, rev 7).
 +
 +A parser's failure can quote what it rejected, and not only through its own
@@ -3440,10 +2809,27 @@ index 0000000..8fc809d
 +    return None, None
 +
 +
-+def load_yaml(stream: str | bytes | IO[Any], *, source: str) -> Any:
-+    """``yaml.safe_load(stream)``; any failure is a :class:`YAMLParseError`."""
++def safe_yaml_loader(*, fast: bool) -> Any:
++    """A safe YAML loader class for :func:`load_yaml`: with ``fast``, libyaml's
++    ``CSafeLoader`` when PyYAML was built with it, else ``SafeLoader``."""
++    if fast:
++        return getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
++    return yaml.SafeLoader
++
++
++def load_yaml(stream: str | bytes | IO[Any], *, source: str, loader: Any = None) -> Any:
++    """``yaml.safe_load(stream)``; any failure is a :class:`YAMLParseError`.
++
++    ``loader`` picks a safe loader class -- ``yaml.SafeLoader`` or libyaml's
++    ``yaml.CSafeLoader`` (the shipped manifest's fast path) -- and nothing
++    else."""
++    safe = {yaml.SafeLoader, getattr(yaml, "CSafeLoader", yaml.SafeLoader)}
++    if loader is not None and loader not in safe:
++        raise ValueError("load_yaml takes only a safe YAML loader")
 +    failure: tuple[int | None, int | None, str] | None = None
 +    try:
++        if loader is not None:
++            return yaml.load(stream, Loader=loader)  # noqa: S506 -- safe loaders only
 +        return yaml.safe_load(stream)
 +    except Exception as error:  # noqa: BLE001 -- classified by origin
 +        line, column = _yaml_position(error)
@@ -3499,53 +2885,36 @@ diff --git a/src/pmcp/policy/policy.py b/src/pmcp/policy/policy.py
 index ec5ee42..fc4bfd3 100644
 --- a/src/pmcp/policy/policy.py
 +++ b/src/pmcp/policy/policy.py
-@@ -14,4 +14,3 @@ from typing import TYPE_CHECKING, Any, Literal
- 
+@@ -15,2 +15 @@ from typing import TYPE_CHECKING, Any, Literal
 -import yaml
 -
 +from pmcp.argument_errors import exception_text
- from pmcp.project_consent import log_refusal, read_and_gate
-@@ -26,2 +25,3 @@ from pmcp.types import (
- from pmcp.auth import _sanitize_base
+@@ -26,0 +26 @@ from pmcp.auth import _sanitize_base
 +from pmcp.parsing import load_json, load_yaml
- from pmcp.redaction_additive import (
-@@ -362,3 +362,3 @@ class PolicyManager:
-                 raise ValueError(
+@@ -363 +363 @@ class PolicyManager:
 -                    f"Failed to load explicit policy {policy_path}: {e}"
 +                    f"Failed to load explicit policy {policy_path}: {exception_text(e)}"
-                 ) from e
-@@ -382,3 +382,3 @@ class PolicyManager:
-         logger.warning(
+@@ -383 +383 @@ class PolicyManager:
 -            f"Could not parse policy file {policy_path}: {error}. {consequence}"
 +            f"Could not parse policy file {policy_path}: {exception_text(error)}. {consequence}"
-         )
-@@ -415,5 +415,5 @@ class PolicyManager:
-             if policy_path.suffix in (".yaml", ".yml"):
+@@ -416 +416 @@ class PolicyManager:
 -                data = yaml.safe_load(content)
 +                data = load_yaml(content, source="policy file")
-             else:
+@@ -418 +418 @@ class PolicyManager:
 -                data = json.loads(content)
 +                data = load_json(content, source="policy file")
-         except Exception as e:
-@@ -421,3 +421,3 @@ class PolicyManager:
-                 raise ValueError(
+@@ -422 +422 @@ class PolicyManager:
 -                    f"Failed to load explicit policy {policy_path}: {e}"
 +                    f"Failed to load explicit policy {policy_path}: {exception_text(e)}"
-                 ) from e
-@@ -435,6 +435,6 @@ class PolicyManager:
-                 raise ValueError(
+@@ -436 +436 @@ class PolicyManager:
 -                    f"Failed to load explicit policy {policy_path}: {e}"
 +                    f"Failed to load explicit policy {policy_path}: {exception_text(e)}"
-                 ) from e
-             raise ValueError(
+@@ -439 +439 @@ class PolicyManager:
 -                f"Invalid policy file {policy_path}: {e}. "
 +                f"Invalid policy file {policy_path}: {exception_text(e)}. "
-                 "Refusing to start rather than fall back to an unrestricted gateway."
-@@ -887,3 +887,3 @@ class PolicyManager:
-             try:
+@@ -888 +888 @@ class PolicyManager:
 -                result = json.loads(final_str)
 +                result = load_json(final_str, source="redacted output")
-             except json.JSONDecodeError:
 ````
 
 ### Patch — `src/pmcp/provision_gate.py`
@@ -3555,15 +2924,11 @@ diff --git a/src/pmcp/provision_gate.py b/src/pmcp/provision_gate.py
 index ee8bbd4..2fb99f4 100644
 --- a/src/pmcp/provision_gate.py
 +++ b/src/pmcp/provision_gate.py
-@@ -42,2 +42,3 @@ from typing import TYPE_CHECKING, Literal
- 
+@@ -42,0 +43 @@ from typing import TYPE_CHECKING, Literal
 +from pmcp.argument_errors import exception_text
- from pmcp.package_approvals import is_package_approved
-@@ -465,3 +466,3 @@ def evaluate_provision(
-             getattr(server_config, "name", None),
+@@ -466 +467 @@ def evaluate_provision(
 -            exc,
 +            exception_text(exc),
-         )
 ````
 
 ### Patch — `src/pmcp/redaction_additive.py`
@@ -3573,20 +2938,14 @@ diff --git a/src/pmcp/redaction_additive.py b/src/pmcp/redaction_additive.py
 index 085c9e8..5e4ddb7 100644
 --- a/src/pmcp/redaction_additive.py
 +++ b/src/pmcp/redaction_additive.py
-@@ -28,3 +28,2 @@ from __future__ import annotations
- import bisect
+@@ -29 +28,0 @@ import bisect
 -import json
- import re
-@@ -33,2 +32,4 @@ from urllib.parse import unquote
- 
+@@ -33,0 +33,2 @@ from urllib.parse import unquote
 +from pmcp.parsing import load_json
 +
- #: Test-only work counter. None in production; the complexity tests set it to
-@@ -1358,3 +1359,3 @@ def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
-     try:
+@@ -1359 +1360 @@ def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
 -        json.loads(text)
 +        load_json(text, source="redaction candidate")
-     except (ValueError, RecursionError):
 ````
 
 ### Patch — `src/pmcp/scoped_advisor_audit.py`
@@ -3596,8 +2955,7 @@ diff --git a/src/pmcp/scoped_advisor_audit.py b/src/pmcp/scoped_advisor_audit.py
 index 76d96e6..fdd7a90 100644
 --- a/src/pmcp/scoped_advisor_audit.py
 +++ b/src/pmcp/scoped_advisor_audit.py
-@@ -16,2 +16,10 @@ from urllib.parse import urlsplit, urlunsplit
- import jsonschema
+@@ -16,0 +17,8 @@ import jsonschema
 +import pydantic
 +
 +from pmcp.argument_errors import (
@@ -3606,14 +2964,10 @@ index 76d96e6..fdd7a90 100644
 +    schema_error_path,
 +)
 +from pmcp.parsing import load_json
- 
-@@ -44,3 +52,3 @@ def validate_scoped_advisor_audit(path: Path) -> list[dict[str, Any]]:
-         records = [
+@@ -45 +53 @@ def validate_scoped_advisor_audit(path: Path) -> list[dict[str, Any]]:
 -            json.loads(line)
 +            load_json(line, source="scoped advisor audit record")
-             for line in Path(path).read_text(encoding="utf-8").splitlines()
-@@ -140,66 +148,2 @@ def _public_source_hash(value: Any) -> str | None:
- 
+@@ -141,64 +148,0 @@ def _public_source_hash(value: Any) -> str | None:
 -def _declared_property_names(schema: Any) -> frozenset[str]:
 -    """Every key of every ``properties`` map anywhere in ``schema``.
 -
@@ -3678,14 +3032,10 @@ index 76d96e6..fdd7a90 100644
 -    return validator if isinstance(validator, str) and validator in keywords else None
 -
 -
- class ScopedAdvisorAudit:
-@@ -306,3 +250,3 @@ class ScopedAdvisorAudit:
-         gateway_tool: str,
+@@ -307 +251 @@ class ScopedAdvisorAudit:
 -        error: jsonschema.ValidationError,
 +        error: jsonschema.ValidationError | pydantic.ValidationError,
-         schema: dict[str, Any],
-@@ -310,3 +254,8 @@ class ScopedAdvisorAudit:
-     ) -> None:
+@@ -311 +255,6 @@ class ScopedAdvisorAudit:
 -        """Record a ``tools/call`` the input-schema gate rejected (Consiliency/pmcp#296).
 +        """Record a ``tools/call`` the input-schema gate rejected (Consiliency/pmcp#296),
 +        or the tool's own argument model did (Consiliency/pmcp#297).
@@ -3693,9 +3043,7 @@ index 76d96e6..fdd7a90 100644
 +        A model rejection's path is its first error's location, redacted the
 +        same way; its validator is ``None`` (a pydantic error type is not a
 +        JSON Schema keyword).
- 
-@@ -329,4 +278,8 @@ class ScopedAdvisorAudit:
-         try:
+@@ -330,2 +279,6 @@ class ScopedAdvisorAudit:
 -            argument_path = _rejected_argument_path(error, schema, arguments)
 -            validator = _rejected_argument_validator(error, schema)
 +            if isinstance(error, jsonschema.ValidationError):
@@ -3704,22 +3052,18 @@ index 76d96e6..fdd7a90 100644
 +            else:
 +                argument_path = model_error_path(error, schema, arguments)
 +                validator = None
-         except Exception:
 ````
 
 ### Patch — `src/pmcp/server.py`
 
 ````diff
 diff --git a/src/pmcp/server.py b/src/pmcp/server.py
-index 0a6ef28..ad27d3d 100644
+index ed00259..7a3326b 100644
 --- a/src/pmcp/server.py
 +++ b/src/pmcp/server.py
-@@ -14,2 +14,3 @@ from typing import Any, Literal
- import jsonschema
+@@ -14,0 +15 @@ import jsonschema
 +import pydantic
- from mcp.server import Server
-@@ -39,2 +40,11 @@ from mcp.types import (
- 
+@@ -39,0 +41,9 @@ from mcp.types import (
 +from pmcp.argument_errors import (
 +    describe_model_error,
 +    describe_schema_error,
@@ -3729,18 +3073,14 @@ index 0a6ef28..ad27d3d 100644
 +    message_text,
 +    safe_exc_info,
 +)
- from pmcp.client.manager import ClientManager
-@@ -71,3 +81,7 @@ from pmcp.subscriptions import BusCatalogEventSink
- from pmcp.summary import generate_capability_summary
+@@ -72 +82,5 @@ from pmcp.summary import generate_capability_summary
 -from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
 +from pmcp.tools.handlers import (
 +    GATEWAY_TOOL_INPUT_MODELS,
 +    GatewayTools,
 +    get_gateway_tool_definitions,
 +)
- from pmcp.types import (
-@@ -100,2 +114,67 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
- 
+@@ -101,0 +116,65 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
 +def _described_errors(handler: Any) -> Any:
 +    """Wrap a request handler so an exception it lets escape never carries a
 +    validation or parse error's text to the caller (Consiliency/pmcp#297,
@@ -3806,15 +3146,11 @@ index 0a6ef28..ad27d3d 100644
 +    return wrapper
 +
 +
- class GatewayServer:
-@@ -125,2 +204,5 @@ class GatewayServer:
-     ) -> None:
+@@ -126,0 +206,3 @@ class GatewayServer:
 +        # Idempotent; again here in case a record factory was replaced since
 +        # import (Consiliency/pmcp#297).
 +        install_log_scrubber()
-         self._project_root = project_root
-@@ -223,8 +305,10 @@ class GatewayServer:
-             instructions=instructions,
+@@ -225,6 +307,8 @@ class GatewayServer:
 -            on_list_tools=self._handle_list_tools,
 -            on_call_tool=self._handle_call_tool,
 -            on_list_resources=self._handle_list_resources,
@@ -3829,21 +3165,15 @@ index 0a6ef28..ad27d3d 100644
 +            on_get_prompt=_described_errors(self._handle_get_prompt),
 +            # A `ListenHandler` object the SDK drives as a stream, not a
 +            # coroutine; it renders its own failures (Consiliency/pmcp#287).
-             on_subscriptions_listen=self._listen_handler,
-@@ -337,2 +421,4 @@ class GatewayServer:
-                     )
+@@ -340,0 +425,2 @@ class GatewayServer:
 +                # Never `e.message`: for `type`, `pattern`, `enum` and length
 +                # errors it quotes the rejected value (Consiliency/pmcp#297).
-                 return CallToolResult(
-@@ -341,3 +427,5 @@ class GatewayServer:
-                         TextContent(
+@@ -345 +431,3 @@ class GatewayServer:
 -                            type="text", text=f"Input validation error: {e.message}"
 +                            type="text",
 +                            text="Input validation error: "
 +                            + describe_schema_error(e, tool.input_schema, arguments),
-                         )
-@@ -479,3 +567,37 @@ class GatewayServer:
-             except Exception as e:
+@@ -483 +571,35 @@ class GatewayServer:
 -                logger.error(f"Tool execution error: {e}")
 +                # A `ValidationError`'s text renders the rejected value
 +                # (pydantic's `input_value=...`, a validator's own message,
@@ -3880,9 +3210,7 @@ index 0a6ef28..ad27d3d 100644
 +                else:
 +                    described = exception_text(e)
 +                    logger.error(f"Tool execution error: {described}")
-                 try:
-@@ -487,8 +609,20 @@ class GatewayServer:
-                     )
+@@ -491,6 +613,18 @@ class GatewayServer:
 -                    self._record_scoped_invocation(
 -                        gateway_tool=audited_name,
 -                        terminal_status=failure_status,
@@ -3907,9 +3235,7 @@ index 0a6ef28..ad27d3d 100644
 +                            arguments=audited_arguments,
 +                            result={"error_type": type(e).__name__},
 +                        )
-                 except ScopedAdvisorAuditError:
-@@ -509,3 +643,8 @@ class GatewayServer:
-                         type="text",
+@@ -513 +647,6 @@ class GatewayServer:
 -                        text=json.dumps({"error": True, "message": str(e)[:400]}),
 +                        text=json.dumps(
 +                            {
@@ -3917,24 +3243,17 @@ index 0a6ef28..ad27d3d 100644
 +                                "message": described[:400],
 +                            }
 +                        ),
-                     )
-@@ -735,3 +874,5 @@ class GatewayServer:
-         except Exception as e:
+@@ -739 +878,3 @@ class GatewayServer:
 -            logger.warning(f"Failed to load manifest startup configs: {e}")
 +            logger.warning(
 +                f"Failed to load manifest startup configs: {exception_text(e)}"
 +            )
- 
-@@ -854,3 +995,3 @@ class GatewayServer:
-             except Exception as e:
+@@ -858 +999 @@ class GatewayServer:
 -                logger.warning(f"Failed to auto-generate cache: {e}")
 +                logger.warning(f"Failed to auto-generate cache: {exception_text(e)}")
- 
-@@ -1020,3 +1161,3 @@ class GatewayServer:
-         except Exception as e:
+@@ -1024 +1165 @@ class GatewayServer:
 -            logger.error(f"Error during shutdown: {e}")
 +            logger.error(f"Error during shutdown: {exception_text(e)}")
-         finally:
 ````
 
 ### Patch — `src/pmcp/subscriptions.py`
@@ -3944,18 +3263,13 @@ diff --git a/src/pmcp/subscriptions.py b/src/pmcp/subscriptions.py
 index f05ef50..007b47b 100644
 --- a/src/pmcp/subscriptions.py
 +++ b/src/pmcp/subscriptions.py
-@@ -50,2 +50,4 @@ from mcp.shared.subscriptions import (
- 
+@@ -50,0 +51,2 @@ from mcp.shared.subscriptions import (
 +from pmcp.argument_errors import safe_exc_info
 +
- __all__ = ["CatalogEventSink", "BusCatalogEventSink"]
-@@ -189,3 +191,3 @@ class BusCatalogEventSink:
-             await self._bus.publish(kind())
+@@ -190 +192 @@ class BusCatalogEventSink:
 -        except Exception:
 +        except Exception as exc:
-             # Isolate a raising bus from the drain, matching
-@@ -193,2 +195,5 @@ class BusCatalogEventSink:
-             # contract -- one bad publish must not stop the next drain.
+@@ -194 +196,4 @@ class BusCatalogEventSink:
 -            logger.exception("subscription bus publish raised; catalog event dropped")
 +            logger.error(
 +                "subscription bus publish raised; catalog event dropped",
@@ -3970,166 +3284,133 @@ diff --git a/src/pmcp/templates/code_snippets_loader.py b/src/pmcp/templates/cod
 index 00e741c..02c2e70 100644
 --- a/src/pmcp/templates/code_snippets_loader.py
 +++ b/src/pmcp/templates/code_snippets_loader.py
-@@ -12,3 +12,4 @@ from typing import TYPE_CHECKING
- 
+@@ -13 +13,2 @@ from typing import TYPE_CHECKING
 -import yaml
 +from pmcp.argument_errors import exception_text
 +from pmcp.parsing import load_yaml
- 
-@@ -46,3 +47,3 @@ class CodeSnippetsLoader:
-             with open(self._templates_path) as f:
+@@ -47 +48 @@ class CodeSnippetsLoader:
 -                data = yaml.safe_load(f)
 +                data = load_yaml(f, source="code snippet templates")
- 
-@@ -63,3 +64,3 @@ class CodeSnippetsLoader:
-             print(
+@@ -64 +65 @@ class CodeSnippetsLoader:
 -                f"Warning: Failed to load code snippets from {self._templates_path}: {e}"
 +                f"Warning: Failed to load code snippets from {self._templates_path}: {exception_text(e)}"
-             )
 ````
 
 ### Patch — `src/pmcp/tools/handlers.py`
 
 ````diff
 diff --git a/src/pmcp/tools/handlers.py b/src/pmcp/tools/handlers.py
-index 09e9f34..fe67c2f 100644
+index 09e9f34..3c228a4 100644
 --- a/src/pmcp/tools/handlers.py
 +++ b/src/pmcp/tools/handlers.py
-@@ -22,2 +22,3 @@ from mcp.types import Tool
- from pydantic import BaseModel
+@@ -22,0 +23 @@ from pydantic import BaseModel
 +from pmcp.argument_errors import describe_value, exception_text, safe_exc_info
- from pmcp import __version__ as PMCP_VERSION
-@@ -67,2 +68,3 @@ from pmcp.validation import (
-     discovered_env_var_allowed,
+@@ -34 +35,5 @@ from pmcp.auth import (
+-from pmcp.client.manager import ClientManager, _terminate_process_tree
++from pmcp.client.manager import (
++    ClientManager,
++    _terminate_process_tree,
++    parse_request_id,
++)
+@@ -67,0 +73 @@ from pmcp.validation import (
 +    discovered_env_var_refusal_reason,
-     env_var_allowed,
-@@ -202,2 +204,3 @@ from pmcp.manifest.loader import (
- )
+@@ -202,0 +209 @@ from pmcp.manifest.loader import (
 +from pmcp.parsing import load_json, load_json_file
- 
-@@ -1016,6 +1019,6 @@ class GatewayTools:
-             with open(path) as f:
+@@ -1017 +1024 @@ class GatewayTools:
 -                data = json.load(f)
 +                data = load_json_file(f, source="provisioned registry")
-             return {k: v for k, v in data.items() if isinstance(k, str)}
-         except Exception as e:
+@@ -1020 +1027 @@ class GatewayTools:
 -            logger.warning(f"Could not load provisioned registry: {e}")
 +            logger.warning(f"Could not load provisioned registry: {exception_text(e)}")
-             return {}
-@@ -1030,3 +1033,3 @@ class GatewayTools:
-         except Exception as e:
+@@ -1031 +1038 @@ class GatewayTools:
 -            logger.warning(f"Could not save provisioned registry: {e}")
 +            logger.warning(f"Could not save provisioned registry: {exception_text(e)}")
- 
-@@ -1831,3 +1834,3 @@ class GatewayTools:
-                 )
+@@ -1678,0 +1686,9 @@ class GatewayTools:
++            # A task answer is returned as the task record, whose `raw`
++            # holds only what pmcp could use: size and summarise that, not
++            # the answer, whose size followed a hint pmcp dropped
++            # (Consiliency/pmcp#297 on Consiliency/pmcp#298).
++            sized = (
++                {**result, "task": task_info.raw}
++                if task_info is not None and isinstance(result, dict)
++                else result
++            )
+@@ -1680 +1696 @@ class GatewayTools:
+-                result, redact=redact, max_bytes=max_bytes
++                sized, redact=redact, max_bytes=max_bytes
+@@ -1832 +1848 @@ class GatewayTools:
 -            auth_challenge = self._auth_challenge_from_message(str(e))
 +            auth_challenge = self._auth_challenge_from_message(exception_text(e))
-             auth_state = "none"
-@@ -1909,3 +1912,5 @@ class GatewayTools:
-             except Exception as e:
+@@ -1910 +1926,3 @@ class GatewayTools:
 -                logger.warning(f"Failed to load manifest startup configs: {e}")
 +                logger.warning(
 +                    f"Failed to load manifest startup configs: {exception_text(e)}"
 +                )
- 
-@@ -1915,3 +1920,5 @@ class GatewayTools:
-             except Exception as e:
+@@ -1916 +1934,3 @@ class GatewayTools:
 -                logger.warning(f"Failed to restore provisioned servers: {e}")
 +                logger.warning(
 +                    f"Failed to restore provisioned servers: {exception_text(e)}"
 +                )
- 
-@@ -2161,3 +2168,3 @@ class GatewayTools:
-                 started_at=audit_started_at,
+@@ -2162 +2182 @@ class GatewayTools:
 -                error=str(e),
 +                error=exception_text(e),
-             )
-@@ -2169,3 +2176,3 @@ class GatewayTools:
-                 revision_id="error",
+@@ -2170 +2190 @@ class GatewayTools:
 -                errors=[str(e)],
 +                errors=[exception_text(e)],
-                 pending_requests_seen=pending_seen,
-@@ -4269,3 +4276,5 @@ class GatewayTools:
-                     )
+@@ -4270 +4290,3 @@ class GatewayTools:
 -                logger.error(f"Failed to connect remote server {server_name}: {e}")
 +                logger.error(
 +                    f"Failed to connect remote server {server_name}: {exception_text(e)}"
 +                )
-                 self._record_feedback_event(
-@@ -4351,3 +4360,5 @@ class GatewayTools:
-         except Exception as e:
+@@ -4352 +4374,3 @@ class GatewayTools:
 -            logger.error(f"Failed to start provisioning {server_name}: {e}")
 +            logger.error(
 +                f"Failed to start provisioning {server_name}: {exception_text(e)}"
 +            )
-             self._record_feedback_event(
-@@ -4439,3 +4450,3 @@ class GatewayTools:
-                         auth_event="url_elicitation_required",
+@@ -4440 +4464 @@ class GatewayTools:
 -                        error=str(e),
 +                        error=exception_text(e),
-                     )
-@@ -4444,3 +4455,3 @@ class GatewayTools:
-                         server=server_name,
+@@ -4445 +4469 @@ class GatewayTools:
 -                        message=str(e),
 +                        message=exception_text(e),
-                         auth_state="elicitation_required",
-@@ -4580,3 +4591,6 @@ class GatewayTools:
-                 auth_event="policy_denied",
+@@ -4581 +4605,4 @@ class GatewayTools:
 -                error=f"Env var '{env_var}' is not permitted for this server.",
 +                error=(
 +                    f"Env var ({describe_value(env_var)}) is not permitted for "
 +                    "this server."
 +                ),
-             )
-@@ -4589,7 +4603,8 @@ class GatewayTools:
-                 message=(
+@@ -4590,2 +4617,2 @@ class GatewayTools:
 -                    f"Env var '{env_var}' is not permitted for server "
 -                    f"'{server_name}'.{expected} Refusing to store it."
 +                    f"Env var ({describe_value(env_var)}) is not permitted for "
 +                    f"server '{server_name}'.{expected} Refusing to store it."
-                 ),
-                 auth_state="missing_auth",
+@@ -4594 +4621,2 @@ class GatewayTools:
 -                env_var=env_var,
 +                # Not echoed: the caller's rejected value (rev 12).
 +                env_var=None,
-             )
-@@ -4607,3 +4622,3 @@ class GatewayTools:
-                 auth_event="missing_credential",
+@@ -4608 +4636 @@ class GatewayTools:
 -                error=str(exc),
 +                error=exception_text(exc),
-             )
-@@ -4612,5 +4627,6 @@ class GatewayTools:
-                 server=server_name,
+@@ -4613 +4641 @@ class GatewayTools:
 -                message=str(exc),
 +                message=exception_text(exc),
-                 auth_state="missing_auth",
+@@ -4615 +4643,2 @@ class GatewayTools:
 -                env_var=env_var,
 +                # Not echoed: the caller's rejected value (rev 12).
 +                env_var=None,
-             )
-@@ -4816,3 +4832,3 @@ class GatewayTools:
-             # granted permission to send.
+@@ -4817 +4846 @@ class GatewayTools:
 -            logger.warning("Feedback submission raised: %s", exc)
 +            logger.warning("Feedback submission raised: %s", exception_text(exc))
-             result = progress.abandon()
-@@ -5090,3 +5106,3 @@ class GatewayTools:
-                 package_name=package_name,
+@@ -5091 +5120 @@ class GatewayTools:
 -                message=f"Failed to run update probe: {e}",
 +                message=f"Failed to run update probe: {exception_text(e)}",
-             )
-@@ -5320,3 +5336,3 @@ class GatewayTools:
-                                 f"Failed to persist descriptions cache after updating "
+@@ -5321 +5350 @@ class GatewayTools:
 -                                f"'{server_name}': {e}"
 +                                f"'{server_name}': {exception_text(e)}"
-                             )
-@@ -5444,3 +5460,3 @@ class GatewayTools:
-                     f"Refused to register '{server_name}': "
+@@ -5445 +5474 @@ class GatewayTools:
 -                    f"unsafe package identifier {package!r}."
 +                    f"unsafe package identifier ({describe_value(package)})."
-                 ),
-@@ -5459,3 +5475,10 @@ class GatewayTools:
-         if disallowed:
+@@ -5460 +5489,8 @@ class GatewayTools:
 -            names = ", ".join(operator_safe(name) for name in disallowed)
 +            reasons: dict[str, int] = {}
 +            for name in disallowed:
@@ -4139,97 +3420,86 @@ index 09e9f34..fe67c2f 100644
 +            names = "; ".join(
 +                f"{count} {reason}" for reason, count in sorted(reasons.items())
 +            )
-             return RegisterDiscoveredServerOutput(
-@@ -5489,3 +5512,7 @@ class GatewayTools:
-         except Exception as exc:  # resolution fails closed; see package_identity
+@@ -5490 +5526,5 @@ class GatewayTools:
 -            logger.warning("Package identity lookup raised for %r: %s", package, exc)
 +            logger.warning(
 +                "Package identity lookup raised for %r: %s",
 +                package,
 +                exception_text(exc),
 +            )
- 
-@@ -5606,6 +5633,8 @@ class GatewayTools:
- 
+@@ -5606,0 +5647,5 @@ class GatewayTools:
 +        # Outside the `try`: its arm logs a traceback and renders `str(e)`,
 +        # and a `ValidationError`'s text carries the rejected value. Raised,
 +        # it is described without it (Consiliency/pmcp#297).
 +        parsed = ProvisionStatusInput.model_validate(input_data)
 +        job_id = parsed.job_id
-         try:
+@@ -5608,3 +5652,0 @@ class GatewayTools:
 -            parsed = ProvisionStatusInput.model_validate(input_data)
 -            job_id = parsed.job_id
 -
-             job_manager = get_job_manager()
-@@ -5677,6 +5706,9 @@ class GatewayTools:
-         except Exception as e:
+@@ -5678 +5720,4 @@ class GatewayTools:
 -            logger.error(f"provision_status handler failed: {e}", exc_info=True)
 +            logger.error(
 +                f"provision_status handler failed: {exception_text(e)}",
 +                exc_info=safe_exc_info(e),
 +            )
-             # Return a safe error response instead of crashing
-             return ProvisionJobStatus(
+@@ -5681 +5726 @@ class GatewayTools:
 -                job_id=input_data.get("job_id", "unknown"),
 +                job_id=job_id,
-                 server="unknown",
-@@ -5771,5 +5803,8 @@ class GatewayTools:
-         except Exception as e:
+@@ -5772 +5817,4 @@ class GatewayTools:
 -            logger.error(f"Handoff failed for {job_server_name}: {e}", exc_info=True)
 +            logger.error(
 +                f"Handoff failed for {job_server_name}: {exception_text(e)}",
 +                exc_info=safe_exc_info(e),
 +            )
-             job.status = "failed"
+@@ -5774 +5822 @@ class GatewayTools:
 -            job.error = f"Handoff failed: {e}"
 +            job.error = f"Handoff failed: {exception_text(e)}"
-             # Kill the orphaned process
-@@ -5817,3 +5852,3 @@ class GatewayTools:
-         except Exception as e:
+@@ -5818 +5866 @@ class GatewayTools:
 -            logger.error(f"Failed to refresh after install: {e}")
 +            logger.error(f"Failed to refresh after install: {exception_text(e)}")
-             refresh_error = self._sanitize_error(e)
-@@ -6046,3 +6081,3 @@ class GatewayTools:
-                 server_name=parsed.server_name,
+@@ -6047 +6095 @@ class GatewayTools:
 -                error=str(e),
 +                error=exception_text(e),
-             )
-@@ -6090,3 +6125,3 @@ class GatewayTools:
-                 task_id=parsed.task_id,
+@@ -6091 +6139 @@ class GatewayTools:
 -                error=str(e),
 +                error=exception_text(e),
-             )
-@@ -6126,3 +6161,5 @@ class GatewayTools:
-                     try:
+@@ -6127 +6175,3 @@ class GatewayTools:
 -                        decoded = json.loads(result_payload)
 +                        decoded = load_json(
 +                            result_payload, source="tool result payload"
 +                        )
-                     except json.JSONDecodeError:
-@@ -6164,3 +6201,3 @@ class GatewayTools:
-                 task_id=parsed.task_id,
+@@ -6165 +6215 @@ class GatewayTools:
 -                error=str(e),
 +                error=exception_text(e),
-             )
+@@ -6269,3 +6319,7 @@ class GatewayTools:
+-        server_name = (
+-            parsed.request_id.rsplit("::", 1)[0] if "::" in parsed.request_id else None
+-        )
++        # A request id `cancel_request` rejected for its format is the
++        # caller's rejected value: neither the response nor the audit event
++        # copies it, or any part of it (rev 13, round-12 B1; the auth_connect
++        # rule of rev 12). A well-formed id is accepted; a lookup that then
++        # misses names it, as every lookup miss does (Consiliency/pmcp#315).
++        parsed_id = parse_request_id(parsed.request_id)
++        server_name = parsed_id[0] if parsed_id is not None else None
+@@ -6282 +6336 @@ class GatewayTools:
+-            request_id=parsed.request_id,
++            request_id=parsed.request_id if parsed_id is not None else None,
 ````
 
 ### Patch — `src/pmcp/transport/http.py`
 
 ````diff
 diff --git a/src/pmcp/transport/http.py b/src/pmcp/transport/http.py
-index 41af495..1623233 100644
+index 624108b..eef51fd 100644
 --- a/src/pmcp/transport/http.py
 +++ b/src/pmcp/transport/http.py
-@@ -22,3 +22,2 @@ import hmac
- import ipaddress
+@@ -23 +22,0 @@ import ipaddress
 -import json
- import logging
-@@ -44,2 +43,3 @@ from pmcp.auth import (
- )
+@@ -48,0 +48 @@ from pmcp.auth import (
 +from pmcp.parsing import load_json
- from pmcp.types import GatewayDiagnosticsInfo
-@@ -258,9 +258,20 @@ def _split_host_port(value: str, default_port: str) -> tuple[str, str]:
- def _origin_host_port(origin: str) -> tuple[str, str] | None:
+@@ -278,3 +278,14 @@ def _origin_host_port(origin: str) -> tuple[str, str] | None:
 -    """Return (hostname, port) for an Origin header value, or None if unparseable."""
 -    parsed = urlparse(origin)
 -    if not parsed.scheme or not parsed.hostname:
@@ -4247,18 +3517,14 @@ index 41af495..1623233 100644
 +    except ValueError:
 +        return None
 +    if not parsed.scheme or not hostname:
-         return None
-     default_port = "443" if parsed.scheme == "https" else "80"
+@@ -283,2 +294,2 @@ def _origin_host_port(origin: str) -> tuple[str, str] | None:
 -    port = str(parsed.port) if parsed.port is not None else default_port
 -    return parsed.hostname, port
 +    port = str(explicit_port) if explicit_port is not None else default_port
 +    return hostname, port
- 
-@@ -672,3 +683,3 @@ def create_http_app(
-             try:
+@@ -709 +720 @@ def create_http_app(
 -                body_method = json.loads(body_bytes).get("method")
 +                body_method = load_json(body_bytes, source="request body").get("method")
-             except Exception:
 ````
 
 ### Patch — `src/pmcp/trust_store.py`
@@ -4268,42 +3534,35 @@ diff --git a/src/pmcp/trust_store.py b/src/pmcp/trust_store.py
 index dd9ed8c..5b4b1d3 100644
 --- a/src/pmcp/trust_store.py
 +++ b/src/pmcp/trust_store.py
-@@ -44,2 +44,4 @@ from pathlib import Path
- from typing import Any
+@@ -44,0 +45,2 @@ from typing import Any
 +from pmcp.argument_errors import exception_text
 +from pmcp.parsing import load_json, parse_timestamp
- 
-@@ -269,5 +271,7 @@ def _decode(entry: Any) -> TrustRecord:
-     try:
+@@ -270 +272 @@ def _decode(entry: Any) -> TrustRecord:
 -        parsed_at = datetime.fromisoformat(str(recorded_at))
 +        parsed_at = parse_timestamp(str(recorded_at), source="trust store record")
-     except ValueError as exc:
+@@ -272 +274,3 @@ def _decode(entry: Any) -> TrustRecord:
 -        raise TrustStoreError(f"Unparseable trust timestamp: {exc}") from exc
 +        raise TrustStoreError(
 +            f"Unparseable trust timestamp: {exception_text(exc)}"
 +        ) from exc
- 
-@@ -297,5 +301,7 @@ def _read_store(path: Path) -> list[TrustRecord]:
-     try:
+@@ -298 +302 @@ def _read_store(path: Path) -> list[TrustRecord]:
 -        data = json.loads(raw)
 +        data = load_json(raw, source="trust store")
-     except ValueError as exc:
+@@ -300 +304,3 @@ def _read_store(path: Path) -> list[TrustRecord]:
 -        raise TrustStoreError(f"Cannot parse trust store {path}: {exc}") from exc
 +        raise TrustStoreError(
 +            f"Cannot parse trust store {path}: {exception_text(exc)}"
 +        ) from exc
- 
 ````
 
 ### Patch — `src/pmcp/types.py`
 
 ````diff
 diff --git a/src/pmcp/types.py b/src/pmcp/types.py
-index 7dc8e7c..57f1baf 100644
+index 448e714..6236b18 100644
 --- a/src/pmcp/types.py
 +++ b/src/pmcp/types.py
-@@ -11,2 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
- 
+@@ -19,0 +20,7 @@ from pydantic import (
 +from pmcp.argument_errors import (
 +    CORRELATION_ID_CHARSET,
 +    PACKAGE_NAME_INVALID,
@@ -4311,33 +3570,31 @@ index 7dc8e7c..57f1baf 100644
 +    argument_error,
 +)
 +from pmcp.parsing import parse_timestamp
- from pmcp.validation import is_valid_package_name, version_separator_index
-@@ -551,3 +558,3 @@ class McpTaskInfo(BaseModel):
-                 candidate = f"{candidate[:-1]}+00:00"
+@@ -591 +598,3 @@ def _usable_task_timestamp(value: Any) -> Any:
 -            return datetime.fromisoformat(candidate).timestamp()
++            # Through the parse helper (Consiliency/pmcp#297): its failure
++            # is value-free; the value itself is dropped, as main drops it.
 +            return parse_timestamp(candidate, source="task timestamp").timestamp()
-         return value
-@@ -886,3 +893,3 @@ class InvokeInput(GatewayArguments):
-         if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", value) is None:
+@@ -1012 +1021 @@ class InvokeInput(GatewayArguments):
 -            raise ValueError("correlation IDs may contain only alphanumerics and ._:-")
 +            raise argument_error(CORRELATION_ID_CHARSET)
-         return value
-@@ -899,5 +906,3 @@ class InvokeInput(GatewayArguments):
-         ):
+@@ -1025,3 +1034 @@ class InvokeInput(GatewayArguments):
 -            raise ValueError(
 -                "scoped advisor correlation fields must be supplied together"
 -            )
 +            raise argument_error(SCOPED_CORRELATION_INCOMPLETE)
-         return self
-@@ -1394,7 +1399,3 @@ class RegisterDiscoveredServerInput(GatewayArguments):
-         if not is_valid_package_name(value):
+@@ -1218 +1225,3 @@ class CancelOutput(BaseModel):
+-    request_id: str
++    #: The id cancelled, or null when it was rejected for its format
++    #: (Consiliency/pmcp#297): a rejected value is not copied back.
++    request_id: str | None
+@@ -1520,5 +1529 @@ class RegisterDiscoveredServerInput(GatewayArguments):
 -            raise ValueError(
 -                "package must be a valid npm/pypi identifier "
 -                "(no leading dash, whitespace, path separators, or shell "
 -                "metacharacters)"
 -            )
 +            raise argument_error(PACKAGE_NAME_INVALID)
-         return value
 ````
 
 ### Patch — `src/pmcp/validation.py`
@@ -4347,8 +3604,7 @@ diff --git a/src/pmcp/validation.py b/src/pmcp/validation.py
 index df1995a..0953e6a 100644
 --- a/src/pmcp/validation.py
 +++ b/src/pmcp/validation.py
-@@ -258 +258,14 @@ def discovered_env_var_allowed(name: str) -> bool:
-     return bool(_CREDENTIAL_NAME_RE.fullmatch(name))
+@@ -258,0 +259,13 @@ def discovered_env_var_allowed(name: str) -> bool:
 +
 +
 +def discovered_env_var_refusal_reason(name: str) -> str:
@@ -4369,10 +3625,10 @@ index df1995a..0953e6a 100644
 ````diff
 diff --git a/tests/test_argument_error_echo.py b/tests/test_argument_error_echo.py
 new file mode 100644
-index 0000000..7058d8b
+index 0000000..9841afb
 --- /dev/null
 +++ b/tests/test_argument_error_echo.py
-@@ -0,0 +1,1594 @@
+@@ -0,0 +1,1845 @@
 +"""A rejected gateway-tool argument never echoes its value (Consiliency/pmcp#297).
 +
 +The oracle is a generated sweep, not hand-picked cases. Its axes come from the
@@ -5017,8 +4273,18 @@ index 0000000..7058d8b
 +        ]
 +
 +    def stable(self) -> tuple[Any, ...]:
-+        """What must be identical for two sentinels of different length."""
-+        return (self.response, self.log, self.streams, self.warnings, self.audit)
++        """What must be identical for two sentinels of different length. A
++        task time pmcp itself records (the current time, for a timestamp it
++        dropped as unusable; Consiliency/pmcp#298) is not the pair's."""
++        response = re.sub(
++            r'"(created_at|updated_at)": [0-9.eE+-]+', r'"\1": <time>', self.response
++        )
++        # ...and so is the digest of a result holding that time.
++        audit = [
++            {k: v for k, v in entry.items() if k != "redacted_result_digest"}
++            for entry in self.audit
++        ]
++        return (response, self.log, self.streams, self.warnings, audit)
 +
 +    def differs(self, other: _Observed) -> list[tuple[str, Any, Any]]:
 +        """The channels where `self` and `other` differ, for a readable failure."""
@@ -5124,7 +4390,7 @@ index 0000000..7058d8b
 +    pydantic error from an argument model, and a jsonschema error."""
 +    errors: list[BaseException] = []
 +    for model, data in (
-+        (McpTaskInfo, {"task_id": {s: s}, "created_at": [s]}),
++        (McpTaskInfo, {"task_id": {s: s}, "raw": [s]}),
 +        (InvokeInput, {"tool_id": {s: s}, "options": s, "_meta": [s]}),
 +    ):
 +        try:
@@ -5156,7 +4422,7 @@ index 0000000..7058d8b
 +#: What `exception_text` makes of each of `_handler_validation_errors`.
 +_HANDLER_ERROR_TEXT = (
 +    re.compile(
-+        r"2 validation errors for McpTaskInfo: \$\.task_id: must be a string; \$\.created_at: "
++        r"2 validation errors for McpTaskInfo: \$\.task_id: must be a string; \$\.raw: "
 +    ),
 +    re.compile(r"3 validation errors for InvokeInput: \$\.tool_id: must be a string; "),
 +    # `x` is no name pmcp's models declare, so it reads as `*`.
@@ -5425,13 +4691,13 @@ index 0000000..7058d8b
 +    s = _SENTINELS[1]
 +    try:
 +        try:
-+            McpTaskInfo.model_validate({"task_id": "t", "ttl": s})
++            McpTaskInfo.model_validate({"task_id": {"v": s}})
 +        except ValidationError as inner:
 +            raise RuntimeError(f"task parse failed: {inner}") from inner
 +    except RuntimeError as outer:
 +        text = exception_text(outer)
 +        assert text.startswith(
-+            "RuntimeError: 1 validation error for McpTaskInfo: $.ttl: must be an integer"
++            "RuntimeError: 1 validation error for McpTaskInfo: $.task_id: must be a string"
 +        ), text
 +        assert not any(form in text for form in _forbidden(s))
 +        assert safe_exc_info(outer) is None
@@ -5457,14 +4723,14 @@ index 0000000..7058d8b
 +        from exceptiongroup import ExceptionGroup as group_type
 +    s = _FAMILIES[family][1]
 +    with pytest.raises(ValidationError) as raised:
-+        McpTaskInfo.model_validate({"task_id": "t", "ttl": {"v": s}})
++        McpTaskInfo.model_validate({"task_id": {"v": s}})
 +    leaf = raised.value
 +    for group in (
 +        group_type("unhandled errors in a TaskGroup", [leaf]),
 +        group_type("unhandled errors in a TaskGroup", [RuntimeError("boom"), leaf]),
 +    ):
 +        text = describe_exception(group)
-+        assert "validation error for McpTaskInfo: $.ttl: must be an integer" in text
++        assert "validation error for McpTaskInfo: $.task_id: must be a string" in text
 +        assert not any(form in text for form in _forbidden(s)), text
 +
 +
@@ -5540,12 +4806,25 @@ index 0000000..7058d8b
 +                if key not in ("taskId", "task_id")
 +                else {key: value}
 +            )
-+            try:
-+                manager._task_info_from_payload(payload)
-+            except ValidationError:
++            if _task_outcome(manager._task_info_from_payload, payload):
 +                positions.append((key, shape))
 +    assert len(positions) > 10, positions
 +    return positions
++
++
++def _task_outcome(parser: Any, payload: dict) -> str | None:
++    """How the task parser refuses a value in `payload`: it raises
++    (`rejected`), or -- since Consiliency/pmcp#298 -- drops it and names the
++    field in `unusable_fields` (`dropped`). None if it accepts the value, or
++    finds no task at all (no string `taskId`: the answer is then not a task,
++    and is returned as the downstream's data, as before)."""
++    try:
++        task = parser(payload)
++    except ValidationError:
++        return "rejected"
++    if task is not None and task.unusable_fields:
++        return "dropped"
++    return None
 +
 +
 +def _task_server(
@@ -5654,11 +4933,8 @@ index 0000000..7058d8b
 +    parser = server._client_manager._task_info_from_payload
 +
 +    def rejects(key: str, value: Any) -> bool:
-+        try:
-+            parser({"taskId": "t", "status": "working", key: value})
-+        except ValidationError:
-+            return True
-+        return False
++        payload = {"taskId": "t", "status": "working", key: value}
++        return _task_outcome(parser, payload) is not None
 +
 +    rejected = expected = 0
 +    for name, arguments, method in _task_calls():
@@ -5691,9 +4967,13 @@ index 0000000..7058d8b
 +                    assert method in state["methods"], (name, state["methods"])
 +                    assert observed.leaks(s) == [], (name, key, shape, family, observed)
 +                    seen.append(observed)
-+                # No vacuous pass: the payload was rejected, and said so.
++                # No vacuous pass: the payload was rejected, and said so --
++                # or (Consiliency/pmcp#298) the value was dropped, and the
++                # field is named as unusable.
 +                assert re.search(
-+                    r"validation errors? for McpTaskInfo: \$", seen[0].response
++                    r"validation errors? for McpTaskInfo: \$|\"unusable_fields\": \[\s*\"|"
++                    r"[Tt]ask not found",
++                    seen[0].response,
 +                ), (
 +                    name,
 +                    key,
@@ -5860,7 +5140,7 @@ index 0000000..7058d8b
 +        for s in sentinels:
 +
 +            async def connect(_config: Any, s: str = s) -> None:
-+                McpTaskInfo.model_validate({"task_id": "t", "ttl": {"v": s}})
++                McpTaskInfo.model_validate({"task_id": {"v": s}})
 +
 +            monkeypatch.setattr(manager, "_connect_server", connect)
 +            mark = tap.start()
@@ -5871,7 +5151,7 @@ index 0000000..7058d8b
 +            observed = tap.since(mark, json.dumps(errors) + health)
 +            assert observed.leaks(s) == [], (family, observed)
 +            assert (
-+                "validation error for McpTaskInfo: $.ttl: must be an integer"
++                "validation error for McpTaskInfo: $.task_id: must be a string"
 +                in (errors[0])
 +            ), errors
 +            seen.append((json.dumps(errors), observed.log))
@@ -5897,7 +5177,6 @@ index 0000000..7058d8b
 +    in the response's text, its structured fields and the audit-event
 +    buffer. (A downstream's rejected pagination cursor is in the frame
 +    sweep's `cursor-*` shapes.)"""
-+    from pmcp.client.manager import ClientManager
 +    from pmcp.manifest.loader import Manifest, ServerConfig
 +    from pmcp.policy.policy import PolicyManager
 +    from pmcp.tools.handlers import GatewayTools
@@ -5907,11 +5186,31 @@ index 0000000..7058d8b
 +    forbidden = _forbidden(s)
 +    seen: list[str] = []
 +
-+    manager = ClientManager()
-+    for request_id in (s, f"srv::{s}"):
-+        status, message, _, _ = await manager.cancel_request(request_id)
-+        assert status == "not_found"
-+        seen.append(message)
++    # Rev 13 (round-12 B1): through the real `gateway.cancel`, not
++    # `cancel_request` alone -- the response's `request_id` field and the
++    # audit event's `server_name` copied the id the format check rejected.
++    # Each rejection: the id has no `::`, or its local id is not an integer
++    # (with the value on either side of the separator).
++    server, audit_path = _server(tmp_path, audited=True)
++    for request_id in (s, f"{s}::notint", f"srv::{s}", f"{s}::{s}"):
++        result = await _call(server, "gateway.cancel", {"request_id": request_id})
++        text = "".join(block.text for block in result.content)
++        payload = json.loads(text)
++        assert payload["status"] == "not_found", text
++        assert payload["request_id"] is None, text
++        event = server._gateway_tools._audit_events[-1]
++        assert event.method == "gateway.cancel" and event.server_name is None, event
++        seen.append(text)
++        seen.append(event.model_dump_json())
++    # The control: a well-formed id is accepted and kept (its lookup miss is
++    # Consiliency/pmcp#315's), so the nulling above is the format rule's.
++    result = await _call(server, "gateway.cancel", {"request_id": "nosuch::5"})
++    payload = json.loads("".join(block.text for block in result.content))
++    assert payload["request_id"] == "nosuch::5", payload
++    assert server._gateway_tools._audit_events[-1].server_name == "nosuch"
++    await server.shutdown()
++    assert audit_path is not None
++    seen.append(audit_path.read_text() if audit_path.exists() else "")
 +
 +    manifest = Manifest(
 +        version="1.0",
@@ -5967,6 +5266,229 @@ index 0000000..7058d8b
 +    seen.extend(event.model_dump_json() for event in events)
 +    text = "\n".join(seen)
 +    assert not any(form in text for form in forbidden), text[:600]
++
++
++# --- rev 13: every output or audit field that copies a caller input -----------
++
++#: Why each field that copies a caller input may hold it (round-12 B1, as a
++#: class). The rule is rev 12's: a value pmcp *rejects* is not copied back,
++#: into the response or the audit event. A value it accepts may be, and a
++#: lookup of an accepted value that misses is Consiliency/pmcp#315's.
++_NULLED = "rejected for its format: null / None on that path (rev 13, B1)"
++_REFUSED = "refused: null on the refusal paths (rev 12); copied on success"
++_LOOKUP = "accepted (any non-empty string); a miss is a lookup echo, #315"
++_ACCEPTED = "copied only on the path that accepted it"
++_NEVER = "never rejected by hand"
++_DERIVED = "a value pmcp computed from the input, not the input"
++_COPIED_INPUT_TRIAGE: dict[tuple[str, str], str] = {
++    ("cancel", "CancelOutput.request_id"): _NULLED,
++    ("cancel", "GatewayAuditEvent.server_name"): _NULLED,
++    ("auth_connect", "AuthConnectOutput.env_var"): _REFUSED,
++    ("auth_connect", "AuthConnectOutput.server"): _LOOKUP,
++    ("auth_connect", "GatewayAuditEvent.server_name"): _LOOKUP,
++    ("auth_connect", "AuthConnectOutput.url_elicitation"): _ACCEPTED,
++    ("auth_connect", "UrlElicitationInfo.elicitation_id"): _ACCEPTED,
++    ("auth_connect", "UrlElicitationInfo.next_step"): _ACCEPTED,
++    ("auth_connect", "UrlElicitationInfo.url"): _ACCEPTED,
++    ("auth_connect", "UrlElicitationInfo.url_verified"): _DERIVED,
++    ("connect_server", "LifecycleServerOutput.server"): _LOOKUP,
++    ("connect_server", "_lifecycle_output.server"): _LOOKUP,
++    ("connect_server", "_lifecycle_output.message"): _LOOKUP,
++    ("disconnect_server", "LifecycleServerOutput.server"): _LOOKUP,
++    ("disconnect_server", "_lifecycle_output.server"): _LOOKUP,
++    ("disconnect_server", "_lifecycle_output.active_task_count"): _DERIVED,
++    ("disconnect_server", "_lifecycle_output.cancelled_task_count"): _DERIVED,
++    ("restart_server", "LifecycleServerOutput.server"): _LOOKUP,
++    ("restart_server", "_lifecycle_output.server"): _LOOKUP,
++    ("invoke", "InvokeOutput.tool_id"): _LOOKUP,
++    ("invoke", "GatewayAuditEvent.tool_id"): _LOOKUP,
++    ("invoke", "GatewayAuditEvent.error"): _LOOKUP,
++    ("invoke", "InvokeOutput.task"): _DERIVED,
++    ("invoke", "process_output.redact"): _DERIVED,
++    ("provision", "ProvisionOutput.server"): _LOOKUP,
++    ("update_server", "UpdateServerOutput.server"): _LOOKUP,
++    ("provision_status", "ProvisionJobStatus.job_id"): _LOOKUP,
++    ("register_discovered_server", "RegisterDiscoveredServerOutput.server_name"): (
++        "accepted; the refusals are of the package and env vars, described (rev 12)"
++    ),
++    ("register_discovered_server", "ServerConfig.env_var"): _ACCEPTED,
++    ("register_discovered_server", "ServerConfig.name"): _ACCEPTED,
++    ("register_discovered_server", "ServerConfig.package"): _ACCEPTED,
++    ("request_capability", "CapabilityResolution.candidates"): _DERIVED,
++    **{
++        ("request_capability", f"CLIResolution.{field}"): _DERIVED
++        for field in (
++            "available",
++            "check_command",
++            "description",
++            "examples",
++            "help_command",
++            "name",
++            "path",
++            "prefer_mcp_for",
++            "reason",
++        )
++    },
++    ("search_registry", "SearchRegistryOutput.query"): _NEVER,
++    ("submit_feedback", "SubmitFeedbackOutput.issue_title"): (
++        "never rejected; a refusal is of the destination or credential, and "
++        "the text is returned for filing by hand"
++    ),
++    ("submit_feedback", "SubmitFeedbackOutput.issue_body"): (
++        "never rejected; a refusal is of the destination or credential, and "
++        "the text is returned for filing by hand"
++    ),
++    ("submit_feedback", "SubmitFeedbackOutput.issue_url"): _DERIVED,
++    ("submit_feedback", "SubmitFeedbackOutput.repository"): _DERIVED,
++    ("sync_environment", "SyncEnvironmentOutput.platform"): _ACCEPTED,
++    ("sync_environment", "SyncEnvironmentOutput.detected_clis"): _NEVER,
++    ("tasks_list", "GatewayAuditEvent.server_name"): _LOOKUP,
++    ("tasks_get", "GatewayAuditEvent.server_name"): _LOOKUP,
++    ("tasks_get", "GatewayAuditEvent.task_id"): _LOOKUP,
++    ("tasks_result", "GatewayAuditEvent.server_name"): _LOOKUP,
++    ("tasks_result", "GatewayAuditEvent.task_id"): _LOOKUP,
++    ("tasks_result", "process_output.redact"): _DERIVED,
++    ("tasks_cancel", "GatewayAuditEvent.server_name"): _LOOKUP,
++    ("tasks_cancel", "GatewayAuditEvent.task_id"): _LOOKUP,
++}
++
++
++def _gateway_tools_class() -> Any:
++    import ast
++
++    import pmcp.tools.handlers as handlers_module
++
++    tree = ast.parse(Path(handlers_module.__file__).read_text())
++    return next(
++        node
++        for node in tree.body
++        if isinstance(node, ast.ClassDef) and node.name == "GatewayTools"
++    )
++
++
++def _mirrored_fields() -> set[tuple[str, str]]:
++    """By the models: each tool's return model's fields named as one of its
++    input model's fields (`server_name` is returned as `server`)."""
++    import ast
++
++    import pmcp.types as types_module
++
++    found: set[tuple[str, str]] = set()
++    for fn in _gateway_tools_class().body:
++        if not isinstance(fn, ast.AsyncFunctionDef) or fn.name.startswith("_"):
++            continue
++        output = getattr(types_module, ast.unparse(fn.returns), None)
++        if output is None:
++            continue
++        for call in ast.walk(fn):
++            if not (
++                isinstance(call, ast.Call)
++                and isinstance(call.func, ast.Attribute)
++                and call.func.attr == "model_validate"
++                and isinstance(call.func.value, ast.Name)
++                and call.func.value.id.endswith("Input")
++            ):
++                continue
++            names = set(getattr(types_module, call.func.value.id).model_fields)
++            if "server_name" in names:
++                names.add("server")
++            found |= {
++                (fn.name, f"{output.__name__}.{field}")
++                for field in output.model_fields
++                if field in names
++            }
++    return found
++
++
++def _copied_inputs() -> set[tuple[str, str]]:
++    """By the code: each keyword of a model construction, an `*_output`
++    helper call or an `_audit` call whose value is the input itself
++    (`parsed.<field>`), a conditional on it, or a local bound from it by an
++    attribute, boolean or conditional expression or a module-level parse
++    function (`parse_request_id(parsed.request_id)`)."""
++    import ast
++
++    def reads(node: ast.AST, bound: dict[str, str]) -> set[str]:
++        out: set[str] = set()
++        for sub in ast.walk(node):
++            if (
++                isinstance(sub, ast.Attribute)
++                and isinstance(sub.value, ast.Name)
++                and sub.value.id == "parsed"
++            ):
++                out.add(sub.attr)
++            elif isinstance(sub, ast.Name) and sub.id in bound:
++                out.add(bound[sub.id])
++        return out
++
++    found: set[tuple[str, str]] = set()
++    for fn in _gateway_tools_class().body:
++        if not isinstance(fn, ast.AsyncFunctionDef) or fn.name.startswith("_"):
++            continue
++        bound: dict[str, str] = {}
++        for node in ast.walk(fn):
++            if not (
++                isinstance(node, ast.Assign)
++                and len(node.targets) == 1
++                and isinstance(node.targets[0], ast.Name)
++            ):
++                continue
++            value = node.value
++            if isinstance(value, (ast.Attribute, ast.BoolOp, ast.IfExp)) or (
++                isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
++            ):
++                for name in reads(value, dict(bound)):
++                    bound[node.targets[0].id] = name
++        for node in ast.walk(fn):
++            if not isinstance(node, ast.Call):
++                continue
++            if isinstance(node.func, ast.Name) and node.func.id[:1].isupper():
++                label = node.func.id
++            elif isinstance(node.func, ast.Attribute) and node.func.attr == "_audit":
++                label = "GatewayAuditEvent"
++            elif isinstance(node.func, ast.Attribute) and node.func.attr.endswith(
++                "_output"
++            ):
++                label = node.func.attr
++            else:
++                continue
++            for keyword in node.keywords:
++                value = keyword.value
++                if keyword.arg is None or not isinstance(
++                    value, (ast.Attribute, ast.Name, ast.IfExp, ast.Subscript)
++                ):
++                    continue
++                if reads(value, bound):
++                    found.add((fn.name, f"{label}.{keyword.arg}"))
++    return found
++
++
++def test_every_field_that_copies_a_caller_input_is_triaged() -> None:
++    """Round-12 B1 as a class: `gateway.cancel` copied a request id it had
++    rejected into its response and its audit event. Every output or audit
++    field that copies a caller input -- found two ways, by the models and by
++    the code -- has a reason it may hold the value, and the table has no
++    stale entry. A new copy fails here until it is triaged."""
++    found = _mirrored_fields() | _copied_inputs()
++    assert found == set(_COPIED_INPUT_TRIAGE), (
++        sorted(found - set(_COPIED_INPUT_TRIAGE)),
++        sorted(set(_COPIED_INPUT_TRIAGE) - found),
++    )
+````
+
+### Patch — `tests/test_auth_operator_messages.py`
+
+````diff
+diff --git a/tests/test_auth_operator_messages.py b/tests/test_auth_operator_messages.py
+index 862d690..ba0c749 100644
+--- a/tests/test_auth_operator_messages.py
++++ b/tests/test_auth_operator_messages.py
+@@ -1078 +1078,4 @@ def test_no_redacting_log_hook_in_the_source() -> None:
+-    assert hits == []
++    # Consiliency/pmcp#297's record scrubber is a record factory, but it only
++    # rewrites a record that carries a validation or parse error; the sink
++    # test above shows every auth message passes through it intact.
++    assert hits == ["argument_errors.py: setLogRecordFactory("]
 ````
 
 ### Patch — `tests/test_downstream_frame_echo.py`
@@ -5974,10 +5496,10 @@ index 0000000..7058d8b
 ````diff
 diff --git a/tests/test_downstream_frame_echo.py b/tests/test_downstream_frame_echo.py
 new file mode 100644
-index 0000000..789f083
+index 0000000..14c6599
 --- /dev/null
 +++ b/tests/test_downstream_frame_echo.py
-@@ -0,0 +1,1229 @@
+@@ -0,0 +1,1617 @@
 +"""A downstream's malformed JSON-RPC reply never echoes into pmcp's output
 +(Consiliency/pmcp#297, rev 3).
 +
@@ -6067,10 +5589,36 @@ index 0000000..789f083
 +    "cursor-object",
 +    "cursor-list",
 +    "cursor-repeat",
++    # rev 13 (round-12 codex B2): an error envelope that breaks one rule of
++    # JSON-RPC 2.0 elsewhere, with the sentinel as its `message` -- the text a
++    # caller renders. `jsonrpc` "1.0", no `jsonrpc`, both `result` and
++    # `error`, and a bool `code` (which the SDK's model coerces to 1). The
++    # property test below takes every rule; these four take every caller and
++    # transport.
++    "envelope-version",
++    "envelope-unversioned",
++    "envelope-both",
++    "envelope-code",
 +)
-+#: The shapes whose frame the parser rejects: stdio then also sends the real
-+#: reply, so the request completes instead of timing out.
-+_REJECTED_SHAPES = ("not-json", "json-deep", "json-bigint", "json-syntax")
++#: The shapes whose frame pmcp rejects -- the parser, or (rev 13) the
++#: envelope check, which leaves the request waiting: stdio then also sends the
++#: real reply, so the request completes instead of timing out.
++_REJECTED_SHAPES = (
++    # rev 13: the envelope check drops these on stdio too (rev 12's
++    # dispatcher acted on them), so they are followed by the real reply.
++    "result-type",
++    "error-code",
++    "error-message",
++    "jsonrpc",
++    "not-json",
++    "json-deep",
++    "json-bigint",
++    "json-syntax",
++    "envelope-version",
++    "envelope-unversioned",
++    "envelope-both",
++    "envelope-code",
++)
 +_METHODS = (
 +    "initialize",
 +    "tools/list",
@@ -6181,6 +5729,17 @@ index 0000000..789f083
 +            frame = {"jsonrpc": "2.0", "id": rid, "result": normal(method, request.get("params") or {})}
 +        elif state["shape"] == "payload":
 +            frame = {"jsonrpc": "2.0", "id": rid, "result": invalid_payload(method, s, request.get("params") or {})}
++        elif state["shape"].startswith("envelope-"):
++            error = {"code": -32000, "message": s}
++            frame = {"jsonrpc": "2.0", "id": rid, "error": error}
++            if state["shape"] == "envelope-version":
++                frame["jsonrpc"] = "1.0"
++            elif state["shape"] == "envelope-unversioned":
++                del frame["jsonrpc"]
++            elif state["shape"] == "envelope-both":
++                frame["result"] = {}
++            else:
++                error["code"] = True
 +        elif state["shape"] == "json-syntax":
 +            head = '{"jsonrpc":"2.0","id":%s,"error":{"message":"m",,' % json.dumps(rid)
 +            return (head + '"code":%s}}' % json.dumps(s)).encode()
@@ -6521,6 +6080,13 @@ index 0000000..789f083
 +                            # asked for this result. Never in the log.
 +                            leaks = []
 +                        assert leaks == [], (transport, method, shape, family, observed)
++                        if transport == "stdio" and shape.startswith("envelope-"):
++                            # No vacuous pass: the envelope reached the
++                            # dispatcher and was dropped (rev 13).
++                            assert any(
++                                "dropped invalid frame" in r.getMessage()
++                                for r in records
++                            ), (transport, method, shape, family)
 +                        if transport == "stdio" and shape.startswith("json-"):
 +                            # No vacuous pass: the rejected frame reached the
 +                            # reader and got the fixed record (rev 12).
@@ -7006,7 +6572,7 @@ index 0000000..789f083
 +
 +    def invalid() -> ValidationError:
 +        try:
-+            McpTaskInfo.model_validate({"task_id": "t", "ttl": s})
++            McpTaskInfo.model_validate({"task_id": {"v": s}})
 +        except ValidationError as error:
 +            return error
 +        raise AssertionError("did not reject")
@@ -7032,6 +6598,8 @@ index 0000000..789f083
 +
 +    async def mcp_data_carries() -> None:
 +        error = invalid()
++        # The value alone, though the rejected input was `{"v": <s>}`: a
++        # string inside a container input is matched too (rev 13).
 +        raise MCPError(-32602, "bad input", {"input": s}) from error
 +
 +    async def mcp_partial_message() -> None:
@@ -7090,18 +6658,145 @@ index 0000000..789f083
 +
 +
 +def _is_valid_frame(line: bytes) -> bool:
-+    """The test's own statement of a JSON-RPC message (it parses to an object
-+    with `"jsonrpc": "2.0"`, a string `method`, or an id with a result or an
-+    error) -- the only kind of stdout line the reader may act on."""
++    """The test's own statement of a JSON-RPC 2.0 message as MCP defines one
++    -- the only kind of stdout line whose content the reader may act on
++    (rev 13: the specification's rules, written here independently of
++    `jsonrpc_envelope_problem`). `"jsonrpc": "2.0"`; a request or
++    notification has a string `method`, an object `params` if any, and no
++    `result`/`error`; a response has an `id` and exactly one of an object
++    `result` or an `error` object with an integer `code` and a string
++    `message`."""
 +    try:
 +        value = json.loads(line)
 +    except Exception:  # noqa: BLE001
 +        return False
 +    if not isinstance(value, dict) or value.get("jsonrpc") != "2.0":
 +        return False
++
++    def request_id(v: Any) -> bool:
++        return type(v) in (str, int)
++
 +    if "method" in value:
-+        return isinstance(value["method"], str)
-+    return value.get("id") is not None and ("result" in value or "error" in value)
++        return (
++            isinstance(value["method"], str)
++            and ("id" not in value or request_id(value["id"]))
++            and isinstance(value.get("params", {}), dict)
++            and "result" not in value
++            and "error" not in value
++        )
++    if "id" not in value or ("result" in value) == ("error" in value):
++        return False
++    if "result" in value:
++        return request_id(value["id"]) and isinstance(value["result"], dict)
++    error = value["error"]
++    return (
++        (value["id"] is None or request_id(value["id"]))
++        and isinstance(error, dict)
++        and type(error.get("code")) is int
++        and isinstance(error.get("message"), str)
++    )
++
++
++_MISSING = object()
++
++
++def _envelope_violations(s: str, rid: Any) -> list[tuple[str, dict[str, Any]]]:
++    """Rev 13 (round-12 codex B2): one frame per way a JSON-RPC 2.0 response
++    can break the specification's envelope rules (JSON-RPC 2.0 sections 4-5,
++    MCP's response types), each addressed to pending request `rid` and each
++    carrying the sentinel where a caller would render it -- the error's
++    `message` and `data`, or the result. Derived from the rules, not from the
++    four frames codex sent."""
++    err = {"code": -32000, "message": s, "data": {"detail": s}}
++    base: dict[str, Any] = {"jsonrpc": "2.0", "id": rid, "error": err}
++
++    def with_member(frame: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
++        out = dict(frame)
++        if value is _MISSING:
++            out.pop(key, None)
++        else:
++            out[key] = value
++        return out
++
++    cases: list[tuple[str, dict[str, Any]]] = []
++    # `jsonrpc` MUST be exactly "2.0".
++    for value in (_MISSING, "1.0", "2", "2.0 ", 2.0, 2, None, ["2.0"], {"v": "2.0"}):
++        cases.append(
++            (f"jsonrpc {type(value).__name__}", with_member(base, "jsonrpc", value))
++        )
++    # Exactly one of `result` and `error`.
++    cases.append(("result and error", {**base, "result": {}}))
++    cases.append(
++        (
++            "result and error, result first",
++            {"jsonrpc": "2.0", "id": rid, "result": {"x": s}, "error": err},
++        )
++    )
++    cases.append(
++        ("neither result nor error", {"jsonrpc": "2.0", "id": rid, "message": s})
++    )
++    # `error.code` MUST be an integer.
++    for code in (
++        _MISSING,
++        True,
++        False,
++        1.5,
++        -32000.0,
++        "-32000",
++        None,
++        {},
++        [],
++        {"c": s},
++        [s],
++    ):
++        cases.append(
++            (
++                f"code {type(code).__name__}",
++                {**base, "error": with_member(err, "code", code)},
++            )
++        )
++    # `error.message` MUST be a string (the sentinel then rides in `data`).
++    for message in (_MISSING, 5, None, True, [s], {s: s}):
++        cases.append(
++            (
++                f"message {type(message).__name__}",
++                {**base, "error": with_member(err, "message", message)},
++            )
++        )
++    # `error` MUST be an object.
++    for error in (s, [s], [err], 5, None, True):
++        cases.append((f"error {type(error).__name__}", {**base, "error": error}))
++    # A response's `id` is a string, an integer, or null (an error only):
++    # not a bool, a float, an array or an object -- and it MUST be present.
++    if isinstance(rid, int):
++        for bad_id in (float(rid), [rid], {"id": rid}):
++            cases.append((f"id {type(bad_id).__name__}", {**base, "id": bad_id}))
++        cases.append(("id bool", {**base, "id": rid == 1}))
++    cases.append(("no id", with_member(base, "id", _MISSING)))
++    # `result` MUST be an object (MCP's `Result`).
++    for result in (s, [s], 5, None, True):
++        cases.append(
++            (
++                f"result {type(result).__name__}",
++                {"jsonrpc": "2.0", "id": rid, "result": result},
++            )
++        )
++    cases.append(
++        ("result with null id", {"jsonrpc": "2.0", "id": None, "result": {"x": s}})
++    )
++    # A request or notification carries neither `result` nor `error`, and
++    # its `params` is an object.
++    cases.append(("request with error", {**base, "method": "x"}))
++    cases.append(
++        ("notification with error", {"jsonrpc": "2.0", "method": "x", "error": err})
++    )
++    cases.append(
++        (
++            "request with array params",
++            {"jsonrpc": "2.0", "id": rid, "method": "x", "params": [s]},
++        )
++    )
++    return cases
 +
 +
 +def _stdout_streams(s: str) -> list[tuple[str, list[bytes], int | None]]:
@@ -7123,6 +6818,11 @@ index 0000000..789f083
 +    streams.append(("round-11 interleaved response", [head, reply, tail], None))
 +    streams.append(("interleaved notification", [head, note, tail], None))
 +    streams.append(("oversized head", [head + b"A" * 5000, tail, note], 2048))
++    # Rev 13: malformed envelopes addressed to the pending request (id 8).
++    streams += [
++        (f"envelope: {label}", [json.dumps(frame).encode()], None)
++        for label, frame in _envelope_violations(s, 8)
++    ]
 +    for banner in (
 +        f"server ready {s}",
 +        f"INFO: {s}",
@@ -7187,6 +6887,14 @@ index 0000000..789f083
 +            assert not shown, (label, sorted(shown)[:3])
 +        messages = [r.getMessage() for r in records]
 +        assert not any("Non-JSON output" in m for m in messages), (label, messages)
++        if label.startswith("envelope"):
++            # Rev 13: a malformed envelope never settles the request it names;
++            # only the end of the stream does (a disconnect, not its error).
++            from pmcp.client.manager import DownstreamError
++
++            settled = future.exception() if future.done() else None
++            assert not (future.done() and settled is None), label
++            assert not isinstance(settled, DownstreamError), (label, settled)
 +        fixed += sum("non-protocol stdout line" in m for m in messages)
 +    # No vacuous pass: thousands of lines took the fixed record.
 +    assert fixed > 1000, fixed
@@ -7207,6 +6915,208 @@ index 0000000..789f083
 +        "[srv] non-protocol stdout line: could not parse JSON downstream stdio "
 +        "frame at line 1, column 1 (JSONDecodeError)"
 +    ]
++
++
++# --- rev 13: a malformed envelope, through the caller waiting on it ------------
++
++
++class _Stdin:
++    """The stdio pipe pmcp writes requests to: each request line is handed
++    to `respond`, which feeds the downstream's answer to the reader."""
++
++    def __init__(self, respond: Any) -> None:
++        self.respond = respond
++
++    def write(self, data: bytes) -> None:
++        for line in data.splitlines():
++            self.respond(json.loads(line))
++
++    async def drain(self) -> None:
++        return None
++
++
++_CONSUMERS = ("tools/list page 2", "tools/call", "tasks/get")
++
++
++async def _through_a_caller(consumer: str, malformed: bytes) -> str:
++    """Run `consumer` -- the code that waits on a request and renders what it
++    gets -- against the REAL `_read_stdout`. The targeted request is answered
++    with `malformed`, then with a valid reply; return what the caller got
++    (its value, or its exception's text)."""
++    from pmcp.types import ServerStatusEnum, ToolInfo
++
++    manager, managed = _stdio_manager()
++    managed.config.name = "srv"
++    managed.status.server_capabilities = {"tasks": {}}
++    manager._clients["srv"] = managed
++    manager._tools["srv::run"] = ToolInfo(
++        tool_id="srv::run",
++        server_name="srv",
++        tool_name="run",
++        description="d",
++        short_description="d",
++        input_schema={"type": "object"},
++        tags=[],
++        risk_hint="low",
++    )
++    reader = asyncio.StreamReader()
++    managed.process.stdout = reader
++    method = consumer.split()[0]
++
++    def respond(request: dict[str, Any]) -> None:
++        rid, params = request["id"], request.get("params") or {}
++        if method == "tools/list" and not params.get("cursor"):
++            result: dict[str, Any] = {
++                "tools": [{"name": "run", "inputSchema": {"type": "object"}}],
++                "nextCursor": "page-2",
++            }
++            reader.feed_data(
++                json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode()
++                + b"\n"
++            )
++            return
++        valid = {
++            "tools/list": {"tools": []},
++            "tools/call": {"content": [{"type": "text", "text": "ok"}]},
++            "tasks/get": {"task": {"taskId": "t", "status": "working"}},
++        }[method]
++        line = malformed.replace(b"@@ID@@", json.dumps(rid).encode())
++        reply = json.dumps({"jsonrpc": "2.0", "id": rid, "result": valid}).encode()
++        reader.feed_data(line + b"\n" + reply + b"\n")
++
++    managed.process.stdin = _Stdin(respond)
++    read_task = asyncio.create_task(manager._read_stdout("srv", managed))
++    try:
++        if method == "tools/list":
++            outcome: Any = await manager._fetch_listing_pages(managed, "tools")
++        elif method == "tools/call":
++            outcome = await manager.call_tool("srv::run", {}, timeout_ms=5000)
++        else:
++            outcome = await manager.get_task("srv", "t")
++        text = repr(outcome)
++    except Exception as error:  # noqa: BLE001 -- what the caller would render
++        text = f"{type(error).__name__}: {error}"
++    finally:
++        managed.config = None  # no reconnect at EOF
++        managed.status.status = ServerStatusEnum.OFFLINE
++        reader.feed_eof()
++        await read_task
++    return text
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("family", sorted(_FAMILIES))
++@pytest.mark.parametrize("consumer", _CONSUMERS)
++async def test_no_malformed_envelope_reaches_its_waiting_caller(
++    caplog: pytest.LogCaptureFixture, consumer: str, family: str
++) -> None:
++    """Round-12 codex B2: `{"jsonrpc": "1.0", "id": 8, "error": {...}}` --
++    or no `jsonrpc`, both `result` and `error`, an object `code` -- resolved
++    the waiting request, and the caller logged `tools/list page 2 failed
++    (<message>)`. The rev 12 property test stopped before any caller ran.
++    Here each envelope violation `_envelope_violations` derives goes to a
++    real caller (listing pagination, `call_tool`, `get_task`) through the real
++    reader: no record and nothing the caller returns or raises carries any
++    part of it, and the caller gets the valid reply that follows."""
++    caplog.set_level(logging.DEBUG)
++    s = _FAMILIES[family][1]
++    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
++    cases = _envelope_violations(s, "@@ID@@")
++    assert len(cases) > 40, len(cases)
++    for label, frame in cases:
++        malformed = json.dumps(frame).encode().replace(b'"@@ID@@"', b"@@ID@@")
++        start = len(caplog.records)
++        outcome = await asyncio.wait_for(_through_a_caller(consumer, malformed), 20)
++        records = "\n".join(_record_text(r) for r in caplog.records[start:])
++        text = records + "\n" + outcome
++        assert not any(f in text for f in forbidden), (consumer, label, text[:600])
++        shown = _windows(malformed.decode()) & (_windows(text))
++        assert not shown, (consumer, label, sorted(shown)[:3])
++        # A part of the value: `describe_exception` elides a long message to
++        # its two ends, which the whole-value forms above do not match.
++        part = _windows(s, 8) & _windows(text, 8)
++        assert not part, (consumer, label, sorted(part)[:3])
++        # The valid reply answered the caller: the malformed frame did not.
++        assert "Error" not in outcome.split(":")[0], (consumer, label, outcome)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("consumer", _CONSUMERS)
++async def test_a_valid_error_still_reaches_its_caller(consumer: str) -> None:
++    """The control: a well-formed error envelope is the downstream's own
++    message, shown by design -- so the test above would see a leak."""
++    frame = {
++        "jsonrpc": "2.0",
++        "id": "@@ID@@",
++        "error": {"code": -32000, "message": "downstream says no"},
++    }
++    malformed = json.dumps(frame).encode().replace(b'"@@ID@@"', b"@@ID@@")
++    outcome = await asyncio.wait_for(_through_a_caller(consumer, malformed), 20)
++    if consumer.startswith("tools/list"):
++        # Page 2 failed: the whole kind is unreadable (None), and logged.
++        assert outcome == "None", outcome
++    else:
++        assert "downstream says no" in outcome, outcome
++
++
++@pytest.mark.parametrize("family", sorted(_FAMILIES))
++def test_the_sdk_client_transports_check_the_envelope(family: str) -> None:
++    """Round-12 codex B2 on SSE and streamable HTTP: the SDK's models coerce
++    an `error.code` of `true`, `"5"` or `5.0` and ignore a `result` beside an
++    `error`, so those frames validated and their `message` reached pmcp. The
++    SDK's three client transports now validate through the strict adapter
++    (installed on `import pmcp`): every envelope violation is a
++    `ValidationError` whose text carries none of the frame, and a valid
++    frame validates as before."""
++    import mcp.client.sse as sse_module
++    import mcp.client.stdio as stdio_module
++    import mcp.client.streamable_http as streamable_module
++    from pydantic import ValidationError
++
++    s = _FAMILIES[family][1]
++    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
++    adapters = {
++        "sse": sse_module.types.jsonrpc_message_adapter,
++        "stdio": stdio_module.types.jsonrpc_message_adapter,
++        "streamable_http": streamable_module.jsonrpc_message_adapter,
++    }
++    for transport, adapter in adapters.items():
++        for label, frame in _envelope_violations(s, 8):
++            raw = json.dumps(frame)
++            with pytest.raises(ValidationError) as caught:
++                adapter.validate_json(raw, by_name=False)
++            text = str(caught.value)
++            assert not any(f in text for f in forbidden), (transport, label, text)
++            assert not _windows(raw) & _windows(text), (transport, label, text)
++        for frame in (
++            {"jsonrpc": "2.0", "id": 8, "result": {"x": s}},
++            {"jsonrpc": "2.0", "id": 8, "error": {"code": -1, "message": s}},
++            {"jsonrpc": "2.0", "id": None, "error": {"code": -1, "message": s}},
++            {"jsonrpc": "2.0", "method": "notifications/message", "params": {}},
++            {"jsonrpc": "2.0", "id": "a", "method": "ping"},
++        ):
++            assert adapter.validate_json(json.dumps(frame), by_name=False)
++
++
++def test_the_strict_envelope_is_installed_on_import_pmcp() -> None:
++    """`pmcp refresh` reaches downstreams through the SDK's `stdio_client`
++    without importing the client manager: the adapter is installed with the
++    record scrubber, by `import pmcp` alone."""
++    import subprocess
++
++    code = (
++        "import pmcp, mcp.client.sse as a, mcp.client.stdio as b, "
++        "mcp.client.streamable_http as c, mcp.server.sse as d; "
++        "print(type(a.types).__name__, type(b.types).__name__, "
++        "type(c.jsonrpc_message_adapter).__name__, type(d.types).__name__ "
++        "if hasattr(d, 'types') else 'module')"
++    )
++    out = subprocess.run(
++        [sys.executable, "-c", code], capture_output=True, text=True, check=True
++    ).stdout.split()
++    assert out[:3] == ["_ClientTypesView", "_ClientTypesView", "_StrictMessageAdapter"]
++    # The server side is untouched.
++    assert out[3] != "_ClientTypesView", out
 ````
 
 ### Patch — `tests/test_exception_text_sinks.py`
@@ -7214,10 +7124,10 @@ index 0000000..789f083
 ````diff
 diff --git a/tests/test_exception_text_sinks.py b/tests/test_exception_text_sinks.py
 new file mode 100644
-index 0000000..24c6664
+index 0000000..d8e9e37
 --- /dev/null
 +++ b/tests/test_exception_text_sinks.py
-@@ -0,0 +1,895 @@
+@@ -0,0 +1,1098 @@
 +"""Every place `src/pmcp` turns an exception into text goes through the
 +value-free renderers (Consiliency/pmcp#297).
 +
@@ -8000,80 +7910,239 @@ index 0000000..24c6664
 +
 +#: Rejection wording: a message carrying one of these, built with `!r`,
 +#: `repr(...)` or `%r` of a non-constant, is a hand-rendered rejection.
++#: Rev 13 (round-12 claude): bad, wrong, failed, cannot, unrecognised and
++#: not found added.
 +_REJECTION_WORDS = re.compile(
 +    r"(?i)(invalid|unusable|unexpected|malformed|reject|refus|ignor|unsupported"
 +    r"|unknown|unsafe|not a valid|not permitted|not allowed|must be|expected"
 +    r"|illegal|disallowed|forbidden|denied|blocked|skipping|unparseable"
-+    r"|unreadable|repeated|not an? |does not |must match)"
++    r"|unreadable|repeated|not an? |does not |must match|bad|wrong|fail"
++    r"|cannot|can't|unrecogni[sz]|not found)"
 +)
++
++
++def _is_repr_call(node: ast.AST) -> bool:
++    """`repr(<non-constant>)` or `ascii(<non-constant>)`."""
++    return (
++        isinstance(node, ast.Call)
++        and isinstance(node.func, ast.Name)
++        and node.func.id in ("repr", "ascii")
++        and bool(node.args)
++        and not isinstance(node.args[0], ast.Constant)
++    )
++
++
++_PERCENT = re.compile(
++    r"%(?:\((?P<key>[^)]*)\))?[#0\- +]*(?:\*|\d+)?(?:\.(?:\*|\d+))?[hlL]?(?P<conv>[a-zA-Z%])"
++)
++
++
++def _percent_repr_targets(text: str, args: list[ast.AST]) -> list[ast.AST]:
++    """The arguments a `%`-format renders with `%r` or `%a`, by position (or
++    by key, for a single mapping argument)."""
++    targets: list[ast.AST] = []
++    position = 0
++    for match in _PERCENT.finditer(text):
++        conv = match.group("conv")
++        if conv == "%":
++            continue
++        if match.group("key") is not None:
++            if conv in "ra" and len(args) == 1 and isinstance(args[0], ast.Dict):
++                for k, v in zip(args[0].keys, args[0].values):
++                    if isinstance(k, ast.Constant) and k.value == match.group("key"):
++                        targets.append(v)
++            continue
++        if conv in "ra" and position < len(args):
++            targets.append(args[position])
++        position += 1
++    return [t for t in targets if not isinstance(t, ast.Constant)]
++
++
++def _format_repr_targets(
++    text: str, args: list[ast.AST], keywords: dict[str, ast.AST]
++) -> list[ast.AST]:
++    """The arguments a `str.format` renders with `!r` or `!a`."""
++    import string
++
++    targets: list[ast.AST] = []
++    auto = 0
++    try:
++        fields = list(string.Formatter().parse(text))
++    except ValueError:
++        return []
++    for _, name, _, conversion in fields:
++        if name is None:
++            continue
++        head = name.split(".")[0].split("[")[0]
++        if head == "":
++            index: int | str = auto
++            auto += 1
++        elif head.isdigit():
++            index = int(head)
++        else:
++            index = head
++        if conversion not in ("r", "a"):
++            continue
++        if isinstance(index, int) and index < len(args):
++            targets.append(args[index])
++        elif isinstance(index, str) and index in keywords:
++            targets.append(keywords[index])
++    return [t for t in targets if not isinstance(t, ast.Constant)]
++
++
++def _constant_text(node: ast.AST) -> str:
++    """The literal text of a string expression: a constant, an f-string's
++    constant parts, or the constant operands of a `+` chain."""
++    if isinstance(node, ast.Constant) and isinstance(node.value, str):
++        return node.value
++    if isinstance(node, ast.JoinedStr):
++        return "".join(_constant_text(v) for v in node.values)
++    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
++        return _constant_text(node.left) + _constant_text(node.right)
++    return ""
++
++
++def _repr_sites(source: str) -> list[tuple[int, str]]:
++    """Each value in `source` rendered with its repr inside a message
++    carrying rejection wording, as (line, the rendered expression). Rev 13
++    covers every spelling Python has (round-12 claude):
++
++    - an f-string field with `!r`, or holding `repr(x)`;
++    - `"..." + repr(x)` (a `+` chain);
++    - `"... %r ..." % x`, and `"... %s ..." % repr(x)`;
++    - `"... {!r} ...".format(x)`, and `.format(repr(x))`;
++    - a call whose first argument is the message: `%r` in it, or `repr(x)`
++      as a later argument (`logger.warning("bad %s", repr(x))`).
++    """
++    tree = ast.parse(source)
++    sites: list[tuple[int, str]] = []
++
++    def add(node: ast.AST, value: ast.AST) -> None:
++        sites.append((getattr(node, "lineno", 0), ast.unparse(value)))
++
++    def reprs_in(node: ast.AST) -> list[ast.AST]:
++        return [n.args[0] for n in ast.walk(node) if _is_repr_call(n)]  # type: ignore[attr-defined]
++
++    for node in ast.walk(tree):
++        if isinstance(node, ast.JoinedStr):
++            if not _REJECTION_WORDS.search(_constant_text(node)):
++                continue
++            for v in node.values:
++                if not isinstance(v, ast.FormattedValue) or isinstance(
++                    v.value, ast.Constant
++                ):
++                    continue
++                if v.conversion in (ord("r"), ord("a")):
++                    add(node, v.value)
++                elif _is_repr_call(v.value):
++                    add(node, v.value.args[0])  # type: ignore[attr-defined]
++        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
++            if isinstance(getattr(node, "_parent_add", None), ast.BinOp):
++                continue
++            if _REJECTION_WORDS.search(_constant_text(node)):
++                operands = []
++                stack: list[ast.AST] = [node]
++                while stack:
++                    current = stack.pop()
++                    if isinstance(current, ast.BinOp) and isinstance(
++                        current.op, ast.Add
++                    ):
++                        current.left._parent_add = current  # type: ignore[attr-defined]
++                        current.right._parent_add = current  # type: ignore[attr-defined]
++                        stack += [current.left, current.right]
++                    else:
++                        operands.append(current)
++                for operand in operands:
++                    if _is_repr_call(operand):
++                        add(node, operand.args[0])  # type: ignore[attr-defined]
++        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
++            text = _constant_text(node.left)
++            if not _REJECTION_WORDS.search(text):
++                continue
++            values = (
++                node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
++            )
++            for value in _percent_repr_targets(text, values):
++                add(node, value)
++            for value in values:
++                for inner in reprs_in(value):
++                    add(node, inner)
++        elif isinstance(node, ast.Call):
++            func = node.func
++            if (
++                isinstance(func, ast.Attribute)
++                and func.attr == "format"
++                and _REJECTION_WORDS.search(_constant_text(func.value))
++            ):
++                text = _constant_text(func.value)
++                arguments = list(node.args) + [k.value for k in node.keywords]
++                keywords = {k.arg: k.value for k in node.keywords if k.arg}
++                for value in _format_repr_targets(text, list(node.args), keywords):
++                    add(node, value)
++                for value in arguments:
++                    for inner in reprs_in(value):
++                        add(node, inner)
++            elif node.args and _REJECTION_WORDS.search(_constant_text(node.args[0])):
++                text = _constant_text(node.args[0])
++                if isinstance(node.args[0], ast.JoinedStr):
++                    continue  # its fields are the JoinedStr branch's
++                for value in _percent_repr_targets(text, list(node.args[1:])):
++                    add(node, value)
++                for value in node.args[1:]:
++                    for inner in reprs_in(value):
++                        add(node, inner)
++    return sites
++
++
++def _repr_rejections(source: str) -> list[int]:
++    """Lines in `source` that render a non-constant with its repr inside a
++    message carrying rejection wording (`_repr_sites`)."""
++    return sorted({line for line, _ in _repr_sites(source)})
++
 +
 +#: Sites whose repr'd value is the operator's own (config, environment, CLI
 +#: arguments, pmcp's own stores) or pmcp's own child: outside Consiliency/
 +#: pmcp#297's caller/downstream class, and tracked in Consiliency/pmcp#315.
 +#: A downstream's or a caller's value is described with `describe_value`.
++#: Rev 13 (round-12 claude): keyed by SITE -- the module, the function and
++#: the rendered expression -- not by function, so a new repr inside an
++#: exempt function is a new key, and fails until triaged.
 +_REPR_REJECTION_EXEMPT: dict[str, str] = {
-+    "cli.py::_exact_package_spec": "operator CLI argument",
-+    "cli.py::_run_trust_revoke_package": "operator CLI argument",
-+    "client/manager.py::_request_ceiling_ms": "operator environment",
-+    "client/manager.py::_stdio_read_limit": "operator environment",
-+    "config/loader.py::registry_allow_private_from_config": "operator config",
-+    "manifest/npm_resolver.py::_query_locked": "pmcp's own resolver child",
-+    "manifest/npm_resolver.py::resolve": "manifest/config command",
-+    "manifest/refresher.py::check_staleness": "configured vs cached package",
-+    "package_approvals.py::_decode": "pmcp's own approval store",
-+    "package_approvals.py::_read_store_and_stale": "pmcp's own approval store",
-+    "package_approvals.py::_require_identity_fields": "pmcp's own approval store",
-+    "trust_store.py::_decode": "pmcp's own trust store",
-+    "trust_store.py::record_resolved": "pmcp's own trust store",
-+    "validation.py::parse_package_spec": "config/CLI/manifest package spec",
++    "cli.py::_exact_package_spec::spec": "operator CLI argument",
++    "cli.py::_run_trust_revoke_package::args.spec": "operator CLI argument",
++    "client/manager.py::_request_ceiling_ms::raw": "operator environment",
++    "client/manager.py::_stdio_read_limit::raw": "operator environment",
++    "config/loader.py::registry_allow_private_from_config::value": "operator config",
++    "manifest/npm_resolver.py::_query_locked::status": "pmcp's own resolver child",
++    "manifest/npm_resolver.py::resolve::command": "manifest/config command",
++    "manifest/package_identity.py::_fetch_packument::name": (
++        "an accepted, validated package name; the failure is the registry fetch's"
++    ),
++    "manifest/refresher.py::check_staleness::cfg_name": "configured package",
++    "manifest/refresher.py::check_staleness::desc.package": "cached package",
++    "package_approvals.py::_decode::decision": "pmcp's own approval store",
++    "package_approvals.py::_read_store_and_stale::entry['name']": (
++        "pmcp's own approval store"
++    ),
++    "package_approvals.py::_read_store_and_stale::entry['resolved_version']": (
++        "pmcp's own approval store"
++    ),
++    "package_approvals.py::_require_identity_fields::name": (
++        "pmcp's own approval store"
++    ),
++    "package_approvals.py::_require_identity_fields::registry": (
++        "pmcp's own approval store"
++    ),
++    "provision_gate.py::evaluate_provision::getattr(server_config, 'name', None)": (
++        "a resolved server config's name (operator/manifest config)"
++    ),
++    "trust_store.py::_decode::decision": "pmcp's own trust store",
++    "trust_store.py::record_resolved::decision": "pmcp's own trust store",
++    "validation.py::parse_package_spec::spec": "config/CLI/manifest package spec",
 +}
 +
 +
-+def _repr_rejections(source: str) -> list[int]:
-+    """Lines in `source` that render a non-constant with `!r`, `repr()` or
-+    `%r` inside a message carrying rejection wording."""
-+    tree = ast.parse(source)
-+    lines = []
-+    for node in ast.walk(tree):
-+        if isinstance(node, ast.JoinedStr):
-+            text = "".join(
-+                v.value
-+                for v in node.values
-+                if isinstance(v, ast.Constant) and isinstance(v.value, str)
-+            )
-+            if _REJECTION_WORDS.search(text) and any(
-+                isinstance(v, ast.FormattedValue)
-+                and not isinstance(v.value, ast.Constant)
-+                and (
-+                    v.conversion == ord("r")
-+                    or (
-+                        isinstance(v.value, ast.Call)
-+                        and isinstance(v.value.func, ast.Name)
-+                        and v.value.func.id == "repr"
-+                    )
-+                )
-+                for v in node.values
-+            ):
-+                lines.append(node.lineno)
-+        elif (
-+            isinstance(node, ast.Call)
-+            and node.args
-+            and isinstance(node.args[0], ast.Constant)
-+            and isinstance(node.args[0].value, str)
-+            and "%r" in node.args[0].value
-+            and _REJECTION_WORDS.search(node.args[0].value)
-+        ):
-+            lines.append(node.lineno)
-+    return lines
-+
-+
-+def test_no_rejected_value_is_rendered_with_repr() -> None:
-+    """Round-11 codex P1's class, as a static rule (rev 12): `{x!r}`, `repr(x)`
-+    or `%r` in a message that rejects something renders the value itself.
-+    Every such site in `src/pmcp` is a named exemption with its provenance
-+    (none is a caller's or a downstream's value), and every exemption must
-+    still exist. The rule cannot see `{x}` without `!r`; those sites were
-+    triaged by hand (the plan's table)."""
++def _repr_site_keys() -> set[str]:
 +    root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
 +    found: set[str] = set()
 +    for path in sorted(root.rglob("*.py")):
@@ -8086,12 +8155,31 @@ index 0000000..24c6664
 +            for n in ast.walk(tree)
 +            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
 +        ]
-+        for line in _repr_rejections(source):
++        counts: dict[str, int] = {}
++        for line, expression in sorted(_repr_sites(source)):
 +            owners = [
 +                f for f in functions if f.lineno <= line <= (f.end_lineno or f.lineno)
 +            ]
-+            owner = min(owners, key=lambda f: (f.end_lineno or f.lineno) - f.lineno)
-+            found.add(f"{path.relative_to(root).as_posix()}::{owner.name}")
++            owner = (
++                min(owners, key=lambda f: (f.end_lineno or f.lineno) - f.lineno).name
++                if owners
++                else "<module>"
++            )
++            key = f"{path.relative_to(root).as_posix()}::{owner}::{expression}"
++            counts[key] = counts.get(key, 0) + 1
++            found.add(key if counts[key] == 1 else f"{key}#{counts[key]}")
++    return found
++
++
++def test_no_rejected_value_is_rendered_with_repr() -> None:
++    """Round-11 codex P1's class, as a static rule (rev 12; rev 13 widened
++    it to every repr spelling and keyed it by site): a repr in a message
++    that rejects something renders the value itself. Every such site in
++    `src/pmcp` is a named exemption with its provenance (none is a caller's
++    or a downstream's value), and every exemption must still exist. The rule
++    cannot see `{x}` or `%s` of `x` itself; those sites were triaged by hand
++    (the plan's table)."""
++    found = _repr_site_keys()
 +    assert found == set(_REPR_REJECTION_EXEMPT), (
 +        sorted(found - set(_REPR_REJECTION_EXEMPT)),
 +        sorted(set(_REPR_REJECTION_EXEMPT) - found),
@@ -8104,6 +8192,31 @@ index 0000000..24c6664
 +        ('f"unusable cursor ({raw!r})"', True),
 +        ('f"invalid value {repr(v)}"', True),
 +        ('logger.warning("Ignoring %s: got %r", k, v)', True),
++        # rev 13 (round-12 claude): every other spelling, and the new words.
++        ('"invalid: " + repr(x)', True),
++        ('"invalid: " + name + " " + repr(x)', True),
++        ('"invalid: %r" % x', True),
++        ('"invalid: %r and %r" % (x, y)', True),
++        ('"invalid: %s" % repr(x)', True),
++        ('"invalid {!r}".format(x)', True),
++        ('"invalid {}".format(repr(x))', True),
++        ('logger.warning("invalid %s", repr(x))', True),
++        ('logger.warning("bad cursor: %r", x)', True),
++        ('f"wrong value {x!r}"', True),
++        ('f"lookup failed for {x!r}"', True),
++        ('f"cannot use {x!r}"', True),
++        ('f"unrecognised {x!r}"', True),
++        ('f"not found: {x!r}"', True),
++        ('"invalid: " + str(x)', False),
++        ('"invalid: %s" % x', False),
++        ('"connected to %r" % x', False),
++        ('logger.debug("fetch failed for %s: %s", name, repr(e))', True),
++        ('logger.debug("fetch failed for %s: %r", name, exception_text(e))', True),
++        ('logger.debug("fetch failed for %r: %s", "pkg", exception_text(e))', False),
++        ('"invalid %(v)r" % {"v": x}', True),
++        ('"invalid {0} {1!r}".format(a, b)', True),
++        ('"invalid {0!r}".format("const")', False),
++        ('f"invalid {x!a}"', True),
 +        ('f"unusable cursor ({describe_value(raw)})"', False),
 +        ('f"connected to {name!r}"', False),
 +        ("f\"invalid {'x'!r}\"", False),
@@ -8119,39 +8232,32 @@ index 0000000..24c6664
 
 ````diff
 diff --git a/tests/test_gateway_tool_schemas.py b/tests/test_gateway_tool_schemas.py
-index e6ddeb9..94456d8 100644
+index 4986c06..8b2f949 100644
 --- a/tests/test_gateway_tool_schemas.py
 +++ b/tests/test_gateway_tool_schemas.py
-@@ -437,3 +437,7 @@ async def _call_through_gate(name: str, arguments: dict[str, Any]) -> Any:
-     [
+@@ -438 +438,5 @@ async def _call_through_gate(name: str, arguments: dict[str, Any]) -> Any:
 -        ("gateway.describe", {"tool_id": ""}, "should be non-empty"),
 +        (
 +            "gateway.describe",
 +            {"tool_id": ""},
 +            "$.tool_id: must be at least 1 character",
 +        ),
-         (
-@@ -441,3 +445,3 @@ async def _call_through_gate(name: str, arguments: dict[str, Any]) -> Any:
-             {"title": "short", "description": "d"},
+@@ -442 +446 @@ async def _call_through_gate(name: str, arguments: dict[str, Any]) -> Any:
 -            "is too short",
 +            "$.title: must be at least 8 characters",
-         ),
-@@ -446,3 +450,3 @@ async def _call_through_gate(name: str, arguments: dict[str, Any]) -> Any:
-             {"server_name": "s", "task_id": "t", "options": {"max_output_chars": 5}},
+@@ -447 +451 @@ async def _call_through_gate(name: str, arguments: dict[str, Any]) -> Any:
 -            "less than the minimum",
 +            "$.options.max_output_chars: must be greater than or equal to",
-         ),
 ````
 
 ### Patch — `tests/test_http_transport.py`
 
 ````diff
 diff --git a/tests/test_http_transport.py b/tests/test_http_transport.py
-index e83214a..c4f2ffe 100644
+index b5ccf90..ef5f6c1 100644
 --- a/tests/test_http_transport.py
 +++ b/tests/test_http_transport.py
-@@ -490,2 +490,48 @@ class TestHttpObservabilityContracts:
- 
+@@ -491,0 +492,46 @@ class TestHttpObservabilityContracts:
 +    @pytest.mark.parametrize(
 +        "client_kwargs",
 +        [
@@ -8198,7 +8304,6 @@ index e83214a..c4f2ffe 100644
 +        assert sentinel not in observed
 +        assert sentinel.encode("utf-8").hex() not in observed.encode("utf-8").hex()
 +
-     def test_no_origin_and_loopback_and_same_origin_pass_by_default(self) -> None:
 ````
 
 ### Patch — `tests/test_log_record_scrubber.py`
@@ -8206,7 +8311,7 @@ index e83214a..c4f2ffe 100644
 ````diff
 diff --git a/tests/test_log_record_scrubber.py b/tests/test_log_record_scrubber.py
 new file mode 100644
-index 0000000..a0dca03
+index 0000000..c116176
 --- /dev/null
 +++ b/tests/test_log_record_scrubber.py
 @@ -0,0 +1,429 @@
@@ -8248,7 +8353,7 @@ index 0000000..a0dca03
 +
 +def _validation_error(s: str) -> ValidationError:
 +    try:
-+        McpTaskInfo.model_validate({"task_id": "t", "ttl": {"v": s}})
++        McpTaskInfo.model_validate({"task_id": {"v": s}})
 +    except ValidationError as error:
 +        return error
 +    raise AssertionError("no validation error")
@@ -8304,7 +8409,7 @@ index 0000000..a0dca03
 +        )
 +    (record,) = capture.records
 +    assert record.exc_info is None
-+    assert "validation error for McpTaskInfo: $.ttl" in record.getMessage()
++    assert "validation error for McpTaskInfo: $.task_id" in record.getMessage()
 +    assert _clean(record, s)
 +
 +
@@ -8646,10 +8751,10 @@ index 0000000..a0dca03
 ````diff
 diff --git a/tests/test_parse_error_echo.py b/tests/test_parse_error_echo.py
 new file mode 100644
-index 0000000..b12fe09
+index 0000000..7f96639
 --- /dev/null
 +++ b/tests/test_parse_error_echo.py
-@@ -0,0 +1,875 @@
+@@ -0,0 +1,879 @@
 +"""A parse error never echoes the structured text it rejected
 +(Consiliency/pmcp#297; rev 6, reclassified by origin in rev 7).
 +
@@ -9388,8 +9493,12 @@ index 0000000..b12fe09
 +                "recorded_at": s,
 +            }
 +        ),
-+        lambda: McpTaskInfo(task_id="t", created_at=s),
 +    ]
++    # Since Consiliency/pmcp#298 a task timestamp pmcp cannot use is dropped,
++    # not raised: it is `None`, named in `unusable_fields`, and not kept.
++    task = McpTaskInfo(task_id="t", created_at=s)
++    assert task.created_at is None and task.unusable_fields == ["created_at"]
++    assert not any(form in task.model_dump_json() for form in forbidden)
 +    for call in calls:
 +        with pytest.raises(Exception) as caught:
 +            call()
@@ -9534,32 +9643,27 @@ diff --git a/tests/test_pkgid_panel_fixes.py b/tests/test_pkgid_panel_fixes.py
 index 41cadd8..72141e2 100644
 --- a/tests/test_pkgid_panel_fixes.py
 +++ b/tests/test_pkgid_panel_fixes.py
-@@ -272,3 +272,5 @@ async def test_registration_refuses_the_panel_reproduction(
-     assert registered.registered is False
+@@ -273 +273,3 @@ async def test_registration_refuses_the_panel_reproduction(
 -    assert "npm_config_registry" in registered.message
 +    # rev 12 (Consiliency/pmcp#297): the rule is named, never the name.
 +    assert "NPM_CONFIG_* family" in registered.message
 +    assert "npm_config_registry" not in registered.message
-     assert "Nothing was registered" in registered.message
-@@ -328,3 +330,6 @@ async def test_a_hostile_declared_name_is_rendered_inert_in_the_refusal(
-     assert registered.message.isprintable()
+@@ -329 +331,4 @@ async def test_a_hostile_declared_name_is_rendered_inert_in_the_refusal(
 -    assert "'X$(touch CANARY)\\x1b[2J_TOKEN'" in registered.message
 +    # rev 12 (Consiliency/pmcp#297): the refused name is not echoed at all,
 +    # only the rule it broke.
 +    assert "CANARY" not in registered.message
 +    assert "1 not credential-shaped" in registered.message
- 
 ````
 
 ### Patch — `tests/test_scoped_advisor_audit.py`
 
 ````diff
 diff --git a/tests/test_scoped_advisor_audit.py b/tests/test_scoped_advisor_audit.py
-index 138e06a..9d427ad 100644
+index edf4db0..65bfad4 100644
 --- a/tests/test_scoped_advisor_audit.py
 +++ b/tests/test_scoped_advisor_audit.py
-@@ -1360,22 +1360,13 @@ _MARKERS = (
- _INVALID_INDEX = 99
+@@ -1362,20 +1362,11 @@ _INVALID_INDEX = 99
 -#: The pre-existing log lines this plan does not own, matched as whole
 -#: messages so that one carrying anything more stays in the oracle. Both come
 -#: from `call_tool`'s `except Exception`, `f"Tool execution error: {e}"`:
@@ -9591,16 +9695,12 @@ index 138e06a..9d427ad 100644
 +    "rejected_argument_path": ["meta"],
 +    "rejected_argument_validator": None,
 +}
- 
-@@ -1506,2 +1497,6 @@ _EXCEPTION_ARGS: dict[str, tuple[Any, ...]] = {
-     "MissingApiKeyError": ("STUB_VAR", "stub", "stub"),
+@@ -1509,0 +1501,4 @@ _EXCEPTION_ARGS: dict[str, tuple[Any, ...]] = {
 +    # `pmcp.parsing` (Consiliency/pmcp#297, rev 7): (kind, source).
 +    "YAMLParseError": ("YAML", "stub handler failed"),
 +    "JSONParseError": ("JSON", "stub handler failed"),
 +    "TimestampParseError": ("timestamp", "stub handler failed"),
- }
-@@ -1588,2 +1583,23 @@ def _invocations(audit_path: Path, event: str) -> list[dict[str, Any]]:
- 
+@@ -1591,0 +1587,21 @@ def _invocations(audit_path: Path, event: str) -> list[dict[str, Any]]:
 +def _call_records(audit_path: Path) -> list[dict[str, Any]]:
 +    """One record per call: its invocation, or its argument rejection."""
 +    return [
@@ -9622,9 +9722,7 @@ index 138e06a..9d427ad 100644
 +    _assert_pair(tool_name, label, record, reference, exempt)
 +
 +
- def _assert_nothing_generated_leaked(
-@@ -1601,10 +1617,2 @@ def _assert_nothing_generated_leaked(
- 
+@@ -1605,8 +1620,0 @@ def _assert_nothing_generated_leaked(
 -def _is_foreign(message: str, name: str | None = None) -> bool:
 -    """Whether `message` is exactly one of the lines above -- the whole of it.
 -    `name` is the tool name of the call that logged it, if known."""
@@ -9633,26 +9731,20 @@ index 138e06a..9d427ad 100644
 -    return name is not None and message == f"Tool execution error: Unknown tool: {name}"
 -
 -
- _PMCP_FORMATTERS: list[logging.Formatter] = []
-@@ -1633,3 +1641,5 @@ def _log_text(
-     """Every log record as pmcp's formatters render it -- message, and any
+@@ -1637 +1645,3 @@ def _log_text(
 -    `exc_info` traceback -- bar the exact foreign lines above."""
 +    `exc_info` traceback. Nothing is excluded: the two pre-existing echoes
 +    the sweep used to skip (a non-dict `meta`, an unknown tool's name) are
 +    fixed by Consiliency/pmcp#297."""
-     # The capture is live (DEBUG, root), so an empty result is not vacuous
-@@ -1637,7 +1647,6 @@ def _log_text(
-     assert caplog.records, "nothing was logged, so the log oracle proves nothing"
+@@ -1641 +1651 @@ def _log_text(
 -    excluded = calls.foreign if calls is not None else set()
 +    del calls  # every call's log is in `caplog`
-     return "\n".join(
+@@ -1643 +1653 @@ def _log_text(
 -        formatter.format(shown)
 +        formatter.format(record)
-         for record in caplog.records
+@@ -1645 +1654,0 @@ def _log_text(
 -        if (shown := _oracle_view(record, excluded)) is not None
-         for formatter in _pmcp_formatters()
-@@ -1646,26 +1655,2 @@ def _log_text(
- 
+@@ -1650,24 +1658,0 @@ def _log_text(
 -#: What stands in for an excluded message when its record carries diagnostics.
 -_EXCLUDED_MESSAGE = "<excluded pre-existing line>"
 -
@@ -9677,25 +9769,19 @@ index 138e06a..9d427ad 100644
 -    return shown
 -
 -
- #: A default object repr, the one volatile part a message can carry besides
-@@ -1686,7 +1671,6 @@ def _normalized(record: logging.LogRecord, formatter: logging.Formatter) -> str:
- 
+@@ -1690 +1675 @@ def _normalized(record: logging.LogRecord, formatter: logging.Formatter) -> str:
 -def _normalized_log(records: list[logging.LogRecord], excluded: set[int]) -> str:
 +def _normalized_log(records: list[logging.LogRecord]) -> str:
-     return "\n".join(
+@@ -1692 +1677 @@ def _normalized_log(records: list[logging.LogRecord], excluded: set[int]) -> str
 -        _normalized(shown, formatter)
 +        _normalized(record, formatter)
-         for record in records
+@@ -1694 +1678,0 @@ def _normalized_log(records: list[logging.LogRecord], excluded: set[int]) -> str
 -        if (shown := _oracle_view(record, excluded)) is not None
-         for formatter in _pmcp_formatters()
-@@ -1704,5 +1688,2 @@ class _LoggedCalls:
-         self.caplog = caplog
+@@ -1708,3 +1691,0 @@ class _LoggedCalls:
 -        #: Records that are exactly `Tool execution error: Unknown tool: <name>`
 -        #: for the name of the call that logged them.
 -        self.foreign: set[int] = set()
- 
-@@ -1713,9 +1694,3 @@ class _LoggedCalls:
-             results.append(await _call(self.server, name, arguments))
+@@ -1717,7 +1698 @@ class _LoggedCalls:
 -            produced = self.caplog.records[start:]
 -            self.foreign |= {
 -                id(record)
@@ -9704,75 +9790,53 @@ index 138e06a..9d427ad 100644
 -            }
 -            logs.append(_normalized_log(produced, self.foreign))
 +            logs.append(_normalized_log(self.caplog.records[start:]))
-         assert all(log == logs[0] for log in logs), (label, logs)
-@@ -1760,3 +1735,3 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
-     baseline = _declared_baseline(tool)
+@@ -1764 +1739 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
 -    exempt = _INVOKE_ONLY_EXEMPT if tool_name == "gateway.invoke" else frozenset()
 +    exempt: frozenset[str] = frozenset()
-     server, audit_path, real_tools = _allowed_server(tmp_path)
-@@ -1824,3 +1799,3 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
- 
+@@ -1828 +1803 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
 -    records = _invocations(audit_path, "audit.invocation")
 +    records = _call_records(audit_path)
-     ok_count = 1 + len(_TAGS) * len(cases)
-@@ -1831,4 +1806,4 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
-     ):
+@@ -1835,2 +1810,2 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
 -        _assert_pair(tool_name, label, first, second, case_exempt - _INVOKE_ONLY_EXEMPT)
 -        _assert_pair(tool_name, label, first, reference, case_exempt)
 +        _assert_pair(tool_name, label, first, second, case_exempt)
 +        _assert_against(tool_name, label, first, reference, case_exempt)
-     errors = records_per_case[1:]
-@@ -1840,3 +1815,3 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
-         _assert_pair(tool_name, label, first, second, frozenset())
+@@ -1844 +1819 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
 -        _assert_pair(tool_name, label, first, reference, exempt)
 +        _assert_against(tool_name, label, first, reference, exempt)
-     _assert_nothing_generated_leaked(
-@@ -1878,3 +1853,3 @@ async def test_generated_caller_values_never_reach_an_uncorrelated_invoke_record
- 
+@@ -1882 +1857 @@ async def test_generated_caller_values_never_reach_an_uncorrelated_invoke_record
 -    records = _invocations(audit_path, "audit.invocation")
 +    records = _call_records(audit_path)
-     assert len(records) == 1 + len(_TAGS) * len(_SHAPES)
-@@ -1884,5 +1859,3 @@ async def test_generated_caller_values_never_reach_an_uncorrelated_invoke_record
-         _assert_pair("gateway.invoke", f"E6 {shape}", first, second, frozenset())
+@@ -1888,3 +1863 @@ async def test_generated_caller_values_never_reach_an_uncorrelated_invoke_record
 -        _assert_pair(
 -            "gateway.invoke", f"E6 {shape}", first, reference, _INVOKE_ONLY_EXEMPT
 -        )
 +        _assert_against("gateway.invoke", f"E6 {shape}", first, reference, frozenset())
-     _assert_nothing_generated_leaked(
-@@ -2030,3 +2003,3 @@ async def test_generated_caller_values_on_the_real_scoped_handlers(
-     baseline = _declared_baseline(tool)
+@@ -2034 +2007 @@ async def test_generated_caller_values_on_the_real_scoped_handlers(
 -    exempt = _INVOKE_ONLY_EXEMPT if tool_name == "gateway.invoke" else frozenset()
 +    exempt: frozenset[str] = frozenset()
-     server, audit_path = _scoped_server(tmp_path)
-@@ -2050,3 +2023,3 @@ async def test_generated_caller_values_on_the_real_scoped_handlers(
- 
+@@ -2054 +2027 @@ async def test_generated_caller_values_on_the_real_scoped_handlers(
 -    records = _invocations(audit_path, "audit.invocation")
 +    records = _call_records(audit_path)
-     assert len(records) == 1 + len(_TAGS) * len(_SHAPES)
-@@ -2055,3 +2028,3 @@ async def test_generated_caller_values_on_the_real_scoped_handlers(
-         _assert_pair(tool_name, f"real {shape}", first, second, frozenset())
+@@ -2059 +2032 @@ async def test_generated_caller_values_on_the_real_scoped_handlers(
 -        _assert_pair(tool_name, f"real {shape}", first, reference, exempt)
 +        _assert_against(tool_name, f"real {shape}", first, reference, exempt)
-     _assert_nothing_generated_leaked(
-@@ -2075,107 +2048,53 @@ def test_the_log_normalisation_keeps_a_hex_count_and_drops_only_the_time() -> No
-     are volatile."""
+@@ -2079,2 +2052,2 @@ def test_the_log_normalisation_keeps_a_hex_count_and_drops_only_the_time() -> No
 -    count_a = _normalized_log([_log_record("argument_count=0x28", 1.0)], set())
 -    count_b = _normalized_log([_log_record("argument_count=0x2e", 2.0)], set())
 +    count_a = _normalized_log([_log_record("argument_count=0x28", 1.0)])
 +    count_b = _normalized_log([_log_record("argument_count=0x2e", 2.0)])
-     assert count_a != count_b
-     assert "0x28" in count_a and "0x2e" in count_b
+@@ -2083,2 +2056,2 @@ def test_the_log_normalisation_keeps_a_hex_count_and_drops_only_the_time() -> No
 -    same_a = _normalized_log([_log_record("started", 1.0)], set())
 -    same_b = _normalized_log([_log_record("started", 1_000_000.5)], set())
 +    same_a = _normalized_log([_log_record("started", 1.0)])
 +    same_b = _normalized_log([_log_record("started", 1_000_000.5)])
-     assert same_a == same_b
+@@ -2086,2 +2059,2 @@ def test_the_log_normalisation_keeps_a_hex_count_and_drops_only_the_time() -> No
 -    repr_a = _normalized_log([_log_record("<a.B object at 0x7f00aa>", 1.0)], set())
 -    repr_b = _normalized_log([_log_record("<a.B object at 0x7f00bb>", 1.0)], set())
 +    repr_a = _normalized_log([_log_record("<a.B object at 0x7f00aa>", 1.0)])
 +    repr_b = _normalized_log([_log_record("<a.B object at 0x7f00bb>", 1.0)])
-     assert repr_a == repr_b
-     # A hex span that is not an object repr's address is kept.
+@@ -2090,33 +2063,2 @@ def test_the_log_normalisation_keeps_a_hex_count_and_drops_only_the_time() -> No
 -    assert _normalized_log(
 -        [_log_record("fp 0x7f00aa>", 1.0)], set()
 -    ) != _normalized_log([_log_record("fp 0x7f00bb>", 1.0)], set())
@@ -9808,7 +9872,7 @@ index 138e06a..9d427ad 100644
 -        "pmcp.server", logging.ERROR, __file__, 1, message, None, None
 +    assert _normalized_log([_log_record("fp 0x7f00aa>", 1.0)]) != _normalized_log(
 +        [_log_record("fp 0x7f00bb>", 1.0)]
-     )
+@@ -2124,11 +2065,0 @@ def _excluded_record(message: str, marker: str, diagnostics: str) -> logging.Log
 -    if diagnostics == "exc_info":
 -        try:
 -            raise ValueError(marker)
@@ -9820,12 +9884,12 @@ index 138e06a..9d427ad 100644
 -        record.stack_info = f"Stack (most recent call last):\n  {marker}"
 -    return record
 -
- 
+@@ -2136,4 +2066,0 @@ def _excluded_record(message: str, marker: str, diagnostics: str) -> logging.Log
 -def _invoke_input_line() -> str:
 -    with pytest.raises(ValidationError) as raised:
 -        InvokeInput.model_validate({"tool_id": "a::b", "meta": "not-a-dict"})
 -    return f"Tool execution error: {raised.value}"
- 
+@@ -2141,5 +2068,3 @@ def _invoke_input_line() -> str:
 -
 -@pytest.mark.parametrize("diagnostics", ["exc_info", "exc_text", "stack_info"])
 -@pytest.mark.parametrize("shape", ["invoke-input", "unknown-tool"])
@@ -9834,7 +9898,7 @@ index 138e06a..9d427ad 100644
 +@pytest.mark.asyncio
 +async def test_the_formerly_excluded_log_echoes_are_gone(
 +    tmp_path: Path, caplog: pytest.LogCaptureFixture
- ) -> None:
+@@ -2147,19 +2072,8 @@ def test_an_excluded_line_keeps_its_traceback_and_stack_in_the_oracle(
 -    """Regression (PR 306 board, round 2): an exactly-excluded message may
 -    hide only itself. A traceback, exception text or stack attached to it is
 -    rendered into the oracle, so a caller value there is caught by both the
@@ -9862,7 +9926,7 @@ index 138e06a..9d427ad 100644
 +    server, audit_path = _scoped_server(tmp_path)
 +    server._policy_manager.is_gateway_tool_allowed = (  # type: ignore[method-assign]
 +        lambda name: True
-     )
+@@ -2167,16 +2081,8 @@ def test_an_excluded_line_keeps_its_traceback_and_stack_in_the_oracle(
 -    normalized = {
 -        tag: _normalized_log([record], excluded) for tag, record in records.items()
 -    }
@@ -9887,7 +9951,7 @@ index 138e06a..9d427ad 100644
 +            "meta": "caller_marker_meta",
 +            **_correlations(),
 +        },
-     )
+@@ -2184 +2090,14 @@ def test_an_excluded_line_keeps_its_traceback_and_stack_in_the_oracle(
 -    assert _normalized_log([bare], excluded | {id(bare)}) == ""
 +    await _call(server, "gateway.caller_marker_name", {})
 +    await server.shutdown()
@@ -9912,13 +9976,11 @@ diff --git a/tests/test_tools.py b/tests/test_tools.py
 index 1e91803..e708508 100644
 --- a/tests/test_tools.py
 +++ b/tests/test_tools.py
-@@ -3941,3 +3941,5 @@ class TestCapabilityAndProvision:
-         assert result.auth_state == "missing_auth"
+@@ -3942 +3942,3 @@ class TestCapabilityAndProvision:
 -        assert result.env_var == "BAD-NAME"
 +        # rev 12 (Consiliency/pmcp#297): a rejected name is not echoed back.
 +        assert result.env_var is None
 +        assert "BAD-NAME" not in result.message
-         assert "test-token" not in result.message
 ````
 
 ### Patch — `tests/test_trust_boundaries_e2e.py`
@@ -9928,64 +9990,80 @@ diff --git a/tests/test_trust_boundaries_e2e.py b/tests/test_trust_boundaries_e2
 index 2d05cec..8a6db46 100644
 --- a/tests/test_trust_boundaries_e2e.py
 +++ b/tests/test_trust_boundaries_e2e.py
-@@ -649,3 +649,5 @@ async def test_s01_a_package_manager_variable_is_refused_at_registration(
-     assert refused.registered is False
+@@ -650 +650,3 @@ async def test_s01_a_package_manager_variable_is_refused_at_registration(
 -    assert "npm_config_registry" in refused.message
 +    # rev 12 (Consiliency/pmcp#297): the rule is named, never the name.
 +    assert "NPM_CONFIG_* family" in refused.message
 +    assert "npm_config_registry" not in refused.message
-     # No config applied: the server does not exist afterwards, so the later
 ````
 
 ## Measurement scripts
 
-`probe.py`, `count_leaks.py` and `codemod.py` (rev 1–2 measurement and provenance scripts) are embedded in rev 5 of this plan (`91562e6`); they are unchanged, and omitted here to keep the plan under its size budget.
+`probe.py`, `count_leaks.py` and `codemod.py` are embedded in rev 5 of this plan (`91562e6`), unchanged.
 
-### `mutants.py` — the mutation run; `python mutants.py <worktree> <out-dir> [M4 ...]`, `NO_STATIC=1` deselects both static checks
+### `mutants.py` — the mutation run; `python mutants.py <worktree> <out-dir> [M4 ...]`, `NO_STATIC=1` deselects both sink checks
 
-To fit the size budget it is given as a diff against the copy embedded in rev 9 of this plan (`a449dd9`, the `mutants.py` block): extract that block, then `patch -p1 mutants.py < this.diff` (revs 10-12 add M54-M75, retire M46, M47, M49-M53, M59, M61-M64, and re-anchor M28 and M66).
+Given as a diff to fit the size budget: extract the `mutants.py` block of rev 9 of this plan (`a449dd9`), `patch -p1 mutants.py <` the `mutants.py` diff of rev 12 (`48b7a89`), then `patch -p1 mutants.py <` this diff (rev 13: M75 re-anchored, M76–M93 added, and a mutant may span files).
 
 ````diff
 --- a/mutants.py
 +++ b/mutants.py
-@@ -45,7 +45,7 @@
-  ("M25 malformed error message kept", C, [("    if not isinstance(message, str):\n", "    if False:\n")]),
-  ("M26 scrubber keeps the traceback", A, [("            record.exc_info = None\n", "")]),
-  ("M27 scrubber misses a non-mcp logger", A, [("        return scrub_record(previous(*args, **kwargs))\n", "        record = previous(*args, **kwargs)\n        return scrub_record(record) if str(record.name).startswith(\"mcp\") else record\n")]),
-- ("M28 %-args branch removed", A, [("        if record.args:\n            record.args = _scrubbed(record.args)\n", "")]),
-+ ("M28 %-args branch removed", A, [("            else:\n                record.args = _scrubbed(record.args)\n", "            else:\n                pass\n")]),
-  ("M29 msg-is-an-exception branch removed", A, [("        if isinstance(record.msg, BaseException):\n            record.msg = _scrubbed(record.msg)\n", "")]),
-  ("M30 nested containers not walked", A, [("    if isinstance(value, tuple):\n        return tuple(_scrubbed(item, depth + 1) for item in value)\n", "    if isinstance(value, tuple):\n        return tuple(exception_text(i) if isinstance(i, BaseException) and safe_exc_info(i) is None else i for i in value)\n")]),
-  ("M31 install removed from pmcp/__init__.py", P, [("_install_log_scrubber()\n", "")]),
-@@ -63,12 +63,24 @@
-  ("M43 no threading.excepthook wrapper", A, [("    _install_threading_excepthook()\n", "")]),
-  ("M44 excepthook writes with no stderr", A, [('            if sys.stderr is not None:\n                sys.stderr.write(safe_traceback_text(value) + "\\n")\n', '            sys.stderr.write(safe_traceback_text(value) + "\\n")\n')]),
-  ("M45 unqualified class name", A, [("_qualified_name(type(current))", "type(current).__name__")]),
-- ("M46 stdio: a rejected frame logged raw again", C, [("            if not _is_downstream_output(text):\n", "            if False:\n")]),
-- ("M50 stdio: the quote excluded from where JSON starts", C, [("""_JSON_VALUE_START = frozenset('{["-0123456789tfnNI')""", """_JSON_VALUE_START = frozenset('{[-0123456789tfnNI')""")]),
-- ("M51 stdio: shown output not truncated at a frame opener", C, [("    if not cuts:\n        return body.rstrip()\n", "    if True:\n        return body.rstrip()\n")]),
-- ("M52 stdio: control and format characters not skipped", C, [('        char.isspace() or char == "\\ufffd" or unicodedata.category(char) in ("Cc", "Cf")\n', '        char.isspace() or char == "\\ufffd"\n')]),
-- ("M53 stdio: Unicode whitespace not skipped", C, [("        char.isspace() or char", "        char in ' \\t\\r\\n' or char")]),
-  ("M48 static check ignores parser submodules", "tests/test_parse_error_echo.py", [("    if package in _PARSER_PACKAGES and owner != package:\n", "    if False:\n")]),
-+ ("M54 SDK message objects render their payload", A, [("    _install_message_rendering()\n", "")]),
-+ ("M55 a dict-shaped message in log arguments not described", A, [("    if _message_fields(value) is not None:\n        return describe_jsonrpc_message(value)\n", "")]),
-+ ("M56 an undeclared method shown", A, [("            if isinstance(method, str) and method in _known_methods()\n", "            if isinstance(method, str)\n")]),
-+ ("M57 a handler's escaping validation error reaches the caller", S, [("    if inspect.isasyncgenfunction(handler):\n", "    if True:\n")]),
-+ ("M58 a nameless catalog entry labelled by its content", C, [("        return f\"(an entry with {len(entry)} key{'' if len(entry) == 1 else 's'})\"\n", "        return repr(entry)[:120]\n")]),
-+ ("M60 metadata headers rendered with their values", A, [('        shown = f" headers: {\', \'.join(names)}" if names else ""\n', '        shown = f" headers: {headers}" if names else ""\n')]),
-+ ("M65 a bare validation error leaves as code 0", S, [("                replacement = MCPError(INVALID_PARAMS, described)\n", "                replacement = ValueError(described)\n")]),
-+ ("M66 an MCPError loses its code", S, [("                replacement = MCPError(error.error.code, message, data)\n", "                replacement = MCPError(0, message, data)\n")]),
-+ ("M67 a non-protocol stdout line logged with its text", C, [('            logger.debug(f"[{name}] non-protocol stdout line: {exception_text(error)}")\n', '            logger.debug(f"[{name}] non-protocol stdout line: {text}")\n')]),
-+ ("M68 a rejected cursor rendered", C, [('f"cursor ({describe_value(raw_cursor)}); treating as "', 'f"cursor ({raw_cursor!r}); treating as "')]),
-+ ("M69 a rejected cancel request id rendered", C, [('f"({describe_value(request_id)})",', 'f"({request_id})",')]),
-+ ("M70 a refused env var echoed in auth_connect's output", H, [("                # Not echoed: the caller's rejected value (rev 12).\n                env_var=None,\n            )\n\n        try:", "                env_var=env_var,\n            )\n\n        try:")]),
-+ ("M71 an invalid env var name quoted", "src/pmcp/env_store.py", [('        raise ValueError("Env var name must match ^[A-Za-z_][A-Za-z0-9_]*$")\n', '        raise ValueError(f"Env var name must match ^[A-Za-z_][A-Za-z0-9_]*$: {name!r}")\n')]),
-+ ("M72 disallowed discovered env vars named", H, [('            names = "; ".join(\n                f"{count} {reason}" for reason, count in sorted(reasons.items())\n            )\n', '            names = ", ".join(disallowed)\n')]),
-+ ("M73 an MCPError's data kept though it carries the value", S, [("                if data is not None and carries_rejected_value(data, error):\n", "                if False:\n")]),
-+ ("M74 an MCPError's data always dropped", S, [("                if data is not None and carries_rejected_value(data, error):\n", "                if True:\n")]),
-+ ("M75 the repr-rejection rule ignores !r", "tests/test_exception_text_sinks.py", [('                    v.conversion == ord("r")\n', '                    False\n')]),
-  ("G1 connect retry logs last_error", C, [("        if last_error:\n            raise last_error\n", "        if last_error:\n            logger.warning(f\"giving up: {last_error}\")\n            raise last_error\n")]),
-  ("S5 value in a log extra= field", S, [("                        audited_name,\n                        reason,\n                    )\n", "                        audited_name,\n                        reason,\n                        extra={'args_dump': repr(arguments)},\n                    )\n")]),
-  ("S6 arguments printed to stderr", S, [("                    reason = describe_model_error(e, tool.input_schema, arguments)\n", "                    reason = describe_model_error(e, tool.input_schema, arguments)\n                    print(arguments, file=sys.stderr)\n")]),
+@@ -18,0 +19 @@
++X = "tests/test_exception_text_sinks.py"; E = "tests/test_argument_error_echo.py"
+@@ -83 +84,19 @@
+- ("M75 the repr-rejection rule ignores !r", "tests/test_exception_text_sinks.py", [('                    v.conversion == ord("r")\n', '                    False\n')]),
++ ("M75 the repr-rejection rule ignores !r", X, [('                if v.conversion in (ord("r"), ord("a")):\n', '                if False:\n')]),
++ ("M76 gateway.cancel's response copies a rejected id", H, [("            request_id=parsed.request_id if parsed_id is not None else None,\n", "            request_id=parsed.request_id,\n")]),
++ ("M77 gateway.cancel's audit names the server of a rejected id", H, [("        server_name = parsed_id[0] if parsed_id is not None else None\n", "        server_name = (\n            parsed.request_id.rsplit(\"::\", 1)[0] if \"::\" in parsed.request_id else None\n        )\n")]),
++ ("M78 gateway.cancel's response never copies the id", H, [("            request_id=parsed.request_id if parsed_id is not None else None,\n", "            request_id=None,\n")]),
++ ("M79 the dispatcher checks only that a frame is an object", C, [("        problem = jsonrpc_envelope_problem(frame)\n        if problem is not None:\n            logger.debug(f\"[{name}] dropped invalid frame: {problem}\")\n", "        problem = jsonrpc_envelope_problem(frame) if not isinstance(frame, dict) else None\n        if problem is not None:\n            logger.debug(f\"[{name}] dropped invalid frame: {problem}\")\n")]),
++ ("M80 jsonrpc version not checked", A, [('    if frame.get("jsonrpc") != "2.0" or not isinstance(frame.get("jsonrpc"), str):\n', '    if False:\n')]),
++ ("M81 a response with both result and error accepted", A, [("    if has_result == has_error:\n", "    if not has_result and not has_error:\n")]),
++ ("M82 a bool error code accepted", A, [('    if type(error.get("code")) is not int:\n', '    if not isinstance(error.get("code"), int):\n')]),
++ ("M83 the strict client adapter not installed", A, [("    _install_message_rendering()\n    _install_strict_client_envelopes()\n", "    _install_message_rendering()\n")]),
++ ("M84 the strict client adapter checks nothing", A, [("        problem = jsonrpc_envelope_problem(value)\n        if problem is not None:\n", "        problem = jsonrpc_envelope_problem(value)\n        if False:\n")]),
++ ("M85 the repr rule blind to concatenation", X, [("                for operand in operands:\n                    if _is_repr_call(operand):\n", "                for operand in operands:\n                    if False:\n")]),
++ ("M86 the repr rule blind to %r", X, [('        if conv in "ra" and position < len(args):\n', '        if False:\n')]),
++ ("M87 repr exemptions keyed by function again", X, [('            key = f"{path.relative_to(root).as_posix()}::{owner}::{expression}"\n', '            key = f"{path.relative_to(root).as_posix()}::{owner}"\n')]),
++ ("M88 the round-12 rejection words dropped", X, [('    r"|unreadable|repeated|not an? |does not |must match|bad|wrong|fail"\n    r"|cannot|can\'t|unrecogni[sz]|not found)"\n', '    r"|unreadable|repeated|not an? |does not |must match)"\n')]),
++ ("M89 the copied-input derivation ignores audit calls", E, [('            elif isinstance(node.func, ast.Attribute) and node.func.attr == "_audit":\n', '            elif isinstance(node.func, ast.Attribute) and node.func.attr == "_audit_x":\n')]),
++ ("M90 both non-string-message guards off (the envelope's and _downstream_error's)", (A, C), [(A, '    if not isinstance(error.get("message"), str):\n', '    if False:\n'), (C, "    if not isinstance(message, str):\n", "    if False:\n")]),
++ ("M91 an unusable task hint kept in the task's raw", C, [("            raw=_usable_task_raw(payload),\n", "            raw=payload,\n")]),
++ ("M92 a task answer sized with the hint pmcp dropped", H, [('            sized = (\n                {**result, "task": task_info.raw}\n                if task_info is not None and isinstance(result, dict)\n                else result\n            )\n', "            sized = result\n")]),
++ ("M93 strings inside a container input not matched", A, [("                elif depth and isinstance(item, str):\n                    candidates.append(item)\n", "                elif False:\n                    pass\n")]),
+@@ -94,8 +113,13 @@
+-    path = root / rel; saved = out / (path.name + ".saved")
+-    # Refuse to start from a dirty file: a killed earlier run must not have
+-    # its mutant saved as the "clean" copy (rev 7).
+-    assert subprocess.run(["git", "diff", "--quiet", "--", rel], cwd=root).returncode == 0, (label, "dirty before mutation")
+-    shutil.copy2(path, saved)
+-    text = path.read_text()
+-    for old, new in edits:
+-        n = text.count(old)
++    # A mutant may span files (rev 13): `rel` a tuple, each edit (file, old, new).
++    targets = rel if isinstance(rel, tuple) else (rel,)
++    steps = [e if len(e) == 3 else (rel, *e) for e in edits]
++    saved = {}
++    for t in targets:
++        # Refuse to start from a dirty file: a killed earlier run must not have
++        # its mutant saved as the "clean" copy (rev 7).
++        assert subprocess.run(["git", "diff", "--quiet", "--", t], cwd=root).returncode == 0, (label, "dirty before mutation")
++        saved[t] = (root / t, out / ((root / t).name + ".saved"))
++        shutil.copy2(*saved[t])
++    texts = {t: (root / t).read_text() for t in targets}
++    for t, old, new in steps:
++        n = texts[t].count(old)
+@@ -103,2 +127,3 @@
+-        text = text.replace(old, new)
+-    path.write_text(text)
++        texts[t] = texts[t].replace(old, new)
++    for t in targets:
++        (root / t).write_text(texts[t])
+@@ -111,2 +136,3 @@
+-    shutil.copy2(saved, path)
+-    assert filecmp.cmp(saved, path, shallow=False), label
++    for path, copy in saved.values():
++        shutil.copy2(copy, path)
++        assert filecmp.cmp(copy, path, shallow=False), label
 ````
 
