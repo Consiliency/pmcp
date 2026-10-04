@@ -456,7 +456,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconnects or adopts a server process any more (a `refresh` that was
   mid-flight returns without reconnecting), and a cancelled forced
   `disconnect_server` also stops a connect of that server sitting in its
-  retry backoff. Every bounded wait in `src/pmcp` now uses `pmcp.waits.bounded_wait`
+  retry backoff. Adopting a provisioned server process now waits for a
+  disconnect, `disconnect_all` or `refresh` in progress to finish, so it can
+  no longer be dropped from the registry with its process still running, or
+  respawned by a reconnect a few seconds after `disconnect_all` returned; a
+  provisioning handoff cancelled while it waits kills the process it was
+  handing over. Every bounded wait in `src/pmcp` now uses `pmcp.waits.bounded_wait`
   instead of `asyncio.wait_for`, which on Python 3.10/3.11 could drop a
   cancel that landed as the awaited work finished. Where process groups do
   not exist (Windows) the single-process fallback is used, as before. Known

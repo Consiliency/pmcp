@@ -177,6 +177,26 @@ def _retrieve_outcome(task: asyncio.Future[Any]) -> None:
         logger.debug(f"abandoned task ended with {type(exc).__name__}")
 
 
+def _kill_handed_over_process(process: asyncio.subprocess.Process) -> None:
+    """Kill a process handed to `adopt_process` that was never registered:
+    synchronous, for a cancel while adoption waited for the lifecycle lock.
+    Its whole group when it leads one (as an adopted client's teardown
+    would); otherwise the leader only (`process.kill()`: the installer does
+    not start a new session -- the leader-only limit of #344's class)."""
+    if process.returncode is not None:
+        return
+    group = _own_group_pgid(process)
+    if group is not None:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+
+
 def _cancel_without_waiting(task: asyncio.Future[Any] | None) -> None:
     if task is not None and not task.done():
         task.cancel()
@@ -4184,17 +4204,10 @@ class ClientManager:
             # them too; they stay in this method, which the publisher-coverage
             # AST guard (tests/runtime/test_publisher_coverage.py) requires.
             #
-            # A client registered while this teardown was suspended (e.g. an
-            # `adopt_process` handoff) is not in `clients`, so neither the
-            # graceful path nor the cancel fallback above reached it. Clearing
-            # `_clients` would drop it with its process still running, and a
-            # later `abandon_all_now()` could no longer find it. Abandon every
-            # such client synchronously before the clear, on both paths
-            # (Consiliency/pmcp#324, codex round 5).
-            snapshot = {id(managed) for _name, managed in clients}
-            for late_name, late in list(self._clients.items()):
-                if id(late) not in snapshot:
-                    self._abandon_client_io(late_name, late)
+            # No client can be registered while this runs: every path that
+            # registers one -- the connect funnel and `adopt_process` -- holds
+            # the lifecycle lock, which this method's callers hold throughout
+            # (Consiliency/pmcp#324, rounds 5-6). So `clients` is all of them.
             self._connect_tasks.clear()
             self._reconnect_tasks.clear()
             self._reconcile_tasks.clear()
@@ -4322,6 +4335,18 @@ class ClientManager:
             process: Running subprocess with stdin/stdout pipes
             config: Server configuration
 
+        Adoption registers a client, so it holds the lifecycle lock like
+        every other path that registers or tears one down: it waits for a
+        `disconnect_all`/`refresh`/`disconnect_server` in progress to finish,
+        and no teardown can be suspended while it registers
+        (Consiliency/pmcp#324, rounds 5-6).
+
+        A cancel while waiting for the lock kills the handed-over process
+        synchronously (`_kill_handed_over_process`: its group if it leads
+        one, else the leader only -- the installer does not start a new
+        session) and re-raises: nothing was registered, and the caller
+        (`_finalize_server_ready`) catches only `Exception`.
+
         Raises:
             _ManagerAbandoned: If `abandon_all_now()` has run (the gateway is
                 shutting down); the process is left to the caller, which
@@ -4329,15 +4354,38 @@ class ClientManager:
             RuntimeError: If process is not running or missing pipes
             Exception: If MCP initialization fails
         """
+        self._refuse_adoption_if_abandoned(name)
+        try:
+            await self._lifecycle_lock.acquire()
+        except asyncio.CancelledError:
+            _kill_handed_over_process(process)
+            raise
+        try:
+            await self._adopt_process_locked(name, process, config)
+        finally:
+            self._lifecycle_lock.release()
+
+    def _refuse_adoption_if_abandoned(self, name: str) -> None:
         # Adoption registers a client without going through `_connect_server`,
         # so it checks abandonment itself: nothing may register a client after
-        # `abandon_all_now()` (Consiliency/pmcp#324, codex round 2). The check
-        # and the registration below have no await between them, so a client
-        # adopted before abandonment is in the set `abandon_all_now()` kills.
+        # `abandon_all_now()` (Consiliency/pmcp#324, codex round 2).
         if self._abandoned:
             raise _ManagerAbandoned(
                 f"Not adopting {name}: the client manager was abandoned"
             )
+
+    async def _adopt_process_locked(
+        self,
+        name: str,
+        process: asyncio.subprocess.Process,
+        config: ResolvedServerConfig,
+    ) -> None:
+        """`adopt_process` with the lifecycle lock held."""
+        # Re-checked under the lock (abandonment may have run while this
+        # waited for it). No await between here and the registration below,
+        # so a client adopted before abandonment is in the set
+        # `abandon_all_now()` kills.
+        self._refuse_adoption_if_abandoned(name)
         # Validate process state
         if process.returncode is not None:
             raise RuntimeError(f"Process for {name} has already exited")
