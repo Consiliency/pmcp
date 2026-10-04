@@ -497,8 +497,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   programmatic path, `create_http_app` refuses a protected-resource
   metadata URL that normalisation used to drop silently, omitting the
   metadata route -- any URL that is not an absolute `https://` URL to a
-  public IP address or a DNS name other than `localhost`, written in plain
-  ASCII, with a valid port
+  public IP address or a DNS name other than `localhost`, with its host in
+  canonical form, no backslash or control character, and a valid port (the
+  #341 entry above states the full rule)
   (so plain `http://` to any host, loopback included, is refused too; see
   [Consiliency/pmcp#341](https://github.com/Consiliency/pmcp/issues/341)).
   The metadata route also refuses to

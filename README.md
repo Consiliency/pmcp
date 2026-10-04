@@ -237,8 +237,8 @@ and octal forms such as `2130706433` or `0177.0.0.1`, `127.000.0.1`,
 `example.123`, `-a.example.com`, `[v1.fe]` and `[fe80::1%25eth0]` are all
 refused, as are `bücher.example` (write `xn--bcher-kva.example`),
 underscores and empty labels. PMCP strips leading spaces and C0 control
-characters, and trailing tabs, CRs and LFs, and nothing else; any other
-control character (U+0000 to U+001F, or DEL) is refused wherever it is, a
+characters, and trailing tabs, CRs and LFs, and nothing else; any control
+character (U+0000 to U+001F, or DEL) left after that strip is refused, a
 backslash is refused anywhere in the URL, and, for a JWKS or metadata URL,
 so is any whitespace character (anything Python's `str.isspace` matches,
 so a trailing space, a no-break space or U+2028 too). A DNS name is not
