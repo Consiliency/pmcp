@@ -20,6 +20,7 @@ from pmcp.auth import (
     AuthMessage,
     ResourceServerAuthError,
     ResourceServerJWKSUnavailable,
+    _legacy_numeric_addresses,
     fetch_json_metadata,
     is_verified_public_auth_url,
     normalize_auth_metadata,
@@ -829,6 +830,7 @@ def test_sanitize_public_auth_url_rejects_invalid_and_non_public_urls() -> None:
 # de-duplicate these labels.
 #
 #   RFC 4291  IPv4-mapped         ::ffff:0:0/96    unwrapped
+#   RFC 6145  IPv4-translated     ::ffff:0:0:0/96  unwrapped (#341 rev 3)
 #   RFC 4291  IPv4-compatible     ::/96            unwrapped (deprecated form)
 #   RFC 6052  NAT64 well-known    64:ff9b::/96     unwrapped
 #   RFC 5214  ISATAP              ..:0:5efe:a.b.c.d unwrapped by interface id
@@ -836,11 +838,15 @@ def test_sanitize_public_auth_url_rejects_invalid_and_non_public_urls() -> None:
 #             02-00-5E-FE with the u/g bit set (RFC 5214 section 6.1). The
 #             `5efe` hextet alone does NOT identify ISATAP; see the
 #             over-rejection trap in _MUST_ACCEPT_HOSTS.
-#   RFC 3056  6to4                2002::/16        already non-global
-#   RFC 4380  Teredo              2001::/32        already non-global
+#   RFC 3056  6to4                2002::/16        non-global, and its embedded
+#                                                  address is classified too
+#   RFC 4380  Teredo              2001::/32        non-global, and its server and
+#                                                  (de-obfuscated) client too
+#   RFC 8215  local-use NAT64     64:ff9b:1::/48   refused whole: the embedding
+#                                                  position is operator-chosen
 #
-# The last two pass today only because neither prefix is global -- luck, not
-# design. They are pinned below so that stays true.
+# Before #341 rev 3, 6to4 and Teredo passed only because neither prefix is
+# global -- luck, not design. They are still pinned below.
 # --------------------------------------------------------------------------- #
 
 _MUST_ACCEPT_HOSTS = [
@@ -851,6 +857,7 @@ _MUST_ACCEPT_HOSTS = [
     # every IPv4-mapped address is is_reserved.
     ("::ffff:8.8.8.8", "RFC 4291 IPv4-mapped, wrapping a public address"),
     ("64:ff9b::808:808", "RFC 6052 NAT64, wrapping a public address"),
+    ("::ffff:0:808:808", "RFC 6145 IPv4-translated, wrapping a public address"),
     # Over-rejection trap for ISATAP: an ordinary global address that merely
     # carries `5efe` in that hextet. Matching the marker alone rather than the
     # full RFC 5214 interface identifier unwraps this to 10.0.0.5 and rejects a
@@ -875,6 +882,10 @@ _MUST_REJECT_HOSTS = [
     ("::0:5efe:a00:5", "RFC 5214 ISATAP (00-00-5E-FE), embedding 10.0.0.5"),
     ("::0:5efe:7f00:1", "RFC 5214 ISATAP (00-00-5E-FE), embedding 127.0.0.1"),
     ("::200:5efe:a00:5", "RFC 5214 ISATAP with the u/g bit set (02-00-5E-FE)"),
+    # --- Fixed by #341 rev 3 -------------------------------------------------
+    ("::ffff:0:a9fe:a9fe", "RFC 6145 IPv4-translated, embedding 169.254.169.254"),
+    ("::ffff:0:7f00:1", "RFC 6145 IPv4-translated, embedding 127.0.0.1"),
+    ("64:ff9b:1::808:808", "RFC 8215 local-use NAT64, refused whole"),
     # --- Pinned, not fixed: these are already non-global ---------------------
     ("2002:0a00:0005::1", "RFC 3056 6to4, embedding 10.0.0.5"),
     ("2001:0:0:0:0:0:0a00:0005", "RFC 4380 Teredo"),
@@ -933,8 +944,13 @@ def test_public_auth_url_rejects_non_public_ip_literals(
     with pytest.raises(ValueError) as excinfo:
         sanitize_public_auth_url(_auth_url(host))
     # Guard against passing for the wrong reason -- a malformed URL raises the
-    # same exception type from a different branch.
-    assert "non-public IP literal" in str(excinfo.value), rationale
+    # same exception type from a different branch. Since Consiliency/pmcp#341
+    # rev 2 a legacy numeric form is refused one step earlier, as a host not
+    # written in canonical ASCII: still refused for its host, never accepted.
+    assert str(excinfo.value) in {
+        AuthMessage.PUBLIC_URL_NOT_PUBLIC,
+        AuthMessage.PUBLIC_URL_HOST_NOT_CANONICAL,
+    }, rationale
 
 
 def test_public_auth_url_error_message_does_not_claim_the_host_was_verified() -> None:
@@ -969,23 +985,35 @@ def test_public_auth_url_still_accepts_non_numeric_hosts_after_canonicalisation(
         "auth.example.com",
         "metadata.google.internal",
         "1.example.com",  # a numeric label, but the host is not a number
+    ]:
+        assert sanitize_public_auth_url(_auth_url(host)) == _auth_url(host)
+    # Consiliency/pmcp#341 rev 2: a host whose last label is a number is an
+    # IPv4 address or nothing to a WHATWG parser, so these are refused, not
+    # passed through as names.
+    for host in [
         "999.999.999.999",  # numeric-looking, but no valid reading exists
         "0xdeadbeefcafe",  # exceeds 32 bits, so it is not an address
         "1.2.3.4.5",  # too many parts for inet_aton
     ]:
-        assert sanitize_public_auth_url(_auth_url(host)) == _auth_url(host)
+        with pytest.raises(ValueError) as excinfo:
+            sanitize_public_auth_url(_auth_url(host))
+        assert str(excinfo.value) == AuthMessage.PUBLIC_URL_HOST_NOT_CANONICAL
 
 
 def test_public_auth_host_does_not_read_python_int_quirks_as_addresses() -> None:
     """`int()` accepts separators, signs, and non-ASCII digits; the parser must not.
 
     `int("1_0")` is 10 and `int("١٢٧")` is 127, so canonicalising with a bare
-    `int(part)` would turn these hostnames into addresses. No resolver reads them
-    that way, so they stay on the name path. The parser matches ASCII character
-    classes before converting, which is what keeps that true.
+    `int(part)` would turn these hostnames into addresses. The numeric parser
+    matches ASCII character classes before converting, which is what keeps
+    that true. Since Consiliency/pmcp#341 rev 2 none of them is a canonical
+    ASCII host either, so all three are refused before any classification.
     """
     for host in ["1_0", "١٢٧", "+2852039166"]:
-        assert sanitize_public_auth_url(_auth_url(host)) == _auth_url(host)
+        assert _legacy_numeric_addresses(host) == set()
+        with pytest.raises(ValueError) as excinfo:
+            sanitize_public_auth_url(_auth_url(host))
+        assert str(excinfo.value) == AuthMessage.PUBLIC_URL_HOST_NOT_CANONICAL
 
 
 def test_normalize_auth_metadata_omits_invalid_urls_with_safe_diagnostics() -> None:
