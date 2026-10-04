@@ -1874,8 +1874,15 @@ async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
     holding the value and sized with it. Every task call, in every shape the
     recogniser accepts, with every dropped position: the value is in no
     channel, and two sentinel lengths give the same answer (no size channel)."""
-    from pmcp.client.manager import task_payload_of
+    import pmcp.client.manager as manager_module
 
+    # The recogniser as the manager defines it; before rev 14 it was only the
+    # manager's own method (so this test runs, and fails on the value, there).
+    task_payload_of = getattr(
+        manager_module,
+        "task_payload_of",
+        lambda result: manager_module.ClientManager()._extract_task_payload(result),
+    )
     caplog.set_level(logging.DEBUG)
     probe = {"taskId": "t", "status": "working", "ttl": "x"}
     for method in ("tools/call", "tasks/get", "tasks/result", "tasks/cancel"):

@@ -1668,8 +1668,10 @@ async def test_a_malformed_initialize_reply_ends_the_refresh_in_bounded_time(
     from pmcp.manifest.loader import ServerConfig
 
     caplog.set_level(logging.DEBUG)
-    monkeypatch.setattr(refresher, "REFRESH_READ_TIMEOUT_SECONDS", 1.0)
-    monkeypatch.setattr(refresher, "REFRESH_TIMEOUT_SECONDS", 8.0)
+    # `raising=False`: before rev 14 these did not exist, and the refresh then
+    # waits out the guard below instead of failing on a missing name.
+    monkeypatch.setattr(refresher, "REFRESH_READ_TIMEOUT_SECONDS", 1.0, raising=False)
+    monkeypatch.setattr(refresher, "REFRESH_TIMEOUT_SECONDS", 8.0, raising=False)
     script = tmp_path / "init_downstream.py"
     script.write_text(_INIT_SCRIPT)
     tap = _Tap(typing.cast(Any, _NoServer()), None, caplog, capfd, recwarn)
@@ -1686,9 +1688,12 @@ async def test_a_malformed_initialize_reply_ends_the_refresh_in_bounded_time(
         )
         mark = tap.start()
         started = time.monotonic()
-        result = await asyncio.wait_for(
-            refresher.refresh_server(config, force=True), 20
-        )
+        try:
+            result = await asyncio.wait_for(
+                refresher.refresh_server(config, force=True), 20
+            )
+        except asyncio.TimeoutError:
+            raise AssertionError(f"refresh still waiting at 20 s: {kind}") from None
         assert time.monotonic() - started < 10, (kind, family)
         assert result is None, (kind, family)
         observed = tap.since(mark, repr(result))
