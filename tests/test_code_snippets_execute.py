@@ -150,3 +150,19 @@ def test_the_describe_snippet_warns_on_safety_notes(
     assert snippet is not None
     exec(snippet, {"mcp": _fake_mcp("risky"), **_FREE_NAMES})
     assert "Warning" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("variant", ["plain", "no_job"])
+def test_the_provision_snippet_reports_the_outcome(
+    variant: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Grok, #358 round 3: the loop ended on complete/failed/timeout alike and
+    the snippet said nothing. It now prints the terminal status (or that the
+    provision finished without a job)."""
+    snippet = _LOADER.get_snippet_for_tool(
+        "gateway::provision_status", max_lines=_DEFAULT
+    )
+    assert snippet is not None
+    exec(snippet, {"mcp": _fake_mcp(variant), **_FREE_NAMES})
+    out = capsys.readouterr().out
+    assert ("complete" in out) if variant == "plain" else ("without a job" in out)

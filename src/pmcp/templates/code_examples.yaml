@@ -97,9 +97,9 @@
 "gateway::provision_status":
   snippet: |
     import time
-    job = mcp.call_tool("gateway.provision", {"server_name": "github"}).get("job_id")  # None: nothing to wait for
-    while job and mcp.call_tool("gateway.provision_status", {"job_id": job})["status"] in ("pending", "installing"):
-        time.sleep(1)
+    job = mcp.call_tool("gateway.provision", {"server_name": "github"}).get("job_id")  # None: no job to wait for
+    while job and (st := mcp.call_tool("gateway.provision_status", {"job_id": job})["status"]) in ("pending", "installing"): time.sleep(1)
+    print("provision:", st if job else "finished without a job (see gateway.provision's status)")
 
 "gateway::catalog_search":
   snippet: |
