@@ -165,4 +165,28 @@ def test_the_provision_snippet_reports_the_outcome(
     assert snippet is not None
     exec(snippet, {"mcp": _fake_mcp(variant), **_FREE_NAMES})
     out = capsys.readouterr().out
-    assert ("complete" in out) if variant == "plain" else ("without a job" in out)
+    assert ("complete" in out) if variant == "plain" else ("already_running" in out)
+
+
+def test_the_provision_snippet_reports_a_refusal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Claude, #358 round 4: a refused provision (no job, ok: false) was
+    reported as "finished without a job". It now prints the status and
+    the gateway's message."""
+    snippet = _LOADER.get_snippet_for_tool(
+        "gateway::provision_status", max_lines=_DEFAULT
+    )
+    assert snippet is not None
+    refusal = ProvisionOutput(
+        ok=False,
+        server="figma",
+        message="Server 'figma' requires authentication. Set one of: FIGMA_API_KEY",
+        status="failed",
+    ).model_dump(mode="json")
+    exec(
+        snippet,
+        {"mcp": SimpleNamespace(call_tool=lambda name, args: refusal), **_FREE_NAMES},
+    )
+    out = capsys.readouterr().out
+    assert "failed" in out and "requires authentication" in out
