@@ -30,6 +30,44 @@
 >   Python.
 >
 > Every number below was re-measured on the rev-2 spike and proof tree.
+>
+> **Rev 3** (after the round-2 claude seat on Consiliency/pmcp#346, DISAGREE
+> on wording; it found no accepted host that a fetcher reads as non-public
+> or different):
+>
+> - **F001, blocking.** Rev 2's `PUBLIC_URL_HOST_NOT_CANONICAL` text, "host
+>   must be plain ASCII: a DNS name of letters, digits and hyphens …, a
+>   dotted-quad IPv4 address, or a bracketed IPv6 address without a zone",
+>   was false for inputs that reach it. It refused `example.123`,
+>   `-a.example.com`, a 64-character label and `127.000.0.1`, which match
+>   that description, and `2130706433`, `127.0.0.1.` and `[v1.fe]`, which
+>   are plain ASCII. The README label "host not in plain ASCII" and the
+>   README rule had the same defect, and the message-truth test re-ran the
+>   classifier instead of reading the text. Rev 3 fixes the class:
+>   - The rule now has one wording, `pmcp.auth.CANONICAL_HOST_FORMS`. The
+>     message is built from it, and a test requires the README and the
+>     docstring to carry each clause verbatim.
+>   - The message-truth oracle is keyed by the message **text** and checks
+>     what the words say.
+>   - Over 871 inputs generated from the grammar, the texts characterise
+>     acceptance exactly. A strict caller accepts a URL if and only if no
+>     refusal text is true of it.
+> - **F002.** The seat's four surviving mutants are added (M32 to M35) and
+>   are now red. The new inputs cover every C0 control and DEL at four
+>   positions, several `@`, label-edge hyphens, and labels of 63 and 64
+>   characters.
+> - **F003.** The docstring now states the stripping exactly.
+> - **F004.**
+>   - Any IPv6 literal that embeds an IPv4 address is classified on that
+>     address too. This adds IPv4-translated `::ffff:0:0:0/96`
+>     (`[::ffff:0:a9fe:a9fe]` was accepted, on main too), 6to4, Teredo
+>     server and client, and refuses local-use NAT64 `64:ff9b:1::/48`
+>     whole. It is checked by a differential over 54 constructed addresses.
+>   - A backslash anywhere in a URL is refused (`PUBLIC_URL_BACKSLASH`).
+>   - `localhost6` and `ip6-localhost` join the deferred `*.localhost`
+>     follow-up.
+>
+> Every number below was re-measured on the rev-3 spike and proof tree.
 
 ## Task
 
@@ -63,6 +101,18 @@ panel on Consiliency/pmcp#340, the implementation of Consiliency/pmcp#326:
    control characters, or state the behaviour exactly.
 7. **(rev 2, F004)** The `gateway.auth_connect` loopback docstring omits the
    IPv4-mapped forms and zone ids.
+8. **(rev 3, F001, blocking)** `PUBLIC_URL_HOST_NOT_CANONICAL`, the README
+   label and the README rule are false for some inputs that reach them.
+   State the real rule in one wording everywhere. Make the truth test check
+   the **text**, over inputs generated from the grammar.
+9. **(rev 3, F002)** Bind the rule's edges: every C0 control and DEL, more
+   than one `@`, hyphens at label edges, labels of 63 and 64 characters.
+10. **(rev 3, F003)** Make the sanitiser docstring exact about what is
+    stripped.
+11. **(rev 3, F004)** Classify every IPv4-embedding IPv6 form on its
+    embedded address, derived from the IANA registry or `ipaddress` and
+    tested differentially. Refuse a backslash in the authority. List
+    `localhost6` and `ip6-localhost` with the `*.localhost` follow-up.
 
 The #326 registry rules apply: a rewording goes through `AuthMessage`, and
 the sanitiser test (`test_every_registry_member_survives_the_sanitiser` and
@@ -152,7 +202,9 @@ the member after this plan, and whether its text is true for that input.
 | https, punycode IDN | `https://xn--bcher-kva.example/…` | accepted | accepted | - | - |
 | https, IPv4-mapped public | `https://[::ffff:8.8.8.8]/…` | accepted | accepted | - | - |
 | https, `*.localhost` | `https://app.localhost/…` | **accepted** (a name, not resolved) | accepted | - | see *Findings* |
-| **host not in canonical ASCII (rev 2)** | `https://１２７.0.0.1/…`, `127。0。0。1`, full-width `localhost`, `bücher.example`, `localhost.`, `127.0.0.1.`, `127%2E0%2E0%2E1`, `2130706433`, `0177.0.0.1`, `134744072`, `example.123`, `[v1.fe]`, `[::1%25lo]`, `my_host…`, `a..b` | refused (**main accepted** every non-numeric one, and `134744072`) | refused | `PUBLIC_URL_HOST_NOT_CANONICAL` (new) | yes: none of them is an LDH name, a dotted quad or a zone-less IPv6 literal |
+| **host not in canonical form (rev 2/3)** | `https://１２７.0.0.1/…`, `127。0。0。1`, full-width `localhost`, `bücher.example`, `localhost.`, `127.0.0.1.`, `127%2E0%2E0%2E1`, `2130706433`, `0177.0.0.1`, `127.000.0.1`, `134744072`, `example.123`, `-a.example.com`, a 64-character label, `[v1.fe]`, `[::1%25lo]`, `my_host…`, `a..b` | refused (**main accepted** every one except the numeric forms, which it refused as non-public; it accepted `134744072`) | refused | `PUBLIC_URL_HOST_NOT_CANONICAL` (new) | yes, by the text: none is any of the three forms the message lists (checked clause by clause) |
+| **backslash (rev 3)** | `https://127.0.0.1\@auth.example.com/…`, `…/a\b` | refused (main accepted) | refused | `PUBLIC_URL_BACKSLASH` (new) | yes |
+| **IPv6 embedding a non-public IPv4 (rev 3)** | `[::ffff:0:a9fe:a9fe]`, `[64:ff9b:1::808:808]` | refused (main **accepted** the first) | refused | `PUBLIC_URL_NOT_PUBLIC` | yes: a non-public IP literal, on its embedded address |
 | **control character inside the URL (rev 2)** | `…/key\tset.json`, `\r`, `\n` in the host, NUL, DEL | refused (main stored `keyset.json`, passed NUL) | refused | `PUBLIC_URL_CONTROL_CHARACTER` (new) | yes |
 | https, loopback IPv4 | `https://127.0.0.1/…`, `https://127.1.2.3/…` | refused | refused | `PUBLIC_URL_NOT_PUBLIC` | yes: non-public IP literal |
 | https, loopback IPv6 | `https://[::1]/…` | refused | refused | `PUBLIC_URL_NOT_PUBLIC` | yes |
@@ -183,10 +235,16 @@ accepts an auth URL if and only if all of these hold:
 - it contains no other C0 control or DEL;
 - it is an absolute `https://` URL;
 - its port, if any, parses as 0 to 65535;
-- its host is written in **canonical ASCII**: letters-digits-hyphens labels
-  with no empty label (an IDN in `xn--` form), a dotted-quad IPv4 address
-  with no leading zeros, or a bracketed IPv6 address without a zone id;
-- that host is a public address, or a DNS name other than `localhost`.
+- it contains no backslash (rev 3);
+- its host is in **canonical form**, in rev 3's one wording
+  (`CANONICAL_HOST_FORMS`): a DNS name of dot-separated labels of 1 to 63
+  ASCII letters, digits and hyphens, each starting and ending with a letter
+  or digit, the last starting with a letter, so never a number (an IDN in
+  its xn-- form); a dotted-quad IPv4 address with no leading zeros; or a
+  bracketed IPv6 address with no zone id;
+- that host is a public address, or a DNS name other than `localhost`. An
+  IPv6 address that embeds an IPv4 address must be public on the embedded
+  address too (rev 3).
 
 For a JWKS or metadata URL, the startup check also refuses any whitespace.
 DNS names are not resolved. Userinfo is accepted and dropped. Plain
@@ -350,6 +408,94 @@ What the table shows:
   WHATWG read as the same name or address that pmcp classified and stored:
   ASCII names, `xn--` IDNs, dotted quads and zone-less IPv6.
 
+### Rev 3: the message states the rule, and the oracle reads the message
+
+Rev 2's canonical-host text listed the forms loosely, so it was false for
+inputs that reach it (Task item 8). Rev 3 gives the rule one wording,
+`pmcp.auth.CANONICAL_HOST_FORMS`. It has three clauses, and the message is
+built from them:
+
+> Public auth URL host must be a DNS name of dot-separated labels of 1 to 63
+> ASCII letters, digits and hyphens, each starting and ending with a letter
+> or digit, the last starting with a letter, so never a number (an IDN in
+> its xn-- form); a dotted-quad IPv4 address with no leading zeros; or a
+> bracketed IPv6 address with no zone id.
+
+The text is 331 characters, under the sanitiser's 400-character cap, and it
+passes #326's sanitiser test unchanged. The README rule and the
+`sanitize_public_auth_url` docstring carry each clause verbatim, and
+`test_the_canonical_rule_has_one_wording` checks that, with whitespace
+normalised.
+
+**"The last starting with a letter" replaces rev 2's WHATWG
+"ends in a number" test.**
+
+- It is stricter. It also refuses `example.1com`. No real top-level domain
+  starts with a digit, and IDN TLDs start with `xn--`.
+- It states in one phrase what a WHATWG parser needs: a last label that
+  cannot be a number. "So never a number" names the consequence, so the
+  seat's falsifier (the message names "number" and "leading zero") passes.
+- In code, a host whose last label starts with a digit is accepted only as
+  an exact dotted quad (`str(IPv4Address(raw)) == raw`).
+
+**The oracle reads the text.**
+
+- `_TEXT_CLAIMS` in the test module is keyed by each refusal's exact text.
+  Each value checks what that text asserts about the URL.
+- The canonical text is split into its clauses. Each clause is a key of
+  `_HOST_FORM_CLAIMS`, whose predicate checks that clause's words: label
+  length, character set, edge characters, a dotted quad without leading
+  zeros, and a bracketed `inet_pton` IPv6 without `%`.
+- `test_the_text_oracle_covers_every_sanitiser_message` requires the keys
+  to equal the texts `sanitize_public_auth_url` raises (found by AST) and
+  the message's clauses to equal the oracle's clauses. So rewording any
+  message fails until its claim is re-derived (mutant M42).
+- `test_each_message_is_true_and_acceptance_is_exact` runs 871 inputs.
+  These are every class, every generated host over `https` and `http`,
+  every C0 control and DEL at four positions, label edges and lengths,
+  userinfo with zero to two `@` and backslashes, and 54 IPv4-embedding
+  IPv6 literals. For each, strict and operator, it checks two things:
+  - **Refused:** the refusal text's claim holds for the URL.
+  - **Accepted:** no refusal text's claim holds. The one exception is the
+    operator path, where only "plain http" and "non-public" may hold, and
+    only for a loopback host.
+
+  So the texts together define acceptance. A rule that drifts from its
+  words fails in one direction or the other.
+
+**The rev-3 classes, measured** (yarl 1.22.0; node v24.20.0 `new URL()`;
+main = `31c1357`):
+
+| Class | URL (shape) | yarl `raw_host` | WHATWG `hostname` | main | rev 3 |
+|---|---|---|---|---|---|
+| IPv4-translated, link-local | `https://[::ffff:0:a9fe:a9fe]/x` | `'::ffff:0:a9fe:a9fe'` | `[::ffff:0:a9fe:a9fe]` | accepted | refused NOT_PUBLIC |
+| IPv4-translated, loopback | `https://[::ffff:0:7f00:1]/x` | `'::ffff:0:7f00:1'` | `[::ffff:0:7f00:1]` | accepted | refused NOT_PUBLIC |
+| IPv4-translated, public | `https://[::ffff:0:808:808]/x` | `'::ffff:0:808:808'` | `[::ffff:0:808:808]` | accepted | accepted |
+| local-use NAT64, public v4 | `https://[64:ff9b:1::808:808]/x` | `'64:ff9b:1::808:808'` | `[64:ff9b:1::808:808]` | refused NOT_PUBLIC | refused NOT_PUBLIC |
+| 6to4, public v4 | `https://[2002:808:808::1]/x` | `'2002:808:808::1'` | `[2002:808:808::1]` | refused NOT_PUBLIC | refused NOT_PUBLIC |
+| 6to4, link-local v4 | `https://[2002:a9fe:a9fe::1]/x` | `'2002:a9fe:a9fe::1'` | `[2002:a9fe:a9fe::1]` | refused NOT_PUBLIC | refused NOT_PUBLIC |
+| Teredo, link-local client | `https://[2001:0:808:808::5601:5656]/x` | `'2001:0:808:808::5601:5656'` | `[2001:0:808:808::5601:5656]` | refused NOT_PUBLIC | refused NOT_PUBLIC |
+| backslash before @ | `https://127.0.0.1\@auth.example.com/x` | `'auth.example.com'` | `127.0.0.1` | accepted | refused BACKSLASH |
+| backslash, port, @ | `https://127.0.0.1:80\@auth.example.com/x` | `'auth.example.com'` | `127.0.0.1` | accepted | refused BACKSLASH |
+| backslash in path | `https://auth.example.com/a\b` | `'auth.example.com'` | `auth.example.com` | accepted | refused BACKSLASH |
+| two @, public host | `https://a@b@auth.example.com/x` | `'auth.example.com'` | `auth.example.com` | accepted | accepted |
+| two @, loopback host | `https://u@x@127.0.0.1/x` | `'127.0.0.1'` | `127.0.0.1` | refused NOT_PUBLIC | refused NOT_PUBLIC |
+| label starts with hyphen | `https://-a.example.com/x` | `'-a.example.com'` | `-a.example.com` | accepted | refused HOST_NOT_CANONICAL |
+| label ends with hyphen | `https://a-.example.com/x` | `'a-.example.com'` | `a-.example.com` | accepted | refused HOST_NOT_CANONICAL |
+| 63-character label | `https://aaaaaaaaaaaa…aaaaaa.example.com/x` | `'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com'` | `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com` | accepted | accepted |
+| 64-character label | `https://aaaaaaaaaaaa…aaaaaa.example.com/x` | `'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com'` | `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com` | accepted | refused HOST_NOT_CANONICAL |
+| last label all digits | `https://example.123/x` | `'example.123'` | invalid URL | accepted | refused HOST_NOT_CANONICAL |
+| last label digit-led | `https://example.1com/x` | `'example.1com'` | `example.1com` | accepted | refused HOST_NOT_CANONICAL |
+| leading-zero quad | `https://127.000.0.1/x` | `'127.000.0.1'` | `127.0.0.1` | refused NOT_PUBLIC | refused HOST_NOT_CANONICAL |
+| inner U+001F | `https://auth.example.com/k\x1fs` | `'auth.example.com'` | `auth.example.com` | accepted | refused CONTROL_CHARACTER |
+| trailing NUL | `https://auth.example.com/x\x00` | `'auth.example.com'` | `auth.example.com` | accepted | refused CONTROL_CHARACTER |
+| trailing space | `https://auth.example.com/x ` | `'auth.example.com'` | `auth.example.com` | accepted | accepted |
+| leading DEL | `\x7fhttps://auth.example.com/x` | `None` | invalid URL | refused NOT_ABSOLUTE | refused CONTROL_CHARACTER |
+
+The seat's two falsifiers, written to scratch files and run against the
+rev-3 spike, pass: `test_canonical_refusal_names_what_the_host_lacks` (2)
+and `test_every_inner_control_character_is_refused` (33), 35 passed in all.
+
 ### Findings outside the issue's examples (not fixed here)
 
 - **`*.localhost` is accepted as a public name** on the https path. Rev 2
@@ -363,7 +509,11 @@ What the table shows:
   docs-and-message issue (Design decision 3). The new table pins today's
   behaviour, so a later fix must update these rows on purpose. Recommended
   follow-up issue: "auth: treat `*.localhost` as loopback names in
-  `pmcp.auth`, consistently with `transport/http.py`".
+  `pmcp.auth`, consistently with `transport/http.py`". The same follow-up
+  should cover `localhost6` and `ip6-localhost`. Debian's `/etc/hosts`
+  maps both to `::1`, so they are loopback names that pmcp accepts as
+  ordinary names today (seat round 2, F004). Like `*.localhost`, they
+  depend on DNS or `/etc/hosts`, which pmcp does not resolve (#211).
 - **Port `0` is accepted and silently dropped** by `redact_auth_url`
   (`if port:`), so `https://h:0/x` is stored as `https://h/x`. This is
   harmless for a public URL and is pinned as accepted; it can go into the
@@ -501,6 +651,62 @@ A trailing **space** is not stripped. It is still refused at startup as
 whitespace, exactly as on main (#326's `_BAD_JWKS_URLS` row), so no
 previously refused value starts.
 
+### 8. (rev 3) One wording for the rule, and an oracle keyed by text
+
+See *Rev 3: the message states the rule*. One source,
+`CANONICAL_HOST_FORMS`, feeds the message, the README and the docstring. The
+README and the docstring cannot import it, so a test pins them to it. The
+truth test is keyed by text. Rejected alternative: keep the predicate-keyed
+oracle and only reword the message. That is what let rev 2's text drift:
+the test could not see the words.
+
+### 9. (rev 3) Refuse a backslash anywhere in the URL
+
+A WHATWG parser ends the authority at `\` for special schemes, while
+`urlsplit` and yarl do not. That is the one authority delimiter on which
+they differ: `/`, `?` and `#` end it for all three. So
+`https://127.0.0.1\@auth.example.com/` is `auth.example.com` to pmcp and
+aiohttp, and `127.0.0.1` to a browser. Today a browser never sees the raw
+form: the published metadata URL and the elicitation URL are the redacted
+form, which drops userinfo. But that safety is incidental.
+
+Refusing `\` anywhere is one check, fails closed, and costs nothing. No
+legitimate auth URL contains a backslash, and in a path a WHATWG parser
+would rewrite it to `/` anyway. A narrower "authority only" check would
+need its own authority parser, which is the thing in dispute.
+
+### 10. (rev 3) An IPv6 literal is classified on every IPv4 address it embeds
+
+The list comes from the IANA IPv6 Special-Purpose Address Registry plus the
+two RFC forms outside it, each cited in the code and in the
+`tests/test_auth.py` matrix:
+
+| Form | Prefix | Where the IPv4 address sits | Rev 3 |
+|---|---|---|---|
+| IPv4-mapped (RFC 4291, IANA) | `::ffff:0:0/96` | low 32 bits | classified on it (as before) |
+| IPv4-translated (RFC 6145) | `::ffff:0:0:0/96` | low 32 bits | **added**; `[::ffff:0:a9fe:a9fe]` was accepted |
+| IPv4-compatible (RFC 4291, deprecated) | `::/96` | low 32 bits | as before |
+| NAT64 well-known (RFC 6052, IANA) | `64:ff9b::/96` | low 32 bits | as before |
+| ISATAP (RFC 5214) | interface id `0:5efe` / `200:5efe` | low 32 bits | as before |
+| 6to4 (RFC 3056, IANA) | `2002::/16` | bits 16 to 47 (`IPv6Address.sixtofour`) | **added**: the IPv6 address and the embedded one must both be public |
+| Teredo (RFC 4380, IANA) | `2001::/32` | server at bits 32 to 63, client as the inverted low 32 bits (`IPv6Address.teredo`) | **added**: both must be public, and the IPv6 address too |
+| local-use NAT64 (RFC 8215, IANA) | `64:ff9b:1::/48` | the operator's choice (RFC 6052 2.2, /32 to /96) | **refused whole**: it cannot be located |
+
+On 3.10.21, `2002::/16`, `2001::/32` and `64:ff9b:1::/48` are already
+non-global. Rev 3 makes their refusal independent of the running Python's
+special-purpose table. Only IPv4-translated changes a measured outcome.
+
+`test_every_ipv4_embedding_is_classified_on_the_embedded_address` builds 54
+addresses by bit arithmetic: 9 forms by 6 IPv4 samples (public, loopback,
+private, link-local, CGNAT and unspecified). It checks three things:
+
+- The test's extraction agrees with `ipaddress`' own `ipv4_mapped`,
+  `sixtofour` and `teredo` wherever those exist. That is the differential
+  against Python's properties.
+- pmcp accepts an address if and only if the test's independent classifier
+  calls it public.
+- Any address that embeds a non-public IPv4 address is refused.
+
 ## Changes
 
 ### `src/pmcp/auth.py` (modify)
@@ -529,6 +735,27 @@ previously refused value starts.
 - (rev 2) `_is_loopback_host` unwraps an IPv4-mapped address itself (F004,
   version-independent), and the `sanitize_url_elicitation_url` docstring
   lists the operator's loopback set and states that zone ids are refused.
+- (rev 3) `CANONICAL_HOST_FORMS` is the one wording of the host rule, and
+  `PUBLIC_URL_HOST_NOT_CANONICAL` is built from it. The rev-2 text above is
+  superseded.
+- (rev 3) A new member, `PUBLIC_URL_BACKSLASH` ("Public auth URL contains a
+  backslash."). The sanitiser refuses `\` right after the control check.
+- (rev 3) `_is_canonical_host`: a last label starting with a digit means an
+  exact dotted quad, and otherwise the last label must start with a letter.
+  `_WHATWG_NUMBER` is gone.
+- (rev 3) The IPv4-embedding class:
+  - `_V4_EMBEDDING_NETWORKS` gains `::ffff:0:0:0/96`.
+  - `_V4_EMBEDDING_UNLOCATABLE = (64:ff9b:1::/48,)` is new.
+  - `_is_translated_v4`, `_embedded_v4_addresses` (low 32 bits, 6to4 and
+    Teredo) and `_is_public_single` are new, and `_unwrap_embedded_v4` is
+    removed.
+  - `_is_public_ip` refuses an unlocatable prefix, requires every embedded
+    IPv4 address to be public, and classifies a low-32-bit translator form
+    on its IPv4 address alone, as before.
+- (rev 3) The `sanitize_public_auth_url` docstring states exactly what is
+  stripped: leading C0 controls and spaces, and trailing tabs, CRs and
+  LFs. A trailing space is kept, and a trailing NUL is refused. It also
+  carries the canonical clauses verbatim.
 
 ### `README.md` (modify)
 
@@ -541,6 +768,14 @@ previously refused value starts.
   behaviour exactly (F002) and the operator's loopback set (F004). The
   table gains six rows: one accepted `xn--` IDN and five refused with "host
   not in plain ASCII".
+- (rev 3) The rule is restated with `CANONICAL_HOST_FORMS`' clauses
+  verbatim, plus the IPv4-embedding rule, the backslash refusal, exact
+  stripping, and "any whitespace character (`str.isspace`)" for the
+  startup check (seat F003).
+- (rev 3) The table label becomes "refused: host not in canonical form".
+  Five rows are added: `127.000.0.1`, `example.123` and `-a.example.com`
+  (not canonical), `[::ffff:0:a9fe:a9fe]` (non-public host), and
+  `https://127.0.0.1\@auth.example.com/` (backslash).
 
 ### `CHANGELOG.md` (modify)
 
@@ -549,12 +784,22 @@ previously refused value starts.
 - (rev 2) A new `Fixed` bullet covers the canonical-host refusal and the
   control-character refusal. It names `134744072`, `example.123` and
   trailing-dot hosts as newly refused.
+- (rev 3) That bullet now states the rule in `CANONICAL_HOST_FORMS`'
+  words, and adds the backslash refusal and the IPv4-embedding classes.
 
 ### `tests/test_auth_operator_messages.py`, `tests/test_transport_http.py`, `tests/test_auth.py` (modify)
 
 - The `_STARTUP_REFUSALS` key and member move to the new name.
 - (rev 2) `_STARTUP_REFUSALS` gains rows for the two new members. The
   registry count goes from 32 to 34, and the raise count from 39 to 41.
+- (rev 3) `_STARTUP_REFUSALS` gains `PUBLIC_URL_BACKSLASH`. The registry
+  goes to 35 and the raises to 42. In `tests/test_auth.py`:
+  - The matrix comment adds RFC 6145 IPv4-translated and RFC 8215
+    local-use NAT64, and records that 6to4 and Teredo are now classified on
+    their embedded addresses.
+  - `_MUST_ACCEPT_HOSTS` gains `::ffff:0:808:808`.
+  - `_MUST_REJECT_HOSTS` gains `::ffff:0:a9fe:a9fe`, `::ffff:0:7f00:1` and
+    `64:ff9b:1::808:808`.
 - (rev 2) `tests/test_auth.py`:
   - `test_public_auth_url_rejects_non_public_ip_literals` accepts
     `NOT_PUBLIC` or `HOST_NOT_CANONICAL`. Legacy numeric forms are now
@@ -572,12 +817,11 @@ previously refused value starts.
 
 ### `tests/test_auth_public_url_rule.py` (create)
 
-1134 tests, about 3.5 s:
+2176 tests, about 7 s (rev 3; rev 2 had 1134):
 
-1. `test_the_sanitiser_applies_the_rule[class]`: each of the 69 classes,
+1. `test_the_sanitiser_applies_the_rule[class]`: each of the 83 classes,
    strict and operator.
-2. `test_each_refusal_is_true_of_its_input[class]`: each refusal's claim
-   holds for its input, by an independent oracle.
+2. (rev 3: replaced by item 14) `test_each_refusal_is_true_of_its_input`.
 3. `test_every_accepted_url_is_absolute_https[class]`: the accepted rule,
    seen from the other side.
 4. `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http[host, scheme, allow]`:
@@ -623,9 +867,39 @@ previously refused value starts.
     `create_http_app` and remote elicitation all refuse it as
     non-canonical.
 
-The oracle `_claim_holds` gains `CONTROL` and `NOT_CANONICAL`, so
-`test_each_refusal_is_true_of_its_input` checks the two new texts against
-every class that reaches them.
+14. (rev 3) `test_each_message_is_true_and_acceptance_is_exact[url]`: 871
+    inputs generated from the grammar, checked against the text-keyed
+    oracle in both directions. See *Rev 3: the message states the rule*.
+15. (rev 3) `test_the_text_oracle_covers_every_sanitiser_message`: the
+    oracle's keys equal the texts the sanitiser raises, and its clauses
+    equal the message's.
+16. (rev 3) `test_every_control_character_is_refused_inside_and_stripped_only_at_the_ends[code]`:
+    33 codes (0x00 to 0x1F, and 0x7F).
+    - A control anywhere inside the host or path is refused.
+    - A leading C0 control is stripped, and a leading DEL is refused.
+    - A trailing tab, CR or LF is stripped, and any other trailing control
+      is refused.
+17. (rev 3) `test_every_ipv4_embedding_is_classified_on_the_embedded_address[form/v4]`:
+    54 addresses (Design decision 10).
+18. (rev 3) `test_the_canonical_rule_has_one_wording`: the message, the
+    README and the docstring all carry `CANONICAL_HOST_FORMS`.
+19. (rev 3) `test_tunnel_prefixes_are_classified_on_their_embedded_addresses[host]`:
+    the test patches `IPv6Address.is_global` to call 6to4, Teredo and
+    local-use NAT64 global, simulating an interpreter with a different
+    special-purpose table. With that patch:
+    - 6to4 or Teredo embedding 10.0.0.5 is still refused.
+    - Local-use NAT64 is still refused whole.
+    - 6to4 and Teredo embedding only 8.8.8.8 are accepted, which proves the
+      patch takes effect.
+
+    Without this test, M39 to M41 survived on 3.10.21, because these
+    prefixes are already non-global there.
+20. (rev 3) `test_operator_loopback_does_not_rest_on_is_loopback_for_mapped`:
+    the test patches `IPv6Address.is_loopback` to say False for
+    IPv4-mapped addresses, as older CPython releases did, and checks that
+    the operator still accepts `http://[::ffff:127.0.0.1]/`. This kills M30.
+
+Item 7 now runs 83 classes x 9 entry points = 747 cases.
 
 ## Documentation impact
 
@@ -656,10 +930,10 @@ mkdir -p /var/tmp/pmcp-341-bt-$USER
 Apply *Verbatim bodies* (see *How to apply*), then:
 
 ```bash
-# 1. the new module (spike: 1134 passed, 3.9 s)
+# 1. the new module (spike: 2176 passed, 7.4 s)
 .venv/bin/python -m pytest tests/test_auth_public_url_rule.py -q -p no:cacheprovider \
   --basetemp=/var/tmp/pmcp-341-bt-$USER/new --cov-fail-under=0
-# 2. the suites that touch auth, the HTTP transport, the CLI and the redactor (spike: 2138 passed, 55 deselected, 0 failed, 85 s)
+# 2. the suites that touch auth, the HTTP transport, the CLI and the redactor (spike: 3187 passed, 55 deselected, 0 failed, 93 s)
 env -u npm_config_cache -u npm_config_store_dir .venv/bin/python -m pytest \
   tests/test_auth.py tests/test_transport_http.py tests/test_auth_origin_wiring.py \
   tests/test_redaction_additive.py tests/test_auth_operator_messages.py tests/test_auth_public_url_rule.py \
@@ -669,41 +943,50 @@ env -u npm_config_cache -u npm_config_store_dir .venv/bin/python -m pytest \
 .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
 .venv/bin/mypy src/pmcp/auth.py src/pmcp/cli.py src/pmcp/transport/http.py
 python3 scripts/check_security_claims.py          # expect OK, 129 cited node ids
-# 4. the full suite, once, detached (memory on dev0 is shared) (spike: 6663 passed, 3 skipped, 80 deselected, 0 failed, 487 s)
+# 4. the full suite, once, detached (memory on dev0 is shared) (spike: 7712 passed, 3 skipped, 80 deselected, 0 failed, 495 s)
 env -u npm_config_cache -u npm_config_store_dir nohup .venv/bin/python -m pytest -q -p no:cacheprovider \
   --basetemp=/var/tmp/pmcp-341-bt-$USER/full > "$WORKTREE_ROOT/pmcp-341-full.log" 2>&1 &
 ```
 
-**Red on main (rev 2).** On `31c1357` with only the new module added:
-**606 failed, 528 passed**. By test:
+**Red on main (rev 3).** On `31c1357` with only the new module added:
+**1465 failed, 711 passed**. The largest groups:
 
 | Test | Failed |
 |---|---|
-| `test_every_entry_point_applies_the_rule` | 311 |
+| `test_each_message_is_true_and_acceptance_is_exact` | 744 |
+| `test_every_entry_point_applies_the_rule` | 374 |
 | `test_pmcp_classifies_the_host_yarl_will_connect_to` | 230 |
-| `test_the_sanitiser_applies_the_rule` | 35 |
+| `test_the_sanitiser_applies_the_rule` | 42 |
+| `test_every_control_character_is_refused_inside_and_stripped_only_at_the_ends` | 33 |
 | `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http` | 21 |
+| `test_every_ipv4_embedding_is_classified_on_the_embedded_address` | 5 |
 | `test_the_panel_hosts_map_to_non_public_hosts_in_yarl_and_are_refused` | 4 |
-| `test_pmcp_classifies_the_host_a_browser_will_open` | 1 |
-| `test_the_plain_http_text_makes_no_loopback_claim` | 1 |
-| `test_the_table_covers_every_member_the_sanitiser_raises` | 1 |
-| `test_the_readme_url_table_matches_the_code` | 1 |
-| `test_the_superseded_wording_is_gone` | 1 |
+| `test_tunnel_prefixes_are_classified_on_their_embedded_addresses` | 4 |
+| `test_operator_loopback_does_not_rest_on_is_loopback_for_mapped` | 1 |
 
-The two differentials fail on main for the F001 reason. Main accepts hosts
-that yarl or WHATWG read as loopback or private, and hosts that they read as
-a different host from the one stored. The *Embedding proof* section also
-runs the rev-2 differential against rev 1's sanitiser: 235 failed. The
-plain-http rows fail because main raises the old member, whose text is the
-false loopback claim. The tests that pass on main are the rows whose
-behaviour this plan does not change.
+Nine more tests fail once each: the WHATWG differential, the canonical
+one-wording test, the text-oracle coverage test, the README table, the
+superseded-wording test, the table-coverage test and the plain-http text
+test. (These per-test counts group parametrised ids by test name, so a few
+IPv6 ids may fall into the wrong group. The total is exact.)
+
+The differentials fail on main for the rev-2 F001 reason. The embedding
+test fails for exactly the five IPv4-translated addresses that embed a
+non-public IPv4 address (127.0.0.1, 10.0.0.5, 169.254.169.254, 100.64.0.1
+and 0.0.0.0). Main accepted all five, including `[::ffff:0:a9fe:a9fe]`.
+The five table-independence cases fail on main too. Under a table that
+calls the tunnel prefixes global, main accepts 6to4 and Teredo embedding
+10.0.0.5, and local-use NAT64. With `is_loopback` false for mapped
+addresses, main refuses the operator's `[::ffff:127.0.0.1]`. So on main
+these outcomes rest on the interpreter. The rev-2
+proof also ran the differentials against rev 1's sanitiser: 235 failed.
 
 ## Acceptance criteria
 
 - [ ] `AuthMessage` has `PUBLIC_URL_PLAIN_HTTP_REFUSED` with the exact text
       above, and no `PUBLIC_URL_HTTP_LOOPBACK_ONLY`.
 - [ ] For every class in the ground-truth table, every entry point gives the
-      table's result (`test_every_entry_point_applies_the_rule`, 621 cases).
+      table's result (`test_every_entry_point_applies_the_rule`, 747 cases).
 - [ ] Every refusal's text is true for every input that reaches it
       (`test_each_refusal_is_true_of_its_input`,
       `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`).
@@ -717,6 +1000,17 @@ behaviour this plan does not change.
       result, and both differentials pass: pmcp never accepts a host that
       yarl or a WHATWG parser reads as a non-public host, or as a different
       host from the one stored.
+- [ ] (rev 3) `test_each_message_is_true_and_acceptance_is_exact` passes
+      on all 871 inputs, and `test_the_text_oracle_covers_every_sanitiser_message`
+      passes: each refusal text is true of every input that reaches it, and
+      a strict caller accepts exactly the URLs of which no refusal text is
+      true.
+- [ ] (rev 3) `CANONICAL_HOST_FORMS` is the one wording: the message, the
+      README and the docstring carry it.
+- [ ] (rev 3) A backslash anywhere is refused. Every IPv4-embedding IPv6
+      form is classified on its embedded address, and local-use NAT64 is
+      refused.
+- [ ] (rev 3) The seat's falsifiers for F001 and F002 pass.
 - [ ] (rev 2) A control character inside a URL is refused; leading
       spaces/controls and a trailing tab/CR/LF are still dropped.
 - [ ] The #326 module `tests/test_auth_operator_messages.py` passes
@@ -727,7 +1021,7 @@ behaviour this plan does not change.
 ## Mutation table
 
 Measured on the proof tree (*Embedding proof*) with
-`scratchpad/341r2/mutants.py`; an earlier run on the spike, without M18, gave
+`scratchpad/341r3/mutants.py`; an earlier run on the spike, without M18, gave
 the same result for every other mutant. Each mutant is one
 or more exact string edits to `auth.py`, `transport/http.py`, `cli.py`,
 `README.md` or `CHANGELOG.md`. Each one runs
@@ -736,41 +1030,53 @@ tests/test_auth_operator_messages.py` with `-o timeout=60` and a 300 s cap,
 then restores every touched file from its saved copy in a `finally`. After
 the run, every file was checked byte-identical by sha256.
 
-**30 mutants: 27 red, 3 equivalent (M13, M21, M30).** M19 is checked by mypy, not pytest. M20 to M31 are rev 2's.
+**42 mutants: 39 red, 3 equivalent (M13, M21, M36).** M19 is checked by mypy, not pytest. M20 to M31 are rev 2's, and M32 to M43 are rev 3's; M32 to M35 are the round-2 seat's own four survivors.
 
 | # | Mutant | Red tests (measured) |
 |---|---|---|
-| M1 | old loopback text restored in the registry | 2 red -- `test_invalid_metadata_url_does_not_create_route_or_challenge_header`, `test_the_plain_http_text_makes_no_loopback_claim` |
-| M2 | plain-http guard: `or` -> `and` (strict callers accept http) | 69 red -- `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
-| M3 | plain-http raise names PUBLIC_URL_NOT_PUBLIC | 102 red -- `test_every_builtin_message_site_is_driven`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_invalid_metadata_url_does_not_create_route_or_challenge_header`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_the_table_covers_every_member_the_sanitiser_raises` |
-| M4 | non-public raise names PUBLIC_URL_PLAIN_HTTP_REFUSED | 140 red -- `test_an_ip_literal_jwks_url_keeps_its_specific_message_through_the_cli`, `test_every_builtin_message_site_is_driven`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_public_auth_url_error_message_does_not_claim_the_host_was_verified`, `test_public_auth_url_rejects_non_public_ip_literals`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_the_table_covers_every_member_the_sanitiser_raises` |
-| M5 | not-absolute raise names PUBLIC_URL_INVALID | 79 red -- `test_cli_and_env_paths_refuse_at_startup`, `test_every_builtin_message_site_is_driven`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_startup_refuses_a_jwks_url_the_renderer_would_refuse`, `test_startup_refuses_a_metadata_url_the_renderer_would_refuse`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_the_table_covers_every_member_the_sanitiser_raises` |
-| M6 | port no longer parsed in the sanitiser | 23 red -- `test_a_swapped_member_at_a_builtin_site_is_a_type_error_not_a_placeholder`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
-| M7 | `localhost` no longer a non-public name | 25 red -- `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_public_auth_url_rejects_non_public_ip_literals`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
-| M8 | auth `_is_loopback_host` also takes *.localhost | 5 red -- `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_sanitiser_applies_the_rule` |
+| M1 | old loopback text restored in the registry | 37 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_invalid_metadata_url_does_not_create_route_or_challenge_header`, `test_the_plain_http_text_makes_no_loopback_claim`, `test_the_text_oracle_covers_every_sanitiser_message` |
+| M2 | plain-http guard: `or` -> `and` (strict callers accept http) | 81 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
+| M3 | plain-http raise names PUBLIC_URL_NOT_PUBLIC | 115 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_message_site_is_driven`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_invalid_metadata_url_does_not_create_route_or_challenge_header`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_the_table_covers_every_member_the_sanitiser_raises`, `test_the_text_oracle_covers_every_sanitiser_message` |
+| M4 | non-public raise names PUBLIC_URL_PLAIN_HTTP_REFUSED | 317 red -- `test_an_ip_literal_jwks_url_keeps_its_specific_message_through_the_cli`, `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_message_site_is_driven`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_every_ipv4_embedding_is_classified_on_the_embedded_address`, `test_public_auth_url_error_message_does_not_claim_the_host_was_verified`, `test_public_auth_url_rejects_non_public_ip_literals`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_the_table_covers_every_member_the_sanitiser_raises`, `test_the_text_oracle_covers_every_sanitiser_message` |
+| M5 | not-absolute raise names PUBLIC_URL_INVALID | 87 red -- `test_cli_and_env_paths_refuse_at_startup`, `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_message_site_is_driven`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_startup_refuses_a_jwks_url_the_renderer_would_refuse`, `test_startup_refuses_a_metadata_url_the_renderer_would_refuse`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_the_table_covers_every_member_the_sanitiser_raises`, `test_the_text_oracle_covers_every_sanitiser_message` |
+| M6 | port no longer parsed in the sanitiser | 25 red -- `test_a_swapped_member_at_a_builtin_site_is_a_type_error_not_a_placeholder`, `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
+| M7 | `localhost` no longer a non-public name | 29 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_public_auth_url_rejects_non_public_ip_literals`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
+| M8 | auth `_is_loopback_host` also takes *.localhost | 8 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_sanitiser_applies_the_rule` |
 | M9 | operator elicitation loses loopback http | 5 red -- `test_every_entry_point_applies_the_rule`, `test_sanitize_url_elicitation_url_allows_loopback_http_for_operator` |
-| M10 | a new refusal in the sanitiser (port 0) without a table row | 12 red -- `test_every_entry_point_applies_the_rule`, `test_the_sanitiser_applies_the_rule`, `test_the_site_check_sees_every_site`, `test_the_table_covers_every_member_the_sanitiser_raises` |
-| M11 | CLI skips the JWKS URL check | 62 red -- `test_an_ip_literal_jwks_url_keeps_its_specific_message_through_the_cli`, `test_cli_and_env_paths_refuse_at_startup`, `test_every_entry_point_applies_the_rule`, `test_inner_whitespace_is_refused_at_startup_not_by_the_sanitiser` |
-| M12 | create_http_app skips the metadata URL check | 66 red -- `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_inner_whitespace_is_refused_at_startup_not_by_the_sanitiser`, `test_invalid_metadata_url_does_not_create_route_or_challenge_header`, `test_startup_refuses_a_metadata_url_the_renderer_would_refuse`, `test_the_panel_hosts_map_to_non_public_hosts_in_yarl_and_are_refused` |
+| M10 | a new refusal in the sanitiser (port 0) without a table row | 14 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_the_sanitiser_applies_the_rule`, `test_the_site_check_sees_every_site`, `test_the_table_covers_every_member_the_sanitiser_raises`, `test_the_text_oracle_covers_every_sanitiser_message` |
+| M11 | CLI skips the JWKS URL check | 72 red -- `test_an_ip_literal_jwks_url_keeps_its_specific_message_through_the_cli`, `test_cli_and_env_paths_refuse_at_startup`, `test_every_entry_point_applies_the_rule`, `test_inner_whitespace_is_refused_at_startup_not_by_the_sanitiser` |
+| M12 | create_http_app skips the metadata URL check | 76 red -- `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_inner_whitespace_is_refused_at_startup_not_by_the_sanitiser`, `test_invalid_metadata_url_does_not_create_route_or_challenge_header`, `test_startup_refuses_a_metadata_url_the_renderer_would_refuse`, `test_the_panel_hosts_map_to_non_public_hosts_in_yarl_and_are_refused` |
 | M13 | create_http_app skips sanitising the JWKS URL up front | **0 red -- equivalent** (see below) |
 | M14 | README row flipped: http loopback shown as accepted | 1 red -- `test_the_readme_url_table_matches_the_code` |
 | M15 | README drops the only `invalid URL` example | 1 red -- `test_the_readme_url_table_matches_the_code` |
 | M16 | README restores the superseded refused-list wording | 1 red -- `test_the_superseded_wording_is_gone` |
 | M17 | CHANGELOG restores the superseded wording | 1 red -- `test_the_superseded_wording_is_gone` |
 | M18 | AsyncJWKS stores its URL unsanitised | 3 red -- `test_a_value_the_store_cleans_is_checked_as_stored` |
-| M20 | rev 2: the canonical-host check removed | 459 red -- `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_public_auth_host_does_not_read_python_int_quirks_as_addresses`, `test_public_auth_url_still_accepts_non_numeric_hosts_after_canonicalisation`, `test_the_panel_hosts_map_to_non_public_hosts_in_yarl_and_are_refused`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
+| M20 | rev 2: the canonical-host check removed | 752 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_public_auth_host_does_not_read_python_int_quirks_as_addresses`, `test_public_auth_url_still_accepts_non_numeric_hosts_after_canonicalisation`, `test_the_panel_hosts_map_to_non_public_hosts_in_yarl_and_are_refused`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
 | M21 | rev 2: non-ASCII hosts allowed (isascii check dropped) | **0 red -- equivalent** (see below) |
-| M22 | rev 2: IPv6 zone ids allowed | 23 red -- `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_the_sanitiser_applies_the_rule` |
-| M23 | rev 2: no WHATWG ends-in-a-number branch (legacy numeric read as names) | 80 red -- `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_public_auth_url_still_accepts_non_numeric_hosts_after_canonicalisation`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
-| M24 | rev 2: host checked unbracketed and lowercased (`parsed.hostname`) | 91 red -- `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_s10_metadata_resource_fallback_keeps_ipv6_brackets`, `test_sanitize_url_elicitation_url_allows_loopback_http_for_operator`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
-| M25 | rev 2: control characters inside the URL allowed | 51 red -- `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_the_sanitiser_applies_the_rule` |
-| M26 | rev 2: trailing newline no longer stripped | 24 red -- `test_a_value_the_store_cleans_is_checked_as_stored`, `test_configs_that_start_on_main_still_start`, `test_every_entry_point_applies_the_rule`, `test_the_sanitiser_applies_the_rule` |
-| M27 | rev 2: LDH labels allow underscore | 12 red -- `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_public_auth_host_does_not_read_python_int_quirks_as_addresses`, `test_the_sanitiser_applies_the_rule` |
-| M28 | rev 2: empty labels allowed (trailing dot passes) | 45 red -- `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
-| M29 | rev 2: IPv4 not required to be in canonical text (leading zeros) | 67 red -- `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
-| M30 | rev 2: operator loopback no longer unwraps IPv4-mapped | **0 red -- equivalent** (see below) |
+| M22 | rev 2: IPv6 zone ids allowed | 26 red -- `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_the_sanitiser_applies_the_rule` |
+| M23 | rev 2/3: no digit-led-last-label branch (legacy numeric read as names) | 172 red -- `test_an_ip_literal_jwks_url_keeps_its_specific_message_through_the_cli`, `test_auth_challenge_marks_a_public_literal_verified`, `test_auth_metadata_reports_a_literal_and_a_name_differently`, `test_downstream_elicitation_marks_a_public_literal_verified`, `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_fetch_json_metadata_uses_safe_request_headers`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_public_auth_url_accepts_public_ip_literals`, `test_public_auth_url_error_message_does_not_claim_the_host_was_verified`, `test_sanitize_url_elicitation_url_allows_loopback_http_for_operator`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_url_elicitation_next_step_is_unqualified_for_a_verified_literal` |
+| M24 | rev 2: host checked unbracketed and lowercased (`parsed.hostname`) | 281 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_every_ipv4_embedding_is_classified_on_the_embedded_address`, `test_operator_loopback_does_not_rest_on_is_loopback_for_mapped`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_s10_metadata_resource_fallback_keeps_ipv6_brackets`, `test_sanitize_url_elicitation_url_allows_loopback_http_for_operator`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
+| M25 | rev 2: control characters inside the URL allowed | 155 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_control_character_is_refused_inside_and_stripped_only_at_the_ends`, `test_every_entry_point_applies_the_rule`, `test_the_sanitiser_applies_the_rule` |
+| M26 | rev 2: trailing newline no longer stripped | 32 red -- `test_a_value_the_store_cleans_is_checked_as_stored`, `test_configs_that_start_on_main_still_start`, `test_each_message_is_true_and_acceptance_is_exact`, `test_every_control_character_is_refused_inside_and_stripped_only_at_the_ends`, `test_every_entry_point_applies_the_rule`, `test_the_sanitiser_applies_the_rule` |
+| M27 | rev 2: LDH labels allow underscore | 12 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_sanitiser_applies_the_rule` |
+| M28 | rev 2: empty labels allowed (trailing dot passes) | 21 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_sanitiser_applies_the_rule` |
+| M29 | rev 2: IPv4 not required to be in canonical text (leading zeros) | 75 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
+| M30 | rev 2: operator loopback no longer unwraps IPv4-mapped | 1 red -- `test_operator_loopback_does_not_rest_on_is_loopback_for_mapped` |
 | M31 | rev 2: README canonical row flipped to accepted | 1 red -- `test_the_readme_url_table_matches_the_code` |
-| M19 | `_is_absolute_http(parsed: str)` or `(parsed: SplitResult)` | mypy: `arg-type` at both call sites (`auth.py:211`, `auth.py:714` on the rev-2 spike); with main's `Any`, mypy is silent |
+| M32 | rev 3 (seat F002): control check `< 0x20` -> `< 0x1F` | 3 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_control_character_is_refused_inside_and_stripped_only_at_the_ends` |
+| M33 | rev 3 (seat F002): `_raw_host` takes the first `@` | 32 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_the_sanitiser_applies_the_rule` |
+| M34 | rev 3 (seat F002): LDH labels may start or end with a hyphen | 25 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
+| M35 | rev 3 (seat F002): LDH labels may be 64 characters | 14 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_the_sanitiser_applies_the_rule` |
+| M36 | rev 3: last label need not start with a letter | **0 red -- equivalent** (see below) |
+| M37 | rev 3: backslash allowed | 25 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
+| M38 | rev 3: IPv4-translated prefix not unwrapped | 23 red -- `test_every_entry_point_applies_the_rule`, `test_every_ipv4_embedding_is_classified_on_the_embedded_address`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
+| M39 | rev 3: local-use NAT64 not refused whole | 1 red (parametrised ids only) |
+| M40 | rev 3: 6to4 embedded address not classified | 1 red (parametrised ids only) |
+| M41 | rev 3: Teredo embedded addresses not classified | 2 red (parametrised ids only) |
+| M42 | rev 3: a message clause reworded without re-deriving its oracle | 539 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_the_canonical_rule_has_one_wording`, `test_the_text_oracle_covers_every_sanitiser_message` |
+| M43 | rev 3: README canonical clause drifts from the source | 1 red -- `test_the_canonical_rule_has_one_wording` |
+| M19 | `_is_absolute_http(parsed: str)` or `(parsed: SplitResult)` | mypy: `arg-type` at both call sites (`auth.py:232`, `auth.py:779` on the rev-3 spike); with main's `Any`, mypy is silent |
 
 M13 is **equivalent**. `AsyncJWKS.__init__`, constructed on the next line,
 runs the same sanitiser on the same URL, so dropping the early call changes
@@ -782,17 +1088,22 @@ URLs with the same members. The #326 module's
 stored `url` keeps its trailing newline.
 
 M21 is **equivalent** too. `_is_canonical_host`'s leading `isascii()` is
-defence in depth. Every later test is ASCII-only: `_LDH_LABEL` and
-`_WHATWG_NUMBER` use explicit `[0-9A-Za-z]` ranges, not `\d`, and
-`IPv4Address` and `IPv6Address` check ASCII digit sets. So no non-ASCII host
-gets through without it. The 287-host differential confirms this: it
-stayed green.
+defence in depth. Every later test is ASCII-only: `_LDH_LABEL` uses
+explicit `[0-9A-Za-z]` ranges, and `isdigit()` and `isalpha()` see only
+ASCII after it. `IPv4Address` and `IPv6Address` check ASCII digit sets. So
+no non-ASCII host gets through without it, and the 287-host differential
+stayed green under the mutant.
 
-M30 is **equivalent on the measured interpreter**. CPython 3.10.21's
-`IPv6Address.is_loopback` already treats `::ffff:127.0.0.1` as loopback, as
-does every 3.10+ release that has the 2024 `ipaddress` IPv4-mapped fix. The
-explicit unwrap pins that behaviour for interpreters that predate the fix,
-and no supported test interpreter here can show the difference.
+M36 is **equivalent** (rev 3). Dropping "the last label starts with a
+letter" changes nothing, because a digit-led last label has already been
+sent to the dotted-quad branch, and `_LDH_LABEL` requires a letter or digit
+first. The check stays because it is the code form of the message's
+clause, and the text oracle holds the message to it.
+
+M30, M39, M40 and M41 survived the first rev-3 run. They change behaviour
+only on an interpreter whose `ipaddress` table differs from 3.10.21's, so
+the rev-3 spike gained tests 19 and 20. Those simulate such a table by
+patching `is_global` and `is_loopback`, and the second run kills all four.
 
 Every other mutant is red.
 
@@ -802,6 +1113,7 @@ Every other mutant is red.
   of one member change, plus docs and an annotation.
 - `*.localhost` / port-0 handling (*Findings*, follow-up).
 - Canonicalising (IDNA/NFKC) instead of refusing (Design decision 6).
+- `localhost6` / `ip6-localhost` (the `*.localhost` follow-up).
 - Resolving DNS names (Consiliency/pmcp#211, a deliberate non-goal there).
 - The elicitation wrapper's own text (`ELICITATION_URL_INVALID`). It is true
   for every input and unchanged.
@@ -840,7 +1152,7 @@ Every other mutant is red.
 
 ````diff
 diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
-index 51b2d05..1d58e38 100644
+index 51b2d05..ac7b72d 100644
 --- a/src/pmcp/auth.py
 +++ b/src/pmcp/auth.py
 @@ -13,7 +13,7 @@ from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
@@ -852,7 +1164,27 @@ index 51b2d05..1d58e38 100644
  from urllib.request import HTTPRedirectHandler, Request, build_opener
  
  import aiohttp
-@@ -106,12 +106,30 @@ class AuthMessage:
+@@ -54,6 +54,19 @@ class PyJwtText(str):
+         return obj
+ 
+ 
++#: The canonical host forms (Consiliency/pmcp#341 rev 3), one clause each.
++#: The single source of the rule: `AuthMessage.PUBLIC_URL_HOST_NOT_CANONICAL`
++#: is built from these clauses, and tests require the README rule and the
++#: `sanitize_public_auth_url` docstring to carry each one verbatim.
++CANONICAL_HOST_FORMS = (
++    "a DNS name of dot-separated labels of 1 to 63 ASCII letters, digits and "
++    "hyphens, each starting and ending with a letter or digit, the last "
++    "starting with a letter, so never a number (an IDN in its xn-- form)",
++    "a dotted-quad IPv4 address with no leading zeros",
++    "a bracketed IPv6 address with no zone id",
++)
++
++
+ class AuthMessage:
+     """The registry of every fixed operator-facing message that `pmcp.auth`
+     and `pmcp.transport.http` raise or send as an auth rejection -- the auth
+@@ -106,12 +119,38 @@ class AuthMessage:
      PUBLIC_URL_NOT_ABSOLUTE = AuthText(
          "Public auth URL must be an absolute HTTP(S) URL."
      )
@@ -873,19 +1205,27 @@ index 51b2d05..1d58e38 100644
 +    # every fetcher reads the same way. yarl/aiohttp NFKC- and IDNA-map
 +    # `１２７.0.0.1` and `127。0。0。1` to 127.0.0.1, and a WHATWG parser
 +    # decodes `127%2E0%2E0%2E1`; pmcp saw names there. Anything else is
-+    # refused, not rewritten.
++    # refused, not rewritten. Rev 3: the text states the whole rule, from
++    # `CANONICAL_HOST_FORMS`, so it is true of every host it refuses.
 +    PUBLIC_URL_CONTROL_CHARACTER = AuthText(
 +        "Public auth URL contains a control character."
 +    )
++    # Rev 3: WHATWG ends the authority at `\` (yarl and urlsplit do not), so
++    # `https://127.0.0.1\@auth.example.com/` is 127.0.0.1 to a browser.
++    PUBLIC_URL_BACKSLASH = AuthText("Public auth URL contains a backslash.")
 +    PUBLIC_URL_HOST_NOT_CANONICAL = AuthText(
-+        "Public auth URL host must be plain ASCII: a DNS name of letters, "
-+        "digits and hyphens (an IDN in its xn-- form), a dotted-quad IPv4 "
-+        "address, or a bracketed IPv6 address without a zone."
++        "Public auth URL host must be "
++        + CANONICAL_HOST_FORMS[0]
++        + "; "
++        + CANONICAL_HOST_FORMS[1]
++        + "; or "
++        + CANONICAL_HOST_FORMS[2]
++        + "."
 +    )
      ELICITATION_URL_INVALID = AuthText("Invalid URL-mode elicitation URL.")
      # -- HTTP transport startup refusals --
      UNSUPPORTED_AUTH_MODE = AuthText("Unsupported auth mode.")
-@@ -170,7 +188,7 @@ _MEMBER_FIELDS = {
+@@ -170,7 +209,7 @@ _MEMBER_FIELDS = {
  _SCOPE_LIST = re.compile(r"[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*")
  
  
@@ -894,7 +1234,7 @@ index 51b2d05..1d58e38 100644
      """The absolute-HTTP(S) rule `sanitize_public_auth_url` applies to every
      configured auth URL: an http(s) scheme, a netloc and a hostname."""
      return (
-@@ -397,12 +415,75 @@ def redact_auth_url(url: str) -> str:
+@@ -397,31 +436,108 @@ def redact_auth_url(url: str) -> str:
  
  
  def _is_loopback_host(hostname: str) -> bool:
@@ -924,11 +1264,14 @@ index 51b2d05..1d58e38 100644
 +# A trailing space is kept, as before, and refused at startup (#326).
 +_C0_OR_SPACE = "".join(chr(code) for code in range(0x21))
 +_TRAILING_NEWLINE = "\t\r\n"
++# `CANONICAL_HOST_FORMS[0]`: 1-63 letters, digits, hyphens; a letter or
++# digit at each end. The last label must also start with a letter: a WHATWG
++# parser reads a host whose last label is a number (`example.123`,
++# `0x7f.1`) as an IPv4 address or rejects it, and `getaddrinfo` reads
++# `2130706433` as 127.0.0.1, so a host whose last label starts with a digit
++# is accepted only as a dotted quad (rev 3: "starts with a letter" replaces
++# rev 2's WHATWG-number test; it is stricter and states in one phrase).
 +_LDH_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
-+# WHATWG URL "ends in a number": a last label that is all decimal digits or
-+# `0x` hex makes the host an IPv4 address or a parse failure in a browser,
-+# while `getaddrinfo` reads `2130706433` or `0x7f.1` as 127.0.0.1.
-+_WHATWG_NUMBER = re.compile(r"[0-9]+|0[xX][0-9A-Fa-f]*")
 +
 +
 +def _raw_host(netloc: str) -> str:
@@ -943,13 +1286,12 @@ index 51b2d05..1d58e38 100644
 +
 +
 +def _is_canonical_host(raw: str) -> bool:
-+    """True only for a host that yarl/aiohttp, `getaddrinfo` and a WHATWG
-+    parser all read as the same name or address as `ipaddress` does: ASCII
-+    letter-digit-hyphen labels with no empty label (so no trailing dot), a
-+    strict dotted-quad IPv4 address, or a bracketed IPv6 address without a
-+    zone id. Refused rather than rewritten: Unicode (NFKC/IDNA mapping turns
-+    `１２７.0.0.1` into 127.0.0.1), `%` escapes, underscores, legacy numeric
-+    and octal forms, and a bracketed host that is not IPv6 (`[v1.fe]`)."""
++    """True only for a host in one of `CANONICAL_HOST_FORMS` -- the forms
++    yarl/aiohttp, `getaddrinfo` and a WHATWG parser all read as the same name
++    or address that `ipaddress` does. Refused rather than rewritten: Unicode
++    (NFKC/IDNA mapping turns `１２７.0.0.1` into 127.0.0.1), `%` escapes,
++    underscores, empty labels (a trailing dot), legacy numeric and octal
++    forms, and a bracketed host that is not IPv6 (`[v1.fe]`)."""
 +    if not raw.isascii():
 +        return False
 +    if raw.startswith("["):
@@ -962,46 +1304,168 @@ index 51b2d05..1d58e38 100644
 +            return False
 +        return True
 +    labels = raw.split(".")
-+    if _WHATWG_NUMBER.fullmatch(labels[-1]):
++    if labels[-1][:1].isdigit():
 +        try:
 +            return str(IPv4Address(raw)) == raw
 +        except ValueError:
 +            return False
-+    return all(_LDH_LABEL.fullmatch(label) for label in labels)
++    return labels[-1][:1].isalpha() and all(
++        _LDH_LABEL.fullmatch(label) for label in labels
++    )
  
  
- # Every IPv6 format that carries an IPv4 address in its low 32 bits. The set is
-@@ -601,7 +682,28 @@ UNVERIFIED_URL_CAVEAT = (
+-# Every IPv6 format that carries an IPv4 address in its low 32 bits. The set is
+-# closed and RFC-specified, so enumerating it is defensible -- but the list must
+-# not live only here. The matrix in tests/test_auth.py names each format with its
+-# RFC so that a seventh format is a visible gap rather than a silent one.
++# Every IPv6 format that carries an IPv4 address in its low 32 bits, where
++# the IPv4 address is what a translator reaches. The set is closed and
++# RFC-specified, so enumerating it is defensible -- but the list must not live
++# only here. The matrix in tests/test_auth.py names each format with its RFC
++# so that a new format is a visible gap rather than a silent one.
+ _V4_EMBEDDING_NETWORKS = (
+-    ip_network("::ffff:0:0/96"),  # RFC 4291 IPv4-mapped
++    ip_network("::ffff:0:0/96"),  # RFC 4291 IPv4-mapped (IANA special-purpose)
++    ip_network("::ffff:0:0:0/96"),  # RFC 2765/6145 IPv4-translated (SIIT); #341 rev 3
+     ip_network("::/96"),  # RFC 4291 IPv4-compatible (deprecated)
+-    ip_network("64:ff9b::/96"),  # RFC 6052 NAT64 well-known prefix
++    ip_network("64:ff9b::/96"),  # RFC 6052 NAT64 well-known prefix (IANA)
+ )
++# RFC 8215 local-use NAT64 (IANA special-purpose 64:ff9b:1::/48): the IPv4
++# address sits where the operator's prefix length puts it (RFC 6052 2.2, /32
++# to /96), so pmcp cannot locate it. Refused whole, whatever the running
++# Python's `is_global` says (#341 rev 3).
++_V4_EMBEDDING_UNLOCATABLE = (ip_network("64:ff9b:1::/48"),)
+ # RFC 5214 §6.1: an ISATAP interface identifier is the full 32 bits
+ # `00-00-5E-FE` -- or `02-00-5E-FE` with the u/g bit set -- immediately followed
+ # by the IPv4 address in the low 32 bits. Matching only the `5efe` hextet is not
+ # enough to identify ISATAP: `2606:4700::1234:5efe:a00:5` is an ordinary global
+ # address that merely happens to carry `5efe` there, and unwrapping it would
+ # reject a genuinely public host.
+-# RFC 3056 6to4 (2002::/16) and RFC 4380 Teredo (2001::/32) need no unwrapping
+-# because neither prefix is global.
++# RFC 3056 6to4 (2002::/16) and RFC 4380 Teredo (2001::/32) embed IPv4
++# addresses outside the low 32 bits (`IPv6Address.sixtofour`, `.teredo`,
++# whose client address is de-obfuscated). Both prefixes are non-global today,
++# but since #341 rev 3 their embedded addresses are classified as well, so
++# the answer does not rest on the running Python's special-purpose table.
+ _ISATAP_INTERFACE_IDS = (0x00005EFE, 0x02005EFE)
+ 
+ # inet_aton part grammar. A part is hex, octal, or decimal; a leading zero is
+@@ -432,33 +548,54 @@ _OCTAL_PART = re.compile(r"0[0-7]*")
+ _DECIMAL_PART = re.compile(r"[0-9]+")
+ 
+ 
+-def _unwrap_embedded_v4(
+-    address: IPv4Address | IPv6Address,
+-) -> IPv4Address | IPv6Address:
+-    """Return the IPv4 address an IPv6 literal embeds, or the address unchanged."""
+-    if isinstance(address, IPv6Address):
+-        for network in _V4_EMBEDDING_NETWORKS:
+-            if address in network:
+-                return IPv4Address(int(address) & 0xFFFFFFFF)
+-        if ((int(address) >> 32) & 0xFFFFFFFF) in _ISATAP_INTERFACE_IDS:
+-            return IPv4Address(int(address) & 0xFFFFFFFF)
+-    return address
++def _is_translated_v4(address: IPv6Address) -> bool:
++    """A low-32-bit embedding: one of `_V4_EMBEDDING_NETWORKS`, or ISATAP."""
++    return any(address in network for network in _V4_EMBEDDING_NETWORKS) or (
++        ((int(address) >> 32) & 0xFFFFFFFF) in _ISATAP_INTERFACE_IDS
++    )
++
++
++def _embedded_v4_addresses(address: IPv6Address) -> list[IPv4Address]:
++    """Every IPv4 address an IPv6 literal embeds, by every format it matches."""
++    found: list[IPv4Address] = []
++    if _is_translated_v4(address):
++        found.append(IPv4Address(int(address) & 0xFFFFFFFF))
++    if address.sixtofour is not None:
++        found.append(address.sixtofour)
++    if address.teredo is not None:
++        found.extend(address.teredo)
++    return found
++
++
++def _is_public_single(address: IPv4Address | IPv6Address) -> bool:
++    return bool(
++        address.is_global
++        and not getattr(address, "is_site_local", False)
++        and not address.is_multicast
++    )
+ 
+ 
+ def _is_public_ip(address: IPv4Address | IPv6Address) -> bool:
+-    """Classify an address positively, after unwrapping any embedded IPv4.
++    """Classify an address positively, and an IPv6 address on every IPv4
++    address it embeds as well (Consiliency/pmcp#341 rev 3).
+ 
+     Classifying positively (what *is* public) rather than subtracting a list of
+     bad properties is deliberate: the subtractive form missed RFC 6598 CGNAT and
+     RFC 3879 site-local. `is_global` alone is not enough -- it is True for
+-    ``fec0::1`` and, on Python 3.10, for multicast.
++    ``fec0::1`` and, on Python 3.10, for multicast. A low-32-bit embedding
++    (mapped, translated, compatible, NAT64, ISATAP) is classified on its IPv4
++    address alone, as before -- that address is what a translator reaches; 6to4
++    and Teredo must pass on both; RFC 8215 local-use NAT64 is refused.
+     """
+-    unwrapped = _unwrap_embedded_v4(address)
+-    return bool(
+-        unwrapped.is_global
+-        and not getattr(unwrapped, "is_site_local", False)
+-        and not unwrapped.is_multicast
+-    )
++    if isinstance(address, IPv6Address):
++        if any(address in network for network in _V4_EMBEDDING_UNLOCATABLE):
++            return False
++        embedded = _embedded_v4_addresses(address)
++        if not all(_is_public_single(v4) for v4 in embedded):
++            return False
++        if _is_translated_v4(address):
++            return True
++    return _is_public_single(address)
+ 
+ 
+ def _numeric_part_values(part: str) -> set[int]:
+@@ -601,7 +738,37 @@ UNVERIFIED_URL_CAVEAT = (
  
  
  def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> str:
 -    """Validate and redact a public absolute auth metadata or elicitation URL."""
 +    """Validate and redact a public absolute auth metadata or elicitation URL.
 +
-+    Accepted (Consiliency/pmcp#341): an absolute ``https://`` URL whose port,
-+    if any, parses (0-65535) and whose host is written in canonical ASCII
-+    (`_is_canonical_host`) and is a public IPv4/IPv6 address or a DNS name
-+    other than ``localhost`` -- a name is not resolved. With
++    Consiliency/pmcp#341. First, leading C0 controls and spaces are stripped,
++    and trailing tabs, CRs and LFs; nothing else is stripped -- a trailing
++    space is kept (the startup check then refuses it as whitespace), and a
++    trailing NUL or other control character is refused like one anywhere
++    else. Then, refused in this order: a C0 control or DEL anywhere
++    (`PUBLIC_URL_CONTROL_CHARACTER`); a backslash anywhere
++    (`PUBLIC_URL_BACKSLASH`); an unparseable port or host
++    (`PUBLIC_URL_INVALID`); no http(s) scheme or no host
++    (`PUBLIC_URL_NOT_ABSOLUTE`); a host that is not
++    a DNS name of dot-separated labels of 1 to 63 ASCII letters, digits and
++    hyphens, each starting and ending with a letter or digit, the last
++    starting with a letter, so never a number (an IDN in its xn-- form);
++    a dotted-quad IPv4 address with no leading zeros;
++    or a bracketed IPv6 address with no zone id
++    (`PUBLIC_URL_HOST_NOT_CANONICAL`); plain ``http://`` the caller does
++    not allow (`PUBLIC_URL_PLAIN_HTTP_REFUSED`); and ``localhost`` or a
++    non-public IP address, an IPv6 address also on every IPv4 address it
++    embeds (`PUBLIC_URL_NOT_PUBLIC`). A DNS name is not resolved. With
 +    ``allow_loopback_http`` (only the operator's URL-mode elicitation path),
-+    also ``http://`` to ``localhost`` (any case), ``127.0.0.0/8``, ``::1`` or
-+    ``::ffff:127.0.0.0/104`` (`_is_loopback_host`). Leading and trailing
-+    spaces and C0 controls, and a trailing tab, CR or LF, are stripped first. Userinfo and auth-bearing
-+    query values are stripped from what is returned, so the stored host is
-+    the one checked. Refused, in this order: a control character inside the
-+    URL (`PUBLIC_URL_CONTROL_CHARACTER`), an unparseable port or host
-+    (`PUBLIC_URL_INVALID`), no http(s) scheme or no host
-+    (`PUBLIC_URL_NOT_ABSOLUTE`), a host not in canonical ASCII
-+    (`PUBLIC_URL_HOST_NOT_CANONICAL`), plain ``http://`` the caller does not
-+    allow (`PUBLIC_URL_PLAIN_HTTP_REFUSED`), and a non-public IP address or
-+    ``localhost`` (`PUBLIC_URL_NOT_PUBLIC`).
++    ``http://`` to ``localhost`` (any case), ``127.0.0.0/8``, ``::1`` or
++    ``::ffff:127.0.0.0/104`` is accepted (`_is_loopback_host`). Userinfo and
++    auth-bearing query values are stripped from what is returned, so the
++    stored host is the one checked.
 +    """
 +    url = url.lstrip(_C0_OR_SPACE).rstrip(_TRAILING_NEWLINE)
 +    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in url):
 +        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_CONTROL_CHARACTER))
++    if "\\" in url:
++        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_BACKSLASH))
      try:
          parsed = urlparse(url)
          hostname = parsed.hostname
-@@ -611,11 +713,13 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) ->
+@@ -611,11 +778,13 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) ->
  
      if not _is_absolute_http(parsed) or not hostname:
          raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_NOT_ABSOLUTE))
@@ -1016,7 +1480,7 @@ index 51b2d05..1d58e38 100644
      if not (
          allow_loopback_http and parsed.scheme == "http" and _is_loopback_host(hostname)
      ):
-@@ -1004,7 +1108,11 @@ def sanitize_url_elicitation_url(
+@@ -1004,7 +1173,11 @@ def sanitize_url_elicitation_url(
      ``operator``
          The URL was typed by the operator into ``gateway.auth_connect``. Local
          OAuth redirects back to ``http://127.0.0.1``, and refusing that would
@@ -1035,7 +1499,7 @@ index 51b2d05..1d58e38 100644
 
 ````diff
 diff --git a/tests/test_auth.py b/tests/test_auth.py
-index e34a906..7a5e262 100644
+index e34a906..00e1c17 100644
 --- a/tests/test_auth.py
 +++ b/tests/test_auth.py
 @@ -20,6 +20,7 @@ from pmcp.auth import (
@@ -1046,7 +1510,54 @@ index e34a906..7a5e262 100644
      fetch_json_metadata,
      is_verified_public_auth_url,
      normalize_auth_metadata,
-@@ -933,8 +934,13 @@ def test_public_auth_url_rejects_non_public_ip_literals(
+@@ -829,6 +830,7 @@ def test_sanitize_public_auth_url_rejects_invalid_and_non_public_urls() -> None:
+ # de-duplicate these labels.
+ #
+ #   RFC 4291  IPv4-mapped         ::ffff:0:0/96    unwrapped
++#   RFC 6145  IPv4-translated     ::ffff:0:0:0/96  unwrapped (#341 rev 3)
+ #   RFC 4291  IPv4-compatible     ::/96            unwrapped (deprecated form)
+ #   RFC 6052  NAT64 well-known    64:ff9b::/96     unwrapped
+ #   RFC 5214  ISATAP              ..:0:5efe:a.b.c.d unwrapped by interface id
+@@ -836,11 +838,15 @@ def test_sanitize_public_auth_url_rejects_invalid_and_non_public_urls() -> None:
+ #             02-00-5E-FE with the u/g bit set (RFC 5214 section 6.1). The
+ #             `5efe` hextet alone does NOT identify ISATAP; see the
+ #             over-rejection trap in _MUST_ACCEPT_HOSTS.
+-#   RFC 3056  6to4                2002::/16        already non-global
+-#   RFC 4380  Teredo              2001::/32        already non-global
++#   RFC 3056  6to4                2002::/16        non-global, and its embedded
++#                                                  address is classified too
++#   RFC 4380  Teredo              2001::/32        non-global, and its server and
++#                                                  (de-obfuscated) client too
++#   RFC 8215  local-use NAT64     64:ff9b:1::/48   refused whole: the embedding
++#                                                  position is operator-chosen
+ #
+-# The last two pass today only because neither prefix is global -- luck, not
+-# design. They are pinned below so that stays true.
++# Before #341 rev 3, 6to4 and Teredo passed only because neither prefix is
++# global -- luck, not design. They are still pinned below.
+ # --------------------------------------------------------------------------- #
+ 
+ _MUST_ACCEPT_HOSTS = [
+@@ -851,6 +857,7 @@ _MUST_ACCEPT_HOSTS = [
+     # every IPv4-mapped address is is_reserved.
+     ("::ffff:8.8.8.8", "RFC 4291 IPv4-mapped, wrapping a public address"),
+     ("64:ff9b::808:808", "RFC 6052 NAT64, wrapping a public address"),
++    ("::ffff:0:808:808", "RFC 6145 IPv4-translated, wrapping a public address"),
+     # Over-rejection trap for ISATAP: an ordinary global address that merely
+     # carries `5efe` in that hextet. Matching the marker alone rather than the
+     # full RFC 5214 interface identifier unwraps this to 10.0.0.5 and rejects a
+@@ -875,6 +882,10 @@ _MUST_REJECT_HOSTS = [
+     ("::0:5efe:a00:5", "RFC 5214 ISATAP (00-00-5E-FE), embedding 10.0.0.5"),
+     ("::0:5efe:7f00:1", "RFC 5214 ISATAP (00-00-5E-FE), embedding 127.0.0.1"),
+     ("::200:5efe:a00:5", "RFC 5214 ISATAP with the u/g bit set (02-00-5E-FE)"),
++    # --- Fixed by #341 rev 3 -------------------------------------------------
++    ("::ffff:0:a9fe:a9fe", "RFC 6145 IPv4-translated, embedding 169.254.169.254"),
++    ("::ffff:0:7f00:1", "RFC 6145 IPv4-translated, embedding 127.0.0.1"),
++    ("64:ff9b:1::808:808", "RFC 8215 local-use NAT64, refused whole"),
+     # --- Pinned, not fixed: these are already non-global ---------------------
+     ("2002:0a00:0005::1", "RFC 3056 6to4, embedding 10.0.0.5"),
+     ("2001:0:0:0:0:0:0a00:0005", "RFC 4380 Teredo"),
+@@ -933,8 +944,13 @@ def test_public_auth_url_rejects_non_public_ip_literals(
      with pytest.raises(ValueError) as excinfo:
          sanitize_public_auth_url(_auth_url(host))
      # Guard against passing for the wrong reason -- a malformed URL raises the
@@ -1062,7 +1573,7 @@ index e34a906..7a5e262 100644
  
  
  def test_public_auth_url_error_message_does_not_claim_the_host_was_verified() -> None:
-@@ -969,23 +975,35 @@ def test_public_auth_url_still_accepts_non_numeric_hosts_after_canonicalisation(
+@@ -969,23 +985,35 @@ def test_public_auth_url_still_accepts_non_numeric_hosts_after_canonicalisation(
          "auth.example.com",
          "metadata.google.internal",
          "1.example.com",  # a numeric label, but the host is not a number
@@ -1104,7 +1615,7 @@ index e34a906..7a5e262 100644
  
  def test_normalize_auth_metadata_omits_invalid_urls_with_safe_diagnostics() -> None:
 diff --git a/tests/test_auth_operator_messages.py b/tests/test_auth_operator_messages.py
-index 862d690..a7fd71b 100644
+index 862d690..c6c7712 100644
 --- a/tests/test_auth_operator_messages.py
 +++ b/tests/test_auth_operator_messages.py
 @@ -113,7 +113,7 @@ def _rendered(member: AuthText) -> str:
@@ -1112,7 +1623,7 @@ index 862d690..a7fd71b 100644
      """The registry is the list now (no derivation to shrink): 29 members on
      the round-4 spike, each an `AuthText`, no two with the same text."""
 -    assert len(_MESSAGES) == 32, sorted(_MESSAGES)
-+    assert len(_MESSAGES) == 34, sorted(_MESSAGES)  # +2 in #341 rev 2
++    assert len(_MESSAGES) == 35, sorted(_MESSAGES)  # +2 #341 rev 2, +1 rev 3
      assert len(set(_MESSAGES.values())) == len(_MESSAGES)
      assert all(type(v) is AuthText for v in _MESSAGES.values())
      assert _MESSAGES["KEY_CANNOT_VERIFY_TOKEN"] == (
@@ -1121,7 +1632,7 @@ index 862d690..a7fd71b 100644
              if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_reject":
                  counts["_reject"] += 1
 -    assert counts == {"raise": 39, "_reject": 7}, counts
-+    assert counts == {"raise": 41, "_reject": 7}, counts  # +2 in #341 rev 2
++    assert counts == {"raise": 42, "_reject": 7}, counts  # +2 #341 r2, +1 r3
  
  
  _STATIC_SHAPES = {
@@ -1137,13 +1648,18 @@ index 862d690..a7fd71b 100644
          ValueError,
      ),
      "PUBLIC_URL_NOT_PUBLIC": (
-@@ -1703,6 +1703,16 @@ _STARTUP_REFUSALS: dict[str, tuple[Callable[[], Any], str, type[Exception]]] = {
+@@ -1703,6 +1703,21 @@ _STARTUP_REFUSALS: dict[str, tuple[Callable[[], Any], str, type[Exception]]] = {
          "PUBLIC_URL_NOT_PUBLIC",
          ValueError,
      ),
 +    "PUBLIC_URL_CONTROL_CHARACTER": (
 +        lambda: auth_mod.AsyncJWKS("https://issuer.example/key\x00set.json"),
 +        "PUBLIC_URL_CONTROL_CHARACTER",
++        ValueError,
++    ),
++    "PUBLIC_URL_BACKSLASH": (
++        lambda: auth_mod.AsyncJWKS("https://127.0.0.1\\@issuer.example/jwks.json"),
++        "PUBLIC_URL_BACKSLASH",
 +        ValueError,
 +    ),
 +    "PUBLIC_URL_HOST_NOT_CANONICAL": (
@@ -1175,10 +1691,10 @@ index 237759b..188e5b3 100644
 
 ````diff
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 0ae8ba2..6d5b6a2 100644
+index 0ae8ba2..e45bd52 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -437,6 +437,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+@@ -437,6 +437,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  
  
  ### Fixed
@@ -1188,16 +1704,27 @@ index 0ae8ba2..6d5b6a2 100644
 +  browsers rewrite such hosts before connecting: `https://１２７.0.0.1/`
 +  (full-width digits), `127。0。0。1` and full-width `localhost` reached
 +  127.0.0.1, and `127%2E0%2E0%2E1` decodes to it in a browser. PMCP now
-+  refuses, rather than rewrites, any host that is not a letters-digits-
-+  hyphens DNS name (IDNs in `xn--` form), a dotted-quad IPv4 address or a
-+  bracketed IPv6 address without a zone id (`PUBLIC_URL_HOST_NOT_CANONICAL`).
-+  This also refuses trailing-dot hosts (`localhost.`, `127.0.0.1.`), legacy
++  refuses, rather than rewrites, any host not in canonical form
++  (`PUBLIC_URL_HOST_NOT_CANONICAL`, whose message states the rule): a DNS
++  name of dot-separated labels of 1 to 63 ASCII letters, digits and
++  hyphens, each starting and ending with a letter or digit, the last
++  starting with a letter, so never a number (IDNs in `xn--` form); a
++  dotted-quad IPv4 address with no leading zeros; or a bracketed IPv6
++  address with no zone id. This
++  also refuses trailing-dot hosts (`localhost.`, `127.0.0.1.`), legacy
 +  numeric and octal forms that were accepted when public (`134744072`),
-+  hosts ending in a number (`example.123`), underscores, `[v1.fe]` and IPv6
-+  zone ids. A control character inside the URL is refused
-+  (`PUBLIC_URL_CONTROL_CHARACTER`) instead of being silently deleted
-+  (`key<TAB>set.json` was stored as `keyset.json`) or passed (NUL); leading
-+  spaces and controls and a trailing newline are still dropped. See
++  hosts whose last label starts with a digit (`example.123`), underscores,
++  `[v1.fe]` and IPv6 zone ids. A control character (U+0000 to U+001F, DEL)
++  inside the URL is refused (`PUBLIC_URL_CONTROL_CHARACTER`) instead of
++  being silently deleted (`key<TAB>set.json` was stored as `keyset.json`)
++  or passed (NUL); leading spaces and C0 controls and trailing tabs, CRs
++  and LFs are still dropped. A backslash anywhere in the URL is refused
++  (`PUBLIC_URL_BACKSLASH`): a browser ends the host at it, so
++  `https://127.0.0.1\@auth.example.com/` is 127.0.0.1 there. An IPv6
++  literal that embeds an IPv4 address is classified on that address too,
++  now including the IPv4-translated prefix `::ffff:0:0:0/96`
++  (`[::ffff:0:a9fe:a9fe]` was accepted), 6to4 and Teredo; the local-use
++  NAT64 prefix `64:ff9b:1::/48` is refused. See
 +  [Consiliency/pmcp#341](https://github.com/Consiliency/pmcp/issues/341).
 +- **The plain-`http://` auth URL refusal no longer claims loopback is
 +  allowed.** A JWKS URL or metadata URL such as `http://127.0.0.1/...` was
@@ -1211,7 +1738,7 @@ index 0ae8ba2..6d5b6a2 100644
  - **Auth operator messages come through pmcp's own sanitiser intact, and
    invalid auth configuration refuses startup.** Four auth and startup
    messages were reworded because pmcp's own sanitiser rewrote them (`Token
-@@ -455,8 +481,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+@@ -455,8 +492,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    (a stray value in another mode is ignored, as before); and on the
    programmatic path, `create_http_app` refuses a protected-resource
    metadata URL that normalisation used to drop silently, omitting the
@@ -1227,7 +1754,7 @@ index 0ae8ba2..6d5b6a2 100644
    configuration reaches. The README now documents deployments behind a
    prefix-stripping proxy; the metadata `404` there is a known follow-up,
 diff --git a/README.md b/README.md
-index cfdd1b2..10e5dd9 100644
+index cfdd1b2..2143d71 100644
 --- a/README.md
 +++ b/README.md
 @@ -165,7 +165,8 @@ audience is bound to the configured `resource_server_audience` (the server's
@@ -1240,7 +1767,7 @@ index cfdd1b2..10e5dd9 100644
  signatures are only accepted for the operator-configured
  `resource_server_allowed_algorithms` allowlist (default `RS256`/`ES256`); the
  token's own `alg` header is never trusted. JWKS is fetched
-@@ -204,17 +205,65 @@ that path to PMCP unchanged. An application that mounts PMCP under a
+@@ -204,17 +205,78 @@ that path to PMCP unchanged. An application that mounts PMCP under a
  not at the URL's own path. The `resource` is never taken from the request
  `Host`. A forged token, including one whose algorithm does not match the
  published key's type, gets `401`, never `500`. In resource-server mode over
@@ -1266,28 +1793,36 @@ index cfdd1b2..10e5dd9 100644
 +dropped, with the metadata route silently omitted.
 +
 +An auth URL is accepted only if it is an absolute `https://` URL whose port,
-+if it has one, is a number no greater than 65535, and whose host is written
-+in plain ASCII -- a DNS name of letters, digits and hyphens (an
-+internationalised name in its `xn--` form), a dotted-quad IPv4 address, or a
-+bracketed IPv6 address without a zone id -- and is a public address or a
-+name other than `localhost`. A host in any other spelling is refused rather
++if it has one, is a number no greater than 65535, and whose host is in
++canonical form -- a DNS name of dot-separated labels of 1 to 63 ASCII
++letters, digits and hyphens, each starting and ending with a letter or
++digit, the last starting with a letter, so never a number (an IDN in its xn-- form); a
++dotted-quad IPv4 address with no leading zeros; or a bracketed IPv6 address
++with no zone id -- and is a public address or a name other than
++`localhost`. An IPv6 address that embeds an IPv4 address (IPv4-mapped,
++IPv4-translated, IPv4-compatible, NAT64, ISATAP, 6to4, Teredo) must be
++public on the embedded address too; the local-use NAT64 prefix
++`64:ff9b:1::/48` is refused. A host in any other spelling is refused rather
 +than rewritten, because the HTTP client and a browser would rewrite it
 +first: `https://１２７.0.0.1/` (full-width digits), `127。0。0。1`, full-width
 +`localhost`, `127%2E0%2E0%2E1`, `127.0.0.1.` (trailing dot), legacy numeric
-+and octal forms such as `2130706433` or `0177.0.0.1`, `[v1.fe]` and
-+`[fe80::1%25eth0]` are all refused, as are `bücher.example` (write
-+`xn--bcher-kva.example`), underscores and empty labels. PMCP drops leading
-+spaces and control characters and a trailing tab, CR or LF; a control
-+character anywhere else (a tab, CR, LF, NUL or DEL) is refused, and so is a
-+space when the URL is a JWKS or metadata URL. A DNS name is not resolved
-+(see below), and only the exact name `localhost` is treated as loopback:
-+`*.localhost` is a name like any other and passes unresolved. Userinfo such
-+as `user:pass@` is accepted and dropped. Everything else is refused,
-+including plain `http://` to any host, loopback hosts too, and `https://`
-+to `localhost` or a loopback address. (Plain `http://` to `localhost`,
-+`127.0.0.0/8`, `[::1]` or `[::ffff:127.x.y.z]` is accepted in one place
-+only: a URL the operator types into `gateway.auth_connect`.) For example,
-+as a JWKS URL or a metadata URL:
++and octal forms such as `2130706433` or `0177.0.0.1`, `127.000.0.1`,
++`example.123`, `-a.example.com`, `[v1.fe]` and `[fe80::1%25eth0]` are all
++refused, as are `bücher.example` (write `xn--bcher-kva.example`),
++underscores and empty labels. PMCP strips leading spaces and C0 control
++characters, and trailing tabs, CRs and LFs, and nothing else; any other
++control character (U+0000 to U+001F, or DEL) is refused wherever it is, a
++backslash is refused anywhere in the URL, and, for a JWKS or metadata URL,
++so is any whitespace character (anything Python's `str.isspace` matches,
++so a trailing space, a no-break space or U+2028 too). A DNS name is not
++resolved (see below), and only the exact name `localhost` is treated as
++loopback: `*.localhost` is a name like any other and passes unresolved.
++Userinfo such as `user:pass@` is accepted and dropped. Everything else is
++refused, including plain `http://` to any host, loopback hosts too, and
++`https://` to `localhost` or a loopback address. (Plain `http://` to
++`localhost`, `127.0.0.0/8`, `[::1]` or `[::ffff:127.x.y.z]` is accepted in
++one place only: a URL the operator types into `gateway.auth_connect`.) For
++example, as a JWKS URL or a metadata URL:
 +
 +<!-- auth-url-rule:begin -->
 +| URL | Result |
@@ -1307,11 +1842,16 @@ index cfdd1b2..10e5dd9 100644
 +| `https://auth.example.com:abc/jwks.json` | refused: invalid URL |
 +| `https://auth.example.com/key set.json` | refused: whitespace |
 +| `https://xn--bcher-kva.example/jwks.json` | accepted |
-+| `https://１２７.0.0.1/jwks.json` | refused: host not in plain ASCII |
-+| `https://127。0。0。1/jwks.json` | refused: host not in plain ASCII |
-+| `https://127.0.0.1./jwks.json` | refused: host not in plain ASCII |
-+| `https://2130706433/jwks.json` | refused: host not in plain ASCII |
-+| `https://[v1.fe]/jwks.json` | refused: host not in plain ASCII |
++| `https://１２７.0.0.1/jwks.json` | refused: host not in canonical form |
++| `https://127。0。0。1/jwks.json` | refused: host not in canonical form |
++| `https://127.0.0.1./jwks.json` | refused: host not in canonical form |
++| `https://2130706433/jwks.json` | refused: host not in canonical form |
++| `https://[v1.fe]/jwks.json` | refused: host not in canonical form |
++| `https://127.000.0.1/jwks.json` | refused: host not in canonical form |
++| `https://example.123/jwks.json` | refused: host not in canonical form |
++| `https://-a.example.com/jwks.json` | refused: host not in canonical form |
++| `https://[::ffff:0:a9fe:a9fe]/jwks.json` | refused: non-public host |
++| `https://127.0.0.1\@auth.example.com/jwks.json` | refused: backslash |
 +<!-- auth-url-rule:end -->
 +
  In public auth metadata URLs it rejects hosts written as non-public **IP
@@ -1393,6 +1933,7 @@ PLAIN_HTTP = "PUBLIC_URL_PLAIN_HTTP_REFUSED"
 NOT_PUBLIC = "PUBLIC_URL_NOT_PUBLIC"
 CONTROL = "PUBLIC_URL_CONTROL_CHARACTER"
 NOT_CANONICAL = "PUBLIC_URL_HOST_NOT_CANONICAL"
+BACKSLASH = "PUBLIC_URL_BACKSLASH"
 
 # (label, url, strict, operator). `None` is accepted; otherwise the member
 # `sanitize_public_auth_url` raises. `strict` is every caller but one;
@@ -1512,6 +2053,54 @@ CLASSES: list[tuple[str, str, str | None, str | None]] = [
     ("bracketed non-IPv6", "https://[v1.fe]/jwks.json", NOT_CANONICAL, NOT_CANONICAL),
     ("underscore", "https://my_host.example.com/x", NOT_CANONICAL, NOT_CANONICAL),
     ("empty label", "https://a..example.com/x", NOT_CANONICAL, NOT_CANONICAL),
+    # rev 3: the canonical text's own clauses, at their edges
+    (
+        "label edge hyphen, first",
+        "https://-a.example.com/x",
+        NOT_CANONICAL,
+        NOT_CANONICAL,
+    ),
+    (
+        "label edge hyphen, last",
+        "https://a-.example.com/x",
+        NOT_CANONICAL,
+        NOT_CANONICAL,
+    ),
+    ("inner hyphens", "https://a--b.example.com/x", None, None),
+    ("63-character label", "https://" + "a" * 63 + ".example.com/x", None, None),
+    (
+        "64-character label",
+        "https://" + "a" * 64 + ".example.com/x",
+        NOT_CANONICAL,
+        NOT_CANONICAL,
+    ),
+    (
+        "last label starts with a digit",
+        "https://example.1com/x",
+        NOT_CANONICAL,
+        NOT_CANONICAL,
+    ),
+    # rev 3: userinfo with several `@` -- the host follows the last one
+    ("two @, public host", "https://a@b@auth.example.com/x", None, None),
+    ("two @, loopback host", "https://u@x@127.0.0.1/x", NOT_PUBLIC, NOT_PUBLIC),
+    # rev 3: a backslash ends the authority for a WHATWG parser only
+    (
+        "backslash in userinfo",
+        "https://127.0.0.1\\@auth.example.com/x",
+        BACKSLASH,
+        BACKSLASH,
+    ),
+    ("backslash in path", "https://auth.example.com/a\\b", BACKSLASH, BACKSLASH),
+    # rev 3: IPv6 that embeds an IPv4 address
+    (
+        "IPv4-translated link-local",
+        "https://[::ffff:0:a9fe:a9fe]/x",
+        NOT_PUBLIC,
+        NOT_PUBLIC,
+    ),
+    ("IPv4-translated public", "https://[::ffff:0:808:808]/x", None, None),
+    ("local-use NAT64", "https://[64:ff9b:1::808:808]/x", NOT_PUBLIC, NOT_PUBLIC),
+    ("6to4 public", "https://[2002:808:808::1]/x", NOT_PUBLIC, NOT_PUBLIC),
     # -- a control character inside the URL (rev 2, F002) ------------------------
     ("inner tab", "https://auth.example.com/key\tset.json", CONTROL, CONTROL),
     ("inner CR", "https://auth.example.com/key\rset.json", CONTROL, CONTROL),
@@ -1542,24 +2131,86 @@ def _outcome(call: Callable[[], object]) -> str | None:
     return None
 
 
-# --- the oracle: what each refusal claims, without PMCP's classifier --------
+# --- the oracle: what each refusal's TEXT claims -------------------------------
+#
+# Rev 3 (#346 round 2, F001): the oracle is keyed by the message text, not by
+# the member name, and each entry checks what those words say -- not the
+# classifier's predicate. `test_the_text_oracle_covers_every_sanitiser_message`
+# requires a key for every text `sanitize_public_auth_url` can raise, so a
+# rewording without a re-derived claim fails. For a strict caller the texts
+# also characterise acceptance exactly: a URL is accepted if and only if no
+# text's claim holds for it (`test_each_message_is_true_and_acceptance_is_exact`).
+
+_C0_DEL = {chr(code) for code in [*range(0x20), 0x7F]}
+
+
+def _stripped(url: str) -> str:
+    """What the sanitiser checks: leading C0/space and trailing tab/CR/LF off
+    (stated in its docstring and the README)."""
+    return url.lstrip("".join(map(chr, range(0x21)))).rstrip("\t\r\n")
 
 
 def _literal(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     """`host` as an IP literal, legacy numeric forms included (inet_aton is
-    what a resolver does with them), IPv4-mapped IPv6 unwrapped."""
+    what a resolver does with them)."""
     try:
-        address: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(
-            host
-        )
+        return ipaddress.ip_address(host)
     except ValueError:
         try:
-            address = ipaddress.IPv4Address(socket.inet_aton(host))
+            return ipaddress.IPv4Address(socket.inet_aton(host))
         except OSError:
             return None
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
-        return address.ipv4_mapped
-    return address
+
+
+_MASK32 = 0xFFFFFFFF
+# IANA IPv6 Special-Purpose Address Registry entries (and RFC 4291/6145/5214
+# forms outside it) that embed an IPv4 address, located by bit arithmetic here,
+# independently of `ipaddress`' properties and of pmcp's networks.
+_LOW32_EMBEDDINGS = [
+    (ipaddress.ip_network("::ffff:0:0/96"), "RFC 4291 IPv4-mapped"),
+    (ipaddress.ip_network("::ffff:0:0:0/96"), "RFC 6145 IPv4-translated"),
+    (ipaddress.ip_network("::/96"), "RFC 4291 IPv4-compatible"),
+    (ipaddress.ip_network("64:ff9b::/96"), "RFC 6052 NAT64 well-known"),
+]
+_UNLOCATABLE = ipaddress.ip_network("64:ff9b:1::/48")  # RFC 8215 local-use NAT64
+
+
+def _embedded_v4(
+    address: ipaddress.IPv6Address,
+) -> tuple[bool, list[ipaddress.IPv4Address]]:
+    """(is a low-32-bit translator form, every embedded IPv4 address)."""
+    value = int(address)
+    low = ipaddress.IPv4Address(value & _MASK32)
+    translated = any(address in net for net, _ in _LOW32_EMBEDDINGS) or (
+        (value >> 32) & _MASK32 in (0x00005EFE, 0x02005EFE)  # RFC 5214 ISATAP
+    )
+    found = [low] if translated else []
+    if value >> 112 == 0x2002:  # RFC 3056 6to4: bits 16..47
+        found.append(ipaddress.IPv4Address((value >> 80) & _MASK32))
+    if value >> 96 == 0x20010000:  # RFC 4380 Teredo: server, ~client
+        found.append(ipaddress.IPv4Address((value >> 64) & _MASK32))
+        found.append(ipaddress.IPv4Address(~value & _MASK32))
+    return translated, found
+
+
+def _public_one(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return bool(
+        address.is_global
+        and not address.is_multicast
+        and not getattr(address, "is_site_local", False)
+    )
+
+
+def _is_public_literal(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(address, ipaddress.IPv6Address):
+        if address in _UNLOCATABLE:
+            return False
+        translated, embedded = _embedded_v4(address)
+        if not all(_public_one(v4) for v4 in embedded):
+            return False
+        if translated:
+            return True
+    return _public_one(address)
 
 
 def _is_loopback(host: str) -> bool:
@@ -1577,12 +2228,9 @@ def _is_loopback(host: str) -> bool:
     return address.is_loopback
 
 
-_LDH = set(string.ascii_letters + string.digits + "-")
-
-
 def _written_host(url: str) -> str:
-    """The host as written: after `//`, before the path, without userinfo or
-    port, brackets kept. Written independently of `auth._raw_host`."""
+    """The host as written: after `//`, before the path, without userinfo (up
+    to the LAST `@`) or port, brackets kept. Independent of `auth._raw_host`."""
     after = url.split("//", 1)[1]
     for stop in "/?#":
         after = after.split(stop, 1)[0]
@@ -1592,67 +2240,139 @@ def _written_host(url: str) -> str:
     return after.split(":", 1)[0]
 
 
-def _canonical_by_oracle(raw: str) -> bool:
-    """The canonical-ASCII rule, by `socket.inet_pton` and character sets
-    rather than by `ipaddress` or pmcp's regexes."""
-    if not raw.isascii():
-        return False
-    if raw.startswith("["):
-        if not raw.endswith("]") or "%" in raw:
-            return False
-        try:
-            socket.inet_pton(socket.AF_INET6, raw[1:-1])
-        except OSError:
-            return False
-        return True
-    labels = raw.split(".")
-    last = labels[-1].lower()
-    if last.isdigit() or (
-        last.startswith("0x") and set(last[2:]) <= set(string.hexdigits)
-    ):
-        try:
-            socket.inet_pton(socket.AF_INET, raw)
-        except OSError:
-            return False
-        return all(str(int(label)) == label for label in labels)
+# "Public auth URL host must be A; B; or C." -- one claim per clause, keyed
+# by the clause's own words and checked against those words.
+_LETTERS_DIGITS = set(string.ascii_letters + string.digits)
+
+
+def _is_described_dns_name(host: str) -> bool:
+    # "a DNS name of dot-separated labels of 1 to 63 ASCII letters, digits and
+    # hyphens, each starting and ending with a letter or digit, the last
+    # starting with a letter, so never a number (an IDN in its xn-- form)"
+    labels = host.split(".")
     return all(
-        0 < len(label) <= 63
-        and set(label) <= _LDH
-        and not label.startswith("-")
-        and not label.endswith("-")
+        1 <= len(label) <= 63
+        and set(label) <= _LETTERS_DIGITS | {"-"}
+        and label[0] in _LETTERS_DIGITS
+        and label[-1] in _LETTERS_DIGITS
         for label in labels
+    ) and labels[-1][:1] in set(string.ascii_letters)
+
+
+def _is_described_dotted_quad(host: str) -> bool:
+    # "a dotted-quad IPv4 address with no leading zeros"
+    parts = host.split(".")
+    return len(parts) == 4 and all(
+        part != ""
+        and set(part) <= set(string.digits)
+        and int(part) <= 255
+        and not (len(part) > 1 and part[0] == "0")
+        for part in parts
     )
 
 
-def _claim_holds(member: str, url: str) -> bool:
-    """True if the refusal `member` says something true about `url`."""
-    stripped = url.lstrip("".join(map(chr, range(0x21)))).rstrip("\t\r\n")
-    has_control = any(ord(c) < 0x20 or ord(c) == 0x7F for c in stripped)
-    if member == CONTROL:  # "contains a control character."
-        return has_control
-    if has_control:
+def _is_described_bracketed_ipv6(host: str) -> bool:
+    # "a bracketed IPv6 address with no zone id"
+    if not (host.startswith("[") and host.endswith("]")) or "%" in host:
         return False
     try:
-        parts = urlsplit(url)
-        host = parts.hostname
-        _ = parts.port
-    except ValueError:
-        return member == INVALID  # "Invalid public auth URL."
-    if member == INVALID:
+        socket.inet_pton(socket.AF_INET6, host[1:-1])
+    except (OSError, ValueError):
         return False
-    if member == NOT_ABSOLUTE:  # "must be an absolute HTTP(S) URL."
-        return parts.scheme not in {"http", "https"} or not host
-    if member == NOT_CANONICAL:  # "host must be plain ASCII: ..."
-        return bool(host) and not _canonical_by_oracle(_written_host(stripped))
-    if member == PLAIN_HTTP:  # "Plain http:// is not accepted for this ..."
-        return parts.scheme == "http" and bool(host)
-    if member == NOT_PUBLIC:  # "a non-public IP literal or loopback name."
-        assert host
-        if host.lower() == "localhost":
-            return True
-        address = _literal(host)
-        return address is not None and (not address.is_global or address.is_multicast)
-    raise AssertionError(f"no oracle for {member}")
+    return True
+
+
+_HOST_FORM_CLAIMS: dict[str, Callable[[str], bool]] = {
+    "a DNS name of dot-separated labels of 1 to 63 ASCII letters, digits and "
+    "hyphens, each starting and ending with a letter or digit, the last "
+    "starting with a letter, so never a number (an IDN in its xn-- form)": _is_described_dns_name,
+    "a dotted-quad IPv4 address with no leading zeros": _is_described_dotted_quad,
+    "a bracketed IPv6 address with no zone id": _is_described_bracketed_ipv6,
+}
+_CANONICAL_PREFIX = "Public auth URL host must be "
+
+
+def _host_form_clauses(text: str) -> list[str]:
+    """The clauses of "Public auth URL host must be A; B; or C."."""
+    assert text.startswith(_CANONICAL_PREFIX) and text.endswith("."), text
+    clauses = text[len(_CANONICAL_PREFIX) : -1].split("; ")
+    clauses[-1] = clauses[-1].removeprefix("or ")
+    return clauses
+
+
+def _matches_a_described_form(text: str, url: str) -> bool:
+    host = _written_host(_stripped(url))
+    return any(_HOST_FORM_CLAIMS[clause](host) for clause in _host_form_clauses(text))
+
+
+def _parse_raises(url: str) -> bool:
+    try:
+        parts = urlsplit(_stripped(url))
+        _ = parts.hostname, parts.port
+    except ValueError:
+        return True
+    return False
+
+
+def _host(url: str) -> str:
+    return urlsplit(_stripped(url)).hostname or ""
+
+
+def _claim_non_public(url: str) -> bool:
+    # "Public auth URL host is a non-public IP literal or loopback name."
+    host = _host(url)
+    if host.lower() == "localhost":
+        return True
+    address = _literal(host)
+    return address is not None and not _is_public_literal(address)
+
+
+_CANONICAL_TEXT = (
+    _CANONICAL_PREFIX
+    + "; ".join(list(_HOST_FORM_CLAIMS)[:2])
+    + "; or "
+    + list(_HOST_FORM_CLAIMS)[2]
+    + "."
+)
+
+_TEXT_CLAIMS: dict[str, Callable[[str], bool]] = {
+    "Public auth URL contains a control character.": lambda url: any(
+        c in _C0_DEL for c in _stripped(url)
+    ),
+    "Public auth URL contains a backslash.": lambda url: "\\" in url,
+    "Invalid public auth URL.": _parse_raises,
+    "Public auth URL must be an absolute HTTP(S) URL.": lambda url: (
+        urlsplit(_stripped(url)).scheme not in {"http", "https"} or not _host(url)
+    ),
+    _CANONICAL_TEXT: lambda url: not _matches_a_described_form(_CANONICAL_TEXT, url),
+    "Plain http:// is not accepted for this public auth URL.": lambda url: (
+        urlsplit(_stripped(url)).scheme == "http"
+    ),
+    "Public auth URL host is a non-public IP literal or loopback name.": (
+        _claim_non_public
+    ),
+}
+
+
+def _claim_holds(member: str, url: str) -> bool:
+    """True if the TEXT of `member` says something true about `url`."""
+    return _TEXT_CLAIMS[str(getattr(AuthMessage, member))](url)
+
+
+def _sanitiser_members() -> set[str]:
+    tree = ast.parse((_ROOT / "src/pmcp/auth.py").read_text())
+    func = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "sanitize_public_auth_url"
+    )
+    return {
+        node.attr
+        for node in ast.walk(func)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "AuthMessage"
+    }
 
 
 # --- 1. the rule, at the sanitiser ------------------------------------------
@@ -1668,13 +2388,13 @@ def test_the_sanitiser_applies_the_rule(label: str) -> None:
     )
 
 
-@pytest.mark.parametrize("label", list(_BY_LABEL))
-def test_each_refusal_is_true_of_its_input(label: str) -> None:
-    """The message an input gets states something true about that input."""
-    url, strict, operator = _BY_LABEL[label]
-    for member in {strict, operator} - {None}:
-        assert member is not None
-        assert _claim_holds(member, url), f"{member} is untrue for {url!r}"
+def test_the_text_oracle_covers_every_sanitiser_message() -> None:
+    """Every text the sanitiser can raise has a claim here, keyed by the
+    text: a reworded message fails until its claim is re-derived."""
+    texts = {str(getattr(AuthMessage, name)) for name in _sanitiser_members()}
+    assert texts == set(_TEXT_CLAIMS)
+    clauses = _host_form_clauses(str(AuthMessage.PUBLIC_URL_HOST_NOT_CANONICAL))
+    assert clauses == list(_HOST_FORM_CLAIMS)
 
 
 @pytest.mark.parametrize(
@@ -1686,11 +2406,11 @@ def test_every_accepted_url_is_absolute_https(label: str) -> None:
     a non-public IP literal."""
     url = _BY_LABEL[label][0]
     parts = urlsplit(url)
-    assert _canonical_by_oracle(_written_host(url.strip()))
+    assert _matches_a_described_form(_CANONICAL_TEXT, url)
     assert parts.scheme == "https"
     assert parts.hostname and parts.hostname.lower() != "localhost"
     address = _literal(parts.hostname)
-    assert address is None or (address.is_global and not address.is_multicast)
+    assert address is None or _is_public_literal(address)
 
 
 _HOSTS = [
@@ -1920,7 +2640,8 @@ _README_REASONS = {
     "refused: not an absolute http(s) URL": {NOT_ABSOLUTE},
     "refused: invalid URL": {INVALID},
     "refused: whitespace": {"JWKS_URL_NOT_USABLE", "METADATA_URL_NOT_USABLE"},
-    "refused: host not in plain ASCII": {NOT_CANONICAL},
+    "refused: host not in canonical form": {NOT_CANONICAL},
+    "refused: backslash": {"PUBLIC_URL_BACKSLASH"},
 }
 _ROW = re.compile(r"^\| `(?P<url>[^`]+)` \| (?P<result>[^|]+?) \|$")
 
@@ -2053,13 +2774,13 @@ _GENERATED = _generated_hosts()
 def _is_public(host: str) -> bool:
     """Whether a host a fetcher will connect to is public: `localhost` is
     not, an IP literal (legacy numeric via `inet_aton`, IPv4-mapped
-    unwrapped) is public only if global and not multicast, and any other
+    and every embedded IPv4 classified) is public only if `_is_public_literal`, and any other
     name is public by assumption (names are not resolved, #211)."""
     host = host.strip("[]")
     if host.lower().rstrip(".") == "localhost":
         return False
     address = _literal(host.split("%", 1)[0].rstrip("."))
-    return address is None or (address.is_global and not address.is_multicast)
+    return address is None or _is_public_literal(address)
 
 
 def _same_host(stored: str, fetched: str) -> bool:
@@ -2104,7 +2825,7 @@ def test_pmcp_classifies_the_host_yarl_will_connect_to(host: str) -> None:
         if fetched is not None and not _is_public(fetched) and scheme == "https":
             assert got is not None, (url, fetched)
         if got is None or got == NOT_CANONICAL:
-            assert (got is None) == _canonical_by_oracle(_written_host(url)), url
+            assert (got is None) == _matches_a_described_form(_CANONICAL_TEXT, url), url
 
 
 _NODE = shutil.which("node")
@@ -2163,6 +2884,282 @@ def test_the_panel_hosts_map_to_non_public_hosts_in_yarl_and_are_refused(
     assert _outcome(lambda: check_auth_config(jwks_url=url)) == NOT_CANONICAL
     assert _outcome(lambda: _metadata_app(url)) == NOT_CANONICAL
     assert _outcome(lambda: _elicitation("remote")(url)) == NOT_CANONICAL
+
+
+# --- 5. rev 3: every message is true, and the texts define acceptance ---------
+#
+# Inputs generated from the grammar the texts speak about: every C0 control
+# and DEL at every position, several `@`, a backslash, labels at their
+# length and hyphen edges, and every IPv4-embedding IPv6 form -- plus every
+# class above and every generated host.
+
+_CONTROLS = [*range(0x20), 0x7F]
+
+
+def _control_urls() -> list[str]:
+    urls = []
+    for code in _CONTROLS:
+        c = chr(code)
+        urls += [
+            f"https://auth.exa{c}mple.com/x",
+            f"https://auth.example.com/k{c}s",
+            f"{c}https://auth.example.com/x",
+            f"https://auth.example.com/x{c}",
+        ]
+    return urls
+
+
+def _label_urls() -> list[str]:
+    labels = [
+        "a",
+        "a-b",
+        "a--b",
+        "-a",
+        "a-",
+        "-",
+        "1a",
+        "a1",
+        "xn--bcher-kva",
+        "0x7f",
+        "123",
+    ]
+    labels += ["a" * 62 + "b", "a" * 63 + "b", "a" * 64]
+    urls = []
+    for label in labels:
+        urls += [f"https://{label}.example.com/x", f"https://example.{label}/x"]
+    return urls
+
+
+def _netloc_urls() -> list[str]:
+    urls = []
+    for userinfo in ["", "u@", "u:p@", "a@b@", "u@x@", "@", "u@@"]:
+        for host in ["auth.example.com", "127.0.0.1", "[::1]", "8.8.8.8"]:
+            urls.append(f"https://{userinfo}{host}/x")
+    for netloc in [
+        "127.0.0.1\\@auth.example.com",
+        "auth.example.com\\@127.0.0.1",
+        "127.0.0.1:80\\@auth.example.com",
+        "auth.example.com\\",
+    ]:
+        urls.append(f"https://{netloc}/x")
+    return urls
+
+
+_V4_SAMPLES = [
+    "8.8.8.8",
+    "127.0.0.1",
+    "10.0.0.5",
+    "169.254.169.254",
+    "100.64.0.1",
+    "0.0.0.0",
+]
+
+
+def _embedding_addresses() -> list[tuple[str, ipaddress.IPv6Address]]:
+    """Every IPv4-embedding IPv6 form, built by bit arithmetic."""
+    out = []
+    for v4s in _V4_SAMPLES:
+        v4 = int(ipaddress.IPv4Address(v4s))
+        for net, label in _LOW32_EMBEDDINGS:
+            out.append(
+                (f"{label}/{v4s}", ipaddress.IPv6Address(int(net.network_address) | v4))
+            )
+        out.append(
+            (
+                f"ISATAP/{v4s}",
+                ipaddress.IPv6Address((0x2606_4700 << 96) | (0x5EFE << 32) | v4),
+            )
+        )
+        out.append(
+            (f"6to4/{v4s}", ipaddress.IPv6Address((0x2002 << 112) | (v4 << 80) | 1))
+        )
+        out.append(
+            (
+                f"Teredo server/{v4s}",
+                ipaddress.IPv6Address(
+                    (0x2001_0000 << 96)
+                    | (v4 << 64)
+                    | (~int(ipaddress.IPv4Address("8.8.8.8")) & _MASK32)
+                ),
+            )
+        )
+        out.append(
+            (
+                f"Teredo client/{v4s}",
+                ipaddress.IPv6Address(
+                    (0x2001_0000 << 96)
+                    | (int(ipaddress.IPv4Address("8.8.8.8")) << 64)
+                    | (~v4 & _MASK32)
+                ),
+            )
+        )
+        out.append(
+            (
+                f"local-use NAT64/{v4s}",
+                ipaddress.IPv6Address(int(_UNLOCATABLE.network_address) | v4),
+            )
+        )
+    return out
+
+
+_EMBEDDINGS = _embedding_addresses()
+
+
+def _truth_inputs() -> list[str]:
+    urls = [url for _, url, _, _ in CLASSES]
+    for host in _GENERATED:
+        urls += [f"https://{host}/x", f"http://{host}/x"]
+    urls += _control_urls() + _label_urls() + _netloc_urls()
+    urls += [f"https://[{address}]/x" for _, address in _EMBEDDINGS]
+    return list(dict.fromkeys(urls))
+
+
+_TRUTH_INPUTS = _truth_inputs()
+
+
+@pytest.mark.parametrize(
+    "url", _TRUTH_INPUTS, ids=[repr(u)[:60] for u in _TRUTH_INPUTS]
+)
+def test_each_message_is_true_and_acceptance_is_exact(url: str) -> None:
+    """For a strict caller: a refusal's text is true of the URL it refuses,
+    and a URL is accepted only when no refusal text is true of it. For the
+    operator: the same, except that plain http to a loopback host is the one
+    true claim it may accept through."""
+    for allow in (False, True):
+        try:
+            sanitize_public_auth_url(url, allow_loopback_http=allow)
+        except ValueError as exc:
+            text = str(exc)
+            assert text in _TEXT_CLAIMS, f"unknown refusal text {text!r}"
+            assert _TEXT_CLAIMS[text](url), f"{text!r} is untrue for {url!r}"
+            continue
+        true_claims = {text for text, claim in _TEXT_CLAIMS.items() if claim(url)}
+        loopback_http = {
+            str(AuthMessage.PUBLIC_URL_PLAIN_HTTP_REFUSED),
+            str(AuthMessage.PUBLIC_URL_NOT_PUBLIC),
+        }
+        if allow and true_claims and true_claims <= loopback_http:
+            # the operator's one exception: plain http to a loopback host
+            assert urlsplit(_stripped(url)).scheme == "http", url
+            assert _is_loopback(_host(url)), url
+            continue
+        assert true_claims == set(), (url, allow, true_claims)
+
+
+@pytest.mark.parametrize("code", _CONTROLS, ids=hex)
+def test_every_control_character_is_refused_inside_and_stripped_only_at_the_ends(
+    code: int,
+) -> None:
+    c = chr(code)
+    for inner in (f"https://auth.exa{c}mple.com/x", f"https://auth.example.com/k{c}s"):
+        assert _outcome(lambda: sanitize_public_auth_url(inner)) == CONTROL
+    leading = _outcome(
+        lambda: sanitize_public_auth_url(f"{c}https://auth.example.com/x")
+    )
+    assert leading == (None if code < 0x20 else CONTROL)  # DEL is not C0
+    trailing = _outcome(
+        lambda: sanitize_public_auth_url(f"https://auth.example.com/x{c}")
+    )
+    assert trailing == (None if c in "\t\r\n" else CONTROL)
+
+
+@pytest.mark.parametrize("label", [label for label, _ in _EMBEDDINGS])
+def test_every_ipv4_embedding_is_classified_on_the_embedded_address(label: str) -> None:
+    """The IANA/RFC embedding list, differentially: the arithmetic here agrees
+    with `ipaddress`' own `ipv4_mapped`, `sixtofour` and `teredo` where they
+    exist, and pmcp accepts the literal only if every embedded IPv4 address
+    is public (6to4 and Teredo: and the IPv6 address too; local-use NAT64:
+    never)."""
+    address = dict(_EMBEDDINGS)[label]
+    translated, embedded = _embedded_v4(address)
+    if address.ipv4_mapped is not None:
+        assert address.ipv4_mapped in embedded
+    if address.sixtofour is not None:
+        assert address.sixtofour in embedded
+    if address.teredo is not None:
+        assert set(address.teredo) <= set(embedded)
+    expected_public = _is_public_literal(address)
+    got = _outcome(lambda: sanitize_public_auth_url(f"https://[{address}]/x"))
+    assert got == (None if expected_public else NOT_PUBLIC), (label, str(address))
+    if embedded and not all(_public_one(v4) for v4 in embedded):
+        assert got == NOT_PUBLIC
+
+
+def test_the_canonical_rule_has_one_wording() -> None:
+    """`CANONICAL_HOST_FORMS` is the one source: the message is built from
+    it, and the README rule and the sanitiser docstring carry each clause."""
+    from pmcp.auth import CANONICAL_HOST_FORMS
+
+    def flat(text: str) -> str:
+        return " ".join(text.split())
+
+    readme = flat((_ROOT / "README.md").read_text())
+    doc = flat(sanitize_public_auth_url.__doc__ or "")
+    assert list(CANONICAL_HOST_FORMS) == list(_HOST_FORM_CLAIMS)
+    for clause in CANONICAL_HOST_FORMS:
+        assert clause in readme, clause
+        assert clause in doc, clause
+
+
+# --- the rule does not rest on the running Python's special-purpose table ----
+
+_ORIGINAL_IS_GLOBAL = ipaddress.IPv6Address.is_global
+_ORIGINAL_IS_LOOPBACK = ipaddress.IPv6Address.is_loopback
+_TABLE_DEPENDENT = [
+    ipaddress.ip_network("2002::/16"),
+    ipaddress.ip_network("2001::/32"),
+    ipaddress.ip_network("64:ff9b:1::/48"),
+]
+
+
+@pytest.fixture
+def _python_calls_tunnel_prefixes_global(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Simulate an interpreter whose `ipaddress` table calls 6to4, Teredo and
+    local-use NAT64 global (CPython's table has changed across releases)."""
+
+    def is_global(self: ipaddress.IPv6Address) -> bool:
+        if any(self in net for net in _TABLE_DEPENDENT):
+            return True
+        return bool(_ORIGINAL_IS_GLOBAL.fget(self))  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(ipaddress.IPv6Address, "is_global", property(is_global))
+
+
+@pytest.mark.usefixtures("_python_calls_tunnel_prefixes_global")
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("[2002:a00:5::1]", NOT_PUBLIC),  # 6to4 embedding 10.0.0.5
+        ("[2002:808:808::1]", None),  # 6to4 embedding 8.8.8.8: the patch bites
+        ("[2001:0:808:808::f5ff:fffa]", NOT_PUBLIC),  # Teredo client 10.0.0.5
+        ("[2001:0:a00:5::f7f7:f7f7]", NOT_PUBLIC),  # Teredo server 10.0.0.5
+        ("[2001:0:808:808::f7f7:f7f7]", None),  # Teredo, both 8.8.8.8
+        ("[64:ff9b:1::808:808]", NOT_PUBLIC),  # local-use NAT64: refused whole
+    ],
+)
+def test_tunnel_prefixes_are_classified_on_their_embedded_addresses(
+    host: str, expected: str | None
+) -> None:
+    assert _outcome(lambda: sanitize_public_auth_url(f"https://{host}/x")) == expected
+
+
+def test_operator_loopback_does_not_rest_on_is_loopback_for_mapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Older CPython releases called `::ffff:127.0.0.1` not loopback; the
+    operator's loopback set must not depend on that."""
+
+    def is_loopback(self: ipaddress.IPv6Address) -> bool:
+        if self.ipv4_mapped is not None:
+            return False
+        return bool(_ORIGINAL_IS_LOOPBACK.fget(self))  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(ipaddress.IPv6Address, "is_loopback", property(is_loopback))
+    url = "http://[::ffff:127.0.0.1]/x"
+    assert (
+        _outcome(lambda: sanitize_public_auth_url(url, allow_loopback_http=True))
+        is None
+    )
 ````
 
 ## Embedding proof
@@ -2171,15 +3168,12 @@ The bodies above were taken **back out of this file**, not out of the
 spike, and applied to a fresh `31c1357`:
 
 ```bash
-# extract.py splits this file at "## Verbatim bodies" and writes each
-# ```` block to 341-src.patch, 341-tests.patch, 341-docs.patch and
-# test_auth_public_url_rule.py
 python3 extract.py detailed-341-auth-url-docs-*.md extracted/
 cmp extracted/<each> <the spike's own git diff / file>   # all four: identical
-git switch -c proof3/341 origin/main                      # 31c1357
+git switch -c proof5/341 origin/main                      # 31c1357
 git apply extracted/341-src.patch extracted/341-tests.patch extracted/341-docs.patch   # clean, no fuzz
 cp extracted/test_auth_public_url_rule.py tests/
-git diff spike2/341 -- src tests README.md CHANGELOG.md   # tracked files: no difference
+git diff spike3/341 -- src tests README.md CHANGELOG.md   # tracked files: no difference
 ```
 
 Measured on that proof tree (CPython 3.10.21, yarl 1.22.0, aiohttp 3.14.3,
@@ -2187,15 +3181,14 @@ node v24.20.0):
 
 | Step | Result |
 |---|---|
-| new module | 1134 passed, 0 skipped (the WHATWG differential ran) |
-| auth / transport / CLI / redactor suites (step 2) | 2138 passed, 55 deselected, 0 failed, 85 s |
+| new module | 2176 passed, 0 skipped (the WHATWG differential ran) |
+| auth / transport / CLI / redactor suites (step 2) | 3187 passed, 55 deselected, 0 failed, 93 s |
 | `ruff check src tests` | All checks passed |
 | `ruff format --check src tests` | 175 files already formatted |
 | `mypy src/pmcp/auth.py src/pmcp/cli.py src/pmcp/transport/http.py` | Success: no issues found in 3 source files |
 | `scripts/check_security_claims.py` | OK, 129 cited node id(s) |
-| mutation table | 30 mutants: 27 red, 3 equivalent (M13, M21, M30); tree byte-identical afterwards; identical to the spike run |
-| full suite, run alone, `env -u npm_config_cache -u npm_config_store_dir` | 6663 passed, 3 skipped, 80 deselected, 0 failed, 487 s |
-| red on main (module only, on `31c1357`) | 606 failed, 528 passed |
-| the rev-2 differentials against rev 1's `auth.py` (`-k "yarl or browser"`) | 235 failed, 57 passed |
-| a live aiohttp fetch of the F001 spellings (main's accept set) | `200` from a server bound to 127.0.0.1 for 9 hosts main accepted (see the host-encoding table) |
+| the round-2 seat's falsifiers (F001, F002), from scratch files | 35 passed |
+| mutation table | 42 mutants: 39 red, 3 equivalent (M13, M21, M36); tree byte-identical afterwards |
+| full suite, run alone, `env -u npm_config_cache -u npm_config_store_dir` | 7712 passed, 3 skipped, 80 deselected, 0 failed, 495 s |
+| red on main (module only, on `31c1357`) | 1465 failed, 711 passed |
 
