@@ -87,6 +87,22 @@
 > (`bounded_wait` retrieves the outcome of work that fails after a
 > cancelled post-timeout wait); N2–N4 are stated. All numbers below are
 > re-measured on the round-7 spike on main `c9206a9`, on 3.10, 3.11 and 3.12.
+>
+> **Round 8** (after the round-7 panel: claude AGREE with N1/N2; codex two
+> blockers). (1) A Windows regression new in round 7: the spawn-contract id
+> was recorded even without `os.killpg`, and `_group_alive()` then raised
+> `AttributeError`, so `disconnect_server` failed and kept the client. Every
+> group path now goes through `_process_groups_supported()`; where groups do
+> not exist no id is recorded and none is used (Design decision 4). (2) A
+> cancel while `create_subprocess_exec()` is still completing leaks
+> grandchildren -- asyncio's cleanup kills only the leader. Pre-existing on
+> main, filed as Consiliency/pmcp#344 and **not** fixed here: the plan's
+> claim that asyncio covers it is corrected, and the guarantee is restated
+> for processes after `create_subprocess_exec` returns. Claude's N1
+> (catalogs after a pre-start-cancelled shutdown) and N2 (the alive-leader
+> group kill during the watcher-reap window) are stated. All numbers below
+> are re-measured on the round-8 spike on main `c9206a9`, on 3.10, 3.11 and
+> 3.12.
 
 ## Task
 
@@ -427,7 +443,33 @@ sets `returncode` in a loop callback. Between the two the pid is free while
 -- only if the kernel wraps the pid space in that instant. The same window
 exists for every `process.kill()`/`terminate()` in pmcp and on main; this
 plan neither opens nor closes it. The group kill has the analogous window for
-a group whose last member exits at that instant.
+a group whose last member exits at that instant. *Claude round 7, N2:* while
+`returncode` is still `None`, `_kill_process_tree_now` now `killpg`s the
+retained id without re-checking `os.getpgid(pid) == pid` first; in that same
+watcher-reap window the id could only belong to someone else if our whole
+group had emptied and the id been reassigned, so the window is no wider than
+N5's.
+
+**Round 8 (codex round 7): no group path where groups do not exist.**
+Round 7 recorded `group_pgid = process.pid` unconditionally, so on Windows
+(no `os.killpg`/`os.getpgid`) a non-`None` id reached `_group_alive()`'s
+`os.killpg` and raised `AttributeError`: with the APIs removed, on
+3.10–3.12, `disconnect_server` returned `(False, 0, …)` and kept `srv` in
+`_clients` (main succeeds), so a restart failed. Every group path now asks
+`_process_groups_supported()` (`hasattr(os, "killpg") and hasattr(os,
+"getpgid")`, read at call time, as main's existing fallback checks): the
+spawn contract records `_spawned_group_pgid(process)` -- the pid, or `None`
+where groups do not exist; `_own_group_pgid`, `_kill_retained_group` and
+`_kill_process_tree_now` ignore an id there; `_terminate_process_tree`
+drops a retained id there and falls back to `terminate()`/`kill()`.
+`test_without_process_groups_every_kill_path_falls_back` removes the APIs
+and passes an explicit id through `_kill_process_tree_now`,
+`_kill_retained_group`, `_terminate_process_tree` (alive and reaped),
+`disconnect_server` (succeeds, client dropped), `abandon_all_now` and the
+update probe's timeout and cancel paths; the existing
+`test_windows_falls_back_without_killpg` also passes an id. Mutants M38–M40
+remove the guard at the capability check, in terminate and at the spawn
+contract.
 
 ### 5. `disconnect_server` and the lifecycle lock
 
@@ -528,10 +570,15 @@ pending (mutant M26).
   covered.
 - `_connect_all_unlocked` gathers connect workers. A worker cancelled before
   its first instruction has spawned nothing; one cancelled at any later
-  await runs its own handler, and a cancel inside `create_subprocess_exec`
-  is handled by asyncio itself (it closes and waits the half-made
-  transport). So it needs no parent kill -- and must not have one, since a
-  cancelled `connect_all` keeps the servers that did connect.
+  await runs its own handler. **Corrected in round 8 (codex round 7):** a
+  cancel while `create_subprocess_exec()` is still completing is cleaned up
+  by asyncio only for the **leader** (it kills and waits the half-made
+  transport's process); a grandchild the leader already started survives.
+  That is pre-existing on main, filed as Consiliency/pmcp#344, and out of
+  this plan (Non-goals). For every process *after* `create_subprocess_exec`
+  returns, the worker's own handler kills the group. So `connect_all` needs
+  no parent kill -- and must not have one, since a cancelled `connect_all`
+  keeps the servers that did connect.
   `test_connect_all_cancelled_before_its_workers_start_spawns_nothing`
   pins it with a real command (no process spawned, `_clients` empty).
 - `_fetch_server_listings`' gather and the reconcile tasks own no process or
@@ -788,6 +835,8 @@ and `src/pmcp/tools/handlers.py` (7 in, 7 out).
   passes `managed.group_pgid`. The four `wait_for` calls become
   `bounded_wait` (Design decision 11).
 - Round 7: `ClientManager.abandon_all_now()` (Design decision 11).
+- Round 8: `_process_groups_supported()` and `_spawned_group_pgid(process)`;
+  every group path is guarded by the former (Design decision 4).
 
 ### `src/pmcp/waits.py` (create, round 6)
 
@@ -808,6 +857,11 @@ and `src/pmcp/tools/handlers.py` (7 in, 7 out).
   `pmcp.tools.handlers.bounded_wait`; a fake `_terminate_process_tree`
   accepts the new keyword.
 
+### `tests/test_client_manager.py` (modify, round 8)
+
+- `test_windows_falls_back_without_killpg` also passes a retained
+  `group_pgid` and asserts the single-process fallback.
+
 ### `src/pmcp/tools/handlers.py` (modify)
 
 - `_run_update_probe_command`'s `except asyncio.CancelledError`
@@ -815,14 +869,15 @@ and `src/pmcp/tools/handlers.py` (7 in, 7 out).
   `await _terminate_process_tree(...)`; import it.
 - Round 6: `bounded_wait` instead of `wait_for`; the group id is passed to
   both kill paths. Round 7: it is `process.pid` (spawn contract), not a
-  lookup.
+  lookup; round 8: `_spawned_group_pgid(process)`, `None` where groups do
+  not exist.
 
-**Round-7 diff size** (`git diff --stat` on `c9206a9`, with `waits.py`
-added): 8 files, 787 insertions, 288 deletions.
+**Round-8 diff size** (`git diff --stat` on `c9206a9`, with `waits.py`
+added): 9 files, 812 insertions, 289 deletions.
 
 ### `tests/test_cancel_teardown.py` (create)
 
-The module in *Verbatim bodies*: **60 tests** (58 on 3.10, where the two
+The module in *Verbatim bodies*: **61 tests** (59 on 3.10, where the two
 3.11+ tests skip); ~20 s per run (round-5 spike: 21.6 s on 3.10), most of it the
 real-subprocess tests and the round-5 test's 5.5 s wait past the reconnect
 delay.
@@ -849,6 +904,7 @@ delay.
 | **round 7:** `test_fast_exiting_leaders_never_leave_a_grandchild`, `test_a_fast_exiting_update_probe_never_leaves_a_grandchild` (real processes) | codex round 6: `/bin/sh -c 'sleep 300 & echo $! > file'` -- five rounds of eight concurrent real `_connect_stdio`s whose handshake fails (once the pid is recorded), and 24 concurrent update probes that time out: every grandchild dies, through the spawn-contract group id (mutants M30, M34) |
 | **round 7:** `test_gateway_shutdown_cancelled_before_disconnect_all_starts_kills_the_tree[stop-loop, main-returns]` (real processes, child interpreter) | codex round 6: the real `GatewayServer.shutdown()` with the `disconnect_all` task cancelled before it starts -- tree dead, `_clients` empty (mutants M35, M36) |
 | **round 7:** `test_a_cancel_during_the_post_timeout_wait_retrieves_the_outcome` | claude N1 (mutant M37) |
+| **round 8:** `test_without_process_groups_every_kill_path_falls_back` | codex round 7, Windows: with `os.killpg`/`os.getpgid` removed and an id passed explicitly, every kill path falls back without `AttributeError`; `disconnect_server` succeeds and drops the client (mutants M38–M40) |
 | **round 6:** `test_a_grandchild_of_a_reaped_leader_is_killed[disconnect_all_call_soon, disconnect_server_cancelled, disconnect_server]`, `test_a_reused_group_id_is_not_signalled` (real processes) | codex round 5: a session leader that exited 0 (reaped) and a live `sleep 300` grandchild holding its pipes: the grandchild dies on a cancelled `disconnect_all`, a cancelled and an uncancelled `disconnect_server`; a group whose id a live process holds is not signalled (Design decision 4) |
 | **round 5:** `test_a_cancelled_disconnect_all_does_not_respawn_its_servers` (real processes, real readers) | claude round-4 F1: two connected SIGTERM-ignoring servers with grandchildren, `disconnect_all` cancelled at 0, 1 and 2 loop steps: no `reconnect-*` task once the readers have run, no spawn within 5.5 s, every leader and grandchild dead, `_clients == {}` |
 | **round 4:** `test_connect_all_cancelled_before_its_workers_start_spawns_nothing` (real command) | the other process-owning fan-out needs no parent kill: nothing spawned |
@@ -878,7 +934,9 @@ the terminate test's two `sleep(0)`s.
   termination is cancelled, including by event-loop shutdown. A cancelled
   `disconnect_all()`/`refresh()` does not respawn the servers it was
   removing (the reconnect revival after a cancelled *reconnect* remains
-  Consiliency/pmcp#336).
+  Consiliency/pmcp#336). This covers processes once spawned; a cancel while
+  the spawn itself is completing can still leave a grandchild
+  (Consiliency/pmcp#344).
 - `SECURITY.md`: no change; `scripts/check_security_claims.py` reports
   `OK … 129 cited node id(s)` on the spike.
 
@@ -916,7 +974,7 @@ CHANGELOG bullet by hand), then:
 
 ```bash
 # 1+2. the new module plus the client-manager suites, on all three Pythons
-#      (round-7 spike on c9206a9: 332 passed, 2 skipped on 3.10; 334 passed on 3.11; 334 passed on 3.12)
+#      (round-8 spike on c9206a9: 333 passed, 2 skipped on 3.10; 335 passed on 3.11; 335 passed on 3.12)
 for v in 3.10 3.11 3.12; do E=.venv; [ $v != 3.10 ] && E=.venv-$v
   $E/bin/python -m pytest tests/test_cancel_teardown.py tests/test_client_manager.py \
     tests/test_client_manager_reconnect.py --cov-fail-under=0 -p no:cacheprovider -q -o timeout=60; done
@@ -927,9 +985,9 @@ python3 scripts/check_security_claims.py          # expect OK, 129 cited node id
 python3 scripts/check_plan_consistency.py .consiliency/plans/detailed-324-cancel-teardown-20261003-0213.md
 #   measured on this file: "consistent ... blocking inconsistencies: 0", exit 0
 # 4. the full suite: once, alone, detached, with a notifying waiter (memory on dev0 is shared)
-#    (round-7 spike on c9206a9, run alone on 3.10 with the npm vars unset and
-#     pytest's basetemp outside the checkout and off /tmp: 5581 passed, 5 skipped,
-#     80 deselected, 0 failed, 522 s;
+#    (round-8 spike on c9206a9, run alone on 3.10 with the npm vars unset and
+#     pytest's basetemp outside the checkout and off /tmp: 5582 passed, 5 skipped,
+#     80 deselected, 0 failed, 497 s;
 #     in round 4 a first run caught the publisher-coverage AST guard, see Design decision 7)
 #    /tmp has a shared per-user quota on dev0 that a full run can exhaust (measured on
 #    the #326 implementation: 57 `OSError: [Errno 122] Disk quota exceeded`), so keep
@@ -963,6 +1021,7 @@ since a tree that waits after a cancel hits the hang guards):
 | round-5 spike (`160a9e8`) | 44 passed, 2 skipped | 46 passed | 46 passed |
 | round-6 spike (`c9206a9`) | 53 passed, 2 skipped | 55 passed | 55 passed |
 | round-7 spike (`c9206a9`) | 58 passed, 2 skipped | 60 passed | 60 passed |
+| round-8 spike (`c9206a9`) | 59 passed, 2 skipped | 61 passed | 61 passed |
 
 On main the 5 that pass are the ones that must: the two "child cancellation
 is still absorbed" tests, `test_disconnect_server_does_not_cancel_its_own_caller`,
@@ -975,6 +1034,11 @@ fallback handler). The round-2 spike measured in round 3 (31/33/33 failed)
 is unchanged in substance.
 
 ## Acceptance criteria
+
+Scope of every "kills the tree" below: processes **after
+`create_subprocess_exec` returns**. A cancel while the spawn is still
+completing leaves a grandchild the leader already started (asyncio kills
+only the leader); that is Consiliency/pmcp#344, not this plan.
 
 - [ ] A caller cancelled at any await of the stdio, remote,
   `disconnect_server`, `_cleanup_client` or `_shutdown_one` teardown sees
@@ -1028,15 +1092,19 @@ is unchanged in substance.
   M35, M36.
 - [ ] A cancel during `bounded_wait`'s post-timeout wait leaves no
   unretrieved task exception. Mutant M37.
+- [ ] Where process groups do not exist (Windows), no group id is recorded
+  or used, and every kill path -- including `disconnect_server`, which
+  succeeds and drops the client -- uses the single-process fallback.
+  Mutants M38–M40.
 - [ ] Verification steps 1–4 pass on 3.10, and 1–2 on 3.11 and 3.12.
 - [ ] Every mutant below is red, for the reason stated, on all three Pythons.
 
 ## Mutation table
 
-Each mutant was measured on the round-7 spike on `c9206a9` (`mutants7.py`: one or more
+Each mutant was measured on the round-8 spike on `c9206a9` (`mutants8.py`: one or more
 string edits to `manager.py`, `handlers.py`, `waits.py` or `server.py`, run
 `tests/test_cancel_teardown.py` with the target version's own interpreter
-under `-o timeout=60` and a 300 s cap, restore in a `finally`). **All 36 are red on 3.10, 3.11 and 3.12**; none
+under `-o timeout=60` and a 300 s cap, restore in a `finally`). **All 39 are red on 3.10, 3.11 and 3.12**; none
 hung. After each run the two files were byte-identical to the spike.
 Red tests are 3.10's.
 
@@ -1053,13 +1121,13 @@ Red tests are 3.10's.
 | M9 | _shutdown_one: cancel not abandoned | 1 red -- every_teardown_abandons_synchronously_on_cancel |
 | M10 | child waits back to shield + absorb (the original defect) | 18 red -- stdio_handshake_teardown[read_task], stdio_handshake_teardown[stderr_task], stdio_handshake_teardown[outbound_writer] (+15) |
 | M12 | background sweep back to gather | 1 red -- disconnect_server[sweep] |
-| M13 | abandon does not kill | 25 red -- stdio_handshake_teardown[read_task], stdio_handshake_teardown[stderr_task], stdio_handshake_teardown[outbound_writer] (+22) |
+| M13 | abandon does not kill | 26 red -- stdio_handshake_teardown[read_task], stdio_handshake_teardown[stderr_task], stdio_handshake_teardown[outbound_writer] (+23) |
 | M14 | synchronous kill skips the group | 6 red -- a_cancelled_disconnect_all_does_not_respawn_its_servers, gateway_shutdown_cancelled_before_disconnect_all_starts_kill, gateway_shutdown_cancelled_before_disconnect_all_starts_kill (+3) |
 | M15 | cancelled terminate does not kill (round-1 B2) | 2 red -- a_cancelled_terminate_kills_a_sigterm_ignoring_tree, every_teardown_abandons_synchronously_on_cancel |
 | M16 | abandon failure logged with its value | 2 red -- a_failing_kill_cannot_replace_the_cancel[stdio], a_failing_kill_cannot_replace_the_cancel[adopt] |
 | M17 | abandon lets a kill failure escape | 3 red -- a_failing_kill_cannot_replace_the_cancel[stdio], a_failing_kill_cannot_replace_the_cancel[adopt], a_cancel_caught_in_the_handshake_is_not_retried |
 | M18 | stdio stale entry dropped only on success | 7 red -- stdio_handshake_teardown[read_task], stdio_handshake_teardown[stderr_task], stdio_handshake_teardown[outbound_writer] (+4) |
-| M19 | update-probe cancel awaits terminate | 1 red -- no_cancellation_handler_awaits |
+| M19 | update-probe cancel awaits terminate | 2 red -- without_process_groups_every_kill_path_falls_back, no_cancellation_handler_awaits |
 | M20 | abandoned owner only signalled, never cancelled | 5 red -- remote_handshake_teardown[read_task], remote_handshake_teardown[outbound_writer], remote_handshake_teardown[close_transport] (+2) |
 | M21 | abandoned owner cancelled once, immediately (no re-cancel chain) | 5 red -- remote_handshake_teardown[read_task], remote_handshake_teardown[outbound_writer], remote_handshake_teardown[close_transport] (+2) |
 | M22 | cancelled close waits for the owner after abandoning it (round-2 B2) | 2 red -- a_cancelled_disconnect_does_not_wait_on_a_hung_escalation, no_cancellation_handler_awaits |
@@ -1068,7 +1136,7 @@ Red tests are 3.10's.
 | M25 | handoff cancels the owner once (codex r3, 2) | 2 red -- a_cancel_at_remote_handoff_abandons_the_owner, an_owner_is_cancelled_only_through_abandon_owner |
 | M26 | abandon does not mark an ONLINE client OFFLINE first (claude r4, F1) | 1 red -- a_cancelled_disconnect_all_does_not_respawn_its_servers |
 | M27 | terminate waits with asyncio.wait_for again (grok r5) | 3 red -- no_wait_for_in_src_pmcp, a_cancel_as_the_leader_exits_is_not_swallowed_by_terminate, a_restart_cancelled_as_the_old_server_exits_spawns_nothing |
-| M28 | update probe waits with asyncio.wait_for again (grok r5) | 3 red -- no_wait_for_in_src_pmcp, an_update_probe_cancelled_as_it_finishes_is_cancelled, a_fast_exiting_update_probe_never_leaves_a_grandchild |
+| M28 | update probe waits with asyncio.wait_for again (grok r5) | 4 red -- no_wait_for_in_src_pmcp, an_update_probe_cancelled_as_it_finishes_is_cancelled, a_fast_exiting_update_probe_never_leaves_a_grandchild (+1) |
 | M29 | bounded_wait returns the result when the work finished in the cancel's turn | 4 red -- bounded_wait_keeps_a_cancel_that_lands_as_the_work_finishes, a_cancel_as_the_leader_exits_is_not_swallowed_by_terminate, a_restart_cancelled_as_the_old_server_exits_spawns_nothing (+1) |
 | M30 | stdio spawn looks the group up again instead of the spawn contract (codex r6) | 1 red -- fast_exiting_leaders_never_leave_a_grandchild |
 | M31 | synchronous kill skips the retained group once the leader is reaped | 1 red -- a_grandchild_of_a_reaped_leader_is_killed[disconnect_all_cal |
@@ -1076,8 +1144,11 @@ Red tests are 3.10's.
 | M33 | retained group signalled even when a live process holds the leader's pid | 1 red -- a_reused_group_id_is_not_signalled |
 | M34 | update probe looks the group up again instead of the spawn contract (codex r6) | 1 red -- a_fast_exiting_update_probe_never_leaves_a_grandchild |
 | M35 | shutdown's cancel handler does not abandon (codex r6) | 1 red -- gateway_shutdown_cancelled_before_disconnect_all_starts_kill |
-| M36 | abandon_all_now does not abandon the clients | 1 red -- gateway_shutdown_cancelled_before_disconnect_all_starts_kill |
+| M36 | abandon_all_now does not abandon the clients | 2 red -- gateway_shutdown_cancelled_before_disconnect_all_starts_kill, without_process_groups_every_kill_path_falls_back |
 | M37 | post-timeout cancel does not retrieve the outcome (claude r6 N1) | 1 red -- a_cancel_during_the_post_timeout_wait_retrieves_the_outcome |
+| M38 | no platform guard: groups assumed everywhere (codex r7, Windows) | 1 red -- without_process_groups_every_kill_path_falls_back |
+| M39 | graceful terminate keeps a retained id where groups do not exist | 1 red -- without_process_groups_every_kill_path_falls_back |
+| M40 | the spawn contract records an id where groups do not exist | 1 red -- without_process_groups_every_kill_path_falls_back |
 
 M27–M28 are red on 3.12 too: through the structural ban, and the terminate
 and probe regressions also fail there under the restored `wait_for`.
@@ -1095,8 +1166,12 @@ runs on 3.10 -- a kill landing before `sh` had recorded the grandchild's
 pid -- so its failing handshake now waits for the pid file; 30 runs per
 Python were then all green.
 
-The implementer re-runs all 36 on the final tree on all three Pythons, with
-`mutants7.py`'s `finally`-restore (never `git checkout --`).
+Round 8: M38–M40 are new (the Windows guard removed at the capability
+check, in terminate, at the spawn contract); M30 and M34 were re-anchored on
+`_spawned_group_pgid(process)`.
+
+The implementer re-runs all 39 on the final tree on all three Pythons, with
+`mutants8.py`'s `finally`-restore (never `git checkout --`).
 
 ## Non-goals
 
@@ -1105,6 +1180,16 @@ The implementer re-runs all 36 on the final tree on all three Pythons, with
   clears run in `_disconnect_all_unlocked`'s `finally`, on the cancelled path
   too -- `_clients`, `_servers`, the catalogs and the task registries --
   which Design decision 7, the acceptance criteria and mutant M24 require.)*
+- **A cancel during `create_subprocess_exec()`** (codex round 7): asyncio's
+  cleanup kills only the half-spawned leader, so a grandchild it already
+  started survives. Pre-existing on main; filed as Consiliency/pmcp#344.
+  This plan's guarantees cover processes after `create_subprocess_exec`
+  returns.
+- **Catalogs after a shutdown cancelled before `disconnect_all` starts**
+  (claude round 7, N1): `abandon_all_now()` drops the clients and task
+  registries but leaves `_tools`/`_resources`/`_prompts` populated (catalog
+  writes stay in `_disconnect_all_unlocked`, per the publisher-coverage
+  guard). It is terminal -- the process is exiting -- and harmless.
 - **`_own_remote_transport` forwarding its own pre-handoff cancel** into
   `ready` (row 10 of the main census): not a lost caller cancel.
 - **Task roots** (`cli.run_server`, `_health_monitor_loop`, the installer's
@@ -1162,16 +1247,16 @@ The implementer re-runs all 36 on the final tree on all three Pythons, with
    then run `git apply 324-src.patch` on `c9206a9` (measured). It creates
    `src/pmcp/waits.py` and changes `client/manager.py`, `tools/handlers.py`,
    `server.py`, `transport/http.py`, `manifest/environment.py`,
-   `manifest/installer.py` and `tests/test_tools.py`. It changes
-   `src/pmcp/client/manager.py` and `src/pmcp/tools/handlers.py`.
+   `manifest/installer.py`, `tests/test_tools.py` and
+   `tests/test_client_manager.py`.
 2. Write the test module below to `tests/test_cancel_teardown.py`.
 3. Add the `CHANGELOG.md` bullet by hand.
 
-### Patch — `src/pmcp/client/manager.py`, `src/pmcp/tools/handlers.py`, `src/pmcp/waits.py` (new), `src/pmcp/server.py`, `src/pmcp/transport/http.py`, `src/pmcp/manifest/environment.py`, `src/pmcp/manifest/installer.py`, `tests/test_tools.py`
+### Patch — `src/pmcp/client/manager.py`, `src/pmcp/tools/handlers.py`, `src/pmcp/waits.py` (new), `src/pmcp/server.py`, `src/pmcp/transport/http.py`, `src/pmcp/manifest/environment.py`, `src/pmcp/manifest/installer.py`, `tests/test_tools.py`, `tests/test_client_manager.py`
 
 ````diff
 diff --git a/src/pmcp/client/manager.py b/src/pmcp/client/manager.py
-index cae5645..ce437fb 100644
+index cae5645..d1902d2 100644
 --- a/src/pmcp/client/manager.py
 +++ b/src/pmcp/client/manager.py
 @@ -57,6 +57,7 @@ from pmcp.types import (
@@ -1319,10 +1404,26 @@ index cae5645..ce437fb 100644
  # The three catalog kinds, in the order reconciliation fetches and applies them.
  # Iterating this rather than three hand-written branches is what keeps
  # "each kind is handled independently" true as kinds are added.
-@@ -270,8 +401,108 @@ class _NullCatalogEventSink:
+@@ -270,8 +401,126 @@ class _NullCatalogEventSink:
          pass
  
  
++def _process_groups_supported() -> bool:
++    """Whether this platform has POSIX process groups to signal. Windows has
++    neither `os.killpg` nor `os.getpgid`: there every group path is skipped
++    and teardown uses the single-process `terminate()`/`kill()` fallback, as
++    on main (codex round 7: a retained id reached `os.killpg` there and the
++    `AttributeError` failed `disconnect_server`). Read at call time, so a
++    test that removes the APIs sees it."""
++    return hasattr(os, "killpg") and hasattr(os, "getpgid")
++
++
++def _spawned_group_pgid(process: asyncio.subprocess.Process) -> int | None:
++    """The group id of a process pmcp spawned with `start_new_session=True`:
++    its pid (the spawn contract), or `None` where groups do not exist."""
++    return process.pid if _process_groups_supported() else None
++
++
 +def _own_group_pgid(process: asyncio.subprocess.Process | None) -> int | None:
 +    """The process group an *adopted* downstream leads, read while it is
 +    still ours (spawned servers take it from the spawn contract instead).
@@ -1339,7 +1440,7 @@ index cae5645..ce437fb 100644
 +    if process is None or process.returncode is not None:
 +        return None
 +    pid = process.pid
-+    if not isinstance(pid, int) or not hasattr(os, "getpgid"):
++    if not isinstance(pid, int) or not _process_groups_supported():
 +        return None
 +    try:
 +        return pid if os.getpgid(pid) == pid else None
@@ -1359,7 +1460,7 @@ index cae5645..ce437fb 100644
 +    by a new session leader that then exits while its own children live, all
 +    between our reap and this call -- the pid space must cycle in that window.
 +    """
-+    if group_pgid is None or not hasattr(os, "killpg"):
++    if group_pgid is None or not _process_groups_supported():
 +        return
 +    try:
 +        os.killpg(group_pgid, 0)
@@ -1393,6 +1494,8 @@ index cae5645..ce437fb 100644
 +    was cached earlier by `_terminate_process_tree` and the group is still
 +    alive.
 +    """
++    if not _process_groups_supported():
++        group_pgid = None
 +    if process is None:
 +        _kill_retained_group(group_pgid)
 +        return
@@ -1429,7 +1532,7 @@ index cae5645..ce437fb 100644
  ) -> None:
      """Terminate a downstream process and its whole process group.
  
-@@ -285,7 +516,11 @@ async def _terminate_process_tree(
+@@ -285,7 +534,11 @@ async def _terminate_process_tree(
      never accidentally signals an unrelated group such as the gateway's own.
      """
      if process is None or process.returncode is not None:
@@ -1437,11 +1540,11 @@ index cae5645..ce437fb 100644
 +        # 5). Kill it through the id retained at spawn, never the pid.
 +        _kill_retained_group(group_pgid)
          return
-+    retained_pgid = group_pgid
++    retained_pgid = group_pgid if _process_groups_supported() else None
  
      def _signal(kill: bool) -> None:
          # Process-group signalling is POSIX-only. On Windows os.getpgid/os.killpg
-@@ -318,9 +553,14 @@ async def _terminate_process_tree(
+@@ -318,9 +571,14 @@ async def _terminate_process_tree(
      # Cache the process group up front: once the leader exits, os.getpgid(pid)
      # fails, so we could no longer find the group to escalate against. Only set
      # when this process leads its own group (POSIX, start_new_session=True).
@@ -1458,7 +1561,7 @@ index cae5645..ce437fb 100644
          try:
              if os.getpgid(pid) == pid:
                  group_pgid = pid
-@@ -338,39 +578,46 @@ async def _terminate_process_tree(
+@@ -338,39 +596,46 @@ async def _terminate_process_tree(
  
      _signal(kill=False)
      try:
@@ -1535,7 +1638,7 @@ index cae5645..ce437fb 100644
  
  
  # Heartbeat thresholds for health monitoring
-@@ -1062,6 +1309,13 @@ class ManagedClient:
+@@ -1062,6 +1327,13 @@ class ManagedClient:
      # drains the queue, recreated on demand when the previous one is done.
      outbound: asyncio.Queue[dict[str, Any]] | None = None
      outbound_writer: asyncio.Task[None] | None = None
@@ -1549,7 +1652,7 @@ index cae5645..ce437fb 100644
  
  
  class ClientManager:
-@@ -1216,11 +1470,38 @@ class ClientManager:
+@@ -1216,11 +1488,38 @@ class ClientManager:
          # task: a connect/reconnect task scoped to this server name must never
          # cancel a gather() containing itself (that self-cancel recurses until
          # RecursionError and leaves the server stuck in ERROR).
@@ -1589,7 +1692,7 @@ index cae5645..ce437fb 100644
              task
              for task in self._background_tasks
              if task not in exclude
-@@ -1232,14 +1513,6 @@ class ClientManager:
+@@ -1232,14 +1531,6 @@ class ClientManager:
                  or task is self._connect_tasks.get(server_name)
              )
          ]
@@ -1604,7 +1707,7 @@ index cae5645..ce437fb 100644
  
      def _next_request_id(self, server_name: str) -> int:
          request_id = self._request_counters.get(server_name, 0) + 1
-@@ -1425,68 +1698,82 @@ class ClientManager:
+@@ -1425,68 +1716,82 @@ class ClientManager:
              managed.status.status = ServerStatusEnum.OFFLINE
              managed.status.pending_request_count = 0
  
@@ -1746,18 +1849,18 @@ index cae5645..ce437fb 100644
      async def restart_server(
          self, config: ResolvedServerConfig, force: bool = False
      ) -> tuple[bool, int, list[str]]:
-@@ -2512,6 +2799,10 @@ class ClientManager:
+@@ -2512,6 +2817,10 @@ class ClientManager:
              config=config,
              process=process,
              status=status,
 +            # The spawn contract: `start_new_session=True` above makes the
 +            # child a session and group leader, so its pgid IS its pid --
 +            # true even if it has already exited and been reaped.
-+            group_pgid=process.pid,
++            group_pgid=_spawned_group_pgid(process),
          )
          self._clients[name] = managed
  
-@@ -2548,27 +2839,118 @@ class ClientManager:
+@@ -2548,27 +2857,118 @@ class ClientManager:
                  f"{resource_count} resources, {prompt_count} prompts indexed"
              )
  
@@ -1892,7 +1995,7 @@ index cae5645..ce437fb 100644
      async def _connect_sse(self, config: ResolvedServerConfig) -> None:
          """Connect to a remote SSE MCP server."""
          if not isinstance(config.config, RemoteMcpServerConfig):
-@@ -2713,67 +3095,40 @@ class ClientManager:
+@@ -2713,67 +3113,40 @@ class ClientManager:
                      raise exc
              return
          try:
@@ -1991,7 +2094,7 @@ index cae5645..ce437fb 100644
          # NOTE: no `except Exception` here, deliberately. A transport exit
          # that genuinely fails must propagate, or disconnect_server's
          # `except Exception -> return (False, cancelled, str(e))` can never
-@@ -2848,9 +3203,9 @@ class ClientManager:
+@@ -2848,9 +3221,9 @@ class ClientManager:
              # signal-and-wait -- a cancelled caller must not linger, and the
              # peer reaps its own session on timeout. The owner's `async
              # with` unwinds in the owner, as always -- never touch its stack
@@ -2004,7 +2107,7 @@ index cae5645..ce437fb 100644
              raise
  
          try:
-@@ -2876,30 +3231,41 @@ class ClientManager:
+@@ -2876,30 +3249,41 @@ class ClientManager:
                  f"{resource_count} resources, {prompt_count} prompts indexed"
              )
  
@@ -2060,7 +2163,7 @@ index cae5645..ce437fb 100644
                  except asyncio.TimeoutError:
                      logger.debug(f"[{name}] stderr readline timed out, continuing")
                      continue
-@@ -3356,16 +3722,10 @@ class ClientManager:
+@@ -3356,16 +3740,10 @@ class ClientManager:
          writer = managed.outbound_writer
          managed.outbound = None
          managed.outbound_writer = None
@@ -2081,7 +2184,7 @@ index cae5645..ce437fb 100644
  
      async def _drain_outbound(self, managed: ManagedClient) -> None:
          """The one writer task per client: drain the bounded outbound queue.
-@@ -3585,7 +3945,7 @@ class ClientManager:
+@@ -3585,7 +3963,7 @@ class ClientManager:
          slice_s = min(idle_timeout_s, IDLE_POLL_SLICE_S)
          while True:
              try:
@@ -2090,7 +2193,7 @@ index cae5645..ce437fb 100644
              except asyncio.TimeoutError:
                  if future.done():
                      return future.result()
-@@ -3676,14 +4036,7 @@ class ClientManager:
+@@ -3676,14 +4054,7 @@ class ClientManager:
                  managed.status.pending_request_count = 0
  
                  # Cancel read task
@@ -2106,7 +2209,7 @@ index cae5645..ce437fb 100644
  
                  # Close transport. _close_remote_transport itself never
                  # swallows a genuine transport-exit failure; the swallow
-@@ -3694,7 +4047,16 @@ class ClientManager:
+@@ -3694,7 +4065,16 @@ class ClientManager:
                  if managed.is_remote:
                      await self._close_remote_transport(name, managed)
                  else:
@@ -2124,7 +2227,7 @@ index cae5645..ce437fb 100644
              except Exception as e:
                  logger.warning(
                      f"Error disconnecting from {name}: {describe_exception(e)}"
-@@ -3702,57 +4064,75 @@ class ClientManager:
+@@ -3702,57 +4082,75 @@ class ClientManager:
  
          # Reap servers concurrently: each _terminate_process_tree can cost up to
          # ~8s for a hung stdio server, and disconnect_all() runs under a bounded
@@ -2241,7 +2344,7 @@ index cae5645..ce437fb 100644
  
          Cancels only *this* client's own read/stderr tasks — not every background
          task scoped to the server name. A reconnect runs its connect inside a task
-@@ -3764,13 +4144,24 @@ class ClientManager:
+@@ -3764,13 +4162,24 @@ class ClientManager:
          # `while True` writer is not a background-task sweep target on this path
          # (`_cleanup_client` deliberately does NOT call `_cancel_background_tasks`),
          # so without this it leaked one writer task per reconnect generation.
@@ -2272,7 +2375,7 @@ index cae5645..ce437fb 100644
          # Reset the outbound path so nothing survives onto a next generation.
          # The writer was cancelled above, but the Queue -- and any reply /
          # notifications/cancelled frames the dead connection left buffered,
-@@ -3803,10 +4194,9 @@ class ClientManager:
+@@ -3803,10 +4212,9 @@ class ClientManager:
                      f"[{name}] Error closing remote transport: {describe_exception(e)}"
                  )
          else:
@@ -2286,7 +2389,7 @@ index cae5645..ce437fb 100644
  
      async def refresh(self, configs: list[ResolvedServerConfig]) -> list[str]:
          """Refresh connections (disconnect + reconnect)."""
-@@ -3876,6 +4266,10 @@ class ClientManager:
+@@ -3876,6 +4284,10 @@ class ClientManager:
              config=config,
              process=process,
              status=status,
@@ -2297,7 +2400,7 @@ index cae5645..ce437fb 100644
          )
          self._clients[name] = managed
  
-@@ -3913,6 +4307,13 @@ class ClientManager:
+@@ -3913,6 +4325,13 @@ class ClientManager:
  
              logger.info(f"Adopted {name}: {indexed} tools indexed")
  
@@ -2436,10 +2539,10 @@ index ed00259..f208426 100644
              logger.warning("Shutdown timed out, forcing disconnect")
          except Exception as e:
 diff --git a/src/pmcp/tools/handlers.py b/src/pmcp/tools/handlers.py
-index 09e9f34..d3f538e 100644
+index 09e9f34..3fde100 100644
 --- a/src/pmcp/tools/handlers.py
 +++ b/src/pmcp/tools/handlers.py
-@@ -31,7 +31,11 @@ from pmcp.auth import (
+@@ -31,7 +31,12 @@ from pmcp.auth import (
      sanitize_url_elicitation_url,
  )
  
@@ -2447,12 +2550,13 @@ index 09e9f34..d3f538e 100644
 +from pmcp.client.manager import (
 +    ClientManager,
 +    _kill_process_tree_now,
++    _spawned_group_pgid,
 +    _terminate_process_tree,
 +)
  from pmcp.config.guidance import GuidanceConfig
  from pmcp.config.loader import (
      registry_allow_private_from_config,
-@@ -200,6 +204,7 @@ from pmcp.manifest.loader import (
+@@ -200,6 +205,7 @@ from pmcp.manifest.loader import (
      is_usable_credential_value,
      requires_credential,
  )
@@ -2460,7 +2564,7 @@ index 09e9f34..d3f538e 100644
  
  logger = logging.getLogger(__name__)
  
-@@ -3404,12 +3409,19 @@ class GatewayTools:
+@@ -3404,12 +3410,19 @@ class GatewayTools:
              env=env,
              start_new_session=True,
          )
@@ -2468,7 +2572,7 @@ index 09e9f34..d3f538e 100644
 +        # leader, so its pgid IS its pid -- not looked up, since a probe that
 +        # exits at once may already be reaped (Consiliency/pmcp#324, codex
 +        # rounds 5 and 6). A grandchild can outlive it.
-+        group_pgid = process.pid
++        group_pgid = _spawned_group_pgid(process)
          try:
 -            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
 +            stdout, stderr = await bounded_wait(process.communicate(), timeout=60.0)
@@ -2484,7 +2588,7 @@ index 09e9f34..d3f538e 100644
              raise
          except (asyncio.TimeoutError, TimeoutError) as exc:
              # asyncio.TimeoutError is listed EXPLICITLY: it only became an alias
-@@ -3418,7 +3430,9 @@ class GatewayTools:
+@@ -3418,7 +3431,9 @@ class GatewayTools:
              # the cleanup never runs. CI caught this on 3.10 while 3.11 and 3.12
              # both passed -- the fix silently did nothing on the oldest
              # supported version.
@@ -2601,6 +2705,26 @@ index 0000000..32bea3f
 +    if task.cancelled():
 +        raise asyncio.TimeoutError
 +    return task.result()
+diff --git a/tests/test_client_manager.py b/tests/test_client_manager.py
+index dff5a63..34df9ef 100644
+--- a/tests/test_client_manager.py
++++ b/tests/test_client_manager.py
+@@ -3990,9 +3990,14 @@ class TestTerminateProcessTree:
+         process.returncode = None
+         process.wait = AsyncMock(return_value=0)
+ 
+-        # Must not raise; must use the cross-platform single-process path.
++        # Must not raise; must use the cross-platform single-process path --
++        # also with a retained group id passed in (Consiliency/pmcp#324: the
++        # id is never used where groups do not exist; every other kill path
++        # is covered in tests/test_cancel_teardown.py).
+         await _terminate_process_tree(process, "browser")
+         process.terminate.assert_called_once()
++        await _terminate_process_tree(process, "browser", group_pgid=4321)
++        assert process.terminate.call_count == 2
+ 
+ 
+ class TestReadStdoutFailureSurfacing:
 diff --git a/tests/test_tools.py b/tests/test_tools.py
 index 1e91803..623c660 100644
 --- a/tests/test_tools.py
@@ -4291,6 +4415,90 @@ def test_gateway_shutdown_cancelled_before_disconnect_all_starts_kills_the_tree(
     finally:
         _kill_pids(pids)
     assert "clients=[]" in result.stdout, result.stdout
+
+
+async def test_without_process_groups_every_kill_path_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex round 7, Windows: without `os.killpg`/`os.getpgid` a retained
+    group id must never reach a group call. With the APIs removed (as
+    `tests/test_client_manager.py`'s Windows fallback test does) and an id
+    passed explicitly through every kill path: no `AttributeError`, the
+    single-process fallback runs, `disconnect_server` succeeds and drops the
+    client, and the spawn contract records no id."""
+    monkeypatch.delattr(manager_mod.os, "killpg", raising=False)
+    monkeypatch.delattr(manager_mod.os, "getpgid", raising=False)
+
+    def fake_process(returncode: int | None = None) -> MagicMock:
+        process = MagicMock()
+        process.pid = 4321
+        process.returncode = returncode
+        process.wait = AsyncMock(return_value=0)
+        return process
+
+    assert manager_mod._spawned_group_pgid(fake_process()) is None
+    assert manager_mod._own_group_pgid(fake_process()) is None
+
+    alive = fake_process()
+    manager_mod._kill_process_tree_now(alive, group_pgid=4321)
+    alive.kill.assert_called_once()
+    manager_mod._kill_process_tree_now(fake_process(returncode=0), group_pgid=4321)
+    manager_mod._kill_retained_group(4321)
+
+    graceful = fake_process()
+    await manager_mod._terminate_process_tree(graceful, "srv", group_pgid=4321)
+    graceful.terminate.assert_called_once()
+    await manager_mod._terminate_process_tree(
+        fake_process(returncode=0), "srv", group_pgid=4321
+    )
+
+    mgr = ClientManager()
+    status = ServerStatus(name="srv", status=ServerStatusEnum.ONLINE, tool_count=0)
+    managed = ManagedClient(
+        config=MagicMock(), process=fake_process(), status=status, group_pgid=4321
+    )
+    managed.is_remote = False
+    mgr._clients["srv"] = managed
+    mgr._servers["srv"] = status
+    ok, _cancelled, error = await mgr.disconnect_server("srv", force=True)
+    assert ok and error is None and "srv" not in mgr._clients
+
+    abandoned = fake_process()
+    mgr._clients["other"] = ManagedClient(
+        config=MagicMock(), process=abandoned, status=status, group_pgid=4321
+    )
+    mgr.abandon_all_now()
+    abandoned.kill.assert_called_once()
+    assert mgr._clients == {}
+
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools import handlers as handlers_mod
+    from pmcp.tools.handlers import GatewayTools
+
+    gt = GatewayTools(client_manager=MagicMock(), policy_manager=PolicyManager())
+    for outcome in ("timeout", "cancel"):
+        probe = fake_process()
+
+        async def fake_exec(*args: Any, **kwargs: Any) -> MagicMock:
+            return probe
+
+        async def ending(aw: Any, timeout: float | None) -> Any:
+            aw.close()
+            if outcome == "timeout":
+                raise asyncio.TimeoutError
+            raise asyncio.CancelledError
+
+        with (
+            patch("asyncio.create_subprocess_exec", fake_exec),
+            patch.object(handlers_mod, "bounded_wait", ending),
+        ):
+            expected = TimeoutError if outcome == "timeout" else asyncio.CancelledError
+            with pytest.raises(expected):
+                await gt._run_update_probe_command(["probe", "--help"])
+        if outcome == "timeout":
+            probe.terminate.assert_called_once()
+        else:
+            probe.kill.assert_called_once()
 
 
 def test_a_reused_group_id_is_not_signalled() -> None:
