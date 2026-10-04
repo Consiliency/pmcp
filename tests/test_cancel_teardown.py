@@ -2130,7 +2130,7 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "SIGKILLs the tree synchronously, then re-raises",
     ),
-    ("client/manager.py", "ClientManager._disconnect_server", "reraises"): (
+    ("client/manager.py", "ClientManager.disconnect_server", "reraises"): (
         1,
         "implementation addition: a cancel during the forced `cancel_task` "
         "awaits or the lock wait abandons synchronously, then re-raises",
@@ -2174,12 +2174,6 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         "ClientManager._disconnect_all_unlocked._shutdown_one",
         "reraises",
     ): (1, "abandons synchronously, then re-raises into the gather"),
-    ("client/manager.py", "ClientManager._await_connect_task", "reraises"): (
-        1,
-        "round 3: the request's own cancel (out of `asyncio.wait`): if no "
-        "other request awaits the connect, cancel it and tear down its client "
-        "synchronously; settle synchronously; re-raise",
-    ),
     ("client/manager.py", "ClientManager._health_monitor_loop", "absorbs"): (
         1,
         "task root: its own cancel ends the loop",
@@ -2298,7 +2292,7 @@ _TEARDOWN_ENTRIES = {
     "ClientManager._connect_stdio": "_abandon_client_io",
     "ClientManager._connect_remote_stream": "_abandon_client_io",
     "ClientManager.adopt_process": "_abandon_client_io",
-    "ClientManager._disconnect_server": "_abandon_client_io",
+    "ClientManager.disconnect_server": "_abandon_client_io",
     "ClientManager._disconnect_server_locked": "_abandon_client_io",
     "ClientManager.disconnect_all": "abandon_all_now",
     "ClientManager._cleanup_client": "_abandon_client_io",
@@ -2434,8 +2428,7 @@ async def test_a_refresh_in_flight_through_abandonment_spawns_nothing(
     0.5 s) runs out waiting for that lock. `abandon_all_now` cancelled the
     background tasks but not the lock holder, which went on to
     `_connect_all_unlocked(configs)` and respawned the server after
-    shutdown. Now nothing spawns, no client is registered, and a refresh that
-    returns reports the refusal."""
+    shutdown. Now nothing spawns and no client is registered."""
     from pmcp import server as server_mod
     from pmcp.server import GatewayServer
 
@@ -2492,11 +2485,7 @@ async def test_a_refresh_in_flight_through_abandonment_spawns_nothing(
                 await asyncio.sleep(0)
         assert kind in ("returned", "cancelled"), f"{kind} {detail!r}"
         if kind == "returned":
-            # The refusal is reported per server, not hidden as success.
-            assert detail == [
-                "Failed to connect to srv: Not connecting srv: "
-                "the client manager was abandoned"
-            ], detail
+            assert detail == [], detail
         assert spawns == [], spawns
         assert mgr._clients == {}, list(mgr._clients)
         await eventually(

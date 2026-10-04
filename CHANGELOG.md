@@ -450,50 +450,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its 10 s budget runs out (for example while another operation holds the
   lifecycle lock) or when its `disconnect_all` is cancelled before it starts.
   A forced `disconnect_server` cancelled while waiting for a `tasks/cancel`
-  reply, or for the lifecycle lock, finishes its teardown too, and it
-  supersedes every connect of that server requested before it: one queued on
-  the lifecycle lock, a `refresh` still tearing down before it reconnects, a
-  lazy start, an auto-reconnect, one in its retry backoff or mid-spawn. None
-  spawns the server afterwards; `connect_server`, `connect_all` and `refresh`
-  report `Not connecting <name>: superseded by a disconnect_server(<name>)
-  requested after this connect and cancelled before it ran` for it,
-  `ensure_connected` returns false, and the server ends as the uncancelled
-  ordering leaves it (disconnected; lazy again if it came from a project,
-  user or custom config) -- unless a connect requested after the cancelled
-  disconnect already owns the server, whose state it then leaves alone. A
-  connect requested after the cancelled disconnect is unaffected, including
-  while a superseded lazy start is still winding down. A request writes a
-  server's status and lazy registration after it waited only under the
-  lifecycle lock and only while no newer connect of that server has started,
-  so a lazy start that finishes after a forced disconnect has made the server
-  lazy again no longer drops its lazy registration (it pops it only for a
-  server that is online). Cancelling one of two lazy starts that share a
-  connect no longer cancels the connect the other is still waiting for, and
-  a `connect_server` that holds the lifecycle lock no longer waits forever on
-  a lazy start's connect queued behind it. A connect that finished just
-  before the cancelled disconnect took the server down is refused too
-  (`ensure_connected` returns false) instead of reporting success, and a
-  caller cancelled after the supersession stays cancelled while the server
-  is still settled. A caller cancelled while its connect is in flight now
-  has that connect's client killed and dropped before the cancellation
-  reaches it. `restart_server` disconnects and reconnects in one hold of the
-  lifecycle lock, as one request: a disconnect queued during a restart runs
-  after the whole restart, and if it is cancelled it supersedes the
-  restart's reconnect. (Gateway-level operations that release the lock
-  between steps -- `gateway.refresh`, server updates, provisioning -- issue a
-  separate request for each connect, each ordered at its own request, as
-  their uncancelled ordering is.) An uncancelled disconnect supersedes nothing: it runs after
-  those connects (the lock is first-come, first-served) and tears down what
-  they produced, so its end state is already this one, and refusing them
-  instead would change what their callers are told. The one pre-existing
-  departure from request order is left as it is: uncancelled, a lazy start
-  queued on the lock before a disconnect can still connect after it, because
-  it takes the lock twice. Once shutdown abandons the client manager, no
-  connect path spawns a server and `adopt_process` registers none (a
-  provisioning handoff then fails and kills the process it was handing
-  over); a `refresh` in flight through shutdown reports the refusal per
-  server. A cancelled `disconnect_all()`/`refresh()` does not respawn the
-  servers it was removing. Every bounded wait in `src/pmcp` now uses `pmcp.waits.bounded_wait`
+  reply, or for the lifecycle lock, finishes its teardown too. A cancelled
+  `disconnect_all()`/`refresh()` does not respawn the servers it was
+  removing. Every bounded wait in `src/pmcp` now uses `pmcp.waits.bounded_wait`
   instead of `asyncio.wait_for`, which on Python 3.10/3.11 could drop a
   cancel that landed as the awaited work finished. Where process groups do
   not exist (Windows) the single-process fallback is used, as before. Known
