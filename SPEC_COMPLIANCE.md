@@ -24,6 +24,14 @@ revision is documented in the MCP specification changelog:
 | Tool schemas that omit `$schema` advertise JSON Schema 2020-12 as the default dialect per SEP-1613. | Compliant | `src/pmcp/client/manager.py`, `src/pmcp/tools/handlers.py`, `src/pmcp/types.py` | `tests/test_tools.py::test_catalog_search_uses_default_schema_dialect_when_schema_omits_marker`; `tests/test_tools.py::test_describe_uses_default_schema_dialect_when_schema_omits_marker` |
 | Downstream tool/resource/prompt `icons` metadata is indexed, and tool icons pass through `gateway.catalog_search` and `gateway.describe` per SEP-973. | Compliant | `src/pmcp/client/manager.py`, `src/pmcp/tools/handlers.py` | `tests/test_tools.py::test_catalog_search_includes_compact_modern_metadata`; `tests/test_tools.py::test_describe_returns_modern_tool_metadata` |
 | MCP server implementation metadata is populated when supported by the installed SDK. | SDK-limited | `src/pmcp/server.py` | `tests/test_baseline_constraints.py::test_mcp_sdk_implementation_description_surface_is_documented` records that the installed MCP SDK exposes `name`, `version`, `title`, `websiteUrl`, and `icons`, but no `description` field. PMCP therefore does not invent unsupported implementation metadata. |
+| A downstream server's `ping` request is answered with an empty result, and any other server→client request gets a `-32601` (Method not found) error rather than going unanswered; PMCP advertises no client capabilities to downstream servers. | Compliant | `src/pmcp/client/manager.py` | `tests/test_client_manager.py::test_c01_stdio_ping_gets_empty_result_reply`; `tests/test_client_manager.py::test_c01_unsupported_request_gets_method_not_found` |
+| A request PMCP abandons (`gateway.cancel`, an idle or ceiling timeout, or the caller's cancellation) is cancelled downstream with `notifications/cancelled`, and `initialize` is never cancelled. | Compliant | `src/pmcp/client/manager.py` | `tests/test_client_manager.py::test_c04_gateway_cancel_notifies_downstream`; `tests/test_client_manager.py::test_c04_initialize_request_is_never_cancelled_downstream` |
+
+### Known deviations
+
+- Task `ttl` and `poll_interval`: PMCP documents both in seconds, but MCP
+  defines them in milliseconds, and PMCP forwards them unchanged. Tracked as
+  [Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330).
 
 ## Draft Revision Impact
 

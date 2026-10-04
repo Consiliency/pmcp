@@ -66,7 +66,8 @@ def _no_downstream_tools_summary(provisionable_categories: str | None = None) ->
         "  - gateway.describe - full schema for one tool before calling it",
         "  - gateway.invoke - call a downstream tool (connects its server if needed)",
         "  - gateway.request_capability - describe a need in plain language; "
-        "provisions a server if one is missing",
+        "recommends a local CLI or a server to provision (it starts nothing; "
+        "gateway.provision does)",
     ]
     if provisionable_categories:
         lines += ["", f"Provisionable categories: {provisionable_categories}"]

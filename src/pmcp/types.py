@@ -785,7 +785,13 @@ class TasksCancelInput(GatewayArguments):
 
     server_name: str = Field(min_length=1, description="Server that owns the task")
     task_id: str = Field(min_length=1, description="Opaque downstream task ID")
-    force: bool = Field(default=False, description="Cancel even if the task is healthy")
+    force: bool = Field(
+        default=False,
+        description=(
+            "Passed as force in the downstream tasks/cancel request; PMCP "
+            "applies no health check of its own"
+        ),
+    )
     requestor_context: dict[str, Any] | None = Field(
         default=None, description="Opaque requestor context forwarded downstream"
     )
@@ -832,7 +838,11 @@ class CatalogSearchInput(GatewayArguments):
         default=20, ge=1, le=100, description="Maximum number of results to return"
     )
     include_offline: bool = Field(
-        default=False, description="Include tools from offline servers"
+        default=False,
+        description=(
+            "Also include cached tools of offline servers and, with a query, "
+            "manifest servers never started (manifest_candidates)"
+        ),
     )
 
 
@@ -947,10 +957,17 @@ class InvokeOptions(GatewayArguments):
         default=None,
         ge=100,
         le=100000,
-        description="Maximum output characters (truncated if exceeded)",
+        description=(
+            "Output size budget for this call: output is truncated at 4x "
+            "this many UTF-8 bytes"
+        ),
     )
     redact_secrets: bool = Field(
-        default=False, description="Redact detected secrets from output"
+        default=False,
+        description=(
+            "Redact detected secrets from output. Without options, task "
+            "results are redacted and plain results are not"
+        ),
     )
 
 

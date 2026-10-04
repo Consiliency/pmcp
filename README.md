@@ -293,7 +293,7 @@ and `AuthChallengeInfo.resource_metadata_url_verified` all default to
 unverified, and the caveat is carried in the `next_step` an agent follows and in
 CLI output. Where PMCP *fetches* a URL itself it fails closed instead, requiring
 a verified public literal
-([#211](https://github.com/Consiliency/pmcp/issues/211)). PMCP is still not an
+([Consiliency/pmcp#211](https://github.com/Consiliency/pmcp/issues/211)). PMCP is still not an
 Authorization Server and does not provide dynamic client registration, SSO,
 RBAC, billing, or a complete multi-tenant identity service.
 
@@ -328,7 +328,8 @@ audience so the proxied `Host` is accepted.
 **Assumptions and trust model:**
 
 - PMCP binds to `127.0.0.1` by default — not safe to expose publicly without
-  `PMCP_AUTH_TOKEN`.
+  an HTTP auth mode (`PMCP_AUTH_TOKEN` for `shared-secret`, or
+  `resource-server`).
 - User-scoped and explicitly configured sources (`~/.mcp.json`, an explicit
   `--config`, an explicit `--policy`) are trusted inputs — treat them like code.
   A project-scoped `.mcp.json`, `.pmcp/manifest.yaml` or
@@ -366,8 +367,14 @@ systemctl --user enable --now pmcp
 Or with nohup:
 
 ```bash
-PMCP_AUTH_TOKEN=replace-with-secret-token nohup pmcp --transport http >> ~/.pmcp/logs/gateway.log 2>&1 &
+cd ~ && PMCP_AUTH_TOKEN=replace-with-secret-token nohup pmcp --transport http > /dev/null 2>&1 &
 ```
+
+The gateway writes its own log to `.pmcp/logs/gateway.log` relative to its
+working directory (rotated at 1 MB, 5 backups), so started from `~` as above —
+or as a systemd user service, whose working directory is your home — it lands
+in `~/.pmcp/logs/gateway.log`. Don't redirect stderr onto that same file: every
+line would be written twice.
 
 ### TLS / Reverse Proxy
 
@@ -410,27 +417,22 @@ PMCP works with any MCP-compatible client. Below are configuration examples for 
 
 #### Codex CLI
 
-Create `~/.codex/mcp.json` (verify path in Codex documentation):
+Add to `~/.codex/config.toml` (verify in the Codex documentation):
 
-```json
-{
-  "mcpServers": {
-    "gateway": {
-      "command": "pmcp",
-      "args": []
-    }
-  }
-}
+```toml
+[mcp_servers.pmcp]
+command = "pmcp"
+args = []
 ```
 
 #### Gemini CLI
 
-Create the appropriate config file (verify path in Gemini CLI documentation):
+Add to `~/.gemini/settings.json` (verify in the Gemini CLI documentation):
 
 ```json
 {
   "mcpServers": {
-    "gateway": {
+    "pmcp": {
       "command": "pmcp",
       "args": []
     }
@@ -449,7 +451,7 @@ Claude uses: gateway.invoke {
   tool_id: "playwright::browser_navigate",
   arguments: { url: "https://google.com" }
 }
-// Then: gateway.invoke { tool_id: "playwright::browser_screenshot" }
+// Then: gateway.invoke { tool_id: "playwright::browser_take_screenshot" }
 
 Returns: Screenshot of google.com
 ```
@@ -590,9 +592,12 @@ Supported flows:
   process env, project env-store, and user env-store values, but status, doctor,
   health, and feedback output only show required or missing env var names, not
   the resolved header value.
-- Tenant-aware remote header resolution uses a tenant-scoped credential file
-  under the resolved project root. Tenant mode reads only that tenant's values
-  and reports missing env var names without printing header values.
+- A tenant-scoped header resolver exists for applications that embed PMCP: it
+  reads only `<project>/.pmcp/tenants/<tenant_id>/pmcp.env` and reports missing
+  env var names without printing header values. The gateway's own remote
+  connections never select a tenant, and no config key, flag or env var turns
+  tenant mode on (see
+  [Consiliency/pmcp#353](https://github.com/Consiliency/pmcp/issues/353)).
 - Remote authorization discovery is diagnostic-only. PMCP can preserve and report
   OAuth Protected Resource Metadata, Authorization Server Metadata, OpenID
   Connect discovery, Client ID Metadata Document URLs, and declared scopes when a
@@ -742,7 +747,7 @@ gateway.catalog_search({ query: "documentation" })
 
 CLI recommendations are returned separately from MCP tool cards:
 
-```json
+```
 gateway.catalog_search({ "query": "git" })
 ```
 
@@ -793,23 +798,27 @@ the selected server.
 ### Step 3: Get Tool Details
 
 ```
-gateway.describe({ tool_id: "context7::get-library-docs" })
+gateway.describe({ tool_id: "context7::query-docs" })
 ```
 
 ### Step 4: Invoke the Tool
 
 ```
 gateway.invoke({
-  tool_id: "context7::get-library-docs",
-  arguments: { libraryId: "/npm/react/19.0.0" }
+  tool_id: "context7::query-docs",
+  arguments: { libraryId: "/facebook/react", query: "useEffect cleanup" }
 })
 ```
+
+Downstream tool names and arguments come from the downstream server, not from
+PMCP; the shipped `context7` and `playwright` entries run the latest published
+package, so use `gateway.describe` for the current schema.
 
 ### Offline Tool Discovery
 
 When using `gateway.catalog_search`, you can discover tools from servers that haven't started yet:
 
-```json
+```
 // Search all tools including offline/lazy servers
 gateway.catalog_search({
   "query": "browser",
@@ -817,17 +826,22 @@ gateway.catalog_search({
 })
 ```
 
-This uses pre-cached tool descriptions from `.mcp-gateway/descriptions.yaml`. To refresh the cache:
+This uses pre-cached tool descriptions from `.mcp-gateway/descriptions.yaml`,
+relative to the gateway's working directory. `pmcp refresh` writes to `.pmcp/`
+by default, so point it at the directory the gateway reads (see
+[Consiliency/pmcp#352](https://github.com/Consiliency/pmcp/issues/352)):
 
 ```bash
-pmcp refresh
+pmcp refresh --cache-dir .mcp-gateway
 ```
 
 **Note**: Cached tools show metadata only. Full schemas are available after the server starts (use `gateway.describe` to trigger lazy start).
 
-The MCP Registry cache is stored separately under `.mcp-gateway`; PMCP uses the
-cache when the public registry is unavailable. Registry candidates can coexist
-with cached offline tool cards without changing `total_available`.
+The MCP Registry cache is stored separately, at
+`$XDG_CACHE_HOME/pmcp/registry-cache.json` (`~/.cache/pmcp/registry-cache.json`
+when `XDG_CACHE_HOME` is unset); PMCP uses the cache when the public registry is
+unavailable. Registry candidates can coexist with cached offline tool cards
+without changing `total_available`.
 
 #### Private registry (debugging, opt-in)
 
@@ -839,6 +853,13 @@ servers can opt in with an environment flag (default **off**):
 export PMCP_REGISTRY_ALLOW_PRIVATE=1
 export PMCP_REGISTRY_PRIVATE_ENDPOINT=https://registry.internal.example/v0/servers
 ```
+
+The opt-in can also be set with a top-level `"allowPrivateRegistry": true` in
+`.mcp.json` (project, then user, then `--config`; first one that states it
+wins). `PMCP_REGISTRY_ALLOW_PRIVATE` overrides the config value only when it is
+set. The endpoint must be `https://` (plain `http://` only for `localhost` or a
+loopback address) and must not be a link-local, multicast or unspecified address; otherwise
+PMCP logs a warning and uses the public registry.
 
 When enabled, PMCP fetches from the configured private endpoint and tolerates
 draft/non-GA `server.json` schema fields, surfacing all versions (including
@@ -909,7 +930,7 @@ Common opt-in choices:
 | Server | Description | API Key |
 |--------|-------------|---------|
 | `playwright` | Browser automation - navigation, screenshots, DOM inspection | Not required |
-| `context7` | Library documentation lookup - up-to-date docs for any package | Optional (for higher rate limits) |
+| `context7` | Library documentation lookup - up-to-date docs for any package | Not required |
 
 Startup policy decisions are visible through `gateway.health` and live
 `pmcp status --verbose`. Health rows keep the existing `name`, `status`,
@@ -926,7 +947,7 @@ Startup policy decisions are visible through `gateway.health` and live
 
 For persistent administration, use the config tools:
 
-```json
+```
 gateway.config_status({})
 gateway.get_startup_policy({})
 gateway.set_startup_policy({
@@ -1077,15 +1098,14 @@ The manifest includes 90+ servers that can be provisioned on-demand:
 | `google-drive` | Google Drive files | `GDRIVE_CREDENTIALS` |
 | `sentry` | Error tracking | `SENTRY_AUTH_TOKEN` |
 | `stripe` | Payments and billing | `STRIPE_SECRET_KEY` |
-| `github-actions` | CI/CD workflows | `GITHUB_PERSONAL_ACCESS_TOKEN` |
 | `datadog` | Monitoring and observability | `DATADOG_API_KEY` |
 | `cloudflare` | Edge network and Workers | `CLOUDFLARE_API_TOKEN` |
-| `figma` | Design files and components | `FIGMA_ACCESS_TOKEN` |
-| `jira` | Issue tracking | `JIRA_API_TOKEN` |
-| `airtable` | Spreadsheet database | `AIRTABLE_TOKEN` |
+| `figma` | Design files and components | `FIGMA_API_KEY` |
+| `jira` | Issue tracking | `ATLASSIAN_API_TOKEN` (also set `ATLASSIAN_SITE_NAME`, `ATLASSIAN_USER_EMAIL`) |
+| `airtable` | Spreadsheet database | `AIRTABLE_API_KEY` |
 | `hubspot` | CRM and marketing | `HUBSPOT_ACCESS_TOKEN` |
 | `twilio` | SMS and voice | `TWILIO_ACCOUNT_SID` |
-| `...and 80+ more` | Use `gateway.catalog_search` to explore | — |
+| `...and 70+ more` | Use `gateway.catalog_search` to explore | — |
 
 See `.env.example` for all supported environment variables.
 
@@ -1095,11 +1115,11 @@ PMCP includes built-in guidance to encourage models to use code execution patter
 
 ### Guidance Layers
 
-**L0 (MCP Instructions)**: Brief philosophy in server instructions (~30 tokens)
+**L0 (MCP Instructions)**: Brief philosophy in server instructions (~60-90 tokens)
 - "Write code to orchestrate tools - use loops, filters, conditionals"
 
 **L1 (Code Hints)**: Ultra-terse hints in search results (~8-12 tokens/card)
-- Single-word hints: "loop", "filter", "try/catch", "poll"
+- Single-word hints: "loop", "filter", "try", "poll" (cut to `max_hint_length`, default 8 characters)
 
 **L2 (Code Snippets)**: Minimal examples in describe output (~40-80 tokens, opt-in)
 - 3-4 line code examples showing practical usage
@@ -1123,12 +1143,18 @@ guidance:
 
   enable_telemetry: true            # failure feedback hints and issue previews
   enable_feedback_submission: false # let PMCP POST feedback to GitHub (default: off)
+  # custom_instructions: "..."     # optional: replaces the default L0 workflow text
 ```
 
 **Levels**:
-- `minimal` (default): L0 + L1 (~200 tokens overhead)
-- `standard`: L0 + L1 + L2 (~320 tokens overhead)
+- `minimal` (default): L0 + L1 (~230 tokens overhead)
+- `standard`: L0 + L1 + L2 (~290 tokens overhead)
 - `off`: No guidance
+
+`level` is a preset that sets all four `layers` flags, and it is applied after
+the file is read, so it overrides whatever `layers:` says: `level: minimal`
+with `code_snippets: true` still has no L2 snippets. To get L2, set
+`level: standard`.
 
 ### View Guidance Status
 
@@ -1145,8 +1171,8 @@ decision to `~/.claude/gateway-guidance.yaml` before printing the new state. See
 
 ### Token Budget
 
-- **Minimal mode**: ~200 tokens typical workflow (L0 + search)
-- **Standard mode**: ~320 tokens (L0 + search + 1 describe)
+- **Minimal mode**: ~230 tokens typical workflow (L0 + a 15-card search)
+- **Standard mode**: ~290 tokens (L0 + search + 1 describe)
 - **80% reduction** vs loading all tool schemas upfront!
 
 ## Configuration
@@ -1155,9 +1181,19 @@ decision to `~/.claude/gateway-guidance.yaml` before printing the new state. See
 
 PMCP discovers MCP servers from:
 
-1. **Project config**: `.mcp.json` in project root (highest priority)
+1. **Project config**: `.mcp.json` in project root (highest priority). The
+   project root is `--project` when given, otherwise the nearest ancestor of
+   the working directory holding a `.mcp.json`, `.git`, `package.json` or
+   `pyproject.toml`, stopping before `$HOME`. A project `.mcp.json` is ignored
+   until you run `pmcp trust approve <path>` (see
+   [Security](#security)).
 2. **User config**: `~/.mcp.json` or `~/.claude/.mcp.json`
 3. **Custom config**: Via `--config` flag or `PMCP_CONFIG` env var
+
+On a server-name collision the earlier source wins. `PMCP_CONFIG`,
+`PMCP_POLICY` and `PMCP_MANIFEST_PATH` are honoured only when exported in the
+shell that starts PMCP; a value set by a `.env` or `.env.pmcp` file is ignored
+with a warning.
 
 ### Private manifest overlay
 
@@ -1173,8 +1209,10 @@ server name; a same-named entry is replaced whole, not deep-merged):
 
 1. **Shipped manifest** (base)
 2. **User**: `~/.pmcp/manifest.yaml`
-3. **Project**: `<project>/.pmcp/manifest.yaml` (nearest ancestor of the cwd)
-4. **Explicit**: `PMCP_MANIFEST_PATH` env var (wins over all)
+3. **Project**: `<project>/.pmcp/manifest.yaml` (nearest ancestor of the cwd,
+   below `$HOME`; ignored until you run `pmcp trust approve <path>`)
+4. **Explicit**: `PMCP_MANIFEST_PATH` env var (wins over all; honoured only when
+   exported, not when set by a `.env` file)
 
 Overlays use the same entry schema as the shipped manifest. Example
 `~/.pmcp/manifest.yaml`:
@@ -1193,7 +1231,7 @@ servers:
   my-remote:
     description: "My private remote server"
     keywords: [myremote, internal api]
-    url: "https://mcp.internal.example.com/sse"
+    url: "https://mcp.internal.example.com/mcp"
     headers:
       Authorization: "Bearer ${MY_REMOTE_TOKEN}"
 ```
@@ -1224,7 +1262,9 @@ Overlay loading is **fail-soft**: a missing file is skipped silently, and a
 malformed file or a single bad entry logs a warning and is skipped without
 crashing the gateway — the shipped manifest always still loads. pmcp re-reads
 overlay files on every manifest load, so edits apply without a restart, and
-logs each warning once per change rather than on every load.
+logs each warning once per change rather than on every load — except that a
+file that cannot be read or parsed is reported on every load until it is
+fixed.
 
 > **Security:** a manifest entry can specify an arbitrary `command`/`args` to
 > run when provisioned — treat an overlay file with the same trust as your own
@@ -1263,7 +1303,7 @@ ignore the pin. Only a bare `npx` launcher is pinned (not a path such as `./npx`
 `install` argv is judged by the rules of the host pmcp runs on, whatever platform key it sits
 under, so a `windows:` argv using `npx.cmd` refuses the pin on Linux or macOS. For uvx, pip,
 cargo or docker, or any other case, pin the version in the server's own `command`/`args` in
-`.mcp.json` or `.pmcp.json`.
+`.mcp.json` (or the file you pass with `--config`).
 
 The pin fixes the npm spec; npm resolves it in your own environment (your `.npmrc`, npm's
 cache, and a `node_modules` in the directory pmcp runs in; a `.npmrc` there can also set
@@ -1307,9 +1347,11 @@ PMCP supports both local command-based and remote URL-based downstream entries f
 
 For a fleet pilot of the local-first code indexer, add `index-it-mcp` to your
 `.mcp.json` with a **pinned** version and its operational env. PMCP spawns it
-over stdio and passes the `env` block **verbatim** into the child process
-(`_connect_stdio` does `env = os.environ.copy(); env.update(config.env)`), so
-this is the supported channel for the server's configuration:
+over stdio and applies the `env` block **verbatim** on top of the gateway's
+environment, minus PMCP-stored credentials and keys PMCP loaded from `.env` /
+`.env.pmcp` (`_connect_stdio` builds the child env with
+`sanitized_subprocess_env(config.env, project_root)`), so this is the supported
+channel for the server's configuration:
 
 ```json
 {
@@ -1338,10 +1380,11 @@ Notes:
 - **`OPENAI_API_KEY`** is only the token the server presents to a local
   OpenAI-compatible endpoint (e.g. a vLLM embedding server at
   `SEMANTIC_EMBEDDING_BASE_URL`); it is not an api.openai.com secret.
-- **Env must go via `.mcp.json`.** The shipped-manifest and private-overlay
-  entry schema has **no `env:` block** — putting `env:` in a manifest overlay
-  will be ignored. Per-entry environment is only honored from `.mcp.json`
-  `mcpServers` entries.
+- **Env must go via `.mcp.json`.** An `env:` key in a shipped-manifest or
+  private-overlay entry is ignored. Manifest entries take non-secret variables
+  only through `extra_env:` (or an overlay `server_env:` patch), which cannot
+  carry a credential; for a server like this one, put its env in the
+  `.mcp.json` `mcpServers` entry.
 - **Pin the Python interpreter** with `"args": ["--python", "3.12", "--from", …]`.
   `index-it-mcp==1.2.0` depends on `tree-sitter-languages`, which has no wheel for
   CPython 3.13; without the pin, `uvx` may pick 3.13 and fail to launch.
@@ -1377,9 +1420,10 @@ The top-level `autoStart` list controls explicit eager startup. Names can refer 
 servers defined in `mcpServers` or packaged manifest entries such as `playwright`
 and `context7`. Omit a server from `autoStart` to keep it lazy.
 
-The legacy top-level `disableAutoStart` list remains supported for deployments
-that temporarily enable `PMCP_LEGACY_MANIFEST_AUTOSTART=1`, but packaged PMCP
-defaults no longer require it.
+The legacy top-level `disableAutoStart` list is still honoured and overrides
+`autoStart`. `PMCP_LEGACY_MANIFEST_AUTOSTART=1` additionally eager-starts
+manifest entries that declare `auto_start: true`; no shipped entry does, so it
+matters only for overlay entries.
 
 The same policy is available locally from the CLI:
 
@@ -1391,6 +1435,9 @@ pmcp config set-startup-policy add playwright --source project --apply
 ```
 
 CLI mutation previews by default. `--apply` is required before writing.
+Writing an approved project `.mcp.json` this way carries its trust approval
+forward to the rewritten bytes; an unapproved one stays ignored until
+`pmcp trust approve`.
 
 Lazy Excalidraw example:
 
@@ -1446,7 +1493,7 @@ You can also configure downstream MCP servers over HTTP/SSE directly in `.mcp.js
 ```
 
 - `url` should be the full remote endpoint for that server.
-- `headers` values support `${ENV_VAR}` interpolation (Issue #40).
+- `headers` values support `${ENV_VAR}` interpolation (Consiliency/pmcp#40).
 - Resolve those environment variables from your shell environment or `~/.config/pmcp/pmcp.env`.
 
 **Important**: Don't add `pmcp` itself to this file. PMCP is configured
@@ -1519,11 +1566,11 @@ PMCP stores secrets in environment files by scope:
 You can manage both scopes with `pmcp secrets`:
 
 ```bash
-# Store a secret in user scope (shared by all projects)
-pmcp secrets set API_TOKEN your-token --scope user
+# Store a secret in user scope (shared by all projects); prompts for the value
+pmcp secrets set API_TOKEN --scope user
 
-# Store a secret in project scope
-pmcp secrets set API_TOKEN your-token --scope project --project /path/to/project
+# Store a secret in project scope (the default scope), reading the value from stdin
+printf '%s' "$TOKEN" | pmcp secrets set API_TOKEN --stdin --project /path/to/project
 
 # Copy all user-scoped secrets into project scope
 pmcp secrets sync --from-scope user --to-scope project --overwrite
@@ -1531,6 +1578,10 @@ pmcp secrets sync --from-scope user --to-scope project --overwrite
 # Copy project-scoped secrets into user scope
 pmcp secrets sync --from-scope project --to-scope user --overwrite
 ```
+
+Passing the value on the command line (`pmcp secrets set API_TOKEN your-token`)
+still works but exposes it in `ps` output and shell history. `pmcp secrets check`
+prints, as JSON, the keys your configured servers require and which are present.
 
 Use scope-appropriate values such as `API_TOKEN` and keep the values in the generated `.env` files; PMCP and downstream MCP servers read from these files according to your active mode.
 
@@ -1568,6 +1619,24 @@ redaction:
     - "(api[_-]?key)[\\s]*[:=][\\s]*[\"']?([^\\s\"']+)"
     - "(password|secret)[\\s]*[:=][\\s]*[\"']?([^\\s\"']+)"
 ```
+
+Every section has an `allowlist` and a `denylist` of glob patterns; a denylist
+match always refuses, and a non-empty allowlist admits only what it matches.
+Besides `servers`, `tools` (`server::tool`), `packages`, `limits` and
+`redaction` shown above, three sections are available:
+
+- `gateway_tools` — which `gateway.*` tools are advertised and callable (for
+  example, allowlist only `gateway.health`, `gateway.catalog_search`,
+  `gateway.describe` and `gateway.invoke`).
+- `resources` — downstream resources, matched as `server::uri`.
+- `prompts` — downstream prompts, matched as `server::name`.
+
+PMCP looks for the policy at `~/.claude/gateway-policy.yaml` or
+`~/.claude/gateway-policy.json`, and for a project policy at
+`.mcp-gateway-policy.yaml` or `.mcp-gateway-policy.json` in the gateway's
+working directory; a project policy is
+ignored until approved with `pmcp trust approve`, and can only narrow the
+operator's policy. `--policy` / `PMCP_POLICY` names one explicitly.
 
 An explicitly requested policy (`--policy` or `PMCP_POLICY`) is a fail-closed
 boundary: a missing, unreadable, malformed, or schema-invalid file terminates
@@ -1730,8 +1799,8 @@ For hosted tenant auth, keep credentials in PMCP env storage or tenant-scoped
 project storage and reference only placeholders from config:
 `${TENANT_CODE_MODE_MCP_TOKEN}` and `${TENANT_CODE_MODE_TENANT_ID}`. Use
 `pmcp secrets set ... --scope project` or `gateway.auth_connect` to populate
-env-store values for non-tenant mode; tenant mode uses isolated per-tenant env
-files derived from the resolved project root. PMCP diagnostics report missing
+env-store values; the gateway does not select a per-tenant env file itself
+(see [Auth And Elicitation](#auth-and-elicitation)). PMCP diagnostics report missing
 field or env-var names such as
 `TENANT_CODE_MODE_MCP_TOKEN`; they must not print token values.
 
@@ -1755,19 +1824,35 @@ pmcp status
 pmcp status --json              # JSON output
 pmcp status --verbose           # Include startup policy details when available
 pmcp status --server playwright # Filter by server
+pmcp status --pending           # Include pending requests
+pmcp status --probe             # Actively connect to each configured server
 
-# View logs
+# View logs (reads .pmcp/logs/gateway.log in the current directory)
 pmcp logs
 pmcp logs --follow              # Live tail
-pmcp logs --tail 100            # Last 100 lines
+pmcp logs --tail 100            # Last 100 lines (default 50)
+pmcp logs --level error         # Filter by level
+pmcp logs --server github       # Filter by server name
 
-# Refresh server connections
+# Regenerate cached tool descriptions (default cache dir: .pmcp; the gateway
+# reads .mcp-gateway, so pass --cache-dir .mcp-gateway for offline discovery)
 pmcp refresh
 pmcp refresh --server github    # Refresh specific server
-pmcp refresh --force            # Force reconnect all
+pmcp refresh --force            # Refresh even if not stale
 pmcp refresh --check-versions   # Report stale cached descriptions without refreshing
                                 # (honours --cache-dir; a local server whose package
                                 #  cannot be classified reports stale on every run)
+
+# Update subordinate MCP server packages (needs a running HTTP gateway at PMCP_GATEWAY_URL)
+pmcp update github
+pmcp update --all --json
+
+# Upgrade pmcp itself (detects uv tool vs pip --user)
+pmcp upgrade --dry-run
+pmcp upgrade --restart-service
+
+# Machine-readable capability/version metadata
+pmcp capabilities --json
 
 # Initialize config (interactive)
 pmcp init
@@ -1780,10 +1865,17 @@ pmcp setup --client opencode --mode http --write
 # Run diagnostics for lock/mode/http checks
 pmcp doctor
 pmcp doctor --project /path/to/project
+pmcp doctor --timeout 10        # HTTP health probe timeout (default 3s)
 
 # Manage project/user secrets
-pmcp secrets set API_TOKEN my-token --scope user
+pmcp secrets set API_TOKEN --scope user   # prompts for the value
 pmcp secrets sync --from-scope user --to-scope project --overwrite
+pmcp secrets check              # JSON: keys required by configured servers, present/missing
+
+# Store a credential for a server and retry provisioning through the running
+# HTTP gateway (CLI form of gateway.auth_connect)
+pmcp auth connect github --scope user     # prompts for the credential
+pmcp auth acknowledge my-remote --elicitation-id <id>
 
 # Approve, list and revoke trust decisions
 pmcp trust approve /abs/path/to/project/.mcp.json   # a project config file's current bytes
@@ -1793,6 +1885,47 @@ pmcp trust approve-package @acme/example-server@1.4.2  # a discovered package, o
 pmcp trust list-packages
 pmcp trust revoke-package @acme/example-server         # every version, or name@version for one
 ```
+
+### Gateway options and environment variables
+
+Options for the gateway itself (`pmcp` with no subcommand):
+
+| Flag | Env var | Default | Purpose |
+| --- | --- | --- | --- |
+| `--transport {stdio,http}` | `PMCP_TRANSPORT` | `stdio` | Transport to serve. |
+| `--host` | `PMCP_HOST` | `127.0.0.1` | HTTP bind address. |
+| `--port` | `PMCP_PORT` | `3344` | HTTP port. |
+| `-l`, `--log-level` | `PMCP_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`; `--debug` and `-q` are shorthands. |
+| `--log-format {text,json}` | — | `text` | `json` emits one JSON object per line. |
+| `-p`, `--project` | — | discovered | Project root for `.mcp.json` discovery. |
+| `-c`, `--config` | `PMCP_CONFIG` | — | Extra MCP config file. |
+| `--policy` | `PMCP_POLICY` | discovered | Policy file (YAML or JSON). |
+| `--lock-dir` | `PMCP_LOCK_DIR` | `~/.pmcp` | Singleton lock directory. |
+| `--audit-jsonl` | `PMCP_AUDIT_JSONL` | — | Scoped-advisor audit sink. |
+| `--auth-token` | `PMCP_AUTH_TOKEN` | — | Shared-secret bearer token (HTTP only). |
+| `--auth-token-file` | — | — | Read the token from a file (whitespace stripped); cannot be combined with `--auth-token`. |
+| `--max-concurrent-spawns` | `PMCP_MAX_SPAWNS` | `8` | Child MCP server processes spawned at once. |
+| `--rate-limit` | `PMCP_RATE_LIMIT` | `0` (unlimited) | Requests per minute per client IP on `/mcp`. |
+| `--request-timeout` | `PMCP_REQUEST_TIMEOUT` | `60` | HTTP request timeout, in seconds. |
+
+The auth and OAuth flags are listed under [Security](#security). Precedence is
+not uniform: `PMCP_TRANSPORT`, `PMCP_HOST`, `PMCP_PORT` and `PMCP_LOG_LEVEL`
+override the flag whenever they are set (for the log level, `--debug` and `-q`
+still win over `PMCP_LOG_LEVEL`), while every other variable above is read only
+when its flag is absent. `--auth-token-file` wins over `--auth-token`,
+which wins over `PMCP_AUTH_TOKEN`.
+
+Other environment variables:
+
+| Env var | Purpose |
+| --- | --- |
+| `PMCP_GATEWAY_URL` | Running HTTP gateway that `pmcp status`, `pmcp update`, `pmcp auth` and `pmcp doctor` talk to (default `http://127.0.0.1:3344/mcp`). |
+| `PMCP_MANIFEST_PATH` | Explicit manifest overlay ([Private manifest overlay](#private-manifest-overlay)). |
+| `PMCP_MAX_LISTEN_STREAMS` | Concurrent `subscriptions/listen` streams (default `64`). |
+| `PMCP_STDIO_READ_LIMIT`, `PMCP_REQUEST_CEILING_MS` | [Downstream call tunables](#downstream-call-tunables). |
+| `PMCP_REGISTRY_ALLOW_PRIVATE`, `PMCP_REGISTRY_PRIVATE_ENDPOINT` | [Private registry](#private-registry-debugging-opt-in). |
+| `PMCP_FEEDBACK_TOKEN`, `PMCP_FEEDBACK_REPO` | [Feedback Telemetry](#feedback-telemetry). |
+| `PMCP_LEGACY_MANIFEST_AUTOSTART` | Legacy manifest `auto_start` entries (see [Adding Custom Servers](#adding-custom-servers)). |
 
 ### `pmcp doctor` (Recommended before/after upgrades)
 
@@ -1848,10 +1981,14 @@ export PMCP_STDIO_READ_LIMIT=$((20 * 1024 * 1024))
 export PMCP_REQUEST_CEILING_MS=600000
 ```
 
+The per-call inactivity timeout is `gateway.invoke`'s `options.timeout_ms`
+(default `30000`, range `1000`–`300000`).
+
+
 ## Deprecations
 
-- `mcp-gateway` command naming is deprecated in documentation and examples.
-- Use `pmcp` for all CLI commands going forward.
+- The `mcp-gateway` command no longer exists; the package installs only `pmcp`.
+- Use `pmcp` for all CLI commands.
 - Migration examples:
   - `mcp-gateway refresh --force` -> `pmcp refresh --force`
   - `mcp-gateway status --json` -> `pmcp status --json`
@@ -1906,7 +2043,7 @@ pmcp/
 ├── src/pmcp/
 │   ├── __init__.py
 │   ├── __main__.py           # python -m pmcp entry
-│   ├── cli.py                # CLI commands (status, logs, init, refresh)
+│   ├── cli.py                # CLI commands (status, logs, setup, doctor, trust, ...)
 │   ├── server.py             # MCP server implementation
 │   ├── config/
 │   │   └── loader.py         # Config discovery (.mcp.json)
@@ -1916,13 +2053,15 @@ pmcp/
 │   │   └── policy.py         # Allow/deny lists
 │   ├── tools/
 │   │   └── handlers.py       # Gateway tool implementations
-│   ├── manifest/
-│   │   ├── manifest.yaml     # Server manifest (90+ servers)
-│   │   ├── loader.py         # Manifest loading
-│   │   ├── installer.py      # Server provisioning
-│   │   └── environment.py    # Platform/CLI detection
-│   └── baml_client/          # BAML-generated client (used for structured parsing; no outbound LLM calls since v1.8.0)
-├── tests/                    # 310+ tests
+│   ├── transport/
+│   │   └── http.py           # Streamable HTTP transport
+│   ├── auth.py               # HTTP auth modes (shared-secret, resource-server)
+│   └── manifest/
+│       ├── manifest.yaml     # Server manifest (90+ servers)
+│       ├── loader.py         # Manifest loading and overlays
+│       ├── installer.py      # Server provisioning
+│       └── environment.py    # Platform/CLI detection
+├── tests/                    # 8000+ tests
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env.example
@@ -1935,19 +2074,26 @@ pmcp/
 ### Server Won't Connect
 
 ```bash
-pmcp status
-pmcp logs --level debug
-pmcp refresh --force
+pmcp status --probe             # actively connect to each configured server
+pmcp logs --level error
 ```
+
+Then reconnect it with `gateway.restart_server` or `gateway.connect_server`.
+(`pmcp refresh` regenerates cached tool descriptions; it does not reconnect a
+running gateway's servers.)
 
 ### Missing API Key
 
-```bash
-# Check which key is needed
-pmcp status --server github
+`gateway.request_capability` and `gateway.provision` report the variable a
+manifest server needs (`env_var`, `env_instructions`); `pmcp secrets check`
+lists the keys your configured servers require and which are missing.
 
-# Set the key
+```bash
+# Set the key in the shell that starts pmcp...
 export GITHUB_PERSONAL_ACCESS_TOKEN=ghp_...
+
+# ...or store it through a running HTTP gateway (prompts for the value)
+pmcp auth connect github --scope user
 ```
 
 ### Tool Invocation Fails

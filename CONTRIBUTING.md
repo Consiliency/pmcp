@@ -6,21 +6,24 @@ Thank you for your interest in contributing to PMCP (Progressive MCP)!
 
 ```bash
 # Clone the repository
-git clone https://github.com/ViperJuice/pmcp
+git clone https://github.com/Consiliency/pmcp
 cd pmcp
 
-# Install with uv (recommended)
-uv sync --all-extras
+# Install with uv (recommended; CI tests Python 3.10, 3.11 and 3.12)
+uv sync --all-extras -p 3.10
 
-# Or with pip
-pip install -e ".[dev]"
+# Or with pip (the tests need the http extra as well as dev)
+pip install -e ".[all]"
 ```
 
 ## Running Tests
 
 ```bash
-# Run all tests
+# Run all tests (live and slow tests are deselected by default)
 uv run pytest
+
+# What CI runs (coverage must stay at or above 60%)
+uv run pytest tests/ -v --cov=pmcp --cov-report=term-missing
 
 # Run with coverage
 uv run pytest --cov=pmcp --cov-report=term-missing
@@ -28,7 +31,7 @@ uv run pytest --cov=pmcp --cov-report=term-missing
 # Run specific test file
 uv run pytest tests/test_policy.py -v
 
-# Run integration tests (uses manifest auto-start servers)
+# Run integration tests (need MCP servers available via config or manifest)
 uv run pytest tests/test_integration.py -v
 
 # Run the slow tier (excluded by default: the redactor's large
@@ -55,7 +58,7 @@ that can be provisioned on-demand via `gateway.provision`.
 ### Steps to Add a New Server
 
 1. Edit `src/pmcp/manifest/manifest.yaml`
-2. Add an entry under `mcp_servers`:
+2. Add an entry under `servers:`:
 
 ```yaml
 my-server:
@@ -77,7 +80,7 @@ my-server:
   # alone never relaxes anything. An unset, self-referencing, or placeholder
   # value fails closed and the credential stays required.
   api_key_optional_when: ["MY_SERVER_BASE_URL"]
-  auto_start: false               # Set to true for essential servers only
+  auto_start: false               # Leave false; see Auto-Start below
 ```
 
 3. Add tests in `tests/test_manifest.py`
@@ -85,12 +88,11 @@ my-server:
 
 ### Auto-Start Servers
 
-Only mark a server as `auto_start: true` if it:
-- Provides essential functionality (like browser automation)
-- Works without API keys (or with optional keys)
-- Has minimal resource footprint
-
-Currently, only Playwright and Context7 are auto-start servers.
+No shipped manifest entry sets `auto_start: true`, and new entries should not:
+servers start lazily, on first use. The manifest's `auto_start` field is a
+legacy switch that is honoured only when `PMCP_LEGACY_MANIFEST_AUTOSTART=1` is
+set. An operator who wants a server started eagerly lists it under `autoStart`
+in their `.mcp.json` (or uses `pmcp config set-startup-policy`).
 
 ## Code Style
 
@@ -108,13 +110,14 @@ Currently, only Playwright and Context7 are auto-start servers.
 
 ```bash
 # Format code
-uv run ruff format .
+uv run ruff format src/ tests/
 
-# Check linting
-uv run ruff check .
+# Check formatting and linting (as CI does)
+uv run ruff format --check src/ tests/
+uv run ruff check src/ tests/
 
-# Check types
-uv run mypy src/pmcp
+# Check types (as CI does)
+uv run mypy src/pmcp --exclude baml_client
 ```
 
 ## Architecture Overview
