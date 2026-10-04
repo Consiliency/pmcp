@@ -123,12 +123,12 @@
         print(f"Invocation failed: {e}")
 
 # Context7 examples
-"context7::get-library-docs":
+"context7::query-docs":
   snippet: |
-    # Fetch docs for libraries
-    libraries = ["react/19.0.0", "vue/3.4.0"]
+    # Query docs for libraries (resolve each ID first with context7::resolve-library-id)
+    libraries = ["/facebook/react", "/vuejs/core"]
     for lib in libraries:
-        docs = mcp.call_tool("gateway.invoke", {"tool_id": "context7::get-library-docs", "arguments": {"libraryId": f"/npm/{lib}"}})
+        docs = mcp.call_tool("gateway.invoke", {"tool_id": "context7::query-docs", "arguments": {"libraryId": lib, "query": "hooks"}})
 
 # Generic fallback template (used when no specific template exists)
 _generic_fallback:

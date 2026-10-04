@@ -1910,8 +1910,9 @@ Options for the gateway itself (`pmcp` with no subcommand):
 
 The auth and OAuth flags are listed under [Security](#security). Precedence is
 not uniform: `PMCP_TRANSPORT`, `PMCP_HOST`, `PMCP_PORT` and `PMCP_LOG_LEVEL`
-override the flag whenever they are set, while every other variable above is
-read only when its flag is absent. `--auth-token-file` wins over `--auth-token`,
+override the flag whenever they are set (for the log level, `--debug` and `-q`
+still win over `PMCP_LOG_LEVEL`), while every other variable above is read only
+when its flag is absent. `--auth-token-file` wins over `--auth-token`,
 which wins over `PMCP_AUTH_TOKEN`.
 
 Other environment variables:

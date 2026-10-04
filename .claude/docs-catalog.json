@@ -51,10 +51,6 @@
         "P3B"
       ]
     },
-    ".claude/plans/ticklish-inventing-stearns.md": {
-      "purpose": "markdown document",
-      "touched_by_phases": []
-    },
     "specs/README.md": {
       "purpose": "root project README",
       "touched_by_phases": []

@@ -676,7 +676,7 @@ _GATEWAY_TOOL_SPECS: tuple[_GatewayToolSpec, ...] = (
         name="gateway.tasks_cancel",
         input_model=TasksCancelInput,
         description=(
-            "Cancel a downstream MCP task by opaque task ID. Only a task PMCP has recorded (from gateway.invoke with task, gateway.tasks_list or gateway.tasks_get) can be cancelled; an already-finished task is reported without a downstream call. Use gateway.cancel only for PMCP request IDs from gateway.list_pending."
+            "Cancel a downstream MCP task by opaque task ID. Only a task PMCP has recorded (from gateway.invoke with task, gateway.tasks_list, gateway.tasks_get or gateway.tasks_result) can be cancelled; an already-finished task is reported without a downstream call. Use gateway.cancel only for PMCP request IDs from gateway.list_pending."
         ),
     ),
     _GatewayToolSpec(
