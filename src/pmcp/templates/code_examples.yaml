@@ -31,7 +31,7 @@
 
 "filesystem::read_file":
   snippet: |
-    # Failures come back as ok: false, not as exceptions
+    # Gateway failures are ok: false (a tool's own failure is ok: true + result.isError)
     out = mcp.call_tool("gateway.invoke", {"tool_id": "filesystem::read_file", "arguments": {"path": "file.txt"}})
     if not out["ok"]:
         print(f"Read failed: {out['errors']}")
@@ -51,7 +51,7 @@
 
 "github::createIssue":
   snippet: |
-    # Failures come back as ok: false, not as exceptions
+    # Gateway failures are ok: false (a tool's own failure is ok: true + result.isError)
     out = mcp.call_tool("gateway.invoke", {"tool_id": "github::createIssue", "arguments": {"title": "Bug", "body": "Description"}})
     if not out["ok"]:
         print(f"Failed: {out['errors']}")
@@ -113,7 +113,7 @@
 
 "gateway::invoke":
   snippet: |
-    # Failures come back as ok: false, not as exceptions
+    # Gateway failures are ok: false (a tool's own failure is ok: true + result.isError)
     out = mcp.call_tool("gateway.invoke", {"tool_id": "server::tool", "arguments": args})
     if not out["ok"]:
         print(f"Invocation failed: {out['errors']}")
