@@ -7,10 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.8.0] - 2026-10-04
+## [3.0.0] - 2026-10-04
 
 ### Upgrade notes
-Things 2.7.3 accepted that 2.8.0 refuses, and defaults or output that changed.
+Things 2.7.3 accepted that 3.0.0 refuses, and defaults or output that changed. This is a major release because of them: upgrading can stop a project's servers from loading until you approve its files (first item below).
 Each is described in full in the section named at the end of the line.
 
 - **Project files need approval.** A repository's `.pmcp/manifest.yaml`, `.mcp.json`
@@ -100,7 +100,7 @@ Each is described in full in the section named at the end of the line.
   errors from a remote transport now show the individual exceptions inside an
   exception group instead of `unhandled errors in a TaskGroup`. Anything matching
   the old string should match the underlying error instead. *Fixed*
-- **Known issues in 2.8.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
+- **Known issues in 3.0.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
   but the gateway reads `.mcp-gateway`; until that is fixed, run
   `pmcp refresh --cache-dir .mcp-gateway`
   ([Consiliency/pmcp#352](https://github.com/Consiliency/pmcp/issues/352)).

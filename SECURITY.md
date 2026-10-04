@@ -4,15 +4,15 @@
 
 | Version | Supported |
 |---------|-----------|
-| 2.8.x   | ✅ Active  |
-| 2.0.x – 2.7.x | ❌ No longer supported; upgrade to 2.8.x |
+| 3.0.x   | ✅ Active  |
+| 2.0.x – 2.7.x | ❌ No longer supported; upgrade to 3.0.x |
 | 1.22.x  | ✅ Security fixes only |
 | < 1.22  | ❌ No longer supported |
 
-2.8.0 is the release that implements the v13 trust boundary described below.
-Several things 2.7.x accepted are refused from 2.8.0 on, among them unapproved
+3.0.0 is the release that implements the v13 trust boundary described below.
+Several things 2.7.x accepted are refused from 3.0.0 on, among them unapproved
 project configuration files, unapproved discovered packages and non-canonical
-auth URLs; the CHANGELOG's *Upgrade notes* for 2.8.0 list them all.
+auth URLs; the CHANGELOG's *Upgrade notes* for 3.0.0 list them all.
 
 2.0.0 is a breaking release: `GET /mcp` is retired (405) and the
 `PMCP_KEEPALIVE_MAX_SECONDS` lifetime cap is removed with no replacement by
