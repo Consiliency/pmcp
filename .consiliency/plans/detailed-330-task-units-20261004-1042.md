@@ -4,6 +4,40 @@
 > `plan/330-task-units`. Every number below was measured on that tree, or on
 > the spike of this plan applied to it. The spike was then removed, and this PR
 > carries only this file. See Consiliency/pmcp#330.
+>
+> **Revision 2 (2026-10-04), on main `2adcd9a`.** Board round 1 on PR 355
+> (rev 1, `b98de7d`) had no blocking finding. Grok, codex and gemini found no
+> defect. The claude seat said PARTIALLY AGREE and raised three findings, all
+> taken:
+>
+> - **F001 (docs).** The CHANGELOG and the tenant contract now warn **tenant
+>   servers** built to the old seconds contract: they now receive ms, and the
+>   seconds they return read 1000× too small. Both docs state that the
+>   downstream's snake_case `poll_interval` is ms too. The #298 bullet now says
+>   "at most 2^53−1 ms". The contract no longer says pmcp "forwards them when
+>   supplied" unqualified. A docs test pins all of this.
+> - **F002 (alias choice).** `pollInterval` vs `poll_interval` was chosen on
+>   the ms value, before division, so a camelCase value that rounds to 0 s hid
+>   a usable snake_case one. The choice is now made on the value as pmcp will
+>   hold it, in seconds (Design decision 10), and a test covers it.
+> - **F003 (class).** The structural guards only saw code that *names* a
+>   duration. A task model built by spreading a downstream reply bypassed them;
+>   the seat's mutants X1 and X2 survived. The fix closes the class (Design
+>   decision 11). Every construction in `src/pmcp` of a model that carries a
+>   task (`McpTaskInfo`, `McpTaskRecord`, and the 5 outputs that embed one,
+>   found transitively from `pmcp.types`) is listed with its exact task-data
+>   arguments and the reason they are already in seconds, in any form:
+>   `Model(...)`, `Model(**x)`, `Model.model_validate(x)`, `model_construct`. A
+>   new or changed one fails. Attribute stores and `model_copy(update=…)` of a
+>   duration are forbidden. Two provenance checks pin the two allowlisted
+>   spreads, and three behavioural tests bind the fallbacks. X1, X2 and two
+>   more (X9 `model_copy`, X10 the list fallback) are now in the mutation
+>   table: 21/21 killed.
+>
+> **Re-measured on fresh trees under `/var/tmp`:** the new module, red on main
+> and green on the patch; the 8 touched modules; 21 mutants, each restore
+> sha-verified; the full suite, once. The overlap note now covers #338 rev 6
+> (Design decision 9). Rev 1 is `b98de7d`.
 
 ## Task
 
@@ -144,6 +178,7 @@ again. That constraint shapes Design decision 3.
 | R1 | *re-validation* | `manager.py:1802-1803` `_record_task` → `McpTaskRecord(ttl=task_info.ttl, …)` | seconds → seconds | every I-path | unchanged; the model's check is now in seconds |
 | R2 | *re-validation* | `handlers.py:6025` `tasks_list`: `McpTaskInfo(**task)` from `record.model_dump()` | seconds → seconds | `gateway.tasks_list` | unchanged |
 | R3 | *re-validation* | `handlers.py:6169-6176` `_sanitize_task_for_output`: JSON dump, then `McpTaskInfo.model_validate` | seconds → seconds | `gateway.invoke`, `tasks_list`, `tasks_get`, `tasks_result` | unchanged |
+| R5 | *construction, closed* | every other construction of a task-carrying model (`InvokeOutput`, `TasksListOutput`, `TasksGetOutput`, `TasksResultOutput`, `TasksCancelOutput`) | — | models only | rev 2: listed with exact arguments; a new one fails (Design decision 11) |
 | R4 | *re-validation* | `McpTaskInfo._drop_unusable_hints` (`types.py:641`) | runs on every construction above | all | ttl check in seconds (`_usable_task_ttl`); poll check unit-free |
 | P1 | passthrough | `McpTaskInfo.raw` (`manager.py:1765`) | the downstream payload as sent | every task output | **verbatim, in ms**: Design decision 7 |
 | P2 | passthrough | `gateway.tasks_result`'s `result` (`handlers.py` `result.get("result", result)`), and `gateway.invoke`'s `result` for a non-task call | as sent | — | verbatim: Design decision 7 |
@@ -299,13 +334,20 @@ tenant.
   1. `None` → `None`.
   2. It applies the wire check in ms, which is the #298 rule. A value that
      fails comes back as `UNUSABLE_TASK_VALUE`.
-  3. Otherwise it returns `usable / MS_PER_SECOND`.
+  3. Otherwise it divides by `MS_PER_SECOND` and applies the **seconds**
+     check (rev 2). A value that underflows to 0 s therefore comes back as
+     `UNUSABLE_TASK_VALUE` here, not only later in the model.
 - `MS_PER_SECOND = 1000` is the only conversion constant.
 
 The structural tests pin the layout. Only those two functions name a
 duration wire key. Each converter has exactly one caller. Every `ttl=` or
 `poll_interval=` keyword elsewhere copies a model attribute of the same name.
-So a new reader or writer cannot bypass the conversion and still pass.
+
+**Rev 2 narrows the rev 1 claim.** Those guards catch a reader or writer that
+*names* a duration. Rev 1 concluded that no new reader could bypass the
+conversion, and the board showed that a spread
+(`McpTaskInfo.model_validate({**reply, …})`) does. Design decision 11 closes
+that class.
 
 ### 2. Inbound values are `float` seconds; `McpTaskInfo.ttl` becomes `float | None`
 
@@ -342,6 +384,9 @@ re-validation. Mutant M7 shows that this is what happens. So the check splits:
   number in [0, (2^63 − 1) / 1000]. That accepts exactly the image of the wire
   rule.
 - `_usable_poll_interval` (finite, > 0) has no unit and serves both sides.
+- Rev 2: the converter applies both checks, the ms check then the seconds
+  check, through one private helper, `_wire_duration_seconds`. The alias
+  picker uses the same helper (Design decision 10).
 
 `test_seconds_survive_every_revalidation_unchanged` drives a converted
 fractional task through `_record_task`, then `McpTaskInfo(**record)`, then
@@ -360,6 +405,7 @@ fractional task through `_record_task`, then `McpTaskInfo(**record)`, then
 | Overflow after × 1000 | max `ttl` → 9,007,199,254,740,000 ms ≤ 2^53 − 1, an int; max `poll_interval` → 9.00719925474e15, exact; smallest `poll_interval` 5e−324 s → 4.94e−321 ms > 0, so it never underflows to 0 | `test_the_largest_accepted_value_does_not_overflow_on_the_wire` |
 | Downstream bound | #298's rule on the **ms** value as sent: `ttl` an integer in [0, 2^63 − 1], `pollInterval` finite > 0. `ttl: 1.5` (fractional ms) stays unusable | `test_an_unusable_downstream_duration_is_named_not_converted`, M8 |
 | Underflow inbound | `pollInterval: 5e-324` ms passes the ms check, but ÷ 1000 = `0.0` s. The seconds check (> 0) then names it unusable; it is not reported as 0 | same test |
+| Both poll aliases sent (rev 2) | `pollInterval` wins if it is usable **in seconds**; otherwise the first usable `poll_interval` does. `{"pollInterval": 5e-324, "poll_interval": 2500}` → 2.5 | `test_the_alias_is_chosen_by_usability_in_seconds`, `test_the_camel_case_alias_wins_when_both_are_usable`, M17 |
 | Non-numeric | caller: `"300"`, `true`, `[300]`, `{…}` are still refused at the gate, and `null` is "not given". Downstream: `"300000"`, `true`, NaN, ±Inf are still unusable. #330 changes neither | `test_a_non_numeric_caller_duration_is_still_refused`, the unusable table |
 
 ### 5. The bounds sit on the side whose unit they were written in
@@ -412,8 +458,9 @@ the downstream server in milliseconds)" and "Seconds between task status polls
 
 ### 9. Overlap with Consiliency/pmcp#347 (plan for Consiliency/pmcp#338, the task cap)
 
-#347's plan (`detailed-338-task-cap-20261004-0451.md`, read at
-`origin/plan/338-task-cap`) touches the same files. In each, whichever PR lands
+#347's plan (`detailed-338-task-cap-20261004-0451.md`, re-read for rev 2 at
+`origin/plan/338-task-cap` rev 6, `57881a8`; rev 7 was in progress and not
+pushed) touches the same files. In each, whichever PR lands
 second rebases:
 
 | File | #330 hunks | #338 hunks | Conflict risk |
@@ -423,30 +470,119 @@ second rebases:
 | `CHANGELOG.md` | the #298 bounds lines; the "Known follow-up" bullet, replaced by the #330 entry | the same "Known follow-up" context, plus a new #338 entry after it | **textual conflict**: keep #298's rewritten bullet, then the #330 entry, then the #338 entry |
 | `tests/test_task_numeric_bounds.py` | imports; the `test_task_hint_bounds` rows; `USABLE`; `test_forwarded_task_hints_are_spec_shaped`; the alias test | eviction and recording tests (483+, 508+, 539+, 671+, 891+, 924+, 941+, 977+) | low; the alias-test hunk is near #338's 891 hunk |
 
+**Rev 2 additions to the overlap.** #338 rev 6 changes `tools/handlers.py`.
+`invoke` and `tasks_result` take the task from new
+`call_tool_with_task`/`get_task_result_with_task` replies instead of
+`get_task_record`, and `tasks_list` always uses `McpTaskInfo(**task)` from
+the listed dump. #330 does not edit `handlers.py`, but its closed-world test
+(`TASK_MODEL_CONSTRUCTIONS`, Design decision 11) records the exact arguments
+of every task-model construction there. So:
+- if #338 lands first, the #330 executor re-derives the table on the rebased
+  tree. The test prints the diff. Each new or changed entry must get a reason
+  that it holds seconds, or the code must route through
+  `_task_info_from_payload`. If `call_tool_with_task`'s reply type is a
+  pydantic model in `pmcp.types` that embeds `McpTaskInfo`, it is picked up
+  automatically;
+- if #330 lands first, #338's executor runs `tests/test_task_units.py`, and
+  the same test names each construction #338 added.
+
+`tasks_list`'s `McpTaskInfo(**task)` entry is the same before and after #338
+rev 6. Its provenance test (`list_tasks` appends only `record.model_dump()`)
+matches #338's "records then dumps each at once".
+
 This plan's patch is kept minimal so that the rebase stays mechanical. It
 adds no new class, does not move `_record_task`, and makes no eviction
 change.
+
+### 10. Alias choice is made in seconds (rev 2, board F002)
+
+#298's rule is "the first usable alias wins" (`pollInterval`, then
+`poll_interval`). Rev 1 judged "usable" on the ms value. A camelCase value that
+is usable in ms but divides to 0 s therefore won, and was then dropped as
+unusable, hiding a usable snake_case value. `task_hint_is_usable` now judges a
+duration by `_wire_duration_seconds`, which is what the converter returns. The
+precedence is stated in the CHANGELOG and the contract: `pollInterval` if it
+is usable after conversion, otherwise `poll_interval`. The snake_case alias is
+milliseconds too.
+
+### 11. Building a task model from downstream data is closed-world (rev 2, board F003)
+
+The rev 1 guards see a duration crossing that names a wire key or a
+`ttl=`/`poll_interval=` keyword. Anything that builds a model from a mapping
+(`Model(**x)`, `Model.model_validate(x)`), or changes one without validation
+(`obj.ttl = …`, `model_copy(update=…)`), names neither. The fix removes that
+degree of freedom with three rules:
+
+1. **Every construction is reviewed.**
+   `test_every_task_model_construction_is_a_reviewed_one` works in three
+   steps:
+   - It finds the task-carrying models from `pmcp.types` itself:
+     `McpTaskInfo`, its subclasses, and every model whose field annotations
+     mention one, transitively. Today that is `McpTaskInfo`, `McpTaskRecord`,
+     `InvokeOutput`, `TasksListOutput`, `TasksGetOutput`, `TasksResultOutput`
+     and `TasksCancelOutput`.
+   - It then walks every call in `src/pmcp` to one of them, in any form.
+   - It records the call's task-data arguments as source: positional
+     arguments, `**` spreads, and `task`/`tasks`/`ttl`/`poll_interval`/`raw`.
+
+   The result must equal `TASK_MODEL_CONSTRUCTIONS`, which gives each
+   (file, function, model, form) its exact arguments and a reason. An output
+   that only carries errors has no task data and is skipped; an
+   `McpTaskInfo`/`McpTaskRecord` construction never is. The current entries
+   are:
+
+   | Site | Task-data args | Why it holds seconds |
+   |---|---|---|
+   | `manager._task_info_from_payload` `McpTaskInfo(...)` | `ttl=task_duration_from_wire(...)`, `poll_interval=task_duration_from_wire(...)`, `raw=payload` | **the** inbound converter |
+   | `manager._record_task` `McpTaskRecord(...)` | `ttl=task_info.ttl`, `poll_interval=task_info.poll_interval`, `raw=task_info.raw` | copies a parsed model |
+   | `manager.cancel_task` `McpTaskInfo(...)` (I3 fallback) | `raw=result` | no duration; `raw` verbatim by design |
+   | `handlers.tasks_list` `McpTaskInfo(**task)` | `**task` | `task` is a `record.model_dump()` from `list_tasks`, pinned by `test_list_tasks_returns_only_record_dumps` |
+   | `handlers._sanitize_task_for_output` `McpTaskInfo.model_validate(task_data)` | `task_data` | `task.model_dump(mode="json")` of a model, pinned by `test_output_sanitising_revalidates_only_a_model_dump` |
+   | `handlers.invoke` `InvokeOutput` | `task=public_task` | sanitized record |
+   | `handlers.tasks_list` `TasksListOutput` | `tasks=tasks` | sanitized records |
+   | `handlers.tasks_get` `TasksGetOutput` | `task=self._sanitize_task_for_output(task)` | the record `get_task` returned |
+   | `handlers.tasks_result` `TasksResultOutput` | `task=self._sanitize_task_for_output(task) if task is not None else None` | registry record |
+   | `handlers.tasks_cancel` `TasksCancelOutput` | `task=task` | the record `cancel_task` returned |
+
+2. **No mutation around validation.**
+   `test_no_task_duration_is_assigned_or_copied_around_validation` forbids two
+   things anywhere in `src/pmcp`: an attribute store to `.ttl` or
+   `.poll_interval`, and any `model_copy(update=…)` or
+   `model_construct(update=…)`. Pydantic validates only on construction, so
+   either would put an unconverted value in a task model unchecked.
+
+3. **The fallbacks are bound by behaviour too.**
+   - `test_the_cancel_fallback_never_reports_a_wire_duration_as_seconds` is
+     the seat's falsifier, verbatim in substance.
+   - `test_a_get_reply_without_a_task_reports_no_task`: `get_task` raises,
+     and `gateway.tasks_get` returns `ok: false` with no task.
+   - `test_a_listed_task_without_a_record_is_still_reported_in_seconds`.
+
+Mutants X1 (the cancel fallback spreads the reply), X2 (`get_task` falls back
+to spreading the reply), X9 (`get_task` patches the record with
+`model_copy(update=payload)`) and X10 (the `tasks_list` fallback merges `raw`)
+are all killed, each by the closed-world rule and by a behavioural test.
 
 ## Changes
 
 | File | Change | Size |
 |---|---|---|
-| `src/pmcp/types.py` | Adds `MS_PER_SECOND` and `MAX_TASK_SECONDS`. `_usable_task_ttl` is renamed to `_usable_wire_task_ttl`. A new seconds-unit `_usable_task_ttl` is the model check. Adds `_WIRE_TASK_HINT_CHECKS`. `task_hint_is_usable` uses the wire table. Adds `task_seconds_to_wire` and `task_duration_from_wire`. `McpTaskInfo.ttl` becomes `float \| None`. `TaskMetadataInput.ttl`/`poll_interval` get `le=MAX_TASK_SECONDS` and the new descriptions | +80 / −12 |
+| `src/pmcp/types.py` | Adds `MS_PER_SECOND` and `MAX_TASK_SECONDS`. `_usable_task_ttl` is renamed to `_usable_wire_task_ttl`. A new seconds-unit `_usable_task_ttl` is the model check. Adds `_WIRE_TASK_HINT_CHECKS`. Adds `_TASK_DURATIONS` and `_wire_duration_seconds` (the ms check, ÷ 1000, the seconds check). `task_hint_is_usable` judges a duration in seconds (rev 2). Adds `task_seconds_to_wire` and `task_duration_from_wire`. `McpTaskInfo.ttl` becomes `float \| None`. `TaskMetadataInput.ttl`/`poll_interval` get `le=MAX_TASK_SECONDS` and the new descriptions | +99 / −12 |
 | `src/pmcp/client/manager.py` | 2 imports; O1/O2 through `task_seconds_to_wire`; I1/I2 through `task_duration_from_wire` | +10 / −4 |
 | `tests/fixtures/gateway_tool_schemas.json` | regenerated: 2 maxima, 2 descriptions | +4 / −4 |
-| `tests/test_task_units.py` | **new**; 54 cases | +550 |
+| `tests/test_task_units.py` | **new**; 66 cases (rev 1: 54) | +830 |
 | `tests/test_task_numeric_bounds.py` | migrated to the new unit: bounds rows, `USABLE` rows, the outbound shape, the alias rows | +15 / −11 |
 | `tests/test_client_manager.py` | 2 tests migrated: the fake downstream sends ms; the outbound assertion expects ms | +8 / −8 |
 | `tests/test_phase6_tenant_code_mode.py` | the fake tenant returns spec ms (`300000`, `100`) | +2 / −2 |
 | `README.md` | the units sentence in the tenant-runs paragraph | +7 / −1 |
-| `specs/tenant-code-mode-host-contract.md` | a "Units" paragraph in the task lifecycle section; the `ttl`/`poll_interval` bullets in the metadata section | +24 / −2 |
-| `CHANGELOG.md` | the #298 bounds restated; its "Known follow-up" replaced by a pointer; a new #330 entry under `[Unreleased]` → `### Changed` | +43 / −8 |
+| `specs/tenant-code-mode-host-contract.md` | a "Units" paragraph in the task lifecycle section, covering the snake_case alias and its precedence; a "Changed in Consiliency/pmcp#330" warning to tenant servers; the "forwards them when supplied" sentence restated; the `ttl`/`poll_interval` bullets in the metadata section | +35 / −4 |
+| `CHANGELOG.md` | the #298 bounds restated ("at most 2^53−1 ms"); its "Known follow-up" replaced by a pointer; a new #330 entry under `[Unreleased]` → `### Changed`, with the caller warning, the tenant-server warning and the alias's unit and precedence | +53 / −8 |
 
 `McpTaskInfo`'s output schema is not snapshotted (`grep -c "unusable_fields\|McpTaskInfo" tests/fixtures/*.json` → 0), so the `ttl` type change moves no fixture.
 
 ## Tests
 
-`tests/test_task_units.py` (new, 54 cases). Every case maps to a derived site
+`tests/test_task_units.py` (new, 66 cases; rev 2 added 12). Every case maps to a derived site
 or a decision:
 
 | Test | Covers | Cases |
@@ -469,6 +605,16 @@ or a decision:
 | `test_the_inbound_choke_point_converts_every_duration_it_reads` | **structural**: the `ttl=`/`poll_interval=` of the `McpTaskInfo(...)` call are `task_duration_from_wire(...)` calls | 1 |
 | `test_every_other_duration_assignment_copies_seconds_from_a_model` | **structural**: every other `ttl=`/`poll_interval=` keyword in `src/pmcp` is a same-named attribute copy (R1) | 1 |
 | `test_each_converter_has_exactly_one_caller` | **structural**: one call site per direction | 1 |
+| `test_the_alias_is_chosen_by_usability_in_seconds` (rev 2) | F002: a camelCase value that underflows or is 0 does not hide a usable snake_case one | 3 |
+| `test_the_camel_case_alias_wins_when_both_are_usable` (rev 2) | the stated precedence | 1 |
+| `test_every_task_model_construction_is_a_reviewed_one` (rev 2) | **structural, closed world**: F003 | 1 |
+| `test_no_task_duration_is_assigned_or_copied_around_validation` (rev 2) | **structural**: no attribute store or `model_copy(update=…)` | 1 |
+| `test_list_tasks_returns_only_record_dumps` (rev 2) | **structural**: provenance of `McpTaskInfo(**task)` in `tasks_list` | 1 |
+| `test_output_sanitising_revalidates_only_a_model_dump` (rev 2) | **structural**: provenance of `model_validate(task_data)` | 1 |
+| `test_the_cancel_fallback_never_reports_a_wire_duration_as_seconds` (rev 2) | I3, by behaviour (the seat's falsifier) | 1 |
+| `test_a_get_reply_without_a_task_reports_no_task` (rev 2) | the `get_task` fallback, by behaviour | 1 |
+| `test_a_listed_task_without_a_record_is_still_reported_in_seconds` (rev 2) | the `tasks_list` fallback, by behaviour | 1 |
+| `test_the_changelog_and_contract_state_the_units_for_tenant_servers` (rev 2) | F001: the CHANGELOG warns tenant servers and gives the alias's unit; the contract names the snake_case alias and drops the old wording | 1 |
 
 The migrations in the three existing modules are listed under *Changes* and
 appear in the patch.
@@ -482,16 +628,16 @@ git -C ~/code/pmcp fetch origin
 git -C ~/code/pmcp worktree add -b fix/330-task-units "$WORKTREE_ROOT/pmcp-330-fix" origin/main
 cd "$WORKTREE_ROOT/pmcp-330-fix"
 uv sync --all-extras -p 3.10      # without --all-extras, `uv run` silently uses the system pytest
-mkdir -p /var/tmp/pmcp-330-bt-$USER
+mkdir -p /var/tmp/pmcp-330-bt-$USER     # keep basetemps and logs off /mnt/workspace
 BT=/var/tmp/pmcp-330-bt-$USER
 ```
 
 Apply *Verbatim bodies* (one `git apply`). Then:
 
 ```bash
-# 1. the new module (spike: 54 passed)
+# 1. the new module (rev 2 spike: 66 passed)
 uv run pytest tests/test_task_units.py --cov-fail-under=0 -p no:cacheprovider --basetemp=$BT/u -q
-# 2. the suites the change touches (spike: 1072 passed, 0 failed)
+# 2. the suites the change touches (rev 2 spike: 1084 passed, 0 failed)
 env -u npm_config_cache -u npm_config_store_dir uv run pytest tests/test_task_units.py \
   tests/test_task_numeric_bounds.py tests/test_gateway_tool_schemas.py tests/test_tools.py \
   tests/test_client_manager.py tests/test_phase6_tenant_code_mode.py tests/test_server.py \
@@ -505,7 +651,7 @@ uv run mypy src/pmcp/types.py src/pmcp/client/manager.py
 python3 scripts/check_security_claims.py          # expect OK
 # 5. the repro (expect ttl=300000 and ok=False only at t=300.000)
 uv run python repro_330.py
-# 6. the mutation table (expect 16 KILLED)
+# 6. the mutation table (expect 21 KILLED; each restore is sha256-verified by the script)
 uv run python mutants330.py
 # 7. the full suite: once, detached, with a notifying waiter (memory on dev0 is shared)
 env -u npm_config_cache -u npm_config_store_dir nohup uv run pytest -q -p no:cacheprovider --basetemp=$BT/full \
@@ -518,36 +664,46 @@ schema and the snapshot disagree.
 
 ## Red on main
 
-The new module was run against main `2adcd9a`'s sources. `MAX_TASK_SECONDS`
-does not exist on main, so the import was shimmed: the import line was dropped
-and `MAX_TASK_SECONDS = (2**53 - 1) // 1000` was defined in the module. Result:
-**23 failed, 31 passed**.
+Rev 2 was measured on a fresh detached worktree of main `2adcd9a` under
+`/var/tmp`. The rev 2 test modules were copied in. `MAX_TASK_SECONDS` does not
+exist on main, so the import was shimmed: the import line was dropped and
+`MAX_TASK_SECONDS = (2**53 - 1) // 1000` was defined in the module. Main's own
+`CHANGELOG.md` and contract were used; they were restored with `git show
+HEAD:…`, and each restore was verified against its blob hash. Result:
+**30 failed, 36 passed**.
 
 | Test | Failed | Cause on main |
 |---|---|---|
 | `test_a_ttl_of_300_lasts_300_seconds_on_a_spec_downstream` | 1 | the downstream got `ttl: 300` (ms) |
 | `test_outbound_ttl_and_poll_interval_are_sent_in_milliseconds` | 1 | `{"ttl": 300, "pollInterval": 2.5}` |
 | `test_every_inbound_path_reports_seconds` | 2 | `ttl` 300000 / `poll_interval` 2500.0 reported as is |
+| `test_a_listed_task_without_a_record_is_still_reported_in_seconds` | 1 | same, on the `McpTaskInfo(**task)` path |
 | `test_a_usable_downstream_duration_is_reported_in_seconds` | 8 | ms kept as given, `int` type |
 | `test_an_unusable_downstream_duration_is_named_not_converted[…5e-324]` | 1 | a value that rounds to 0 s is "usable" when nothing divides |
-| `test_caller_bounds_are_in_seconds` | 4 | 9,007,199,254,741 … 2^53 − 1 are accepted, at the gate and in the model |
-| `test_the_largest_accepted_value_does_not_overflow_on_the_wire` | 1 | `ttl` forwarded unscaled (`9007199254740`) |
+| `test_the_alias_is_chosen_by_usability_in_seconds`, `test_the_camel_case_alias_wins_when_both_are_usable` | 3 + 1 | values come back in ms |
+| `test_caller_bounds_are_in_seconds` | 4 | 9,007,199,254,741 … 2^53 − 1 accepted at the gate and in the model |
+| `test_the_largest_accepted_value_does_not_overflow_on_the_wire` | 1 | `ttl` forwarded unscaled |
 | `test_the_model_checks_seconds[ttl-1.5-True]` | 1 | the model demands integer ms |
 | `test_seconds_survive_every_revalidation_unchanged` | 1 | `ttl` 1500 stays 1500 |
+| `test_every_task_model_construction_is_a_reviewed_one` | 1 | main's parser passes `ttl=payload.get('ttl')`, not the converter |
 | `test_the_outbound_choke_point_converts…`, `test_the_inbound_choke_point_converts…`, `test_each_converter_has_exactly_one_caller` | 1 each | no converter exists |
+| `test_the_changelog_and_contract_state_the_units_for_tenant_servers` | 1 | main's CHANGELOG has no #330 entry |
 
 These pass on main, by design:
-- the two round-trip properties, because main's pass-through is the identity
-  in both directions. They pin **symmetry**, and M1–M4, M9 and M16 show that
-  they fail when one direction converts and the other does not;
+- the two round-trip properties. Main's pass-through is the identity in both
+  directions, so they pin **symmetry**: M1–M4, M9 and M16 show they fail when
+  one direction converts and the other does not;
 - the null/absent and non-numeric controls, which #330 must not change;
-- `test_only_the_two_choke_points_name…` and
-  `test_every_other_duration_assignment…`. Main already has exactly those two
-  sites. M12–M14 prove that the tests can fail.
+- the closed-world rules that main already satisfies. Main has the same two
+  name-sites, no attribute stores, and the same list/sanitize provenance.
+  M12–M14 and X1, X2, X9 and X10 prove that each can fail;
+- the cancel- and get-fallback behaviours, which hold on main. That is the
+  point: they bind the fallbacks against regressions (X1, X2).
 
 The migrated existing modules (`test_task_numeric_bounds.py`,
-`test_client_manager.py`, `test_phase6_tenant_code_mode.py`, with the same
-shim) give **13 failed, 562 passed** on main. The failures break down as:
+`test_client_manager.py`, `test_phase6_tenant_code_mode.py`, unchanged from
+rev 1, with the same shim) give **13 failed, 562 passed** on main. The
+failures break down as:
 - `test_task_hint_bounds`, 3: `MAX_TASK_SECONDS + 1` for both fields, and
   2^53 − 1 for `ttl`, are accepted on main;
 - `USABLE`, 5: the ms values come back unconverted;
@@ -557,34 +713,58 @@ shim) give **13 failed, 562 passed** on main. The failures break down as:
 
 ## Mutation table
 
-All 16 mutants were measured on the spike with `mutants330.py`. Each run
-applies one string replacement, runs `tests/test_task_units.py` (54 cases), and
-then restores the file from a copy saved in memory. **All 16 are killed.**
-Afterwards the source/test diff was byte-identical to the spike patch.
+All 21 mutants were measured on the rev 2 spike with `mutants330.py`, and
+again on the embedding-proof tree with the same counts. Each run applies one
+string replacement, runs `tests/test_task_units.py` (66 cases), restores the
+file from its saved bytes, and **asserts that the file's sha256 equals the
+original's**. **All 21 are killed.** Afterwards the tree's `git diff` sha256
+was unchanged (`19c25e58…`).
+
+Rev 2 adds:
+- M17 (F002);
+- the seat's X1 and X2 (F003), which survived rev 1;
+- X9 and X10, the two other spread/patch forms of the F003 class.
+
+M5's anchor moved to the rev 2 helper. Every other rev 1 mutant is unchanged,
+and some now fail more tests because the rev 2 tests also see them.
 
 | # | Rule | Mutant | Failed (measured) |
 |---|---|---|---|
-| M1 | outbound `ttl` converted | `payload["ttl"] = parsed.ttl` | 7: the repro, outbound, every-inbound-path, overflow, outbound-structural, ttl round trip |
-| M2 | outbound `pollInterval` converted | `payload["pollInterval"] = parsed.poll_interval` | 4: outbound, poll round trip, overflow, outbound-structural |
-| M3 | inbound `ttl` converted | `ttl=payload.get("ttl")` | 10: usable-in-seconds, unusable table, every-inbound-path, revalidation, inbound-structural, ttl round trip |
-| M4 | inbound `pollInterval` converted | `poll_interval=poll_interval` | 9: usable-in-seconds, unusable table (underflow), every-inbound-path, poll round trip, revalidation, inbound-structural |
-| M5 | inbound is float seconds | `usable / MS_PER_SECOND` → `usable // MS_PER_SECOND` | 8: usable-in-seconds, every-inbound-path, poll round trip, revalidation |
-| M6 | caller bound restated in seconds | `MAX_TASK_SECONDS = MAX_FORWARDED_TASK_NUMBER` | 3: caller bounds, overflow |
-| M7 | the model checks seconds | model table `"ttl": _usable_wire_task_ttl` | 4: usable-in-seconds, revalidation, model-checks-seconds |
-| M8 | the wire checks ms (integer) | wire table `"ttl": _usable_task_ttl` | 2: usable-in-seconds (`int64` boundary), unusable table (`ttl: 1.5`) |
-| M9 | `ttl: null` stays unlimited | converter `None` → `_UNUSABLE` | 22: null/absent, usable, unusable, both round trips |
-| M10 | model `ttl` upper bound | drop `<= _INT64_MAX / MS_PER_SECOND` | 1: model-checks-seconds |
-| M11 | model `ttl` lower bound | drop `0 <=` | 1: model-checks-seconds |
-| M12 | no double conversion | `_record_task` passes `ttl` through `task_duration_from_wire` again | 6: one-caller, every-inbound-path, other-assignments, choke-points, revalidation |
-| M13 | no bypassing inbound site | `cancel_task` fallback adds `ttl=result.get("ttl")` | 2: other-assignments, choke-points |
-| M14 | no bypassing outbound site | `_task_request_params` adds `"ttl": 300` to `params.task` | 1: choke-points |
-| M15 | the factor is 1000 | `MS_PER_SECOND = 1024` | 14: the repro, usable, every-inbound-path, outbound, revalidation, overflow, model-checks-seconds |
-| M16 | outbound `pollInterval` is not rounded | `int(seconds * MS_PER_SECOND)` | 2: poll round trip, overflow |
+| M1 | outbound ttl unconverted | `payload["ttl"] = parsed.ttl` | 8: a_listed_task_without_a_record_is_still_reported_in_seconds, a_ttl_of_300_lasts_300_seconds_on_a_spec_downstream, every_inbound_path_reports_seconds, outbound_ttl_and_poll_interval_are_sent_in_milliseconds, the_largest_accepted_value_does_not_overflow_on_the_wire, the_outbound_choke_point_converts_every_duration_it_writes, ttl_round_trips_exactly |
+| M2 | outbound pollInterval unconverted | `payload["pollInterval"] = parsed.poll_interval` | 4: outbound_ttl_and_poll_interval_are_sent_in_milliseconds, poll_interval_round_trips_to_within_rounding, the_largest_accepted_value_does_not_overflow_on_the_wire, the_outbound_choke_point_converts_every_duration_it_writes |
+| M3 | inbound ttl unconverted | `ttl=payload.get("ttl")` | 12: a_listed_task_without_a_record_is_still_reported_in_seconds, a_usable_downstream_duration_is_reported_in_seconds, an_unusable_downstream_duration_is_named_not_converted, every_inbound_path_reports_seconds, every_task_model_construction_is_a_reviewed_one, seconds_survive_every_revalidation_unchanged, the_inbound_choke_point_converts_every_duration_it_reads, ttl_round_trips_exactly |
+| M4 | inbound pollInterval unconverted | `poll_interval=poll_interval` | 15: a_listed_task_without_a_record_is_still_reported_in_seconds, a_usable_downstream_duration_is_reported_in_seconds, an_unusable_downstream_duration_is_named_not_converted, every_inbound_path_reports_seconds, every_task_model_construction_is_a_reviewed_one, poll_interval_round_trips_to_within_rounding, seconds_survive_every_revalidation_unchanged, the_alias_is_chosen_by_usability_in_seconds, the_camel_case_alias_wins_when_both_are_usable, the_inbound_choke_point_converts_every_duration_it_reads |
+| M5 | inbound floor division (int seconds) | `(usable / MS_PER_SECOND)` → `(usable // MS_PER_SECOND)` | 13: a_listed_task_without_a_record_is_still_reported_in_seconds, a_usable_downstream_duration_is_reported_in_seconds, every_inbound_path_reports_seconds, poll_interval_round_trips_to_within_rounding, seconds_survive_every_revalidation_unchanged, the_alias_is_chosen_by_usability_in_seconds, the_camel_case_alias_wins_when_both_are_usable |
+| M6 | caller bound not restated (ms-sized) | `MAX_TASK_SECONDS = MAX_FORWARDED_TASK_NUMBER` | 3: caller_bounds_are_in_seconds, the_largest_accepted_value_does_not_overflow_on_the_wire |
+| M7 | model checks ttl in ms (integer rule) | model table `"ttl": _usable_wire_task_ttl` | 4: a_usable_downstream_duration_is_reported_in_seconds, seconds_survive_every_revalidation_unchanged, the_model_checks_seconds |
+| M8 | wire ttl checked in seconds (fractional ms ok) | wire table `"ttl": _usable_task_ttl` | 2: a_usable_downstream_duration_is_reported_in_seconds, an_unusable_downstream_duration_is_named_not_converted |
+| M9 | sent null ttl made unusable | converter `None` → `_UNUSABLE` | 25: a_null_or_absent_ttl_stays_unlimited, a_usable_downstream_duration_is_reported_in_seconds, an_unusable_downstream_duration_is_named_not_converted, poll_interval_round_trips_to_within_rounding, the_alias_is_chosen_by_usability_in_seconds, ttl_round_trips_exactly |
+| M10 | model ttl upper bound dropped | drop `<= _INT64_MAX / MS_PER_SECOND` | 1: the_model_checks_seconds |
+| M11 | model ttl lower bound dropped | drop `0 <=` | 1: the_model_checks_seconds |
+| M12 | inbound converted twice (record re-converts) | `_record_task` passes `ttl` through `task_duration_from_wire` again | 8: a_listed_task_without_a_record_is_still_reported_in_seconds, each_converter_has_exactly_one_caller, every_inbound_path_reports_seconds, every_other_duration_assignment_copies_seconds_from_a_model, every_task_model_construction_is_a_reviewed_one, only_the_two_choke_points_name_a_task_duration_wire_key, seconds_survive_every_revalidation_unchanged |
+| M13 | new bypassing inbound site (cancel fallback reads raw ttl) | `cancel_task` fallback adds `ttl=result.get("ttl")` | 4: every_other_duration_assignment_copies_seconds_from_a_model, every_task_model_construction_is_a_reviewed_one, only_the_two_choke_points_name_a_task_duration_wire_key, the_cancel_fallback_never_reports_a_wire_duration_as_seconds |
+| M14 | new bypassing outbound site (requestor params carry ttl) | `_task_request_params` adds `"ttl": 300` to `params.task` | 1: only_the_two_choke_points_name_a_task_duration_wire_key |
+| M15 | conversion factor wrong | `MS_PER_SECOND = 1024` | 19: a_listed_task_without_a_record_is_still_reported_in_seconds, a_ttl_of_300_lasts_300_seconds_on_a_spec_downstream, a_usable_downstream_duration_is_reported_in_seconds, every_inbound_path_reports_seconds, outbound_ttl_and_poll_interval_are_sent_in_milliseconds, seconds_survive_every_revalidation_unchanged, the_alias_is_chosen_by_usability_in_seconds, the_camel_case_alias_wins_when_both_are_usable, the_largest_accepted_value_does_not_overflow_on_the_wire, the_model_checks_seconds |
+| M16 | outbound converter rounds poll to int ms | `int(seconds * MS_PER_SECOND)` | 2: poll_interval_round_trips_to_within_rounding, the_largest_accepted_value_does_not_overflow_on_the_wire |
+| M17 | alias judged in ms, before conversion (F002) | `task_hint_is_usable`: `if name in _TASK_DURATIONS:` → `if False:` (judge the alias in ms) | 2: the_alias_is_chosen_by_usability_in_seconds |
+| X1 | cancel fallback spreads the downstream reply (F003) | cancel fallback → `McpTaskInfo.model_validate({**result, "task_id": …, "status": "cancelled", "raw": result})` | 2: every_task_model_construction_is_a_reviewed_one, the_cancel_fallback_never_reports_a_wire_duration_as_seconds |
+| X2 | get_task falls back to spreading the reply (F003) | `get_task`: parser returned None → `McpTaskInfo.model_validate({**payload, "task_id": task_id})` instead of `KeyError` | 2: a_get_reply_without_a_task_reports_no_task, every_task_model_construction_is_a_reviewed_one |
+| X9 | get_task patches the record from the reply, unvalidated (F003) | `get_task` returns `self._record_task(...).model_copy(update=payload)` | 3: every_inbound_path_reports_seconds, no_task_duration_is_assigned_or_copied_around_validation |
+| X10 | tasks_list fallback built from the wire payload in raw (F003) | `tasks_list`: `McpTaskInfo(**task)` → `McpTaskInfo(**{**task, **task["raw"]})` | 2: a_listed_task_without_a_record_is_still_reported_in_seconds, every_task_model_construction_is_a_reviewed_one |
+
+The board's X3 and X6 survive as equivalent mutants, and stay out of the
+table:
+- X3 (the alias picker uses the seconds-side table) is now the intended
+  behaviour.
+- X6 (`isinstance` in the model check) is equivalent because only converter
+  floats or copied attributes reach the model.
+
+The board's X4, X5, X7 and X8 were killed by rev 1's tests.
 
 ```python
 """Apply one string replacement, run tests/test_task_units.py, restore from an
 in-memory copy. Usage: uv run python mutants330.py (from the worktree root)."""
-import re, subprocess, sys
+import hashlib, re, subprocess, sys
 M = [
  ("M1","outbound ttl unconverted","src/pmcp/client/manager.py",
   'payload["ttl"] = task_seconds_to_wire(parsed.ttl)','payload["ttl"] = parsed.ttl'),
@@ -595,7 +775,7 @@ M = [
  ("M4","inbound pollInterval unconverted","src/pmcp/client/manager.py",
   'poll_interval=task_duration_from_wire("poll_interval", poll_interval),','poll_interval=poll_interval,'),
  ("M5","inbound floor division (int seconds)","src/pmcp/types.py",
-  "return usable / MS_PER_SECOND","return usable // MS_PER_SECOND"),
+  "(usable / MS_PER_SECOND)","(usable // MS_PER_SECOND)"),
  ("M6","caller bound not restated (ms-sized)","src/pmcp/types.py",
   "MAX_TASK_SECONDS = MAX_FORWARDED_TASK_NUMBER // MS_PER_SECOND","MAX_TASK_SECONDS = MAX_FORWARDED_TASK_NUMBER"),
  ("M7","model checks ttl in ms (integer rule)","src/pmcp/types.py",
@@ -621,12 +801,27 @@ M = [
   "MS_PER_SECOND = 1000\n","MS_PER_SECOND = 1024\n"),
  ("M16","outbound converter rounds poll to int ms","src/pmcp/types.py",
   "    return seconds * MS_PER_SECOND\n","    return int(seconds * MS_PER_SECOND)\n"),
+ ("M17","alias judged in ms, before conversion (F002)","src/pmcp/types.py",
+  "    if name in _TASK_DURATIONS:\n","    if False:\n"),
+ ("X1","cancel fallback spreads the downstream reply (F003)","src/pmcp/client/manager.py",
+  "            task_info = McpTaskInfo(\n                task_id=task_id,\n                status=\"cancelled\",\n                updated_at=time.time(),\n                raw=result,\n            )",
+  "            task_info = McpTaskInfo.model_validate(\n                {**result, \"task_id\": task_id, \"status\": \"cancelled\", \"raw\": result}\n            )"),
+ ("X2","get_task falls back to spreading the reply (F003)","src/pmcp/client/manager.py",
+  "        if task_info is None:\n            raise KeyError(f\"Task not found: {server_name}::{task_id}\")",
+  "        if task_info is None:\n            task_info = McpTaskInfo.model_validate({**payload, \"task_id\": task_id})"),
+ ("X9","get_task patches the record from the reply, unvalidated (F003)","src/pmcp/client/manager.py",
+  "        return self._record_task(server_name, task_info)\n\n    async def get_task_result(",
+  "        return self._record_task(server_name, task_info).model_copy(update=payload)\n\n    async def get_task_result("),
+ ("X10","tasks_list fallback built from the wire payload in raw (F003)","src/pmcp/tools/handlers.py",
+  "McpTaskInfo(**task)","McpTaskInfo(**{**task, **task[\"raw\"]})"),
 ]
 only = set(sys.argv[1:])
 results = []
 for mid, rule, path, old, new in M:
     if only and mid not in only: continue
-    src = open(path).read()
+    raw = open(path, "rb").read()
+    digest = hashlib.sha256(raw).hexdigest()
+    src = raw.decode()
     assert src.count(old) == 1, (mid, src.count(old))
     open(path, "w").write(src.replace(old, new))
     try:
@@ -634,7 +829,8 @@ for mid, rule, path, old, new in M:
             "-p","no:cacheprovider",f"--basetemp=/var/tmp/pmcp-330-bt-viperjuice/mut-{mid}",
             "-q","--no-header","-rf"], capture_output=True, text=True)
     finally:
-        open(path, "w").write(src)
+        open(path, "wb").write(raw)
+        assert hashlib.sha256(open(path, "rb").read()).hexdigest() == digest, (mid, path)
     failed = sorted({re.sub(r"\[.*", "", l.split("::",1)[1].split(" ")[0]) for l in p.stdout.splitlines() if l.startswith("FAILED")})
     n = sum(1 for l in p.stdout.splitlines() if l.startswith("FAILED"))
     err = "ERROR" in p.stdout and n == 0
@@ -643,35 +839,39 @@ for mid, rule, path, old, new in M:
 
 ## Embedding proof
 
-This proof was measured on 2026-10-04, on a **fresh** detached worktree of
-`origin/main` at `2adcd9a`. That worktree is separate from the spike's.
+Rev 2 was measured on 2026-10-04, on a **fresh** detached worktree of
+`origin/main` at `2adcd9a`, at `/var/tmp/pmcp-330-r2-proof`. It is separate
+from the spike (`/var/tmp/pmcp-330-r2-spike`) and from the red-on-main tree.
+Basetemps and logs went to `/var/tmp`.
 
 1. **Extraction.** The patch was taken out of this file with
-   `awk '/^````diff$/{f=1;next} /^````$/{f=0} f' plan.md > extracted.patch`.
-   `cmp` shows it is byte-identical to the spike's `git diff`, with
-   `tests/test_task_units.py` added through `git add -N`.
+   `awk '/^````diff$/{f=1;next} /^````$/{f=0} f' plan.md`. Its sha256 is
+   `19c25e58f379ca9eb3a424b4c4345738e7b3337d44151b404d2a4e8c83ae581a`, the
+   same as the spike's `git diff`, with `tests/test_task_units.py` added
+   through `git add -N`.
 2. **Apply.** `git apply --check`, then `git apply`, both clean. The patch
-   modified 9 files and created 1 (`tests/test_task_units.py`).
-3. **The new module:** **54 passed**.
-4. **The 8 touched modules:** **1072 passed**, 0 failed.
-5. **Snapshot regeneration** left the patched fixture byte-identical to the
-   patch's version.
+   modified 9 files and created 1. After applying, the tree's `git diff`
+   sha256 equals the patch's.
+3. **The new module:** **66 passed**.
+4. **The 8 touched modules:** **1084 passed**, 0 failed.
+5. **Snapshot regeneration** left the tree's diff sha256 unchanged
+   (`19c25e58…`).
 6. **CI gates:** `ruff check` and `ruff format --check` passed (176 files),
    `mypy` passed on both source files, and `check_security_claims.py` printed
    `OK`.
 7. **`repro_330.py`:** `ttl=300000` was sent, and `tasks_get` was ok until
-   t = 299.999 s and failed at 300.000 s. That is the "with this plan's patch"
-   output above.
-8. **`mutants330.py`:** **16/16 KILLED**, with the same per-mutant failure
-   counts as on the spike. The tree's diff was byte-identical afterwards.
+   t = 299.999 s and failed at 300.000 s.
+8. **`mutants330.py`:** **21/21 KILLED**, with the same per-mutant counts as
+   on the spike. Each restore was sha-verified inside the script, and the
+   tree's diff sha256 was unchanged afterwards.
 9. **The full suite:**
-   `env -u npm_config_cache -u npm_config_store_dir uv run pytest -q -p no:cacheprovider --basetemp=…`
-   gave **8338 passed, 3 skipped, 80 deselected, 0 failed**, in 537 s. The
-   spike tree gave the same result: 8338 passed, 3 skipped, in 557 s.
-10. **Red on main** is in its own section above: 23 of the new module's 54
-    cases fail on main, and 13 of the migrated cases fail on main.
+   `env -u npm_config_cache -u npm_config_store_dir uv run pytest -q -p no:cacheprovider --basetemp=/var/tmp/…`
+   gave **8350 passed, 3 skipped, 80 deselected, 0 failed**, in 555 s.
+   Rev 1 had 8338 passed; the 12 new rev 2 cases account for the difference.
+10. **Red on main** is in its own section above: 30 of the new module's 66
+    cases fail on main, and 13 of the migrated cases fail.
 
-The spike was then reverted with `git apply -R`, so this branch carries only
+The spike, proof and main trees were then removed, so this branch carries only
 this plan file.
 
 ## Acceptance criteria
@@ -702,10 +902,20 @@ this plan file.
 - [ ] The only places in `src/pmcp` that name a duration wire key are the two
   choke points; each converter has one caller; every other duration keyword
   copies seconds from a model. Proven by the five structural tests.
-- [ ] All 16 mutants are killed by `tests/test_task_units.py`.
+- [ ] (rev 2) When both poll aliases are sent, the choice is made in seconds.
+  Proven by `test_the_alias_is_chosen_by_usability_in_seconds`.
+- [ ] (rev 2) Every construction of a task-carrying model in `src/pmcp` is in
+  `TASK_MODEL_CONSTRUCTIONS` with its exact task-data arguments. No attribute
+  store or `model_copy(update=…)` touches a duration. Proven by the closed-world
+  and provenance tests, and by the fallback behaviour tests.
+- [ ] (rev 2) The CHANGELOG and the contract warn tenant servers built to the
+  seconds contract, and give the snake_case alias's unit. Proven by
+  `test_the_changelog_and_contract_state_the_units_for_tenant_servers`.
+- [ ] All 21 mutants are killed by `tests/test_task_units.py`.
 - [ ] README, the tenant contract and the CHANGELOG say: seconds in pmcp, ms
   on the wire, the conversion in both directions, `raw` verbatim, the new
-  maximum, and the 1000× warning for callers who sent ms.
+  maximum, the 1000× warning for callers who sent ms, and (rev 2) the warning
+  for tenant servers.
 - [ ] The full suite passes; ruff, ruff format, mypy and
   `check_security_claims.py` are clean.
 
@@ -733,13 +943,14 @@ this plan file.
   repo can tell whether such callers exist.
 - **#338 landing first.** The overlap table comes from reading #347's
   embedded patch, not from applying both. Whichever lands second re-runs
-  steps 1–4 of *Verification*.
+  steps 1–4 of *Verification*, and re-derives `TASK_MODEL_CONSTRUCTIONS`
+  (Design decision 9).
 
 ## Execution Policy
 
 - execute: effort=low.
 - reason: a contained change on the trust edge, in both directions. It touches
-  2 source files (+90 / −16) through two choke points. Its one behaviour
+  2 source files (+109 / −16) through two choke points. Its one behaviour
   change is caller-visible, and the CHANGELOG states it.
 - Re-run the mutation table, the 8-module run, ruff and mypy before requesting
   review.
@@ -760,7 +971,7 @@ this plan file.
 
 ````diff
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 1eb3866..a6e70e7 100644
+index 1eb3866..b8ea017 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -634,12 +634,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
@@ -770,9 +981,9 @@ index 1eb3866..a6e70e7 100644
 -  - `task.ttl` must be an integer from 1 to 2^53−1. Zero and negative values,
 -    which were forwarded downstream unchanged, are now rejected with
 -    `Input validation error: …`, and so is any value above 2^53−1.
-+  - `task.ttl` must be an integer from 1 to 9,007,199,254,740: 2^53−1
-+    milliseconds once Consiliency/pmcp#330 converts it (next entry). Zero and
-+    negative values, which were forwarded downstream unchanged, are now
++  - `task.ttl` must be an integer from 1 to 9,007,199,254,740 seconds, so that
++    it is at most 2^53−1 ms once Consiliency/pmcp#330 converts it (next
++    entry). Zero and negative values, which were forwarded downstream unchanged, are now
 +    rejected with `Input validation error: …`, and so is any value above the
 +    maximum.
    - `task.poll_interval` must be a finite number greater than 0 and at most
@@ -783,7 +994,7 @@ index 1eb3866..a6e70e7 100644
    - The transport gate now treats `NaN` and `±Infinity` as non-numbers for
      every numeric argument. Both transports can deliver them, even though they
      are not JSON. Until Consiliency/pmcp#297 lands, a rejection message may
-@@ -689,9 +691,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+@@ -689,9 +691,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      originates) that contains one is dropped and logged, never written. Before,
      stdio servers received a non-JSON `NaN` literal, and HTTP/SSE servers
      silently received `null`.
@@ -804,12 +1015,22 @@ index 1eb3866..a6e70e7 100644
 +    1000× too long.** `task: {ttl: 300000}` used to mean five minutes to a
 +    spec-conforming server. It now asks for 300,000 seconds, about 3.5 days.
 +    Send seconds instead: `ttl: 300`. The same applies to `poll_interval`.
++  - **If you run a tenant server built to pmcp's earlier tenant contract**,
++    which described `ttl` in seconds, it now receives milliseconds: a caller's
++    `ttl: 300` arrives as `ttl: 300000`. A server that reads that as seconds
++    keeps the task 1000× longer than asked. It must also return `ttl` and
++    `pollInterval` (or `poll_interval`) in milliseconds, or pmcp reports them
++    1000× too small: a returned `ttl: 300` is shown as `0.3` seconds. See
++    `specs/tenant-code-mode-host-contract.md`.
 +  - Outbound: `task.ttl` is sent as `ttl` in milliseconds (seconds × 1000,
 +    exact). `task.poll_interval` is sent as `pollInterval` × 1000. MCP's
 +    `TaskMetadata` has no `pollInterval`, so a spec-conforming server ignores
 +    it.
 +  - Inbound: a downstream task's `ttl` and `pollInterval` are read in
-+    milliseconds. pmcp reports and records them as `ttl` and `poll_interval`
++    milliseconds, and so is the snake_case `poll_interval` alias some servers
++    send. When both poll aliases are present, `pollInterval` wins if it is
++    usable after conversion to seconds; otherwise a usable `poll_interval`
++    does. pmcp reports and records them as `ttl` and `poll_interval`
 +    in seconds, everywhere a task is returned: `gateway.invoke`'s `task`,
 +    `gateway.tasks_list`, `gateway.tasks_get`, `gateway.tasks_result` and
 +    `gateway.tasks_cancel`. A task that used to show `ttl: 300000` now shows
@@ -849,10 +1070,18 @@ index 0578946..b840ca4 100644
  `gateway.tasks_result`, and `gateway.tasks_cancel`. Do not use PMCP request IDs
  from `gateway.list_pending` or `gateway.cancel` for tenant task operations.
 diff --git a/specs/tenant-code-mode-host-contract.md b/specs/tenant-code-mode-host-contract.md
-index 998e2e5..12cf51c 100644
+index 998e2e5..594f30a 100644
 --- a/specs/tenant-code-mode-host-contract.md
 +++ b/specs/tenant-code-mode-host-contract.md
-@@ -109,6 +109,24 @@ clients, but PMCP does not persist task records past gateway process lifetime.
+@@ -104,11 +104,38 @@ downstream MCP task ID, not a PMCP request ID. `gateway.list_pending` and
+ tenant run/task IDs.
+ 
+ The tenant server should treat `pollInterval` and `ttl` as hints and lifecycle
+-metadata. PMCP forwards them when supplied and may surface returned values to
+-clients, but PMCP does not persist task records past gateway process lifetime.
++metadata. PMCP converts a caller's values to milliseconds and forwards them
++when supplied, and surfaces returned values to clients in seconds (see *Units*
++below). PMCP does not persist task records past gateway process lifetime.
  A returned value PMCP cannot use is surfaced as `null` and named in the task's
  `unusable_fields`.
  
@@ -865,7 +1094,9 @@ index 998e2e5..12cf51c 100644
 +  multiplied by 1000. A caller's `ttl: 300` reaches the tenant server as
 +  `ttl: 300000`.
 +- Inbound: a returned `ttl` or `pollInterval` is checked in milliseconds, as
-+  sent. A `ttl` must be an integer in [0, 2^63 − 1], or `null` for unlimited. A
++  sent. `poll_interval` (snake_case), which PMCP also accepts, is in
++  milliseconds too; when both are sent, `pollInterval` is used if it is usable
++  after conversion, and `poll_interval` otherwise. A `ttl` must be an integer in [0, 2^63 − 1], or `null` for unlimited. A
 +  `pollInterval` must be a finite number greater than 0. The value is then
 +  divided by 1000, and PMCP reports and records it as `ttl` and `poll_interval`
 +  in seconds. Both are numbers that may be fractional: `ttl: 1500` becomes
@@ -874,10 +1105,16 @@ index 998e2e5..12cf51c 100644
 +- The task's `raw` object, and any result PMCP relays as sent, keep the tenant
 +  server's own values and units.
 +
++**Changed in Consiliency/pmcp#330.** Earlier versions of this contract described
++`ttl` in seconds and PMCP passed the number through unchanged. A tenant server
++built to that text now receives milliseconds (a caller's `ttl: 300` arrives as
++`ttl: 300000`), and must return `ttl` and `pollInterval` in milliseconds:
++seconds it returns are reported 1000× too small (`ttl: 300` shows as `0.3`).
++
  ## Metadata Forwarding Contract
  
  PMCP can forward OpenTelemetry-style trace context through
-@@ -119,8 +137,12 @@ documented. These values are strings only and are metadata, not authentication.
+@@ -119,8 +146,12 @@ documented. These values are strings only and are metadata, not authentication.
  Task metadata supplied to `gateway.invoke` may include:
  
  - `metadata`: a bounded object for tenant-server execution context.
@@ -935,7 +1172,7 @@ index cae5645..e202341 100644
          )
  
 diff --git a/src/pmcp/types.py b/src/pmcp/types.py
-index 448e714..2d0d17f 100644
+index 448e714..2dcc0cc 100644
 --- a/src/pmcp/types.py
 +++ b/src/pmcp/types.py
 @@ -89,6 +89,15 @@ DEFAULT_AUTH_STATE_SEMANTICS: dict[AuthState, AuthStateSemanticsInfo] = {
@@ -989,7 +1226,7 @@ index 448e714..2d0d17f 100644
  def _usable_poll_interval(value: Any) -> Any:
      """A non-bool, finite number greater than 0."""
      if type(value) in (int, float):
-@@ -609,10 +633,43 @@ _TASK_HINT_CHECKS: dict[str, Any] = {
+@@ -609,10 +633,62 @@ _TASK_HINT_CHECKS: dict[str, Any] = {
  }
  
  
@@ -1001,13 +1238,37 @@ index 448e714..2d0d17f 100644
 +}
 +
 +
++#: Task fields MCP carries in milliseconds and pmcp holds in seconds.
++_TASK_DURATIONS = frozenset({"ttl", "poll_interval"})
++
++
++def _wire_duration_seconds(name: str, value: Any) -> Any:
++    """A downstream duration in milliseconds as seconds, or ``None`` (not sent)
++    or ``_UNUSABLE``. Checked twice: in milliseconds as sent (the
++    Consiliency/pmcp#298 rule), then in seconds after division, so a value
++    that underflows to 0 s is unusable here, not later (Consiliency/pmcp#330)."""
++    if value is None:
++        return None
++    usable = _WIRE_TASK_HINT_CHECKS[name](value)
++    if usable is _UNUSABLE:
++        return _UNUSABLE
++    return _TASK_HINT_CHECKS[name](usable / MS_PER_SECOND)
++
++
  def task_hint_is_usable(name: str, value: Any) -> bool:
 -    """Whether ``value`` passes the check for task field ``name`` -- for the
 -    downstream parser choosing among a field's wire aliases."""
 -    return value is not None and _TASK_HINT_CHECKS[name](value) is not _UNUSABLE
 +    """Whether wire value ``value`` passes the check for task field ``name`` --
-+    for the downstream parser choosing among a field's wire aliases."""
-+    return value is not None and _WIRE_TASK_HINT_CHECKS[name](value) is not _UNUSABLE
++    for the downstream parser choosing among a field's wire aliases. A duration
++    is judged as pmcp will hold it, in seconds after conversion, so an alias
++    that underflows to 0 s does not hide a usable one (Consiliency/pmcp#330)."""
++    if value is None:
++        return False
++    if name in _TASK_DURATIONS:
++        seconds = _wire_duration_seconds(name, value)
++        return seconds is not None and seconds is not _UNUSABLE
++    return _WIRE_TASK_HINT_CHECKS[name](value) is not _UNUSABLE
 +
 +
 +def task_seconds_to_wire(seconds: int | float) -> int | float:
@@ -1020,23 +1281,18 @@ index 448e714..2d0d17f 100644
 +
 +def task_duration_from_wire(name: str, value: Any) -> Any:
 +    """The one inbound conversion (Consiliency/pmcp#330): a downstream
-+    ``ttl`` / ``pollInterval`` in milliseconds, checked in milliseconds (the
-+    Consiliency/pmcp#298 rule), as float seconds.
++    ``ttl`` / ``pollInterval`` / ``poll_interval`` in milliseconds, checked in
++    milliseconds (the Consiliency/pmcp#298 rule), as float seconds.
 +
 +    ``None`` (not sent; for ``ttl`` also a sent ``null``, MCP's "unlimited")
-+    stays ``None``. A value the wire check refuses, and the parser's
-+    ``UNUSABLE_TASK_VALUE``, come back as ``UNUSABLE_TASK_VALUE`` for the model
-+    to report as unusable."""
-+    if value is None:
-+        return None
-+    usable = _WIRE_TASK_HINT_CHECKS[name](value)
-+    if usable is _UNUSABLE:
-+        return _UNUSABLE
-+    return usable / MS_PER_SECOND
++    stays ``None``. A value the wire check refuses, one that divides to a value
++    the seconds check refuses, and the parser's ``UNUSABLE_TASK_VALUE`` come
++    back as ``UNUSABLE_TASK_VALUE`` for the model to report as unusable."""
++    return _wire_duration_seconds(name, value)
  
  
  class McpTaskInfo(BaseModel):
-@@ -631,7 +688,10 @@ class McpTaskInfo(BaseModel):
+@@ -631,7 +707,10 @@ class McpTaskInfo(BaseModel):
      status_message: str | None = None
      created_at: float | None = None
      updated_at: float | None = None
@@ -1048,7 +1304,7 @@ index 448e714..2d0d17f 100644
      poll_interval: float | None = None
      unusable_fields: list[str] = Field(default_factory=list)
      raw: dict[str, Any] = Field(default_factory=dict)
-@@ -694,10 +754,14 @@ class TaskMetadataInput(GatewayArguments):
+@@ -694,10 +773,14 @@ class TaskMetadataInput(GatewayArguments):
          # `TaskMetadata.ttl` integer, which a JavaScript peer reads as a double
          # -- above 2**53 - 1 it is no longer the integer the caller sent. The
          # bound also keeps the gate and the model agreeing on floats outside
@@ -1066,7 +1322,7 @@ index 448e714..2d0d17f 100644
      )
      poll_interval: float | None = Field(
          default=None,
-@@ -706,10 +770,14 @@ class TaskMetadataInput(GatewayArguments):
+@@ -706,10 +789,14 @@ class TaskMetadataInput(GatewayArguments):
          # integer of |n| >= 2**1024 - 2**970 past the gate to a model that
          # cannot hold it. `allow_inf_nan` is not projected into the schema;
          # the gate's validator refuses non-finite numbers itself.
@@ -1247,10 +1503,10 @@ index f804183..0262d79 100644
  def test_every_aliased_hint_prefers_its_usable_alias(
 diff --git a/tests/test_task_units.py b/tests/test_task_units.py
 new file mode 100644
-index 0000000..f09ac58
+index 0000000..6ad8c74
 --- /dev/null
 +++ b/tests/test_task_units.py
-@@ -0,0 +1,550 @@
+@@ -0,0 +1,830 @@
 +"""Task durations: seconds in pmcp, milliseconds on the MCP wire
 +(Consiliency/pmcp#330).
 +
@@ -1278,12 +1534,13 @@ index 0000000..f09ac58
 +from unittest.mock import MagicMock
 +
 +import pytest
-+from pydantic import ValidationError
++from pydantic import BaseModel, ValidationError
 +
 +from pmcp.client.manager import ClientManager, ManagedClient
 +from pmcp.policy.policy import PolicyManager
 +from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
 +from pmcp.tools.schema import GATE_VALIDATOR
++import pmcp.types as pmcp_types
 +from pmcp.types import (
 +    MAX_FORWARDED_TASK_NUMBER,
 +    MAX_TASK_SECONDS,
@@ -1655,6 +1912,32 @@ index 0000000..f09ac58
 +
 +
 +@pytest.mark.parametrize(
++    "payload",
++    [
++        {"pollInterval": 5e-324, "poll_interval": 2500},
++        {"poll_interval": 2500, "pollInterval": 5e-324},
++        {"pollInterval": 0, "poll_interval": 2500},
++    ],
++    ids=["camel-underflows", "snake-first-in-dict", "camel-zero"],
++)
++def test_the_alias_is_chosen_by_usability_in_seconds(payload: dict[str, Any]) -> None:
++    """`pollInterval` is preferred over `poll_interval`, but only when it is
++    usable AS SECONDS: a camelCase value that divides to 0 s must not hide a
++    usable snake_case one (#298: the first usable alias wins; #330 board F002).
++    The snake_case alias is milliseconds too."""
++    info = ClientManager()._task_info_from_payload({"taskId": "t", **payload})
++    assert info is not None
++    assert info.poll_interval == 2.5 and info.unusable_fields == [], info
++
++
++def test_the_camel_case_alias_wins_when_both_are_usable() -> None:
++    info = ClientManager()._task_info_from_payload(
++        {"taskId": "t", "poll_interval": 9000, "pollInterval": 2500}
++    )
++    assert info is not None and info.poll_interval == 2.5
++
++
++@pytest.mark.parametrize(
 +    ("attr", "value", "usable"),
 +    [
 +        ("ttl", 1.5, True),
@@ -1801,4 +2084,257 @@ index 0000000..f09ac58
 +        "task_seconds_to_wire": {OUTBOUND},
 +        "task_duration_from_wire": {INBOUND},
 +    }
++
++
++# --- structure: every task model is built from downstream data only by the parser --
++#
++# The guards above see a duration that NAMES a wire key or a `ttl=`/
++# `poll_interval=` keyword. A task model built by spreading a downstream reply
++# (`McpTaskInfo.model_validate({**result, ...})`) names neither (#330 board
++# F003, mutants X1/X2). So the set of places that build ANY model carrying a
++# task is closed: each is listed below with the reason its input is already in
++# seconds, and a new or changed one fails until it is reviewed and added.
++
++
++def _task_carrying_models() -> set[str]:
++    models = {
++        name: obj
++        for name, obj in vars(pmcp_types).items()
++        if isinstance(obj, type) and issubclass(obj, BaseModel)
++    }
++    carrying = {n for n, m in models.items() if issubclass(m, McpTaskInfo)}
++    grew = True
++    while grew:
++        grew = False
++        for name, model in models.items():
++            if name not in carrying and any(
++                any(c in str(field.annotation) for c in carrying)
++                for field in model.model_fields.values()
++            ):
++                carrying.add(name)
++                grew = True
++    return carrying
++
++
++_TASK_DATA_KEYWORDS = {"task", "tasks", "ttl", "poll_interval", "raw", None}
++
++#: (file, function, model, how) -> (task-data arguments as source, why it is safe)
++TASK_MODEL_CONSTRUCTIONS: dict[tuple[str, str, str, str], tuple[str, str]] = {
++    ("client/manager.py", "_task_info_from_payload", "McpTaskInfo", "call"): (
++        "poll_interval=task_duration_from_wire('poll_interval', poll_interval); "
++        "raw=payload; ttl=task_duration_from_wire('ttl', payload.get('ttl'))",
++        "THE inbound converter",
++    ),
++    ("client/manager.py", "_record_task", "McpTaskRecord", "call"): (
++        "poll_interval=task_info.poll_interval; raw=task_info.raw; ttl=task_info.ttl",
++        "copies a parsed McpTaskInfo (seconds)",
++    ),
++    ("client/manager.py", "cancel_task", "McpTaskInfo", "call"): (
++        "raw=result",
++        "no duration: task_id, status, updated_at; `raw` is verbatim by design",
++    ),
++    ("tools/handlers.py", "tasks_list", "McpTaskInfo", "call"): (
++        "**task",
++        "`task` is a `record.model_dump()` from ClientManager.list_tasks "
++        "(pinned by test_list_tasks_returns_only_record_dumps)",
++    ),
++    (
++        "tools/handlers.py",
++        "_sanitize_task_for_output",
++        "McpTaskInfo",
++        "model_validate",
++    ): (
++        "task_data",
++        "`task_data` is `task.model_dump(mode='json')` of a model "
++        "(pinned by test_output_sanitising_revalidates_only_a_model_dump)",
++    ),
++    ("tools/handlers.py", "invoke", "InvokeOutput", "call"): (
++        "task=public_task",
++        "public_task is _sanitize_task_for_output(record) or None",
++    ),
++    ("tools/handlers.py", "tasks_list", "TasksListOutput", "call"): (
++        "tasks=tasks",
++        "a list of _sanitize_task_for_output results",
++    ),
++    ("tools/handlers.py", "tasks_get", "TasksGetOutput", "call"): (
++        "task=self._sanitize_task_for_output(task)",
++        "the record ClientManager.get_task returned",
++    ),
++    ("tools/handlers.py", "tasks_result", "TasksResultOutput", "call"): (
++        "task=self._sanitize_task_for_output(task) if task is not None else None",
++        "the registry record",
++    ),
++    ("tools/handlers.py", "tasks_cancel", "TasksCancelOutput", "call"): (
++        "task=task",
++        "the record (or None) ClientManager.cancel_task returned",
++    ),
++}
++
++
++def _task_model_constructions() -> dict[tuple[str, str, str, str], set[str]]:
++    carrying = _task_carrying_models()
++    found: dict[tuple[str, str, str, str], set[str]] = {}
++    for path, func in _functions():
++        for node in ast.walk(func):
++            if not isinstance(node, ast.Call):
++                continue
++            target = node.func
++            if isinstance(target, ast.Name) and target.id in carrying:
++                model, how = target.id, "call"
++            elif (
++                isinstance(target, ast.Attribute)
++                and isinstance(target.value, ast.Name)
++                and target.value.id in carrying
++            ):
++                model, how = target.value.id, target.attr
++            else:
++                continue
++            data = [ast.unparse(arg) for arg in node.args]
++            data += [
++                f"**{ast.unparse(kw.value)}"
++                if kw.arg is None
++                else f"{kw.arg}={ast.unparse(kw.value)}"
++                for kw in node.keywords
++                if kw.arg in _TASK_DATA_KEYWORDS
++            ]
++            if not data and model not in ("McpTaskInfo", "McpTaskRecord"):
++                continue  # an error-only output: carries no task
++            key = (path, func.name, model, how)
++            found.setdefault(key, set()).add(
++                "; ".join(sorted(d.replace('"', "'") for d in data))
++            )
++    return found
++
++
++def test_every_task_model_construction_is_a_reviewed_one() -> None:
++    """Closed world: every place in `src/pmcp` that builds a task-carrying model
++    (any form: `Model(...)`, `Model(**x)`, `Model.model_validate(x)`,
++    `Model.model_construct(...)`) with task data is listed, with exactly the
++    arguments listed. A spread of a downstream reply anywhere fails here."""
++    found = _task_model_constructions()
++    expected = {key: {args} for key, (args, _) in TASK_MODEL_CONSTRUCTIONS.items()}
++    assert found == expected
++
++
++def test_no_task_duration_is_assigned_or_copied_around_validation() -> None:
++    """Pydantic validates on construction only: an attribute store or a
++    `model_copy(update=...)` would put an unconverted value in a task model
++    without any check. Neither exists in `src/pmcp`."""
++    for path, func in _functions():
++        for node in ast.walk(func):
++            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):
++                assert node.attr not in ("ttl", "poll_interval"), (path, func.name)
++            if _called(node) in ("model_copy", "model_construct"):
++                assert not any(
++                    kw.arg == "update"
++                    for kw in node.keywords  # type: ignore[attr-defined]
++                ), (path, func.name, ast.unparse(node))
++
++
++def test_list_tasks_returns_only_record_dumps() -> None:
++    """The provenance the `McpTaskInfo(**task)` in `gateway.tasks_list` relies
++    on: every listed entry is the dump of a record `_record_task` just built."""
++    funcs = dict(((p, f.name), f) for p, f in _functions())
++    func = funcs[("client/manager.py", "list_tasks")]
++    records = {
++        node.targets[0].id
++        for node in ast.walk(func)
++        if isinstance(node, ast.Assign)
++        and isinstance(node.targets[0], ast.Name)
++        and _called(node.value) == "_record_task"
++    }
++    appended = [
++        node.args[0]
++        for node in ast.walk(func)
++        if isinstance(node, ast.Call)
++        and isinstance(node.func, ast.Attribute)
++        and node.func.attr == "append"
++    ]
++    assert appended and records
++    for arg in appended:
++        assert (
++            _called(arg) == "model_dump"
++            and isinstance(arg.func.value, ast.Name)  # type: ignore[attr-defined]
++            and arg.func.value.id in records  # type: ignore[attr-defined]
++        ), ast.unparse(arg)
++
++
++def test_output_sanitising_revalidates_only_a_model_dump() -> None:
++    funcs = dict(((p, f.name), f) for p, f in _functions())
++    func = funcs[("tools/handlers.py", "_sanitize_task_for_output")]
++    (source,) = [
++        node.value
++        for node in ast.walk(func)
++        if isinstance(node, ast.Assign)
++        and isinstance(node.targets[0], ast.Name)
++        and node.targets[0].id == "task_data"
++    ]
++    assert _called(source) == "model_dump", ast.unparse(source)
++
++
++@pytest.mark.asyncio
++async def test_the_cancel_fallback_never_reports_a_wire_duration_as_seconds() -> None:
++    """Site I3 bound behaviourally (#330 board F003, the seat's falsifier):
++    a cancel reply with no task in it is not read for durations."""
++    manager = _manager()
++
++    async def reply(managed: Any, method: str, params: dict[str, Any], **_: Any) -> Any:
++        return {"ttl": 300_000, "pollInterval": 2500}  # no taskId: the fallback
++
++    manager._send_request = reply  # type: ignore[method-assign]
++    manager._record_task(SERVER, McpTaskInfo(task_id="t1", status="working"))
++    ok, task, _ = await manager.cancel_task(SERVER, "t1")
++    assert ok and task is not None
++    assert task.ttl in (None, 300.0) and task.poll_interval in (None, 2.5), task
++
++
++@pytest.mark.asyncio
++async def test_a_get_reply_without_a_task_reports_no_task() -> None:
++    """`tasks/get` with no task in the reply is "not found", never a task
++    built from the reply's fields (#330 board F003, mutant X2)."""
++    manager = _manager()
++
++    async def reply(managed: Any, method: str, params: dict[str, Any], **_: Any) -> Any:
++        return {"ttl": 300_000, "pollInterval": 2500, "status": "working"}
++
++    manager._send_request = reply  # type: ignore[method-assign]
++    with pytest.raises(KeyError):
++        await manager.get_task(SERVER, "t1")
++    gateway = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
++    got = await gateway.tasks_get({"server_name": SERVER, "task_id": "t1"})
++    assert not got.ok and got.task is None
++
++
++@pytest.mark.asyncio
++async def test_a_listed_task_without_a_record_is_still_reported_in_seconds(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """`gateway.tasks_list`'s `McpTaskInfo(**task)` path (no record found, e.g.
++    evicted): the listed dump is already in seconds."""
++    gateway, _ = _gateway()
++    await gateway.invoke({"tool_id": TOOL_ID, "task": {"ttl": 300}})
++    monkeypatch.setattr(gateway._client_manager, "get_task_record", lambda *a: None)
++    listed = await gateway.tasks_list({"server_name": SERVER})
++    assert listed.ok, listed.errors
++    (task,) = listed.tasks
++    _assert_seconds(task)
++
++
++# --- docs -------------------------------------------------------------------------
++
++ROOT = SRC.parent.parent
++
++
++def test_the_changelog_and_contract_state_the_units_for_tenant_servers() -> None:
++    """#330 board F001: the release note warns tenant servers built to the old
++    seconds contract, and both docs give the unit of the snake_case alias."""
++    text = (ROOT / "CHANGELOG.md").read_text()
++    unreleased = text.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
++    start = unreleased.index("converted between pmcp's seconds")
++    entry = unreleased[start:].split("\n- **", 1)[0]
++    assert "tenant server" in entry.lower(), entry
++    assert "`poll_interval`" in entry and "milliseconds" in entry
++    contract = (ROOT / "specs" / "tenant-code-mode-host-contract.md").read_text()
++    assert "PMCP forwards them when supplied" not in contract
++    assert "`poll_interval` (snake_case)" in contract
 ````
