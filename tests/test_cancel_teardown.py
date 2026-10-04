@@ -2523,3 +2523,32 @@ async def test_a_connect_after_abandonment_is_refused_without_retrying(
     assert elapsed < manager_mod.RETRY_DELAYS[0], f"retried: {elapsed:.2f}s"
     assert _spawns(counter) == 0
     assert mgr._clients == {} and mgr._connect_tasks == {}
+
+
+async def test_adoption_after_abandonment_is_refused_and_registers_nothing() -> None:
+    """Codex round 2 (F002): `adopt_process` registers a client without going
+    through `_connect_server`, so it used to register an ONLINE client after
+    `abandon_all_now()`. It now refuses with `_ManagerAbandoned` before
+    touching any registry, leaving the process to its caller (real process)."""
+    mgr = ClientManager()
+    cfg = _stdio_config("adopted")
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(300)",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        mgr.abandon_all_now()
+        with pytest.raises(manager_mod._ManagerAbandoned):
+            await asyncio.wait_for(
+                mgr.adopt_process("adopted", process, cfg), _HANG_GUARD_S
+            )
+        assert "adopted" not in mgr._clients
+        assert "adopted" not in mgr._servers
+        assert process.returncode is None  # the caller owns its cleanup
+    finally:
+        process.kill()
+        await asyncio.wait_for(process.wait(), _HANG_GUARD_S)

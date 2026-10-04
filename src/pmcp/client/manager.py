@@ -4311,9 +4311,21 @@ class ClientManager:
             config: Server configuration
 
         Raises:
+            _ManagerAbandoned: If `abandon_all_now()` has run (the gateway is
+                shutting down); the process is left to the caller, which
+                kills it on any handoff failure (`_finalize_server_ready`)
             RuntimeError: If process is not running or missing pipes
             Exception: If MCP initialization fails
         """
+        # Adoption registers a client without going through `_connect_server`,
+        # so it checks abandonment itself: nothing may register a client after
+        # `abandon_all_now()` (Consiliency/pmcp#324, codex round 2). The check
+        # and the registration below have no await between them, so a client
+        # adopted before abandonment is in the set `abandon_all_now()` kills.
+        if self._abandoned:
+            raise _ManagerAbandoned(
+                f"Not adopting {name}: the client manager was abandoned"
+            )
         # Validate process state
         if process.returncode is not None:
             raise RuntimeError(f"Process for {name} has already exited")

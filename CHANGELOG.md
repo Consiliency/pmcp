@@ -452,7 +452,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A forced `disconnect_server` cancelled while waiting for a `tasks/cancel`
   reply, or for the lifecycle lock, finishes its teardown too. A cancelled
   `disconnect_all()`/`refresh()` does not respawn the servers it was
-  removing. Every bounded wait in `src/pmcp` now uses `pmcp.waits.bounded_wait`
+  removing. Once shutdown has abandoned every client, nothing connects,
+  reconnects or adopts a server process any more (a `refresh` that was
+  mid-flight returns without reconnecting), and a cancelled forced
+  `disconnect_server` also stops a connect of that server sitting in its
+  retry backoff. Every bounded wait in `src/pmcp` now uses `pmcp.waits.bounded_wait`
   instead of `asyncio.wait_for`, which on Python 3.10/3.11 could drop a
   cancel that landed as the awaited work finished. Where process groups do
   not exist (Windows) the single-process fallback is used, as before. Known
@@ -460,7 +464,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   auto-reconnect
   ([Consiliency/pmcp#336](https://github.com/Consiliency/pmcp/issues/336)),
   and a cancel while the spawn itself is completing can leave a grandchild
-  ([Consiliency/pmcp#344](https://github.com/Consiliency/pmcp/issues/344)).
+  ([Consiliency/pmcp#344](https://github.com/Consiliency/pmcp/issues/344)),
+  and a connect of a server requested *before* a cancelled forced disconnect
+  can still run afterwards
+  ([Consiliency/pmcp#359](https://github.com/Consiliency/pmcp/issues/359)).
   See [Consiliency/pmcp#324](https://github.com/Consiliency/pmcp/issues/324).
 - **Auth operator messages come through pmcp's own sanitiser intact, and
   invalid auth configuration refuses startup.** Four auth and startup
