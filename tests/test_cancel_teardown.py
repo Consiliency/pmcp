@@ -2174,6 +2174,20 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         "ClientManager._disconnect_all_unlocked._shutdown_one",
         "reraises",
     ): (1, "abandons synchronously, then re-raises into the gather"),
+    ("client/manager.py", "ClientManager._connect_singleflight", "reraises"): (
+        1,
+        "round 2: a supersession cancel of the awaited connect task becomes "
+        "the refusal (sync `_admit_connect`); any other cancel re-raises",
+    ),
+    (
+        "client/manager.py",
+        "ClientManager._ensure_connected_requested",
+        "reraises",
+    ): (1, "round 2: as `_connect_singleflight`"),
+    ("client/manager.py", "ClientManager._reconnect_loop", "reraises"): (
+        1,
+        "round 2: a superseded reconnect settles synchronously, then re-raises",
+    ),
     ("client/manager.py", "ClientManager._health_monitor_loop", "absorbs"): (
         1,
         "task root: its own cancel ends the loop",
@@ -2428,7 +2442,8 @@ async def test_a_refresh_in_flight_through_abandonment_spawns_nothing(
     0.5 s) runs out waiting for that lock. `abandon_all_now` cancelled the
     background tasks but not the lock holder, which went on to
     `_connect_all_unlocked(configs)` and respawned the server after
-    shutdown. Now nothing spawns and no client is registered."""
+    shutdown. Now nothing spawns, no client is registered, and a refresh that
+    returns reports the refusal."""
     from pmcp import server as server_mod
     from pmcp.server import GatewayServer
 
@@ -2485,7 +2500,11 @@ async def test_a_refresh_in_flight_through_abandonment_spawns_nothing(
                 await asyncio.sleep(0)
         assert kind in ("returned", "cancelled"), f"{kind} {detail!r}"
         if kind == "returned":
-            assert detail == [], detail
+            # The refusal is reported per server, not hidden as success.
+            assert detail == [
+                "Failed to connect to srv: Not connecting srv: "
+                "the client manager was abandoned"
+            ], detail
         assert spawns == [], spawns
         assert mgr._clients == {}, list(mgr._clients)
         await eventually(

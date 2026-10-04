@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, contextmanager
+import contextvars
 import json
 import logging
 import os
@@ -13,7 +14,9 @@ import re
 import signal
 import traceback
 import string
+import sys
 import time
+import weakref
 from collections import deque
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
@@ -177,10 +180,40 @@ def _retrieve_outcome(task: asyncio.Future[Any]) -> None:
         logger.debug(f"abandoned task ended with {type(exc).__name__}")
 
 
-def _cancel_without_waiting(task: asyncio.Future[Any] | None) -> None:
+def _cancel_without_waiting(
+    task: asyncio.Future[Any] | None, msg: str | None = None
+) -> None:
     if task is not None and not task.done():
-        task.cancel()
+        task.cancel(msg)
         task.add_done_callback(_retrieve_outcome)
+
+
+# The cancel message `abandon_all_now()` and a cancelled `disconnect_server`
+# give the connect tasks they stop, so that a request awaiting one of them --
+# itself not cancelled -- reports a refusal instead of a cancellation it never
+# received (`_cancelled_by_supersession`).
+_SUPERSEDED_CANCEL = "pmcp: connect superseded (Consiliency/pmcp#324)"
+
+
+def _cancelled_by_supersession(exc: asyncio.CancelledError) -> bool:
+    """True when `exc`, raised by awaiting a per-name connect task, is that
+    task's supersession cancel and not the awaiting task's own cancel.
+
+    The awaited task's cancel message reaches the awaiting task as the
+    `CancelledError`'s args on 3.11+, and as its `__context__`'s on 3.10. A
+    cancel of the awaiting task itself carries no message either way: while
+    it awaits, the cancel is forwarded into the connect task without one,
+    which replaces the message; once that task is done, the awaiting task
+    gets a fresh `CancelledError` of its own. On 3.11+ the awaiting task is
+    then also `cancelling()`."""
+    cancelling = getattr(asyncio.current_task(), "cancelling", None)
+    if cancelling is not None and cancelling():
+        return False
+    marked = (_SUPERSEDED_CANCEL,)
+    context = exc.__context__
+    return exc.args[:1] == marked or (
+        isinstance(context, asyncio.CancelledError) and context.args[:1] == marked
+    )
 
 
 # How often an abandoned transport owner is re-cancelled until it ends.
@@ -382,10 +415,49 @@ def _downstream_error(error: Any) -> DownstreamError:
     )
 
 
-class _ManagerAbandoned(Exception):
-    """A connect refused because `ClientManager.abandon_all_now()` ran: the
-    gateway is shutting down, and nothing may spawn or register a client
-    after it (Consiliency/pmcp#324, codex round 1 on the implementation)."""
+class _ConnectRefused(Exception):
+    """A connect refused by `ClientManager._admit_connect` -- the one check
+    every connect path and `adopt_process` pass before they spawn, join a
+    connect in flight, or register a client (Consiliency/pmcp#324). Not a
+    connection failure: `_connect_with_retry` re-raises it instead of
+    retrying, and the reconnect loop stops on it."""
+
+
+class _ManagerAbandoned(_ConnectRefused):
+    """A connect or adoption refused because `ClientManager.abandon_all_now()`
+    ran: the gateway is shutting down, and no connect path and no
+    `adopt_process` spawns or registers a client after it, whenever it was
+    requested (Consiliency/pmcp#324, codex rounds 1 and 2 on the
+    implementation)."""
+
+
+class _ConnectSuperseded(_ConnectRefused):
+    """A connect refused because it was requested before a
+    `disconnect_server(name)` that was cancelled before it took the lifecycle
+    lock. Uncancelled, that disconnect would have run after this connect and
+    torn down what it produced; cancelled, it never runs, so the connect is
+    refused instead (Consiliency/pmcp#324, round 2 on the implementation)."""
+
+
+# Every ticket is below this, so `abandon_all_now()` setting the global
+# supersession point to it makes every connect stale, for every name, forever.
+_ABANDONED_AT = sys.maxsize
+
+
+@dataclass(frozen=True)
+class _ConnectTicket:
+    """The lifecycle generation a connect captured when it was REQUESTED,
+    before it waited for the lifecycle lock. Carried from the entry point to
+    `_admit_connect` in `_CONNECT_TICKET`; `asyncio.create_task` copies the
+    context, so the per-name tasks a request starts carry it too."""
+
+    owner: ClientManager
+    seq: int
+
+
+_CONNECT_TICKET: contextvars.ContextVar[_ConnectTicket | None] = contextvars.ContextVar(
+    "pmcp_connect_ticket", default=None
+)
 
 
 class _NullCatalogEventSink:
@@ -656,6 +728,8 @@ IDLE_POLL_SLICE_S = 1.0
 # Connection retry settings
 MAX_CONNECTION_RETRIES = 3
 RETRY_DELAYS = [1.0, 2.0, 4.0]  # Exponential backoff delays in seconds
+# The auto-reconnect loop's delay before each attempt, in seconds.
+RECONNECT_DELAYS = (5.0, 15.0, 30.0)
 PREFERRED_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = (
     PREFERRED_PROTOCOL_VERSION,
@@ -1375,10 +1449,27 @@ class ClientManager:
         self._project_root = project_root
         self._spawn_semaphore = asyncio.Semaphore(max_concurrent_spawns)
         self._lifecycle_lock = asyncio.Lock()
-        # Set once by `abandon_all_now()` and never cleared: see
-        # `_connect_server`.
-        self._abandoned = False
+        # Connect generations (Consiliency/pmcp#324): every connect captures
+        # `_lifecycle_seq` when it is requested (`_connect_request`), and
+        # `_admit_connect` refuses it when it is older than the point at which
+        # its name -- or every name -- was superseded. A cancelled
+        # `disconnect_server(name)` supersedes `name`
+        # (`_supersede_connects`); `abandon_all_now()` supersedes every name,
+        # for every ticket, forever (`_ABANDONED_AT`).
+        self._lifecycle_seq = 0
+        self._superseded_at: dict[str, int] = {}
+        self._all_superseded_at = 0
         self._connect_tasks: dict[str, asyncio.Task[None]] = {}
+        # The ticket each per-name connect task was started with, so that a
+        # request never joins a task that is staler than itself.
+        self._connect_task_tickets: weakref.WeakKeyDictionary[
+            asyncio.Task[None], int
+        ] = weakref.WeakKeyDictionary()
+        # `_connect_all_unlocked`'s per-config request tasks (see
+        # `_cancel_background_tasks_now`).
+        self._connect_request_tasks: weakref.WeakSet[asyncio.Task[Any]] = (
+            weakref.WeakSet()
+        )
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._background_task_servers: dict[asyncio.Task[Any], str | None] = {}
         self._reconnect_tasks: dict[str, asyncio.Task[None]] = {}
@@ -1401,6 +1492,86 @@ class ClientManager:
         # Increments on every `_record_task`: the terminal-eviction order.
         self._record_order = 0
 
+    @contextmanager
+    def _connect_request(self) -> Iterator[None]:
+        """Capture the connect generation NOW -- when the connect is
+        requested, before it waits for the lifecycle lock -- for every
+        `_admit_connect` reached inside this block, including from the tasks
+        it starts (`create_task` copies the context). Every connect entry
+        point opens one: `connect_all` (startup and the CLI), `connect_server`
+        (and `restart_server`), `refresh` and `ensure_connected` (lazy start).
+        The reconnect loop sets the same ticket from the generation
+        `_schedule_reconnect` captured when it scheduled it."""
+        token = _CONNECT_TICKET.set(_ConnectTicket(self, self._lifecycle_seq))
+        try:
+            yield
+        finally:
+            _CONNECT_TICKET.reset(token)
+
+    def _current_ticket(self) -> int:
+        """The generation the running connect request captured. Outside any
+        request (a direct call of a private connect method), now."""
+        ticket = _CONNECT_TICKET.get()
+        if ticket is not None and ticket.owner is self:
+            return ticket.seq
+        return self._lifecycle_seq
+
+    def _ticket_is_current(self, name: str, ticket: int) -> bool:
+        return ticket >= max(self._all_superseded_at, self._superseded_at.get(name, 0))
+
+    def _supersede_connects(self, name: str) -> None:
+        """Refuse every connect of `name` requested before now: synchronous,
+        for `disconnect_server`'s cancelled pre-lock path."""
+        self._lifecycle_seq += 1
+        self._superseded_at[name] = self._lifecycle_seq
+
+    def _admit_connect(
+        self, name: str, config: ResolvedServerConfig | None = None
+    ) -> None:
+        """THE check (Consiliency/pmcp#324). Raise `_ManagerAbandoned` once
+        `abandon_all_now()` ran, or `_ConnectSuperseded` when the running
+        request is older than a cancelled `disconnect_server(name)`.
+        Synchronous; every caller registers, spawns or joins nothing before
+        it.
+
+        On supersession, with `config` and no client registered, it leaves
+        the server as the disconnect would have, had it run after this
+        connect (`_settle_disconnected`): the end state of the uncancelled
+        ordering. A client registered by a newer request is left alone."""
+        ticket = self._current_ticket()
+        if ticket < self._all_superseded_at:
+            raise _ManagerAbandoned(
+                f"Not connecting {name}: the client manager was abandoned"
+            )
+        if ticket < self._superseded_at.get(name, 0):
+            if config is not None and name not in self._clients:
+                self._settle_disconnected(name, config)
+            raise _ConnectSuperseded(
+                f"Not connecting {name}: superseded by a disconnect_server"
+                f"({name}) requested after this connect and cancelled before"
+                " it ran"
+            )
+
+    def _joinable_connect_task(self, name: str) -> asyncio.Task[None] | None:
+        """The per-name connect task in flight, unless it was started by a
+        request that is staler than the admitted caller: that task will be
+        refused, and joining it would refuse a request that is current."""
+        task = self._connect_tasks.get(name)
+        if task is None:
+            return None
+        started = self._connect_task_tickets.get(task, self._lifecycle_seq)
+        return task if self._ticket_is_current(name, started) else None
+
+    def _start_connect_task(self, name: str, coro: Any) -> asyncio.Task[None]:
+        """Start, track and register the per-name connect task, recording the
+        ticket it carries."""
+        task: asyncio.Task[None] = self._track_background_task(
+            asyncio.create_task(coro), name
+        )
+        self._connect_task_tickets[task] = self._current_ticket()
+        self._connect_tasks[name] = task
+        return task
+
     async def connect_all(
         self, configs: list[ResolvedServerConfig], retry: bool = True
     ) -> list[str]:
@@ -1416,19 +1587,18 @@ class ClientManager:
         if not configs:
             return []
 
-        async with self._lifecycle_lock:
-            return await self._connect_all_unlocked(configs, retry=retry)
+        with self._connect_request():
+            async with self._lifecycle_lock:
+                return await self._connect_all_unlocked(configs, retry=retry)
 
     async def _connect_all_unlocked(
         self, configs: list[ResolvedServerConfig], retry: bool = True
     ) -> list[str]:
-        """Connect to all configured servers while caller owns lifecycle lock."""
+        """Connect to all configured servers while caller owns lifecycle lock.
+
+        A refused connect (`_ConnectRefused`) is one error string per server,
+        as any other failure, logged at INFO: it is not a fault."""
         if not configs:
-            return []
-        if self._abandoned:
-            # A refresh that held the lock across `abandon_all_now()` ends
-            # here rather than logging one refused connect per server.
-            logger.info("Not connecting: the client manager was abandoned")
             return []
 
         # Connect to all servers concurrently, sharing work for duplicate names.
@@ -1441,6 +1611,7 @@ class ClientManager:
                     asyncio.create_task(self._connect_singleflight(config, retry)),
                     config.name,
                 )
+                self._connect_request_tasks.add(task)
                 tasks_by_name[config.name] = task
             tasks.append(task)
 
@@ -1451,7 +1622,10 @@ class ClientManager:
         for config, result in zip(configs, results):
             if isinstance(result, Exception):
                 error_msg = f"Failed to connect to {config.name}: {result}"
-                logger.error(error_msg)
+                if isinstance(result, _ConnectRefused):
+                    logger.info(error_msg)
+                else:
+                    logger.error(error_msg)
                 errors.append(error_msg)
 
         self._revision_id = _generate_revision_id()
@@ -1462,23 +1636,35 @@ class ClientManager:
     async def _connect_singleflight(
         self, config: ResolvedServerConfig, retry: bool = True
     ) -> None:
-        """Share concurrent connection attempts for the same server name."""
+        """Share concurrent connection attempts for the same server name.
+
+        A superseded request is refused first -- before it can report an
+        ONLINE server as its own success or join a connect in flight -- and
+        a current one never joins a task a staler request started
+        (Consiliency/pmcp#324)."""
         name = config.name
+        self._admit_connect(name, config)
         status = self._servers.get(name)
         if status is not None and status.status == ServerStatusEnum.ONLINE:
             return
 
-        task = self._connect_tasks.get(name)
+        task = self._joinable_connect_task(name)
         if task is None:
-            if retry:
-                task = asyncio.create_task(self._connect_with_retry(config))
-            else:
-                task = asyncio.create_task(self._connect_server(config))
-            task = self._track_background_task(task, name)
-            self._connect_tasks[name] = task
+            task = self._start_connect_task(
+                name,
+                self._connect_with_retry(config)
+                if retry
+                else self._connect_server(config),
+            )
 
         try:
             await task
+        except asyncio.CancelledError as e:
+            # The connect task was stopped because this request was
+            # superseded (or the manager abandoned): report the refusal.
+            if _cancelled_by_supersession(e):
+                self._admit_connect(name, config)
+            raise
         finally:
             if self._connect_tasks.get(name) is task:
                 self._connect_tasks.pop(name, None)
@@ -1517,11 +1703,21 @@ class ClientManager:
             if task.done():
                 self._background_task_servers.pop(task, None)
 
-    def _cancel_background_tasks_now(self, *, server_name: str | None = None) -> None:
+    def _cancel_background_tasks_now(
+        self, *, server_name: str | None = None, msg: str | None = None
+    ) -> None:
         """`_cancel_background_tasks` without the wait: for a cancelled
-        teardown, which must not await (Consiliency/pmcp#324)."""
+        teardown, which must not await (Consiliency/pmcp#324).
+
+        With `msg` (`_SUPERSEDED_CANCEL`: connects are being superseded), the
+        request tasks of a `connect_all`/`refresh` are spared: each is
+        awaiting a per-name connect task this cancels, or has not started and
+        will be refused by `_admit_connect`, so it reports a refusal rather
+        than ending cancelled and missing from the result."""
         for task in self._background_tasks_for(server_name=server_name):
-            _cancel_without_waiting(task)
+            if msg is not None and task in self._connect_request_tasks:
+                continue
+            _cancel_without_waiting(task, msg)
 
     def _background_tasks_for(
         self,
@@ -1605,6 +1801,20 @@ class ClientManager:
         Raises:
             ValueError: If server is not registered (neither connected nor lazy)
         """
+        with self._connect_request():
+            return await self._ensure_connected_requested(server_name)
+
+    async def _ensure_connected_requested(self, server_name: str) -> bool:
+        """`ensure_connected` inside its connect request.
+
+        Its connect task carries the request's ticket and is admitted (or
+        refused) in `_connect_server`. A superseded lazy start needs no check
+        of its own here: the lock is first-come, first-served, so it reaches
+        this block before any connect requested after the supersession, and
+        so finds neither a server that request brought ONLINE nor its task
+        to join. The task it starts here is refused in the funnel, and a
+        current request that finds it registered starts its own instead
+        (`_joinable_connect_task`) (Consiliency/pmcp#324)."""
         async with self._lifecycle_lock:
             if self.is_server_online(server_name):
                 return True
@@ -1616,19 +1826,28 @@ class ClientManager:
 
             config = self._lazy_configs[server_name]
             logger.info(f"Lazy-starting server: {server_name}")
-            task = self._connect_tasks.get(server_name)
+            task = self._joinable_connect_task(server_name)
             if task is None:
-                task = self._track_background_task(
-                    asyncio.create_task(self._connect_with_lifecycle_lock(config)),
-                    server_name,
+                task = self._start_connect_task(
+                    server_name, self._connect_with_lifecycle_lock(config)
                 )
-                self._connect_tasks[server_name] = task
 
         try:
-            await task
+            try:
+                await task
+            except asyncio.CancelledError as e:
+                # As in `_connect_singleflight`.
+                if _cancelled_by_supersession(e):
+                    self._admit_connect(server_name, config)
+                raise
             async with self._lifecycle_lock:
                 self._lazy_configs.pop(server_name, None)
             return True
+        except _ConnectRefused as e:
+            # Not a failure of the server: it leaves the status as the
+            # refusal settled it (`_admit_connect`), not ERROR.
+            logger.info(f"Not lazy-starting {server_name}: {describe_exception(e)}")
+            return False
         except Exception as e:
             logger.error(f"Failed to lazy-start {server_name}: {describe_exception(e)}")
             async with self._lifecycle_lock:
@@ -1649,19 +1868,29 @@ class ClientManager:
         self, config: ResolvedServerConfig, retry: bool = True
     ) -> list[str]:
         """Connect one server through same-server single-flight startup."""
-        async with self._lifecycle_lock:
-            try:
-                await self._connect_singleflight(config, retry=retry)
-                if self.is_server_online(config.name):
-                    self._lazy_configs.pop(config.name, None)
-                self._revision_id = _generate_revision_id()
-                self._last_refresh_ts = time.time()
-                return []
-            except Exception as e:
-                if config.name in self._servers:
-                    self._servers[config.name].status = ServerStatusEnum.ERROR
-                    self._servers[config.name].last_error = describe_exception(e)
-                return [f"Failed to connect to {config.name}: {describe_exception(e)}"]
+        with self._connect_request():
+            async with self._lifecycle_lock:
+                return await self._connect_server_locked(config, retry)
+
+    async def _connect_server_locked(
+        self, config: ResolvedServerConfig, retry: bool
+    ) -> list[str]:
+        """`connect_server` with the lifecycle lock held."""
+        try:
+            await self._connect_singleflight(config, retry=retry)
+            if self.is_server_online(config.name):
+                self._lazy_configs.pop(config.name, None)
+            self._revision_id = _generate_revision_id()
+            self._last_refresh_ts = time.time()
+            return []
+        except _ConnectRefused as e:
+            # Not a failure of the server: no ERROR status.
+            return [f"Failed to connect to {config.name}: {describe_exception(e)}"]
+        except Exception as e:
+            if config.name in self._servers:
+                self._servers[config.name].status = ServerStatusEnum.ERROR
+                self._servers[config.name].last_error = describe_exception(e)
+            return [f"Failed to connect to {config.name}: {describe_exception(e)}"]
 
     def cancel_pending_requests(self, server: str) -> int:
         """Cancel pending requests for one server and return newly cancelled count."""
@@ -1712,6 +1941,16 @@ class ClientManager:
                         return (False, cancelled, message)
             await self._lifecycle_lock.acquire()
         except asyncio.CancelledError:
+            # Cancelled before it took the lock, this disconnect never runs
+            # after the connects of `name` requested before it, as it would
+            # have uncancelled (the lock is FIFO). Refuse them instead: one
+            # still queued on the lock, one held up behind a lock holder that
+            # has not started its per-name task yet (a `refresh` in its
+            # disconnect phase), a lazy start, a reconnect -- each fails
+            # `_admit_connect` when it gets there. Not on the uncancelled
+            # path: there the disconnect does run after them, and refusing
+            # them would change what those callers are told.
+            self._supersede_connects(name)
             before_lock = self._clients.get(name)
             if before_lock is not None:
                 before_lock.status.status = ServerStatusEnum.OFFLINE
@@ -1721,8 +1960,9 @@ class ClientManager:
             # with no client registered yet (e.g. in its retry backoff,
             # holding the lock). Cancel it either way, or its next attempt
             # spawns after this disconnect. (Its `_connect_singleflight`
-            # drops the `_connect_tasks` entry as the cancel unwinds.)
-            self._cancel_background_tasks_now(server_name=name)
+            # drops the `_connect_tasks` entry as the cancel unwinds, and
+            # reports the refusal to the request awaiting it.)
+            self._cancel_background_tasks_now(server_name=name, msg=_SUPERSEDED_CANCEL)
             raise
         try:
             return await self._disconnect_server_locked(name, cancelled)
@@ -1821,6 +2061,12 @@ class ClientManager:
         self._catalog_suppressed.pop(name, None)
         self._clients.pop(name, None)
         self._remove_server_indexes(name)
+        self._settle_disconnected(name, config)
+
+    def _settle_disconnected(self, name: str, config: Any) -> None:
+        """The registry state a completed `disconnect_server(name)` leaves:
+        lazy re-registration, LAZY/OFFLINE status, a new revision. Also what
+        `_admit_connect` leaves for a superseded connect with no client."""
         if config is not None and config.source in {"project", "user", "custom"}:
             self._lazy_configs[name] = config
         self._servers[name] = ServerStatus(
@@ -1863,8 +2109,8 @@ class ClientManager:
             try:
                 await self._connect_server(config)
                 return  # Success
-            except _ManagerAbandoned:
-                raise  # Not a failure to retry: the gateway is shutting down.
+            except _ConnectRefused:
+                raise  # Not a failure to retry: no later attempt is admitted.
             except Exception as e:
                 last_error = e
                 if attempt < MAX_CONNECTION_RETRIES - 1:
@@ -1884,14 +2130,11 @@ class ClientManager:
         """Connect to a single MCP server.
 
         Every connect path -- startup, `connect_server`, `refresh`, lazy
-        start, reconnect -- ends here, so this one check is what stops an
-        operation that was already in flight when `abandon_all_now()` ran
-        (e.g. a `refresh` holding the lifecycle lock through shutdown) from
-        spawning a server afterwards (Consiliency/pmcp#324)."""
-        if self._abandoned:
-            raise _ManagerAbandoned(
-                f"Not connecting {config.name}: the client manager was abandoned"
-            )
+        start, reconnect -- ends here, and every attempt of a retried connect
+        passes here again: `_admit_connect` refuses one requested before
+        `abandon_all_now()` or before a cancelled `disconnect_server` of this
+        name (Consiliency/pmcp#324)."""
+        self._admit_connect(config.name, config)
         if isinstance(config.config, RemoteMcpServerConfig):
             if config.config.type in ("http", "streamable-http"):
                 await self._connect_streamable_http(config)
@@ -2973,13 +3216,15 @@ class ClientManager:
         Catalogs are left to `disconnect_all` (the publisher-coverage guard
         keeps catalog writes there); the process is exiting.
 
-        It is terminal: `_abandoned` stays set, so a lifecycle operation
-        already in flight (a `refresh` holding the lock) or queued behind
-        one cannot spawn a server afterwards (`_connect_server`)."""
-        self._abandoned = True
+        It is terminal: every connect ticket is superseded for every name,
+        forever, so no connect path -- in flight (a `refresh` holding the
+        lock), queued behind one, or requested later -- spawns or joins a
+        connect afterwards, and `adopt_process` registers nothing
+        (`_admit_connect`)."""
+        self._all_superseded_at = _ABANDONED_AT
         for name, managed in list(self._clients.items()):
             self._abandon_client_io(name, managed)
-        self._cancel_background_tasks_now()
+        self._cancel_background_tasks_now(msg=_SUPERSEDED_CANCEL)
         self._clients.clear()
         self._connect_tasks.clear()
         self._reconnect_tasks.clear()
@@ -3602,8 +3847,10 @@ class ClientManager:
         task = self._reconnect_tasks.get(name)
         if task is not None and not task.done():
             return
+        # The reconnect is requested now: capture the generation here, not per
+        # attempt, so a disconnect cancelled after this point supersedes it.
         task = asyncio.create_task(
-            self._reconnect_loop(name, config),
+            self._reconnect_loop(name, config, ticket=self._lifecycle_seq),
             name=f"reconnect-{name}",
         )
         self._reconnect_tasks[name] = task
@@ -3615,13 +3862,49 @@ class ClientManager:
 
         task.add_done_callback(clear_reconnect)
 
-    async def _reconnect_loop(self, name: str, config: ResolvedServerConfig) -> None:
+    async def _reconnect_loop(
+        self,
+        name: str,
+        config: ResolvedServerConfig,
+        ticket: int | None = None,
+    ) -> None:
         """Attempt to reconnect a crashed server with exponential back-off.
 
         Tries up to 3 times with 5 s / 15 s / 30 s delays. Gives up if another
-        caller has already brought the server back online.
+        caller has already brought the server back online, and on a refusal
+        (`_ConnectRefused`): every later attempt carries the same ticket, so
+        none would be admitted.
+
+        `ticket` is the generation captured when the reconnect was scheduled
+        (`_schedule_reconnect`); None means now.
         """
-        delays = [5.0, 15.0, 30.0]
+        token = _CONNECT_TICKET.set(
+            _ConnectTicket(self, self._lifecycle_seq if ticket is None else ticket)
+        )
+        try:
+            await self._reconnect_attempts(name, config)
+        except asyncio.CancelledError as e:
+            # Stopped by a cancelled `disconnect_server(name)` requested after
+            # this reconnect: leave what that disconnect would have left, had
+            # it run after the reconnect (`_admit_connect` settles a
+            # superseded request; it raises the refusal, which is moot here).
+            if e.args[:1] == (_SUPERSEDED_CANCEL,) or (
+                isinstance(e.__context__, asyncio.CancelledError)
+                and e.__context__.args[:1] == (_SUPERSEDED_CANCEL,)
+            ):
+                try:
+                    self._admit_connect(name, config)
+                except _ConnectRefused:
+                    pass
+            raise
+        finally:
+            _CONNECT_TICKET.reset(token)
+
+    async def _reconnect_attempts(
+        self, name: str, config: ResolvedServerConfig
+    ) -> None:
+        """`_reconnect_loop` inside its connect request."""
+        delays = RECONNECT_DELAYS
         try:
             for attempt, delay in enumerate(delays, start=1):
                 await asyncio.sleep(delay)
@@ -3643,6 +3926,9 @@ class ClientManager:
                             return
                         await self._connect_singleflight(config)
                     logger.info(f"[{name}] reconnected successfully")
+                    return
+                except _ConnectRefused as e:
+                    logger.info(f"[{name}] reconnect stopped: {describe_exception(e)}")
                     return
                 except Exception as e:
                     safe_error = describe_exception(e)
@@ -4289,10 +4575,15 @@ class ClientManager:
             )
 
     async def refresh(self, configs: list[ResolvedServerConfig]) -> list[str]:
-        """Refresh connections (disconnect + reconnect)."""
-        async with self._lifecycle_lock:
-            await self._disconnect_all_unlocked()
-            return await self._connect_all_unlocked(configs)
+        """Refresh connections (disconnect + reconnect).
+
+        The reconnect is requested when `refresh` is called, so a
+        `disconnect_server(name)` cancelled while this waits for the lock or
+        tears down supersedes its connect of `name` (Consiliency/pmcp#324)."""
+        with self._connect_request():
+            async with self._lifecycle_lock:
+                await self._disconnect_all_unlocked()
+                return await self._connect_all_unlocked(configs)
 
     async def adopt_process(
         self,
@@ -4311,9 +4602,18 @@ class ClientManager:
             config: Server configuration
 
         Raises:
+            _ManagerAbandoned: If `abandon_all_now()` ran. Nothing is
+                registered and the process is left as passed: the caller
+                spawned it and owns its cleanup (`_finalize_server_ready`
+                kills it on any handoff failure).
             RuntimeError: If process is not running or missing pipes
             Exception: If MCP initialization fails
         """
+        # The same check as every connect path (Consiliency/pmcp#324), with
+        # no await between it and the registration below. An adoption is
+        # requested by this call and carries no earlier ticket, so only
+        # abandonment can refuse it.
+        self._admit_connect(name)
         # Validate process state
         if process.returncode is not None:
             raise RuntimeError(f"Process for {name} has already exited")

@@ -450,9 +450,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its 10 s budget runs out (for example while another operation holds the
   lifecycle lock) or when its `disconnect_all` is cancelled before it starts.
   A forced `disconnect_server` cancelled while waiting for a `tasks/cancel`
-  reply, or for the lifecycle lock, finishes its teardown too. A cancelled
-  `disconnect_all()`/`refresh()` does not respawn the servers it was
-  removing. Every bounded wait in `src/pmcp` now uses `pmcp.waits.bounded_wait`
+  reply, or for the lifecycle lock, finishes its teardown too, and it
+  supersedes every connect of that server requested before it: one queued on
+  the lifecycle lock, a `refresh` still tearing down before it reconnects, a
+  lazy start, an auto-reconnect, one in its retry backoff or mid-spawn. None
+  spawns the server afterwards; `connect_server`, `connect_all` and `refresh`
+  report `Not connecting <name>: superseded by a disconnect_server(<name>)
+  requested after this connect and cancelled before it ran` for it,
+  `ensure_connected` returns false, and the server ends as the uncancelled
+  ordering leaves it (disconnected; lazy again if it came from a project,
+  user or custom config). A connect requested after the cancelled disconnect
+  is unaffected. An uncancelled disconnect supersedes nothing: it runs after
+  those connects (the lock is first-come, first-served) and tears down what
+  they produced, so its end state is already this one, and refusing them
+  instead would change what their callers are told. The one pre-existing
+  departure from request order is left as it is: uncancelled, a lazy start
+  queued on the lock before a disconnect can still connect after it, because
+  it takes the lock twice. Once shutdown abandons the client manager, no
+  connect path spawns a server and `adopt_process` registers none (a
+  provisioning handoff then fails and kills the process it was handing
+  over); a `refresh` in flight through shutdown reports the refusal per
+  server. A cancelled `disconnect_all()`/`refresh()` does not respawn the
+  servers it was removing. Every bounded wait in `src/pmcp` now uses `pmcp.waits.bounded_wait`
   instead of `asyncio.wait_for`, which on Python 3.10/3.11 could drop a
   cancel that landed as the awaited work finished. Where process groups do
   not exist (Windows) the single-process fallback is used, as before. Known
