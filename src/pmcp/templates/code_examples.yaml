@@ -25,9 +25,10 @@
 # Filesystem examples
 "filesystem::list_files":
   snippet: |
-    # Filter files locally
-    files = mcp.call_tool("gateway.invoke", {"tool_id": "filesystem::list_files", "arguments": {"path": "./"}})
-    py_files = [f for f in files if f.endswith(".py")]
+    # Unwrap the downstream result, then filter locally
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "filesystem::list_files", "arguments": {"path": "./"}})
+    text = out["result"]["content"][0]["text"]
+    py_files = [line for line in text.splitlines() if line.endswith(".py")]
 
 "filesystem::read_file":
   snippet: |
@@ -45,8 +46,9 @@
 # GitHub examples
 "github::listIssues":
   snippet: |
-    # Filter issues locally
-    issues = mcp.call_tool("gateway.invoke", {"tool_id": "github::listIssues", "arguments": {"repo": "owner/repo"}})
+    import json
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "github::listIssues", "arguments": {"repo": "owner/repo"}})
+    issues = json.loads(out["result"]["content"][0]["text"])
     open_bugs = [i for i in issues if i["state"] == "open" and "bug" in i["labels"]]
 
 "github::createIssue":
@@ -59,14 +61,16 @@
 # Database examples
 "postgres::query":
   snippet: |
-    # Query and filter
-    rows = mcp.call_tool("gateway.invoke", {"tool_id": "postgres::query", "arguments": {"sql": "SELECT * FROM users"}})
+    import json
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "postgres::query", "arguments": {"sql": "SELECT * FROM users"}})
+    rows = json.loads(out["result"]["content"][0]["text"])
     active = [r for r in rows if r["status"] == "active"]
 
 "sqlite::query":
   snippet: |
-    # Query with filter
-    data = mcp.call_tool("gateway.invoke", {"tool_id": "sqlite::query", "arguments": {"query": "SELECT * FROM items"}})
+    import json
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "sqlite::query", "arguments": {"query": "SELECT * FROM items"}})
+    data = json.loads(out["result"]["content"][0]["text"])
     recent = [d for d in data if d["created"] > cutoff_date]
 
 # Browser automation
@@ -92,10 +96,10 @@
 
 "gateway::provision_status":
   snippet: |
-    # Poll until ready
-    while True:
-        status = mcp.call_tool("gateway.provision_status", {"server_name": "github"})
-        if status["state"] in ["ready", "failed"]: break
+    import time
+    job = mcp.call_tool("gateway.provision", {"server_name": "github"})["job_id"]
+    while mcp.call_tool("gateway.provision_status", {"job_id": job})["status"] in ("pending", "installing"):
+        time.sleep(1)
 
 "gateway::catalog_search":
   snippet: |
@@ -106,10 +110,10 @@
 
 "gateway::describe":
   snippet: |
-    # Check before invoke
-    schema = mcp.call_tool("gateway.describe", {"tool_id": "server::tool"})
-    if schema["risk_hint"] == "HIGH":
-        print("Warning: high-risk tool")
+    # Check safety hints before invoking
+    card = mcp.call_tool("gateway.describe", {"tool_id": "server::tool"})
+    if (card.get("annotations") or {}).get("destructiveHint"):
+        print("Warning: destructive tool", card.get("safety_notes"))
 
 "gateway::invoke":
   snippet: |
