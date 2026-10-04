@@ -5,6 +5,54 @@
 > the spike of this plan applied to it. The spike was then removed, and this PR
 > carries only this file. See Consiliency/pmcp#330.
 >
+> **Revision 3 (2026-10-04), rebased onto main `b2884db`.** Board round 2 on
+> PR 355 (rev 2, `afb64d4`) had no blocking finding. Grok and gemini filed
+> nothing, and codex was degraded. The claude seat said PARTIALLY AGREE: all
+> three round-1 findings were resolved, and it raised one new non-blocking
+> finding, which rev 3 takes as the coordinator directed.
+>
+> - **Round-2 F001.** The construction guard sees only a task model built
+>   **by its class name**. Three other forms build or patch one from a raw
+>   downstream reply, and the seat's mutants for them survived every task test:
+>   - Y1: `TypeAdapter(McpTaskInfo).validate_python(...)`;
+>   - Y2: a classmethod called through an instance, `record.model_validate(...)`;
+>   - Y4: `rec.__dict__.update(...)`.
+>
+>   All three sat in the one reply path no units test covered: a
+>   spec-conforming `tasks/result` with no task in it.
+> - **Not done: chasing more forms in the guard.** That pattern never ends.
+>   Rev 3 adds a **behavioural backstop** instead:
+>   `test_every_reply_path_reports_and_records_seconds`. It covers every reply
+>   path of every task operation (9 rows) against a spec-shaped downstream in
+>   ms that also echoes stray ms fields on replies that carry no task. It
+>   asserts that every task the gateway outputs and every record pmcp holds
+>   reports seconds. `test_the_reply_path_table_covers_every_task_operation`
+>   derives the operations from the code. The seat's falsifier is included as
+>   `test_a_result_reply_without_a_task_never_records_wire_durations`.
+> - **The guard's claim is narrowed** to "catches direct construction by
+>   class name; the per-path behavioural test is the backstop" (Design
+>   decision 11). Rev 2's "in any form" wording is withdrawn.
+> - **Y1, Y2 and Y4 are rows in the mutation table.** Each is killed by the
+>   per-path behavioural test, and by the falsifier: 24/24 killed.
+> - **Rebase.** Main moved to `b2884db` (Consiliency/pmcp#358, the 2.8.0 docs
+>   audit). Only `CHANGELOG.md` conflicted. Its #298 entry and "Known
+>   follow-up" now use linked issue references, and a new "Upgrade notes"
+>   section has a "Task numbers are bounded" line. The #330 entry is carried
+>   over in that style. That line now gives the seconds maximum, and a new
+>   upgrade note states the unit change for callers and tenant servers. The
+>   other 9 files applied unchanged. `client/manager.py` is unchanged on main,
+>   and the `handlers.py` task sites keep their line numbers, so the
+>   boundary-site table still holds. The derivation sweep's line numbers are
+>   from `2adcd9a`.
+> - **A rev 1 verification bug is fixed.** Step 3 used `git diff --exit-code`
+>   on the fixture, which always fails on a patched tree. It now compares the
+>   fixture's sha256 before and after regeneration.
+>
+> **Re-measured on fresh trees under `/var/tmp`, from `b2884db`:** the new
+> module (77 cases), red on main and green on the patch; the 8 touched modules;
+> 24 mutants, each restore sha-verified; the full suite, once. Rev 2 is
+> `afb64d4`.
+>
 > **Revision 2 (2026-10-04), on main `2adcd9a`.** Board round 1 on PR 355
 > (rev 1, `b98de7d`) had no blocking finding. Grok, codex and gemini found no
 > defect. The claude seat said PARTIALLY AGREE and raised three findings, all
@@ -26,9 +74,10 @@
 >   decision 11). Every construction in `src/pmcp` of a model that carries a
 >   task (`McpTaskInfo`, `McpTaskRecord`, and the 5 outputs that embed one,
 >   found transitively from `pmcp.types`) is listed with its exact task-data
->   arguments and the reason they are already in seconds, in any form:
->   `Model(...)`, `Model(**x)`, `Model.model_validate(x)`, `model_construct`. A
->   new or changed one fails. Attribute stores and `model_copy(update=…)` of a
+>   arguments and the reason they are already in seconds, in the forms
+>   `Model(...)`, `Model(**x)`, `Model.model_validate(x)` and
+>   `model_construct`. A new or changed one fails. (Rev 3 narrows this claim:
+>   these forms are by class name only.) Attribute stores and `model_copy(update=…)` of a
 >   duration are forbidden. Two provenance checks pin the two allowlisted
 >   spreads, and three behavioural tests bind the fallbacks. X1, X2 and two
 >   more (X9 `model_copy`, X10 the list fallback) are now in the mutation
@@ -346,8 +395,9 @@ duration wire key. Each converter has exactly one caller. Every `ttl=` or
 **Rev 2 narrows the rev 1 claim.** Those guards catch a reader or writer that
 *names* a duration. Rev 1 concluded that no new reader could bypass the
 conversion, and the board showed that a spread
-(`McpTaskInfo.model_validate({**reply, …})`) does. Design decision 11 closes
-that class.
+(`McpTaskInfo.model_validate({**reply, …})`) does. Design decision 11 adds a
+guard for construction by class name, and (rev 3) a per-path behavioural
+backstop for every other form.
 
 ### 2. Inbound values are `float` seconds; `McpTaskInfo.ttl` becomes `float | None`
 
@@ -505,7 +555,17 @@ precedence is stated in the CHANGELOG and the contract: `pollInterval` if it
 is usable after conversion, otherwise `poll_interval`. The snake_case alias is
 milliseconds too.
 
-### 11. Building a task model from downstream data is closed-world (rev 2, board F003)
+### 11. Building a task model from downstream data: a by-name guard plus a per-path behavioural backstop (rev 2, board F003; narrowed in rev 3)
+
+**What the guard does and does not catch (rev 3).** The guard catches a task
+model constructed directly **by class name**. Python has other ways to build
+or patch an object: `TypeAdapter(M)`, a classmethod reached through an
+instance, `__dict__`, `setattr` and `functools.partial`. Round 2's mutants Y1,
+Y2 and Y4 used three of these, and the guard did not see them. Rev 3 does not
+try to enumerate those forms. The backstop is **behavioural**, in rule 4
+below: every reply path of every task operation is driven with a spec-shaped
+downstream in ms, and every task pmcp outputs or records must report seconds.
+Any form of bypass on any path then shows up in the units.
 
 The rev 1 guards see a duration crossing that names a wire key or a
 `ttl=`/`poll_interval=` keyword. Anything that builds a model from a mapping
@@ -514,14 +574,15 @@ The rev 1 guards see a duration crossing that names a wire key or a
 degree of freedom with three rules:
 
 1. **Every construction is reviewed.**
-   `test_every_task_model_construction_is_a_reviewed_one` works in three
-   steps:
+   `test_every_task_model_construction_is_a_reviewed_one` (by class name
+   only, rev 3) works in three steps:
    - It finds the task-carrying models from `pmcp.types` itself:
      `McpTaskInfo`, its subclasses, and every model whose field annotations
      mention one, transitively. Today that is `McpTaskInfo`, `McpTaskRecord`,
      `InvokeOutput`, `TasksListOutput`, `TasksGetOutput`, `TasksResultOutput`
      and `TasksCancelOutput`.
-   - It then walks every call in `src/pmcp` to one of them, in any form.
+   - It then walks every call in `src/pmcp` that names one of them:
+     `M(...)` or `M.attr(...)`.
    - It records the call's task-data arguments as source: positional
      arguments, `**` spreads, and `task`/`tasks`/`ttl`/`poll_interval`/`raw`.
 
@@ -558,10 +619,44 @@ degree of freedom with three rules:
      and `gateway.tasks_get` returns `ok: false` with no task.
    - `test_a_listed_task_without_a_record_is_still_reported_in_seconds`.
 
+4. **The per-path behavioural backstop (rev 3).**
+   `test_every_reply_path_reports_and_records_seconds` drives each row of
+   `REPLY_PATHS` through the gateway tool for that operation, over a real
+   `ClientManager`. The downstream answers in MCP 2025-11-25's shapes, in ms
+   (`ttl: 300000`, `pollInterval: 2500`), and replies that carry no task also
+   carry those stray ms fields. The test asserts that every task the gateway
+   output contains, and every record in the registry afterwards, reports
+   exactly the row's expected `(ttl, poll_interval)` with no
+   `unusable_fields`. The rows:
+
+   | Operation | Gateway tool | Reply shape(s) | Expected |
+   |---|---|---|---|
+   | `call_tool` | `invoke` | `CreateTaskResult` `{task}` | (300.0, 2.5) |
+   | `get_task` | `tasks_get` | `GetTaskResult` (the Task at top level) | (300.0, 2.5) |
+   | `get_task` | `tasks_get` | `{task}` (also accepted) | (300.0, 2.5) |
+   | `list_tasks` | `tasks_list` | `ListTasksResult` `{tasks: [...]}` | (300.0, 2.5) |
+   | `get_task_result` | `tasks_result` | `{task, result}` | (300.0, 2.5) |
+   | `get_task_result` | `tasks_result` | **spec: a `CallToolResult` with no task** (+ stray ms), then `tasks/get` → `GetTaskResult` | (300.0, 2.5) |
+   | `cancel_task` | `tasks_cancel` | `CancelTaskResult` (the Task at top level) | (300.0, 2.5) |
+   | `cancel_task` | `tasks_cancel` | `{task}` | (300.0, 2.5) |
+   | `cancel_task` | `tasks_cancel` | no task (+ stray ms): the fallback | (None, None) |
+
+   `get_task`'s own no-task branch raises. It is bound by
+   `test_a_get_reply_without_a_task_reports_no_task`.
+   `test_the_reply_path_table_covers_every_task_operation` derives the
+   operations from the code: the set of `ClientManager` methods that call
+   `_task_info_from_payload` must equal the table's operations. A new
+   operation therefore fails until it gets a row.
+   `test_a_result_reply_without_a_task_never_records_wire_durations` is the
+   round-2 seat's falsifier.
+
 Mutants X1 (the cancel fallback spreads the reply), X2 (`get_task` falls back
 to spreading the reply), X9 (`get_task` patches the record with
 `model_copy(update=payload)`) and X10 (the `tasks_list` fallback merges `raw`)
-are all killed, each by the closed-world rule and by a behavioural test.
+are all killed, each by the by-name rule and by a behavioural test. Rev 3's
+Y1 (`TypeAdapter`), Y2 (a classmethod through an instance) and Y4
+(`__dict__.update`) are not seen by the by-name rule, and are killed by the
+per-path backstop and the falsifier.
 
 ## Changes
 
@@ -570,19 +665,19 @@ are all killed, each by the closed-world rule and by a behavioural test.
 | `src/pmcp/types.py` | Adds `MS_PER_SECOND` and `MAX_TASK_SECONDS`. `_usable_task_ttl` is renamed to `_usable_wire_task_ttl`. A new seconds-unit `_usable_task_ttl` is the model check. Adds `_WIRE_TASK_HINT_CHECKS`. Adds `_TASK_DURATIONS` and `_wire_duration_seconds` (the ms check, ÷ 1000, the seconds check). `task_hint_is_usable` judges a duration in seconds (rev 2). Adds `task_seconds_to_wire` and `task_duration_from_wire`. `McpTaskInfo.ttl` becomes `float \| None`. `TaskMetadataInput.ttl`/`poll_interval` get `le=MAX_TASK_SECONDS` and the new descriptions | +99 / −12 |
 | `src/pmcp/client/manager.py` | 2 imports; O1/O2 through `task_seconds_to_wire`; I1/I2 through `task_duration_from_wire` | +10 / −4 |
 | `tests/fixtures/gateway_tool_schemas.json` | regenerated: 2 maxima, 2 descriptions | +4 / −4 |
-| `tests/test_task_units.py` | **new**; 66 cases (rev 1: 54) | +830 |
+| `tests/test_task_units.py` | **new**; 77 cases (rev 1: 54, rev 2: 66) | +986 |
 | `tests/test_task_numeric_bounds.py` | migrated to the new unit: bounds rows, `USABLE` rows, the outbound shape, the alias rows | +15 / −11 |
 | `tests/test_client_manager.py` | 2 tests migrated: the fake downstream sends ms; the outbound assertion expects ms | +8 / −8 |
 | `tests/test_phase6_tenant_code_mode.py` | the fake tenant returns spec ms (`300000`, `100`) | +2 / −2 |
 | `README.md` | the units sentence in the tenant-runs paragraph | +7 / −1 |
 | `specs/tenant-code-mode-host-contract.md` | a "Units" paragraph in the task lifecycle section, covering the snake_case alias and its precedence; a "Changed in Consiliency/pmcp#330" warning to tenant servers; the "forwards them when supplied" sentence restated; the `ttl`/`poll_interval` bullets in the metadata section | +35 / −4 |
-| `CHANGELOG.md` | the #298 bounds restated ("at most 2^53−1 ms"); its "Known follow-up" replaced by a pointer; a new #330 entry under `[Unreleased]` → `### Changed`, with the caller warning, the tenant-server warning and the alias's unit and precedence | +53 / −8 |
+| `CHANGELOG.md` | rev 3, against `b2884db`'s format: the "Upgrade notes" line "Task numbers are bounded" gives the seconds maximum, and a new upgrade note states the unit change; the #298 bounds restated ("at most 2^53−1 ms"); its "Known follow-up" replaced by a pointer; a new #330 entry under `[Unreleased]` → `### Changed`, with the caller warning, the tenant-server warning and the alias's unit and precedence | +62 / −10 |
 
 `McpTaskInfo`'s output schema is not snapshotted (`grep -c "unusable_fields\|McpTaskInfo" tests/fixtures/*.json` → 0), so the `ttl` type change moves no fixture.
 
 ## Tests
 
-`tests/test_task_units.py` (new, 66 cases; rev 2 added 12). Every case maps to a derived site
+`tests/test_task_units.py` (new, 77 cases; rev 2 added 12, rev 3 added 11). Every case maps to a derived site
 or a decision:
 
 | Test | Covers | Cases |
@@ -607,13 +702,16 @@ or a decision:
 | `test_each_converter_has_exactly_one_caller` | **structural**: one call site per direction | 1 |
 | `test_the_alias_is_chosen_by_usability_in_seconds` (rev 2) | F002: a camelCase value that underflows or is 0 does not hide a usable snake_case one | 3 |
 | `test_the_camel_case_alias_wins_when_both_are_usable` (rev 2) | the stated precedence | 1 |
-| `test_every_task_model_construction_is_a_reviewed_one` (rev 2) | **structural, closed world**: F003 | 1 |
+| `test_every_task_model_construction_is_a_reviewed_one` (rev 2) | **structural**: F003, construction by class name (narrowed in rev 3) | 1 |
 | `test_no_task_duration_is_assigned_or_copied_around_validation` (rev 2) | **structural**: no attribute store or `model_copy(update=…)` | 1 |
 | `test_list_tasks_returns_only_record_dumps` (rev 2) | **structural**: provenance of `McpTaskInfo(**task)` in `tasks_list` | 1 |
 | `test_output_sanitising_revalidates_only_a_model_dump` (rev 2) | **structural**: provenance of `model_validate(task_data)` | 1 |
 | `test_the_cancel_fallback_never_reports_a_wire_duration_as_seconds` (rev 2) | I3, by behaviour (the seat's falsifier) | 1 |
 | `test_a_get_reply_without_a_task_reports_no_task` (rev 2) | the `get_task` fallback, by behaviour | 1 |
 | `test_a_listed_task_without_a_record_is_still_reported_in_seconds` (rev 2) | the `tasks_list` fallback, by behaviour | 1 |
+| `test_every_reply_path_reports_and_records_seconds` (rev 3) | **the behavioural backstop**: every reply path of every task operation; every output and record in seconds | 9 |
+| `test_the_reply_path_table_covers_every_task_operation` (rev 3) | **structural**: the table's operations equal the code's task-parsing methods | 1 |
+| `test_a_result_reply_without_a_task_never_records_wire_durations` (rev 3) | the round-2 seat's falsifier: spec `tasks/result` with no task | 1 |
 | `test_the_changelog_and_contract_state_the_units_for_tenant_servers` (rev 2) | F001: the CHANGELOG warns tenant servers and gives the alias's unit; the contract names the snake_case alias and drops the old wording | 1 |
 
 The migrations in the three existing modules are listed under *Changes* and
@@ -625,7 +723,7 @@ Run from a fresh worktree of `origin/main` on dev0 (a team host):
 
 ```bash
 git -C ~/code/pmcp fetch origin
-git -C ~/code/pmcp worktree add -b fix/330-task-units "$WORKTREE_ROOT/pmcp-330-fix" origin/main
+git -C ~/code/pmcp worktree add -b fix/330-task-units "$WORKTREE_ROOT/pmcp-330-fix" origin/main   # measured on b2884db
 cd "$WORKTREE_ROOT/pmcp-330-fix"
 uv sync --all-extras -p 3.10      # without --all-extras, `uv run` silently uses the system pytest
 mkdir -p /var/tmp/pmcp-330-bt-$USER     # keep basetemps and logs off /mnt/workspace
@@ -635,42 +733,45 @@ BT=/var/tmp/pmcp-330-bt-$USER
 Apply *Verbatim bodies* (one `git apply`). Then:
 
 ```bash
-# 1. the new module (rev 2 spike: 66 passed)
+# 1. the new module (rev 3: 77 passed)
 uv run pytest tests/test_task_units.py --cov-fail-under=0 -p no:cacheprovider --basetemp=$BT/u -q
-# 2. the suites the change touches (rev 2 spike: 1084 passed, 0 failed)
+# 2. the suites the change touches (rev 3: 1095 passed, 0 failed)
 env -u npm_config_cache -u npm_config_store_dir uv run pytest tests/test_task_units.py \
   tests/test_task_numeric_bounds.py tests/test_gateway_tool_schemas.py tests/test_tools.py \
   tests/test_client_manager.py tests/test_phase6_tenant_code_mode.py tests/test_server.py \
   tests/test_phase4_e2e.py --cov-fail-under=0 -p no:cacheprovider --basetemp=$BT/t -q
-# 3. the snapshot: regenerating it must leave the patched fixture unchanged
+# 3. the snapshot: regenerating it must leave the patched fixture byte-identical
+before=$(sha256sum tests/fixtures/gateway_tool_schemas.json)
 PMCP_UPDATE_SCHEMA_SNAPSHOT=1 uv run pytest tests/test_gateway_tool_schemas.py::test_advertised_schemas_match_snapshot \
-  --cov-fail-under=0 -p no:cacheprovider --basetemp=$BT/s -q && git diff --exit-code tests/fixtures/gateway_tool_schemas.json
+  --cov-fail-under=0 -p no:cacheprovider --basetemp=$BT/s -q
+[ "$before" = "$(sha256sum tests/fixtures/gateway_tool_schemas.json)" ] && echo SNAPSHOT-STABLE
 # 4. CI gates the list above would otherwise miss
 uv run ruff check src tests && uv run ruff format --check src tests
 uv run mypy src/pmcp/types.py src/pmcp/client/manager.py
 python3 scripts/check_security_claims.py          # expect OK
 # 5. the repro (expect ttl=300000 and ok=False only at t=300.000)
 uv run python repro_330.py
-# 6. the mutation table (expect 21 KILLED; each restore is sha256-verified by the script)
+# 6. the mutation table (expect 24 KILLED; each restore is sha256-verified by the script)
 uv run python mutants330.py
 # 7. the full suite: once, detached, with a notifying waiter (memory on dev0 is shared)
 env -u npm_config_cache -u npm_config_store_dir nohup uv run pytest -q -p no:cacheprovider --basetemp=$BT/full \
   > $BT/full.log 2>&1 &
 ```
 
-Step 3 uses `git diff --exit-code` rather than reading a diffstat. The
-fixture is already patched, so a regeneration that changes it means the
-schema and the snapshot disagree.
+Step 3 compares the fixture's sha256 before and after regeneration. The
+fixture is already patched, so any change means the schema and the snapshot
+disagree. Rev 1 and rev 2 used `git diff --exit-code` here, which fails on any
+patched tree. Their measurements compared against the patch directly, so
+their results stand.
 
 ## Red on main
 
-Rev 2 was measured on a fresh detached worktree of main `2adcd9a` under
-`/var/tmp`. The rev 2 test modules were copied in. `MAX_TASK_SECONDS` does not
+Rev 3 was measured on a fresh detached worktree of main `b2884db` under
+`/var/tmp`. The rev 3 test modules were copied in. `MAX_TASK_SECONDS` does not
 exist on main, so the import was shimmed: the import line was dropped and
 `MAX_TASK_SECONDS = (2**53 - 1) // 1000` was defined in the module. Main's own
-`CHANGELOG.md` and contract were used; they were restored with `git show
-HEAD:…`, and each restore was verified against its blob hash. Result:
-**30 failed, 36 passed**.
+`CHANGELOG.md` and contract were used; they were never overwritten in rev 3's
+tree. Result: **39 failed, 38 passed**.
 
 | Test | Failed | Cause on main |
 |---|---|---|
@@ -688,6 +789,8 @@ HEAD:…`, and each restore was verified against its blob hash. Result:
 | `test_every_task_model_construction_is_a_reviewed_one` | 1 | main's parser passes `ttl=payload.get('ttl')`, not the converter |
 | `test_the_outbound_choke_point_converts…`, `test_the_inbound_choke_point_converts…`, `test_each_converter_has_exactly_one_caller` | 1 each | no converter exists |
 | `test_the_changelog_and_contract_state_the_units_for_tenant_servers` | 1 | main's CHANGELOG has no #330 entry |
+| `test_every_reply_path_reports_and_records_seconds` (rev 3) | 8 of 9 | every path with a task reports `ttl` 300000 / `poll_interval` 2500.0 |
+| `test_a_result_reply_without_a_task_never_records_wire_durations` (rev 3) | 1 | the `tasks/get` refresh records ms |
 
 These pass on main, by design:
 - the two round-trip properties. Main's pass-through is the identity in both
@@ -698,7 +801,11 @@ These pass on main, by design:
   name-sites, no attribute stores, and the same list/sanitize provenance.
   M12–M14 and X1, X2, X9 and X10 prove that each can fail;
 - the cancel- and get-fallback behaviours, which hold on main. That is the
-  point: they bind the fallbacks against regressions (X1, X2).
+  point: they bind the fallbacks against regressions (X1, X2). The same goes
+  for the backstop's `cancel_task` no-task row (None, None), which passes on
+  main;
+- `test_the_reply_path_table_covers_every_task_operation`: main has the same
+  five task-parsing methods.
 
 The migrated existing modules (`test_task_numeric_bounds.py`,
 `test_client_manager.py`, `test_phase6_tenant_code_mode.py`, unchanged from
@@ -713,53 +820,56 @@ failures break down as:
 
 ## Mutation table
 
-All 21 mutants were measured on the rev 2 spike with `mutants330.py`, and
-again on the embedding-proof tree with the same counts. Each run applies one
-string replacement, runs `tests/test_task_units.py` (66 cases), restores the
-file from its saved bytes, and **asserts that the file's sha256 equals the
-original's**. **All 21 are killed.** Afterwards the tree's `git diff` sha256
-was unchanged (`19c25e58…`).
+All 24 mutants were measured on the rev 3 spike (`b2884db` + this patch) with
+`mutants330.py`, and again on the embedding-proof tree with the same counts.
+Each run applies one string replacement, runs `tests/test_task_units.py`
+(77 cases), restores the file from its saved bytes, and **asserts that the
+file's sha256 equals the original's**. **All 24 are killed.** Afterwards the
+tree's `git diff` sha256 was unchanged (`6d2347d2…`).
 
-Rev 2 adds:
-- M17 (F002);
-- the seat's X1 and X2 (F003), which survived rev 1;
-- X9 and X10, the two other spread/patch forms of the F003 class.
+The additions by revision:
+- rev 2: M17 (F002), the round-1 seat's X1 and X2 (F003), and X9 and X10;
+- rev 3: the round-2 seat's Y1, Y2 and Y4. The by-name guard does not see
+  them, and the per-path backstop and the falsifier kill each one.
 
-M5's anchor moved to the rev 2 helper. Every other rev 1 mutant is unchanged,
-and some now fail more tests because the rev 2 tests also see them.
+Counts grew from rev 2 because the backstop sees more mutants.
 
 | # | Rule | Mutant | Failed (measured) |
 |---|---|---|---|
 | M1 | outbound ttl unconverted | `payload["ttl"] = parsed.ttl` | 8: a_listed_task_without_a_record_is_still_reported_in_seconds, a_ttl_of_300_lasts_300_seconds_on_a_spec_downstream, every_inbound_path_reports_seconds, outbound_ttl_and_poll_interval_are_sent_in_milliseconds, the_largest_accepted_value_does_not_overflow_on_the_wire, the_outbound_choke_point_converts_every_duration_it_writes, ttl_round_trips_exactly |
 | M2 | outbound pollInterval unconverted | `payload["pollInterval"] = parsed.poll_interval` | 4: outbound_ttl_and_poll_interval_are_sent_in_milliseconds, poll_interval_round_trips_to_within_rounding, the_largest_accepted_value_does_not_overflow_on_the_wire, the_outbound_choke_point_converts_every_duration_it_writes |
-| M3 | inbound ttl unconverted | `ttl=payload.get("ttl")` | 12: a_listed_task_without_a_record_is_still_reported_in_seconds, a_usable_downstream_duration_is_reported_in_seconds, an_unusable_downstream_duration_is_named_not_converted, every_inbound_path_reports_seconds, every_task_model_construction_is_a_reviewed_one, seconds_survive_every_revalidation_unchanged, the_inbound_choke_point_converts_every_duration_it_reads, ttl_round_trips_exactly |
-| M4 | inbound pollInterval unconverted | `poll_interval=poll_interval` | 15: a_listed_task_without_a_record_is_still_reported_in_seconds, a_usable_downstream_duration_is_reported_in_seconds, an_unusable_downstream_duration_is_named_not_converted, every_inbound_path_reports_seconds, every_task_model_construction_is_a_reviewed_one, poll_interval_round_trips_to_within_rounding, seconds_survive_every_revalidation_unchanged, the_alias_is_chosen_by_usability_in_seconds, the_camel_case_alias_wins_when_both_are_usable, the_inbound_choke_point_converts_every_duration_it_reads |
-| M5 | inbound floor division (int seconds) | `(usable / MS_PER_SECOND)` → `(usable // MS_PER_SECOND)` | 13: a_listed_task_without_a_record_is_still_reported_in_seconds, a_usable_downstream_duration_is_reported_in_seconds, every_inbound_path_reports_seconds, poll_interval_round_trips_to_within_rounding, seconds_survive_every_revalidation_unchanged, the_alias_is_chosen_by_usability_in_seconds, the_camel_case_alias_wins_when_both_are_usable |
+| M3 | inbound ttl unconverted | `ttl=payload.get("ttl")` | 21: a_listed_task_without_a_record_is_still_reported_in_seconds, a_result_reply_without_a_task_never_records_wire_durations, a_usable_downstream_duration_is_reported_in_seconds, an_unusable_downstream_duration_is_named_not_converted, every_inbound_path_reports_seconds, every_reply_path_reports_and_records_seconds, every_task_model_construction_is_a_reviewed_one, seconds_survive_every_revalidation_unchanged, the_inbound_choke_point_converts_every_duration_it_reads, ttl_round_trips_exactly |
+| M4 | inbound pollInterval unconverted | `poll_interval=poll_interval` | 24: a_listed_task_without_a_record_is_still_reported_in_seconds, a_result_reply_without_a_task_never_records_wire_durations, a_usable_downstream_duration_is_reported_in_seconds, an_unusable_downstream_duration_is_named_not_converted, every_inbound_path_reports_seconds, every_reply_path_reports_and_records_seconds, every_task_model_construction_is_a_reviewed_one, poll_interval_round_trips_to_within_rounding, seconds_survive_every_revalidation_unchanged, the_alias_is_chosen_by_usability_in_seconds, the_camel_case_alias_wins_when_both_are_usable, the_inbound_choke_point_converts_every_duration_it_reads |
+| M5 | inbound floor division (int seconds) | `(usable / MS_PER_SECOND)` → `(usable // MS_PER_SECOND)` | 22: a_listed_task_without_a_record_is_still_reported_in_seconds, a_result_reply_without_a_task_never_records_wire_durations, a_usable_downstream_duration_is_reported_in_seconds, every_inbound_path_reports_seconds, every_reply_path_reports_and_records_seconds, poll_interval_round_trips_to_within_rounding, seconds_survive_every_revalidation_unchanged, the_alias_is_chosen_by_usability_in_seconds, the_camel_case_alias_wins_when_both_are_usable |
 | M6 | caller bound not restated (ms-sized) | `MAX_TASK_SECONDS = MAX_FORWARDED_TASK_NUMBER` | 3: caller_bounds_are_in_seconds, the_largest_accepted_value_does_not_overflow_on_the_wire |
 | M7 | model checks ttl in ms (integer rule) | model table `"ttl": _usable_wire_task_ttl` | 4: a_usable_downstream_duration_is_reported_in_seconds, seconds_survive_every_revalidation_unchanged, the_model_checks_seconds |
 | M8 | wire ttl checked in seconds (fractional ms ok) | wire table `"ttl": _usable_task_ttl` | 2: a_usable_downstream_duration_is_reported_in_seconds, an_unusable_downstream_duration_is_named_not_converted |
 | M9 | sent null ttl made unusable | converter `None` → `_UNUSABLE` | 25: a_null_or_absent_ttl_stays_unlimited, a_usable_downstream_duration_is_reported_in_seconds, an_unusable_downstream_duration_is_named_not_converted, poll_interval_round_trips_to_within_rounding, the_alias_is_chosen_by_usability_in_seconds, ttl_round_trips_exactly |
 | M10 | model ttl upper bound dropped | drop `<= _INT64_MAX / MS_PER_SECOND` | 1: the_model_checks_seconds |
 | M11 | model ttl lower bound dropped | drop `0 <=` | 1: the_model_checks_seconds |
-| M12 | inbound converted twice (record re-converts) | `_record_task` passes `ttl` through `task_duration_from_wire` again | 8: a_listed_task_without_a_record_is_still_reported_in_seconds, each_converter_has_exactly_one_caller, every_inbound_path_reports_seconds, every_other_duration_assignment_copies_seconds_from_a_model, every_task_model_construction_is_a_reviewed_one, only_the_two_choke_points_name_a_task_duration_wire_key, seconds_survive_every_revalidation_unchanged |
-| M13 | new bypassing inbound site (cancel fallback reads raw ttl) | `cancel_task` fallback adds `ttl=result.get("ttl")` | 4: every_other_duration_assignment_copies_seconds_from_a_model, every_task_model_construction_is_a_reviewed_one, only_the_two_choke_points_name_a_task_duration_wire_key, the_cancel_fallback_never_reports_a_wire_duration_as_seconds |
+| M12 | inbound converted twice (record re-converts) | `_record_task` passes `ttl` through `task_duration_from_wire` again | 17: a_listed_task_without_a_record_is_still_reported_in_seconds, a_result_reply_without_a_task_never_records_wire_durations, each_converter_has_exactly_one_caller, every_inbound_path_reports_seconds, every_other_duration_assignment_copies_seconds_from_a_model, every_reply_path_reports_and_records_seconds, every_task_model_construction_is_a_reviewed_one, only_the_two_choke_points_name_a_task_duration_wire_key, seconds_survive_every_revalidation_unchanged |
+| M13 | new bypassing inbound site (cancel fallback reads raw ttl) | `cancel_task` fallback adds `ttl=result.get("ttl")` | 5: every_other_duration_assignment_copies_seconds_from_a_model, every_reply_path_reports_and_records_seconds, every_task_model_construction_is_a_reviewed_one, only_the_two_choke_points_name_a_task_duration_wire_key, the_cancel_fallback_never_reports_a_wire_duration_as_seconds |
 | M14 | new bypassing outbound site (requestor params carry ttl) | `_task_request_params` adds `"ttl": 300` to `params.task` | 1: only_the_two_choke_points_name_a_task_duration_wire_key |
-| M15 | conversion factor wrong | `MS_PER_SECOND = 1024` | 19: a_listed_task_without_a_record_is_still_reported_in_seconds, a_ttl_of_300_lasts_300_seconds_on_a_spec_downstream, a_usable_downstream_duration_is_reported_in_seconds, every_inbound_path_reports_seconds, outbound_ttl_and_poll_interval_are_sent_in_milliseconds, seconds_survive_every_revalidation_unchanged, the_alias_is_chosen_by_usability_in_seconds, the_camel_case_alias_wins_when_both_are_usable, the_largest_accepted_value_does_not_overflow_on_the_wire, the_model_checks_seconds |
+| M15 | conversion factor wrong | `MS_PER_SECOND = 1024` | 28: a_listed_task_without_a_record_is_still_reported_in_seconds, a_result_reply_without_a_task_never_records_wire_durations, a_ttl_of_300_lasts_300_seconds_on_a_spec_downstream, a_usable_downstream_duration_is_reported_in_seconds, every_inbound_path_reports_seconds, every_reply_path_reports_and_records_seconds, outbound_ttl_and_poll_interval_are_sent_in_milliseconds, seconds_survive_every_revalidation_unchanged, the_alias_is_chosen_by_usability_in_seconds, the_camel_case_alias_wins_when_both_are_usable, the_largest_accepted_value_does_not_overflow_on_the_wire, the_model_checks_seconds |
 | M16 | outbound converter rounds poll to int ms | `int(seconds * MS_PER_SECOND)` | 2: poll_interval_round_trips_to_within_rounding, the_largest_accepted_value_does_not_overflow_on_the_wire |
-| M17 | alias judged in ms, before conversion (F002) | `task_hint_is_usable`: `if name in _TASK_DURATIONS:` → `if False:` (judge the alias in ms) | 2: the_alias_is_chosen_by_usability_in_seconds |
-| X1 | cancel fallback spreads the downstream reply (F003) | cancel fallback → `McpTaskInfo.model_validate({**result, "task_id": …, "status": "cancelled", "raw": result})` | 2: every_task_model_construction_is_a_reviewed_one, the_cancel_fallback_never_reports_a_wire_duration_as_seconds |
-| X2 | get_task falls back to spreading the reply (F003) | `get_task`: parser returned None → `McpTaskInfo.model_validate({**payload, "task_id": task_id})` instead of `KeyError` | 2: a_get_reply_without_a_task_reports_no_task, every_task_model_construction_is_a_reviewed_one |
-| X9 | get_task patches the record from the reply, unvalidated (F003) | `get_task` returns `self._record_task(...).model_copy(update=payload)` | 3: every_inbound_path_reports_seconds, no_task_duration_is_assigned_or_copied_around_validation |
-| X10 | tasks_list fallback built from the wire payload in raw (F003) | `tasks_list`: `McpTaskInfo(**task)` → `McpTaskInfo(**{**task, **task["raw"]})` | 2: a_listed_task_without_a_record_is_still_reported_in_seconds, every_task_model_construction_is_a_reviewed_one |
+| M17 | alias judged in ms, before conversion (F002) | `task_hint_is_usable`: `if name in _TASK_DURATIONS:` → `if False:` | 2: the_alias_is_chosen_by_usability_in_seconds |
+| X1 | cancel fallback spreads the downstream reply (F003) | cancel fallback → `McpTaskInfo.model_validate({**result, …})` | 3: every_reply_path_reports_and_records_seconds, every_task_model_construction_is_a_reviewed_one, the_cancel_fallback_never_reports_a_wire_duration_as_seconds |
+| X2 | get_task falls back to spreading the reply (F003) | `get_task`: no task → `McpTaskInfo.model_validate({**payload, "task_id": task_id})` | 2: a_get_reply_without_a_task_reports_no_task, every_task_model_construction_is_a_reviewed_one |
+| X9 | get_task patches the record from the reply, unvalidated (F003) | `get_task` returns `….model_copy(update=payload)` | 5: every_inbound_path_reports_seconds, every_reply_path_reports_and_records_seconds, no_task_duration_is_assigned_or_copied_around_validation |
+| X10 | tasks_list fallback built from the wire payload in raw (F003) | `tasks_list`: `McpTaskInfo(**{**task, **task["raw"]})` | 2: a_listed_task_without_a_record_is_still_reported_in_seconds, every_task_model_construction_is_a_reviewed_one |
+| Y1 | tasks/result no-task branch: TypeAdapter spreads the reply (round 2) | `get_task_result` no-task branch records `TypeAdapter(McpTaskInfo).validate_python({**result, "task_id": task_id})` instead of `get_task` | 2: a_result_reply_without_a_task_never_records_wire_durations, every_reply_path_reports_and_records_seconds |
+| Y2 | tasks/result no-task branch: classmethod through an instance (round 2) | same branch records `record.model_validate({**record.model_dump(), **result})` | 2: a_result_reply_without_a_task_never_records_wire_durations, every_reply_path_reports_and_records_seconds |
+| Y4 | tasks/result no-task branch: __dict__.update from the reply (round 2) | same branch: `rec = await self.get_task(...)`, then `rec.__dict__.update({k: v for k, v in result.items() if k in type(rec).model_fields})` | 2: a_result_reply_without_a_task_never_records_wire_durations, every_reply_path_reports_and_records_seconds |
 
-The board's X3 and X6 survive as equivalent mutants, and stay out of the
-table:
-- X3 (the alias picker uses the seconds-side table) is now the intended
-  behaviour.
+The round-2 seat's Y3 (the `__dict__.update` placed in `get_task`) was
+already killed by rev 2's inbound-path tests, so it is not repeated here.
+
+The round-1 seat's X3 and X6 survive as equivalent mutants, and stay out of
+the table:
+- X3 (the alias picker uses the seconds-side table) is the intended behaviour
+  since rev 2.
 - X6 (`isinstance` in the model check) is equivalent because only converter
   floats or copied attributes reach the model.
-
-The board's X4, X5, X7 and X8 were killed by rev 1's tests.
 
 ```python
 """Apply one string replacement, run tests/test_task_units.py, restore from an
@@ -814,6 +924,15 @@ M = [
   "        return self._record_task(server_name, task_info).model_copy(update=payload)\n\n    async def get_task_result("),
  ("X10","tasks_list fallback built from the wire payload in raw (F003)","src/pmcp/tools/handlers.py",
   "McpTaskInfo(**task)","McpTaskInfo(**{**task, **task[\"raw\"]})"),
+ ("Y1","tasks/result no-task branch: TypeAdapter spreads the reply (round 2)","src/pmcp/client/manager.py",
+  "        else:\n            await self.get_task(\n                server_name,\n                task_id,\n                requestor_context=requestor_context\n                or (record.requestor_context if record is not None else None),\n            )\n        return result",
+  "        else:\n            self._record_task(server_name, __import__(\"pydantic\").TypeAdapter(McpTaskInfo).validate_python({**result, \"task_id\": task_id}))\n        return result"),
+ ("Y2","tasks/result no-task branch: classmethod through an instance (round 2)","src/pmcp/client/manager.py",
+  "        else:\n            await self.get_task(\n                server_name,\n                task_id,\n                requestor_context=requestor_context\n                or (record.requestor_context if record is not None else None),\n            )\n        return result",
+  "        else:\n            self._record_task(server_name, record.model_validate({**record.model_dump(), **result}))\n        return result"),
+ ("Y4","tasks/result no-task branch: __dict__.update from the reply (round 2)","src/pmcp/client/manager.py",
+  "        else:\n            await self.get_task(\n                server_name,\n                task_id,\n                requestor_context=requestor_context\n                or (record.requestor_context if record is not None else None),\n            )\n        return result",
+  "        else:\n            rec = await self.get_task(server_name, task_id)\n            rec.__dict__.update({k: v for k, v in result.items() if k in type(rec).model_fields})\n        return result"),
 ]
 only = set(sys.argv[1:])
 results = []
@@ -839,37 +958,36 @@ for mid, rule, path, old, new in M:
 
 ## Embedding proof
 
-Rev 2 was measured on 2026-10-04, on a **fresh** detached worktree of
-`origin/main` at `2adcd9a`, at `/var/tmp/pmcp-330-r2-proof`. It is separate
-from the spike (`/var/tmp/pmcp-330-r2-spike`) and from the red-on-main tree.
+Rev 3 was measured on 2026-10-04, on a **fresh** detached worktree of
+`origin/main` at `b2884db`, at `/var/tmp/pmcp-330-r3-proof`. It is separate
+from the spike (`/var/tmp/pmcp-330-r3-new`) and from the red-on-main tree.
 Basetemps and logs went to `/var/tmp`.
 
 1. **Extraction.** The patch was taken out of this file with
    `awk '/^````diff$/{f=1;next} /^````$/{f=0} f' plan.md`. Its sha256 is
-   `19c25e58f379ca9eb3a424b4c4345738e7b3337d44151b404d2a4e8c83ae581a`, the
-   same as the spike's `git diff`, with `tests/test_task_units.py` added
-   through `git add -N`.
-2. **Apply.** `git apply --check`, then `git apply`, both clean. The patch
-   modified 9 files and created 1. After applying, the tree's `git diff`
-   sha256 equals the patch's.
-3. **The new module:** **66 passed**.
-4. **The 8 touched modules:** **1084 passed**, 0 failed.
-5. **Snapshot regeneration** left the tree's diff sha256 unchanged
-   (`19c25e58…`).
-6. **CI gates:** `ruff check` and `ruff format --check` passed (176 files),
+   `6d2347d28f9939ea847dd85f48b81a269b560212d2e41854bb7ffa12cb3182ca`, the same as the spike's `git diff`, with
+   `tests/test_task_units.py` added through `git add -N`.
+2. **Apply.** `git apply --check`, then `git apply`, both clean on
+   `b2884db`. The patch modified 9 files and created 1. After applying, the
+   tree's `git diff` sha256 equals the patch's.
+3. **The new module:** **77 passed**.
+4. **The 8 touched modules:** **1095 passed**, 0 failed.
+5. **Snapshot regeneration:** the fixture's sha256 was unchanged (`SNAPSHOT-STABLE`).
+6. **CI gates:** `ruff check` and `ruff format --check` passed (178 files),
    `mypy` passed on both source files, and `check_security_claims.py` printed
-   `OK`.
+   `OK` (131 cited node ids on `b2884db`).
 7. **`repro_330.py`:** `ttl=300000` was sent, and `tasks_get` was ok until
    t = 299.999 s and failed at 300.000 s.
-8. **`mutants330.py`:** **21/21 KILLED**, with the same per-mutant counts as
-   on the spike. Each restore was sha-verified inside the script, and the
-   tree's diff sha256 was unchanged afterwards.
+8. **`mutants330.py`:** **24/24 KILLED**, with the same per-mutant counts as on the
+   spike. Each restore was sha-verified inside the script, and the tree's
+   diff sha256 was unchanged afterwards.
 9. **The full suite:**
    `env -u npm_config_cache -u npm_config_store_dir uv run pytest -q -p no:cacheprovider --basetemp=/var/tmp/…`
-   gave **8350 passed, 3 skipped, 80 deselected, 0 failed**, in 555 s.
-   Rev 1 had 8338 passed; the 12 new rev 2 cases account for the difference.
-10. **Red on main** is in its own section above: 30 of the new module's 66
-    cases fail on main, and 13 of the migrated cases fail.
+   gave **8655 passed, 3 skipped, 80 deselected, 0 failed**, in 565 s.
+   The count is higher than rev 2's 8350 because `b2884db` adds the
+   docs-audit tests and rev 3 adds 11 cases.
+10. **Red on main** is in its own section above: 39 of the new module's 77
+    cases fail on `b2884db`, and 13 of the migrated cases fail.
 
 The spike, proof and main trees were then removed, so this branch carries only
 this plan file.
@@ -904,14 +1022,22 @@ this plan file.
   copies seconds from a model. Proven by the five structural tests.
 - [ ] (rev 2) When both poll aliases are sent, the choice is made in seconds.
   Proven by `test_the_alias_is_chosen_by_usability_in_seconds`.
-- [ ] (rev 2) Every construction of a task-carrying model in `src/pmcp` is in
-  `TASK_MODEL_CONSTRUCTIONS` with its exact task-data arguments. No attribute
+- [ ] (rev 2) Every construction of a task-carrying model by class name in
+  `src/pmcp` is in `TASK_MODEL_CONSTRUCTIONS` with its exact task-data
+  arguments. No attribute
   store or `model_copy(update=…)` touches a duration. Proven by the closed-world
   and provenance tests, and by the fallback behaviour tests.
 - [ ] (rev 2) The CHANGELOG and the contract warn tenant servers built to the
   seconds contract, and give the snake_case alias's unit. Proven by
   `test_the_changelog_and_contract_state_the_units_for_tenant_servers`.
-- [ ] All 21 mutants are killed by `tests/test_task_units.py`.
+- [ ] (rev 3) Every reply path of every task operation reports and records
+  seconds against a spec-shaped downstream in ms, and the path table covers
+  every `ClientManager` task operation. Proven by
+  `test_every_reply_path_reports_and_records_seconds`,
+  `test_the_reply_path_table_covers_every_task_operation` and the seat's
+  falsifier.
+- [ ] All 24 mutants are killed by `tests/test_task_units.py`. Y1, Y2 and Y4
+  are each killed by the per-path backstop.
 - [ ] README, the tenant contract and the CHANGELOG say: seconds in pmcp, ms
   on the wire, the conversion in both directions, `raw` verbatim, the new
   maximum, the 1000× warning for callers who sent ms, and (rev 2) the warning
@@ -961,7 +1087,8 @@ this plan file.
 ### How to apply
 
 1. Save the patch below (between the ```` fences) as `330.patch`.
-2. Run `git apply 330.patch` on `2adcd9a`. It changes 9 files and creates
+2. Run `git apply 330.patch` on `b2884db` (rev 3; rev 1 and rev 2 targeted
+   `2adcd9a`). It changes 9 files and creates
    `tests/test_task_units.py`, including the regenerated snapshot fixture and
    the README, contract and CHANGELOG edits.
 3. Save `repro_330.py` and `mutants330.py` from above at the worktree root.
@@ -971,21 +1098,43 @@ this plan file.
 
 ````diff
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 1eb3866..b8ea017 100644
+index 200e082..78016b3 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -634,12 +634,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
- ### Changed
+@@ -57,12 +57,19 @@ Each is described in full in the section named at the end of the line.
+   coercion (`1` for a boolean, `"5"` for an integer) on `invoke.task` is refused, and
+   an explicit `null` for an optional argument is now accepted. Policy is judged before
+   the schema, and gate rejections are recorded as `audit.rejection` events. *Changed*
+-- **Task numbers are bounded.** `invoke.task.ttl` must be an integer from 1 to 2^53−1,
+-  and `invoke.task.poll_interval` a finite number above 0 and at most 2^53−1. `NaN` and
++- **Task numbers are bounded.** `invoke.task.ttl` must be an integer from 1 to
++  9,007,199,254,740 (seconds), and `invoke.task.poll_interval` a finite number above 0
++  and at most 9,007,199,254,740. `NaN` and
+   `±Infinity` are refused for every numeric argument, and a request carrying a value
+   that is not strict JSON fails with `outbound frame is not strict JSON`. A downstream
+   task field pmcp cannot use is reported as `null` and named in `unusable_fields`.
+   *Changed*
++- **Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire.**
++  pmcp now converts both ways, as MCP 2025-11-25 requires. If you sent milliseconds
++  to work around the old pass-through, your values are now 1000× too long. A tenant
++  server built to the old seconds contract now receives milliseconds and must return
++  `ttl`/`pollInterval`/`poll_interval` in milliseconds. A task's `ttl` is now a
++  fractional number of seconds. *Changed*
+ - **Redaction removes more.** `sanitize_auth_diagnostic`, `PolicyManager.redact_secrets`
+   and `process_output` now also replace vendor token shapes, JWTs, PEM private keys,
+   high-entropy runs, URL userinfo and secret query values with `[REDACTED]`. Existing
+@@ -707,12 +714,14 @@ Each is described in full in the section named at the end of the line.
+ - **`tools/call` input-schema rejections are now recorded in the scoped-advisor audit, without argument values ([Consiliency/pmcp#296](https://github.com/Consiliency/pmcp/issues/296)).** A call the transport gate rejects used to return `Input validation error: …` before the audit was reached, so an operator saw no attempt at all. It is now written as a new `audit.rejection` event (not an `audit.invocation`: nothing was invoked, and a reader that correlates invocations to a run skips it) with the tool name (for the scoped-advisor tools; any other tool is recorded with `gateway_tool: null` and a `gateway_tool_digest`), `terminal_status: "invalid_arguments"`, `rejected_argument_path`, the failing location as a JSON array (a key the schema declares, an array index, or `null` for a key the caller chose, since that key can itself be a secret), and `rejected_argument_validator`, the failing JSON Schema keyword (`type`, `pattern`, `required`, …). The record never contains the validation message, the rejected value, correlation IDs, or any digest of the arguments. The capability stays `scoped_advisor_audit.v1`; readers that dispatch on `event` are unaffected. Policy is now judged **before** the schema: a call to a policy-blocked gateway tool is refused with "Gateway tool blocked by policy" and recorded `denied` whatever its arguments, instead of getting an `Input validation error` that described the blocked tool's schema. If the audit sink has failed, a malformed call now gets "Scoped advisor audit channel failed" like every other call, instead of its validation error. The response to a rejected call from an allowed tool is unchanged. An `audit.invocation` record now reads nothing the schema gate did not vouch for: a call refused by policy, or made to an unregistered name, is recorded `denied` with every argument-derived field (`run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`, `evidence_label_digest`, `source_reference_hash`) `null`, a result digest that no longer covers the caller's tool name, and a `gateway_tool_digest` of the registered name (for an unregistered name, of nothing) — previously a correlation-shaped value or a public URL anywhere in such a call's arguments was copied or hashed into the audit. Every other invocation record reads only the top-level arguments the tool's schema declares, so a correlation-shaped key a tool does not declare (e.g. `run_correlation_id` on `gateway.describe`) is no longer recorded; `gateway.invoke` declares every field the record reads, so its records are unchanged.
  - **`gateway.invoke`'s `task.ttl` and `task.poll_interval` are bounded, and
-   NaN/Infinity are refused at the gate (see Consiliency/pmcp#298).**
+   NaN/Infinity are refused at the gate (see [Consiliency/pmcp#298](https://github.com/Consiliency/pmcp/issues/298)).**
 -  - `task.ttl` must be an integer from 1 to 2^53−1. Zero and negative values,
 -    which were forwarded downstream unchanged, are now rejected with
 -    `Input validation error: …`, and so is any value above 2^53−1.
 +  - `task.ttl` must be an integer from 1 to 9,007,199,254,740 seconds, so that
-+    it is at most 2^53−1 ms once Consiliency/pmcp#330 converts it (next
-+    entry). Zero and negative values, which were forwarded downstream unchanged, are now
-+    rejected with `Input validation error: …`, and so is any value above the
-+    maximum.
++    it is at most 2^53−1 ms once [Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330) converts it (next
++    entry). Zero and negative values, which were forwarded downstream unchanged,
++    are now rejected with `Input validation error: …`, and so is any value above
++    the maximum.
    - `task.poll_interval` must be a finite number greater than 0 and at most
 -    2^53−1. Zero, negative values, `NaN`, `Infinity` and `-Infinity` are now
 -    rejected; they were previously accepted and forwarded.
@@ -993,19 +1142,19 @@ index 1eb3866..b8ea017 100644
 +    are now rejected; they were previously accepted and forwarded.
    - The transport gate now treats `NaN` and `±Infinity` as non-numbers for
      every numeric argument. Both transports can deliver them, even though they
-     are not JSON. Until Consiliency/pmcp#297 lands, a rejection message may
-@@ -689,9 +691,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+     are not JSON. Until [Consiliency/pmcp#297](https://github.com/Consiliency/pmcp/issues/297) lands, a rejection message may
+@@ -764,9 +773,52 @@ Each is described in full in the section named at the end of the line.
      originates) that contains one is dropped and logged, never written. Before,
      stdio servers received a non-JSON `NaN` literal, and HTTP/SSE servers
      silently received `null`.
 -  - **Known follow-up:** pmcp documents `ttl` and `poll_interval` in seconds,
 -    but MCP defines both in milliseconds, and pmcp forwards them unchanged.
--    Tracked as Consiliency/pmcp#330.
+-    Tracked as [Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330).
 +  - pmcp documented `ttl` and `poll_interval` in seconds, but MCP defines both
 +    in milliseconds, and pmcp forwarded them unchanged. The next entry
-+    (Consiliency/pmcp#330) fixes that.
++    ([Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330)) fixes that.
 +- **Task `ttl` and `poll_interval` are now converted between pmcp's seconds and
-+  MCP's milliseconds (see Consiliency/pmcp#330).** pmcp has always documented
++  MCP's milliseconds (see [Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330)).** pmcp has always documented
 +  `gateway.invoke`'s `task.ttl` and `task.poll_interval` in seconds. MCP
 +  2025-11-25 defines `ttl` and `pollInterval` in milliseconds, and pmcp passed
 +  the number through unchanged. So `task: {ttl: 300}`, meant as five minutes,
@@ -1047,14 +1196,14 @@ index 1eb3866..b8ea017 100644
 +    0 seconds is reported as unusable.
 +  - Unchanged: a task's `raw` object, and the results pmcp relays as sent,
 +    keep the downstream's own milliseconds.
- - **`pmcp startup add/set --source project` now carries your prior trust approval forward when it rewrites `.mcp.json`.** Setting the startup policy changes the file's bytes, and trust approval is content-keyed, so the edit used to silently invalidate your own `pmcp trust approve` of that file and the next startup refused it. When the pre-write bytes were approved, pmcp now re-records the approval for the exact bytes it writes — keyed on the opened descriptor's verified identity (the resolved key must name the same file the descriptor holds open), never re-approving a file that was not already approved, and never approving a substituted file. A target swapped or unlinked mid-operation is refused rather than mis-bound, and on POSIX a symlinked `.mcp.json` is refused up front. If re-recording ever fails because the trust store is unusable, the edit is still written and the failure is surfaced as a diagnostic rather than crashing (an unusable store also fails the approval check, so nothing is silently carried forward). See [#253](https://github.com/Consiliency/pmcp/issues/253).
- - **`pmcp trust approve` now refuses a store resident in the checkout containing the file being approved**, matching what `serve --project` enforces — so approve no longer reports success for an approval that serve will then refuse. See [#252](https://github.com/Consiliency/pmcp/issues/252).
+ - **`pmcp config set-startup-policy add|remove|set --source project --apply` now carries your prior trust approval forward when it rewrites `.mcp.json`.** Setting the startup policy changes the file's bytes, and trust approval is content-keyed, so the edit used to silently invalidate your own `pmcp trust approve` of that file and the next startup refused it. When the pre-write bytes were approved, pmcp now re-records the approval for the exact bytes it writes — keyed on the opened descriptor's verified identity (the resolved key must name the same file the descriptor holds open), never re-approving a file that was not already approved, and never approving a substituted file. A target swapped or unlinked mid-operation is refused rather than mis-bound, and on POSIX a symlinked `.mcp.json` is refused up front. If re-recording ever fails because the trust store is unusable, the edit is still written and the failure is surfaced as a diagnostic rather than crashing (an unusable store also fails the approval check, so nothing is silently carried forward). See [Consiliency/pmcp#253](https://github.com/Consiliency/pmcp/issues/253).
  - **Every install spawn now logs the command it runs, at WARNING, before it
+   runs.** `start_install`, the legacy `install_server` and `verify_installation`
 diff --git a/README.md b/README.md
-index 0578946..b840ca4 100644
+index f656342..be104a6 100644
 --- a/README.md
 +++ b/README.md
-@@ -1502,7 +1502,13 @@ Tenant runs use the existing task broker. Submit long-running work with
+@@ -1549,7 +1549,13 @@ Tenant runs use the existing task broker. Submit long-running work with
  `gateway.invoke` and non-secret `task.metadata`, `task.ttl`,
  `task.poll_interval`, `task.requestor_context`, and trace keys such as
  `_meta.traceparent`; PMCP forwards those fields to the downstream server only
@@ -1070,10 +1219,10 @@ index 0578946..b840ca4 100644
  `gateway.tasks_result`, and `gateway.tasks_cancel`. Do not use PMCP request IDs
  from `gateway.list_pending` or `gateway.cancel` for tenant task operations.
 diff --git a/specs/tenant-code-mode-host-contract.md b/specs/tenant-code-mode-host-contract.md
-index 998e2e5..594f30a 100644
+index 7e56239..4d98bef 100644
 --- a/specs/tenant-code-mode-host-contract.md
 +++ b/specs/tenant-code-mode-host-contract.md
-@@ -104,11 +104,38 @@ downstream MCP task ID, not a PMCP request ID. `gateway.list_pending` and
+@@ -110,11 +110,38 @@ terminal records are retained, oldest pruned first. `gateway.list_pending` and
  tenant run/task IDs.
  
  The tenant server should treat `pollInterval` and `ttl` as hints and lifecycle
@@ -1114,7 +1263,7 @@ index 998e2e5..594f30a 100644
  ## Metadata Forwarding Contract
  
  PMCP can forward OpenTelemetry-style trace context through
-@@ -119,8 +146,12 @@ documented. These values are strings only and are metadata, not authentication.
+@@ -125,8 +152,12 @@ documented. These values are strings only and are metadata, not authentication.
  Task metadata supplied to `gateway.invoke` may include:
  
  - `metadata`: a bounded object for tenant-server execution context.
@@ -1172,7 +1321,7 @@ index cae5645..e202341 100644
          )
  
 diff --git a/src/pmcp/types.py b/src/pmcp/types.py
-index 448e714..2dcc0cc 100644
+index a73acb3..a1fe888 100644
 --- a/src/pmcp/types.py
 +++ b/src/pmcp/types.py
 @@ -89,6 +89,15 @@ DEFAULT_AUTH_STATE_SEMANTICS: dict[AuthState, AuthStateSemanticsInfo] = {
@@ -1340,7 +1489,7 @@ index 448e714..2dcc0cc 100644
      requestor_context: dict[str, Any] | None = Field(
          default=None, description="Opaque requestor context forwarded downstream"
 diff --git a/tests/fixtures/gateway_tool_schemas.json b/tests/fixtures/gateway_tool_schemas.json
-index cf9be95..9ad4d10 100644
+index e50ba2c..6299df3 100644
 --- a/tests/fixtures/gateway_tool_schemas.json
 +++ b/tests/fixtures/gateway_tool_schemas.json
 @@ -291,9 +291,9 @@
@@ -1503,10 +1652,10 @@ index f804183..0262d79 100644
  def test_every_aliased_hint_prefers_its_usable_alias(
 diff --git a/tests/test_task_units.py b/tests/test_task_units.py
 new file mode 100644
-index 0000000..6ad8c74
+index 0000000..cea7ac4
 --- /dev/null
 +++ b/tests/test_task_units.py
-@@ -0,0 +1,830 @@
+@@ -0,0 +1,986 @@
 +"""Task durations: seconds in pmcp, milliseconds on the MCP wire
 +(Consiliency/pmcp#330).
 +
@@ -1760,6 +1909,158 @@ index 0000000..6ad8c74
 +    assert cancelled.ok
 +    _assert_seconds(cancelled.task)
 +    _assert_seconds(recorded())
++
++
++# --- every reply path, by behaviour (the backstop) -------------------------------
++#
++# The structural guards below catch a task model built directly by class name.
++# They cannot enumerate every way Python can build or patch an object
++# (`TypeAdapter`, a classmethod through an instance, `__dict__`), so this table
++# is the backstop (#330 board round 2): every reply path of every task
++# operation, against a downstream that answers in the spec's shapes and
++# milliseconds -- and also echoes stray ms fields on replies that carry no task,
++# so a path that spreads a reply into a task model shows up in the units.
++
++_WIRE_TASK: dict[str, Any] = {
++    "taskId": "t1",
++    "status": "working",
++    "createdAt": "2026-10-04T00:00:00Z",
++    "lastUpdatedAt": "2026-10-04T00:00:00Z",
++    "ttl": 300_000,
++    "pollInterval": 2500,
++}
++_STRAY_MS = {"ttl": 300_000, "pollInterval": 2500}
++
++
++def _spec_reply(shape: str, status: str) -> dict[str, Any]:
++    task = {**_WIRE_TASK, "status": status}
++    if shape == "create":  # CreateTaskResult
++        return {"task": task}
++    if shape == "top":  # GetTaskResult / CancelTaskResult: the Task itself
++        return task
++    if shape == "wrapped":  # also accepted by pmcp
++        return {"task": task}
++    if shape == "list":  # ListTasksResult
++        return {"tasks": [task]}
++    if shape == "result-with-task":
++        return {"task": task, "result": {"content": []}}
++    if shape == "no-task":  # e.g. tasks/result's CallToolResult, plus stray ms
++        return {
++            "content": [],
++            "_meta": {"io.modelcontextprotocol/related-task": {"taskId": "t1"}},
++            **_STRAY_MS,
++        }
++    raise AssertionError(shape)
++
++
++# (manager operation, gateway tool, {method: reply shape}, expected durations)
++REPLY_PATHS: list[tuple[str, str, dict[str, str], tuple[Any, Any]]] = [
++    ("call_tool", "invoke", {"tools/call": "create"}, (300.0, 2.5)),
++    ("get_task", "tasks_get", {"tasks/get": "top"}, (300.0, 2.5)),
++    ("get_task", "tasks_get", {"tasks/get": "wrapped"}, (300.0, 2.5)),
++    ("list_tasks", "tasks_list", {"tasks/list": "list"}, (300.0, 2.5)),
++    (
++        "get_task_result",
++        "tasks_result",
++        {"tasks/result": "result-with-task"},
++        (300.0, 2.5),
++    ),
++    # the spec's shape: no task in the result, so pmcp asks tasks/get
++    (
++        "get_task_result",
++        "tasks_result",
++        {"tasks/result": "no-task", "tasks/get": "top"},
++        (300.0, 2.5),
++    ),
++    ("cancel_task", "tasks_cancel", {"tasks/cancel": "top"}, (300.0, 2.5)),
++    ("cancel_task", "tasks_cancel", {"tasks/cancel": "wrapped"}, (300.0, 2.5)),
++    # the fallback: no task in the reply, so pmcp records none of its fields
++    ("cancel_task", "tasks_cancel", {"tasks/cancel": "no-task"}, (None, None)),
++]
++
++
++@pytest.mark.parametrize(
++    ("operation", "tool", "shapes", "expected"),
++    REPLY_PATHS,
++    ids=[f"{op}-{'+'.join(sh.values())}" for op, _, sh, _ in REPLY_PATHS],
++)
++@pytest.mark.asyncio
++async def test_every_reply_path_reports_and_records_seconds(
++    operation: str, tool: str, shapes: dict[str, str], expected: tuple[Any, Any]
++) -> None:
++    manager = _manager()
++    status = {"tasks/cancel": "cancelled", "tasks/result": "completed"}
++
++    async def downstream(
++        managed: Any, method: str, params: dict[str, Any], **_: Any
++    ) -> Any:
++        assert method in shapes, method
++        return _spec_reply(shapes[method], status.get(method, "working"))
++
++    manager._send_request = downstream  # type: ignore[method-assign]
++    if operation != "call_tool":
++        manager._record_task(SERVER, McpTaskInfo(task_id="t1", status="working"))
++    gateway = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
++    args: dict[str, Any] = (
++        {"tool_id": TOOL_ID, "task": {"ttl": 300}}
++        if tool == "invoke"
++        else {"server_name": SERVER}
++        if tool == "tasks_list"
++        else {"server_name": SERVER, "task_id": "t1"}
++    )
++    output = await getattr(gateway, tool)(args)
++    assert output.ok, output
++    returned = list(getattr(output, "tasks", None) or [])
++    if getattr(output, "task", None) is not None:
++        returned.append(output.task)
++    assert returned, output
++    seen = returned + manager.get_tracked_tasks()
++    for task in seen:
++        assert (task.ttl, task.poll_interval) == expected, (operation, shapes, task)
++        assert task.unusable_fields == [], task
++
++
++def test_the_reply_path_table_covers_every_task_operation() -> None:
++    """Derived from the code: every `ClientManager` method that turns a
++    downstream reply into a task (calls `_task_info_from_payload`) has a row in
++    `REPLY_PATHS`, and so does each one with a no-task fallback branch."""
++    funcs = dict(((p, f.name), f) for p, f in _functions())
++    parsers = {
++        name
++        for (path, name), func in funcs.items()
++        if path == "client/manager.py"
++        and name != "_task_info_from_payload"
++        and any(_called(n) == "_task_info_from_payload" for n in ast.walk(func))
++    }
++    assert parsers == {op for op, _, _, _ in REPLY_PATHS}, parsers
++    no_task_rows = {op for op, _, sh, _ in REPLY_PATHS if "no-task" in sh.values()}
++    assert no_task_rows == {"get_task_result", "cancel_task"}
++    # get_task's no-task branch raises: test_a_get_reply_without_a_task_reports_no_task
++
++
++@pytest.mark.asyncio
++async def test_a_result_reply_without_a_task_never_records_wire_durations() -> None:
++    """The round-2 seat's falsifier: the spec-shaped `tasks/result` (a
++    CallToolResult, no task, stray ms fields) refreshes the task through
++    `tasks/get` and records seconds."""
++    manager = _manager()
++
++    async def reply(managed: Any, method: str, params: dict[str, Any], **_: Any) -> Any:
++        if method == "tasks/get":
++            return {
++                "taskId": "t1",
++                "status": "completed",
++                "ttl": 300_000,
++                "pollInterval": 2500,
++            }
++        return {"content": [], "ttl": 300_000, "pollInterval": 2500}
++
++    manager._send_request = reply  # type: ignore[method-assign]
++    manager._record_task(SERVER, McpTaskInfo(task_id="t1", status="working"))
++    await manager.get_task_result(SERVER, "t1")
++    record = manager.get_task_record(SERVER, "t1")
++    assert record is not None
++    assert (record.ttl, record.poll_interval) == (300.0, 2.5), record
 +
 +
 +# --- round trip -----------------------------------------------------------------
@@ -2086,14 +2387,17 @@ index 0000000..6ad8c74
 +    }
 +
 +
-+# --- structure: every task model is built from downstream data only by the parser --
++# --- structure: direct constructions of a task model, by class name ----------------
 +#
 +# The guards above see a duration that NAMES a wire key or a `ttl=`/
 +# `poll_interval=` keyword. A task model built by spreading a downstream reply
 +# (`McpTaskInfo.model_validate({**result, ...})`) names neither (#330 board
-+# F003, mutants X1/X2). So the set of places that build ANY model carrying a
-+# task is closed: each is listed below with the reason its input is already in
-+# seconds, and a new or changed one fails until it is reviewed and added.
++# F003, mutants X1/X2). So every construction that names a task-carrying model
++# class is listed below with the reason its input is already in seconds, and a
++# new or changed one fails until it is reviewed. This catches construction BY
++# CLASS NAME only; `TypeAdapter`, a classmethod through an instance or
++# `__dict__` are not seen here (round 2, Y1/Y2/Y4). The per-path behavioural
++# table above is the backstop for those.
 +
 +
 +def _task_carrying_models() -> set[str]:
@@ -2207,10 +2511,11 @@ index 0000000..6ad8c74
 +
 +
 +def test_every_task_model_construction_is_a_reviewed_one() -> None:
-+    """Closed world: every place in `src/pmcp` that builds a task-carrying model
-+    (any form: `Model(...)`, `Model(**x)`, `Model.model_validate(x)`,
++    """Every place in `src/pmcp` that builds a task-carrying model BY CLASS NAME
++    (`Model(...)`, `Model(**x)`, `Model.model_validate(x)`,
 +    `Model.model_construct(...)`) with task data is listed, with exactly the
-+    arguments listed. A spread of a downstream reply anywhere fails here."""
++    arguments listed. Other forms are caught by
++    `test_every_reply_path_reports_and_records_seconds`."""
 +    found = _task_model_constructions()
 +    expected = {key: {args} for key, (args, _) in TASK_MODEL_CONSTRUCTIONS.items()}
 +    assert found == expected
