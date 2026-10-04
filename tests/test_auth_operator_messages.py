@@ -113,7 +113,7 @@ def _rendered(member: AuthText) -> str:
 def test_the_registry_is_complete_and_typed() -> None:
     """The registry is the list now (no derivation to shrink): 29 members on
     the round-4 spike, each an `AuthText`, no two with the same text."""
-    assert len(_MESSAGES) == 32, sorted(_MESSAGES)
+    assert len(_MESSAGES) == 35, sorted(_MESSAGES)  # +2 #341 rev 2, +1 rev 3
     assert len(set(_MESSAGES.values())) == len(_MESSAGES)
     assert all(type(v) is AuthText for v in _MESSAGES.values())
     assert _MESSAGES["KEY_CANNOT_VERIFY_TOKEN"] == (
@@ -850,7 +850,7 @@ def test_the_site_check_sees_every_site() -> None:
                 counts["raise"] += 1
             if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_reject":
                 counts["_reject"] += 1
-    assert counts == {"raise": 39, "_reject": 7}, counts
+    assert counts == {"raise": 42, "_reject": 7}, counts  # +2 #341 r2, +1 r3
 
 
 _STATIC_SHAPES = {
@@ -1693,14 +1693,29 @@ _STARTUP_REFUSALS: dict[str, tuple[Callable[[], Any], str, type[Exception]]] = {
         "PUBLIC_URL_NOT_ABSOLUTE",
         ValueError,
     ),
-    "PUBLIC_URL_HTTP_LOOPBACK_ONLY": (
+    "PUBLIC_URL_PLAIN_HTTP_REFUSED": (
         lambda: auth_mod.AsyncJWKS("http://issuer.example/jwks.json"),
-        "PUBLIC_URL_HTTP_LOOPBACK_ONLY",
+        "PUBLIC_URL_PLAIN_HTTP_REFUSED",
         ValueError,
     ),
     "PUBLIC_URL_NOT_PUBLIC": (
         lambda: auth_mod.AsyncJWKS("https://10.0.0.5/jwks.json"),
         "PUBLIC_URL_NOT_PUBLIC",
+        ValueError,
+    ),
+    "PUBLIC_URL_CONTROL_CHARACTER": (
+        lambda: auth_mod.AsyncJWKS("https://issuer.example/key\x00set.json"),
+        "PUBLIC_URL_CONTROL_CHARACTER",
+        ValueError,
+    ),
+    "PUBLIC_URL_BACKSLASH": (
+        lambda: auth_mod.AsyncJWKS("https://127.0.0.1\\@issuer.example/jwks.json"),
+        "PUBLIC_URL_BACKSLASH",
+        ValueError,
+    ),
+    "PUBLIC_URL_HOST_NOT_CANONICAL": (
+        lambda: auth_mod.AsyncJWKS("https://\uff11\uff12\uff17.0.0.1/jwks.json"),
+        "PUBLIC_URL_HOST_NOT_CANONICAL",
         ValueError,
     ),
     "ELICITATION_URL_INVALID": (
