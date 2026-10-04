@@ -3990,9 +3990,14 @@ class TestTerminateProcessTree:
         process.returncode = None
         process.wait = AsyncMock(return_value=0)
 
-        # Must not raise; must use the cross-platform single-process path.
+        # Must not raise; must use the cross-platform single-process path --
+        # also with a retained group id passed in (Consiliency/pmcp#324: the
+        # id is never used where groups do not exist; every other kill path
+        # is covered in tests/test_cancel_teardown.py).
         await _terminate_process_tree(process, "browser")
         process.terminate.assert_called_once()
+        await _terminate_process_tree(process, "browser", group_pgid=4321)
+        assert process.terminate.call_count == 2
 
 
 class TestReadStdoutFailureSurfacing:

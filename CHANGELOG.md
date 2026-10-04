@@ -437,6 +437,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+- **A cancelled caller keeps its cancellation through every server teardown,
+  and the teardown still completes.** A caller cancelled while a server
+  connection is being torn down -- a failed or cancelled handshake,
+  `disconnect_server`, a reconnect's cleanup, `disconnect_all`, shutdown --
+  keeps its cancellation and returns at once; the server's process tree is
+  SIGKILLed (through the process group recorded at spawn, so a grandchild
+  that outlived its leader dies too) and the client dropped synchronously,
+  and a remote transport is abandoned without its graceful close. A stdio
+  server is SIGKILLed even when its termination is cancelled, including by
+  event-loop shutdown, and shutdown also kills and drops every server when
+  its 10 s budget runs out (for example while another operation holds the
+  lifecycle lock) or when its `disconnect_all` is cancelled before it starts.
+  A forced `disconnect_server` cancelled while waiting for a `tasks/cancel`
+  reply, or for the lifecycle lock, finishes its teardown too. A cancelled
+  `disconnect_all()`/`refresh()` does not respawn the servers it was
+  removing. Every bounded wait in `src/pmcp` now uses `pmcp.waits.bounded_wait`
+  instead of `asyncio.wait_for`, which on Python 3.10/3.11 could drop a
+  cancel that landed as the awaited work finished. Where process groups do
+  not exist (Windows) the single-process fallback is used, as before. Known
+  limits, tracked separately: a cancelled *reconnect* can still be revived by
+  auto-reconnect
+  ([Consiliency/pmcp#336](https://github.com/Consiliency/pmcp/issues/336)),
+  and a cancel while the spawn itself is completing can leave a grandchild
+  ([Consiliency/pmcp#344](https://github.com/Consiliency/pmcp/issues/344)).
+  See [Consiliency/pmcp#324](https://github.com/Consiliency/pmcp/issues/324).
 - **Auth operator messages come through pmcp's own sanitiser intact, and
   invalid auth configuration refuses startup.** Four auth and startup
   messages were reworded because pmcp's own sanitiser rewrote them (`Token

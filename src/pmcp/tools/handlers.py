@@ -31,7 +31,12 @@ from pmcp.auth import (
     sanitize_url_elicitation_url,
 )
 
-from pmcp.client.manager import ClientManager, _terminate_process_tree
+from pmcp.client.manager import (
+    ClientManager,
+    _kill_process_tree_now,
+    _spawned_group_pgid,
+    _terminate_process_tree,
+)
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import (
     registry_allow_private_from_config,
@@ -200,6 +205,7 @@ from pmcp.manifest.loader import (
     is_usable_credential_value,
     requires_credential,
 )
+from pmcp.waits import bounded_wait
 
 logger = logging.getLogger(__name__)
 
@@ -3404,12 +3410,19 @@ class GatewayTools:
             env=env,
             start_new_session=True,
         )
+        # The spawn contract: `start_new_session=True` makes the probe a group
+        # leader, so its pgid IS its pid -- not looked up, since a probe that
+        # exits at once may already be reaped (Consiliency/pmcp#324, codex
+        # rounds 5 and 6). A grandchild can outlive it.
+        group_pgid = _spawned_group_pgid(process)
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
+            stdout, stderr = await bounded_wait(process.communicate(), timeout=60.0)
         except asyncio.CancelledError:
-            # Reap the tree before propagating; cancellation must not leak a
-            # process. Re-raised unchanged -- a cancellation is not a timeout.
-            await _terminate_process_tree(process, "update-probe")
+            # Kill the tree before propagating; cancellation must not leak a
+            # process. Synchronously: an await here could itself be cancelled
+            # (loop shutdown) and skip the kill (Consiliency/pmcp#324).
+            # Re-raised unchanged -- a cancellation is not a timeout.
+            _kill_process_tree_now(process, group_pgid=group_pgid)
             raise
         except (asyncio.TimeoutError, TimeoutError) as exc:
             # asyncio.TimeoutError is listed EXPLICITLY: it only became an alias
@@ -3418,7 +3431,9 @@ class GatewayTools:
             # the cleanup never runs. CI caught this on 3.10 while 3.11 and 3.12
             # both passed -- the fix silently did nothing on the oldest
             # supported version.
-            await _terminate_process_tree(process, "update-probe")
+            await _terminate_process_tree(
+                process, "update-probe", group_pgid=group_pgid
+            )
             # NORMALISE to the builtin before it reaches a caller, the way
             # ClientManager._send_request does. Re-raising the asyncio class
             # reintroduced the same 3.10 split one frame up: the caller's
