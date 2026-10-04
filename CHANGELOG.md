@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-10-04
+
 ### Added
 - **Version pinning, piece 1: pins only.** A manifest entry's `version:`, or an
   overlay's `server_version: {<server>: <version>}`, holds an npx-launched server at one
