@@ -825,15 +825,10 @@ _FRAME_PREFIXES = (
 
 
 def _line_cases(s: str) -> list[tuple[str, bytes]]:
-    """Lines a stdio downstream could write, each carrying `s` only as JSON
-    content (a string value, after an opener, or where a value begins):
-    - every value-start character followed by the sentinel, and an
-      unterminated string (round-8 codex P1), behind every lead;
-    - a number or literal prefix followed by the sentinel;
-    - every prefix class followed by a whole frame, behind every lead;
-    - the whole frame in UTF-8 with a BOM, UTF-16 and UTF-32 (with and
-      without a BOM, both byte orders), a non-UTF-8 byte before it;
-    - CR-only separation and several frames on one line."""
+    """Lines a stdio downstream could write, carrying `s` only as JSON content:
+    value starts, unterminated strings, number and literal prefixes, whole
+    frames behind every lead and in every BOM/UTF encoding, CR-only and
+    several frames per line."""
     spelled = json.dumps(s)[1:-1]
     frame = json.dumps({"jsonrpc": "2.0", "id": 7, "result": {"k": s}})
     out: list[tuple[str, bytes]] = []
@@ -1156,15 +1151,8 @@ async def test_a_wrapped_handler_keeps_the_wire_code(family: str) -> None:
 
 
 def _is_valid_frame(line: bytes) -> bool:
-    """The test's own statement of a JSON-RPC 2.0 message as MCP defines one
-    -- the only kind of stdout line whose content the reader may act on
-    (rev 13: the specification's rules, written here independently of
-    `jsonrpc_envelope_problem`). `"jsonrpc": "2.0"`; a request or
-    notification has a string `method`, an object `params` if any (`null`
-    reads as absent, rev 14), and no
-    `result`/`error`; a response has an `id` and exactly one of an object
-    `result` or an `error` object with an integer `code` and a string
-    `message`."""
+    """JSON-RPC 2.0 as MCP defines it, stated independently of
+    `jsonrpc_envelope_problem`: the only stdout line the reader may act on."""
     try:
         value = json.loads(line)
     except Exception:  # noqa: BLE001
@@ -1509,14 +1497,9 @@ async def _through_a_caller(consumer: str, malformed: bytes) -> str:
 async def test_no_malformed_envelope_reaches_its_waiting_caller(
     caplog: pytest.LogCaptureFixture, consumer: str, family: str
 ) -> None:
-    """Round-12 codex B2: `{"jsonrpc": "1.0", "id": 8, "error": {...}}` --
-    or no `jsonrpc`, both `result` and `error`, an object `code` -- resolved
-    the waiting request, and the caller logged `tools/list page 2 failed
-    (<message>)`. The rev 12 property test stopped before any caller ran.
-    Here each envelope violation `_envelope_violations` derives goes to a
-    real caller (listing pagination, `call_tool`, `get_task`) through the real
-    reader: no record and nothing the caller returns or raises carries any
-    part of it, and the caller gets the valid reply that follows."""
+    """Each envelope violation goes to a real caller (pagination, `call_tool`,
+    `get_task`) through the real reader: nothing it logs, returns or raises
+    carries any of it, and the valid reply that follows is delivered."""
     caplog.set_level(logging.DEBUG)
     s = _FAMILIES[family][1]
     forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
@@ -1560,12 +1543,8 @@ async def test_a_valid_error_still_reaches_its_caller(consumer: str) -> None:
 
 @pytest.mark.parametrize("family", sorted(_FAMILIES))
 def test_the_sdk_client_transports_check_the_envelope(family: str) -> None:
-    """Round-12 codex B2 on SSE and streamable HTTP: the SDK's models coerce
-    an `error.code` of `true`, `"5"` or `5.0` and ignore a `result` beside an
-    `error`, so those frames validated and their `message` reached pmcp. The
-    SDK's three client transports now validate through the strict adapter
-    (installed on `import pmcp`): every envelope violation is a
-    `ValidationError` whose text carries none of the frame, and a valid
+    """The SDK's three client transports validate through the strict adapter:
+    each envelope violation is a value-free `ValidationError`, and a valid
     frame validates as before."""
     import mcp.client.sse as sse_module
     import mcp.client.stdio as stdio_module
@@ -1656,12 +1635,8 @@ async def test_a_malformed_initialize_reply_ends_the_refresh_in_bounded_time(
     recwarn: pytest.WarningsRecorder,
     kind: str,
 ) -> None:
-    """Round-13 claude N2: the strict envelope drops a lax-malformed reply, and
-    the one SDK `ClientSession` pmcp builds (`refresh_server`: `pmcp refresh`
-    and the startup cache generation) had no timeout, so such a reply to
-    `initialize` hung it. It now fails within its read timeout, value-free.
-    (The gateway's own transports do not use an SDK session; their requests
-    have pmcp's idle timeout and ceiling, §12.)"""
+    """A dropped `initialize` reply no longer hangs `refresh_server` (the one
+    SDK session pmcp builds): it fails within its read timeout, value-free."""
     import time
 
     import pmcp.manifest.refresher as refresher

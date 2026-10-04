@@ -873,17 +873,9 @@ def _constant_text(node: ast.AST) -> str:
 
 
 def _repr_sites(source: str) -> list[tuple[int, str]]:
-    """Each value in `source` rendered with its repr inside a message
-    carrying rejection wording, as (line, the rendered expression). Rev 13
-    covers every spelling Python has (round-12 claude):
-
-    - an f-string field with `!r`, or holding `repr(x)`;
-    - `"..." + repr(x)` (a `+` chain);
-    - `"... %r ..." % x`, and `"... %s ..." % repr(x)`;
-    - `"... {!r} ...".format(x)`, and `.format(repr(x))`;
-    - a call whose first argument is the message: `%r` in it, or `repr(x)`
-      as a later argument (`logger.warning("bad %s", repr(x))`).
-    """
+    """Each value rendered with its repr (`!r`, `repr()`, `+`, `%r`,
+    `.format`, a later call argument) in a message with rejection wording,
+    as (line, expression)."""
     tree = ast.parse(source)
     sites: list[tuple[int, str]] = []
 
@@ -1042,13 +1034,9 @@ def _repr_site_keys() -> set[str]:
 
 
 def test_no_rejected_value_is_rendered_with_repr() -> None:
-    """Round-11 codex P1's class, as a static rule (rev 12; rev 13 widened
-    it to every repr spelling and keyed it by site): a repr in a message
-    that rejects something renders the value itself. Every such site in
-    `src/pmcp` is a named exemption with its provenance (none is a caller's
-    or a downstream's value), and every exemption must still exist. The rule
-    cannot see `{x}` or `%s` of `x` itself; those sites were triaged by hand
-    (the plan's table)."""
+    """A repr in a rejecting message renders the value: every such site in
+    `src/pmcp` is a named exemption with its provenance, and each exemption
+    must still exist. `{x}`/`%s` of `x` were triaged by hand."""
     found = _repr_site_keys()
     assert found == set(_REPR_REJECTION_EXEMPT), (
         sorted(found - set(_REPR_REJECTION_EXEMPT)),

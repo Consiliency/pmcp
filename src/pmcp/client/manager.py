@@ -321,11 +321,9 @@ def _usable_task_raw(payload: dict[str, Any]) -> dict[str, Any]:
 def effective_task_mode(
     tool_info: ToolInfo, task: TaskMetadataInput | dict[str, Any] | None
 ) -> bool:
-    """Whether a call runs as an MCP task: requested (or the tool requires it)
-    and not switched off by `enabled: false` where the tool allows that. The
-    one derivation `call_tool` and `gateway.invoke` both use (rev 17,
-    round-15 codex): a call that is not a task treats its answer as opaque
-    data -- no task recognition, no registry lookup, nothing replaced."""
+    """Whether a call runs as an MCP task (the tool requires it, or it was
+    requested and not `enabled: false`): the one derivation for `call_tool`
+    and `gateway.invoke` (rev 17). Otherwise the answer is opaque data."""
     support = (tool_info.execution or {}).get("taskSupport")
     if support == "required":
         return True

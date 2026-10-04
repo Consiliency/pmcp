@@ -30,6 +30,7 @@ hash of the value is disclosed either.
 from __future__ import annotations
 
 import copy
+import itertools
 import gc
 import functools
 from unittest import mock
@@ -1594,13 +1595,9 @@ async def test_a_value_rejected_by_hand_is_described(
     fake_npm_registry: dict[str, str],
     family: str,
 ) -> None:
-    """Round-11 codex P1's class (rev 12): a caller's value that a handler
-    rejects by hand -- a `gateway.cancel` request id, an `auth_connect`
-    env var that is not permitted or not a valid name, the env vars a
-    `register_discovered_server` may not declare -- is described, not echoed:
-    in the response's text, its structured fields and the audit-event
-    buffer. (A downstream's rejected pagination cursor is in the frame
-    sweep's `cursor-*` shapes.)"""
+    """A caller value a handler rejects by hand (a cancel id, an `auth_connect`
+    env var, a server's undeclarable env vars) is described, never echoed:
+    response text, structured fields, audit buffer."""
     from pmcp.manifest.loader import Manifest, ServerConfig
     from pmcp.policy.policy import PolicyManager
     from pmcp.tools.handlers import GatewayTools
@@ -1911,15 +1908,9 @@ async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
     recwarn: pytest.WarningsRecorder,
     wrap: str,
 ) -> None:
-    """Round-13 codex: a task hint pmcp drops as unusable left through the
-    answer itself -- `gateway.invoke` returned a flat task answer as its
-    `result`, and `gateway.tasks_result` the original `{"task": ...}`, both
-    holding the value and sized with it. Rev 15 (round-14 grok F002/F003):
-    the shapes are the PARSER's -- every id alias it reads (`task_id` too),
-    nested or flat -- so an alias the old recogniser missed is swept. Every
-    task call (`tasks_list` included), in every shape, with every dropped
-    position: the value is in no channel, and two sentinel lengths give the
-    same answer (no size channel)."""
+    """A task hint pmcp drops as unusable is in no channel of any task tool's
+    answer, in every shape the parser reads (each id alias, nested or flat),
+    at every position; two sentinel lengths give one size."""
     caplog.set_level(logging.DEBUG)
     probe = {"taskId": "t", "status": "working"}
     for method in ("tools/call", "tasks/get", "tasks/result", "tasks/cancel"):
@@ -2050,14 +2041,9 @@ def _generated_task_answers() -> list[tuple[str, dict[str, Any]]]:
 async def test_the_normaliser_acts_iff_the_parser_accepts_on_every_task_op(
     tmp_path: Path,
 ) -> None:
-    """Round-14 board (codex F024-F027, grok F002/F003, claude F001/F002): rev
-    14's recogniser and parser disagreed both ways. Through `call_tool`,
-    `get_task`, `list_tasks`, `get_task_result` and `cancel_task` (and its
-    fallback), for every generated answer: the normaliser acts iff the parser
-    yields a task; the task becomes exactly the parse's `raw`; the keys
-    removed are exactly those the parser drops (per wire key: one alias of a
-    field can be usable while another is not), which include every sent
-    alias of each field in `unusable_fields`; siblings are untouched."""
+    """For every generated answer, through every manager task op: the
+    normaliser acts iff the parser parses; it removes exactly the keys the
+    parser drops (per wire key) and leaves the rest."""
     from pmcp.client.manager import _TASK_WIRE_KEYS
     from pmcp.types import McpTaskInfo
 
@@ -2174,184 +2160,103 @@ async def test_a_dropped_task_hint_leaves_by_no_alias_or_fallback(
 # ---------------------------------------------------------------------------
 
 
-def _mode_answers(s: str) -> dict[str, dict[str, Any]]:
-    """A task-shaped answer, nested and flat, each carrying a hint the parser
-    drops (`ttl: <s>`), beside result data; and an answer that is not a task."""
-    kept = [{"type": "text", "text": "fresh synchronous report"}]
-    return {
-        "nested": {
-            "task": {"taskId": "t", "status": "working", "ttl": s},
-            "content": kept,
-        },
-        "flat": {"task_id": "t", "ttl": s, "content": kept},
-        "data": {"content": kept, "structuredContent": {"ttl": s}},
-    }
+async def _invoke_as(
+    root: Path, support: Any, requested: bool, answer: Any, recorded: bool = True
+) -> Any:
+    """`gateway.invoke` on `svc::run` (taskSupport `support`, None: absent)
+    with task "t" recorded by another call if `recorded`; the downstream answers
+    `answer`. Returns (the output, the server's policy manager)."""
+    from pmcp.types import McpTaskInfo
+
+    root.mkdir()
+    server, _, _ = _task_server(root, audited=False)
+    manager = server._client_manager
+    tool = next(iter(manager._tools.values()))
+    tool.execution = {} if support is None else {"taskSupport": support}
+
+    async def send(managed: Any, method: str, params: Any, **_: Any) -> Any:
+        return copy.deepcopy(answer)
+
+    manager._send_request = send  # type: ignore[method-assign]
+    if recorded:
+        task = McpTaskInfo(task_id="t", status="working")
+        manager._record_task(_DOWNSTREAM, task, tool_id="o")
+    args: dict[str, Any] = {"tool_id": f"{_DOWNSTREAM}::run", **_correlations()}
+    if requested:
+        args["task"] = {"enabled": True}
+    out = await server._gateway_tools.invoke(args)
+    await server.shutdown()
+    return out, server._policy_manager
+
+
+def _sized_as_returned(out: Any, policy: Any) -> bool:
+    return (
+        out.raw_size_estimate
+        == policy.process_output(out.result, redact=False)["raw_size"]
+    )
 
 
 @pytest.mark.asyncio
 async def test_task_handling_follows_the_calls_effective_task_mode(
     tmp_path: Path,
 ) -> None:
-    """Round-15 codex F001 and claude F003: `gateway.invoke` looked every
-    answer up as a task, so a synchronous answer naming a recorded task id
-    was replaced by that task, and it was sized from the uncleaned answer.
-    Over taskSupport x requested x answer shape x id recorded: a call that
-    does not run as a task gets the answer back whole (as main) and sized as
-    returned; a task call's dropped hint is neither returned nor sized; data
-    is never lost to a lookup."""
-    from pmcp.types import McpTaskInfo
-
+    """Round-15 codex F001, claude F003: over taskSupport x requested x shape
+    (nested, flat, not a task): a call that is not a task gets its answer
+    back whole, sized as returned; a task call's dropped hint is neither
+    returned nor sized; content is never lost to a registry lookup."""
+    kept = [{"type": "text", "text": "fresh report"}]
     cases = 0
-    for support in ("required", "optional", "forbidden", None):
-        for requested in (True, False):
-            for shape in ("nested", "flat", "data"):
-                for recorded in (True, False):
-                    outs = []
-                    for s in ("violetcanaryrejected", "violetcanaryrejected12345"):
-                        root = (
-                            tmp_path
-                            / f"{support}-{requested}-{shape}-{recorded}-{len(s)}"
-                        )
-                        root.mkdir()
-                        server, _, _ = _task_server(root, audited=False)
-                        manager = server._client_manager
-                        tool = next(iter(manager._tools.values()))
-                        tool.execution = (
-                            {} if support is None else {"taskSupport": support}
-                        )
-                        answer = _mode_answers(s)[shape]
-
-                        async def send_request(
-                            managed: Any,
-                            method: str,
-                            params: Any,
-                            a: Any = answer,
-                            **_: Any,
-                        ) -> Any:
-                            return copy.deepcopy(a)
-
-                        manager._send_request = send_request  # type: ignore[method-assign]
-                        if recorded:
-                            task = McpTaskInfo(task_id="t", status="working")
-                            manager._record_task(
-                                _DOWNSTREAM, task, tool_id="svc::other"
-                            )
-                        args: dict[str, Any] = {"tool_id": f"{_DOWNSTREAM}::run"}
-                        args.update(_correlations())
-                        if requested:
-                            args["task"] = {"enabled": True}
-                        out = await server._gateway_tools.invoke(args)
-                        await server.shutdown()
-                        outs.append((s, answer, out))
-                    name = (support, requested, shape, recorded)
-                    as_task = support == "required" or requested
-                    if requested and support in ("forbidden", None):
-                        assert all(not o.ok for _, _, o in outs), name
-                        continue
-                    for s, answer, out in outs:
-                        assert out.ok, name
-                        if not as_task:
-                            assert out.result == answer and out.task is None, name
-                            size = server._policy_manager.process_output(
-                                out.result, redact=False
-                            )["raw_size"]
-                            assert out.raw_size_estimate == size, name
-                        elif shape == "data":
-                            assert out.result == answer and out.task is None, name
-                        else:
-                            assert s not in out.model_dump_json(), name
-                            assert out.task is not None and out.result is None, name
-                    if as_task and shape != "data":
-                        sizes = {o.raw_size_estimate for _, _, o in outs}
-                        assert len(sizes) == 1, (name, sizes)
-                    cases += 1
+    for support, requested, shape, recorded in itertools.product(
+        ("required", "optional", "forbidden", None),
+        (True, False),
+        ("nested", "flat", "data"),
+        (True, False),
+    ):
+        name, outs = (support, requested, shape, recorded), []
+        for s in ("violetcanaryrejected", "violetcanaryrejected12345"):
+            answer = {
+                "nested": {"task": {"taskId": "t", "ttl": s}, "content": kept},
+                "flat": {"task_id": "t", "ttl": s, "content": kept},
+                "data": {"content": kept, "structuredContent": {"ttl": s}},
+            }[shape]
+            root = tmp_path / f"{support}{requested}{shape}{recorded}{len(s)}"
+            out = await _invoke_as(root, support, requested, answer, recorded)
+            outs.append((s, answer, *out))
+        if requested and support in ("forbidden", None):
+            assert not any(o.ok for _, _, o, _ in outs), name
+            continue
+        as_task = (support == "required" or requested) and shape != "data"
+        for s, answer, out, policy in outs:
+            if as_task:
+                assert out.result is None and out.task is not None, name
+                assert s not in out.model_dump_json(), name
+            else:
+                assert out.result == answer and out.task is None, name
+                assert _sized_as_returned(out, policy), name
+        if as_task:
+            assert len({o.raw_size_estimate for _, _, o, _ in outs}) == 1, name
+        cases += 1
     assert cases == 36, cases
 
 
-def test_sync_result_survives_cached_task_id(tmp_path: Path, monkeypatch: Any) -> None:
-    """Round-15 codex F001's falsifier, verbatim in substance: a synchronous
-    answer naming a recorded task id keeps its content (main 2adcd9a did)."""
-    import asyncio
-    from unittest.mock import MagicMock
-
-    from pmcp.client.manager import ClientManager, ManagedClient
-    from pmcp.policy.policy import PolicyManager
-    from pmcp.tools.handlers import GatewayTools
-    from pmcp.types import McpTaskInfo, ServerStatus, ServerStatusEnum, ToolInfo
-
-    policy_path = tmp_path / "policy.json"
-    policy_path.write_text("{}")
-    monkeypatch.setattr(GatewayTools, "_load_provisioned_registry", lambda self: {})
-    manager = ClientManager()
-    tool = ToolInfo(
-        tool_id="svc::report",
-        server_name="svc",
-        tool_name="report",
-        description="Read a report",
-        short_description="Read a report",
-        input_schema={"type": "object"},
-        tags=[],
-        risk_hint="low",
-        execution={"taskSupport": "forbidden"},
-    )
-    manager._tools[tool.tool_id] = tool
-    status = ServerStatus(
-        name="svc",
-        status=ServerStatusEnum.ONLINE,
-        tool_count=1,
-        server_capabilities={"tasks": {}},
-    )
-    manager._clients["svc"] = ManagedClient(
-        config=MagicMock(), is_remote=True, write_stream=MagicMock(), status=status
-    )
-    manager._servers["svc"] = status
+@pytest.mark.asyncio
+async def test_sync_result_survives_cached_task_id(tmp_path: Path) -> None:
+    """Round-15 codex F001's falsifier: a `forbidden` tool's synchronous
+    answer naming a recorded task id keeps its content (as main does)."""
     payload = {"task_id": "t", "content": [{"type": "text", "text": "fresh report"}]}
-
-    async def reply(managed: Any, method: str, params: Any, **kwargs: Any) -> Any:
-        assert method == "tools/call" and "task" not in params
-        return dict(payload)
-
-    monkeypatch.setattr(manager, "_send_request", reply)
-    tools = GatewayTools(manager, PolicyManager(policy_path=policy_path))
-    arguments = {"tool_id": tool.tool_id, "arguments": {}}
-    control = asyncio.run(tools.invoke(arguments))
-    assert control.ok and control.result == payload and control.task is None
-    manager._record_task(
-        "svc", McpTaskInfo(task_id="t", status="working"), tool_id="svc::start"
-    )
-    result = asyncio.run(tools.invoke(arguments))
-    assert result.ok and result.result == payload, "a cached task replaced the result"
-    assert result.task is None
+    out, _ = await _invoke_as(tmp_path / "f", "forbidden", False, payload)
+    assert out.ok and out.result == payload and out.task is None
 
 
 @pytest.mark.asyncio
 async def test_an_unrequested_task_answer_is_sized_as_returned(tmp_path: Path) -> None:
-    """Round-15 claude F003, under rev 17's rule: with `taskSupport:
-    optional`, no task requested and a colliding recorded id, the answer is
-    not a task to pmcp -- it comes back whole, and its size is the size of
-    exactly what comes back, never of an answer pmcp reduced or replaced."""
-    from pmcp.types import McpTaskInfo
-
+    """Round-15 claude F003, restated for rev 17's rule: an `optional` tool,
+    no task requested, a colliding task answer: not a task to pmcp, returned
+    whole and sized from exactly what is returned."""
     for s in ("ghp_a", "ghp_a" + "x" * 40):
-        (tmp_path / str(len(s))).mkdir()
-        server, _, _ = _task_server(tmp_path / str(len(s)), audited=False)
-        manager = server._client_manager
-        for tool in manager._tools.values():
-            tool.execution = {"taskSupport": "optional"}
-        manager._record_task(_DOWNSTREAM, McpTaskInfo(task_id="t", status="working"))
         answer = {"task": {"taskId": "t", "status": "working", "ttl": s}}
-
-        async def send(
-            managed: Any, method: str, params: Any, a: Any = answer, **_: Any
-        ) -> Any:
-            return copy.deepcopy(a)
-
-        manager._send_request = send  # type: ignore[method-assign]
-        args = {"tool_id": f"{_DOWNSTREAM}::run", **_correlations()}
-        out = await server._gateway_tools.invoke(args)
-        await server.shutdown()
+        out, policy = await _invoke_as(
+            tmp_path / str(len(s)), "optional", False, answer
+        )
         assert out.ok and out.task is None and out.result == answer
-        size = server._policy_manager.process_output(out.result, redact=False)[
-            "raw_size"
-        ]
-        assert out.raw_size_estimate == size
+        assert _sized_as_returned(out, policy)
