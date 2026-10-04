@@ -437,6 +437,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+- **An auth URL's host is checked as the HTTP client will read it.** A JWKS
+  URL, a protected-resource metadata URL or a URL-mode elicitation URL whose
+  host was not plain ASCII passed as a "name", but aiohttp (yarl) and
+  browsers rewrite such hosts before connecting: `https://１２７.0.0.1/`
+  (full-width digits), `127。0。0。1` and full-width `localhost` reached
+  127.0.0.1, and `127%2E0%2E0%2E1` decodes to it in a browser. PMCP now
+  refuses, rather than rewrites, any host not in canonical form
+  (`PUBLIC_URL_HOST_NOT_CANONICAL`, whose message states the rule): a DNS
+  name of dot-separated labels of 1 to 63 ASCII letters, digits and
+  hyphens, each starting and ending with a letter or digit, the last
+  starting with a letter, so never a number (IDNs in `xn--` form); a
+  dotted-quad IPv4 address with no leading zeros; or a bracketed IPv6
+  address with no zone id. This
+  also refuses trailing-dot hosts (`localhost.`, `127.0.0.1.`), legacy
+  numeric and octal forms that were accepted when public (`134744072`),
+  hosts whose last label starts with a digit (`example.123`), underscores,
+  `[v1.fe]` and IPv6 zone ids. A control character (U+0000 to U+001F, DEL)
+  inside the URL is refused (`PUBLIC_URL_CONTROL_CHARACTER`) instead of
+  being silently deleted (`key<TAB>set.json` was stored as `keyset.json`)
+  or passed (NUL); leading spaces and C0 controls and trailing tabs, CRs
+  and LFs are still dropped. A backslash anywhere in the URL is refused
+  (`PUBLIC_URL_BACKSLASH`): a browser ends the host at it, so
+  `https://127.0.0.1\@auth.example.com/` is 127.0.0.1 there. An IPv6
+  literal that embeds an IPv4 address is classified on that address too,
+  now including the IPv4-translated prefix `::ffff:0:0:0/96`
+  (`[::ffff:0:a9fe:a9fe]` was accepted), 6to4 and Teredo, and the IPv6
+  address itself must be public as well (an ISATAP interface id carrying
+  8.8.8.8 under `fe80::`, `fd00::` or `ff02::` was accepted); the local-use
+  NAT64 prefix `64:ff9b:1::/48` is refused. As before, an address whose
+  interface id is ISATAP-shaped and embeds a non-public IPv4 address is
+  refused even under a global prefix (`[2606:4700::5efe:a00:5]`). See
+  [Consiliency/pmcp#341](https://github.com/Consiliency/pmcp/issues/341).
+- **The plain-`http://` auth URL refusal no longer claims loopback is
+  allowed.** A JWKS URL or metadata URL such as `http://127.0.0.1/...` was
+  refused at startup with "Public auth URL only allows http:// URLs for
+  loopback hosts." -- untrue there, since these URLs never accept plain
+  `http://`. The message is now "Plain http:// is not accepted for this
+  public auth URL." (registry member `PUBLIC_URL_PLAIN_HTTP_REFUSED`, was
+  `PUBLIC_URL_HTTP_LOOPBACK_ONLY`). The README now states which auth URLs
+  are accepted, with a table of examples that a test checks against the
+  code. See [Consiliency/pmcp#341](https://github.com/Consiliency/pmcp/issues/341).
 - **Auth operator messages come through pmcp's own sanitiser intact, and
   invalid auth configuration refuses startup.** Four auth and startup
   messages were reworded because pmcp's own sanitiser rewrote them (`Token
@@ -455,8 +496,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a stray value in another mode is ignored, as before); and on the
   programmatic path, `create_http_app` refuses a protected-resource
   metadata URL that normalisation used to drop silently, omitting the
-  metadata route -- relative, non-http(s), plain http to a non-loopback
-  host, or a non-public IP literal. The metadata route also refuses to
+  metadata route -- any URL that is not an absolute `https://` URL to a
+  public IP address or a DNS name other than `localhost`, written in plain
+  ASCII, with a valid port
+  (so plain `http://` to any host, loopback included, is refused too; see
+  [Consiliency/pmcp#341](https://github.com/Consiliency/pmcp/issues/341)).
+  The metadata route also refuses to
   start rather than publish an empty `resource`, which no shipped
   configuration reaches. The README now documents deployments behind a
   prefix-stripping proxy; the metadata `404` there is a known follow-up,

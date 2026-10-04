@@ -165,7 +165,8 @@ audience is bound to the configured `resource_server_audience` (the server's
 canonical resource URI, per RFC 8707); it is never derived from the request
 Host header. `resource-server` mode fails closed at startup if the issuer,
 JWKS URL, or audience is missing, and `resource_server_jwks_url` must be an
-`https` URL and is rejected when its host is a non-public IP literal. Token
+`https` URL and is rejected when its host is a non-public IP literal or
+`localhost` (the accepted form is below). Token
 signatures are only accepted for the operator-configured
 `resource_server_allowed_algorithms` allowlist (default `RS256`/`ES256`); the
 token's own `alg` header is never trusted. JWKS is fetched
@@ -204,17 +205,82 @@ that path to PMCP unchanged. An application that mounts PMCP under a
 not at the URL's own path. The `resource` is never taken from the request
 `Host`. A forged token, including one whose algorithm does not match the
 published key's type, gets `401`, never `500`. In resource-server mode over
-HTTP, PMCP refuses to start, with a one-line error, if the JWKS URL or
-metadata URL -- after the cleanup PMCP applies when it stores a URL, which
-drops a trailing newline or a leading space -- is not a public absolute
-http(s) URL without whitespace, or if a required scope is not a single RFC
-6749 scope (printable ASCII with no space, quote or backslash;
-`--required-scope` and `PMCP_REQUIRED_SCOPES` alike), so every
-`401`/`403`/`503` it later sends can be built. An embedding application
-that passes `protected_resource_metadata_url` gets the same refusal, in
-any auth mode, for a relative, non-http(s), plain-http non-loopback or
-non-public-IP URL, which was previously dropped with the metadata route
-silently omitted.
+HTTP, PMCP refuses to start, with a one-line error, if the JWKS URL
+(`--oauth-jwks-url`, `PMCP_OAUTH_JWKS_URL` or `resource_server_jwks_url`) is
+not an accepted auth URL, or if a required scope is not a single RFC 6749
+scope (printable ASCII with no space, quote or backslash; `--required-scope`
+and `PMCP_REQUIRED_SCOPES` alike), so every `401`/`403`/`503` it later sends
+can be built. The CLI takes no metadata URL. An application that embeds
+PMCP and passes `protected_resource_metadata_url` to `create_http_app` gets
+the same refusal for that URL, in any auth mode; such a URL used to be
+dropped, with the metadata route silently omitted.
+
+An auth URL is accepted only if it is an absolute `https://` URL whose port,
+if it has one, is a number no greater than 65535, and whose host is in
+canonical form -- a DNS name of dot-separated labels of 1 to 63 ASCII
+letters, digits and hyphens, each starting and ending with a letter or
+digit, the last starting with a letter, so never a number (an IDN in its xn-- form); a
+dotted-quad IPv4 address with no leading zeros; or a bracketed IPv6 address
+with no zone id -- and is a public address or a name other than
+`localhost`. An IPv6 address that embeds an IPv4 address (IPv4-mapped,
+IPv4-translated, IPv4-compatible, NAT64, ISATAP, 6to4, Teredo) must be
+public on the embedded address too; the local-use NAT64 prefix
+`64:ff9b:1::/48` is refused. Because ISATAP is recognised by its interface
+id, an address whose interface id is ISATAP-shaped and embeds a non-public
+IPv4 address is refused even under a global prefix: `[2606:4700::5efe:a00:5]`
+(10.0.0.5) is refused, as it was before, while `[2606:4700::5efe:808:808]`
+is accepted. A host in any other spelling is refused rather
+than rewritten, because the HTTP client and a browser would rewrite it
+first: `https://１２７.0.0.1/` (full-width digits), `127。0。0。1`, full-width
+`localhost`, `127%2E0%2E0%2E1`, `127.0.0.1.` (trailing dot), legacy numeric
+and octal forms such as `2130706433` or `0177.0.0.1`, `127.000.0.1`,
+`example.123`, `-a.example.com`, `[v1.fe]` and `[fe80::1%25eth0]` are all
+refused, as are `bücher.example` (write `xn--bcher-kva.example`),
+underscores and empty labels. PMCP strips leading spaces and C0 control
+characters, and trailing tabs, CRs and LFs, and nothing else; any other
+control character (U+0000 to U+001F, or DEL) is refused wherever it is, a
+backslash is refused anywhere in the URL, and, for a JWKS or metadata URL,
+so is any whitespace character (anything Python's `str.isspace` matches,
+so a trailing space, a no-break space or U+2028 too). A DNS name is not
+resolved (see below), and only the exact name `localhost` is treated as
+loopback: `*.localhost` is a name like any other and passes unresolved.
+Userinfo such as `user:pass@` is accepted and dropped. Everything else is
+refused, including plain `http://` to any host, loopback hosts too, and
+`https://` to `localhost` or a loopback address. (Plain `http://` to
+`localhost`, `127.0.0.0/8`, `[::1]` or `[::ffff:127.x.y.z]` is accepted in
+one place only: a URL the operator types into `gateway.auth_connect`.) For
+example, as a JWKS URL or a metadata URL:
+
+<!-- auth-url-rule:begin -->
+| URL | Result |
+|---|---|
+| `https://auth.example.com/jwks.json` | accepted |
+| `https://8.8.8.8/jwks.json` | accepted |
+| `https://auth.example.com:8443/jwks.json` | accepted |
+| `https://user:pass@auth.example.com/jwks.json` | accepted (userinfo dropped) |
+| `http://auth.example.com/jwks.json` | refused: plain http |
+| `http://127.0.0.1:8080/jwks.json` | refused: plain http |
+| `http://localhost/jwks.json` | refused: plain http |
+| `https://localhost/jwks.json` | refused: non-public host |
+| `https://127.0.0.1/jwks.json` | refused: non-public host |
+| `https://10.0.0.5/jwks.json` | refused: non-public host |
+| `/.well-known/oauth-protected-resource` | refused: not an absolute http(s) URL |
+| `ftp://auth.example.com/jwks.json` | refused: not an absolute http(s) URL |
+| `https://auth.example.com:abc/jwks.json` | refused: invalid URL |
+| `https://auth.example.com/key set.json` | refused: whitespace |
+| `https://xn--bcher-kva.example/jwks.json` | accepted |
+| `https://１２７.0.0.1/jwks.json` | refused: host not in canonical form |
+| `https://127。0。0。1/jwks.json` | refused: host not in canonical form |
+| `https://127.0.0.1./jwks.json` | refused: host not in canonical form |
+| `https://2130706433/jwks.json` | refused: host not in canonical form |
+| `https://[v1.fe]/jwks.json` | refused: host not in canonical form |
+| `https://127.000.0.1/jwks.json` | refused: host not in canonical form |
+| `https://example.123/jwks.json` | refused: host not in canonical form |
+| `https://-a.example.com/jwks.json` | refused: host not in canonical form |
+| `https://[::ffff:0:a9fe:a9fe]/jwks.json` | refused: non-public host |
+| `https://127.0.0.1\@auth.example.com/jwks.json` | refused: backslash |
+<!-- auth-url-rule:end -->
+
 In public auth metadata URLs it rejects hosts written as non-public **IP
 literals** — private, CGNAT, link-local, loopback, multicast, site-local, and
 unspecified — including IPv4 addresses embedded in IPv6 literals and legacy
