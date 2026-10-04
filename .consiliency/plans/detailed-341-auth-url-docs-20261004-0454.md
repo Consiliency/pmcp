@@ -68,6 +68,40 @@
 >     follow-up.
 >
 > Every number below was re-measured on the rev-3 spike and proof tree.
+>
+> **Rev 4** (two more findings from the round-2 board):
+>
+> - **Grok F001: real.** Rev 3's `_is_public_ip` returned True early for a
+>   low-32-bit embedding, ISATAP included, as soon as the embedded IPv4 was
+>   public. It never classified the IPv6 address itself. So
+>   `https://[fe80::5efe:8.8.8.8]/` (link-local),
+>   `https://[fd00::5efe:8.8.8.8]/` (unique-local) and
+>   `https://[ff02::5efe:8.8.8.8]/` (multicast) were accepted. aiohttp dials
+>   that IPv6 literal: yarl's `raw_host` is `fe80::5efe:808:808`. Main
+>   behaved the same way, but the plan claims an accepted host is public.
+>   Rev 4 fixes the class: an IPv6 address is public only if **both** the
+>   address itself and every IPv4 address it embeds are public, with no
+>   early return for any embedding form (Design decision 10, mutant M44).
+>   The host generator now crosses every interface-id embedding (ISATAP
+>   `00-00-5E-FE` and `02-00-5E-FE`, `::ffff`-style and plain low 32 bits)
+>   with 16 IPv6 scope prefixes from the IANA special-purpose registry and
+>   the scoped ranges, times three IPv4 samples: 192 addresses. Against
+>   rev 3's sanitiser, the yarl differential fails on 18 hosts and the
+>   WHATWG differential fails as well. On rev 4 both pass.
+> - **Codex F001 / grok F006 (trailing newline): not real on the committed
+>   rev 3.** I extracted rev 3 (`deefcf9`) from the plan onto a fresh
+>   `31c1357` in a separate scratch worktree and ran codex's falsifier. It
+>   passes: `check_auth_config`, `sanitize_public_auth_url` and `AsyncJWKS`
+>   all drop a trailing `\n`, `\r`, `\r\n` or `\t`. The seats had read
+>   the live `pmcp-341` checkout while my mutation run had mutant M26 (no
+>   trailing strip) applied. The falsifier is now a test,
+>   `test_a_trailing_newline_or_tab_is_stripped_everywhere`, and M26 kills
+>   it.
+>
+> From rev 4 on, spikes, proofs and mutation runs use a separate scratch
+> worktree (`$WORKTREE_ROOT/pmcp-341-scratch`, removed at the end).
+> `pmcp-341` holds only the committed plan, and every number below was
+> measured there or in that scratch worktree.
 
 ## Task
 
@@ -681,13 +715,13 @@ The list comes from the IANA IPv6 Special-Purpose Address Registry plus the
 two RFC forms outside it, each cited in the code and in the
 `tests/test_auth.py` matrix:
 
-| Form | Prefix | Where the IPv4 address sits | Rev 3 |
+| Form | Prefix | Where the IPv4 address sits | Rev 3 / rev 4 |
 |---|---|---|---|
-| IPv4-mapped (RFC 4291, IANA) | `::ffff:0:0/96` | low 32 bits | classified on it (as before) |
-| IPv4-translated (RFC 6145) | `::ffff:0:0:0/96` | low 32 bits | **added**; `[::ffff:0:a9fe:a9fe]` was accepted |
-| IPv4-compatible (RFC 4291, deprecated) | `::/96` | low 32 bits | as before |
-| NAT64 well-known (RFC 6052, IANA) | `64:ff9b::/96` | low 32 bits | as before |
-| ISATAP (RFC 5214) | interface id `0:5efe` / `200:5efe` | low 32 bits | as before |
+| IPv4-mapped (RFC 4291, IANA) | `::ffff:0:0/96` | low 32 bits | rev 4: the IPv4 **and** the IPv6 address must be public |
+| IPv4-translated (RFC 6145) | `::ffff:0:0:0/96` | low 32 bits | **added** in rev 3 (`[::ffff:0:a9fe:a9fe]` was accepted); rev 4: both must be public |
+| IPv4-compatible (RFC 4291, deprecated) | `::/96` | low 32 bits | rev 4: both must be public |
+| NAT64 well-known (RFC 6052, IANA) | `64:ff9b::/96` | low 32 bits | rev 4: both must be public |
+| ISATAP (RFC 5214) | interface id `0:5efe` / `200:5efe` under **any** /64 | low 32 bits | rev 4: both must be public. This is grok F001: `fe80::`, `fd00::` and `ff02::` with ISATAP and 8.8.8.8 were accepted |
 | 6to4 (RFC 3056, IANA) | `2002::/16` | bits 16 to 47 (`IPv6Address.sixtofour`) | **added**: the IPv6 address and the embedded one must both be public |
 | Teredo (RFC 4380, IANA) | `2001::/32` | server at bits 32 to 63, client as the inverted low 32 bits (`IPv6Address.teredo`) | **added**: both must be public, and the IPv6 address too |
 | local-use NAT64 (RFC 8215, IANA) | `64:ff9b:1::/48` | the operator's choice (RFC 6052 2.2, /32 to /96) | **refused whole**: it cannot be located |
@@ -695,6 +729,52 @@ two RFC forms outside it, each cited in the code and in the
 On 3.10.21, `2002::/16`, `2001::/32` and `64:ff9b:1::/48` are already
 non-global. Rev 3 makes their refusal independent of the running Python's
 special-purpose table. Only IPv4-translated changes a measured outcome.
+
+**Rev 4: never on the embedded address alone.** Rev 3 kept main's shortcut:
+a low-32-bit embedding was public if its IPv4 address was. That is wrong for
+ISATAP. Its interface id can sit under any /64, and the address aiohttp
+dials is the IPv6 one. For the four translator prefixes, the IPv6 address's
+own `is_global` agrees with the embedded IPv4 on 3.10.21 (measured:
+`::ffff:8.8.8.8`, `::ffff:0:808:808`, `::808:808` and `64:ff9b::808:808`
+are all `is_global`), so requiring both changes nothing there.
+
+On an interpreter whose table calls `::ffff:0:0/96` non-global (the IANA
+registry marks it not globally reachable), `[::ffff:8.8.8.8]` would now be
+refused. That is the fail-closed direction, and it is stated, not hidden.
+
+`_is_public_ip` is now:
+
+```python
+if isinstance(address, IPv6Address):
+    if any(address in network for network in _V4_EMBEDDING_UNLOCATABLE):
+        return False
+    if not all(_is_public_single(v4) for v4 in _embedded_v4_addresses(address)):
+        return False
+return _is_public_single(address)
+```
+
+**The scope cross.** `_SCOPE_PREFIXES` lists 16 prefixes:
+
+- global unicast `2606:4700::`
+- link-local `fe80::/10`
+- site-local `fec0::/10`
+- ULA `fc00::/7`
+- multicast `ff02` and `ff0e`
+- documentation `2001:db8::/32` and `3fff::/20`
+- discard-only `100::/64`
+- benchmarking `2001:2::/48`
+- ORCHIDv2 `2001:20::/28`
+- AMT `2001:3::/32`
+- SRv6 `5f00::/16`
+- 6to4 `2002::/16`
+- Teredo `2001::/32`
+- `::/64`
+
+These are crossed with `_INTERFACE_IDS` (ISATAP `00-00-5E-FE`, ISATAP
+`02-00-5E-FE`, `::ffff` and plain low 32 bits) and with 8.8.8.8, 10.0.0.5
+and 127.0.0.1. That gives 192 bracketed hosts, appended to `_GENERATED`.
+They therefore go through the yarl differential, the WHATWG differential
+and the text-oracle truth test.
 
 `test_every_ipv4_embedding_is_classified_on_the_embedded_address` builds 54
 addresses by bit arithmetic: 9 forms by 6 IPv4 samples (public, loopback,
@@ -817,7 +897,7 @@ private, link-local, CGNAT and unspecified). It checks three things:
 
 ### `tests/test_auth_public_url_rule.py` (create)
 
-2176 tests, about 7 s (rev 3; rev 2 had 1134):
+2742 tests, about 11 s (rev 4; rev 3 had 2176, rev 2 1134):
 
 1. `test_the_sanitiser_applies_the_rule[class]`: each of the 83 classes,
    strict and operator.
@@ -898,6 +978,17 @@ private, link-local, CGNAT and unspecified). It checks three things:
     the test patches `IPv6Address.is_loopback` to say False for
     IPv4-mapped addresses, as older CPython releases did, and checks that
     the operator still accepts `http://[::ffff:127.0.0.1]/`. This kills M30.
+21. (rev 4) `test_an_embedded_public_ipv4_does_not_vouch_for_a_non_public_ipv6[host]`:
+    grok's four addresses (`fe80::5efe:8.8.8.8`, `fd00::5efe:8.8.8.8`,
+    `ff02::5efe:8.8.8.8`, `fe80::200:5efe:808:808`). For each, yarl's host
+    is non-public and the sanitiser refuses it.
+22. (rev 4) `test_a_trailing_newline_or_tab_is_stripped_everywhere`: codex's
+    falsifier, unchanged in substance. For each suffix (`\n`, `\r`,
+    `\r\n`, `\t`), `check_auth_config(jwks_url=…, metadata_url=…)` starts,
+    `sanitize_public_auth_url` returns the clean URL, and `AsyncJWKS(…).url`
+    is the clean URL.
+
+The generated hosts are now 476 and the truth-test inputs 1243.
 
 Item 7 now runs 83 classes x 9 entry points = 747 cases.
 
@@ -930,10 +1021,10 @@ mkdir -p /var/tmp/pmcp-341-bt-$USER
 Apply *Verbatim bodies* (see *How to apply*), then:
 
 ```bash
-# 1. the new module (spike: 2176 passed, 7.4 s)
+# 1. the new module (spike: 2742 passed, 9.9 s)
 .venv/bin/python -m pytest tests/test_auth_public_url_rule.py -q -p no:cacheprovider \
   --basetemp=/var/tmp/pmcp-341-bt-$USER/new --cov-fail-under=0
-# 2. the suites that touch auth, the HTTP transport, the CLI and the redactor (spike: 3187 passed, 55 deselected, 0 failed, 93 s)
+# 2. the suites that touch auth, the HTTP transport, the CLI and the redactor (spike: 3753 passed, 55 deselected, 0 failed, 102 s)
 env -u npm_config_cache -u npm_config_store_dir .venv/bin/python -m pytest \
   tests/test_auth.py tests/test_transport_http.py tests/test_auth_origin_wiring.py \
   tests/test_redaction_additive.py tests/test_auth_operator_messages.py tests/test_auth_public_url_rule.py \
@@ -943,43 +1034,38 @@ env -u npm_config_cache -u npm_config_store_dir .venv/bin/python -m pytest \
 .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
 .venv/bin/mypy src/pmcp/auth.py src/pmcp/cli.py src/pmcp/transport/http.py
 python3 scripts/check_security_claims.py          # expect OK, 129 cited node ids
-# 4. the full suite, once, detached (memory on dev0 is shared) (spike: 7712 passed, 3 skipped, 80 deselected, 0 failed, 495 s)
+# 4. the full suite, once, detached (memory on dev0 is shared) (spike: 8278 passed, 3 skipped, 80 deselected, 0 failed, 511 s)
 env -u npm_config_cache -u npm_config_store_dir nohup .venv/bin/python -m pytest -q -p no:cacheprovider \
   --basetemp=/var/tmp/pmcp-341-bt-$USER/full > "$WORKTREE_ROOT/pmcp-341-full.log" 2>&1 &
 ```
 
-**Red on main (rev 3).** On `31c1357` with only the new module added:
-**1465 failed, 711 passed**. The largest groups:
+**Red on main (rev 4).** On `31c1357` with only the new module added:
+**1735 failed, 1007 passed**. The largest groups:
 
 | Test | Failed |
 |---|---|
-| `test_each_message_is_true_and_acceptance_is_exact` | 744 |
+| `test_each_message_is_true_and_acceptance_is_exact` | 988 |
 | `test_every_entry_point_applies_the_rule` | 374 |
-| `test_pmcp_classifies_the_host_yarl_will_connect_to` | 230 |
+| `test_pmcp_classifies_the_host_yarl_will_connect_to` | 252 |
 | `test_the_sanitiser_applies_the_rule` | 42 |
 | `test_every_control_character_is_refused_inside_and_stripped_only_at_the_ends` | 33 |
 | `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http` | 21 |
-| `test_every_ipv4_embedding_is_classified_on_the_embedded_address` | 5 |
-| `test_the_panel_hosts_map_to_non_public_hosts_in_yarl_and_are_refused` | 4 |
+| `test_every_ipv4_embedding_is_classified_on_the_embedded_address` | 5 (the IPv4-translated non-public forms) |
+| `test_an_embedded_public_ipv4_does_not_vouch_for_a_non_public_ipv6` | 4 |
 | `test_tunnel_prefixes_are_classified_on_their_embedded_addresses` | 4 |
-| `test_operator_loopback_does_not_rest_on_is_loopback_for_mapped` | 1 |
+| `test_the_panel_hosts_map_to_non_public_hosts_in_yarl_and_are_refused` | 4 |
 
-Nine more tests fail once each: the WHATWG differential, the canonical
-one-wording test, the text-oracle coverage test, the README table, the
-superseded-wording test, the table-coverage test and the plain-http text
-test. (These per-test counts group parametrised ids by test name, so a few
-IPv6 ids may fall into the wrong group. The total is exact.)
+Eight single tests also fail: the WHATWG differential, the operator mapped
+loopback, the canonical one-wording test, the text-oracle coverage test,
+the README table, the superseded-wording test, the table-coverage test and
+the plain-http text test. `test_a_trailing_newline_or_tab_is_stripped_everywhere`
+passes on main, because main already stripped these.
 
-The differentials fail on main for the rev-2 F001 reason. The embedding
-test fails for exactly the five IPv4-translated addresses that embed a
-non-public IPv4 address (127.0.0.1, 10.0.0.5, 169.254.169.254, 100.64.0.1
-and 0.0.0.0). Main accepted all five, including `[::ffff:0:a9fe:a9fe]`.
-The five table-independence cases fail on main too. Under a table that
-calls the tunnel prefixes global, main accepts 6to4 and Teredo embedding
-10.0.0.5, and local-use NAT64. With `is_loopback` false for mapped
-addresses, main refuses the operator's `[::ffff:127.0.0.1]`. So on main
-these outcomes rest on the interpreter. The rev-2
-proof also ran the differentials against rev 1's sanitiser: 235 failed.
+**The rev-4 tests against rev 3's sanitiser** (rev 3's `auth.py` with rev
+4's test module): **41 failed, 2701 passed**. That is 18 in the yarl
+differential, 18 in the truth test, 4 in grok's addresses and 1 in the
+WHATWG differential. These are exactly the scope-crossed embeddings rev 3
+accepted.
 
 ## Acceptance criteria
 
@@ -1011,6 +1097,9 @@ proof also ran the differentials against rev 1's sanitiser: 235 failed.
       form is classified on its embedded address, and local-use NAT64 is
       refused.
 - [ ] (rev 3) The seat's falsifiers for F001 and F002 pass.
+- [ ] (rev 4) No IPv6 address is accepted unless it is public itself and
+      every IPv4 it embeds is public. The 192 scope-crossed embeddings pass
+      both differentials, and codex's trailing-newline falsifier passes.
 - [ ] (rev 2) A control character inside a URL is refused; leading
       spaces/controls and a trailing tab/CR/LF are still dropped.
 - [ ] The #326 module `tests/test_auth_operator_messages.py` passes
@@ -1021,7 +1110,7 @@ proof also ran the differentials against rev 1's sanitiser: 235 failed.
 ## Mutation table
 
 Measured on the proof tree (*Embedding proof*) with
-`scratchpad/341r3/mutants.py`; an earlier run on the spike, without M18, gave
+`scratchpad/341r4/mutants.py`; an earlier run on the spike, without M18, gave
 the same result for every other mutant. Each mutant is one
 or more exact string edits to `auth.py`, `transport/http.py`, `cli.py`,
 `README.md` or `CHANGELOG.md`. Each one runs
@@ -1030,14 +1119,14 @@ tests/test_auth_operator_messages.py` with `-o timeout=60` and a 300 s cap,
 then restores every touched file from its saved copy in a `finally`. After
 the run, every file was checked byte-identical by sha256.
 
-**42 mutants: 39 red, 3 equivalent (M13, M21, M36).** M19 is checked by mypy, not pytest. M20 to M31 are rev 2's, and M32 to M43 are rev 3's; M32 to M35 are the round-2 seat's own four survivors.
+**43 mutants: 40 red, 3 equivalent (M13, M21, M36).** M19 is checked by mypy, not pytest. M20 to M31 are rev 2's, M32 to M43 rev 3's (M32 to M35 are the round-2 claude seat's four survivors), and M44 is rev 4's early return. M26 (no trailing strip) is the mutant the round-2 seats saw live in the tree; it kills codex's falsifier.
 
 | # | Mutant | Red tests (measured) |
 |---|---|---|
-| M1 | old loopback text restored in the registry | 37 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_invalid_metadata_url_does_not_create_route_or_challenge_header`, `test_the_plain_http_text_makes_no_loopback_claim`, `test_the_text_oracle_covers_every_sanitiser_message` |
-| M2 | plain-http guard: `or` -> `and` (strict callers accept http) | 81 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
-| M3 | plain-http raise names PUBLIC_URL_NOT_PUBLIC | 115 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_message_site_is_driven`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_invalid_metadata_url_does_not_create_route_or_challenge_header`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_the_table_covers_every_member_the_sanitiser_raises`, `test_the_text_oracle_covers_every_sanitiser_message` |
-| M4 | non-public raise names PUBLIC_URL_PLAIN_HTTP_REFUSED | 317 red -- `test_an_ip_literal_jwks_url_keeps_its_specific_message_through_the_cli`, `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_message_site_is_driven`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_every_ipv4_embedding_is_classified_on_the_embedded_address`, `test_public_auth_url_error_message_does_not_claim_the_host_was_verified`, `test_public_auth_url_rejects_non_public_ip_literals`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_the_table_covers_every_member_the_sanitiser_raises`, `test_the_text_oracle_covers_every_sanitiser_message` |
+| M1 | old loopback text restored in the registry | 226 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_invalid_metadata_url_does_not_create_route_or_challenge_header`, `test_the_plain_http_text_makes_no_loopback_claim`, `test_the_text_oracle_covers_every_sanitiser_message` |
+| M2 | plain-http guard: `or` -> `and` (strict callers accept http) | 151 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
+| M3 | plain-http raise names PUBLIC_URL_NOT_PUBLIC | 150 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_message_site_is_driven`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_invalid_metadata_url_does_not_create_route_or_challenge_header`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_the_table_covers_every_member_the_sanitiser_raises`, `test_the_text_oracle_covers_every_sanitiser_message` |
+| M4 | non-public raise names PUBLIC_URL_PLAIN_HTTP_REFUSED | 471 red -- `test_an_ip_literal_jwks_url_keeps_its_specific_message_through_the_cli`, `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_message_site_is_driven`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_every_ipv4_embedding_is_classified_on_the_embedded_address`, `test_public_auth_url_error_message_does_not_claim_the_host_was_verified`, `test_public_auth_url_rejects_non_public_ip_literals`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_the_table_covers_every_member_the_sanitiser_raises`, `test_the_text_oracle_covers_every_sanitiser_message` |
 | M5 | not-absolute raise names PUBLIC_URL_INVALID | 87 red -- `test_cli_and_env_paths_refuse_at_startup`, `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_message_site_is_driven`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_startup_refuses_a_jwks_url_the_renderer_would_refuse`, `test_startup_refuses_a_metadata_url_the_renderer_would_refuse`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_the_table_covers_every_member_the_sanitiser_raises`, `test_the_text_oracle_covers_every_sanitiser_message` |
 | M6 | port no longer parsed in the sanitiser | 25 red -- `test_a_swapped_member_at_a_builtin_site_is_a_type_error_not_a_placeholder`, `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
 | M7 | `localhost` no longer a non-public name | 29 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_public_auth_url_rejects_non_public_ip_literals`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
@@ -1051,14 +1140,14 @@ the run, every file was checked byte-identical by sha256.
 | M15 | README drops the only `invalid URL` example | 1 red -- `test_the_readme_url_table_matches_the_code` |
 | M16 | README restores the superseded refused-list wording | 1 red -- `test_the_superseded_wording_is_gone` |
 | M17 | CHANGELOG restores the superseded wording | 1 red -- `test_the_superseded_wording_is_gone` |
-| M18 | AsyncJWKS stores its URL unsanitised | 3 red -- `test_a_value_the_store_cleans_is_checked_as_stored` |
+| M18 | AsyncJWKS stores its URL unsanitised | 4 red -- `test_a_trailing_newline_or_tab_is_stripped_everywhere`, `test_a_value_the_store_cleans_is_checked_as_stored` |
 | M20 | rev 2: the canonical-host check removed | 752 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_public_auth_host_does_not_read_python_int_quirks_as_addresses`, `test_public_auth_url_still_accepts_non_numeric_hosts_after_canonicalisation`, `test_the_panel_hosts_map_to_non_public_hosts_in_yarl_and_are_refused`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
 | M21 | rev 2: non-ASCII hosts allowed (isascii check dropped) | **0 red -- equivalent** (see below) |
 | M22 | rev 2: IPv6 zone ids allowed | 26 red -- `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_the_sanitiser_applies_the_rule` |
 | M23 | rev 2/3: no digit-led-last-label branch (legacy numeric read as names) | 172 red -- `test_an_ip_literal_jwks_url_keeps_its_specific_message_through_the_cli`, `test_auth_challenge_marks_a_public_literal_verified`, `test_auth_metadata_reports_a_literal_and_a_name_differently`, `test_downstream_elicitation_marks_a_public_literal_verified`, `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_entry_point_applies_the_rule`, `test_fetch_json_metadata_uses_safe_request_headers`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_public_auth_url_accepts_public_ip_literals`, `test_public_auth_url_error_message_does_not_claim_the_host_was_verified`, `test_sanitize_url_elicitation_url_allows_loopback_http_for_operator`, `test_the_plain_http_member_is_reached_by_exactly_the_refused_plain_http`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule`, `test_url_elicitation_next_step_is_unqualified_for_a_verified_literal` |
-| M24 | rev 2: host checked unbracketed and lowercased (`parsed.hostname`) | 281 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_every_ipv4_embedding_is_classified_on_the_embedded_address`, `test_operator_loopback_does_not_rest_on_is_loopback_for_mapped`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_s10_metadata_resource_fallback_keeps_ipv6_brackets`, `test_sanitize_url_elicitation_url_allows_loopback_http_for_operator`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
+| M24 | rev 2: host checked unbracketed and lowercased (`parsed.hostname`) | 846 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_every_ipv4_embedding_is_classified_on_the_embedded_address`, `test_operator_loopback_does_not_rest_on_is_loopback_for_mapped`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_s10_metadata_resource_fallback_keeps_ipv6_brackets`, `test_sanitize_url_elicitation_url_allows_loopback_http_for_operator`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
 | M25 | rev 2: control characters inside the URL allowed | 155 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_builtin_refusal_goes_through_the_renderer`, `test_every_control_character_is_refused_inside_and_stripped_only_at_the_ends`, `test_every_entry_point_applies_the_rule`, `test_the_sanitiser_applies_the_rule` |
-| M26 | rev 2: trailing newline no longer stripped | 32 red -- `test_a_value_the_store_cleans_is_checked_as_stored`, `test_configs_that_start_on_main_still_start`, `test_each_message_is_true_and_acceptance_is_exact`, `test_every_control_character_is_refused_inside_and_stripped_only_at_the_ends`, `test_every_entry_point_applies_the_rule`, `test_the_sanitiser_applies_the_rule` |
+| M26 | rev 2: trailing newline no longer stripped | 33 red -- `test_a_trailing_newline_or_tab_is_stripped_everywhere`, `test_a_value_the_store_cleans_is_checked_as_stored`, `test_configs_that_start_on_main_still_start`, `test_each_message_is_true_and_acceptance_is_exact`, `test_every_control_character_is_refused_inside_and_stripped_only_at_the_ends`, `test_every_entry_point_applies_the_rule`, `test_the_sanitiser_applies_the_rule` |
 | M27 | rev 2: LDH labels allow underscore | 12 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_sanitiser_applies_the_rule` |
 | M28 | rev 2: empty labels allowed (trailing dot passes) | 21 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_sanitiser_applies_the_rule` |
 | M29 | rev 2: IPv4 not required to be in canonical text (leading zeros) | 75 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_every_entry_point_applies_the_rule`, `test_pmcp_classifies_the_host_a_browser_will_open`, `test_pmcp_classifies_the_host_yarl_will_connect_to`, `test_the_readme_url_table_matches_the_code`, `test_the_sanitiser_applies_the_rule` |
@@ -1076,6 +1165,7 @@ the run, every file was checked byte-identical by sha256.
 | M41 | rev 3: Teredo embedded addresses not classified | 2 red (parametrised ids only) |
 | M42 | rev 3: a message clause reworded without re-deriving its oracle | 539 red -- `test_each_message_is_true_and_acceptance_is_exact`, `test_the_canonical_rule_has_one_wording`, `test_the_text_oracle_covers_every_sanitiser_message` |
 | M43 | rev 3: README canonical clause drifts from the source | 1 red -- `test_the_canonical_rule_has_one_wording` |
+| M44 | rev 4 (grok F001): early return on a low-32-bit embedding, skipping the IPv6 address itself | 41 red -- `test_pmcp_classifies_the_host_a_browser_will_open` |
 | M19 | `_is_absolute_http(parsed: str)` or `(parsed: SplitResult)` | mypy: `arg-type` at both call sites (`auth.py:232`, `auth.py:779` on the rev-3 spike); with main's `Any`, mypy is silent |
 
 M13 is **equivalent**. `AsyncJWKS.__init__`, constructed on the next line,
@@ -1152,7 +1242,7 @@ Every other mutant is red.
 
 ````diff
 diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
-index 51b2d05..ac7b72d 100644
+index 51b2d05..0c5685d 100644
 --- a/src/pmcp/auth.py
 +++ b/src/pmcp/auth.py
 @@ -13,7 +13,7 @@ from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
@@ -1403,10 +1493,12 @@ index 51b2d05..ac7b72d 100644
      bad properties is deliberate: the subtractive form missed RFC 6598 CGNAT and
      RFC 3879 site-local. `is_global` alone is not enough -- it is True for
 -    ``fec0::1`` and, on Python 3.10, for multicast.
-+    ``fec0::1`` and, on Python 3.10, for multicast. A low-32-bit embedding
-+    (mapped, translated, compatible, NAT64, ISATAP) is classified on its IPv4
-+    address alone, as before -- that address is what a translator reaches; 6to4
-+    and Teredo must pass on both; RFC 8215 local-use NAT64 is refused.
++    ``fec0::1`` and, on Python 3.10, for multicast. An IPv6 address is public
++    only if it is public itself AND every IPv4 address it embeds is public --
++    never on an embedded form alone (#341 rev 4: an ISATAP interface id under
++    `fe80::/10`, `fd00::/8` or `ff00::/8` carrying 8.8.8.8 is still a
++    link-local, unique-local or multicast address, and aiohttp dials it).
++    RFC 8215 local-use NAT64 is refused.
      """
 -    unwrapped = _unwrap_embedded_v4(address)
 -    return bool(
@@ -1420,8 +1512,6 @@ index 51b2d05..ac7b72d 100644
 +        embedded = _embedded_v4_addresses(address)
 +        if not all(_is_public_single(v4) for v4 in embedded):
 +            return False
-+        if _is_translated_v4(address):
-+            return True
 +    return _is_public_single(address)
  
  
@@ -2205,12 +2295,10 @@ def _is_public_literal(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -
     if isinstance(address, ipaddress.IPv6Address):
         if address in _UNLOCATABLE:
             return False
-        translated, embedded = _embedded_v4(address)
+        _, embedded = _embedded_v4(address)
         if not all(_public_one(v4) for v4 in embedded):
             return False
-        if translated:
-            return True
-    return _public_one(address)
+    return _public_one(address)  # rev 4: the IPv6 address itself, always
 
 
 def _is_loopback(host: str) -> bool:
@@ -2765,7 +2853,53 @@ def _generated_hosts() -> list[str]:
         "[v1.fe]",
         "[：：1]",  # fullwidth colons
     ]
+    hosts += [f"[{address}]" for address in _scoped_embeddings()]
     return list(dict.fromkeys(hosts))
+
+
+# Rev 4 (#346 round 2, grok F001): every IPv4-embedding interface id crossed
+# with every IPv6 scope -- the IANA IPv6 Special-Purpose Address Registry's
+# blocks, the scoped ranges (link-local, site-local, ULA, multicast) and a
+# global unicast prefix -- so an embedded public IPv4 cannot vouch for a
+# non-public IPv6 address.
+_SCOPE_PREFIXES = {
+    "global unicast": "2606:4700::",
+    "link-local fe80::/10": "fe80::",
+    "site-local fec0::/10": "fec0::",
+    "ULA fc00::/7": "fd00::",
+    "multicast ff02 (link)": "ff02::",
+    "multicast ff0e (global)": "ff0e::",
+    "documentation 2001:db8::/32": "2001:db8::",
+    "documentation 3fff::/20": "3fff::",
+    "discard-only 100::/64": "100::",
+    "benchmarking 2001:2::/48": "2001:2::",
+    "ORCHIDv2 2001:20::/28": "2001:20::",
+    "AMT 2001:3::/32": "2001:3::",
+    "SRv6 SIDs 5f00::/16": "5f00::",
+    "6to4 2002::/16": "2002::",
+    "Teredo 2001::/32": "2001::",
+    "loopback/unspecified ::/64": "::",
+}
+_INTERFACE_IDS = {
+    "ISATAP 00-00-5E-FE": 0x00005EFE,
+    "ISATAP 02-00-5E-FE (u/g)": 0x02005EFE,
+    "IPv4-mapped-like ::ffff": 0x0000FFFF,
+    "plain low 32 bits": 0,
+}
+
+
+def _scoped_embeddings() -> list[ipaddress.IPv6Address]:
+    out = []
+    for prefix in _SCOPE_PREFIXES.values():
+        base = int(ipaddress.IPv6Address(prefix)) & ~((1 << 64) - 1)
+        for iid in _INTERFACE_IDS.values():
+            for v4 in ("8.8.8.8", "10.0.0.5", "127.0.0.1"):
+                out.append(
+                    ipaddress.IPv6Address(
+                        base | (iid << 32) | int(ipaddress.IPv4Address(v4))
+                    )
+                )
+    return out
 
 
 _GENERATED = _generated_hosts()
@@ -3160,20 +3294,54 @@ def test_operator_loopback_does_not_rest_on_is_loopback_for_mapped(
         _outcome(lambda: sanitize_public_auth_url(url, allow_loopback_http=True))
         is None
     )
+
+
+def test_a_trailing_newline_or_tab_is_stripped_everywhere() -> None:
+    """The round-2 codex seat's falsifier (F001), verbatim in substance: a
+    file-backed secret's trailing newline, CR, CRLF or tab is dropped by the
+    sanitiser, the startup check and `AsyncJWKS` alike."""
+    clean = "https://auth.example.com/jwks.json"
+    for suffix in ("\n", "\r", "\r\n", "\t"):
+        check_auth_config(jwks_url=clean + suffix, metadata_url=clean + suffix)
+        assert sanitize_public_auth_url(clean + suffix) == clean
+        assert auth_mod.AsyncJWKS(clean + suffix).url == clean
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "fe80::5efe:8.8.8.8",
+        "fd00::5efe:8.8.8.8",
+        "ff02::5efe:8.8.8.8",
+        "fe80::200:5efe:808:808",
+    ],
+)
+def test_an_embedded_public_ipv4_does_not_vouch_for_a_non_public_ipv6(
+    host: str,
+) -> None:
+    """The round-2 grok seat's F001: an ISATAP interface id carrying 8.8.8.8
+    under a link-local, unique-local or multicast prefix is that IPv6 address
+    to aiohttp, so it is refused."""
+    url = f"https://[{host}]/jwks.json"
+    fetched = _yarl_host(url)
+    assert fetched is not None and not _is_public(fetched)
+    assert _outcome(lambda: sanitize_public_auth_url(url)) == NOT_PUBLIC
 ````
 
 ## Embedding proof
 
 The bodies above were taken **back out of this file**, not out of the
-spike, and applied to a fresh `31c1357`:
+spike. They were applied to a fresh `31c1357` in a **separate scratch
+worktree** (`$WORKTREE_ROOT/pmcp-341-scratch`, removed afterwards).
+`pmcp-341` held only the committed plan throughout.
 
 ```bash
 python3 extract.py detailed-341-auth-url-docs-*.md extracted/
 cmp extracted/<each> <the spike's own git diff / file>   # all four: identical
-git switch -c proof5/341 origin/main                      # 31c1357
+git switch -c proof6/341 origin/main                      # 31c1357, in the scratch worktree
 git apply extracted/341-src.patch extracted/341-tests.patch extracted/341-docs.patch   # clean, no fuzz
 cp extracted/test_auth_public_url_rule.py tests/
-git diff spike3/341 -- src tests README.md CHANGELOG.md   # tracked files: no difference
+git diff spike4/341 -- src tests README.md CHANGELOG.md   # tracked files: no difference
 ```
 
 Measured on that proof tree (CPython 3.10.21, yarl 1.22.0, aiohttp 3.14.3,
@@ -3181,14 +3349,16 @@ node v24.20.0):
 
 | Step | Result |
 |---|---|
-| new module | 2176 passed, 0 skipped (the WHATWG differential ran) |
-| auth / transport / CLI / redactor suites (step 2) | 3187 passed, 55 deselected, 0 failed, 93 s |
+| new module | 2742 passed, 0 skipped (the WHATWG differential ran) |
+| auth / transport / CLI / redactor suites (step 2) | 3753 passed, 55 deselected, 0 failed, 102 s |
 | `ruff check src tests` | All checks passed |
 | `ruff format --check src tests` | 175 files already formatted |
 | `mypy src/pmcp/auth.py src/pmcp/cli.py src/pmcp/transport/http.py` | Success: no issues found in 3 source files |
 | `scripts/check_security_claims.py` | OK, 129 cited node id(s) |
-| the round-2 seat's falsifiers (F001, F002), from scratch files | 35 passed |
-| mutation table | 42 mutants: 39 red, 3 equivalent (M13, M21, M36); tree byte-identical afterwards |
-| full suite, run alone, `env -u npm_config_cache -u npm_config_store_dir` | 7712 passed, 3 skipped, 80 deselected, 0 failed, 495 s |
-| red on main (module only, on `31c1357`) | 1465 failed, 711 passed |
+| the round-2 claude seat's falsifiers (F001, F002), from scratch files | 35 passed |
+| codex's trailing-newline falsifier (`test_a_trailing_newline_or_tab_is_stripped_everywhere`) | passes; it also passed on the committed rev 3 (`deefcf9`) extracted onto fresh main |
+| mutation table | 43 mutants: 40 red, 3 equivalent (M13, M21, M36); tree byte-identical afterwards |
+| full suite, run alone, `env -u npm_config_cache -u npm_config_store_dir` | 8278 passed, 3 skipped, 80 deselected, 0 failed, 511 s |
+| red on main (module only, on `31c1357`) | 1735 failed, 1007 passed |
+| rev-4 module against rev 3's `auth.py` | 41 failed, 2701 passed |
 
