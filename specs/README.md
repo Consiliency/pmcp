@@ -8,20 +8,25 @@ historical phase roadmaps. Use this index when onboarding new development work.
 - `tenant-code-mode-host-contract.md` - PMCP/companion-server boundary for
   hosted tenant code-mode execution. PMCP is the broker; the companion server is
   the execution authority.
-- `phase-plans-v6.md` - completed tenant code-mode host-readiness roadmap. All
-  phase exit criteria are reconciled; no further v6 phase is pending.
 - `../README.md` - user/operator documentation, setup flows, gateway tools, task
   lifecycle, tenant code-mode registration, and policy examples.
-- `../SECURITY.md` - production hardening checklist, threat model, and explicit
-  limits for shared-service HTTP and tenant code-mode hosting.
+- `../SECURITY.md` - production hardening checklist, threat model, the v13 trust
+  boundary claim-ledger, and explicit limits for shared-service HTTP and tenant
+  code-mode hosting.
+- `../SPEC_COMPLIANCE.md` - MCP specification compliance notes.
 - `../CHANGELOG.md` - release notes and unreleased changes.
 
 ## Historical Roadmaps
 
-The older `phase-plans-v1.md` through `phase-plans-v5.md` files are retained as
-implementation history. They may contain unchecked planning checkboxes from
-their original roadmap shape; prefer the matching `plans/phase-plan-*` closeout
-files and `CHANGELOG.md` when checking what actually shipped.
+Every `phase-plans-v1.md` through `phase-plans-v13.md` file is implementation
+history; none is a pending backlog. `phase-plans-v13.md` (trust boundaries) is
+the most recent: its TRUST, CONSENT, PKGID, EGRESS and SEAL phases have all
+merged. `phase-plans-v10.md` is marked CLOSED in its header, and
+`phase-plans-v6.md` is the completed tenant code-mode host-readiness roadmap
+behind the contract above. Older files may contain unchecked planning
+checkboxes from their original roadmap shape; prefer the matching
+`plans/phase-plan-*` files (where they exist) and `CHANGELOG.md` when checking
+what actually shipped.
 
 `active/pmcp-gateway-orchestration-plan.md` is also historical despite living
 under `active/`; it is marked implemented in the file header and should not be

@@ -9,11 +9,11 @@
     for url in urls:
         mcp.call_tool("gateway.invoke", {"tool_id": "playwright::browser_navigate", "arguments": {"url": url}})
 
-"playwright::browser_screenshot":
+"playwright::browser_take_screenshot":
   snippet: |
     # Capture screenshots in a loop
     for i, url in enumerate(urls):
-        mcp.call_tool("gateway.invoke", {"tool_id": "playwright::browser_screenshot", "arguments": {"path": f"shot_{i}.png"}})
+        mcp.call_tool("gateway.invoke", {"tool_id": "playwright::browser_take_screenshot", "arguments": {"filename": f"shot_{i}.png"}})
 
 "playwright::browser_click":
   snippet: |

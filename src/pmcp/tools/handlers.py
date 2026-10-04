@@ -517,7 +517,7 @@ _GATEWAY_TOOL_SPECS: tuple[_GatewayToolSpec, ...] = (
         name="gateway.catalog_search",
         input_model=CatalogSearchInput,
         description=(
-            "Search for available tools across all connected MCP servers. Returns compact capability cards without full schemas. Use filters to narrow results by server, tags, or risk level. Set include_offline=True to also discover provisionable servers not yet running. This is the primary tool discovery entry point."
+            "Search for available tools across all connected MCP servers. Returns compact capability cards without full schemas. Use filters to narrow results by server, tags, or risk level. Set include_offline=true to also include cached tools of offline servers and, with a query, provisionable manifest servers not yet started. This is the primary tool discovery entry point."
         ),
     ),
     _GatewayToolSpec(
@@ -615,7 +615,7 @@ _GATEWAY_TOOL_SPECS: tuple[_GatewayToolSpec, ...] = (
         name="gateway.update_server",
         input_model=UpdateServerInput,
         description=(
-            "Update a subordinate MCP server package to latest version and restart it so the new version is actually running. Call this to check for and apply an update -- the gateway does not volunteer update notices, so nothing will prompt you. Refuses to restart by default when the server has pending requests; set force=true to cancel them."
+            "Update a subordinate MCP server package to latest version and restart it so the new version is actually running. Call this to check for and apply an update -- the gateway does not volunteer update notices, so nothing will prompt you. Refuses a server whose config pins a version, and a server registered with gateway.register_discovered_server. Refuses to restart by default when the server has pending requests; set force=true to cancel them."
         ),
     ),
     _GatewayToolSpec(
@@ -676,21 +676,21 @@ _GATEWAY_TOOL_SPECS: tuple[_GatewayToolSpec, ...] = (
         name="gateway.tasks_cancel",
         input_model=TasksCancelInput,
         description=(
-            "Cancel a downstream MCP task by opaque task ID. Use gateway.cancel only for PMCP request IDs from gateway.list_pending."
+            "Cancel a downstream MCP task by opaque task ID. Only a task PMCP has recorded (from gateway.invoke with task, gateway.tasks_list or gateway.tasks_get) can be cancelled; an already-finished task is reported without a downstream call. Use gateway.cancel only for PMCP request IDs from gateway.list_pending."
         ),
     ),
     _GatewayToolSpec(
         name="gateway.search_registry",
         input_model=SearchRegistryInput,
         description=(
-            "Search the public MCP Registry for external servers not in the local manifest. Use this when gateway.request_capability returns not_available. Returns package names and metadata; call gateway.register_discovered_server then gateway.provision to install."
+            "Search the public MCP Registry for external servers not in the local manifest. Use this when gateway.request_capability returns not_available. Returns package names and metadata; call gateway.register_discovered_server then gateway.provision to install. Provisioning a discovered package needs an operator to approve its exact version first (pmcp trust approve-package) unless package policy allows it."
         ),
     ),
     _GatewayToolSpec(
         name="gateway.register_discovered_server",
         input_model=RegisterDiscoveredServerInput,
         description=(
-            "Register an externally-discovered MCP server package so it can be provisioned. Call this after gateway.search_registry to register the chosen package, then call gateway.provision to install and start it."
+            "Register an externally-discovered MCP server package so it can be provisioned. Call this after gateway.search_registry to register the chosen package, then call gateway.provision to install and start it. Registration pins the version resolved from npm; gateway.provision refuses it until an operator approves that exact version (pmcp trust approve-package) or package policy allows it."
         ),
     ),
 )

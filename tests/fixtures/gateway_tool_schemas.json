@@ -125,7 +125,7 @@
    },
    "include_offline": {
     "default": false,
-    "description": "Include tools from offline servers",
+    "description": "Also include cached tools of offline servers and, with a query, manifest servers never started (manifest_candidates)",
     "type": "boolean"
    },
    "limit": {
@@ -230,7 +230,7 @@
     "description": "Timeout, output truncation, and redaction options",
     "properties": {
      "max_output_chars": {
-      "description": "Maximum output characters (truncated if exceeded)",
+      "description": "Output size budget for this call: output is truncated at 4x this many UTF-8 bytes",
       "maximum": 100000,
       "minimum": 100,
       "type": [
@@ -240,7 +240,7 @@
      },
      "redact_secrets": {
       "default": false,
-      "description": "Redact detected secrets from output",
+      "description": "Redact detected secrets from output. Without options, task results are redacted and plain results are not",
       "type": "boolean"
      },
      "timeout_ms": {
@@ -657,7 +657,7 @@
   "properties": {
    "force": {
     "default": false,
-    "description": "Cancel even if the task is healthy",
+    "description": "Passed as force in the downstream tasks/cancel request; PMCP applies no health check of its own",
     "type": "boolean"
    },
    "requestor_context": {
@@ -745,7 +745,7 @@
     "description": "Output redaction and truncation options",
     "properties": {
      "max_output_chars": {
-      "description": "Maximum output characters (truncated if exceeded)",
+      "description": "Output size budget for this call: output is truncated at 4x this many UTF-8 bytes",
       "maximum": 100000,
       "minimum": 100,
       "type": [
@@ -755,7 +755,7 @@
      },
      "redact_secrets": {
       "default": false,
-      "description": "Redact detected secrets from output",
+      "description": "Redact detected secrets from output. Without options, task results are redacted and plain results are not",
       "type": "boolean"
      },
      "timeout_ms": {
