@@ -13,7 +13,7 @@ from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from itertools import product
 from typing import Any, Literal
 from urllib.error import HTTPError
-from urllib.parse import parse_qsl, quote, urlparse, urlunparse
+from urllib.parse import ParseResult, parse_qsl, quote, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import aiohttp
@@ -54,6 +54,19 @@ class PyJwtText(str):
         obj = super().__new__(cls, text)
         obj._minted = _PYJWT_MINT
         return obj
+
+
+#: The canonical host forms (Consiliency/pmcp#341 rev 3), one clause each.
+#: The single source of the rule: `AuthMessage.PUBLIC_URL_HOST_NOT_CANONICAL`
+#: is built from these clauses, and tests require the README rule and the
+#: `sanitize_public_auth_url` docstring to carry each one verbatim.
+CANONICAL_HOST_FORMS = (
+    "a DNS name of dot-separated labels of 1 to 63 ASCII letters, digits and "
+    "hyphens, each starting and ending with a letter or digit, the last "
+    "starting with a letter, so never a number (an IDN in its xn-- form)",
+    "a dotted-quad IPv4 address with no leading zeros",
+    "a bracketed IPv6 address with no zone id",
+)
 
 
 class AuthMessage:
@@ -108,11 +121,37 @@ class AuthMessage:
     PUBLIC_URL_NOT_ABSOLUTE = AuthText(
         "Public auth URL must be an absolute HTTP(S) URL."
     )
-    PUBLIC_URL_HTTP_LOOPBACK_ONLY = AuthText(
-        "Public auth URL only allows http:// URLs for loopback hosts."
+    # Consiliency/pmcp#341: was PUBLIC_URL_HTTP_LOOPBACK_ONLY, "Public auth
+    # URL only allows http:// URLs for loopback hosts." -- false for every
+    # caller that does not allow loopback http (the JWKS URL, the metadata
+    # URL, the CLI), where `http://127.0.0.1` reaches it too. It is raised
+    # for exactly the plain-http URLs the caller refuses, and says only that.
+    PUBLIC_URL_PLAIN_HTTP_REFUSED = AuthText(
+        "Plain http:// is not accepted for this public auth URL."
     )
     PUBLIC_URL_NOT_PUBLIC = AuthText(
         "Public auth URL host is a non-public IP literal or loopback name."
+    )
+    # Consiliency/pmcp#341 rev 2: a host is classified only in the one form
+    # every fetcher reads the same way. yarl/aiohttp NFKC- and IDNA-map
+    # `１２７.0.0.1` and `127。0。0。1` to 127.0.0.1, and a WHATWG parser
+    # decodes `127%2E0%2E0%2E1`; pmcp saw names there. Anything else is
+    # refused, not rewritten. Rev 3: the text states the whole rule, from
+    # `CANONICAL_HOST_FORMS`, so it is true of every host it refuses.
+    PUBLIC_URL_CONTROL_CHARACTER = AuthText(
+        "Public auth URL contains a control character."
+    )
+    # Rev 3: WHATWG ends the authority at `\` (yarl and urlsplit do not), so
+    # `https://127.0.0.1\@auth.example.com/` is 127.0.0.1 to a browser.
+    PUBLIC_URL_BACKSLASH = AuthText("Public auth URL contains a backslash.")
+    PUBLIC_URL_HOST_NOT_CANONICAL = AuthText(
+        "Public auth URL host must be "
+        + CANONICAL_HOST_FORMS[0]
+        + "; "
+        + CANONICAL_HOST_FORMS[1]
+        + "; or "
+        + CANONICAL_HOST_FORMS[2]
+        + "."
     )
     ELICITATION_URL_INVALID = AuthText("Invalid URL-mode elicitation URL.")
     # -- HTTP transport startup refusals --
@@ -172,7 +211,7 @@ _MEMBER_FIELDS = {
 _SCOPE_LIST = re.compile(r"[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*")
 
 
-def _is_absolute_http(parsed: Any) -> bool:
+def _is_absolute_http(parsed: ParseResult) -> bool:
     """The absolute-HTTP(S) rule `sanitize_public_auth_url` applies to every
     configured auth URL: an http(s) scheme, a netloc and a hostname."""
     return (
@@ -399,31 +438,108 @@ def redact_auth_url(url: str) -> str:
 
 
 def _is_loopback_host(hostname: str) -> bool:
+    """`localhost`, an IPv4 address in 127.0.0.0/8, `::1`, or an IPv4-mapped
+    form of 127.0.0.0/8 (`::ffff:127.0.0.1`). The mapped form is unwrapped
+    here so the answer does not depend on the running Python's
+    `IPv6Address.is_loopback`. A zone id never gets this far: the host has
+    already passed `_is_canonical_host` (Consiliency/pmcp#341)."""
     if hostname.lower() == "localhost":
         return True
     try:
-        return ip_address(hostname).is_loopback
+        address = ip_address(hostname)
     except ValueError:
         return False
+    if isinstance(address, IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped.is_loopback
+    return address.is_loopback
 
 
-# Every IPv6 format that carries an IPv4 address in its low 32 bits. The set is
-# closed and RFC-specified, so enumerating it is defensible -- but the list must
-# not live only here. The matrix in tests/test_auth.py names each format with its
-# RFC so that a seventh format is a visible gap rather than a silent one.
+# Consiliency/pmcp#341 rev 2: the one host form every fetcher reads alike.
+# What is stripped before a URL is checked: leading C0 controls and spaces
+# (as `urlsplit` and a WHATWG parser strip them) and a trailing tab, CR or
+# LF (a file-backed secret's newline, which `urlsplit` deletes anyway). Any
+# other C0 control or DEL is refused: `urlsplit` silently deletes tab, CR
+# and LF *inside* a URL (`key\tset.json` -> `keyset.json`) and passes NUL.
+# A trailing space is kept, as before, and refused at startup (#326).
+_C0_OR_SPACE = "".join(chr(code) for code in range(0x21))
+_TRAILING_NEWLINE = "\t\r\n"
+# `CANONICAL_HOST_FORMS[0]`: 1-63 letters, digits, hyphens; a letter or
+# digit at each end. The last label must also start with a letter: a WHATWG
+# parser reads a host whose last label is a number (`example.123`,
+# `0x7f.1`) as an IPv4 address or rejects it, and `getaddrinfo` reads
+# `2130706433` as 127.0.0.1, so a host whose last label starts with a digit
+# is accepted only as a dotted quad (rev 3: "starts with a letter" replaces
+# rev 2's WHATWG-number test; it is stricter and states in one phrase).
+_LDH_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+
+
+def _raw_host(netloc: str) -> str:
+    """The host exactly as written in `netloc`: no userinfo, no port, brackets
+    kept, case kept. `ParseResult.hostname` lowercases and unbrackets it,
+    which hides `[v1.fe]` and would let a check pass on a rewritten form."""
+    hostinfo = netloc.rpartition("@")[2]
+    if hostinfo.startswith("["):
+        end = hostinfo.find("]")
+        return hostinfo if end < 0 else hostinfo[: end + 1]
+    return hostinfo.partition(":")[0]
+
+
+def _is_canonical_host(raw: str) -> bool:
+    """True only for a host in one of `CANONICAL_HOST_FORMS` -- the forms
+    yarl/aiohttp, `getaddrinfo` and a WHATWG parser all read as the same name
+    or address that `ipaddress` does. Refused rather than rewritten: Unicode
+    (NFKC/IDNA mapping turns `１２７.0.0.1` into 127.0.0.1), `%` escapes,
+    underscores, empty labels (a trailing dot), legacy numeric and octal
+    forms, and a bracketed host that is not IPv6 (`[v1.fe]`)."""
+    if not raw.isascii():
+        return False
+    if raw.startswith("["):
+        inner = raw[1:-1]
+        if not raw.endswith("]") or "%" in inner:
+            return False
+        try:
+            IPv6Address(inner)
+        except ValueError:
+            return False
+        return True
+    labels = raw.split(".")
+    if labels[-1][:1].isdigit():
+        try:
+            return str(IPv4Address(raw)) == raw
+        except ValueError:
+            return False
+    return labels[-1][:1].isalpha() and all(
+        _LDH_LABEL.fullmatch(label) for label in labels
+    )
+
+
+# Every IPv6 format that carries an IPv4 address in its low 32 bits, where
+# the IPv4 address is what a translator reaches. The set is closed and
+# RFC-specified, so enumerating it is defensible -- but the list must not live
+# only here. The matrix in tests/test_auth.py names each format with its RFC
+# so that a new format is a visible gap rather than a silent one.
 _V4_EMBEDDING_NETWORKS = (
-    ip_network("::ffff:0:0/96"),  # RFC 4291 IPv4-mapped
+    ip_network("::ffff:0:0/96"),  # RFC 4291 IPv4-mapped (IANA special-purpose)
+    ip_network("::ffff:0:0:0/96"),  # RFC 2765/6145 IPv4-translated (SIIT); #341 rev 3
     ip_network("::/96"),  # RFC 4291 IPv4-compatible (deprecated)
-    ip_network("64:ff9b::/96"),  # RFC 6052 NAT64 well-known prefix
+    ip_network("64:ff9b::/96"),  # RFC 6052 NAT64 well-known prefix (IANA)
 )
+# RFC 8215 local-use NAT64 (IANA special-purpose 64:ff9b:1::/48): the IPv4
+# address sits where the operator's prefix length puts it (RFC 6052 2.2, /32
+# to /96), so pmcp cannot locate it. Refused whole, whatever the running
+# Python's `is_global` says (#341 rev 3).
+_V4_EMBEDDING_UNLOCATABLE = (ip_network("64:ff9b:1::/48"),)
 # RFC 5214 §6.1: an ISATAP interface identifier is the full 32 bits
 # `00-00-5E-FE` -- or `02-00-5E-FE` with the u/g bit set -- immediately followed
 # by the IPv4 address in the low 32 bits. Matching only the `5efe` hextet is not
 # enough to identify ISATAP: `2606:4700::1234:5efe:a00:5` is an ordinary global
 # address that merely happens to carry `5efe` there, and unwrapping it would
 # reject a genuinely public host.
-# RFC 3056 6to4 (2002::/16) and RFC 4380 Teredo (2001::/32) need no unwrapping
-# because neither prefix is global.
+# RFC 3056 6to4 (2002::/16) and RFC 4380 Teredo (2001::/32) embed IPv4
+# addresses outside the low 32 bits (`IPv6Address.sixtofour`, `.teredo`,
+# whose client address is de-obfuscated). Both prefixes are non-global today,
+# but since #341 rev 3 their embedded addresses are classified as well, so
+# the answer does not rest on the running Python's special-purpose table.
 _ISATAP_INTERFACE_IDS = (0x00005EFE, 0x02005EFE)
 
 # inet_aton part grammar. A part is hex, octal, or decimal; a leading zero is
@@ -434,33 +550,54 @@ _OCTAL_PART = re.compile(r"0[0-7]*")
 _DECIMAL_PART = re.compile(r"[0-9]+")
 
 
-def _unwrap_embedded_v4(
-    address: IPv4Address | IPv6Address,
-) -> IPv4Address | IPv6Address:
-    """Return the IPv4 address an IPv6 literal embeds, or the address unchanged."""
-    if isinstance(address, IPv6Address):
-        for network in _V4_EMBEDDING_NETWORKS:
-            if address in network:
-                return IPv4Address(int(address) & 0xFFFFFFFF)
-        if ((int(address) >> 32) & 0xFFFFFFFF) in _ISATAP_INTERFACE_IDS:
-            return IPv4Address(int(address) & 0xFFFFFFFF)
-    return address
+def _is_translated_v4(address: IPv6Address) -> bool:
+    """A low-32-bit embedding: one of `_V4_EMBEDDING_NETWORKS`, or ISATAP."""
+    return any(address in network for network in _V4_EMBEDDING_NETWORKS) or (
+        ((int(address) >> 32) & 0xFFFFFFFF) in _ISATAP_INTERFACE_IDS
+    )
+
+
+def _embedded_v4_addresses(address: IPv6Address) -> list[IPv4Address]:
+    """Every IPv4 address an IPv6 literal embeds, by every format it matches."""
+    found: list[IPv4Address] = []
+    if _is_translated_v4(address):
+        found.append(IPv4Address(int(address) & 0xFFFFFFFF))
+    if address.sixtofour is not None:
+        found.append(address.sixtofour)
+    if address.teredo is not None:
+        found.extend(address.teredo)
+    return found
+
+
+def _is_public_single(address: IPv4Address | IPv6Address) -> bool:
+    return bool(
+        address.is_global
+        and not getattr(address, "is_site_local", False)
+        and not address.is_multicast
+    )
 
 
 def _is_public_ip(address: IPv4Address | IPv6Address) -> bool:
-    """Classify an address positively, after unwrapping any embedded IPv4.
+    """Classify an address positively, and an IPv6 address on every IPv4
+    address it embeds as well (Consiliency/pmcp#341 rev 3).
 
     Classifying positively (what *is* public) rather than subtracting a list of
     bad properties is deliberate: the subtractive form missed RFC 6598 CGNAT and
     RFC 3879 site-local. `is_global` alone is not enough -- it is True for
-    ``fec0::1`` and, on Python 3.10, for multicast.
+    ``fec0::1`` and, on Python 3.10, for multicast. An IPv6 address is public
+    only if it is public itself AND every IPv4 address it embeds is public --
+    never on an embedded form alone (#341 rev 4: an ISATAP interface id under
+    `fe80::/10`, `fd00::/8` or `ff00::/8` carrying 8.8.8.8 is still a
+    link-local, unique-local or multicast address, and aiohttp dials it).
+    RFC 8215 local-use NAT64 is refused.
     """
-    unwrapped = _unwrap_embedded_v4(address)
-    return bool(
-        unwrapped.is_global
-        and not getattr(unwrapped, "is_site_local", False)
-        and not unwrapped.is_multicast
-    )
+    if isinstance(address, IPv6Address):
+        if any(address in network for network in _V4_EMBEDDING_UNLOCATABLE):
+            return False
+        embedded = _embedded_v4_addresses(address)
+        if not all(_is_public_single(v4) for v4 in embedded):
+            return False
+    return _is_public_single(address)
 
 
 def _numeric_part_values(part: str) -> set[int]:
@@ -603,21 +740,55 @@ UNVERIFIED_URL_CAVEAT = (
 
 
 def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> str:
-    """Validate and redact a public absolute auth metadata or elicitation URL."""
+    """Validate and redact a public absolute auth metadata or elicitation URL.
+
+    Consiliency/pmcp#341. First, leading C0 controls and spaces are stripped,
+    and trailing tabs, CRs and LFs; nothing else is stripped -- a trailing
+    space is kept (the startup check then refuses it as whitespace), and a
+    trailing NUL or other control character is refused like one anywhere
+    else. Then, refused in this order: a C0 control or DEL anywhere
+    (`PUBLIC_URL_CONTROL_CHARACTER`); a backslash anywhere
+    (`PUBLIC_URL_BACKSLASH`); an unparseable port or host
+    (`PUBLIC_URL_INVALID`); no http(s) scheme or no host
+    (`PUBLIC_URL_NOT_ABSOLUTE`); a host that is not
+    a DNS name of dot-separated labels of 1 to 63 ASCII letters, digits and
+    hyphens, each starting and ending with a letter or digit, the last
+    starting with a letter, so never a number (an IDN in its xn-- form);
+    a dotted-quad IPv4 address with no leading zeros;
+    or a bracketed IPv6 address with no zone id
+    (`PUBLIC_URL_HOST_NOT_CANONICAL`); plain ``http://`` the caller does
+    not allow (`PUBLIC_URL_PLAIN_HTTP_REFUSED`); and ``localhost`` or a
+    non-public IP address, an IPv6 address also on every IPv4 address it
+    embeds (`PUBLIC_URL_NOT_PUBLIC`). A DNS name is not resolved. With
+    ``allow_loopback_http`` (only the operator's URL-mode elicitation path),
+    ``http://`` to ``localhost`` (any case), ``127.0.0.0/8``, ``::1`` or
+    ``::ffff:127.0.0.0/104`` is accepted (`_is_loopback_host`). Userinfo and
+    auth-bearing query values are stripped from what is returned, so the
+    stored host is the one checked.
+    """
+    url = url.lstrip(_C0_OR_SPACE).rstrip(_TRAILING_NEWLINE)
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in url):
+        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_CONTROL_CHARACTER))
+    if "\\" in url:
+        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_BACKSLASH))
     try:
         parsed = urlparse(url)
         hostname = parsed.hostname
         _ = parsed.port
-    except ValueError as exc:
-        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_INVALID)) from exc
+    except ValueError:
+        # `from None`: urllib's text quotes the rejected port, and a chained
+        # cause reaches any traceback (Consiliency/pmcp#297).
+        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_INVALID)) from None
 
     if not _is_absolute_http(parsed) or not hostname:
         raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_NOT_ABSOLUTE))
+    if not _is_canonical_host(_raw_host(parsed.netloc)):
+        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_HOST_NOT_CANONICAL))
 
     if parsed.scheme == "http" and (
         not allow_loopback_http or not _is_loopback_host(hostname)
     ):
-        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_HTTP_LOOPBACK_ONLY))
+        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_PLAIN_HTTP_REFUSED))
     if not (
         allow_loopback_http and parsed.scheme == "http" and _is_loopback_host(hostname)
     ):
@@ -1009,7 +1180,11 @@ def sanitize_url_elicitation_url(
     ``operator``
         The URL was typed by the operator into ``gateway.auth_connect``. Local
         OAuth redirects back to ``http://127.0.0.1``, and refusing that would
-        break the frozen local-consent flow, so loopback HTTP stays allowed.
+        break the frozen local-consent flow, so loopback HTTP stays allowed:
+        ``localhost``, ``127.0.0.0/8``, ``[::1]`` and the IPv4-mapped
+        ``[::ffff:127.x.y.z]``. Not ``[::127.0.0.1]`` (IPv4-compatible), not
+        a legacy numeric form, and never an IPv6 zone id (``[::1%25lo]``),
+        which is refused as a non-canonical host (Consiliency/pmcp#341).
 
     The default is the strict side deliberately: a call site this change misses
     should lose loopback, not silently keep it. Returns ``str`` -- the frozen

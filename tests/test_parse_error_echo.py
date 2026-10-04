@@ -877,3 +877,22 @@ def test_an_uncaught_error_with_no_stderr_prints_nothing(tmp_path: Path) -> None
     assert result.returncode == 0, result.stderr
     assert result.stdout == "survived"
     assert result.stderr == ""
+
+
+def test_an_unparseable_auth_url_port_is_not_chained_into_a_traceback() -> None:
+    """Consiliency/pmcp#348's URL rule refuses with fixed registry messages;
+    the one refusal built on a parser error (urllib's, which quotes the
+    port) is raised `from None`, so no traceback carries the value."""
+    import traceback
+
+    from pmcp.auth import check_auth_config, sanitize_public_auth_url
+
+    s = "zqcanaryzq"
+    for call in (
+        lambda: sanitize_public_auth_url(f"https://a.example.com:{s}/"),
+        lambda: check_auth_config(jwks_url=f"https://a.example.com:{s}/"),
+        lambda: check_auth_config(metadata_url=f"https://a.example.com:{s}/"),
+    ):
+        with pytest.raises(ValueError) as caught:
+            call()
+        assert s not in "".join(traceback.format_exception(caught.value))

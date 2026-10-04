@@ -189,7 +189,9 @@ class TestAuthGuardHttp:
         # omit the route. (The `?token=` query alone is not a reason: an
         # https URL with one starts and serves its route.) The message is
         # the registry's and carries none of the URL.
-        with pytest.raises(ValueError, match="only allows http:// URLs") as refused:
+        with pytest.raises(
+            ValueError, match=r"^Plain http:// is not accepted"
+        ) as refused:
             _make_app(
                 auth_token="mysecret",
                 protected_resource_metadata_url=(
