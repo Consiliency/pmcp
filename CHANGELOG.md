@@ -59,7 +59,8 @@ to do, how to verify it, and how to roll back to 2.7.3.
   coercion (`1` for a boolean, `"5"` for an integer) on `invoke.task` is refused, and
   an explicit `null` for an optional argument is now accepted. Policy is judged before
   the schema, and gate rejections are recorded as `audit.rejection` events, which carry
-  no values taken from the call's arguments (a digest and type names instead). *Changed*
+  no values taken from the call's arguments: only the failing path and the JSON
+  Schema keyword, never the value or any digest of the arguments. *Changed*
 - **Task numbers are bounded.** `invoke.task.ttl` must be an integer from 1 to 2^53−1,
   and `invoke.task.poll_interval` a finite number above 0 and at most 2^53−1. `NaN` and
   `±Infinity` are refused for every numeric argument, and a request carrying a value
@@ -97,10 +98,13 @@ to do, how to verify it, and how to roll back to 2.7.3.
   than `null` (as stdio servers already did; tracked as
   [Consiliency/pmcp#335](https://github.com/Consiliency/pmcp/issues/335)), and a
   `nextCursor` of `NaN` leaves the previous listing in place. *Changed*
-- **Error text names the real failure.** Status, `doctor` and connect/disconnect
-  errors from a remote transport now show the individual exceptions inside an
-  exception group instead of `unhandled errors in a TaskGroup`. Anything matching
-  the old string should match the underlying error instead. *Fixed*
+- **Error text names the real failure.** Status, `doctor`, health output and
+  connect/disconnect errors from a remote transport now show the individual
+  exceptions inside an exception group instead of `unhandled errors in a
+  TaskGroup`. One line still prints the old string: the batch-connect
+  `Failed to connect to <server>: …`, also shown as `pmcp`'s "cannot reach PMCP
+  gateway" error; the WARNING lines before it name the cause. Match on the
+  underlying error instead. *Fixed*
 - **Known issues in 3.0.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
   but the gateway reads `.mcp-gateway`; until that is fixed, run
   `pmcp refresh --cache-dir .mcp-gateway`
