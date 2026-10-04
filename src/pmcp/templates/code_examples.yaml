@@ -97,8 +97,8 @@
 "gateway::provision_status":
   snippet: |
     import time
-    job = mcp.call_tool("gateway.provision", {"server_name": "github"})["job_id"]
-    while mcp.call_tool("gateway.provision_status", {"job_id": job})["status"] in ("pending", "installing"):
+    job = mcp.call_tool("gateway.provision", {"server_name": "github"}).get("job_id")  # None: nothing to wait for
+    while job and mcp.call_tool("gateway.provision_status", {"job_id": job})["status"] in ("pending", "installing"):
         time.sleep(1)
 
 "gateway::catalog_search":
@@ -110,10 +110,10 @@
 
 "gateway::describe":
   snippet: |
-    # Check safety hints before invoking
+    # Warn on the gateway's safety notes or a destructive hint before invoking
     card = mcp.call_tool("gateway.describe", {"tool_id": "server::tool"})
-    if (card.get("annotations") or {}).get("destructiveHint"):
-        print("Warning: destructive tool", card.get("safety_notes"))
+    if card.get("safety_notes") or (card.get("annotations") or {}).get("destructiveHint"):
+        print("Warning:", card.get("safety_notes") or "destructive tool")
 
 "gateway::invoke":
   snippet: |

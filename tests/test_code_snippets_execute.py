@@ -49,7 +49,7 @@ def _downstream_text(tool_id: str) -> str:
     return json.dumps([_ROW])
 
 
-def _fake_mcp() -> SimpleNamespace:
+def _fake_mcp(variant: str = "plain") -> SimpleNamespace:
     def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "gateway.invoke":
             result = {
@@ -79,14 +79,33 @@ def _fake_mcp() -> SimpleNamespace:
                 results=[card], total_available=1, truncated=False
             )
         elif name == "gateway.describe":
-            out = SchemaCard(server="s", tool_name="t", description="d", args=[])
-        elif name == "gateway.provision":
-            out = ProvisionOutput(
-                ok=True,
-                server=arguments["server_name"],
-                message="started",
-                job_id="job-1",
+            risky = variant == "risky"
+            out = SchemaCard(
+                server="s",
+                tool_name="t",
+                description="d",
+                args=[],
+                annotations=None,
+                safety_notes=["High-risk tool"] if risky else None,
             )
+        elif name == "gateway.provision":
+            # The handler pairs a job_id only with status="started"; an
+            # already-running, remote or refused server returns no job_id.
+            if variant == "no_job":
+                out = ProvisionOutput(
+                    ok=True,
+                    server=arguments["server_name"],
+                    message="already running",
+                    status="already_running",
+                )
+            else:
+                out = ProvisionOutput(
+                    ok=True,
+                    server=arguments["server_name"],
+                    message="started",
+                    job_id="job-1",
+                    status="started",
+                )
         elif name == "gateway.provision_status":
             out = ProvisionJobStatus(
                 job_id=arguments["job_id"],
@@ -112,8 +131,22 @@ _FREE_NAMES: dict[str, Any] = {
 }
 
 
+@pytest.mark.parametrize("variant", ["plain", "risky", "no_job"])
 @pytest.mark.parametrize("tool_id", _TOOL_IDS)
-def test_every_snippet_runs_against_the_real_response_shapes(tool_id: str) -> None:
+def test_every_snippet_runs_against_the_real_response_shapes(
+    tool_id: str, variant: str
+) -> None:
+    """`risky`: describe returns safety notes and no annotations; `no_job`:
+    provision returns no job_id (already running, remote or refused)."""
     snippet = _LOADER.get_snippet_for_tool(tool_id, max_lines=_DEFAULT)
     assert snippet is not None
-    exec(compile(snippet, tool_id, "exec"), {"mcp": _fake_mcp(), **_FREE_NAMES})
+    exec(compile(snippet, tool_id, "exec"), {"mcp": _fake_mcp(variant), **_FREE_NAMES})
+
+
+def test_the_describe_snippet_warns_on_safety_notes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    snippet = _LOADER.get_snippet_for_tool("gateway::describe", max_lines=_DEFAULT)
+    assert snippet is not None
+    exec(snippet, {"mcp": _fake_mcp("risky"), **_FREE_NAMES})
+    assert "Warning" in capsys.readouterr().out
