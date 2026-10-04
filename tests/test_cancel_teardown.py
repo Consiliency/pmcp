@@ -2296,7 +2296,7 @@ def test_no_cancellation_handler_awaits() -> None:
 _TEARDOWN_ENTRIES = {
     "ClientManager._connect_stdio": "_abandon_client_io",
     "ClientManager._connect_remote_stream": "_abandon_client_io",
-    "ClientManager.adopt_process": "_kill_handed_over_process",
+    "ClientManager.adopt_process": "_kill_process_tree_now",
     "ClientManager._adopt_process_locked": "_abandon_client_io",
     "ClientManager.disconnect_server": "_abandon_client_io",
     "ClientManager._disconnect_server_locked": "_abandon_client_io",
@@ -2816,3 +2816,78 @@ async def test_an_adoption_waiting_for_the_lock_through_abandonment_registers_no
             late.kill()
         await late.wait()
         await _drain(mgr)
+
+
+async def test_a_lock_wait_cancel_kills_a_group_whose_leader_already_exited(
+    tmp_path: Path,
+) -> None:
+    """Codex round 7: the handed-over leader leads its own group and exits
+    while adoption waits for the lock, leaving a descendant. The group is
+    read before the wait, so the cancel still kills the descendant."""
+    mgr = ClientManager()
+    script = (
+        "import subprocess,sys; "
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(300)'],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+        "print(p.pid,flush=True); sys.stdin.readline()"
+    )
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert process.stdout is not None and process.stdin is not None
+    child = int(await asyncio.wait_for(process.stdout.readline(), _HANG_GUARD_S))
+    await mgr._lifecycle_lock.acquire()
+    try:
+        adopting = asyncio.create_task(
+            mgr.adopt_process("handoff", process, _stdio_config("handoff"))
+        )
+        await asyncio.sleep(0)
+        assert not adopting.done() and process.returncode is None
+        process.stdin.write(b"\n")
+        assert await asyncio.wait_for(process.wait(), _HANG_GUARD_S) == 0
+        adopting.cancel()
+        assert (await _outcome(adopting))[0] == "cancelled"
+        await eventually(
+            lambda: not _pid_alive(child),
+            timeout=_HANG_GUARD_S,
+            message="the exited leader's descendant survived the cancel",
+        )
+        assert mgr._clients == {}
+    finally:
+        mgr._lifecycle_lock.release()
+        _kill_pids([child])
+
+
+async def test_a_lock_wait_cancel_keeps_its_cancel_when_the_kill_fails() -> None:
+    """Codex round 7: a kill that raises (here `PermissionError`) must not
+    replace the caller's `CancelledError`."""
+    mgr = ClientManager()
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import sys; sys.stdin.readline()",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    await mgr._lifecycle_lock.acquire()
+    try:
+        adopting = asyncio.create_task(
+            mgr.adopt_process("handoff", process, _stdio_config("handoff"))
+        )
+        await asyncio.sleep(0)
+        assert not adopting.done()
+        with patch.object(process, "kill", side_effect=PermissionError("denied")):
+            adopting.cancel()
+            kind, detail = await _outcome(adopting)
+        assert kind == "cancelled", f"{kind} {detail!r}"
+        assert mgr._clients == {}
+    finally:
+        mgr._lifecycle_lock.release()
+        if process.returncode is None:
+            process.kill()
+        await process.wait()

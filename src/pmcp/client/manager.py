@@ -177,26 +177,6 @@ def _retrieve_outcome(task: asyncio.Future[Any]) -> None:
         logger.debug(f"abandoned task ended with {type(exc).__name__}")
 
 
-def _kill_handed_over_process(process: asyncio.subprocess.Process) -> None:
-    """Kill a process handed to `adopt_process` that was never registered:
-    synchronous, for a cancel while adoption waited for the lifecycle lock.
-    Its whole group when it leads one (as an adopted client's teardown
-    would); otherwise the leader only (`process.kill()`: the installer does
-    not start a new session -- the leader-only limit of #344's class)."""
-    if process.returncode is not None:
-        return
-    group = _own_group_pgid(process)
-    if group is not None:
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    try:
-        process.kill()
-    except ProcessLookupError:
-        pass
-
-
 def _cancel_without_waiting(task: asyncio.Future[Any] | None) -> None:
     if task is not None and not task.done():
         task.cancel()
@@ -4342,9 +4322,10 @@ class ClientManager:
         (Consiliency/pmcp#324, rounds 5-6).
 
         A cancel while waiting for the lock kills the handed-over process
-        synchronously (`_kill_handed_over_process`: its group if it leads
-        one, else the leader only -- the installer does not start a new
-        session) and re-raises: nothing was registered, and the caller
+        synchronously (`_kill_process_tree_now`, with the group read before
+        the wait: its group if it leads one, even after the leader exited,
+        else the leader only -- the installer does not start a new session)
+        and re-raises: nothing was registered, and the caller
         (`_finalize_server_ready`) catches only `Exception`.
 
         Raises:
@@ -4355,10 +4336,17 @@ class ClientManager:
             Exception: If MCP initialization fails
         """
         self._refuse_adoption_if_abandoned(name)
+        # Read the group now, while the leader is alive (or an unreaped
+        # zombie): a leader that exits during the wait can then still have
+        # its descendants killed through the retained id (codex round 7).
+        group_pgid = _own_group_pgid(process)
         try:
             await self._lifecycle_lock.acquire()
         except asyncio.CancelledError:
-            _kill_handed_over_process(process)
+            # The one synchronous kill path, with its safeguards: never
+            # signals a reaped leader's pid, checks a retained group for
+            # reuse, and never raises (so the cancel is what propagates).
+            _kill_process_tree_now(process, group_pgid=group_pgid)
             raise
         try:
             await self._adopt_process_locked(name, process, config)
