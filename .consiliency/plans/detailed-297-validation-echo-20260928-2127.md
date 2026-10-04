@@ -1,60 +1,92 @@
 # Detailed plan: describe validation errors from their structure, never their value — everywhere pmcp turns an exception into text
 
-> **Revision 14 (2026-10-04), on main `31c1357`** (since rev 13 only a plan
-> document, Consiliency/pmcp#332, merged into `wip/297-code`). Earlier
-> merges of main: rev 13 (`8b45ddd`) and rev 12 (`48b7a89`).
+> **Revision 15 (2026-10-04), on main `31c1357`** (unchanged since rev 14).
+> Earlier merges of main: rev 14 (`440d170`), rev 13 (`8b45ddd`) and rev 12
+> (`48b7a89`).
 >
 > Consiliency/pmcp#297, the prerequisite for piece B
 > (`extra="forbid"`) of Consiliency/pmcp#236. The change is **embedded, not
 > described**: the 46 blocks under *Verbatim bodies* are `git apply` patches
 > against `origin/main` @ `31c1357`, byte-identical to the verified code on
-> the local-only branch `wip/297-code` @ `06a9e01`, which was never pushed
-> (rev 1 was `19dac95`, rev 2 `929f693`, rev 3 `026aadc`, rev 4 `ee644a9`, rev 5 `1824a09`, rev 6 `9b24daa`, rev 7 `dd3f707`, rev 8 `2d9e736`, rev 9 `8d33b49`, rev 10 `6078419`, rev 11 `46c4904`, rev 12 `0a93265`, rev 13 `ebcf4fc`). *Embedding
+> the local-only branch `wip/297-code` @ `67bd04d`, which was never pushed
+> (rev 1 was `19dac95`, rev 2 `929f693`, rev 3 `026aadc`, rev 4 `ee644a9`, rev 5 `1824a09`, rev 6 `9b24daa`, rev 7 `dd3f707`, rev 8 `2d9e736`, rev 9 `8d33b49`, rev 10 `6078419`, rev 11 `46c4904`, rev 12 `0a93265`, rev 13 `ebcf4fc`, rev 14 `06a9e01`). *Embedding
 > proof* extracts them from this file with its own extractor, `git apply
 > --check`s them on a fresh `31c1357` worktree, applies them and compares
-> the whole tree with `06a9e01`.
+> the whole tree with `67bd04d`.
 >
-> **What rev 14 changes:** see *Rev 13 board findings* (round-13 board on
-> Consiliency/pmcp#314 @ `8b45ddd`: codex one BLOCKING; claude N1–N3 and a
-> nit; gemini AGREE). Rev 13's own account is in `8b45ddd`.
+> **What rev 15 changes:** see *Rev 14 board findings* (round-14 board on
+> Consiliency/pmcp#314 @ `440d170`: codex one BLOCKING; grok and claude the
+> same leak class; grok one compatibility point; gemini AGREE). Rev 14's own
+> account is in `440d170`.
 >
-> **Revs 1–13**, each answering the previous board, are summarised under
-> *Research and design* and given in full in rev 13 of this plan
-> (`8b45ddd`), rev 12 (`48b7a89`; earlier accounts in `97e6973`, `b7eacbe`, `a449dd9`,
+> **Revs 1–14**, each answering the previous board, are summarised under
+> *Research and design* and given in full in rev 14 of this plan
+> (`440d170`), rev 13 (`8b45ddd`), rev 12 (`48b7a89`; earlier accounts in `97e6973`, `b7eacbe`, `a449dd9`,
 > `4bafa47`, `4d4b186`, `8d03712`). Rev 1's decisions stand: one renderer
 > module for both libraries; caller-chosen keys shown as `*`; fixed reason
 > phrases; fixed-message `PydanticCustomError`s in pmcp's validators; one
 > rule for the response, the log and the audit; response prefixes kept.
 
-## Rev 13 board findings — before/after
+## Rev 14 board findings — before/after
 
-Round 13 on Consiliency/pmcp#314 @ `8b45ddd`: codex one BLOCKING (F028–F034);
-claude PARTIALLY AGREE, nothing blocking (N1–N3, a nit); gemini AGREE; grok
-degraded. Rev 13's table for round 12 is in `8b45ddd`.
+Round 14 on Consiliency/pmcp#314 @ `440d170`. Codex filed one BLOCKING
+finding (F024–F027). Grok (F002/F003) and claude (F001, F002) filed the same
+leak class. Grok F004 is a compatibility point. Gemini AGREE. Rev 14's
+table for round 13 is in `440d170`.
 
-**Reproduced** (`r14/test_repro14.py`, unchanged on both trees: the real
-gateway tools over a task-capable downstream; the real `refresh_server`
-against a real stdio downstream, read timeout set to 2 s; a 15 s watch):
+These findings share one cause: rev 14 had two recognisers that disagreed
+in both directions. They were `task_payload_of` (a nested `task` object, or
+a flat string `taskId`) and the parser `_task_info_from_payload`.
 
-| Case | Rev 13 (`ebcf4fc`) | Rev 14 (`06a9e01`) |
+**Reproduced** with `r15/test_repro15.py`, run unchanged on both trees. It
+drives the real gateway tools over a task-capable downstream, and the
+first five rows are rev 14's table. A "leak" here is rev 14's code only,
+not main's.
+
+| Case | Rev 14 (`06a9e01`) | Rev 15 (`67bd04d`) |
 |---|---|---|
-| codex: `gateway.invoke`, flat task answer with `ttl: <S>` | leak: response; `raw_size_estimate` 80→88 for 8 more characters | clean; 42→42 |
-| codex: `gateway.tasks_result`, `{"task": {..., "ttl": <S>}}` with no inner `result` | leak: response; 102→110 | clean; 62→62 |
-| codex: `gateway.tasks_result`, flat task answer | leak: response; 80→88 | clean; 42→42 |
-| claude N2: `refresh_server`, `initialize` answered with `result` and `error` | hangs (still waiting at 15 s) | fails in 2.0 s (the read timeout) |
-| claude N1: `ping` with `params: null` | dropped (`params of type NoneType`) | answered |
-| **total** | **5 of 5** | **0 of 5** |
+| codex: gateway.invoke, flat task answer | clean; raw_size_estimate 42->42 | clean; raw_size_estimate 42->42 |
+| codex: gateway.tasks_result, {task} with no inner result | clean; raw_size_estimate 62->62 | clean; raw_size_estimate 62->62 |
+| codex: gateway.tasks_result, flat task answer | clean; raw_size_estimate 42->42 | clean; raw_size_estimate 42->42 |
+| claude N2: refresh_server, initialize reply with result and error | failed in 2.0 s | failed in 2.0 s |
+| claude N1: ping with params null | answered | answered |
+| codex F024: gateway.tasks_result, non-task data under task | DELETED: statusMessage | kept |
+| codex F024: gateway.invoke, non-task data under task | DELETED: statusMessage | kept |
+| grok F002: gateway.invoke, flat task_id answer | LEAK: response; raw_size_estimate 81->89 | clean; raw_size_estimate 43->43 |
+| grok F003: gateway.tasks_result, flat task_id answer | LEAK: response; raw_size_estimate 81->89 | clean; raw_size_estimate 43->43 |
+| claude F001: gateway.tasks_cancel, answer with integer taskId | LEAK: response (raw) | clean |
+| grok F004: notification with id null | dropped (id of type null) | delivered |
+| **total** | **6 of 11** | **0 of 11** |
 
-- **codex (BLOCKING)**, a dropped task hint left through the answer
-  itself: one recogniser and one normaliser on every task answer (§15).
-  `test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape`;
-  M94–M96.
-- **claude N2**, the SDK refresh session hung on a dropped `initialize`
-  reply: a read timeout and a bound (§12).
-  `test_a_malformed_initialize_reply_ends_the_refresh_in_bounded_time`,
-  `test_every_sdk_session_pmcp_builds_has_a_read_timeout`; M97, M98.
-- **claude N1** `params: null` as absent; **N3** no fallback to the SDK's
-  parser; **nit** JSON type names: one test each; M99–M101.
+- **codex F024–F027 (BLOCKING)**: the normaliser deleted ordinary result
+  data. It reduced any nested `task` object, even one the parser
+  rejected. **grok F002/F003, claude F002**: a flat snake-case `task_id`
+  answer was parsed, with `ttl` dropped, but not recognised. So
+  `gateway.invoke` and `gateway.tasks_result` returned the value and sized
+  it with it. The fix is §15: the recogniser is the parser.
+  `test_the_normaliser_acts_iff_the_parser_accepts_on_every_task_op`,
+  `test_task_result_preserves_non_task_data`, and the shape sweep, whose
+  wraps now come from the parser's id aliases. Mutants M94–M96 and
+  M103–M106.
+- **claude F001**: `cancel_task`'s fallback copied an unparseable answer
+  into `raw`. Its `raw` is now empty (§15).
+  `test_a_dropped_task_hint_leaves_by_no_alias_or_fallback`. Mutant M107.
+- **grok F004**: a notification with `"id": null` was dropped. Main
+  delivered it, and the MCP SDK parses it as a notification. It is now
+  accepted, and the stdio dispatcher routes `id: null` as a notification,
+  as main did (§12).
+  `test_a_notification_with_a_null_id_is_delivered_as_a_notification`.
+  Mutants M108 and M109.
+- **What the differential asserts, against "stripped-set ==
+  unusable_fields"**: `unusable_fields` names model fields (`ttl`,
+  `updated_at`, ...), but what is removed is wire keys. One alias of a
+  field can be usable while another is not: `updatedAt: 5` beside
+  `lastUpdatedAt: "S"` flags nothing and removes `lastUpdatedAt`. So the
+  test asserts two things for every generated answer:
+  - the keys removed are exactly those the parser drops, read key by key
+    from the parser itself;
+  - every sent, non-null alias of each field in `unusable_fields` is
+    removed.
 
 ## Task
 
@@ -83,7 +115,7 @@ position and class (`pmcp.parsing`), an unparseable `Origin` port a 403;
 **§13** SDK message objects render as structure, escaping handler errors
 keep the SDK's wire codes with described text, identifiers are kept.
 
-## Design (rev 13–14; rev 13's full text in `8b45ddd`)
+## Design (rev 13–15; rev 14's full text in `440d170`)
 
 ### 12. Frames that are not JSON-RPC messages
 
@@ -92,7 +124,9 @@ JSON-RPC 2.0 message is logged or acted on. `jsonrpc_envelope_problem`
 states JSON-RPC 2.0's and MCP's envelope rules (`jsonrpc` exactly `"2.0"`;
 requests and notifications with a string `method`, a string or integer id,
 an object `params` or none -- `null` reads as absent (rev 14) -- and no
-`result`/`error`; responses with an `id` and exactly one of an object
+`result`/`error`. A notification's `id: null` reads as absent too (rev 15):
+main and the MCP SDK deliver it, and the stdio dispatcher routes it as a
+notification; responses with an `id` and exactly one of an object
 `result` or an `error` object with an integer `code` and a string
 `message`). stdio drops a violation with a value-free record whose type
 names are JSON's (rev 14); the SDK's three client transports validate
@@ -121,42 +155,75 @@ exemptions keyed by site (19). A well-formed `<token>::5` that misses its
 lookup stays Consiliency/pmcp#315's: only the format rule makes a value
 rejected.
 
-### 15. Task answers (rev 14, round-13 codex)
+### 15. Task answers (rev 14; rev 15, round-14 board)
 
-Rev 13 kept a task hint pmcp drops as unusable (Consiliency/pmcp#298) out
-of the stored task's `raw` and sized `gateway.invoke`'s nested answer from
-it, in the handler; a flat answer, and `gateway.tasks_result`'s own answer
-(`result.get("result", result)`), still carried the value, sized with it.
-Now one recogniser, `task_payload_of` (the manager's shapes: nested `task`
-or flat with a string `taskId`), and one normaliser, `usable_task_response`
-(`_usable_task_raw` on the task it finds), are applied to every task answer
-the manager returns (`call_tool`, `get_task_result`); `tasks_list`, `_get`
-and `_cancel` return the record. The `gateway.invoke` handler finds the task
-with the same recogniser, so a flat task answer now comes back like a
-nested one (`task`, `result: null`). The sweep derives its shapes from the
-recogniser (nested, nested without `result`, flat) and runs every task
-tool with every dropped position, checking the value and the size.
+A task hint that pmcp drops as unusable (Consiliency/pmcp#298) is kept
+out of the stored task's `raw` and out of every task answer the manager
+returns, flat or nested.
+
+Rev 14 used a recogniser (`task_payload_of`) that was separate from the
+parser, and the two disagreed in both directions:
+- it reduced a nested `task` object that the parser rejected, which
+  deleted the downstream's own data;
+- it missed a flat `task_id` answer that the parser read, which returned
+  the dropped value.
+
+Rev 15 removes that freedom. The recogniser is the parser:
+- `task_answer_of` takes the candidate (the nested `task` object, else
+  the flat answer) and returns it with its parse only when
+  `_task_info_from_payload` parses it. The parser is now static and stays
+  where it was.
+- `usable_task_response` replaces that candidate with exactly the
+  parse's `raw`. Anything the parser does not read passes through
+  unchanged, as data.
+- `call_tool`, `get_task`, `list_tasks`, `get_task_result`, `cancel_task`
+  and the `gateway.invoke` handler all use this one function.
+- `cancel_task`'s fallback for an answer it cannot parse records the
+  cancellation with an empty `raw`.
+
+Whether `tasks/result` is followed by a `tasks/get` poll keeps main's
+condition exactly (`_names_a_task`: a `task` object or a string `taskId`).
+One behaviour changes. A flat `task_id` answer is now a task: `call_tool`
+records it, and its `tasks/result` is recorded from the answer itself
+instead of polling `tasks/get`.
+
+The tests derive from the parser's grammar:
+- The sweep's wraps are each id alias the parser reads (found by running
+  it), nested, nested without `result`, and flat, through every task
+  tool.
+- A differential generates 4326 answers (1236 parse): valid and invalid ids,
+  every hint key the parser reads with dropped, null and usable values
+  and alias pairs, in each shape. It checks every manager operation for
+  acted ⇔ parsed and removed == dropped.
 
 ## Changes
 
-These are the patches under *Verbatim bodies* (`git diff 31c1357 06a9e01 -- <file>`):
-46 files, +8613 / −561: one concern applied at every sink, so the
-bounded-plan threshold is exceeded on purpose (19 source files carry only
-the mechanical §7 substitution). Per-file accounts: rev 12 (`48b7a89`),
-rev 13 (`8b45ddd`). Rev 14 changes `src/pmcp/client/manager.py` (modify,
-+188 / −75: `task_payload_of`, `usable_task_response`),
-`src/pmcp/tools/handlers.py` (modify, +98 / −50: the recogniser in
-`invoke`), `src/pmcp/argument_errors.py` (create, +1362: JSON type names,
-`params: null`, no parser fallback), `src/pmcp/manifest/refresher.py`
-(modify, +61 / −45: the read timeout and bound, which re-indents the
-session block), `CHANGELOG.md`, and three test modules.
+These are the patches under *Verbatim bodies* (`git diff 31c1357 67bd04d -- <file>`):
+46 files, +8896 / −587. This is one concern applied at every sink, so
+it exceeds the bounded-plan threshold on purpose: 19 of the source files
+carry only the mechanical §7 substitution. Per-file accounts are in rev 12
+(`48b7a89`), rev 13 (`8b45ddd`) and rev 14 (`440d170`).
+
+Rev 15 changes these files:
+- `src/pmcp/client/manager.py` (modify, +224 / −101):
+  - `task_answer_of`, `_task_candidate` and `_names_a_task`;
+  - `usable_task_response` now acts on the parse;
+  - the parser is static;
+  - the cancel fallback has no `raw`;
+  - `id: null` is routed as a notification.
+- `src/pmcp/tools/handlers.py` (modify, +96 / −50): `invoke` uses
+  `task_answer_of`.
+- `src/pmcp/argument_errors.py` (create, +1365): `id: null` on a
+  notification.
+- `tests/test_argument_error_echo.py` and
+  `tests/test_downstream_frame_echo.py`.
 
 ## Documentation impact
 - `CHANGELOG.md` (`### Fixed`, first entry): one sentence per revision's
   rule. `README.md`: the scoped-advisor audit paragraph (rev 1).
 
 ## Dependencies & order
-All 45 patches are one `git apply`. `pmcp.argument_errors` and
+All 46 patches are one `git apply`. `pmcp.argument_errors` and
 `pmcp.parsing` import no `pmcp` module at load time (later imports are
 lazy), so there are no cycles; no migration, no config.
 
@@ -174,25 +241,25 @@ unset npm_config_cache npm_config_store_dir pnpm_config_store_dir
 uv run pytest -m 'not live and not slow' -q
 ```
 
-Red on main (and on rev 13's code `ebcf4fc`): copy the eight test files at `06a9e01` onto a clean `31c1357`
+Red on main (and on rev 14's code `06a9e01`): copy the eight test files at `67bd04d` onto a clean `31c1357`
 tree and run the same modules. The result is under *Acceptance
 criteria*.
 
-## Acceptance criteria — measured this session (on `06a9e01`, red on `31c1357` and on rev 13's code `ebcf4fc`)
+## Acceptance criteria — measured this session (on `67bd04d`, red on `31c1357` and on rev 14's code `06a9e01`)
 
-- [x] **Revs 1–14**: each revision's tests (accounts in `48b7a89`,
-  `8b45ddd` and *Rev 13 board findings*), all passing here (the eight
-  modules' line below); red on main and on rev 13 below; gates and the
+- [x] **Revs 1–15**: each revision's tests (accounts in `48b7a89`,
+  `8b45ddd`, `440d170` and *Rev 14 board findings*), all passing here (the eight
+  modules' line below); red on main and on rev 14 below; gates and the
   full suite under *Full suite and gates*.
 
-Red on main: the eight test files @ `06a9e01` on a clean `31c1357`,
+Red on main: the eight test files @ `67bd04d` on a clean `31c1357`,
 `pytest ... -q --tb=line`. Counted per test function; the errors are a fixture importing
 `pmcp.argument_errors`.
 
 ```text
 # failing (or erroring) tests on main 31c1357, by module
-     40 tests/test_argument_error_echo.py
-     98 tests/test_downstream_frame_echo.py
+     48 tests/test_argument_error_echo.py
+     99 tests/test_downstream_frame_echo.py
       2 tests/test_exception_text_sinks.py
       3 tests/test_gateway_tool_schemas.py
       3 tests/test_http_transport.py
@@ -205,43 +272,58 @@ tests/test_exception_text_sinks.py:676: AssertionError: cli.py:939: FormattedVal
 tests/test_argument_error_echo.py:700: AssertionError: ('hex', '$.auth_mode:type-object', _Observed(response="
 tests/test_downstream_frame_echo.py:580: AssertionError: ('http-json', 'initialize', 'result-type', 'hex', _Ob
 
-274 failed, 589 passed, 57 errors in 106.68s (0:01:46)
+283 failed, 591 passed, 57 errors in 101.54s (0:01:41)
 ```
 
-Red on rev 13: the same eight files on rev 13's code `ebcf4fc` (same base).
-10 failures, all rev 14 cases, every round-13 repro among them: the
-task-shape sweep (`flat`, `nested-bare`), the bounded refresh (4 kinds),
-the read-timeout rule, `params: null`, the parser fallback, JSON names.
+Red on rev 14: the same eight files on rev 14's code `06a9e01` (same base).
+There are 9 failures, all of them rev 15 cases and each on the value, not
+on a missing name. Every round-14 repro is among them:
+- the shape sweep's `flat-task_id` wrap;
+- the differential (`flat/task_id/none`);
+- the non-task data, for both tools;
+- the dropped hint by a snake-case alias or the cancel fallback (4 cases);
+- `id: null` on a notification.
 
 ```text
-# failing (or erroring) tests on rev 13 ebcf4fc, by module
-      2 tests/test_argument_error_echo.py
-      8 tests/test_downstream_frame_echo.py
+# failing (or erroring) tests on rev 14 06a9e01, by module
+      8 tests/test_argument_error_echo.py
+      1 tests/test_downstream_frame_echo.py
 
 # the first assertion line per module (first 3)
-tests/test_argument_error_echo.py:1942: AssertionError: ('flat', 'gateway.tasks_result', 'createdAt', 'string'
-tests/test_downstream_frame_echo.py:1696: AssertionError: refresh still waiting at 20 s: result-and-error
+tests/test_argument_error_echo.py:1979: AssertionError: ('flat-task_id', 'gateway.tasks_result', 'createdAt', 
+tests/test_downstream_frame_echo.py:1811: AssertionError: assert 'id of type null' is None
 
-10 failed, 910 passed in 335.48s (0:05:35)
+9 failed, 922 passed in 283.81s (0:04:43)
 ```
 
-Green (patched): `920 passed in 282.06s (0:04:42)` for the eight modules.
+Green (patched): `931 passed in 287.32s (0:04:47)` for the eight modules.
 
 ## Mutation evidence
 
-`mutants.py` (below) on a worktree of `06a9e01`: each mutant's anchor must
+`mutants.py` (below) on a worktree of `67bd04d`: each mutant's anchor must
 occur once; the eight modules run with `-x`; a dirty file is refused; the
 file is restored from a saved copy and `cmp`-checked (`git status` after:
 `0` and `0`). Purposes: `a449dd9` (M1–M53, S5–S8, G1), `97e6973`
 (M54–M66), `48b7a89` (M67–M75), `8b45ddd` (M75–M93). Retired: M46, M47,
-M49–M53, M59, M61–M64; M92 (rev 14). Rev 14's: M94/M95 `call_tool` /
-`get_task_result` return the answer as sent; M96 the recogniser misses a
-flat task; M97 no read timeout; M98 no read timeout and no bound; M99
-`params: null` rejected; M100 the parser fallback; M101 Python type
-names; M102 M23 and M100 together (two files, run after the passes).
+M49–M53, M59, M61–M64; M92 (rev 14). Rev 14's are M97–M102: the read
+timeout, the bound, `params: null`, the parser fallback, type names, and M23
+with M100.
+
+Rev 15 retargets M91 (the parser is back in place), M94 and M95 (the
+manager returns the answer as sent), and M96 (the candidate is only a
+nested task). It adds these mutants:
+- M103 over-strip: an unparsed candidate is reduced anyway, which is rev
+  14's behaviour.
+- M104 under-strip: the recogniser accepts only `taskId`.
+- M105 the parser reads only `taskId`.
+- M106 over-strip: a null hint is removed too.
+- M107 the cancel fallback keeps the whole answer as `raw`.
+- M108 a notification with `id: null` is rejected.
+- M109 `id: null` is routed as a request.
+- M110 `tasks/result` polls whenever the parser finds no task.
 
 ```text
-94 mutants applied; 92 killed: M1–M22 M24 M26–M45 M48 M54–M58 M60 M65–M91 M93–M101 G1 S5–S8 M102
+102 mutants applied; 100 killed: M1–M22 M24 M26–M45 M48 M54–M58 M60 M65–M91 M93–M110 G1 S5–S8
 survived: M23 SDK parse error keeps its message
 survived: M25 malformed error message kept
 ```
@@ -249,7 +331,7 @@ survived: M25 malformed error message kept
 `NO_STATIC=1` (the sink guard and the helpers-only rule deselected):
 
 ```text
-94 mutants applied; 88 killed with both sink checks deselected: M1–M18 M21 M24 M26–M34 M36–M45 M48 M54–M58 M60 M65–M91 M93–M101 G1 S5–S8 M102
+102 mutants applied; 96 killed with both sink checks deselected: M1–M18 M21 M24 M26–M34 M36–M45 M48 M54–M58 M60 M65–M91 M93–M110 G1 S5–S8
 survived: M19 tasks_get response uses str(e)
 survived: M20 tasks_get audit buffer uses str(e)
 survived: M22 installer crash message uses raw exc (static guard)
@@ -261,16 +343,22 @@ survived: M35 CLI refresh logs the raw exception
 - By design, the second pass's M22 and M35 (no sweep drives those sinks)
   and, since Consiliency/pmcp#298 stopped `tasks_get` raising, M19 and M20
   die only on the static guard; the first pass kills all four.
-- **M23 and M25 are equivalent mutants** (both passes): rev 14's adapter
-  rejects what `json` cannot read, so every `-32700` the SDK synthesises
-  carries only its value-free reason, and rev 13's envelope check makes
-  `_downstream_error`'s non-string branch unreachable. Each stays as
-  defence in depth; **M102** (M23 with M100) and **M90** (M25 with its
-  envelope partner) die in both passes on the frame sweep.
-- Rev 14's die on their own tests: M94 the task sweep; M95, M96 the
-  task-shape sweep (`flat`); M97 the read-timeout rule; M98 the
-  bounded-refresh test; M99–M101 theirs. No kill was a timeout (a script
-  compares each killing test with the previous run's).
+- **M23 and M25 are equivalent mutants** in both passes, as in rev 14.
+  M102 (M23 with M100) and M90 (M25 with its envelope partner) die in both
+  passes on the frame sweep.
+- Rev 15's mutants die on their own tests:
+  - M91 and M94 die on the task sweep.
+  - M95, M96 and M104 die on the shape sweep (`flat-taskId`,
+    `flat-task_id`).
+  - M103, M106, M107 and M110 die on the differential.
+  - M105 dies on the snake-case alias test.
+  - M108 and M109 die on the `id: null` test.
+- **The run was resumed once.** The team volume holding the logs filled
+  (100%, from other data), and both passes died writing M66's log. The
+  mutated `server.py` was restored from its saved copy, `cmp`-equal to
+  HEAD, with `git status` clean. M66 onwards were then re-run with outputs
+  on the root disk. The two parts are concatenated above: 53 + 49
+  mutants per pass.
 
 ## Non-goals
 
@@ -291,9 +379,17 @@ survived: M35 CLI refresh logs the raw exception
 - The copied-input derivation follows one assignment hop.
 - The strict adapter replaces the SDK client modules' adapter by name
   (`mcp` 2.0.x); the import test fails if an SDK reads it another way.
-- A task answer with no usable `taskId` is not a task and is returned as
-  data, as before.
+- An answer whose task the parser does not read (no non-empty string
+  `taskId` or `task_id`) is returned as data, unchanged, as on main.
 - Revs 4–8's residuals: rev 10 (`b7eacbe`).
+- **Main moved during this revision.** It went to `2adcd9a`, which adds
+  Consiliency/pmcp#346 (a plan document) and Consiliency/pmcp#348 (auth
+  public-URL rule). That touches 4 of the patched files: `CHANGELOG.md`,
+  `README.md`, `src/pmcp/auth.py` and `tests/test_auth_operator_messages.py`.
+  Each patch still passes `git apply --unidiff-zero --check` there.
+  - Rev 15 is verified on `31c1357` only.
+  - Merging `2adcd9a` is the next revision's work. This includes the sweep
+    and the static sink guard over Consiliency/pmcp#348's new auth code.
 
 ## Execution Policy
 
@@ -303,7 +399,7 @@ survived: M35 CLI refresh logs the raw exception
 - Commit/PR text says "see Consiliency/pmcp#297", never a closing keyword.
 ## Embedding proof
 
-The patches were generated with `git diff -U0 31c1357 06a9e01 -- <file>` and embedded. Then, from **this file**, on a fresh worktree `$WORKTREE_ROOT/pmcp-297-proof` of re-fetched `origin/main` (`31c1357`); `p/` is the scratch directory the patches were extracted to, and "identical" means `cmp`-identical to `wip/297-code@06a9e01`. Each of the 46 patches was extracted to `p/<path with / as _>.patch` (the per-file line counts and the 46 per-file `cmp` lines are summarised here for size). The proof was run again on the final file, with this section in it, and printed the same listing.
+The patches were generated with `git diff -U0 31c1357 67bd04d -- <file>` and embedded. Then, from **this file**, on a fresh worktree `$WORKTREE_ROOT/pmcp-297-proof` of `31c1357` (origin/main has since moved; the last line of the listing counts the paths it changed that are patched here, and *Unverified* says what that means); `p/` is the scratch directory the patches were extracted to, and "identical" means `cmp`-identical to `wip/297-code@67bd04d`. Each of the 46 patches was extracted to `p/<path with / as _>.patch` (the per-file line counts and the 46 per-file `cmp` lines are summarised here for size). The proof was run again on the final file, with this section in it, and printed the same listing.
 
 ```text
 $ git -C <proof worktree> rev-parse --short HEAD
@@ -314,17 +410,19 @@ $ git apply --unidiff-zero --check p/*.patch
 check: ok
 applied
 changed paths == the 46 patched files
+$ git diff --name-only 31c1357 origin/main (2adcd9a), against the patched files
+origin/main 2adcd9a: 8 changed paths since 31c1357, 4 of them patched here
 cmp: 46 of 46 files identical
 ```
 
 ## Full suite and gates
 
-On `wip/297-code` @ `06a9e01`, with `npm_config_cache`, `npm_config_store_dir` and
+On `wip/297-code` @ `67bd04d`, with `npm_config_cache`, `npm_config_store_dir` and
 `pnpm_config_store_dir` unset (dev0 is a team host):
 
 ```text
 $ pytest -m 'not live and not slow' -q
-6015 passed, 3 skipped, 80 deselected in 790.38s (0:13:10)
+6026 passed, 3 skipped, 80 deselected in 773.05s (0:12:53)
 EXIT=0
 ```
 
@@ -336,7 +434,7 @@ $ ruff format --check src/ tests/
 $ mypy src/
 Success: no issues found in 54 source files
 $ pytest (eight modules) -q
-920 passed in 282.06s (0:04:42)
+931 passed in 287.32s (0:04:47)
 ```
 
 ## Verbatim bodies
@@ -354,7 +452,7 @@ done
 git apply --unidiff-zero --check <scratch>/*.patch && git apply --unidiff-zero <scratch>/*.patch
 ```
 
-The patches are `git diff -U0 31c1357 06a9e01 -- <file>`. Rev 13 uses
+The patches are `git diff -U0 31c1357 67bd04d -- <file>`. Rev 15 uses
 0 lines of context to stay within the plan's size budget, so `git apply`
 needs `--unidiff-zero`; on the exact base that is safe, and the *Embedding
 proof* applies them so. They are fenced with **four** backticks, and the
@@ -450,10 +548,10 @@ index 5029f42..731fe41 100644
 ````diff
 diff --git a/src/pmcp/argument_errors.py b/src/pmcp/argument_errors.py
 new file mode 100644
-index 0000000..b20eea4
+index 0000000..df8b3a8
 --- /dev/null
 +++ b/src/pmcp/argument_errors.py
-@@ -0,0 +1,1362 @@
+@@ -0,0 +1,1365 @@
 +"""Describe a rejected gateway-tool argument without the value that failed.
 +
 +A gateway tool's arguments are checked twice: by the advertised JSON Schema
@@ -1559,7 +1657,9 @@ index 0000000..b20eea4
 +
 +    - `jsonrpc` is exactly the string `"2.0"`;
 +    - a request has a string `method` and a `RequestId`; a notification has a
-+      string `method` and no `id`; `params`, when present, is an object; a
++      string `method` and no `id` -- or `id: null`, which main, and the MCP
++      SDK's own parser, read as a notification (rev 15, round-14 grok F004;
++      nothing in it is echoed); `params`, when present, is an object; a
 +      request or notification carries neither `result` nor `error`;
 +    - a response has an `id` member (a `RequestId`, or null for an error the
 +      server could not attribute) and exactly one of `result` and `error`;
@@ -1579,8 +1679,9 @@ index 0000000..b20eea4
 +        method = frame["method"]
 +        if not isinstance(method, str):
 +            return f"non-string method ({_type_of(method)})"
-+        if "id" in frame and not _is_request_id(frame["id"]):
-+            return f"id of type {_type_of(frame['id'])}"
++        msg_id = frame.get("id")
++        if msg_id is not None and not _is_request_id(msg_id):
++            return f"id of type {_type_of(msg_id)}"
 +        # `params: null` is outside JSON-RPC 2.0, but the SDK's models accept
 +        # it and it carries nothing: it reads as absent (round-13 claude N1),
 +        # so a `ping` sent that way is still answered.
@@ -1907,7 +2008,7 @@ index 2be0ff2..f266f88 100644
 
 ````diff
 diff --git a/src/pmcp/client/manager.py b/src/pmcp/client/manager.py
-index cae5645..fec1b1e 100644
+index cae5645..37f5778 100644
 --- a/src/pmcp/client/manager.py
 +++ b/src/pmcp/client/manager.py
 @@ -14 +13,0 @@ import signal
@@ -1952,13 +2053,12 @@ index cae5645..fec1b1e 100644
 +    (not an object, or a non-string `message`). Every other error keeps the
 +    downstream's own message string, returned by design.
 +    """
-@@ -246,6 +275,87 @@ def _downstream_error(error: Any) -> DownstreamError:
+@@ -246,5 +275,60 @@ def _downstream_error(error: Any) -> DownstreamError:
 -        return DownstreamError(str(error))
 -    return DownstreamError(
 -        str(error.get("message", "Unknown error")),
 -        code=error.get("code"),
 -        data=error.get("data"),
--    )
 +        return DownstreamError(_MALFORMED_ERROR_MESSAGE)
 +    code = error.get("code")
 +    if code == _PARSE_ERROR:
@@ -2005,33 +2105,46 @@ index cae5645..fec1b1e 100644
 +    return {key: value for key, value in payload.items() if key not in unusable}
 +
 +
-+def task_payload_of(result: Any) -> dict[str, Any] | None:
-+    """The task a downstream answer carries, in every shape pmcp recognises:
-+    a nested `task` object, or a flat answer with a string `taskId`. The one
-+    recogniser the manager and the handlers share."""
++def _task_candidate(result: Any) -> dict[str, Any] | None:
++    """Where a downstream answer would carry a task: its nested `task`
++    object if it has one, else the answer itself (flat)."""
 +    if not isinstance(result, dict):
 +        return None
 +    task = result.get("task")
-+    if isinstance(task, dict):
-+        return task
-+    if isinstance(result.get("taskId"), str):
-+        return result
-+    return None
++    return task if isinstance(task, dict) else result
++
++
++def _names_a_task(result: Any) -> bool:
++    """Main's condition for not polling `tasks/get` after `tasks/result`,
++    kept exactly. It decides only that poll (rev 15)."""
++    return isinstance(result, dict) and (
++        isinstance(result.get("task"), dict) or isinstance(result.get("taskId"), str)
+@@ -253,0 +338,41 @@ def _downstream_error(error: Any) -> DownstreamError:
++def task_answer_of(result: Any) -> tuple[dict[str, Any], McpTaskInfo] | None:
++    """The task a downstream answer carries, and its parse -- or None. The
++    one recogniser, and it is the parser (rev 15): the candidate is a task
++    only if `ClientManager._task_info_from_payload` parses it."""
++    payload = _task_candidate(result)
++    if payload is None:
++        return None
++    info = ClientManager._task_info_from_payload(payload)
++    if info is None:
++        return None
++    return payload, info
 +
 +
 +def usable_task_response(result: Any) -> Any:
-+    """`result` with the task it carries reduced to what pmcp could use
-+    (`_usable_task_raw`): a hint pmcp dropped as unusable is neither returned
-+    to the caller nor sized through the answer itself (Consiliency/pmcp#297,
-+    round-13 codex). The shapes are `task_payload_of`'s, so a flat and a
-+    nested task are treated alike."""
-+    payload = task_payload_of(result)
-+    if payload is None:
++    """`result` with its task replaced by that task's parse (`raw`, without
++    the values pmcp dropped), so a dropped hint is neither returned nor sized
++    (Consiliency/pmcp#297). It acts if and only if `task_answer_of` finds a
++    task; anything else is returned unchanged, as data."""
++    found = task_answer_of(result)
++    if found is None:
 +        return result
-+    usable = _usable_task_raw(payload)
++    payload, info = found
 +    if payload is result:
-+        return usable
-+    return {**result, "task": usable}
++        return dict(info.raw)
++    return {**result, "task": dict(info.raw)}
 +
 +
 +def parse_request_id(request_id: str) -> tuple[str, int] | None:
@@ -2046,54 +2159,57 @@ index cae5645..fec1b1e 100644
 +        return server_name, int(local_id_str)
 +    except ValueError:
 +        return None
-@@ -626 +736,5 @@ def _entry_label(entry: Any, key: str = "name") -> str:
++
++
+@@ -626 +751,5 @@ def _entry_label(entry: Any, key: str = "name") -> str:
 -    return repr(entry)[:120]
 +        # No usable identifier: describe the entry's structure, never its
 +        # content -- the downstream's data that failed validation
 +        # (Consiliency/pmcp#297, rev 10; it was `repr(entry)[:120]`).
 +        return f"(an entry with {len(entry)} key{'' if len(entry) == 1 else 's'})"
 +    return f"(a {type(entry).__name__} entry)"
-@@ -1167 +1281,3 @@ class ClientManager:
+@@ -1167 +1296,3 @@ class ClientManager:
 -                error_msg = f"Failed to connect to {config.name}: {result}"
 +                error_msg = (
 +                    f"Failed to connect to {config.name}: {exception_text(result)}"
 +                )
-@@ -1703,6 +1819,4 @@ class ClientManager:
+@@ -1702,9 +1833,2 @@ class ClientManager:
+-    def _extract_task_payload(self, result: dict[str, Any]) -> dict[str, Any] | None:
 -        task = result.get("task")
 -        if isinstance(task, dict):
 -            return task
 -        if isinstance(result.get("taskId"), str):
 -            return result
 -        return None
-+        return task_payload_of(result)
-+
-+    def _usable_task_response(self, result: Any) -> Any:
-+        return usable_task_response(result)
-@@ -1765 +1879 @@ class ClientManager:
+-
+-    def _task_info_from_payload(self, payload: dict[str, Any]) -> McpTaskInfo | None:
++    @staticmethod
++    def _task_info_from_payload(payload: dict[str, Any]) -> McpTaskInfo | None:
+@@ -1765 +1889 @@ class ClientManager:
 -            raw=payload,
 +            raw=_usable_task_raw(payload),
-@@ -2028 +2142,3 @@ class ClientManager:
+@@ -2028 +2152,3 @@ class ClientManager:
 -                logger.debug(f"Server {name} doesn't support {kind}: {result}")
 +                logger.debug(
 +                    f"Server {name} doesn't support {kind}: {exception_text(result)}"
 +                )
-@@ -2117,2 +2233,2 @@ class ClientManager:
+@@ -2117,2 +2243,2 @@ class ClientManager:
 -                    f"cursor ({raw_cursor!r}); treating as unreadable rather "
 -                    f"than as the end of the listing"
 +                    f"cursor ({describe_value(raw_cursor)}); treating as "
 +                    f"unreadable rather than as the end of the listing"
-@@ -2123,2 +2239,3 @@ class ClientManager:
+@@ -2123,2 +2249,3 @@ class ClientManager:
 -                    f"[{managed.config.name}] {kind}/list repeated cursor "
 -                    f"{raw_cursor!r}; treating as unreadable rather than looping"
 +                    f"[{managed.config.name}] {kind}/list repeated a cursor "
 +                    f"({describe_value(raw_cursor)}); treating as unreadable "
 +                    f"rather than looping"
-@@ -2767,3 +2884 @@ class ClientManager:
+@@ -2767,3 +2894 @@ class ClientManager:
 -                traceback_text = "".join(
 -                    traceback.format_exception(type(exc), exc, exc.__traceback__)
 -                )
 +                traceback_text = safe_traceback_text(exc)
-@@ -2934,6 +3049,10 @@ class ClientManager:
+@@ -2934,6 +3059,10 @@ class ClientManager:
 -            message = json.loads(text)
 -        except json.JSONDecodeError:
 -            # Non-JSON output already counted as a heartbeat by the caller.
@@ -2110,7 +2226,7 @@ index cae5645..fec1b1e 100644
 +            # on stderr, which is logged as before. The record is fixed text
 +            # plus the parser's value-free description.
 +            logger.debug(f"[{name}] non-protocol stdout line: {exception_text(error)}")
-@@ -2977,13 +3096,20 @@ class ClientManager:
+@@ -2977,13 +3106,20 @@ class ClientManager:
 -        Each guard below exists because a later access depends on it, and each
 -        drops the frame with a value-free debug log, as a non-JSON line is
 -        dropped:
@@ -2144,7 +2260,7 @@ index cae5645..fec1b1e 100644
 +        `set_exception` still raise `InvalidStateError` on a future that is
 +        already settled (a caller cancelled it, and the response raced its
 +        `finally` pop), which is checked below.
-@@ -2991,5 +3117,3 @@ class ClientManager:
+@@ -2991,5 +3127,3 @@ class ClientManager:
 -        if not isinstance(frame, dict):
 -            logger.debug(
 -                f"[{name}] dropped invalid frame: not a JSON object "
@@ -2153,7 +2269,7 @@ index cae5645..fec1b1e 100644
 +        problem = jsonrpc_envelope_problem(frame)
 +        if problem is not None:
 +            logger.debug(f"[{name}] dropped invalid frame: {problem}")
-@@ -2998,7 +3121,0 @@ class ClientManager:
+@@ -2998,7 +3131,0 @@ class ClientManager:
 -        if msg_id is not None and (
 -            isinstance(msg_id, bool) or not isinstance(msg_id, (str, int))
 -        ):
@@ -2161,10 +2277,11 @@ index cae5645..fec1b1e 100644
 -                f"[{name}] dropped invalid frame: id of type {type(msg_id).__name__}"
 -            )
 -            return
-@@ -3012 +3129 @@ class ClientManager:
--            if msg_id is None:
-+            if "id" not in frame:
-@@ -3018,9 +3134,0 @@ class ClientManager:
+@@ -3013 +3140,2 @@ class ClientManager:
+-                # Notification: no id, nothing to resolve.
++                # Notification: no id (or `id: null`, which main and the MCP
++                # SDK read as a notification; rev 15), nothing to resolve.
+@@ -3018,9 +3145,0 @@ class ClientManager:
 -        elif "method" in frame:
 -            # A `method` that is present but not a string is not a valid
 -            # JSON-RPC request -- and it is not a response either, so it must
@@ -2174,16 +2291,68 @@ index cae5645..fec1b1e 100644
 -                f"[{name}] dropped invalid frame: non-string method "
 -                f"({type(method).__name__})"
 -            )
-@@ -3995,0 +4104 @@ class ClientManager:
-+            return self._usable_task_response(result)
-@@ -4098 +4207 @@ class ClientManager:
+@@ -3986,10 +4105,9 @@ class ClientManager:
+-            task_payload = self._extract_task_payload(result)
+-            if task_payload is not None:
+-                task_info = self._task_info_from_payload(task_payload)
+-                if task_info is not None:
+-                    self._record_task(
+-                        tool_info.server_name,
+-                        task_info,
+-                        tool_id=tool_id,
+-                        requestor_context=requestor_context,
+-                    )
++            found = task_answer_of(result)
++            if found is not None:
++                self._record_task(
++                    tool_info.server_name,
++                    found[1],
++                    tool_id=tool_id,
++                    requestor_context=requestor_context,
++                )
++            return usable_task_response(result)
+@@ -4061,3 +4179,2 @@ class ClientManager:
+-        payload = self._extract_task_payload(result) or result
+-        task_info = self._task_info_from_payload(payload)
+-        if task_info is None:
++        found = task_answer_of(result)
++        if found is None:
+@@ -4065 +4182 @@ class ClientManager:
+-        return self._record_task(server_name, task_info)
++        return self._record_task(server_name, found[1])
+@@ -4086,6 +4203,4 @@ class ClientManager:
+-        task_payload = self._extract_task_payload(result)
+-        if task_payload is not None:
+-            task_info = self._task_info_from_payload(task_payload)
+-            if task_info is not None:
+-                self._record_task(server_name, task_info)
+-        else:
++        found = task_answer_of(result)
++        if found is not None:
++            self._record_task(server_name, found[1])
++        elif not _names_a_task(result):
+@@ -4098 +4213 @@ class ClientManager:
 -        return result
-+        return self._usable_task_response(result)
-@@ -4425 +4534,2 @@ class ClientManager:
++        return usable_task_response(result)
+@@ -4122,3 +4237,8 @@ class ClientManager:
+-        payload = self._extract_task_payload(result) or result
+-        task_info = self._task_info_from_payload(payload)
+-        if task_info is None:
++        found = task_answer_of(result)
++        if found is not None:
++            task_info = found[1]
++        else:
++            # The answer carries no task pmcp can parse, so nothing in it was
++            # read: `raw` stays empty rather than holding the whole answer
++            # (rev 15, round-14 claude F001: an unparseable task's `ttl` went
++            # back out through `gateway.tasks_cancel`).
+@@ -4129 +4248,0 @@ class ClientManager:
+-                raw=result,
+@@ -4425 +4544,2 @@ class ClientManager:
 -                f"Invalid request_id format: {request_id}",
 +                "Invalid request_id format: expected server_name::local_id "
 +                f"({describe_value(request_id)})",
-@@ -4429,6 +4539,9 @@ class ClientManager:
+@@ -4429,6 +4549,9 @@ class ClientManager:
 -
 -        server_name, local_id_str = request_id.rsplit("::", 1)
 -        try:
@@ -3283,7 +3452,7 @@ index 00e741c..02c2e70 100644
 
 ````diff
 diff --git a/src/pmcp/tools/handlers.py b/src/pmcp/tools/handlers.py
-index 09e9f34..b8773d9 100644
+index 09e9f34..00bffb4 100644
 --- a/src/pmcp/tools/handlers.py
 +++ b/src/pmcp/tools/handlers.py
 @@ -22,0 +23 @@ from pydantic import BaseModel
@@ -3294,7 +3463,7 @@ index 09e9f34..b8773d9 100644
 +    ClientManager,
 +    _terminate_process_tree,
 +    parse_request_id,
-+    task_payload_of,
++    task_answer_of,
 +)
 @@ -67,0 +74 @@ from pmcp.validation import (
 +    discovered_env_var_refusal_reason,
@@ -3309,7 +3478,7 @@ index 09e9f34..b8773d9 100644
 @@ -1031 +1039 @@ class GatewayTools:
 -            logger.warning(f"Could not save provisioned registry: {e}")
 +            logger.warning(f"Could not save provisioned registry: {exception_text(e)}")
-@@ -1659,8 +1667,10 @@ class GatewayTools:
+@@ -1659,8 +1667,8 @@ class GatewayTools:
 -            if isinstance(result, dict):
 -                task_payload = result.get("task")
 -                if isinstance(task_payload, dict):
@@ -3318,89 +3487,87 @@ index 09e9f34..b8773d9 100644
 -                        task_info = self._client_manager.get_task_record(
 -                            tool_info.server_name, task_id
 -                        )
-+            # Every task shape the manager recognises, flat or nested
-+            # (round-13 codex): the manager has already reduced it to what
-+            # pmcp could use (`usable_task_response`).
-+            task_payload = task_payload_of(result)
-+            if task_payload is not None:
-+                task_id = task_payload.get("taskId") or task_payload.get("task_id")
-+                if isinstance(task_id, str):
-+                    task_info = self._client_manager.get_task_record(
-+                        tool_info.server_name, task_id
-+                    )
-@@ -1832 +1842 @@ class GatewayTools:
++            # The manager's one recogniser, which is its parser (rev 15): a
++            # task here is exactly a task the manager recorded and reduced to
++            # what pmcp could use (`usable_task_response`).
++            found = task_answer_of(result)
++            if found is not None:
++                task_info = self._client_manager.get_task_record(
++                    tool_info.server_name, found[1].task_id
++                )
+@@ -1832 +1840 @@ class GatewayTools:
 -            auth_challenge = self._auth_challenge_from_message(str(e))
 +            auth_challenge = self._auth_challenge_from_message(exception_text(e))
-@@ -1910 +1920,3 @@ class GatewayTools:
+@@ -1910 +1918,3 @@ class GatewayTools:
 -                logger.warning(f"Failed to load manifest startup configs: {e}")
 +                logger.warning(
 +                    f"Failed to load manifest startup configs: {exception_text(e)}"
 +                )
-@@ -1916 +1928,3 @@ class GatewayTools:
+@@ -1916 +1926,3 @@ class GatewayTools:
 -                logger.warning(f"Failed to restore provisioned servers: {e}")
 +                logger.warning(
 +                    f"Failed to restore provisioned servers: {exception_text(e)}"
 +                )
-@@ -2162 +2176 @@ class GatewayTools:
+@@ -2162 +2174 @@ class GatewayTools:
 -                error=str(e),
 +                error=exception_text(e),
-@@ -2170 +2184 @@ class GatewayTools:
+@@ -2170 +2182 @@ class GatewayTools:
 -                errors=[str(e)],
 +                errors=[exception_text(e)],
-@@ -4270 +4284,3 @@ class GatewayTools:
+@@ -4270 +4282,3 @@ class GatewayTools:
 -                logger.error(f"Failed to connect remote server {server_name}: {e}")
 +                logger.error(
 +                    f"Failed to connect remote server {server_name}: {exception_text(e)}"
 +                )
-@@ -4352 +4368,3 @@ class GatewayTools:
+@@ -4352 +4366,3 @@ class GatewayTools:
 -            logger.error(f"Failed to start provisioning {server_name}: {e}")
 +            logger.error(
 +                f"Failed to start provisioning {server_name}: {exception_text(e)}"
 +            )
-@@ -4440 +4458 @@ class GatewayTools:
+@@ -4440 +4456 @@ class GatewayTools:
 -                        error=str(e),
 +                        error=exception_text(e),
-@@ -4445 +4463 @@ class GatewayTools:
+@@ -4445 +4461 @@ class GatewayTools:
 -                        message=str(e),
 +                        message=exception_text(e),
-@@ -4581 +4599,4 @@ class GatewayTools:
+@@ -4581 +4597,4 @@ class GatewayTools:
 -                error=f"Env var '{env_var}' is not permitted for this server.",
 +                error=(
 +                    f"Env var ({describe_value(env_var)}) is not permitted for "
 +                    "this server."
 +                ),
-@@ -4590,2 +4611,2 @@ class GatewayTools:
+@@ -4590,2 +4609,2 @@ class GatewayTools:
 -                    f"Env var '{env_var}' is not permitted for server "
 -                    f"'{server_name}'.{expected} Refusing to store it."
 +                    f"Env var ({describe_value(env_var)}) is not permitted for "
 +                    f"server '{server_name}'.{expected} Refusing to store it."
-@@ -4594 +4615,2 @@ class GatewayTools:
+@@ -4594 +4613,2 @@ class GatewayTools:
 -                env_var=env_var,
 +                # Not echoed: the caller's rejected value (rev 12).
 +                env_var=None,
-@@ -4608 +4630 @@ class GatewayTools:
+@@ -4608 +4628 @@ class GatewayTools:
 -                error=str(exc),
 +                error=exception_text(exc),
-@@ -4613 +4635 @@ class GatewayTools:
+@@ -4613 +4633 @@ class GatewayTools:
 -                message=str(exc),
 +                message=exception_text(exc),
-@@ -4615 +4637,2 @@ class GatewayTools:
+@@ -4615 +4635,2 @@ class GatewayTools:
 -                env_var=env_var,
 +                # Not echoed: the caller's rejected value (rev 12).
 +                env_var=None,
-@@ -4817 +4840 @@ class GatewayTools:
+@@ -4817 +4838 @@ class GatewayTools:
 -            logger.warning("Feedback submission raised: %s", exc)
 +            logger.warning("Feedback submission raised: %s", exception_text(exc))
-@@ -5091 +5114 @@ class GatewayTools:
+@@ -5091 +5112 @@ class GatewayTools:
 -                message=f"Failed to run update probe: {e}",
 +                message=f"Failed to run update probe: {exception_text(e)}",
-@@ -5321 +5344 @@ class GatewayTools:
+@@ -5321 +5342 @@ class GatewayTools:
 -                                f"'{server_name}': {e}"
 +                                f"'{server_name}': {exception_text(e)}"
-@@ -5445 +5468 @@ class GatewayTools:
+@@ -5445 +5466 @@ class GatewayTools:
 -                    f"unsafe package identifier {package!r}."
 +                    f"unsafe package identifier ({describe_value(package)})."
-@@ -5460 +5483,8 @@ class GatewayTools:
+@@ -5460 +5481,8 @@ class GatewayTools:
 -            names = ", ".join(operator_safe(name) for name in disallowed)
 +            reasons: dict[str, int] = {}
 +            for name in disallowed:
@@ -3410,59 +3577,59 @@ index 09e9f34..b8773d9 100644
 +            names = "; ".join(
 +                f"{count} {reason}" for reason, count in sorted(reasons.items())
 +            )
-@@ -5490 +5520,5 @@ class GatewayTools:
+@@ -5490 +5518,5 @@ class GatewayTools:
 -            logger.warning("Package identity lookup raised for %r: %s", package, exc)
 +            logger.warning(
 +                "Package identity lookup raised for %r: %s",
 +                package,
 +                exception_text(exc),
 +            )
-@@ -5606,0 +5641,5 @@ class GatewayTools:
+@@ -5606,0 +5639,5 @@ class GatewayTools:
 +        # Outside the `try`: its arm logs a traceback and renders `str(e)`,
 +        # and a `ValidationError`'s text carries the rejected value. Raised,
 +        # it is described without it (Consiliency/pmcp#297).
 +        parsed = ProvisionStatusInput.model_validate(input_data)
 +        job_id = parsed.job_id
-@@ -5608,3 +5646,0 @@ class GatewayTools:
+@@ -5608,3 +5644,0 @@ class GatewayTools:
 -            parsed = ProvisionStatusInput.model_validate(input_data)
 -            job_id = parsed.job_id
 -
-@@ -5678 +5714,4 @@ class GatewayTools:
+@@ -5678 +5712,4 @@ class GatewayTools:
 -            logger.error(f"provision_status handler failed: {e}", exc_info=True)
 +            logger.error(
 +                f"provision_status handler failed: {exception_text(e)}",
 +                exc_info=safe_exc_info(e),
 +            )
-@@ -5681 +5720 @@ class GatewayTools:
+@@ -5681 +5718 @@ class GatewayTools:
 -                job_id=input_data.get("job_id", "unknown"),
 +                job_id=job_id,
-@@ -5772 +5811,4 @@ class GatewayTools:
+@@ -5772 +5809,4 @@ class GatewayTools:
 -            logger.error(f"Handoff failed for {job_server_name}: {e}", exc_info=True)
 +            logger.error(
 +                f"Handoff failed for {job_server_name}: {exception_text(e)}",
 +                exc_info=safe_exc_info(e),
 +            )
-@@ -5774 +5816 @@ class GatewayTools:
+@@ -5774 +5814 @@ class GatewayTools:
 -            job.error = f"Handoff failed: {e}"
 +            job.error = f"Handoff failed: {exception_text(e)}"
-@@ -5818 +5860 @@ class GatewayTools:
+@@ -5818 +5858 @@ class GatewayTools:
 -            logger.error(f"Failed to refresh after install: {e}")
 +            logger.error(f"Failed to refresh after install: {exception_text(e)}")
-@@ -6047 +6089 @@ class GatewayTools:
+@@ -6047 +6087 @@ class GatewayTools:
 -                error=str(e),
 +                error=exception_text(e),
-@@ -6091 +6133 @@ class GatewayTools:
+@@ -6091 +6131 @@ class GatewayTools:
 -                error=str(e),
 +                error=exception_text(e),
-@@ -6127 +6169,3 @@ class GatewayTools:
+@@ -6127 +6167,3 @@ class GatewayTools:
 -                        decoded = json.loads(result_payload)
 +                        decoded = load_json(
 +                            result_payload, source="tool result payload"
 +                        )
-@@ -6165 +6209 @@ class GatewayTools:
+@@ -6165 +6207 @@ class GatewayTools:
 -                error=str(e),
 +                error=exception_text(e),
-@@ -6269,3 +6313,7 @@ class GatewayTools:
+@@ -6269,3 +6311,7 @@ class GatewayTools:
 -        server_name = (
 -            parsed.request_id.rsplit("::", 1)[0] if "::" in parsed.request_id else None
 -        )
@@ -3473,7 +3640,7 @@ index 09e9f34..b8773d9 100644
 +        # misses names it, as every lookup miss does (Consiliency/pmcp#315).
 +        parsed_id = parse_request_id(parsed.request_id)
 +        server_name = parsed_id[0] if parsed_id is not None else None
-@@ -6282 +6330 @@ class GatewayTools:
+@@ -6282 +6328 @@ class GatewayTools:
 -            request_id=parsed.request_id,
 +            request_id=parsed.request_id if parsed_id is not None else None,
 ````
@@ -3615,10 +3782,10 @@ index df1995a..0953e6a 100644
 ````diff
 diff --git a/tests/test_argument_error_echo.py b/tests/test_argument_error_echo.py
 new file mode 100644
-index 0000000..7a8d6d5
+index 0000000..11f28be
 --- /dev/null
 +++ b/tests/test_argument_error_echo.py
-@@ -0,0 +1,1952 @@
+@@ -0,0 +1,2169 @@
 +"""A rejected gateway-tool argument never echoes its value (Consiliency/pmcp#297).
 +
 +The oracle is a generated sweep, not hand-picked cases. Its axes come from the
@@ -3661,7 +3828,7 @@ index 0000000..7a8d6d5
 +import traceback
 +import typing
 +from pathlib import Path
-+from typing import Any
++from typing import Any, cast
 +
 +import jsonschema
 +import pytest
@@ -4786,7 +4953,7 @@ index 0000000..7a8d6d5
 +    from pmcp.client.manager import ClientManager
 +
 +    manager = ClientManager()
-+    keys = _payload_keys(ClientManager._task_info_from_payload)
++    keys = _payload_keys(_task_parser_source())
 +    assert {"ttl", "pollInterval", "createdAt", "status"} <= set(keys), keys
 +    positions = []
 +    for key in keys:
@@ -4817,17 +4984,59 @@ index 0000000..7a8d6d5
 +    return None
 +
 +
-+#: Every shape in which a downstream answer carries a task, as pmcp's one
-+#: recogniser (`task_payload_of`) accepts it (round-13 codex): nested, with
-+#: or without a sibling `result`, and flat.
++def _task_parser_source() -> Any:
++    """The task parser: the manager's `_task_info_from_payload` (static from
++    rev 15, when it became the only recogniser)."""
++    from pmcp.client.manager import ClientManager
++
++    return ClientManager._task_info_from_payload
++
++
++def _parse_task(payload: dict[str, Any]) -> Any:
++    """Run that parser (before rev 15 a method that reads nothing from
++    `self`)."""
++    import inspect
++
++    from pmcp.client.manager import ClientManager
++
++    raw = inspect.getattr_static(ClientManager, "_task_info_from_payload")
++    if isinstance(raw, staticmethod):
++        return ClientManager._task_info_from_payload(payload)
++    return ClientManager._task_info_from_payload(cast(Any, None), payload)
++
++
++def _task_id_aliases() -> list[str]:
++    """Every wire name the parser takes a task's id from, found by RUNNING it
++    on each key it reads (rev 15, round-14: derived from the parser's
++    grammar, not from a recogniser's)."""
++    return [k for k in _payload_keys(_task_parser_source()) if _parse_task({k: "t"})]
++
++
++def _renamed_id(payload: dict[str, Any], alias: str) -> dict[str, Any]:
++    if alias == "taskId" or "taskId" not in payload:
++        return dict(payload)
++    return {(alias if key == "taskId" else key): v for key, v in payload.items()}
++
++
++def _task_wrap(shape: str, alias: str) -> Any:
++    def wrap(p: dict[str, Any], method: str) -> Any:
++        task = _renamed_id(p, alias)
++        if shape == "flat":
++            return task
++        if shape == "nested" and method == "tasks/result":
++            return {"task": task, "result": {"content": []}}
++        return {"task": task}
++
++    return wrap
++
++
++#: Every shape in which a downstream answer carries a task, as the PARSER's
++#: grammar accepts it (rev 15): each id alias the parser reads, nested (with a
++#: sibling `result` on `tasks/result`), nested without one, and flat.
 +_TASK_WRAPS: dict[str, Any] = {
-+    "nested": lambda p, method: (
-+        {"task": p, "result": {"content": []}}
-+        if method == "tasks/result"
-+        else {"task": p}
-+    ),
-+    "nested-bare": lambda p, method: {"task": p},
-+    "flat": lambda p, method: dict(p),
++    f"{shape}-{alias}": _task_wrap(shape, alias)
++    for alias in _task_id_aliases()
++    for shape in ("nested", "nested-bare", "flat")
 +}
 +
 +
@@ -4890,9 +5099,10 @@ index 0000000..7a8d6d5
 +    async def send_request(managed: Any, method: str, params: Any, **_: Any) -> Any:
 +        state["methods"].append(method)
 +        payload = state["payload"]
++        wrap = state.get("wrap", "nested-taskId")
 +        if method == "tasks/list":
-+            return {"tasks": [payload]}
-+        return _TASK_WRAPS[state.get("wrap", "nested")](payload, method)
++            return {"tasks": [_renamed_id(payload, wrap.rsplit("-", 1)[-1])]}
++        return _TASK_WRAPS[wrap](payload, method)
 +
 +    manager._send_request = send_request  # type: ignore[method-assign]
 +    return server, audit_path, state
@@ -5492,22 +5702,18 @@ index 0000000..7a8d6d5
 +    """Round-13 codex: a task hint pmcp drops as unusable left through the
 +    answer itself -- `gateway.invoke` returned a flat task answer as its
 +    `result`, and `gateway.tasks_result` the original `{"task": ...}`, both
-+    holding the value and sized with it. Every task call, in every shape the
-+    recogniser accepts, with every dropped position: the value is in no
-+    channel, and two sentinel lengths give the same answer (no size channel)."""
-+    import pmcp.client.manager as manager_module
-+
-+    # The recogniser as the manager defines it; before rev 14 it was only the
-+    # manager's own method (so this test runs, and fails on the value, there).
-+    task_payload_of = getattr(
-+        manager_module,
-+        "task_payload_of",
-+        lambda result: manager_module.ClientManager()._extract_task_payload(result),
-+    )
++    holding the value and sized with it. Rev 15 (round-14 grok F002/F003):
++    the shapes are the PARSER's -- every id alias it reads (`task_id` too),
++    nested or flat -- so an alias the old recogniser missed is swept. Every
++    task call (`tasks_list` included), in every shape, with every dropped
++    position: the value is in no channel, and two sentinel lengths give the
++    same answer (no size channel)."""
 +    caplog.set_level(logging.DEBUG)
-+    probe = {"taskId": "t", "status": "working", "ttl": "x"}
++    probe = {"taskId": "t", "status": "working"}
 +    for method in ("tools/call", "tasks/get", "tasks/result", "tasks/cancel"):
-+        assert task_payload_of(_TASK_WRAPS[wrap](probe, method)) == probe, method
++        answer = _TASK_WRAPS[wrap](probe, method)
++        candidate = answer["task"] if "task" in answer else answer
++        assert _parse_task(candidate) is not None, (wrap, method)
 +    server, audit_path, state = _task_server(tmp_path, audited=False)
 +    state["wrap"] = wrap
 +    tap = _Tap(server, audit_path, caplog, capfd, recwarn)
@@ -5523,8 +5729,6 @@ index 0000000..7a8d6d5
 +    assert dropped, "no dropped position"
 +    cases = 0
 +    for name, arguments, method in _task_calls():
-+        if method == "tasks/list":
-+            continue
 +        for key, shape in dropped:
 +            for family, sentinels in _FAMILIES.items():
 +                # A value the parser accepts (a digits-only `createdAt` is a
@@ -5570,7 +5774,187 @@ index 0000000..7a8d6d5
 +                )
 +                cases += 1
 +    await server.shutdown()
-+    assert cases >= 4 * len(dropped) * (len(_FAMILIES) - 1), cases
++    assert cases >= 5 * len(dropped) * (len(_FAMILIES) - 1), cases
++
++
++# ---------------------------------------------------------------------------
++# Rev 15 (round-14 board): the recogniser IS the parser
++# ---------------------------------------------------------------------------
++
++
++def _drops_alone(key: str, value: Any) -> bool:
++    """The parser's own verdict: it drops `value` at `key`, the only hint."""
++    info = _parse_task({"taskId": "t", key: value})
++    return info is not None and key not in info.raw
++
++
++def _usable_probe(key: str) -> Any:
++    for value in (5, 5.0, "working", "a message"):
++        info = _parse_task({"taskId": "t", key: value})
++        if info is not None and not info.unusable_fields and key in info.raw:
++            return value
++    return None
++
++
++def _generated_task_answers() -> list[tuple[str, dict[str, Any]]]:
++    """Answers from the parser's grammar: each id it reads, and ids it does
++    not (absent, empty, integer, null, object); each other key it reads with
++    a dropped value, a null, a usable value, and a usable value beside a
++    dropped one; nested beside result data, nested bare, and flat. Plus
++    codex's round-14 falsifier (data under `task`, no id)."""
++    ids = [(a, {a: "t"}) for a in _task_id_aliases()] + [
++        ("no-id", {}),
++        ("empty-id", {"taskId": ""}),
++        ("int-id", {"taskId": 5}),
++        ("null-id", {"taskId": None}),
++        ("object-id", {"task_id": {"x": 1}}),
++    ]
++    keys = [k for k in _payload_keys(_task_parser_source()) if k not in dict(ids)]
++    hints: list[tuple[str, dict[str, Any]]] = [("none", {})]
++    hints.append(("business", {"statusMessage": {"detail": "business-data"}}))
++    for key in keys:
++        hints += [(f"{key}={s}", {key: v}) for s, v in _bad_values("S").items()]
++        hints.append((f"{key}=null", {key: None}))
++        usable = _usable_probe(key)
++        if usable is not None:
++            hints.append((f"{key}=usable", {key: usable}))
++            hints += [
++                (f"{key}=usable+{o}=S", {key: usable, o: "S"})
++                for o in keys
++                if o != key and _usable_probe(o) is not None
++            ]
++    answers = []
++    for id_name, id_part in ids:
++        for hint_name, hint_part in hints:
++            task = {**id_part, "status": "working", **hint_part}
++            name = f"{id_name}/{hint_name}"
++            answers.append((f"nested/{name}", {"task": task, "content": []}))
++            answers.append((f"nested-bare/{name}", {"task": dict(task)}))
++            answers.append((f"flat/{name}", dict(task)))
++    return answers
++
++
++@pytest.mark.asyncio
++async def test_the_normaliser_acts_iff_the_parser_accepts_on_every_task_op(
++    tmp_path: Path,
++) -> None:
++    """Round-14 board (codex F024-F027, grok F002/F003, claude F001/F002): rev
++    14's recogniser and parser disagreed both ways. Through `call_tool`,
++    `get_task`, `list_tasks`, `get_task_result` and `cancel_task` (and its
++    fallback), for every generated answer: the normaliser acts iff the parser
++    yields a task; the task becomes exactly the parse's `raw`; the keys
++    removed are exactly those the parser drops (per wire key: one alias of a
++    field can be usable while another is not), which include every sent
++    alias of each field in `unusable_fields`; siblings are untouched."""
++    from pmcp.client.manager import _TASK_WIRE_KEYS
++    from pmcp.types import McpTaskInfo
++
++    server, _, _ = _task_server(tmp_path, audited=False)
++    manager = server._client_manager
++    reply: dict[str, Any] = {}
++
++    async def send_request(managed: Any, method: str, params: Any, **_: Any) -> Any:
++        task = reply.get("task") if isinstance(reply.get("task"), dict) else reply
++        return copy.deepcopy({"tasks": [task]} if method == "tasks/list" else reply)
++
++    manager._send_request = send_request  # type: ignore[method-assign]
++    answers = _generated_task_answers()
++    acted = 0
++    for name, answer in answers:
++        reply.clear()
++        reply.update(copy.deepcopy(answer))
++        nested = isinstance(answer.get("task"), dict)
++        candidate = answer["task"] if nested else answer
++        info = _parse_task(candidate)
++        expected: Any = answer
++        if info is not None:
++            acted += 1
++            expected = {**answer, "task": info.raw} if nested else info.raw
++            assert set(candidate) - set(info.raw) == {
++                k for k in candidate if _drops_alone(k, candidate[k])
++            }, name
++            for field in info.unusable_fields:
++                for key in _TASK_WIRE_KEYS.get(field, ()):
++                    assert candidate.get(key) is None or key not in info.raw, name
++        manager._tasks.clear()
++        got = await manager.call_tool(f"{_DOWNSTREAM}::run", {}, task={"enabled": True})
++        assert got == expected and bool(manager._tasks) is (info is not None), name
++        manager._tasks.clear()
++        if info is None:
++            with pytest.raises(KeyError):
++                await manager.get_task(_DOWNSTREAM, "t")
++        else:
++            assert (await manager.get_task(_DOWNSTREAM, "t")).raw == info.raw, name
++        listed = await manager.list_tasks(_DOWNSTREAM)
++        raws = [t["raw"] for t in listed["tasks"]]
++        assert raws == ([info.raw] if info is not None else []), name
++        if nested or info is not None:  # otherwise main's rule polls tasks/get
++            assert await manager.get_task_result(_DOWNSTREAM, "t") == expected, name
++        manager._tasks.clear()
++        manager._record_task(_DOWNSTREAM, McpTaskInfo(task_id="t", status="working"))
++        _, record, _ = await manager.cancel_task(_DOWNSTREAM, "t")
++        assert record is not None
++        assert record.raw == (info.raw if info is not None else {}), name
++    await server.shutdown()
++    assert 0 < acted < len(answers) and len(answers) > 1000, (acted, len(answers))
++
++
++async def _answer_text(root: Path, tool: str, reply: Any) -> str:
++    from pmcp.types import McpTaskInfo
++
++    root.mkdir()
++    server, _, _ = _task_server(root, audited=False)
++
++    async def send_request(managed: Any, method: str, params: Any, **_: Any) -> Any:
++        return copy.deepcopy(reply)
++
++    server._client_manager._send_request = send_request  # type: ignore[method-assign]
++    if tool == "gateway.invoke":
++        args = {"tool_id": f"{_DOWNSTREAM}::run", "task": {"enabled": True}}
++        args.update(_correlations())
++    else:
++        args = {"server_name": _DOWNSTREAM, "task_id": "t"}
++        task = McpTaskInfo(task_id="t", status="working")
++        server._client_manager._record_task(_DOWNSTREAM, task)
++    result = await _call(server, tool, args)
++    if tool == "gateway.tasks_cancel":
++        record = server._client_manager.get_task_record(_DOWNSTREAM, "t")
++        assert record is not None and record.raw == {}, record
++    await server.shutdown()
++    return "".join(block.text for block in result.content)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("tool", ["gateway.invoke", "gateway.tasks_result"])
++async def test_task_result_preserves_non_task_data(tmp_path: Path, tool: str) -> None:
++    """Round-14 codex F024-F027: a `task` the parser does not read (no id) is
++    the downstream's data, kept whole as on main; rev 14 deleted from it."""
++    reply = {"task": {"statusMessage": {"detail": "business-data"}}, "content": []}
++    assert "business-data" in await _answer_text(tmp_path / "a", tool, reply)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("tool", "reply"),
++    [
++        # round-14 grok F002/F003, claude F002: a flat snake-case task.
++        ("gateway.invoke", {"task_id": "t", "status": "working", "ttl": "@S@"}),
++        ("gateway.tasks_result", {"task_id": "t", "status": "working", "ttl": "@S@"}),
++        # round-14 claude F001: the cancel fallback copied the whole answer.
++        ("gateway.tasks_cancel", {"taskId": 5, "status": "cancelled", "ttl": "@S@"}),
++        ("gateway.tasks_cancel", {"task": {"taskId": 5, "ttl": "@S@"}}),
++    ],
++)
++async def test_a_dropped_task_hint_leaves_by_no_alias_or_fallback(
++    tmp_path: Path, tool: str, reply: dict[str, Any]
++) -> None:
++    sizes = []
++    for s in ("violetcanaryrejected", "violetcanaryrejected12345678"):
++        sent = json.loads(json.dumps(reply).replace("@S@", s))
++        text = await _answer_text(tmp_path / s, tool, sent)
++        assert s not in text, text
++        sizes.append(json.loads(text).get("raw_size_estimate"))
++    assert sizes[0] == sizes[1], sizes
 ````
 
 ### Patch — `tests/test_auth_operator_messages.py`
@@ -5593,10 +5977,10 @@ index 862d690..ba0c749 100644
 ````diff
 diff --git a/tests/test_downstream_frame_echo.py b/tests/test_downstream_frame_echo.py
 new file mode 100644
-index 0000000..b754f03
+index 0000000..9f3ee2c
 --- /dev/null
 +++ b/tests/test_downstream_frame_echo.py
-@@ -0,0 +1,1795 @@
+@@ -0,0 +1,1824 @@
 +"""A downstream's malformed JSON-RPC reply never echoes into pmcp's output
 +(Consiliency/pmcp#297, rev 3).
 +
@@ -7392,6 +7776,35 @@ index 0000000..b754f03
 +    assert jsonrpc_envelope_problem(error) == "error code of type object"
 +    result = {"jsonrpc": "2.0", "id": 1.5, "result": {}}
 +    assert jsonrpc_envelope_problem(result) == "id of type number"
++
++
++def test_a_notification_with_a_null_id_is_delivered_as_a_notification(
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    """Round-14 grok F004 (rev 15): main delivered `{"method": ..., "id":
++    null}` as a notification, and the MCP SDK's own parser reads it as one;
++    rev 14 dropped it (`id of type null`). It is accepted again, routed as a
++    notification and never answered (a reply with a null id would be a
++    response to nothing). Any other non-RequestId id is still dropped."""
++    import time
++
++    from pmcp.argument_errors import jsonrpc_envelope_problem
++
++    note = {"jsonrpc": "2.0", "id": None, "method": "notifications/tools/list_changed"}
++    assert jsonrpc_envelope_problem(note) is None
++    assert jsonrpc_envelope_problem({**note, "id": 1.5}) == "id of type number"
++    manager, managed = _stdio_manager()
++    replies: list[tuple[Any, str]] = []
++    notified: list[str] = []
++    manager._reply_to_downstream_request = (  # type: ignore[method-assign]
++        lambda name, managed, msg_id, method: replies.append((msg_id, method))
++    )
++    manager._handle_downstream_notification = (  # type: ignore[method-assign]
++        lambda name, managed, method: notified.append(method)
++    )
++    manager._handle_stdout_line("srv", managed, json.dumps(note).encode(), time.time())
++    assert notified == ["notifications/tools/list_changed"]
++    assert replies == []
 ````
 
 ### Patch — `tests/test_exception_text_sinks.py`
@@ -10278,22 +10691,26 @@ index 2d05cec..8a6db46 100644
 
 ### `mutants.py` — the mutation run; `python mutants.py <worktree> <out-dir> [M4 ...]`, `NO_STATIC=1` deselects both sink checks
 
-Given as a diff to fit the size budget: extract the `mutants.py` block of rev 9 of this plan (`a449dd9`), then `patch -p1 mutants.py <` the `mutants.py` diffs of rev 12 (`48b7a89`) and rev 13 (`8b45ddd`) in turn, then this diff (rev 14: M92 retired, M94–M102 added).
+Given as a diff to fit the size budget: extract the `mutants.py` block of rev 9 of this plan (`a449dd9`), then `patch -p1 mutants.py <` the `mutants.py` diffs of rev 12 (`48b7a89`), rev 13 (`8b45ddd`) and rev 14 (`440d170`) in turn, then this diff (rev 15: M91 and M94–M96 retargeted, M103–M110 added).
 
 ````diff
 --- a/mutants.py
 +++ b/mutants.py
-@@ -101 +100,0 @@
-- ("M92 a task answer sized with the hint pmcp dropped", H, [('            sized = (\n                {**result, "task": task_info.raw}\n                if task_info is not None and isinstance(result, dict)\n                else result\n            )\n', "            sized = result\n")]),
-@@ -102,0 +102,9 @@
-+ ("M94 call_tool returns the task answer as sent", C, [("                    )\n            return self._usable_task_response(result)\n\n        return result\n", "                    )\n            return result\n\n        return result\n")]),
-+ ("M95 tasks/result returns the task answer as sent", C, [("            )\n        return self._usable_task_response(result)\n\n    async def cancel_task(", "            )\n        return result\n\n    async def cancel_task(")]),
-+ ("M96 the task recogniser misses a flat task", C, [('    if isinstance(result.get("taskId"), str):\n        return result\n    return None\n', "    return None\n")]),
-+ ("M97 the refresh session has no read timeout", "src/pmcp/manifest/refresher.py", [("                    read, write, read_timeout_seconds=REFRESH_READ_TIMEOUT_SECONDS\n", "                    read, write\n")]),
-+ ("M98 the refresh is unbounded", "src/pmcp/manifest/refresher.py", [("        with anyio.fail_after(REFRESH_TIMEOUT_SECONDS):\n", "        with anyio.fail_after(None):\n"), ("                    read, write, read_timeout_seconds=REFRESH_READ_TIMEOUT_SECONDS\n", "                    read, write\n")]),
-+ ("M99 params null rejected", A, [("        if params is not None and not isinstance(params, dict):\n", '        if "params" in frame and not isinstance(params, dict):\n')]),
-+ ("M100 the adapter falls back to the SDK parser", A, [('            problem = "not parseable as JSON"\n', "            return self._base.validate_json(data, *args, **kwargs)\n")]),
-+ ("M101 drop reasons use Python type names", A, [('    return _JSON_TYPE_NAMES.get(type(value), "value")\n', "    return type(value).__name__\n")]),
-+ ("M102 the -32700 replacement off and the adapter falling back to the SDK parser", (C, A), [(C, "    if code == _PARSE_ERROR:\n", "    if False:\n"), (A, '            problem = "not parseable as JSON"\n', "            return self._base.validate_json(data, *args, **kwargs)\n")]),
+@@ -102,3 +102,3 @@
+- ("M94 call_tool returns the task answer as sent", C, [("                    )\n            return self._usable_task_response(result)\n\n        return result\n", "                    )\n            return result\n\n        return result\n")]),
+- ("M95 tasks/result returns the task answer as sent", C, [("            )\n        return self._usable_task_response(result)\n\n    async def cancel_task(", "            )\n        return result\n\n    async def cancel_task(")]),
+- ("M96 the task recogniser misses a flat task", C, [('    if isinstance(result.get("taskId"), str):\n        return result\n    return None\n', "    return None\n")]),
++ ("M94 call_tool returns the task answer as sent", C, [("            return usable_task_response(result)\n\n        return result\n", "            return result\n\n        return result\n")]),
++ ("M95 tasks/result returns the task answer as sent", C, [("        return usable_task_response(result)\n\n    async def cancel_task(", "        return result\n\n    async def cancel_task(")]),
++ ("M96 the candidate is only a nested task (a flat task missed)", C, [("    return task if isinstance(task, dict) else result\n", "    return task if isinstance(task, dict) else None\n")]),
+@@ -110,0 +111,8 @@
++ ("M103 over-strip: an unparsed candidate is reduced anyway (rev 14)", C, [("    found = task_answer_of(result)\n    if found is None:\n        return result\n    payload, info = found\n", "    found = task_answer_of(result)\n    if found is None:\n        bare = _task_candidate(result)\n        if bare is None:\n            return result\n        return _usable_task_raw(bare) if bare is result else {**result, 'task': _usable_task_raw(bare)}\n    payload, info = found\n")]),
++ ("M104 under-strip: the recogniser accepts only taskId", C, [("    info = ClientManager._task_info_from_payload(payload)\n    if info is None:\n        return None\n    return payload, info\n", "    info = ClientManager._task_info_from_payload(payload)\n    if info is None or not isinstance(payload.get('taskId'), str):\n        return None\n    return payload, info\n")]),
++ ("M105 the parser reads only taskId", C, [('        task_id = payload.get("taskId") or payload.get("task_id")\n', '        task_id = payload.get("taskId")\n')]),
++ ("M106 over-strip: the normaliser also removes a null hint", C, [('    return {**result, "task": dict(info.raw)}\n', '    return {**result, "task": {k: v for k, v in info.raw.items() if v is not None}}\n')]),
++ ("M107 the cancel fallback keeps the whole answer as raw", C, [("                status=\"cancelled\",\n                updated_at=time.time(),\n            )\n", "                status=\"cancelled\",\n                updated_at=time.time(),\n                raw=result if isinstance(result, dict) else {},\n            )\n")]),
++ ("M108 a notification with id null rejected", A, [('        msg_id = frame.get("id")\n        if msg_id is not None and not _is_request_id(msg_id):\n', '        msg_id = frame.get("id")\n        if "id" in frame and not _is_request_id(msg_id):\n')]),
++ ("M109 id null routed as a request", C, [("            if msg_id is None:\n                # Notification: no id", "            if \"id\" not in frame:\n                # Notification: no id")]),
++ ("M110 tasks/result polls whenever the parser finds no task", C, [("        elif not _names_a_task(result):\n", "        else:\n")]),
 ````
 
