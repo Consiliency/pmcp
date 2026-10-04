@@ -1196,6 +1196,20 @@ def _task_outcome(parser: Any, payload: dict) -> str | None:
     return None
 
 
+#: Every shape in which a downstream answer carries a task, as pmcp's one
+#: recogniser (`task_payload_of`) accepts it (round-13 codex): nested, with
+#: or without a sibling `result`, and flat.
+_TASK_WRAPS: dict[str, Any] = {
+    "nested": lambda p, method: (
+        {"task": p, "result": {"content": []}}
+        if method == "tasks/result"
+        else {"task": p}
+    ),
+    "nested-bare": lambda p, method: {"task": p},
+    "flat": lambda p, method: dict(p),
+}
+
+
 def _task_server(
     tmp_path: Path, *, audited: bool
 ) -> tuple[GatewayServer, Path | None, dict]:
@@ -1257,9 +1271,7 @@ def _task_server(
         payload = state["payload"]
         if method == "tasks/list":
             return {"tasks": [payload]}
-        if method == "tasks/result":
-            return {"task": payload, "result": {"content": []}}
-        return {"task": payload}
+        return _TASK_WRAPS[state.get("wrap", "nested")](payload, method)
 
     manager._send_request = send_request  # type: ignore[method-assign]
     return server, audit_path, state
@@ -1645,7 +1657,9 @@ async def test_a_value_rejected_by_hand_is_described(
 #: lookup of an accepted value that misses is Consiliency/pmcp#315's.
 _NULLED = "rejected for its format: null / None on that path (rev 13, B1)"
 _REFUSED = "refused: null on the refusal paths (rev 12); copied on success"
-_LOOKUP = "accepted (any non-empty string); a miss is a lookup echo, #315"
+_LOOKUP = (
+    "accepted (any non-empty string); a miss is a lookup echo, Consiliency/pmcp#315"
+)
 _ACCEPTED = "copied only on the path that accepted it"
 _NEVER = "never rejected by hand"
 _DERIVED = "a value pmcp computed from the input, not the input"
@@ -1843,3 +1857,89 @@ def test_every_field_that_copies_a_caller_input_is_triaged() -> None:
         sorted(found - set(_COPIED_INPUT_TRIAGE)),
         sorted(set(_COPIED_INPUT_TRIAGE) - found),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrap", sorted(_TASK_WRAPS))
+async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capfd: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+    wrap: str,
+) -> None:
+    """Round-13 codex: a task hint pmcp drops as unusable left through the
+    answer itself -- `gateway.invoke` returned a flat task answer as its
+    `result`, and `gateway.tasks_result` the original `{"task": ...}`, both
+    holding the value and sized with it. Every task call, in every shape the
+    recogniser accepts, with every dropped position: the value is in no
+    channel, and two sentinel lengths give the same answer (no size channel)."""
+    from pmcp.client.manager import task_payload_of
+
+    caplog.set_level(logging.DEBUG)
+    probe = {"taskId": "t", "status": "working", "ttl": "x"}
+    for method in ("tools/call", "tasks/get", "tasks/result", "tasks/cancel"):
+        assert task_payload_of(_TASK_WRAPS[wrap](probe, method)) == probe, method
+    server, audit_path, state = _task_server(tmp_path, audited=False)
+    state["wrap"] = wrap
+    tap = _Tap(server, audit_path, caplog, capfd, recwarn)
+    parser = server._client_manager._task_info_from_payload
+    dropped = [
+        (key, shape)
+        for key, shape in _task_positions()
+        if _task_outcome(
+            parser, {"taskId": "t", "status": "working", key: _bad_values("v")[shape]}
+        )
+        == "dropped"
+    ]
+    assert dropped, "no dropped position"
+    cases = 0
+    for name, arguments, method in _task_calls():
+        if method == "tasks/list":
+            continue
+        for key, shape in dropped:
+            for family, sentinels in _FAMILIES.items():
+                # A value the parser accepts (a digits-only `createdAt` is a
+                # number) is data pmcp returns by design, not a dropped hint.
+                if not all(
+                    _task_outcome(
+                        parser,
+                        {
+                            "taskId": "t",
+                            "status": "working",
+                            key: _bad_values(s)[shape],
+                        },
+                    )
+                    == "dropped"
+                    for s in sentinels
+                ):
+                    continue
+                seen = []
+                for s in sentinels:
+                    state["payload"] = {
+                        "taskId": "t",
+                        "status": "working",
+                        key: _bad_values(s)[shape],
+                    }
+                    server._client_manager._tasks.clear()
+                    if method == "tasks/cancel":
+                        server._client_manager._record_task(
+                            _DOWNSTREAM, McpTaskInfo(task_id="t", status="working")
+                        )
+                    mark = tap.start()
+                    result = await _call(server, name, arguments)
+                    response = "".join(block.text for block in result.content)
+                    observed = tap.since(mark, response)
+                    assert observed.leaks(s) == [], (wrap, name, key, shape, family)
+                    seen.append(observed)
+                assert not seen[0].differs(seen[1]), (
+                    wrap,
+                    name,
+                    key,
+                    shape,
+                    family,
+                    seen[0].differs(seen[1]),
+                )
+                cases += 1
+    await server.shutdown()
+    assert cases >= 4 * len(dropped) * (len(_FAMILIES) - 1), cases

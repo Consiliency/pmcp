@@ -318,6 +318,35 @@ def _usable_task_raw(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key not in unusable}
 
 
+def task_payload_of(result: Any) -> dict[str, Any] | None:
+    """The task a downstream answer carries, in every shape pmcp recognises:
+    a nested `task` object, or a flat answer with a string `taskId`. The one
+    recogniser the manager and the handlers share."""
+    if not isinstance(result, dict):
+        return None
+    task = result.get("task")
+    if isinstance(task, dict):
+        return task
+    if isinstance(result.get("taskId"), str):
+        return result
+    return None
+
+
+def usable_task_response(result: Any) -> Any:
+    """`result` with the task it carries reduced to what pmcp could use
+    (`_usable_task_raw`): a hint pmcp dropped as unusable is neither returned
+    to the caller nor sized through the answer itself (Consiliency/pmcp#297,
+    round-13 codex). The shapes are `task_payload_of`'s, so a flat and a
+    nested task are treated alike."""
+    payload = task_payload_of(result)
+    if payload is None:
+        return result
+    usable = _usable_task_raw(payload)
+    if payload is result:
+        return usable
+    return {**result, "task": usable}
+
+
 def parse_request_id(request_id: str) -> tuple[str, int] | None:
     """`server_name::local_id` as `gateway.cancel` takes it, or None when the
     id does not have that format (no `::`, or a local id that is not an
@@ -1787,12 +1816,10 @@ class ClientManager:
         return payload
 
     def _extract_task_payload(self, result: dict[str, Any]) -> dict[str, Any] | None:
-        task = result.get("task")
-        if isinstance(task, dict):
-            return task
-        if isinstance(result.get("taskId"), str):
-            return result
-        return None
+        return task_payload_of(result)
+
+    def _usable_task_response(self, result: Any) -> Any:
+        return usable_task_response(result)
 
     def _task_info_from_payload(self, payload: dict[str, Any]) -> McpTaskInfo | None:
         task_id = payload.get("taskId") or payload.get("task_id")
@@ -4074,6 +4101,7 @@ class ClientManager:
                         tool_id=tool_id,
                         requestor_context=requestor_context,
                     )
+            return self._usable_task_response(result)
 
         return result
 
@@ -4176,7 +4204,7 @@ class ClientManager:
                 requestor_context=requestor_context
                 or (record.requestor_context if record is not None else None),
             )
-        return result
+        return self._usable_task_response(result)
 
     async def cancel_task(
         self,

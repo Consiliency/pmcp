@@ -36,6 +36,7 @@ from pmcp.client.manager import (
     ClientManager,
     _terminate_process_tree,
     parse_request_id,
+    task_payload_of,
 )
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import (
@@ -1663,14 +1664,16 @@ class GatewayTools:
                     )
 
             task_info = None
-            if isinstance(result, dict):
-                task_payload = result.get("task")
-                if isinstance(task_payload, dict):
-                    task_id = task_payload.get("taskId") or task_payload.get("task_id")
-                    if isinstance(task_id, str):
-                        task_info = self._client_manager.get_task_record(
-                            tool_info.server_name, task_id
-                        )
+            # Every task shape the manager recognises, flat or nested
+            # (round-13 codex): the manager has already reduced it to what
+            # pmcp could use (`usable_task_response`).
+            task_payload = task_payload_of(result)
+            if task_payload is not None:
+                task_id = task_payload.get("taskId") or task_payload.get("task_id")
+                if isinstance(task_id, str):
+                    task_info = self._client_manager.get_task_record(
+                        tool_info.server_name, task_id
+                    )
 
             # Process output (truncate, redact)
             max_bytes = None
@@ -1683,17 +1686,8 @@ class GatewayTools:
                 else task_info is not None
             )
 
-            # A task answer is returned as the task record, whose `raw`
-            # holds only what pmcp could use: size and summarise that, not
-            # the answer, whose size followed a hint pmcp dropped
-            # (Consiliency/pmcp#297 on Consiliency/pmcp#298).
-            sized = (
-                {**result, "task": task_info.raw}
-                if task_info is not None and isinstance(result, dict)
-                else result
-            )
             processed = self._policy_manager.process_output(
-                sized, redact=redact, max_bytes=max_bytes
+                result, redact=redact, max_bytes=max_bytes
             )
             public_task = (
                 self._sanitize_task_for_output(task_info)

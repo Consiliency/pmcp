@@ -1070,8 +1070,21 @@ def _scrubbing_factory(previous: Any) -> Any:
 # --- rev 13: the JSON-RPC 2.0 envelope (round-12 codex B2) -------------------
 
 
+#: JSON's type names, for a value `json` produced (round-13 claude nit: the
+#: reasons promise JSON type names, not Python's).
+_JSON_TYPE_NAMES = {
+    dict: "object",
+    list: "array",
+    str: "string",
+    int: "number",
+    float: "number",
+    bool: "boolean",
+    type(None): "null",
+}
+
+
 def _type_of(value: Any) -> str:
-    return type(value).__name__
+    return _JSON_TYPE_NAMES.get(type(value), "value")
 
 
 def _is_request_id(value: Any) -> bool:
@@ -1112,8 +1125,12 @@ def jsonrpc_envelope_problem(frame: Any) -> str | None:
             return f"non-string method ({_type_of(method)})"
         if "id" in frame and not _is_request_id(frame["id"]):
             return f"id of type {_type_of(frame['id'])}"
-        if "params" in frame and not isinstance(frame["params"], dict):
-            return f"params of type {_type_of(frame['params'])}"
+        # `params: null` is outside JSON-RPC 2.0, but the SDK's models accept
+        # it and it carries nothing: it reads as absent (round-13 claude N1),
+        # so a `ping` sent that way is still answered.
+        params = frame.get("params")
+        if params is not None and not isinstance(params, dict):
+            return f"params of type {_type_of(params)}"
         if "result" in frame or "error" in frame:
             return "a request or notification carrying result or error"
         return None
@@ -1163,12 +1180,16 @@ class _StrictMessageAdapter:
     def validate_json(self, data: Any, /, *args: Any, **kwargs: Any) -> Any:
         from pmcp.parsing import JSONParseError, load_json
 
+        problem: str | None
         try:
             value = load_json(data, source="downstream JSON-RPC message")
         except JSONParseError:
-            # Not JSON (or past a parser limit): the SDK's own rejection.
-            return self._base.validate_json(data, *args, **kwargs)
-        problem = jsonrpc_envelope_problem(value)
+            # Not JSON to Python's parser (or past a parser limit): rejected
+            # here, not handed to the SDK's own parser, so nothing depends on
+            # the two parsers agreeing (round-13 claude N3).
+            problem = "not parseable as JSON"
+        else:
+            problem = jsonrpc_envelope_problem(value)
         if problem is not None:
             raise ValidationError.from_exception_data(
                 "JSONRPCMessage",

@@ -1160,7 +1160,8 @@ def _is_valid_frame(line: bytes) -> bool:
     -- the only kind of stdout line whose content the reader may act on
     (rev 13: the specification's rules, written here independently of
     `jsonrpc_envelope_problem`). `"jsonrpc": "2.0"`; a request or
-    notification has a string `method`, an object `params` if any, and no
+    notification has a string `method`, an object `params` if any (`null`
+    reads as absent, rev 14), and no
     `result`/`error`; a response has an `id` and exactly one of an object
     `result` or an `error` object with an integer `code` and a string
     `message`."""
@@ -1178,7 +1179,7 @@ def _is_valid_frame(line: bytes) -> bool:
         return (
             isinstance(value["method"], str)
             and ("id" not in value or request_id(value["id"]))
-            and isinstance(value.get("params", {}), dict)
+            and isinstance(value.get("params") or {}, dict)
             and "result" not in value
             and "error" not in value
         )
@@ -1615,3 +1616,175 @@ def test_the_strict_envelope_is_installed_on_import_pmcp() -> None:
     assert out[:3] == ["_ClientTypesView", "_ClientTypesView", "_StrictMessageAdapter"]
     # The server side is untouched.
     assert out[3] != "_ClientTypesView", out
+
+
+# --- rev 14: the SDK session pmcp builds is bounded (round-13 claude N2) -------
+
+_INIT_SCRIPT = textwrap.dedent(
+    """
+    import json, sys
+    with open(sys.argv[1]) as handle:
+        kind, s = json.load(handle)
+    for line in sys.stdin:
+        request = json.loads(line)
+        rid, method = request.get("id"), request.get("method")
+        if rid is None or method != "initialize":
+            continue
+        error = {"code": -32000, "message": s}
+        frame = {
+            "result-and-error": {"jsonrpc": "2.0", "id": rid, "result": {}, "error": error},
+            "string-code": {"jsonrpc": "2.0", "id": rid, "error": {"code": "5", "message": s}},
+            "result-null": {"jsonrpc": "2.0", "id": rid, "result": None},
+            "silent": None,
+        }[kind]
+        if frame is not None:
+            sys.stdout.write(json.dumps(frame) + "\\n")
+            sys.stdout.flush()
+    """
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind", ["result-and-error", "string-code", "result-null", "silent"]
+)
+async def test_a_malformed_initialize_reply_ends_the_refresh_in_bounded_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capfd: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+    kind: str,
+) -> None:
+    """Round-13 claude N2: the strict envelope drops a lax-malformed reply, and
+    the one SDK `ClientSession` pmcp builds (`refresh_server`: `pmcp refresh`
+    and the startup cache generation) had no timeout, so such a reply to
+    `initialize` hung it. It now fails within its read timeout, value-free.
+    (The gateway's own transports do not use an SDK session; their requests
+    have pmcp's idle timeout and ceiling, §12.)"""
+    import time
+
+    import pmcp.manifest.refresher as refresher
+    from pmcp.manifest.loader import ServerConfig
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(refresher, "REFRESH_READ_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(refresher, "REFRESH_TIMEOUT_SECONDS", 8.0)
+    script = tmp_path / "init_downstream.py"
+    script.write_text(_INIT_SCRIPT)
+    tap = _Tap(typing.cast(Any, _NoServer()), None, caplog, capfd, recwarn)
+    for family in ("hex", "token"):
+        s = _FAMILIES[family][1]
+        (tmp_path / "case.json").write_text(json.dumps([kind, s]))
+        config = ServerConfig(
+            name="d",
+            description="d",
+            keywords=[],
+            install={},
+            command=sys.executable,
+            args=[str(script), str(tmp_path / "case.json")],
+        )
+        mark = tap.start()
+        started = time.monotonic()
+        result = await asyncio.wait_for(
+            refresher.refresh_server(config, force=True), 20
+        )
+        assert time.monotonic() - started < 10, (kind, family)
+        assert result is None, (kind, family)
+        observed = tap.since(mark, repr(result))
+        assert observed.leaks(s) == [], (kind, family, observed)
+        assert any(
+            "Failed to refresh d" in r.getMessage() for r in caplog.records[mark[0] :]
+        ), kind
+
+
+def test_every_sdk_session_pmcp_builds_has_a_read_timeout() -> None:
+    """Every `ClientSession(...)` in `src/pmcp` passes `read_timeout_seconds`
+    (round-13 claude N2, as a class: today there is one, in the refresher)."""
+    import ast
+
+    root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
+    sessions = []
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "ClientSession"
+            ):
+                keywords = {k.arg for k in node.keywords}
+                sessions.append(
+                    (path.name, node.lineno, "read_timeout_seconds" in keywords)
+                )
+    assert sessions, "no SDK session found"
+    assert all(ok for _, _, ok in sessions), sessions
+
+
+def test_params_null_reads_as_absent_and_a_ping_is_answered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round-13 claude N1: `params: null` is outside JSON-RPC 2.0, but the
+    SDK's models accept it; a `ping` sent that way is answered, on stdio and
+    through the SDK client adapter, while `params` of any other non-object
+    type is still dropped."""
+    import time
+
+    import mcp.client.streamable_http as streamable_module
+    from pydantic import ValidationError
+
+    from pmcp.argument_errors import jsonrpc_envelope_problem
+
+    ping = {"jsonrpc": "2.0", "id": 4, "method": "ping", "params": None}
+    assert jsonrpc_envelope_problem(ping) is None
+    assert streamable_module.jsonrpc_message_adapter.validate_json(json.dumps(ping))
+    with pytest.raises(ValidationError):
+        streamable_module.jsonrpc_message_adapter.validate_json(
+            json.dumps({**ping, "params": [1]})
+        )
+    manager, managed = _stdio_manager()
+    replies: list[tuple[Any, str]] = []
+    manager._reply_to_downstream_request = (  # type: ignore[method-assign]
+        lambda name, managed, msg_id, method: replies.append((msg_id, method))
+    )
+    manager._handle_stdout_line("srv", managed, json.dumps(ping).encode(), time.time())
+    assert replies == [(4, "ping")]
+
+
+def test_the_adapter_rejects_what_pythons_parser_cannot_read() -> None:
+    """Round-13 claude N3: a frame Python's `json` cannot parse is rejected by
+    the strict adapter itself, never handed to the SDK's own parser, so the
+    rules do not depend on the two parsers agreeing."""
+    import mcp.client.streamable_http as streamable_module
+    from pydantic import ValidationError
+
+    adapter = streamable_module.jsonrpc_message_adapter
+    calls: list[Any] = []
+    base = adapter._base
+
+    class _Spy:
+        def validate_json(self, *args: Any, **kwargs: Any) -> Any:
+            calls.append(args)
+            return base.validate_json(*args, **kwargs)
+
+    adapter._base = _Spy()
+    try:
+        for raw in ('{"jsonrpc": "2.0", "id": 1, "result": {}', "[" * 5000, "7" * 5000):
+            with pytest.raises(ValidationError) as caught:
+                adapter.validate_json(raw)
+            assert "not parseable as JSON" in str(caught.value)
+        assert calls == []
+    finally:
+        adapter._base = base
+
+
+def test_drop_reasons_use_json_type_names() -> None:
+    """Round-13 claude nit: the reasons name JSON's types."""
+    from pmcp.argument_errors import jsonrpc_envelope_problem
+
+    assert jsonrpc_envelope_problem("x") == "not a JSON object (string)"
+    assert jsonrpc_envelope_problem(None) == "not a JSON object (null)"
+    error = {"jsonrpc": "2.0", "id": 1, "error": {"code": {}, "message": "m"}}
+    assert jsonrpc_envelope_problem(error) == "error code of type object"
+    result = {"jsonrpc": "2.0", "id": 1.5, "result": {}}
+    assert jsonrpc_envelope_problem(result) == "id of type number"
