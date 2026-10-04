@@ -20,7 +20,7 @@ patterns:
     keywords: ["status", "check", "get", "is", "has", "can"]
 
   try_catch:
-    hint: "try/catch"
+    hint: "try"
     description: "Wrap in error handling"
     keywords: ["invoke", "call", "execute", "run", "provision"]
 
@@ -34,17 +34,17 @@ patterns:
 overrides:
   # Playwright
   "playwright::browser_navigate": "loop"
-  "playwright::browser_screenshot": "loop"
+  "playwright::browser_take_screenshot": "loop"
   "playwright::browser_click": "loop"
 
   # File operations
   "filesystem::list_files": "filter"
-  "filesystem::read_file": "try/catch"
-  "filesystem::write_file": "try/catch"
+  "filesystem::read_file": "try"
+  "filesystem::write_file": "try"
 
   # GitHub
   "github::listIssues": "filter"
-  "github::createIssue": "try/catch"
+  "github::createIssue": "try"
 
   # Database operations
   "postgres::query": "filter"
@@ -55,13 +55,13 @@ overrides:
   "puppeteer::screenshot": "loop"
 
   # Provisioning
-  "gateway::provision": "try/catch"
+  "gateway::provision": "try"
   "gateway::provision_status": "poll"
 
   # Catalog operations
   "gateway::catalog_search": "filter"
   "gateway::describe": "if/else"
-  "gateway::invoke": "try/catch"
+  "gateway::invoke": "try"
 
 # Default hint for tools without specific patterns
 default_hint: null  # Don't show hint if pattern unclear
