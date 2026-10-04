@@ -36,7 +36,9 @@ from pmcp.client.manager import (
     ClientManager,
     _terminate_process_tree,
     parse_request_id,
+    effective_task_mode,
     task_answer_of,
+    usable_task_response,
 )
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import (
@@ -1632,6 +1634,7 @@ class GatewayTools:
             )
 
         # Call the tool
+        task_requested = effective_task_mode(tool_info, parsed.task)
         _call_start = time.monotonic()
         timeout_ms = 30000
         if parsed.options:
@@ -1664,14 +1667,19 @@ class GatewayTools:
                     )
 
             task_info = None
-            # The manager's one recogniser, which is its parser (rev 15): a
-            # task here is exactly a task the manager recorded and reduced to
-            # what pmcp could use (`usable_task_response`).
-            found = task_answer_of(result)
-            if found is not None:
-                task_info = self._client_manager.get_task_record(
-                    tool_info.server_name, found[1].task_id
-                )
+            # Rev 17 (round-15 codex F001, claude F003): task handling is gated
+            # on the call's effective task mode, derived once. A call that is
+            # not a task returns its answer as opaque data, sized as returned:
+            # no recognition, no registry lookup, no replacement. A task call
+            # returns, and is sized from, the answer reduced to what pmcp
+            # could use (`usable_task_response`, idempotent).
+            if task_requested:
+                result = usable_task_response(result)
+                found = task_answer_of(result)
+                if found is not None:
+                    task_info = self._client_manager.get_task_record(
+                        tool_info.server_name, found[1].task_id
+                    )
 
             # Process output (truncate, redact)
             max_bytes = None

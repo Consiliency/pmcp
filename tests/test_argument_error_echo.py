@@ -2167,3 +2167,191 @@ async def test_a_dropped_task_hint_leaves_by_no_alias_or_fallback(
         assert s not in text, text
         sizes.append(json.loads(text).get("raw_size_estimate"))
     assert sizes[0] == sizes[1], sizes
+
+
+# ---------------------------------------------------------------------------
+# Rev 17 (round-15 board): task handling gated on the call's effective mode
+# ---------------------------------------------------------------------------
+
+
+def _mode_answers(s: str) -> dict[str, dict[str, Any]]:
+    """A task-shaped answer, nested and flat, each carrying a hint the parser
+    drops (`ttl: <s>`), beside result data; and an answer that is not a task."""
+    kept = [{"type": "text", "text": "fresh synchronous report"}]
+    return {
+        "nested": {
+            "task": {"taskId": "t", "status": "working", "ttl": s},
+            "content": kept,
+        },
+        "flat": {"task_id": "t", "ttl": s, "content": kept},
+        "data": {"content": kept, "structuredContent": {"ttl": s}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_task_handling_follows_the_calls_effective_task_mode(
+    tmp_path: Path,
+) -> None:
+    """Round-15 codex F001 and claude F003: `gateway.invoke` looked every
+    answer up as a task, so a synchronous answer naming a recorded task id
+    was replaced by that task, and it was sized from the uncleaned answer.
+    Over taskSupport x requested x answer shape x id recorded: a call that
+    does not run as a task gets the answer back whole (as main) and sized as
+    returned; a task call's dropped hint is neither returned nor sized; data
+    is never lost to a lookup."""
+    from pmcp.types import McpTaskInfo
+
+    cases = 0
+    for support in ("required", "optional", "forbidden", None):
+        for requested in (True, False):
+            for shape in ("nested", "flat", "data"):
+                for recorded in (True, False):
+                    outs = []
+                    for s in ("violetcanaryrejected", "violetcanaryrejected12345"):
+                        root = (
+                            tmp_path
+                            / f"{support}-{requested}-{shape}-{recorded}-{len(s)}"
+                        )
+                        root.mkdir()
+                        server, _, _ = _task_server(root, audited=False)
+                        manager = server._client_manager
+                        tool = next(iter(manager._tools.values()))
+                        tool.execution = (
+                            {} if support is None else {"taskSupport": support}
+                        )
+                        answer = _mode_answers(s)[shape]
+
+                        async def send_request(
+                            managed: Any,
+                            method: str,
+                            params: Any,
+                            a: Any = answer,
+                            **_: Any,
+                        ) -> Any:
+                            return copy.deepcopy(a)
+
+                        manager._send_request = send_request  # type: ignore[method-assign]
+                        if recorded:
+                            task = McpTaskInfo(task_id="t", status="working")
+                            manager._record_task(
+                                _DOWNSTREAM, task, tool_id="svc::other"
+                            )
+                        args: dict[str, Any] = {"tool_id": f"{_DOWNSTREAM}::run"}
+                        args.update(_correlations())
+                        if requested:
+                            args["task"] = {"enabled": True}
+                        out = await server._gateway_tools.invoke(args)
+                        await server.shutdown()
+                        outs.append((s, answer, out))
+                    name = (support, requested, shape, recorded)
+                    as_task = support == "required" or requested
+                    if requested and support in ("forbidden", None):
+                        assert all(not o.ok for _, _, o in outs), name
+                        continue
+                    for s, answer, out in outs:
+                        assert out.ok, name
+                        if not as_task:
+                            assert out.result == answer and out.task is None, name
+                            size = server._policy_manager.process_output(
+                                out.result, redact=False
+                            )["raw_size"]
+                            assert out.raw_size_estimate == size, name
+                        elif shape == "data":
+                            assert out.result == answer and out.task is None, name
+                        else:
+                            assert s not in out.model_dump_json(), name
+                            assert out.task is not None and out.result is None, name
+                    if as_task and shape != "data":
+                        sizes = {o.raw_size_estimate for _, _, o in outs}
+                        assert len(sizes) == 1, (name, sizes)
+                    cases += 1
+    assert cases == 36, cases
+
+
+def test_sync_result_survives_cached_task_id(tmp_path: Path, monkeypatch: Any) -> None:
+    """Round-15 codex F001's falsifier, verbatim in substance: a synchronous
+    answer naming a recorded task id keeps its content (main 2adcd9a did)."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from pmcp.client.manager import ClientManager, ManagedClient
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+    from pmcp.types import McpTaskInfo, ServerStatus, ServerStatusEnum, ToolInfo
+
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text("{}")
+    monkeypatch.setattr(GatewayTools, "_load_provisioned_registry", lambda self: {})
+    manager = ClientManager()
+    tool = ToolInfo(
+        tool_id="svc::report",
+        server_name="svc",
+        tool_name="report",
+        description="Read a report",
+        short_description="Read a report",
+        input_schema={"type": "object"},
+        tags=[],
+        risk_hint="low",
+        execution={"taskSupport": "forbidden"},
+    )
+    manager._tools[tool.tool_id] = tool
+    status = ServerStatus(
+        name="svc",
+        status=ServerStatusEnum.ONLINE,
+        tool_count=1,
+        server_capabilities={"tasks": {}},
+    )
+    manager._clients["svc"] = ManagedClient(
+        config=MagicMock(), is_remote=True, write_stream=MagicMock(), status=status
+    )
+    manager._servers["svc"] = status
+    payload = {"task_id": "t", "content": [{"type": "text", "text": "fresh report"}]}
+
+    async def reply(managed: Any, method: str, params: Any, **kwargs: Any) -> Any:
+        assert method == "tools/call" and "task" not in params
+        return dict(payload)
+
+    monkeypatch.setattr(manager, "_send_request", reply)
+    tools = GatewayTools(manager, PolicyManager(policy_path=policy_path))
+    arguments = {"tool_id": tool.tool_id, "arguments": {}}
+    control = asyncio.run(tools.invoke(arguments))
+    assert control.ok and control.result == payload and control.task is None
+    manager._record_task(
+        "svc", McpTaskInfo(task_id="t", status="working"), tool_id="svc::start"
+    )
+    result = asyncio.run(tools.invoke(arguments))
+    assert result.ok and result.result == payload, "a cached task replaced the result"
+    assert result.task is None
+
+
+@pytest.mark.asyncio
+async def test_an_unrequested_task_answer_is_sized_as_returned(tmp_path: Path) -> None:
+    """Round-15 claude F003, under rev 17's rule: with `taskSupport:
+    optional`, no task requested and a colliding recorded id, the answer is
+    not a task to pmcp -- it comes back whole, and its size is the size of
+    exactly what comes back, never of an answer pmcp reduced or replaced."""
+    from pmcp.types import McpTaskInfo
+
+    for s in ("ghp_a", "ghp_a" + "x" * 40):
+        (tmp_path / str(len(s))).mkdir()
+        server, _, _ = _task_server(tmp_path / str(len(s)), audited=False)
+        manager = server._client_manager
+        for tool in manager._tools.values():
+            tool.execution = {"taskSupport": "optional"}
+        manager._record_task(_DOWNSTREAM, McpTaskInfo(task_id="t", status="working"))
+        answer = {"task": {"taskId": "t", "status": "working", "ttl": s}}
+
+        async def send(
+            managed: Any, method: str, params: Any, a: Any = answer, **_: Any
+        ) -> Any:
+            return copy.deepcopy(a)
+
+        manager._send_request = send  # type: ignore[method-assign]
+        args = {"tool_id": f"{_DOWNSTREAM}::run", **_correlations()}
+        out = await server._gateway_tools.invoke(args)
+        await server.shutdown()
+        assert out.ok and out.task is None and out.result == answer
+        size = server._policy_manager.process_output(out.result, redact=False)[
+            "raw_size"
+        ]
+        assert out.raw_size_estimate == size

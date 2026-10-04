@@ -318,6 +318,27 @@ def _usable_task_raw(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key not in unusable}
 
 
+def effective_task_mode(
+    tool_info: ToolInfo, task: TaskMetadataInput | dict[str, Any] | None
+) -> bool:
+    """Whether a call runs as an MCP task: requested (or the tool requires it)
+    and not switched off by `enabled: false` where the tool allows that. The
+    one derivation `call_tool` and `gateway.invoke` both use (rev 17,
+    round-15 codex): a call that is not a task treats its answer as opaque
+    data -- no task recognition, no registry lookup, nothing replaced."""
+    support = (tool_info.execution or {}).get("taskSupport")
+    if support == "required":
+        return True
+    if task is None:
+        return False
+    parsed = (
+        task
+        if isinstance(task, TaskMetadataInput)
+        else TaskMetadataInput.model_validate(task)
+    )
+    return parsed.enabled
+
+
 def _task_candidate(result: Any) -> dict[str, Any] | None:
     """Where a downstream answer would carry a task: its nested `task`
     object if it has one, else the answer itself (flat)."""
@@ -4066,12 +4087,10 @@ class ClientManager:
             )
 
         support = self._tool_task_support(tool_info)
-        task_requested = task is not None
-        if support == "required":
-            task_requested = True
-        if task_requested and support == "forbidden":
+        asked = task is not None or support == "required"
+        if asked and support == "forbidden":
             raise RuntimeError(f"Tool {tool_id} does not support MCP task execution")
-        if task_requested and not self._server_supports_tasks(managed):
+        if asked and not self._server_supports_tasks(managed):
             raise RuntimeError(
                 f"Server {tool_info.server_name} does not advertise MCP task support"
             )
@@ -4081,17 +4100,15 @@ class ClientManager:
         if trace_meta:
             params["_meta"] = {**params.get("_meta", {}), **trace_meta}
         requestor_context: dict[str, Any] | None = None
+        task_requested = effective_task_mode(tool_info, task)
         if task_requested:
             parsed_task = (
                 task
                 if isinstance(task, TaskMetadataInput)
                 else TaskMetadataInput.model_validate(task or {})
             )
-            if not parsed_task.enabled and support != "required":
-                task_requested = False
-            else:
-                params["task"] = self._task_wire_metadata(parsed_task)
-                requestor_context = parsed_task.requestor_context
+            params["task"] = self._task_wire_metadata(parsed_task)
+            requestor_context = parsed_task.requestor_context
 
         # Send tool call with metadata for health monitoring
         result = await self._send_request(
