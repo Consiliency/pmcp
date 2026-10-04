@@ -558,6 +558,43 @@ Each is described in full in the section named at the end of the line.
   (D-01); see [Consiliency/pmcp#228](https://github.com/Consiliency/pmcp/pull/228).
 
 ### Fixed
+- **A cancelled caller keeps its cancellation through every server teardown,
+  and the teardown still completes.** A caller cancelled while a server
+  connection is being torn down -- a failed or cancelled handshake,
+  `disconnect_server`, a reconnect's cleanup, `disconnect_all`, shutdown --
+  keeps its cancellation and returns at once; the server's process tree is
+  SIGKILLed (through the process group recorded at spawn, so a grandchild
+  that outlived its leader dies too) and the client dropped synchronously,
+  and a remote transport is abandoned without its graceful close. A stdio
+  server is SIGKILLed even when its termination is cancelled, including by
+  event-loop shutdown, and shutdown also kills and drops every server when
+  its 10 s budget runs out (for example while another operation holds the
+  lifecycle lock) or when its `disconnect_all` is cancelled before it starts.
+  A forced `disconnect_server` cancelled while waiting for a `tasks/cancel`
+  reply, or for the lifecycle lock, finishes its teardown too. A cancelled
+  `disconnect_all()`/`refresh()` does not respawn the servers it was
+  removing. Once shutdown has abandoned every client, nothing connects,
+  reconnects or adopts a server process any more (a `refresh` that was
+  mid-flight returns without reconnecting), and a cancelled forced
+  `disconnect_server` also stops a connect of that server sitting in its
+  retry backoff. Adopting a provisioned server process now waits for a
+  disconnect, `disconnect_all` or `refresh` in progress to finish, so it can
+  no longer be dropped from the registry with its process still running, or
+  respawned by a reconnect a few seconds after `disconnect_all` returned; a
+  provisioning handoff cancelled while it waits kills the process it was
+  handing over. Every bounded wait in `src/pmcp` now uses `pmcp.waits.bounded_wait`
+  instead of `asyncio.wait_for`, which on Python 3.10/3.11 could drop a
+  cancel that landed as the awaited work finished. Where process groups do
+  not exist (Windows) the single-process fallback is used, as before. Known
+  limits, tracked separately: a cancelled *reconnect* can still be revived by
+  auto-reconnect
+  ([Consiliency/pmcp#336](https://github.com/Consiliency/pmcp/issues/336)),
+  and a cancel while the spawn itself is completing can leave a grandchild
+  ([Consiliency/pmcp#344](https://github.com/Consiliency/pmcp/issues/344)),
+  and a connect of a server requested *before* a cancelled forced disconnect
+  can still run afterwards
+  ([Consiliency/pmcp#359](https://github.com/Consiliency/pmcp/issues/359)).
+  See [Consiliency/pmcp#324](https://github.com/Consiliency/pmcp/issues/324).
 - **An auth URL's host is checked as the HTTP client will read it.** A JWKS
   URL, a protected-resource metadata URL or a URL-mode elicitation URL whose
   host was not plain ASCII passed as a "name", but aiohttp (yarl) and
