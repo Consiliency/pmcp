@@ -46,6 +46,15 @@ pip install pmcp
 
 ```
 
+### Upgrading from 2.x
+
+3.0.0 refuses several things 2.7.3 accepted. Most importantly, a repository's
+`.mcp.json`, `.pmcp/manifest.yaml` and `.mcp-gateway-policy.yaml` are ignored
+until you approve them with `pmcp trust approve <absolute path>`.
+[MIGRATING.md](MIGRATING.md) has an upgrade checklist, a section for each
+breaking change (with a check, the fix and how to verify it), and how to roll
+back. To stay on 2.x for now, pin `pmcp<3`.
+
 > **Capability matching is built-in** — no API key needed. `gateway.request_capability`
 > uses a pure-Python matcher that can return direct CLI guidance for installed
 > native tools, MCP server candidates, or registry search guidance.

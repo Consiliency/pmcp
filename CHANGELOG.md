@@ -8,8 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Upgrade notes
-Things 2.7.3 accepted that 2.8.0 refuses, and defaults or output that changed.
+Things 2.7.3 accepted that 3.0.0 refuses, and defaults or output that changed. This is a major release because of them: upgrading can stop a project's servers from loading until you approve its files (first item below).
 Each is described in full in the section named at the end of the line.
+[MIGRATING.md](MIGRATING.md) covers each one: how to tell whether you are affected, what
+to do, how to verify it, and how to roll back to 2.7.3.
 
 - **Project files need approval.** A repository's `.pmcp/manifest.yaml`, `.mcp.json`
   and `.mcp-gateway-policy.yaml` are ignored (with a WARNING naming the command) until
@@ -56,7 +58,8 @@ Each is described in full in the section named at the end of the line.
   `Input validation error: …` result instead of an `{"error": true}` payload. Lax
   coercion (`1` for a boolean, `"5"` for an integer) on `invoke.task` is refused, and
   an explicit `null` for an optional argument is now accepted. Policy is judged before
-  the schema, and gate rejections are recorded as `audit.rejection` events. *Changed*
+  the schema, and gate rejections are recorded as `audit.rejection` events, which carry
+  no values taken from the call's arguments (a digest and type names instead). *Changed*
 - **Task numbers are bounded.** `invoke.task.ttl` must be an integer from 1 to 2^53−1,
   and `invoke.task.poll_interval` a finite number above 0 and at most 2^53−1. `NaN` and
   `±Infinity` are refused for every numeric argument, and a request carrying a value
@@ -78,12 +81,27 @@ Each is described in full in the section named at the end of the line.
 - **Logs.** Every install spawn, package-runner start and update probe logs a
   secret-safe command line at WARNING. A manifest's warnings are logged once each time
   its inputs change, not on every load. *Changed*
-- **Dependency floors.** `pyjwt[crypto]>=2.15.0` (was `>=2.10.0`) and
-  `aiohttp>=3.14.2` (was `>=3.9.0`). *Security*
+- **Dependency floors.** `pyjwt[crypto]>=2.15.0` (was `>=2.10.0`),
+  `aiohttp>=3.14.2` (was `>=3.9.0`), `python-dotenv>=1.2.2` (was `>=1.0.0`) and,
+  in the `http` extra, `starlette>=1.3.1` (was `>=0.27.0`). *Security*
 - **Agent-facing hints.** The `try/catch` code hint is now `try`, and the Playwright
   screenshot pattern and example name `browser_take_screenshot` with `filename`.
   *Changed*
-- **Known issues in 2.8.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
+- **A symlinked `.mcp.json` is no longer edited.** `pmcp config set-startup-policy`
+  and the `gateway.set_startup_policy` tool refuse to rewrite a `.mcp.json` that is a
+  symlink -- for the user, project and custom sources alike, and in a dry-run preview
+  too -- reporting `symlinked_config`/`invalid_source`. 2.7.3 accepted the edit and
+  replaced your symlink with a regular file. Edit the link's target directly. *Changed*
+- **`NaN` from HTTP/SSE servers.** Downstream replies over HTTP and SSE are read as
+  sent: a `NaN` inside a tool result now reaches the caller as a `NaN` token rather
+  than `null` (as stdio servers already did; tracked as
+  [Consiliency/pmcp#335](https://github.com/Consiliency/pmcp/issues/335)), and a
+  `nextCursor` of `NaN` leaves the previous listing in place. *Changed*
+- **Error text names the real failure.** Status, `doctor` and connect/disconnect
+  errors from a remote transport now show the individual exceptions inside an
+  exception group instead of `unhandled errors in a TaskGroup`. Anything matching
+  the old string should match the underlying error instead. *Fixed*
+- **Known issues in 3.0.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
   but the gateway reads `.mcp-gateway`; until that is fixed, run
   `pmcp refresh --cache-dir .mcp-gateway`
   ([Consiliency/pmcp#352](https://github.com/Consiliency/pmcp/issues/352)).
@@ -767,7 +785,7 @@ Each is described in full in the section named at the end of the line.
   - **Known follow-up:** pmcp documents `ttl` and `poll_interval` in seconds,
     but MCP defines both in milliseconds, and pmcp forwards them unchanged.
     Tracked as [Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330).
-- **`pmcp config set-startup-policy add|remove|set --source project --apply` now carries your prior trust approval forward when it rewrites `.mcp.json`.** Setting the startup policy changes the file's bytes, and trust approval is content-keyed, so the edit used to silently invalidate your own `pmcp trust approve` of that file and the next startup refused it. When the pre-write bytes were approved, pmcp now re-records the approval for the exact bytes it writes — keyed on the opened descriptor's verified identity (the resolved key must name the same file the descriptor holds open), never re-approving a file that was not already approved, and never approving a substituted file. A target swapped or unlinked mid-operation is refused rather than mis-bound, and on POSIX a symlinked `.mcp.json` is refused up front. If re-recording ever fails because the trust store is unusable, the edit is still written and the failure is surfaced as a diagnostic rather than crashing (an unusable store also fails the approval check, so nothing is silently carried forward). See [Consiliency/pmcp#253](https://github.com/Consiliency/pmcp/issues/253).
+- **`pmcp config set-startup-policy add|remove|set --source project --apply` now carries your prior trust approval forward when it rewrites `.mcp.json`; a symlinked `.mcp.json` is refused for every source (user, project and custom, apply or preview, CLI or `gateway.set_startup_policy`).** Setting the startup policy changes the file's bytes, and trust approval is content-keyed, so the edit used to silently invalidate your own `pmcp trust approve` of that file and the next startup refused it. When the pre-write bytes were approved, pmcp now re-records the approval for the exact bytes it writes — keyed on the opened descriptor's verified identity (the resolved key must name the same file the descriptor holds open), never re-approving a file that was not already approved, and never approving a substituted file. A target swapped or unlinked mid-operation is refused rather than mis-bound, and on POSIX a symlinked `.mcp.json` is refused up front. If re-recording ever fails because the trust store is unusable, the edit is still written and the failure is surfaced as a diagnostic rather than crashing (an unusable store also fails the approval check, so nothing is silently carried forward). See [Consiliency/pmcp#253](https://github.com/Consiliency/pmcp/issues/253).
 - **Every install spawn now logs the command it runs, at WARNING, before it
   runs.** `start_install`, the legacy `install_server` and `verify_installation`
   each log a rendered command line immediately before the subprocess is
