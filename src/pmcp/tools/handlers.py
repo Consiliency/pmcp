@@ -1655,15 +1655,31 @@ class GatewayTools:
                         trace_context=trace_context,
                     )
 
+            # The task this reply carries, recognised by the manager's own
+            # extractor and parser -- wrapped `{task}` or at the top level --
+            # and only when this call ran as a task, as the manager decides
+            # (Consiliency/pmcp#330, board round 3 F001). The record is the
+            # one the manager made from it, in seconds.
+            task_support = (tool_info.execution or {}).get("taskSupport")
+            task_requested = task_support == "required" or (
+                parsed.task is not None and parsed.task.enabled
+            )
             task_info = None
-            if isinstance(result, dict):
-                task_payload = result.get("task")
-                if isinstance(task_payload, dict):
-                    task_id = task_payload.get("taskId") or task_payload.get("task_id")
-                    if isinstance(task_id, str):
-                        task_info = self._client_manager.get_task_record(
-                            tool_info.server_name, task_id
-                        )
+            if task_requested and isinstance(result, dict):
+                task_payload = ClientManager._extract_task_payload(
+                    self._client_manager, result
+                )
+                found = (
+                    ClientManager._task_info_from_payload(
+                        self._client_manager, task_payload
+                    )
+                    if task_payload is not None
+                    else None
+                )
+                if found is not None:
+                    task_info = self._client_manager.get_task_record(
+                        tool_info.server_name, found.task_id
+                    )
 
             # Process output (truncate, redact)
             max_bytes = None

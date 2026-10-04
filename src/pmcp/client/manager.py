@@ -40,7 +40,9 @@ from pmcp.validation import normalized_executable_name
 from pmcp.types import (
     LocalMcpServerConfig,
     UNUSABLE_TASK_VALUE,
+    task_duration_from_wire,
     task_hint_is_usable,
+    task_seconds_to_wire,
     McpTaskInfo,
     McpTaskRecord,
     PromptArgumentInfo,
@@ -1675,10 +1677,12 @@ class ClientManager:
         payload: dict[str, Any] = {}
         if parsed.metadata:
             payload["metadata"] = parsed.metadata
+        # pmcp's seconds become MCP's milliseconds here, and only here
+        # (Consiliency/pmcp#330).
         if parsed.ttl is not None:
-            payload["ttl"] = parsed.ttl
+            payload["ttl"] = task_seconds_to_wire(parsed.ttl)
         if parsed.poll_interval is not None:
-            payload["pollInterval"] = parsed.poll_interval
+            payload["pollInterval"] = task_seconds_to_wire(parsed.poll_interval)
         if parsed.requestor_context:
             payload["requestorContext"] = parsed.requestor_context
         return payload
@@ -1760,8 +1764,10 @@ class ClientManager:
             status_message=status_message if isinstance(status_message, str) else None,
             created_at=created_at,
             updated_at=updated_at,
-            ttl=payload.get("ttl"),
-            poll_interval=poll_interval,
+            # MCP's milliseconds become pmcp's seconds here, and only here;
+            # `raw` keeps the downstream's own units (Consiliency/pmcp#330).
+            ttl=task_duration_from_wire("ttl", payload.get("ttl")),
+            poll_interval=task_duration_from_wire("poll_interval", poll_interval),
             raw=payload,
         )
 

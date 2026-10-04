@@ -110,10 +110,37 @@ terminal records are retained, oldest pruned first. `gateway.list_pending` and
 tenant run/task IDs.
 
 The tenant server should treat `pollInterval` and `ttl` as hints and lifecycle
-metadata. PMCP forwards them when supplied and may surface returned values to
-clients, but PMCP does not persist task records past gateway process lifetime.
+metadata. PMCP converts a caller's values to milliseconds and forwards them
+when supplied, and surfaces returned values to clients in seconds (see *Units*
+below). PMCP does not persist task records past gateway process lifetime.
 A returned value PMCP cannot use is surfaced as `null` and named in the task's
 `unusable_fields`.
+
+Units (Consiliency/pmcp#330). On the wire, `ttl` and `pollInterval` are in
+milliseconds, as MCP 2025-11-25 defines them. The tenant server receives them in
+milliseconds and must return them in milliseconds. PMCP's own interface uses
+seconds, and PMCP converts at the boundary in both directions:
+
+- Outbound: the caller's `task.ttl` and `task.poll_interval`, in seconds, are
+  multiplied by 1000. A caller's `ttl: 300` reaches the tenant server as
+  `ttl: 300000`.
+- Inbound: a returned `ttl` or `pollInterval` is checked in milliseconds, as
+  sent. `poll_interval` (snake_case), which PMCP also accepts, is in
+  milliseconds too; when both are sent, `pollInterval` is used if it is usable
+  after conversion, and `poll_interval` otherwise. A `ttl` must be an integer in [0, 2^63 − 1], or `null` for unlimited. A
+  `pollInterval` must be a finite number greater than 0. The value is then
+  divided by 1000, and PMCP reports and records it as `ttl` and `poll_interval`
+  in seconds. Both are numbers that may be fractional: `ttl: 1500` becomes
+  `1.5`. A `ttl` of `null` stays `null`, which means unlimited. A
+  `pollInterval` so small that it divides to 0 seconds is unusable.
+- The task's `raw` object, and any result PMCP relays as sent, keep the tenant
+  server's own values and units.
+
+**Changed in Consiliency/pmcp#330.** Earlier versions of this contract described
+`ttl` in seconds and PMCP passed the number through unchanged. A tenant server
+built to that text now receives milliseconds (a caller's `ttl: 300` arrives as
+`ttl: 300000`), and must return `ttl` and `pollInterval` in milliseconds:
+seconds it returns are reported 1000× too small (`ttl: 300` shows as `0.3`).
 
 ## Metadata Forwarding Contract
 
@@ -125,8 +152,12 @@ documented. These values are strings only and are metadata, not authentication.
 Task metadata supplied to `gateway.invoke` may include:
 
 - `metadata`: a bounded object for tenant-server execution context.
-- `ttl`: task lifetime hint in seconds.
-- `pollInterval`: polling hint forwarded on the wire as `pollInterval`.
+- `ttl`: requested task retention in seconds, at most 9,007,199,254,740. It is
+  sent to the tenant server as `ttl` in milliseconds, which is the MCP
+  `TaskMetadata.ttl`.
+- `poll_interval`: polling hint in seconds, at most 9,007,199,254,740. It is
+  forwarded on the wire as `pollInterval` in milliseconds. MCP 2025-11-25's
+  `TaskMetadata` defines only `ttl`, so a tenant server may ignore this one.
 - `requestor_context` or downstream `requestorContext`: non-secret context for
   host/client visibility.
 
