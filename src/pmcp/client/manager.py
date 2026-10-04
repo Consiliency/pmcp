@@ -4183,6 +4183,18 @@ class ClientManager:
             # The registry clears are synchronous, so the cancelled path runs
             # them too; they stay in this method, which the publisher-coverage
             # AST guard (tests/runtime/test_publisher_coverage.py) requires.
+            #
+            # A client registered while this teardown was suspended (e.g. an
+            # `adopt_process` handoff) is not in `clients`, so neither the
+            # graceful path nor the cancel fallback above reached it. Clearing
+            # `_clients` would drop it with its process still running, and a
+            # later `abandon_all_now()` could no longer find it. Abandon every
+            # such client synchronously before the clear, on both paths
+            # (Consiliency/pmcp#324, codex round 5).
+            snapshot = {id(managed) for _name, managed in clients}
+            for late_name, late in list(self._clients.items()):
+                if id(late) not in snapshot:
+                    self._abandon_client_io(late_name, late)
             self._connect_tasks.clear()
             self._reconnect_tasks.clear()
             self._reconcile_tasks.clear()

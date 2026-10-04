@@ -2552,3 +2552,66 @@ async def test_adoption_after_abandonment_is_refused_and_registers_nothing() -> 
     finally:
         process.kill()
         await asyncio.wait_for(process.wait(), _HANG_GUARD_S)
+
+
+@pytest.mark.parametrize("cancel", [True, False])
+async def test_a_client_adopted_during_disconnect_all_is_not_left_running(
+    cancel: bool, tmp_path: Path
+) -> None:
+    """Codex round 5: `_disconnect_all_unlocked` tore down only its snapshot
+    of `_clients`, then cleared the registry. A client adopted while that
+    teardown was suspended (here: in a SIGTERM-ignoring server's grace) was
+    dropped from the registry with its process still running -- cancelled or
+    not -- and a later `abandon_all_now()` could no longer find it. Now every
+    client registered mid-teardown is abandoned before the clear (real
+    processes)."""
+    mgr, _cfg, pids = await _real_server(tmp_path, "slow")  # ignores SIGTERM
+    late_pidfile = tmp_path / "late.pids"
+    late_cfg = ResolvedServerConfig(
+        name="late",
+        source="project",
+        config=LocalMcpServerConfig(
+            command=sys.executable, args=["-c", _MCP_SERVER, str(late_pidfile)]
+        ),
+    )
+    late_pids: list[int] = []
+    terminating = asyncio.Event()
+    real_killpg = os.killpg
+
+    def noting_killpg(pgid: int, sig: int) -> None:
+        real_killpg(pgid, sig)
+        if sig == signal.SIGTERM:
+            terminating.set()
+
+    try:
+        with patch.object(manager_mod.os, "killpg", noting_killpg):
+            task = asyncio.create_task(mgr.disconnect_all())
+            await asyncio.wait_for(terminating.wait(), _HANG_GUARD_S)
+            late = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                _MCP_SERVER,
+                str(late_pidfile),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            await asyncio.wait_for(
+                mgr.adopt_process("late", late, late_cfg), _HANG_GUARD_S
+            )
+            late_pids = [int(p) for p in late_pidfile.read_text().split()]
+            assert "late" in mgr._clients
+            if cancel:
+                task.cancel()
+            kind, detail = await _outcome(task)
+        assert kind == ("cancelled" if cancel else "returned"), f"{kind} {detail!r}"
+        assert mgr._clients == {}, list(mgr._clients)
+        await eventually(
+            lambda: not any(_pid_alive(p) for p in pids + late_pids),
+            timeout=_HANG_GUARD_S,
+            message=f"cancel={cancel}: a process survived disconnect_all",
+        )
+    finally:
+        _kill_pids(pids + late_pids)
+        await _drain(mgr)
