@@ -9,11 +9,11 @@
     for url in urls:
         mcp.call_tool("gateway.invoke", {"tool_id": "playwright::browser_navigate", "arguments": {"url": url}})
 
-"playwright::browser_screenshot":
+"playwright::browser_take_screenshot":
   snippet: |
     # Capture screenshots in a loop
     for i, url in enumerate(urls):
-        mcp.call_tool("gateway.invoke", {"tool_id": "playwright::browser_screenshot", "arguments": {"path": f"shot_{i}.png"}})
+        mcp.call_tool("gateway.invoke", {"tool_id": "playwright::browser_take_screenshot", "arguments": {"filename": f"shot_{i}.png"}})
 
 "playwright::browser_click":
   snippet: |
@@ -25,17 +25,17 @@
 # Filesystem examples
 "filesystem::list_files":
   snippet: |
-    # Filter files locally
-    files = mcp.call_tool("gateway.invoke", {"tool_id": "filesystem::list_files", "arguments": {"path": "./"}})
-    py_files = [f for f in files if f.endswith(".py")]
+    # Unwrap the downstream result, then filter locally
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "filesystem::list_files", "arguments": {"path": "./"}})
+    text = out["result"]["content"][0]["text"]
+    py_files = [line for line in text.splitlines() if line.endswith(".py")]
 
 "filesystem::read_file":
   snippet: |
-    # Read with error handling
-    try:
-        content = mcp.call_tool("gateway.invoke", {"tool_id": "filesystem::read_file", "arguments": {"path": "file.txt"}})
-    except Exception as e:
-        print(f"Read failed: {e}")
+    # Gateway failures are ok: false (a tool's own failure is ok: true + result.isError)
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "filesystem::read_file", "arguments": {"path": "file.txt"}})
+    if not out["ok"]:
+        print(f"Read failed: {out['errors']}")
 
 "filesystem::write_file":
   snippet: |
@@ -46,29 +46,31 @@
 # GitHub examples
 "github::listIssues":
   snippet: |
-    # Filter issues locally
-    issues = mcp.call_tool("gateway.invoke", {"tool_id": "github::listIssues", "arguments": {"repo": "owner/repo"}})
+    import json
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "github::listIssues", "arguments": {"repo": "owner/repo"}})
+    issues = json.loads(out["result"]["content"][0]["text"])
     open_bugs = [i for i in issues if i["state"] == "open" and "bug" in i["labels"]]
 
 "github::createIssue":
   snippet: |
-    # Create with error handling
-    try:
-        result = mcp.call_tool("gateway.invoke", {"tool_id": "github::createIssue", "arguments": {"title": "Bug", "body": "Description"}})
-    except Exception as e:
-        print(f"Failed: {e}")
+    # Gateway failures are ok: false (a tool's own failure is ok: true + result.isError)
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "github::createIssue", "arguments": {"title": "Bug", "body": "Description"}})
+    if not out["ok"]:
+        print(f"Failed: {out['errors']}")
 
 # Database examples
 "postgres::query":
   snippet: |
-    # Query and filter
-    rows = mcp.call_tool("gateway.invoke", {"tool_id": "postgres::query", "arguments": {"sql": "SELECT * FROM users"}})
+    import json
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "postgres::query", "arguments": {"sql": "SELECT * FROM users"}})
+    rows = json.loads(out["result"]["content"][0]["text"])
     active = [r for r in rows if r["status"] == "active"]
 
 "sqlite::query":
   snippet: |
-    # Query with filter
-    data = mcp.call_tool("gateway.invoke", {"tool_id": "sqlite::query", "arguments": {"query": "SELECT * FROM items"}})
+    import json
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "sqlite::query", "arguments": {"query": "SELECT * FROM items"}})
+    data = json.loads(out["result"]["content"][0]["text"])
     recent = [d for d in data if d["created"] > cutoff_date]
 
 # Browser automation
@@ -87,18 +89,17 @@
 # Gateway tools
 "gateway::provision":
   snippet: |
-    # Provision with error handling
-    try:
-        mcp.call_tool("gateway.provision", {"server_name": "github"})
-    except Exception as e:
-        print(f"Provision failed: {e}")
+    # Provisioning reports failure in its result; poll provision_status with job_id
+    out = mcp.call_tool("gateway.provision", {"server_name": "github"})
+    if not out["ok"]:
+        print(f"Provision failed: {out['message']}")
 
 "gateway::provision_status":
   snippet: |
-    # Poll until ready
-    while True:
-        status = mcp.call_tool("gateway.provision_status", {"server_name": "github"})
-        if status["state"] in ["ready", "failed"]: break
+    import time
+    job = (p := mcp.call_tool("gateway.provision", {"server_name": "github"})).get("job_id")  # None: no job to wait for
+    while job and (st := mcp.call_tool("gateway.provision_status", {"job_id": job})["status"]) in ("pending", "installing"): time.sleep(1)
+    print("provision:", st if job else f'{p["status"]}: {p["message"]}')
 
 "gateway::catalog_search":
   snippet: |
@@ -109,26 +110,25 @@
 
 "gateway::describe":
   snippet: |
-    # Check before invoke
-    schema = mcp.call_tool("gateway.describe", {"tool_id": "server::tool"})
-    if schema["risk_hint"] == "HIGH":
-        print("Warning: high-risk tool")
+    # Warn on the gateway's safety notes or a destructive hint before invoking
+    card = mcp.call_tool("gateway.describe", {"tool_id": "server::tool"})
+    if card.get("safety_notes") or (card.get("annotations") or {}).get("destructiveHint"):
+        print("Warning:", card.get("safety_notes") or "destructive tool")
 
 "gateway::invoke":
   snippet: |
-    # Invoke with error handling
-    try:
-        result = mcp.call_tool("gateway.invoke", {"tool_id": "server::tool", "arguments": args})
-    except Exception as e:
-        print(f"Invocation failed: {e}")
+    # Gateway failures are ok: false (a tool's own failure is ok: true + result.isError)
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "server::tool", "arguments": args})
+    if not out["ok"]:
+        print(f"Invocation failed: {out['errors']}")
 
 # Context7 examples
-"context7::get-library-docs":
+"context7::query-docs":
   snippet: |
-    # Fetch docs for libraries
-    libraries = ["react/19.0.0", "vue/3.4.0"]
+    # Query docs for libraries (resolve each ID first with context7::resolve-library-id)
+    libraries = ["/facebook/react", "/vuejs/core"]
     for lib in libraries:
-        docs = mcp.call_tool("gateway.invoke", {"tool_id": "context7::get-library-docs", "arguments": {"libraryId": f"/npm/{lib}"}})
+        docs = mcp.call_tool("gateway.invoke", {"tool_id": "context7::query-docs", "arguments": {"libraryId": lib, "query": "hooks"}})
 
 # Generic fallback template (used when no specific template exists)
 _generic_fallback:

@@ -1,5 +1,22 @@
 # Issue #79 symptom 1b — reproduction harness & findings
 
+> **Status (2026-10-04): historical. The fix shipped.** The recommended fix below
+> landed in Consiliency/pmcp#82 (`26b2867`): `_read_stdout` now drops an oversized
+> line, fails only the oldest pending request, and keeps the server connected
+> (`_fail_oversized_line`, `src/pmcp/client/manager.py`). A re-run on main at
+> `2adcd9a` gave calls 1–3 OK, call 4 failing with `E302 "Downstream response
+> exceeded the 10485760-byte stdout line limit and was dropped; the server stays
+> connected…"`, and call 5 **OK** (no reconnect race).
+>
+> **`repro_client.py` does not run as committed against `mcp>=2`** (the version
+> `pyproject.toml` pins). That re-run needed three local changes:
+> `streamablehttp_client` → `streamable_http_client`; the context manager yields
+> `(read, write)`, not a 3-tuple; `read_timeout_seconds` takes a float, not a
+> `timedelta`. It also passes `timeout_ms` at the top level of the
+> `gateway.invoke` arguments, but the schema puts it under `options.timeout_ms`.
+> The line numbers and "not yet implemented" wording below describe the code as
+> of 2026-06-28.
+
 **Symptom (as reported):** driving long downstream calls through the PMCP gateway,
 Claude Code reports `"MCP server pmcp session expired"`, typically on the **2nd+**
 long call; `browser_run_code_unsafe`-style multi-step loops fail.
@@ -65,7 +82,7 @@ Gateway log: `[slowsrv] stdout read error: Separator is not found, and chunk exc
 3. **Orphaned-future desync after an internal timeout** — not separately triggered
    in this run (no internal timeout fired, since 1a let the long calls complete).
 
-## Recommended fix (the remaining 1b cause — not yet implemented)
+## Recommended fix (the remaining 1b cause — implemented in Consiliency/pmcp#82)
 Primary — **don't tear down the whole server for one oversized line.** In
 `_read_stdout`, on an oversized-line read error, drain to the next newline, fail
 only the in-flight request with a clear "output too large" error (suggest raising
