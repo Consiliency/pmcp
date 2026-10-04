@@ -1793,3 +1793,32 @@ def test_drop_reasons_use_json_type_names() -> None:
     assert jsonrpc_envelope_problem(error) == "error code of type object"
     result = {"jsonrpc": "2.0", "id": 1.5, "result": {}}
     assert jsonrpc_envelope_problem(result) == "id of type number"
+
+
+def test_a_notification_with_a_null_id_is_delivered_as_a_notification(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round-14 grok F004 (rev 15): main delivered `{"method": ..., "id":
+    null}` as a notification, and the MCP SDK's own parser reads it as one;
+    rev 14 dropped it (`id of type null`). It is accepted again, routed as a
+    notification and never answered (a reply with a null id would be a
+    response to nothing). Any other non-RequestId id is still dropped."""
+    import time
+
+    from pmcp.argument_errors import jsonrpc_envelope_problem
+
+    note = {"jsonrpc": "2.0", "id": None, "method": "notifications/tools/list_changed"}
+    assert jsonrpc_envelope_problem(note) is None
+    assert jsonrpc_envelope_problem({**note, "id": 1.5}) == "id of type number"
+    manager, managed = _stdio_manager()
+    replies: list[tuple[Any, str]] = []
+    notified: list[str] = []
+    manager._reply_to_downstream_request = (  # type: ignore[method-assign]
+        lambda name, managed, msg_id, method: replies.append((msg_id, method))
+    )
+    manager._handle_downstream_notification = (  # type: ignore[method-assign]
+        lambda name, managed, method: notified.append(method)
+    )
+    manager._handle_stdout_line("srv", managed, json.dumps(note).encode(), time.time())
+    assert notified == ["notifications/tools/list_changed"]
+    assert replies == []

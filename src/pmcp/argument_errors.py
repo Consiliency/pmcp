@@ -1103,7 +1103,9 @@ def jsonrpc_envelope_problem(frame: Any) -> str | None:
 
     - `jsonrpc` is exactly the string `"2.0"`;
     - a request has a string `method` and a `RequestId`; a notification has a
-      string `method` and no `id`; `params`, when present, is an object; a
+      string `method` and no `id` -- or `id: null`, which main, and the MCP
+      SDK's own parser, read as a notification (rev 15, round-14 grok F004;
+      nothing in it is echoed); `params`, when present, is an object; a
       request or notification carries neither `result` nor `error`;
     - a response has an `id` member (a `RequestId`, or null for an error the
       server could not attribute) and exactly one of `result` and `error`;
@@ -1123,8 +1125,9 @@ def jsonrpc_envelope_problem(frame: Any) -> str | None:
         method = frame["method"]
         if not isinstance(method, str):
             return f"non-string method ({_type_of(method)})"
-        if "id" in frame and not _is_request_id(frame["id"]):
-            return f"id of type {_type_of(frame['id'])}"
+        msg_id = frame.get("id")
+        if msg_id is not None and not _is_request_id(msg_id):
+            return f"id of type {_type_of(msg_id)}"
         # `params: null` is outside JSON-RPC 2.0, but the SDK's models accept
         # it and it carries nothing: it reads as absent (round-13 claude N1),
         # so a `ping` sent that way is still answered.

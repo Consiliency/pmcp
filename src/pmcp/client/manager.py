@@ -318,33 +318,48 @@ def _usable_task_raw(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key not in unusable}
 
 
-def task_payload_of(result: Any) -> dict[str, Any] | None:
-    """The task a downstream answer carries, in every shape pmcp recognises:
-    a nested `task` object, or a flat answer with a string `taskId`. The one
-    recogniser the manager and the handlers share."""
+def _task_candidate(result: Any) -> dict[str, Any] | None:
+    """Where a downstream answer would carry a task: its nested `task`
+    object if it has one, else the answer itself (flat)."""
     if not isinstance(result, dict):
         return None
     task = result.get("task")
-    if isinstance(task, dict):
-        return task
-    if isinstance(result.get("taskId"), str):
-        return result
-    return None
+    return task if isinstance(task, dict) else result
+
+
+def _names_a_task(result: Any) -> bool:
+    """Main's condition for not polling `tasks/get` after `tasks/result`,
+    kept exactly. It decides only that poll (rev 15)."""
+    return isinstance(result, dict) and (
+        isinstance(result.get("task"), dict) or isinstance(result.get("taskId"), str)
+    )
+
+
+def task_answer_of(result: Any) -> tuple[dict[str, Any], McpTaskInfo] | None:
+    """The task a downstream answer carries, and its parse -- or None. The
+    one recogniser, and it is the parser (rev 15): the candidate is a task
+    only if `ClientManager._task_info_from_payload` parses it."""
+    payload = _task_candidate(result)
+    if payload is None:
+        return None
+    info = ClientManager._task_info_from_payload(payload)
+    if info is None:
+        return None
+    return payload, info
 
 
 def usable_task_response(result: Any) -> Any:
-    """`result` with the task it carries reduced to what pmcp could use
-    (`_usable_task_raw`): a hint pmcp dropped as unusable is neither returned
-    to the caller nor sized through the answer itself (Consiliency/pmcp#297,
-    round-13 codex). The shapes are `task_payload_of`'s, so a flat and a
-    nested task are treated alike."""
-    payload = task_payload_of(result)
-    if payload is None:
+    """`result` with its task replaced by that task's parse (`raw`, without
+    the values pmcp dropped), so a dropped hint is neither returned nor sized
+    (Consiliency/pmcp#297). It acts if and only if `task_answer_of` finds a
+    task; anything else is returned unchanged, as data."""
+    found = task_answer_of(result)
+    if found is None:
         return result
-    usable = _usable_task_raw(payload)
+    payload, info = found
     if payload is result:
-        return usable
-    return {**result, "task": usable}
+        return dict(info.raw)
+    return {**result, "task": dict(info.raw)}
 
 
 def parse_request_id(request_id: str) -> tuple[str, int] | None:
@@ -1815,13 +1830,8 @@ class ClientManager:
             payload["task"] = {"requestorContext": requestor_context}
         return payload
 
-    def _extract_task_payload(self, result: dict[str, Any]) -> dict[str, Any] | None:
-        return task_payload_of(result)
-
-    def _usable_task_response(self, result: Any) -> Any:
-        return usable_task_response(result)
-
-    def _task_info_from_payload(self, payload: dict[str, Any]) -> McpTaskInfo | None:
+    @staticmethod
+    def _task_info_from_payload(payload: dict[str, Any]) -> McpTaskInfo | None:
         task_id = payload.get("taskId") or payload.get("task_id")
         if not isinstance(task_id, str) or not task_id:
             return None
@@ -3126,8 +3136,9 @@ class ClientManager:
         # request whose id happens to collide with one of ours must not be
         # mistaken for that response.
         if isinstance(method, str):
-            if "id" not in frame:
-                # Notification: no id, nothing to resolve.
+            if msg_id is None:
+                # Notification: no id (or `id: null`, which main and the MCP
+                # SDK read as a notification; rev 15), nothing to resolve.
                 self._handle_downstream_notification(name, managed, method)
             else:
                 # Server->client request: reply (ping -> {} else -32601).
@@ -4091,17 +4102,15 @@ class ClientManager:
             timeout_ms=timeout_ms,
         )
         if task_requested and isinstance(result, dict):
-            task_payload = self._extract_task_payload(result)
-            if task_payload is not None:
-                task_info = self._task_info_from_payload(task_payload)
-                if task_info is not None:
-                    self._record_task(
-                        tool_info.server_name,
-                        task_info,
-                        tool_id=tool_id,
-                        requestor_context=requestor_context,
-                    )
-            return self._usable_task_response(result)
+            found = task_answer_of(result)
+            if found is not None:
+                self._record_task(
+                    tool_info.server_name,
+                    found[1],
+                    tool_id=tool_id,
+                    requestor_context=requestor_context,
+                )
+            return usable_task_response(result)
 
         return result
 
@@ -4167,11 +4176,10 @@ class ClientManager:
                 or (record.requestor_context if record is not None else None),
             ),
         )
-        payload = self._extract_task_payload(result) or result
-        task_info = self._task_info_from_payload(payload)
-        if task_info is None:
+        found = task_answer_of(result)
+        if found is None:
             raise KeyError(f"Task not found: {server_name}::{task_id}")
-        return self._record_task(server_name, task_info)
+        return self._record_task(server_name, found[1])
 
     async def get_task_result(
         self,
@@ -4192,19 +4200,17 @@ class ClientManager:
                 or (record.requestor_context if record is not None else None),
             ),
         )
-        task_payload = self._extract_task_payload(result)
-        if task_payload is not None:
-            task_info = self._task_info_from_payload(task_payload)
-            if task_info is not None:
-                self._record_task(server_name, task_info)
-        else:
+        found = task_answer_of(result)
+        if found is not None:
+            self._record_task(server_name, found[1])
+        elif not _names_a_task(result):
             await self.get_task(
                 server_name,
                 task_id,
                 requestor_context=requestor_context
                 or (record.requestor_context if record is not None else None),
             )
-        return self._usable_task_response(result)
+        return usable_task_response(result)
 
     async def cancel_task(
         self,
@@ -4228,14 +4234,18 @@ class ClientManager:
         )
         params["force"] = force
         result = await self._send_request(managed, "tasks/cancel", params)
-        payload = self._extract_task_payload(result) or result
-        task_info = self._task_info_from_payload(payload)
-        if task_info is None:
+        found = task_answer_of(result)
+        if found is not None:
+            task_info = found[1]
+        else:
+            # The answer carries no task pmcp can parse, so nothing in it was
+            # read: `raw` stays empty rather than holding the whole answer
+            # (rev 15, round-14 claude F001: an unparseable task's `ttl` went
+            # back out through `gateway.tasks_cancel`).
             task_info = McpTaskInfo(
                 task_id=task_id,
                 status="cancelled",
                 updated_at=time.time(),
-                raw=result,
             )
         return (True, self._record_task(server_name, task_info), "Task cancelled")
 

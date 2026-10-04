@@ -40,7 +40,7 @@ import logging
 import traceback
 import typing
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import jsonschema
 import pytest
@@ -1165,7 +1165,7 @@ def _task_positions() -> list[tuple[str, str]]:
     from pmcp.client.manager import ClientManager
 
     manager = ClientManager()
-    keys = _payload_keys(ClientManager._task_info_from_payload)
+    keys = _payload_keys(_task_parser_source())
     assert {"ttl", "pollInterval", "createdAt", "status"} <= set(keys), keys
     positions = []
     for key in keys:
@@ -1196,17 +1196,59 @@ def _task_outcome(parser: Any, payload: dict) -> str | None:
     return None
 
 
-#: Every shape in which a downstream answer carries a task, as pmcp's one
-#: recogniser (`task_payload_of`) accepts it (round-13 codex): nested, with
-#: or without a sibling `result`, and flat.
+def _task_parser_source() -> Any:
+    """The task parser: the manager's `_task_info_from_payload` (static from
+    rev 15, when it became the only recogniser)."""
+    from pmcp.client.manager import ClientManager
+
+    return ClientManager._task_info_from_payload
+
+
+def _parse_task(payload: dict[str, Any]) -> Any:
+    """Run that parser (before rev 15 a method that reads nothing from
+    `self`)."""
+    import inspect
+
+    from pmcp.client.manager import ClientManager
+
+    raw = inspect.getattr_static(ClientManager, "_task_info_from_payload")
+    if isinstance(raw, staticmethod):
+        return ClientManager._task_info_from_payload(payload)
+    return ClientManager._task_info_from_payload(cast(Any, None), payload)
+
+
+def _task_id_aliases() -> list[str]:
+    """Every wire name the parser takes a task's id from, found by RUNNING it
+    on each key it reads (rev 15, round-14: derived from the parser's
+    grammar, not from a recogniser's)."""
+    return [k for k in _payload_keys(_task_parser_source()) if _parse_task({k: "t"})]
+
+
+def _renamed_id(payload: dict[str, Any], alias: str) -> dict[str, Any]:
+    if alias == "taskId" or "taskId" not in payload:
+        return dict(payload)
+    return {(alias if key == "taskId" else key): v for key, v in payload.items()}
+
+
+def _task_wrap(shape: str, alias: str) -> Any:
+    def wrap(p: dict[str, Any], method: str) -> Any:
+        task = _renamed_id(p, alias)
+        if shape == "flat":
+            return task
+        if shape == "nested" and method == "tasks/result":
+            return {"task": task, "result": {"content": []}}
+        return {"task": task}
+
+    return wrap
+
+
+#: Every shape in which a downstream answer carries a task, as the PARSER's
+#: grammar accepts it (rev 15): each id alias the parser reads, nested (with a
+#: sibling `result` on `tasks/result`), nested without one, and flat.
 _TASK_WRAPS: dict[str, Any] = {
-    "nested": lambda p, method: (
-        {"task": p, "result": {"content": []}}
-        if method == "tasks/result"
-        else {"task": p}
-    ),
-    "nested-bare": lambda p, method: {"task": p},
-    "flat": lambda p, method: dict(p),
+    f"{shape}-{alias}": _task_wrap(shape, alias)
+    for alias in _task_id_aliases()
+    for shape in ("nested", "nested-bare", "flat")
 }
 
 
@@ -1269,9 +1311,10 @@ def _task_server(
     async def send_request(managed: Any, method: str, params: Any, **_: Any) -> Any:
         state["methods"].append(method)
         payload = state["payload"]
+        wrap = state.get("wrap", "nested-taskId")
         if method == "tasks/list":
-            return {"tasks": [payload]}
-        return _TASK_WRAPS[state.get("wrap", "nested")](payload, method)
+            return {"tasks": [_renamed_id(payload, wrap.rsplit("-", 1)[-1])]}
+        return _TASK_WRAPS[wrap](payload, method)
 
     manager._send_request = send_request  # type: ignore[method-assign]
     return server, audit_path, state
@@ -1871,22 +1914,18 @@ async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
     """Round-13 codex: a task hint pmcp drops as unusable left through the
     answer itself -- `gateway.invoke` returned a flat task answer as its
     `result`, and `gateway.tasks_result` the original `{"task": ...}`, both
-    holding the value and sized with it. Every task call, in every shape the
-    recogniser accepts, with every dropped position: the value is in no
-    channel, and two sentinel lengths give the same answer (no size channel)."""
-    import pmcp.client.manager as manager_module
-
-    # The recogniser as the manager defines it; before rev 14 it was only the
-    # manager's own method (so this test runs, and fails on the value, there).
-    task_payload_of = getattr(
-        manager_module,
-        "task_payload_of",
-        lambda result: manager_module.ClientManager()._extract_task_payload(result),
-    )
+    holding the value and sized with it. Rev 15 (round-14 grok F002/F003):
+    the shapes are the PARSER's -- every id alias it reads (`task_id` too),
+    nested or flat -- so an alias the old recogniser missed is swept. Every
+    task call (`tasks_list` included), in every shape, with every dropped
+    position: the value is in no channel, and two sentinel lengths give the
+    same answer (no size channel)."""
     caplog.set_level(logging.DEBUG)
-    probe = {"taskId": "t", "status": "working", "ttl": "x"}
+    probe = {"taskId": "t", "status": "working"}
     for method in ("tools/call", "tasks/get", "tasks/result", "tasks/cancel"):
-        assert task_payload_of(_TASK_WRAPS[wrap](probe, method)) == probe, method
+        answer = _TASK_WRAPS[wrap](probe, method)
+        candidate = answer["task"] if "task" in answer else answer
+        assert _parse_task(candidate) is not None, (wrap, method)
     server, audit_path, state = _task_server(tmp_path, audited=False)
     state["wrap"] = wrap
     tap = _Tap(server, audit_path, caplog, capfd, recwarn)
@@ -1902,8 +1941,6 @@ async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
     assert dropped, "no dropped position"
     cases = 0
     for name, arguments, method in _task_calls():
-        if method == "tasks/list":
-            continue
         for key, shape in dropped:
             for family, sentinels in _FAMILIES.items():
                 # A value the parser accepts (a digits-only `createdAt` is a
@@ -1949,4 +1986,184 @@ async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
                 )
                 cases += 1
     await server.shutdown()
-    assert cases >= 4 * len(dropped) * (len(_FAMILIES) - 1), cases
+    assert cases >= 5 * len(dropped) * (len(_FAMILIES) - 1), cases
+
+
+# ---------------------------------------------------------------------------
+# Rev 15 (round-14 board): the recogniser IS the parser
+# ---------------------------------------------------------------------------
+
+
+def _drops_alone(key: str, value: Any) -> bool:
+    """The parser's own verdict: it drops `value` at `key`, the only hint."""
+    info = _parse_task({"taskId": "t", key: value})
+    return info is not None and key not in info.raw
+
+
+def _usable_probe(key: str) -> Any:
+    for value in (5, 5.0, "working", "a message"):
+        info = _parse_task({"taskId": "t", key: value})
+        if info is not None and not info.unusable_fields and key in info.raw:
+            return value
+    return None
+
+
+def _generated_task_answers() -> list[tuple[str, dict[str, Any]]]:
+    """Answers from the parser's grammar: each id it reads, and ids it does
+    not (absent, empty, integer, null, object); each other key it reads with
+    a dropped value, a null, a usable value, and a usable value beside a
+    dropped one; nested beside result data, nested bare, and flat. Plus
+    codex's round-14 falsifier (data under `task`, no id)."""
+    ids = [(a, {a: "t"}) for a in _task_id_aliases()] + [
+        ("no-id", {}),
+        ("empty-id", {"taskId": ""}),
+        ("int-id", {"taskId": 5}),
+        ("null-id", {"taskId": None}),
+        ("object-id", {"task_id": {"x": 1}}),
+    ]
+    keys = [k for k in _payload_keys(_task_parser_source()) if k not in dict(ids)]
+    hints: list[tuple[str, dict[str, Any]]] = [("none", {})]
+    hints.append(("business", {"statusMessage": {"detail": "business-data"}}))
+    for key in keys:
+        hints += [(f"{key}={s}", {key: v}) for s, v in _bad_values("S").items()]
+        hints.append((f"{key}=null", {key: None}))
+        usable = _usable_probe(key)
+        if usable is not None:
+            hints.append((f"{key}=usable", {key: usable}))
+            hints += [
+                (f"{key}=usable+{o}=S", {key: usable, o: "S"})
+                for o in keys
+                if o != key and _usable_probe(o) is not None
+            ]
+    answers = []
+    for id_name, id_part in ids:
+        for hint_name, hint_part in hints:
+            task = {**id_part, "status": "working", **hint_part}
+            name = f"{id_name}/{hint_name}"
+            answers.append((f"nested/{name}", {"task": task, "content": []}))
+            answers.append((f"nested-bare/{name}", {"task": dict(task)}))
+            answers.append((f"flat/{name}", dict(task)))
+    return answers
+
+
+@pytest.mark.asyncio
+async def test_the_normaliser_acts_iff_the_parser_accepts_on_every_task_op(
+    tmp_path: Path,
+) -> None:
+    """Round-14 board (codex F024-F027, grok F002/F003, claude F001/F002): rev
+    14's recogniser and parser disagreed both ways. Through `call_tool`,
+    `get_task`, `list_tasks`, `get_task_result` and `cancel_task` (and its
+    fallback), for every generated answer: the normaliser acts iff the parser
+    yields a task; the task becomes exactly the parse's `raw`; the keys
+    removed are exactly those the parser drops (per wire key: one alias of a
+    field can be usable while another is not), which include every sent
+    alias of each field in `unusable_fields`; siblings are untouched."""
+    from pmcp.client.manager import _TASK_WIRE_KEYS
+    from pmcp.types import McpTaskInfo
+
+    server, _, _ = _task_server(tmp_path, audited=False)
+    manager = server._client_manager
+    reply: dict[str, Any] = {}
+
+    async def send_request(managed: Any, method: str, params: Any, **_: Any) -> Any:
+        task = reply.get("task") if isinstance(reply.get("task"), dict) else reply
+        return copy.deepcopy({"tasks": [task]} if method == "tasks/list" else reply)
+
+    manager._send_request = send_request  # type: ignore[method-assign]
+    answers = _generated_task_answers()
+    acted = 0
+    for name, answer in answers:
+        reply.clear()
+        reply.update(copy.deepcopy(answer))
+        nested = isinstance(answer.get("task"), dict)
+        candidate = answer["task"] if nested else answer
+        info = _parse_task(candidate)
+        expected: Any = answer
+        if info is not None:
+            acted += 1
+            expected = {**answer, "task": info.raw} if nested else info.raw
+            assert set(candidate) - set(info.raw) == {
+                k for k in candidate if _drops_alone(k, candidate[k])
+            }, name
+            for field in info.unusable_fields:
+                for key in _TASK_WIRE_KEYS.get(field, ()):
+                    assert candidate.get(key) is None or key not in info.raw, name
+        manager._tasks.clear()
+        got = await manager.call_tool(f"{_DOWNSTREAM}::run", {}, task={"enabled": True})
+        assert got == expected and bool(manager._tasks) is (info is not None), name
+        manager._tasks.clear()
+        if info is None:
+            with pytest.raises(KeyError):
+                await manager.get_task(_DOWNSTREAM, "t")
+        else:
+            assert (await manager.get_task(_DOWNSTREAM, "t")).raw == info.raw, name
+        listed = await manager.list_tasks(_DOWNSTREAM)
+        raws = [t["raw"] for t in listed["tasks"]]
+        assert raws == ([info.raw] if info is not None else []), name
+        if nested or info is not None:  # otherwise main's rule polls tasks/get
+            assert await manager.get_task_result(_DOWNSTREAM, "t") == expected, name
+        manager._tasks.clear()
+        manager._record_task(_DOWNSTREAM, McpTaskInfo(task_id="t", status="working"))
+        _, record, _ = await manager.cancel_task(_DOWNSTREAM, "t")
+        assert record is not None
+        assert record.raw == (info.raw if info is not None else {}), name
+    await server.shutdown()
+    assert 0 < acted < len(answers) and len(answers) > 1000, (acted, len(answers))
+
+
+async def _answer_text(root: Path, tool: str, reply: Any) -> str:
+    from pmcp.types import McpTaskInfo
+
+    root.mkdir()
+    server, _, _ = _task_server(root, audited=False)
+
+    async def send_request(managed: Any, method: str, params: Any, **_: Any) -> Any:
+        return copy.deepcopy(reply)
+
+    server._client_manager._send_request = send_request  # type: ignore[method-assign]
+    if tool == "gateway.invoke":
+        args = {"tool_id": f"{_DOWNSTREAM}::run", "task": {"enabled": True}}
+        args.update(_correlations())
+    else:
+        args = {"server_name": _DOWNSTREAM, "task_id": "t"}
+        task = McpTaskInfo(task_id="t", status="working")
+        server._client_manager._record_task(_DOWNSTREAM, task)
+    result = await _call(server, tool, args)
+    if tool == "gateway.tasks_cancel":
+        record = server._client_manager.get_task_record(_DOWNSTREAM, "t")
+        assert record is not None and record.raw == {}, record
+    await server.shutdown()
+    return "".join(block.text for block in result.content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["gateway.invoke", "gateway.tasks_result"])
+async def test_task_result_preserves_non_task_data(tmp_path: Path, tool: str) -> None:
+    """Round-14 codex F024-F027: a `task` the parser does not read (no id) is
+    the downstream's data, kept whole as on main; rev 14 deleted from it."""
+    reply = {"task": {"statusMessage": {"detail": "business-data"}}, "content": []}
+    assert "business-data" in await _answer_text(tmp_path / "a", tool, reply)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "reply"),
+    [
+        # round-14 grok F002/F003, claude F002: a flat snake-case task.
+        ("gateway.invoke", {"task_id": "t", "status": "working", "ttl": "@S@"}),
+        ("gateway.tasks_result", {"task_id": "t", "status": "working", "ttl": "@S@"}),
+        # round-14 claude F001: the cancel fallback copied the whole answer.
+        ("gateway.tasks_cancel", {"taskId": 5, "status": "cancelled", "ttl": "@S@"}),
+        ("gateway.tasks_cancel", {"task": {"taskId": 5, "ttl": "@S@"}}),
+    ],
+)
+async def test_a_dropped_task_hint_leaves_by_no_alias_or_fallback(
+    tmp_path: Path, tool: str, reply: dict[str, Any]
+) -> None:
+    sizes = []
+    for s in ("violetcanaryrejected", "violetcanaryrejected12345678"):
+        sent = json.loads(json.dumps(reply).replace("@S@", s))
+        text = await _answer_text(tmp_path / s, tool, sent)
+        assert s not in text, text
+        sizes.append(json.loads(text).get("raw_size_estimate"))
+    assert sizes[0] == sizes[1], sizes

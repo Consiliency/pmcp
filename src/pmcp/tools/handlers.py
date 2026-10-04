@@ -36,7 +36,7 @@ from pmcp.client.manager import (
     ClientManager,
     _terminate_process_tree,
     parse_request_id,
-    task_payload_of,
+    task_answer_of,
 )
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import (
@@ -1664,16 +1664,14 @@ class GatewayTools:
                     )
 
             task_info = None
-            # Every task shape the manager recognises, flat or nested
-            # (round-13 codex): the manager has already reduced it to what
-            # pmcp could use (`usable_task_response`).
-            task_payload = task_payload_of(result)
-            if task_payload is not None:
-                task_id = task_payload.get("taskId") or task_payload.get("task_id")
-                if isinstance(task_id, str):
-                    task_info = self._client_manager.get_task_record(
-                        tool_info.server_name, task_id
-                    )
+            # The manager's one recogniser, which is its parser (rev 15): a
+            # task here is exactly a task the manager recorded and reduced to
+            # what pmcp could use (`usable_task_response`).
+            found = task_answer_of(result)
+            if found is not None:
+                task_info = self._client_manager.get_task_record(
+                    tool_info.server_name, found[1].task_id
+                )
 
             # Process output (truncate, redact)
             max_bytes = None
