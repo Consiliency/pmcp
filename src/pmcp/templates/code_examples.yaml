@@ -31,11 +31,10 @@
 
 "filesystem::read_file":
   snippet: |
-    # Read with error handling
-    try:
-        content = mcp.call_tool("gateway.invoke", {"tool_id": "filesystem::read_file", "arguments": {"path": "file.txt"}})
-    except Exception as e:
-        print(f"Read failed: {e}")
+    # Failures come back as ok: false, not as exceptions
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "filesystem::read_file", "arguments": {"path": "file.txt"}})
+    if not out["ok"]:
+        print(f"Read failed: {out['errors']}")
 
 "filesystem::write_file":
   snippet: |
@@ -52,11 +51,10 @@
 
 "github::createIssue":
   snippet: |
-    # Create with error handling
-    try:
-        result = mcp.call_tool("gateway.invoke", {"tool_id": "github::createIssue", "arguments": {"title": "Bug", "body": "Description"}})
-    except Exception as e:
-        print(f"Failed: {e}")
+    # Failures come back as ok: false, not as exceptions
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "github::createIssue", "arguments": {"title": "Bug", "body": "Description"}})
+    if not out["ok"]:
+        print(f"Failed: {out['errors']}")
 
 # Database examples
 "postgres::query":
@@ -87,11 +85,10 @@
 # Gateway tools
 "gateway::provision":
   snippet: |
-    # Provision with error handling
-    try:
-        mcp.call_tool("gateway.provision", {"server_name": "github"})
-    except Exception as e:
-        print(f"Provision failed: {e}")
+    # Provisioning reports failure in its result; poll provision_status with job_id
+    out = mcp.call_tool("gateway.provision", {"server_name": "github"})
+    if not out["ok"]:
+        print(f"Provision failed: {out['message']}")
 
 "gateway::provision_status":
   snippet: |
@@ -116,11 +113,10 @@
 
 "gateway::invoke":
   snippet: |
-    # Invoke with error handling
-    try:
-        result = mcp.call_tool("gateway.invoke", {"tool_id": "server::tool", "arguments": args})
-    except Exception as e:
-        print(f"Invocation failed: {e}")
+    # Failures come back as ok: false, not as exceptions
+    out = mcp.call_tool("gateway.invoke", {"tool_id": "server::tool", "arguments": args})
+    if not out["ok"]:
+        print(f"Invocation failed: {out['errors']}")
 
 # Context7 examples
 "context7::query-docs":

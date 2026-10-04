@@ -838,6 +838,7 @@ Each is described in full in the section named at the end of the line.
   idle-timeout tests drive an injected request clock: `ClientManager` takes
   `clock=` (wall time by default, so `started_at` is still an epoch) and caps the
   idle re-check at `IDLE_POLL_SLICE_S`.
+- **Shipped code snippets are always valid Python.** `gateway.describe`'s L2 snippets are cut to `max_snippet_lines` (default 4); four `try`/`except` templates lost their `except` body at that budget and were invalid. The loader now returns the longest prefix that parses (or no snippet), and those four templates now show the real pattern: `gateway.invoke` and `gateway.provision` report failure as `ok: false`, not by raising.
 - **Agent-visible data and help text.** The `try/catch` code hint is now `try`: at the
   default `max_hint_length` of 8 it was being cut to `try/catc`. The Playwright
   screenshot entries in `code_patterns.yaml` and `code_examples.yaml` now name the
