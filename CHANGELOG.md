@@ -459,8 +459,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested after this connect and cancelled before it ran` for it,
   `ensure_connected` returns false, and the server ends as the uncancelled
   ordering leaves it (disconnected; lazy again if it came from a project,
-  user or custom config). A connect requested after the cancelled disconnect
-  is unaffected. An uncancelled disconnect supersedes nothing: it runs after
+  user or custom config) -- unless a connect requested after the cancelled
+  disconnect already owns the server, whose state it then leaves alone. A
+  connect requested after the cancelled disconnect is unaffected, including
+  while a superseded lazy start is still winding down. A request writes a
+  server's status and lazy registration after it waited only under the
+  lifecycle lock and only while no newer connect of that server has started,
+  so a lazy start that finishes after a forced disconnect has made the server
+  lazy again no longer drops its lazy registration (it pops it only for a
+  server that is online). Cancelling one of two lazy starts that share a
+  connect no longer cancels the connect the other is still waiting for, and
+  a `connect_server` that holds the lifecycle lock no longer waits forever on
+  a lazy start's connect queued behind it. A connect that finished just
+  before the cancelled disconnect took the server down is refused too
+  (`ensure_connected` returns false) instead of reporting success, and a
+  caller cancelled after the supersession stays cancelled while the server
+  is still settled. A caller cancelled while its connect is in flight now
+  has that connect's client killed and dropped before the cancellation
+  reaches it. `restart_server` disconnects and reconnects in one hold of the
+  lifecycle lock, as one request: a disconnect queued during a restart runs
+  after the whole restart, and if it is cancelled it supersedes the
+  restart's reconnect. (Gateway-level operations that release the lock
+  between steps -- `gateway.refresh`, server updates, provisioning -- issue a
+  separate request for each connect, each ordered at its own request, as
+  their uncancelled ordering is.) An uncancelled disconnect supersedes nothing: it runs after
   those connects (the lock is first-come, first-served) and tears down what
   they produced, so its end state is already this one, and refusing them
   instead would change what their callers are told. The one pre-existing

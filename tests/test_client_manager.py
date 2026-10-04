@@ -1138,20 +1138,18 @@ class TestTargetServerLifecycle:
         )
         events: list[str] = []
 
-        async def disconnect(
-            name: str, force: bool = False
-        ) -> tuple[bool, int, str | None]:
-            events.append(f"disconnect:{name}:{force}")
-            return (True, 0, None)
+        # One lifecycle-lock hold for both phases (Consiliency/pmcp#324):
+        # nothing can run between the disconnect and the connect.
+        async def disconnect(name: str, cancelled: int) -> tuple[bool, int, str | None]:
+            events.append(f"disconnect:{name}:{manager._lifecycle_lock.locked()}")
+            return (True, cancelled, None)
 
-        async def connect(
-            config: ResolvedServerConfig, retry: bool = True
-        ) -> list[str]:
-            events.append(f"connect:{config.name}:{retry}")
+        async def connect(config: ResolvedServerConfig, retry: bool) -> list[str]:
+            events.append(f"connect:{config.name}:{manager._lifecycle_lock.locked()}")
             return []
 
-        manager.disconnect_server = disconnect  # type: ignore[method-assign]
-        manager.connect_server = connect  # type: ignore[method-assign]
+        manager._disconnect_server_locked = disconnect  # type: ignore[method-assign]
+        manager._connect_server_locked = connect  # type: ignore[method-assign]
 
         ok, cancelled, errors = await manager.restart_server(config, force=True)
 
@@ -1159,6 +1157,7 @@ class TestTargetServerLifecycle:
         assert cancelled == 0
         assert errors == []
         assert events == ["disconnect:target:True", "connect:target:True"]
+        assert not manager._lifecycle_lock.locked()
 
     @pytest.mark.asyncio
     async def test_disconnect_server_preserves_lazy_status_for_known_config(

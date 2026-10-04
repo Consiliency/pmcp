@@ -2130,7 +2130,7 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "SIGKILLs the tree synchronously, then re-raises",
     ),
-    ("client/manager.py", "ClientManager.disconnect_server", "reraises"): (
+    ("client/manager.py", "ClientManager._disconnect_server", "reraises"): (
         1,
         "implementation addition: a cancel during the forced `cancel_task` "
         "awaits or the lock wait abandons synchronously, then re-raises",
@@ -2176,13 +2176,9 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
     ): (1, "abandons synchronously, then re-raises into the gather"),
     ("client/manager.py", "ClientManager._await_connect_task", "reraises"): (
         1,
-        "round 2: the request's own cancel (out of `asyncio.wait`) is "
-        "forwarded to the connect task, as `await task` did, then re-raised",
-    ),
-    ("client/manager.py", "ClientManager._reconnect_loop", "reraises"): (
-        1,
-        "round 2: a superseded reconnect settles synchronously (sync "
-        "`_admit_connect`; a no-op unless superseded), then re-raises",
+        "round 3: the request's own cancel (out of `asyncio.wait`): if no "
+        "other request awaits the connect, cancel it and tear down its client "
+        "synchronously; settle synchronously; re-raise",
     ),
     ("client/manager.py", "ClientManager._health_monitor_loop", "absorbs"): (
         1,
@@ -2302,7 +2298,7 @@ _TEARDOWN_ENTRIES = {
     "ClientManager._connect_stdio": "_abandon_client_io",
     "ClientManager._connect_remote_stream": "_abandon_client_io",
     "ClientManager.adopt_process": "_abandon_client_io",
-    "ClientManager.disconnect_server": "_abandon_client_io",
+    "ClientManager._disconnect_server": "_abandon_client_io",
     "ClientManager._disconnect_server_locked": "_abandon_client_io",
     "ClientManager.disconnect_all": "abandon_all_now",
     "ClientManager._cleanup_client": "_abandon_client_io",
