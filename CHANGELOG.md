@@ -225,11 +225,11 @@ to do, how to verify it, and how to roll back to 2.7.3.
   same rules.
   Two properties are worth knowing before you rely on it. The store must live
   **outside** the checkout it judges — a store path that resolves inside the
-  current repository (or, under `pmcp serve --project`, the served project),
+  current repository (or, under `pmcp --project`, the served project),
   directly or through a symlink, is refused rather than
   read, and `pmcp trust approve` also refuses a store inside the checkout that
   contains the file being approved, so it never reports an approval that
-  `pmcp serve --project` would then refuse
+  `pmcp --project` would then refuse
   ([Consiliency/pmcp#252](https://github.com/Consiliency/pmcp/issues/252)),
   because a repository that ships its own approval record must not be
   believed. And every read failure is a refusal: a missing, unreadable or
@@ -351,7 +351,7 @@ to do, how to verify it, and how to roll back to 2.7.3.
   repository's. See [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **An install spawn now strips PMCP-managed credentials using the project root
   the gateway was given, not the directory it happens to be running in.** When a
-  gateway started with `pmcp serve --project X` ran from a different working
+  gateway started with `pmcp --project X` ran from a different working
   directory, the install child's environment was sanitized by walking up from the
   *working directory* to find the project credential store, while the credential
   was written from the gateway's own root `X` — so a project-scoped credential in
@@ -380,13 +380,13 @@ to do, how to verify it, and how to roll back to 2.7.3.
   gateway serves, not only the directory it was launched from.** A trust store
   that resolves inside a checkout is refused, because a repository must not ship
   its own approval record — but the guard discovered the checkout by walking up
-  from `Path.cwd()`, so `pmcp serve --project <checkout>` launched from any other
+  from `Path.cwd()`, so `pmcp --project <checkout>` launched from any other
   directory did not refuse a store planted inside that served checkout, and it
   would load that checkout's self-approved `.mcp.json`. The guard now judges
   residency against the served project root **and** the launch checkout (adding
   the served root, never replacing the cwd walk, so a store resident in a second
   checkout the operator launches from stays refused too). `pmcp status --project`
-  gets the same binding; the `pmcp trust` verbs and a bare `pmcp serve` keep
+  gets the same binding; the `pmcp trust` verbs and a bare `pmcp` (the gateway) keep
   the cwd-derived guard, and `pmcp trust approve` additionally refuses a store
   inside the approved file's checkout (see the trust-store entry under *Added*). See
   [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230), [Consiliency/pmcp#251](https://github.com/Consiliency/pmcp/issues/251).
