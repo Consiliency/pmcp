@@ -911,3 +911,31 @@ def test_the_store_is_not_opened_before_the_walk_decides(
     monkeypatch.undo()
 
     assert not any(".env.pmcp" in t or "victim" in t for t in touched), touched
+
+
+@pytest.mark.parametrize("entry", list(_REPORTING), ids=list(_REPORTING))
+def test_a_write_failure_after_a_clean_read_is_reported(
+    entry: str, layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ENOSPC at the write -- an error no read can raise -- is still `ok: false`."""
+    if not Path("/proc/self/fd").is_dir():
+        pytest.skip("needs /proc to tell the project write from the user store's")
+    real_fsync = os.fsync
+    project = str(layout["project"].resolve())
+
+    def no_space(fd: int) -> None:
+        # Only the PROJECT store's temp: the sync helper seeds the user store first.
+        if stat.S_ISREG(os.fstat(fd).st_mode) and os.readlink(
+            f"/proc/self/fd/{fd}"
+        ).startswith(project + os.sep):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", no_space)
+    outcome = _guarded(entry, layout)
+    monkeypatch.undo()
+    assert isinstance(outcome, Reported), outcome
+    assert outcome.message == (
+        f"refusing to write .env.pmcp: {os.strerror(errno.ENOSPC)}"
+    )
+    assert not (layout["project"] / ".env.pmcp").exists()
