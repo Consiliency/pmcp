@@ -31,6 +31,7 @@ log is `~/.pmcp/logs/gateway.log`.
   [auth responses](#auth-responses-changed) ·
   [`tools/call` gate](#the-toolscall-gate-enforces-the-schemas-pmcp-advertises) ·
   [task numbers](#task-numbers-are-bounded) ·
+  [task units](#task-ttl-and-poll_interval-are-seconds-in-pmcp-and-milliseconds-on-the-wire) ·
   [redaction](#redaction-removes-more) ·
   [version pins](#manifest-version-pins) ·
   [downstream servers](#downstream-servers-see-more-from-pmcp) ·
@@ -667,7 +668,7 @@ with an `{"error": true, …}` JSON payload instead. Some cases checked on 3.0:
 <!-- gate-case: {"name": "gateway.catalog_search", "arguments": {"query": null}} => accepted -->
 <!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": 0}}} => 0 is less than the minimum of 1 -->
 <!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "poll_interval": NaN}}} => nan is not of type 'number', 'null' -->
-<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": 60000}}} => accepted -->
+<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": 300}}} => accepted -->
 
 An explicit `null` for any optional argument is now accepted; 28 arguments
 used to reject it. Policy is judged before the schema, so a blocked tool gets
@@ -703,7 +704,7 @@ accepts:
 
 <!-- snippet: tools-call-accepted -->
 ```json
-{"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {"query": "pmcp"}, "options": null, "task": {"enabled": true, "ttl": 60000}}}
+{"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {"query": "pmcp"}, "options": null, "task": {"enabled": true, "ttl": 300}}}
 ```
 
 and the shape it now refuses:
@@ -723,8 +724,10 @@ and `run_correlation_id` is set only on `gateway.invoke` records.
 **Am I affected?** You are if you call `gateway.invoke` with a `task` object,
 or use a downstream server that supports MCP tasks.
 
-**What changed.** `task.ttl` must be an integer from 1 to 2^53−1, and
-`task.poll_interval` a finite number above 0 and at most 2^53−1. Zero,
+**What changed.** `task.ttl` must be an integer number of seconds from 1 to
+9,007,199,254,740, and `task.poll_interval` a finite number of seconds above 0
+and at most 9,007,199,254,740 (so the milliseconds pmcp sends stay within
+2^53−1; see the next section). Zero,
 negative values, `NaN` and `±Infinity` are refused at the gate:
 `Input validation error: 0 is less than the minimum of 1`, or
 `nan is not of type 'number', 'null'`. Both transports can deliver `NaN` and
@@ -737,17 +740,67 @@ task's new `unusable_fields` array. 2.7.3 coerced or stored such values.
 Finished tasks beyond the 100-record cap are evicted in the order pmcp
 recorded them, no longer by the downstream's own timestamps.
 
-**What to do.** Send positive values. pmcp forwards `ttl` and `poll_interval`
-unchanged, and MCP defines both in **milliseconds**, although pmcp's own
-descriptions say seconds. That mismatch is not fixed in 3.0
-([Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330)).
-Don't put `NaN` or `Infinity` in tool arguments. If you read task results,
+**What to do.** Send positive values, in seconds. Don't put `NaN` or `Infinity` in tool arguments. If you read task results,
 treat a `null` field listed in `unusable_fields` as "the server sent
 something unusable". A `null` `ttl` that is *not* listed there still means
 "unlimited".
 
-**How to verify.** A task call with `"ttl": 60000` is accepted, and one with
-`"ttl": 0` returns `isError` with `Input validation error`.
+**How to verify.** A task call with `"ttl": 300` is accepted, one with
+`"ttl": 0` returns `isError` with `Input validation error`, and one with
+`"ttl": 9007199254741` returns
+`Input validation error: 9007199254741 is greater than the maximum of 9007199254740`.
+
+<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": 9007199254741}}} => 9007199254741 is greater than the maximum of 9007199254740 -->
+
+### Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire
+
+**Am I affected?** You are if you call `gateway.invoke` with `task.ttl` or
+`task.poll_interval`, read `ttl`/`poll_interval` from the tasks pmcp returns,
+or run a downstream server that supports MCP tasks. Look for task values in
+your callers and in what your servers expect:
+
+```bash
+grep -rnE '"?(ttl|poll_interval)"?[:=] *[0-9]{4,}' /path/to/your/callers
+```
+
+A `ttl` of 1000 or more is often milliseconds sent to work around 2.7.3.
+
+**What changed.** pmcp's own interface stays in **seconds**, and pmcp now
+converts at the boundary, because MCP 2025-11-25 defines task `ttl` and
+`pollInterval` in **milliseconds**. 2.7.3 passed the number through, so
+`ttl: 300` (five minutes in pmcp's docs) gave a spec-conforming server 300 ms.
+Checked with a fake task-capable stdio server, calling `gateway.invoke` with
+`task: {"ttl": 300, "poll_interval": 2.5}`:
+
+| | 2.7.3 | 3.0 |
+|---|---|---|
+| sent downstream | `"task": {"ttl": 300, "pollInterval": 2.5}` | `"task": {"ttl": 300000, "pollInterval": 2500.0}` |
+| task pmcp returns, for a downstream that echoes `ttl` and sends `pollInterval: 2500` | `ttl: 300`, `poll_interval: 2500.0` | `ttl: 300.0`, `poll_interval: 2.5` |
+
+Every task pmcp returns (`gateway.invoke`'s `task`, `gateway.tasks_list`,
+`gateway.tasks_get`, `gateway.tasks_result`, `gateway.tasks_cancel`) reports
+`ttl` and `poll_interval` in seconds, read from the downstream's milliseconds
+(`pollInterval`, or the `poll_interval` alias). `ttl` may now be fractional:
+1500 ms is reported as `1.5`. A task's `raw` object and relayed results keep
+the downstream's own milliseconds. `gateway.invoke` also recognises a task
+the downstream returns at the top level of its reply (`{"taskId": …}`).
+
+**What to do.**
+- **If you sent milliseconds to work around 2.7.3, send seconds now.** A
+  `ttl: 300000` that meant five minutes now asks for 300,000 seconds, about
+  3.5 days. Divide by 1000: `ttl: 300`. The same applies to `poll_interval`.
+- **If you run a tenant server built to pmcp's earlier tenant contract**
+  (`ttl` in seconds), it now receives milliseconds: a caller's `ttl: 300`
+  arrives as `ttl: 300000`. Read `ttl` as milliseconds, and return `ttl` and
+  `pollInterval` (or `poll_interval`) in milliseconds, or pmcp reports them
+  1000× too small. See `specs/tenant-code-mode-host-contract.md`.
+- If you read task results, expect `ttl` as a number of seconds that may be
+  fractional, not an integer of milliseconds.
+
+**How to verify.** Point a task call at a server you control, or the fake
+server pattern above, and log what it receives: `task: {"ttl": 300}` arrives
+as `"ttl": 300000`. The task pmcp returns shows `ttl: 300.0`, and the task
+outlives 0.3 s.
 
 ### Redaction removes more
 
@@ -1031,9 +1084,6 @@ SIGTERM no longer outlives a cancelled disconnect or a timed-out shutdown
   in 2.7.3 or in 3.0. Every remote server's headers come from the gateway's
   own environment. If you need different credentials per tenant, run one
   gateway per tenant, each started with that tenant's variables exported.
-- **Task `ttl` and `poll_interval` units**, as noted under
-  [Task numbers are bounded](#task-numbers-are-bounded)
-  ([Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330)).
 
 ## Other things you may notice
 

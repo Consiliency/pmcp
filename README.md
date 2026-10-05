@@ -1558,7 +1558,13 @@ Tenant runs use the existing task broker. Submit long-running work with
 `gateway.invoke` and non-secret `task.metadata`, `task.ttl`,
 `task.poll_interval`, `task.requestor_context`, and trace keys such as
 `_meta.traceparent`; PMCP forwards those fields to the downstream server only
-when the server and tool advertise task support. The returned downstream MCP
+when the server and tool advertise task support. `task.ttl` and
+`task.poll_interval` are in seconds, at most 9,007,199,254,740. PMCP sends them
+downstream in milliseconds, which is the unit MCP 2025-11-25 uses (`ttl: 300`
+reaches the server as `ttl: 300000`). The `ttl` and `poll_interval` of every
+task PMCP returns are converted back from the server's milliseconds to seconds,
+and may be fractional (`1500` ms is reported as `1.5`). A task's `raw` object
+keeps the values exactly as the server sent them. The returned downstream MCP
 task ID is then used with `gateway.tasks_list`, `gateway.tasks_get`,
 `gateway.tasks_result`, and `gateway.tasks_cancel`. Do not use PMCP request IDs
 from `gateway.list_pending` or `gateway.cancel` for tenant task operations.
