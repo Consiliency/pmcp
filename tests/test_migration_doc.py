@@ -29,6 +29,10 @@ What a wrong guide fails on:
   template that reports something pmcp ignored, or a spawn, matches the grep.
 * **Snippets.** Every YAML/JSON block is tagged and parses through its real
   loader with the stated outcome.
+* **Rollback.** The rollback section's ``rollback-table`` has exactly one row per
+  breaking-change section, each starting "Safe on 2.7.3" or "Reverse:" (with a
+  concrete step), and the sections verified to read differently on 2.7.3 must
+  stay "Reverse:".
 * **Runs.** Tagged ``run:`` blocks are executed: the approval recipes against a
   scratch checkout with the real CLI, the backup recipe under bash and zsh.
 * **2.7.3 facts.** Behaviour of 2.7.3 cannot be re-derived from this tree, so the
@@ -38,7 +42,8 @@ What a wrong guide fails on:
 ``test_seeded_wrong_guides_fail`` feeds in the seven wrong guides that passed
 this test's first version in review of Consiliency/pmcp#364, plus three more
 (a log grep that misses ignored pins, an invented refusal message, a backup
-that copies symlinks as links); each must fail.
+that copies symlinks as links), plus two from the round-3 board (a rollback
+that drops or "safes" the task-unit reversal); each must fail.
 """
 
 from __future__ import annotations
@@ -505,7 +510,7 @@ def _is_message(quote: str) -> bool:
 
 
 def _table_cells_273(text: str) -> set[str]:
-    """Spans inside a table column headed 2.7.3 (quoted from the old release)."""
+    """Spans in a table column whose header names 2.7.3 (text quoted from 2.7.3)."""
     exempt: set[str] = set()
     header: list[str] | None = None
     for line in text.splitlines():
@@ -517,7 +522,7 @@ def _table_cells_273(text: str) -> set[str]:
             header = cells
             continue
         for name, cell in zip(header, cells):
-            if name.startswith("2.7.3"):
+            if "2.7.3" in name:
                 exempt.update(re.findall(r"`([^`]+)`", cell))
     return exempt
 
@@ -1032,6 +1037,86 @@ def _check_backup_run(text: str, tmp: Path) -> list[str]:
     return problems
 
 
+# -- rollback ------------------------------------------------------------------
+
+#: Sections whose migration step 2.7.3 reads differently, verified by running
+#: 2.7.3 against the migrated form (Consiliency/pmcp#364). Their rollback row
+#: must stay "Reverse:"; any other row may be either, but must be present.
+_REVERSE_ON_273: frozenset[str] = frozenset(
+    {
+        "Project files need approval",
+        "New `packages:` policy section",
+        "Auth responses changed",
+        "The `tools/call` gate enforces the schemas pmcp advertises",
+        "Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire",
+        "Manifest version pins",
+        "Agent-facing hints",
+        "Error text names the real failure",
+    }
+)
+
+
+def _breaking_sections(text: str) -> list[str]:
+    start = text.index("\n## Breaking changes\n")
+    end = re.search(r"^## ", text[start + 2 :], flags=re.MULTILINE)
+    body = text[start : start + 2 + end.start()] if end else text[start:]
+    return [t for t in _headings(body) if not t.startswith("Known issues in")]
+
+
+def _rollback_rows(text: str) -> list[tuple[str, str, str]]:
+    """(link text, anchor, status cell) for each row of the rollback table."""
+    start = text.find("<!-- rollback-table -->")
+    if start == -1:
+        return []
+    rows: list[tuple[str, str, str]] = []
+    for line in text[start:].splitlines()[1:]:
+        if not line.startswith("|"):
+            if rows:
+                break
+            continue
+        match = re.match(r"\| \[(.+?)\]\(#([^)]+)\) \| (.+) \|$", line)
+        if match:
+            rows.append((match.group(1), match.group(2), match.group(3)))
+    return rows
+
+
+def _anchor(title: str) -> str:
+    """GitHub's heading anchor."""
+    slug = re.sub(r"[^\w\- ]", "", title.lower()).replace(" ", "-")
+    return slug
+
+
+def _check_rollback(text: str) -> list[str]:
+    """Every breaking change says what rolling back to 2.7.3 does to the
+    migrated form: either it is safe there, or how to reverse it."""
+    problems = []
+    rows = _rollback_rows(text)
+    if not rows:
+        return ["no '<!-- rollback-table -->' table in the rollback section"]
+    titles = [title for title, _anchor_, _status in rows]
+    for title in _breaking_sections(text):
+        if titles.count(title) != 1:
+            problems.append(f"rollback table needs exactly one row for {title!r}")
+    for title, anchor, status in rows:
+        if title not in _breaking_sections(text):
+            problems.append(f"rollback row {title!r} names no breaking-change section")
+        if anchor != _anchor(title):
+            problems.append(
+                f"rollback row {title!r} links #{anchor}, not #{_anchor(title)}"
+            )
+        if not status.startswith(("Safe on 2.7.3", "Reverse:")):
+            problems.append(
+                f"rollback row {title!r} must start 'Safe on 2.7.3' or 'Reverse:'"
+            )
+        if status.startswith("Reverse:") and "`" not in status:
+            problems.append(f"rollback row {title!r} reverses with no concrete step")
+        if title in _REVERSE_ON_273 and not status.startswith("Reverse:"):
+            problems.append(
+                f"rollback row {title!r} must say how to reverse it on 2.7.3"
+            )
+    return problems
+
+
 # -- everything ----------------------------------------------------------------
 
 
@@ -1044,6 +1129,7 @@ def _all_problems(text: str, tmp: Path, *, runs: bool = True) -> list[str]:
         + _check_gate(text)
         + _check_versions(text)
         + _check_log_grep(text)
+        + _check_rollback(text)
         + _check_snippets(text, tmp / "snippets")
     )
     if runs:
@@ -1081,6 +1167,7 @@ def test_the_changelog_has_upgrade_notes_to_cover() -> None:
         _check_gate,
         _check_versions,
         _check_log_grep,
+        _check_rollback,
     ],
     ids=lambda f: f.__name__.removeprefix("_check_"),
 )
@@ -1135,7 +1222,7 @@ def _seeded_wrong_guides(text: str) -> dict[str, str]:
         )
 
     def rejected_for_another_reason(t: str) -> str:
-        old = '{"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": 1, "ttl": 60000}}}'
+        old = '{"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": 1, "ttl": 300}}}'
         new = '{"name": "gateway.invoke", "arguments": {"arguments": {}, "task": {"enabled": true, "ttl": 5}}}'
         assert old in t
         return t.replace(old, new)
@@ -1162,6 +1249,14 @@ def _seeded_wrong_guides(text: str) -> dict[str, str]:
             "2.7.3 ignores the key and starts normally",
         ),
         "g-env-what-to-do-is-nothing": env_nothing,
+        # Round 3 (Consiliency/pmcp#364): the rollback forgets the task units.
+        "k-rollback-keeps-migrated-task-units": lambda t: re.sub(
+            r"\n\| \[Task `ttl` and `poll_interval` are seconds[^\n]*", "", t
+        ),
+        "l-rollback-calls-task-units-safe": lambda t: t.replace(
+            "| Reverse: 2.7.3 sends `ttl` and `poll_interval`",
+            "| Safe on 2.7.3: it sends `ttl` and `poll_interval`",
+        ),
         # Beyond the seven: the review's F004 and F006 shapes, and an invented message.
         "h-log-grep-misses-ignored-pins": lambda t: t.replace(
             "\\[WARNING\\] (Ignoring |Spawning ",
@@ -1188,3 +1283,59 @@ def test_seeded_wrong_guides_fail(name: str, work: Path) -> None:
     wrong = _seeded_wrong_guides(_guide())[name]
     runs = name.startswith(("d-", "j-"))
     assert _all_problems(wrong, work, runs=runs), f"the wrong guide {name} passed"
+
+
+def _function(source: str, name: str, namespace: dict[str, Any]) -> Any:
+    node = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    node.decorator_list = []
+    exec("from __future__ import annotations\n" + ast.unparse(node), namespace)
+    return namespace[name]
+
+
+def test_rollback_restores_task_duration_contract() -> None:
+    """Codex's falsifier from the round-3 board on Consiliency/pmcp#364: run the
+    real seconds-to-wire boundary from HEAD and from v2.7.3, and require the
+    rollback section to tell a migrated caller to restore milliseconds."""
+    from types import SimpleNamespace
+
+    old = subprocess.run(
+        ["git", "show", "v2.7.3:src/pmcp/client/manager.py"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if old.returncode != 0:
+        pytest.skip("v2.7.3 is not in this checkout")
+    rollback = _guide().split("## Rolling back to 2.7.3\n", 1)[1]
+    current_source = (SRC / "client" / "manager.py").read_text(encoding="utf-8")
+    types_source = (SRC / "types.py").read_text(encoding="utf-8")
+    scale = next(
+        ast.literal_eval(node.value)
+        for node in ast.parse(types_source).body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "MS_PER_SECOND" for t in node.targets
+        )
+    )
+    namespace: dict[str, Any] = {
+        "TaskMetadataInput": SimpleNamespace,
+        "MS_PER_SECOND": scale,
+    }
+    _function(types_source, "task_seconds_to_wire", namespace)
+    current = _function(current_source, "_task_wire_metadata", namespace)
+    previous = _function(old.stdout, "_task_wire_metadata", namespace)
+    migrated = SimpleNamespace(
+        ttl=300, poll_interval=2.5, metadata=None, requestor_context=None
+    )
+    assert current(None, migrated) == {"ttl": 300000, "pollInterval": 2500.0}
+    assert previous(None, migrated) == {"ttl": 300, "pollInterval": 2.5}
+    assert re.search(r"\bttl\b|\bpoll_interval\b", rollback) and re.search(
+        r"1000|1,000|millisecond", rollback, re.IGNORECASE
+    ), (
+        "Rollback omits restoring task caller units after the prescribed "
+        "migration: five-minute retention becomes 300 milliseconds."
+    )

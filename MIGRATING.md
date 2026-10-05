@@ -110,7 +110,9 @@ log is `~/.pmcp/logs/gateway.log`.
    config) and every package-runner start, install and update probe. The
    "Ignoring PMCP_…" lines for `PMCP_*` variables set in a `.env` file go only
    to the gateway's stderr, not to `gateway.log`; the `journalctl` line catches
-   them for a service, or watch the terminal for a gateway you started by hand. It reads a service's log. For a gateway started from a
+   them for a service, or watch the terminal for a gateway you started by hand.
+
+   The first command reads a service's log. For a gateway started from a
    checkout, read `<checkout>/.pmcp/logs/gateway.log` instead. `pmcp logs`
    prints the same file, but its `--level` filter matches nothing at
    `warn` (log lines say `[WARNING]`), so use `grep`.
@@ -711,7 +713,7 @@ and the shape it now refuses:
 
 <!-- snippet: tools-call-rejected reason="1 is not of type 'boolean'" path="task.enabled" -->
 ```json
-{"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": 1, "ttl": 60000}}}
+{"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": 1, "ttl": 300}}}
 ```
 
 **How to verify.** Replay your client's calls. None should come back as
@@ -1146,5 +1148,39 @@ against a home directory 3.0 had written to:
 - Discovered packages provision without approval.
 - `gateway.submit_feedback` with `confirm_submission=true` can post again
   using an ambient `GITHUB_TOKEN`/`GH_TOKEN` or the `gh` CLI.
+
+### Undo what you changed for 3.0
+
+Downgrading the package does not undo the changes you made to your own code,
+config and servers while following this guide, and some of them mean
+something different to 2.7.3. Go through this table **before** you restart
+on 2.7.3. Each row is one section of this guide. "Safe on 2.7.3" means
+2.7.3 accepts the migrated form and behaves as you expect; "Reverse:" means
+you must undo that step. Rows marked † were checked by running 2.7.3.
+
+<!-- rollback-table -->
+| Section | On 2.7.3 |
+|---|---|
+| [Project files need approval](#project-files-need-approval) | Reverse: if you moved grants out of a project `.mcp-gateway-policy.yaml` into `~/.claude/gateway-policy.yaml`, 2.7.3 uses the project file *instead of* yours, so a deny-only project file allows everything else. Move the project file aside (`mv .mcp-gateway-policy.yaml .mcp-gateway-policy.yaml.3x`) and copy any of its denials you want into your own policy, or copy your full policy back into the project file.† Approvals in `trust.json` are ignored, and explicit `--config`/`--policy` paths work as before. |
+| [`PMCP_MANIFEST_PATH`, `PMCP_CONFIG` and `PMCP_POLICY` must be exported in your shell](#pmcp_manifest_path-pmcp_config-and-pmcp_policy-must-be-exported-in-your-shell) | Safe on 2.7.3: it honours an exported variable and the `--config`/`--policy` flags. |
+| [Spawned servers no longer inherit the keys pmcp loaded from `.env`](#spawned-servers-no-longer-inherit-the-keys-pmcp-loaded-from-env) | Safe on 2.7.3: shell exports are inherited, a server's `env` block in `~/.mcp.json` is passed as written,† and `pmcp secrets set` works the same. |
+| [Discovered servers are default-deny](#discovered-servers-are-default-deny) | Safe on 2.7.3: package approvals are ignored and discovered packages provision without one. A `packages.allowlist` must go, as for the next row. |
+| [New `packages:` policy section](#new-packages-policy-section) | Reverse: remove every `packages:` section (step 1 above), or 2.7.3 refuses to start.† |
+| [Feedback submission is off by default](#feedback-submission-is-off-by-default) | Safe on 2.7.3: the `enable_feedback_submission` key is ignored.† Note that 2.7.3 posts on `confirm_submission=true` without that switch, and also with an ambient `GITHUB_TOKEN`. Unset `GITHUB_TOKEN`/`GH_TOKEN` in the gateway's environment if you don't want that. |
+| [Auth URLs must be canonical](#auth-urls-must-be-canonical) | Safe on 2.7.3: it accepts every rewritten URL in the table.† |
+| [Auth responses changed](#auth-responses-changed) | Reverse: monitoring or tests that now match `Empty token.`, `The token's algorithm is not supported.` or a `503` must match the 2.7.3 texts and `500`s again (or both). `--oauth-audience` exists in 2.7.3. |
+| [The `tools/call` gate enforces the schemas pmcp advertises](#the-toolscall-gate-enforces-the-schemas-pmcp-advertises) | Reverse: don't send an explicit `null` for an optional argument; 2.7.3 rejects it (`Input validation error: None is not of type 'object'` for `"options": null`).† Correct JSON types are accepted by both. An audit reader that handles `audit.rejection` sees none. |
+| [Task numbers are bounded](#task-numbers-are-bounded) | Safe on 2.7.3 for the bounds; the units change is the next row. |
+| [Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire](#task-ttl-and-poll_interval-are-seconds-in-pmcp-and-milliseconds-on-the-wire) | Reverse: 2.7.3 sends `ttl` and `poll_interval` to the server unchanged, and MCP reads them as milliseconds, so a migrated `ttl: 300` keeps a task for 0.3 s, not five minutes.† Multiply by 1000 again (`ttl: 300000`, `poll_interval: 2500`). Switch a tenant server you changed back to reading and returning seconds. Code that reads `ttl`/`poll_interval` from tasks pmcp returns gets the downstream's milliseconds again. |
+| [Redaction removes more](#redaction-removes-more) | Safe on 2.7.3: it redacts less. |
+| [Manifest version pins](#manifest-version-pins) | Reverse: 2.7.3 ignores `version:` and `server_version:` silently,† so a pinned server runs whatever npm resolves. To keep a version, put it in that server's `args` in `~/.mcp.json` (for example `"args": ["-y", "firecrawl-mcp@3.25.5"]`). |
+| [Downstream servers see more from pmcp](#downstream-servers-see-more-from-pmcp) | Safe on 2.7.3: a server that handles `-32601` and `notifications/cancelled` simply doesn't receive them. |
+| [Logs](#logs) | Safe on 2.7.3: alert exclusions for the new WARNINGs match nothing. |
+| [Dependency floors](#dependency-floors) | Safe on 2.7.3: its floors are lower and it has no upper bounds.† |
+| [Agent-facing hints](#agent-facing-hints) | Reverse: matchers that now expect `try` or `playwright::browser_take_screenshot` see `try/catch` and `playwright::browser_screenshot` again.† Match both. |
+| [A symlinked `.mcp.json` is no longer edited](#a-symlinked-mcpjson-is-no-longer-edited) | Safe on 2.7.3: `--path` exists there.† Don't run `set-startup-policy` with `--source` against a symlink on 2.7.3: it replaces the link with a file.† |
+| [`NaN` from HTTP/SSE servers](#nan-from-httpsse-servers) | Safe on 2.7.3: a lenient parser also reads the `null` 2.7.3 sends. |
+| [Error text names the real failure](#error-text-names-the-real-failure) | Reverse: 2.7.3 logs only `unhandled errors in a TaskGroup (1 sub-exception)`, without the cause,† so a matcher on `ConnectError` finds nothing. Match both. |
+| [A cancelled teardown kills stdio servers at once](#a-cancelled-teardown-kills-stdio-servers-at-once) | Safe on 2.7.3: an uncancelled `gateway.disconnect_server` and a longer stop timeout work the same. |
 
 Prefer holding at `pmcp<3` for a short time over running 2.7.3 for long.
