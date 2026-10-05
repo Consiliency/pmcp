@@ -54,7 +54,9 @@ def read_env_file(path: Path) -> dict[str, str]:
     return _env_values(dotenv_values(path, interpolate=False))
 
 
-def read_store_for_update(scope: str, path: Path) -> dict[str, str]:
+def read_store_for_update(
+    scope: str, path: Path, verb: str = "write"
+) -> dict[str, str]:
     """Read a credential store that the caller is about to rewrite.
 
     The user store is the operator's and is read as :func:`read_env_file` reads
@@ -72,7 +74,7 @@ def read_store_for_update(scope: str, path: Path) -> dict[str, str]:
     confine_to = scope_confinement(scope, path)
     if confine_to is None:
         return read_env_file(path)
-    data = read_confined(path, confine_to)
+    data = read_confined(path, confine_to, verb=verb)
     if data is None:
         return {}
     return _env_values(
@@ -181,22 +183,36 @@ def scope_confinement(scope: str, store_path: Path) -> Path | None:
     raise ValueError(f"Unsupported secret scope: {scope}")
 
 
-def store_write_refusal(store_path: Path, exc: OSError) -> str:
-    """The operator-facing, value-free report of a failed credential-store write.
+def store_refusal(
+    store_path: Path, exc: OSError | ValueError, verb: str = "write"
+) -> str:
+    """The operator-facing, value-free report of a failed credential-store access.
 
     The one conversion the entry points (``pmcp secrets set``/``sync``,
-    ``gateway.auth_connect``) apply at their boundary, so every ``OSError`` from
-    the store -- a confinement refusal, ``EISDIR``, ``ENOTDIR``, ``ELOOP``,
-    ``EACCES``, ``ENOENT``, ``ENOSPC`` -- becomes an ``ok: false`` instead of an
-    uncaught traceback. It names only the store's file name: never a path or a
-    link target, which a repository may have chosen.
+    ``gateway.auth_connect``, the startup load) apply at their boundary, so a
+    store that cannot be read, parsed or written becomes an ``ok: false`` (or a
+    startup warning) instead of an uncaught traceback:
+
+    * an ``OSError`` -- a confinement refusal, ``EISDIR``, ``ENOTDIR``,
+      ``ELOOP``, ``EACCES``, ``ENOENT``, ``ENOSPC``;
+    * a ``UnicodeDecodeError`` -- a store that is not UTF-8 (reported without
+      the offending bytes);
+    * any other ``ValueError`` -- a value with a newline, an invalid key name.
+
+    It names only the store's file name: never a path or a link target, which
+    a repository may have chosen, and never a stored value. ``verb`` says what
+    was being done to THAT file ("write", "read" for a sync source, "load").
     """
-    from pmcp.atomic_write import ConfinedWriteError
+    from pmcp.atomic_write import ConfinedWriteError, refusing
 
     if isinstance(exc, ConfinedWriteError):
         return str(exc)
+    if isinstance(exc, UnicodeDecodeError):
+        return f"{refusing(verb)} {store_path.name}: it is not valid UTF-8"
+    if isinstance(exc, ValueError):
+        return f"{refusing(verb)} {store_path.name}: {exc}"
     reason = os.strerror(exc.errno) if exc.errno else "the write failed"
-    return f"refusing to write {store_path.name}: {reason}"
+    return f"{refusing(verb)} {store_path.name}: {reason}"
 
 
 def write_env_file(

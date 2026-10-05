@@ -32,7 +32,7 @@ from pmcp.env_store import (
     read_env_file,
     scope_confinement,
     set_env_value,
-    store_write_refusal,
+    store_refusal,
     write_env_file,
 )
 
@@ -146,7 +146,7 @@ async def _via_set_env_value(lay: dict[str, Path]) -> None:
     try:
         set_env_value("project", "K", "v", lay["project"])
     except OSError as exc:
-        raise Reported(store_write_refusal(lay["project"] / ".env.pmcp", exc)) from exc
+        raise Reported(store_refusal(lay["project"] / ".env.pmcp", exc)) from exc
 
 
 async def _via_secrets_set(lay: dict[str, Path]) -> None:
@@ -881,7 +881,10 @@ def test_a_sync_from_a_leaving_project_store_is_refused_before_reading_it(
             )
         )
     )
-    assert out["ok"] is False and out["error"] == REFUSAL
+    # N2 (round 4): the project store is only the SOURCE here -- "read".
+    assert out["ok"] is False and out["error"] == (
+        "refusing to read .env.pmcp: it is a symlink that leaves the project"
+    )
     assert not (Path.home() / ".config" / "pmcp" / "pmcp.env").exists()
 
 
@@ -939,3 +942,52 @@ def test_a_write_failure_after_a_clean_read_is_reported(
         f"refusing to write .env.pmcp: {os.strerror(errno.ENOSPC)}"
     )
     assert not (layout["project"] / ".env.pmcp").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Round 4 non-blocking findings.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("entry", _ALL_ENTRIES, ids=_ALL_ENTRIES)
+def test_a_project_directory_that_does_not_exist_yet_is_created_not_refused(
+    entry: str, tmp_path: Path
+) -> None:
+    """N1: a missing project directory is an EMPTY store, as on main and d50c4c2."""
+    project = tmp_path / "new" / "project"
+    lay = {"project": project, "outside": tmp_path, "base": tmp_path}
+    outcome = _guarded(entry, lay)
+    assert outcome is None, outcome
+    assert read_env_file(project / ".env.pmcp")
+    assert stat.S_IMODE((project / ".env.pmcp").stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("entry", list(_REPORTING), ids=list(_REPORTING))
+def test_a_store_that_is_not_utf8_is_a_reported_value_free_refusal(
+    entry: str, layout: dict[str, Path]
+) -> None:
+    """N3: a UnicodeDecodeError is reported, without the bytes, never raised."""
+    store = layout["project"] / ".env.pmcp"
+    store.write_bytes(b"K=\xff\xfe-not-utf8\n")
+    outcome = _guarded(entry, layout)
+    assert isinstance(outcome, Reported), outcome
+    assert outcome.message == "refusing to write .env.pmcp: it is not valid UTF-8"
+    assert store.read_bytes() == b"K=\xff\xfe-not-utf8\n"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["pmcp secrets set", "pmcp secrets sync --to-scope project"],
+)
+def test_a_store_holding_a_multiline_value_is_a_reported_refusal(
+    entry: str, layout: dict[str, Path]
+) -> None:
+    """N3: the rewrite's newline check is reported, not raised, and nothing is written."""
+    store = layout["project"] / ".env.pmcp"
+    store.write_text('A="l1\nl2"\n', encoding="utf-8")
+    outcome = _guarded(entry, layout)
+    assert isinstance(outcome, Reported), outcome
+    assert outcome.message == (
+        "refusing to write .env.pmcp: Credential values must not contain newlines"
+    )
+    assert store.read_text(encoding="utf-8") == 'A="l1\nl2"\n'

@@ -373,7 +373,8 @@ delete the `envcheck` entry and restart the gateway.
 ### A project `.env.pmcp` that is a symlink leaving the project is refused
 
 **Am I affected?** You are if a project's `.env.pmcp` is a symlink, a fifo or
-a socket, and you store project credentials with `pmcp secrets set`,
+a socket, and you either run `pmcp` (any command, the gateway included) from
+that project's directory or store project credentials with `pmcp secrets set`,
 `pmcp secrets sync --to-scope project` or `gateway.auth_connect` with
 `scope="project"`:
 
@@ -385,20 +386,26 @@ ls -l .env.pmcp
 symlink leaving the project, before reading or writing it, and report
 `refusing to write .env.pmcp: it is a symlink that leaves the project`. 2.7.3
 wrote your secrets wherever the link pointed, and in a cloned repository the
-repository chooses that target. A link that stays inside the project still
-works. An absolute link inside the project works only when it spells the
-project's real path; otherwise the refusal ends `so use a relative link
-instead`. A `.env.pmcp` that is not a regular file is refused with
-`refusing to write .env.pmcp: it is not a regular file`. Any other failure to
-read or write the store comes back as `"ok": false` instead of crashing the
-command. On Windows, any symlinked project `.env.pmcp` is refused. The user
-store `~/.config/pmcp/pmcp.env` still follows its link anywhere. Reading
-`.env.pmcp` at startup and `pmcp secrets check` still follow a project link
-(Consiliency/pmcp#367).
+repository chooses that target. Every `pmcp` command also loads
+`<cwd>/.env.pmcp` at startup; it now skips such a store, prints
+`pmcp: refusing to load .env.pmcp: it is a symlink that leaves the project` on
+stderr and carries on without those keys, where 2.7.3 loaded whatever the link
+pointed at. A link that stays inside the project still works. An absolute link
+inside the project works only when it spells the project's real path;
+otherwise the refusal ends `so use a relative link instead`. A `.env.pmcp`
+that is not a regular file is refused with `refusing to write .env.pmcp: it is
+not a regular file` (and skipped at startup) instead of hanging the command.
+Any other failure to read or write the store, including bytes that are not
+UTF-8, comes back as `"ok": false` instead of crashing the command; when
+`pmcp secrets sync` only reads the project store, the refusal says
+`refusing to read`. On Windows, any symlinked project `.env.pmcp` is refused.
+The user store `~/.config/pmcp/pmcp.env` still follows its link anywhere. A
+running gateway's spawn-time credential checks and `pmcp secrets check` still
+follow a project link when they read (Consiliency/pmcp#367).
 
 **What to do.** If the link pointed somewhere you meant, such as a shared
-secrets file, store those keys in your user store instead, then remove the
-project link:
+secrets file that the gateway used to load, store those keys in your user
+store instead, then remove the project link:
 
 ```bash
 pmcp secrets set FIRECRAWL_API_KEY --scope user
@@ -1209,7 +1216,7 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
 | [Project files need approval](#project-files-need-approval) | Reverse: if you moved grants out of a project `.mcp-gateway-policy.yaml` into `~/.claude/gateway-policy.yaml`, 2.7.3 uses the project file *instead of* yours, so a deny-only project file allows everything else. Move the project file aside (`mv .mcp-gateway-policy.yaml .mcp-gateway-policy.yaml.3x`) and copy any of its denials you want into your own policy, or copy your full policy back into the project file.† Approvals in `trust.json` are ignored, and explicit `--config`/`--policy` paths work as before. |
 | [`PMCP_MANIFEST_PATH`, `PMCP_CONFIG` and `PMCP_POLICY` must be exported in your shell](#pmcp_manifest_path-pmcp_config-and-pmcp_policy-must-be-exported-in-your-shell) | Safe on 2.7.3: it honours an exported variable and the `--config`/`--policy` flags. |
 | [Spawned servers no longer inherit the keys pmcp loaded from `.env`](#spawned-servers-no-longer-inherit-the-keys-pmcp-loaded-from-env) | Safe on 2.7.3: shell exports are inherited, a server's `env` block in `~/.mcp.json` is passed as written,† and `pmcp secrets set` works the same. |
-| [A project `.env.pmcp` that is a symlink leaving the project is refused](#a-project-envpmcp-that-is-a-symlink-leaving-the-project-is-refused) | Safe on 2.7.3: a regular `.env.pmcp`, a relative link inside the project and your user store work the same. 2.7.3 writes through a link that leaves the project again, so check `ls -l .env.pmcp` in repositories you clone. |
+| [A project `.env.pmcp` that is a symlink leaving the project is refused](#a-project-envpmcp-that-is-a-symlink-leaving-the-project-is-refused) | Safe on 2.7.3: a regular `.env.pmcp`, a relative link inside the project and your user store work the same. 2.7.3 writes through, and loads at startup, a link that leaves the project again, and hangs on a fifo `.env.pmcp`, so check `ls -l .env.pmcp` in repositories you clone. |
 | [Discovered servers are default-deny](#discovered-servers-are-default-deny) | Safe on 2.7.3: package approvals are ignored and discovered packages provision without one. A `packages.allowlist` must go, as for the next row. |
 | [New `packages:` policy section](#new-packages-policy-section) | Reverse: remove every `packages:` section (step 1 above), or 2.7.3 refuses to start.† |
 | [Feedback submission is off by default](#feedback-submission-is-off-by-default) | Reverse: 2.7.3 ignores `enable_feedback_submission`† and posts on `confirm_submission=true` through the first of these that works: `PMCP_FEEDBACK_TOKEN`, then `GITHUB_TOKEN` (each exported, or loaded from a `.env`, a checkout's `.env.pmcp` or `~/.config/pmcp/pmcp.env`), then a `gh` CLI on the gateway's `PATH` using its stored login.† It posts to `ViperJuice/pmcp`, the project's former name, which GitHub redirects to `Consiliency/pmcp`, unless `PMCP_FEEDBACK_REPO` names another.† To stop every channel, run `pmcp guidance --telemetry off` before you restart on 2.7.3; the call then refuses before it reads any token.† 3.0 honours the same setting. Otherwise unset `PMCP_FEEDBACK_TOKEN` and `GITHUB_TOKEN`, delete them from those files, and keep `gh` off the gateway's `PATH`.† `GH_TOKEN` alone posts nothing without `gh`.† |

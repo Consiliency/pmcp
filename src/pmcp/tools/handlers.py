@@ -61,7 +61,7 @@ from pmcp.env_store import (
     resolve_scope_path,
     sanitized_subprocess_env,
     set_env_value,
-    store_write_refusal,
+    store_refusal,
 )
 from pmcp.feedback_egress import (
     FeedbackProgress,
@@ -4634,11 +4634,12 @@ class GatewayTools:
             # `.env.pmcp` that is a symlink leaving the project (pmcp.atomic_write),
             # a directory at the path, a loop, no permission. Reported as a
             # value-free refusal naming only the store's file, never raised.
+            # A store that is not UTF-8 (a UnicodeDecodeError, a ValueError)
+            # is reported without its bytes; other ValueErrors are input
+            # validation messages and stay as they were.
             message = (
-                store_write_refusal(
-                    resolve_scope_path(parsed.scope, self._project_root), exc
-                )
-                if isinstance(exc, OSError)
+                store_refusal(resolve_scope_path(parsed.scope, self._project_root), exc)
+                if isinstance(exc, (OSError, UnicodeDecodeError))
                 else str(exc)
             )
             self._audit(

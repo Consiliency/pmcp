@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.metadata
+import io
 import json
 import logging
 import os
@@ -19,7 +20,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 from pmcp import package_approvals, trust_store
-from pmcp.atomic_write import atomic_write
+from pmcp.atomic_write import atomic_write, read_confined
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
 from pmcp.cli_commands.install import (
@@ -41,6 +42,7 @@ from pmcp.env_store import (
     env_key_is_operator_supplied,
     record_dotenv_keys,
     record_pmcp_introduced_keys,
+    store_refusal,
 )
 from pmcp.validation import is_valid_package_version, parse_package_spec
 from pmcp.manifest.loader import load_manifest
@@ -3110,8 +3112,38 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     # is never recorded and never refused.
     before = set(os.environ)
     load_dotenv(Path.home() / ".config" / "pmcp" / "pmcp.env", override=False)
-    load_dotenv(Path.cwd() / ".env.pmcp", override=False)
+    _load_project_store_at_startup(Path.cwd() / ".env.pmcp")
     record_pmcp_introduced_keys(set(os.environ) - before)
+
+
+def _load_project_store_at_startup(path: Path) -> None:
+    """Load ``<cwd>/.env.pmcp`` through the confined reader, or skip it with a warning.
+
+    The project store is repository-controlled: a clone can ship it as a symlink
+    out of the project, as a fifo, or as a socket. This load runs in ``main()``
+    BEFORE any subcommand -- including ``pmcp secrets set``/``sync`` and
+    ``pmcp auth connect``, which rewrite or report on that store -- so it must
+    not follow a link those commands would refuse, nor block on a fifo. It reads
+    through :func:`pmcp.atomic_write.read_confined` (the write's own walk,
+    confined to the store's directory): a link that leaves it, a non-regular
+    file, an unreadable or non-UTF-8 store are each skipped with one value-free
+    line on stderr, and the command goes on. A regular store, or a link that
+    stays inside, loads exactly as ``load_dotenv(path, override=False)`` did
+    (same parser, interpolation and precedence, from the same bytes).
+
+    Other readers of a project ``.env.pmcp`` -- spawn env loading and
+    ``pmcp secrets check`` -- are Consiliency/pmcp#367.
+    """
+    if not os.path.lexists(path):
+        return
+    try:
+        data = read_confined(path, path.parent, verb="load")
+        text = data.decode("utf-8") if data is not None else None
+    except (OSError, ValueError) as exc:
+        print(f"pmcp: {store_refusal(path, exc, verb='load')}", file=sys.stderr)
+        return
+    if text is not None:
+        load_dotenv(stream=io.StringIO(text), override=False)
 
 
 def main() -> None:

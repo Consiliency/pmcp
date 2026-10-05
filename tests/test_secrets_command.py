@@ -138,24 +138,31 @@ class TestSecretsHandlers:
         """set rejects invalid keys and multiline credentials before writes."""
         env_path = tmp_path / ".env.pmcp"
 
-        with pytest.raises(ValueError):
-            await run_secrets_set(
-                argparse.Namespace(
-                    scope="project",
-                    key="GOOD=bad",
-                    value="secret",
-                    project=tmp_path,
-                )
+        # Reported as `ok: false` (round-4 N3), never raised and never written.
+        bad_key = await run_secrets_set(
+            argparse.Namespace(
+                scope="project",
+                key="GOOD=bad",
+                value="secret",
+                project=tmp_path,
             )
-        with pytest.raises(ValueError):
-            await run_secrets_set(
-                argparse.Namespace(
-                    scope="project",
-                    key="OPENAI_API_KEY",
-                    value="first\nINJECTED=second",
-                    project=tmp_path,
-                )
+        )
+        assert bad_key["ok"] is False
+        assert str(bad_key["error"]).startswith("refusing to write .env.pmcp: ")
+        multiline = await run_secrets_set(
+            argparse.Namespace(
+                scope="project",
+                key="OPENAI_API_KEY",
+                value="first\nINJECTED=second",
+                project=tmp_path,
             )
+        )
+        assert multiline["ok"] is False
+        assert multiline["error"] == (
+            "refusing to write .env.pmcp: Credential values must not contain newlines"
+        )
+        assert "secret" not in str(bad_key["error"])
+        assert "INJECTED" not in str(multiline["error"])
 
         assert not env_path.exists()
 
@@ -214,9 +221,12 @@ class TestSecretsHandlers:
                 overwrite=True,
                 project=project,
             )
-            with pytest.raises(ValueError):
-                await run_secrets_sync(args)
+            output = await run_secrets_sync(args)
 
+        assert output["ok"] is False
+        assert output["error"] == (
+            "refusing to write .env.pmcp: Credential values must not contain newlines"
+        )
         assert project_env.read_text() == "LOCAL=ok\n"
 
     @pytest.mark.asyncio
@@ -241,9 +251,10 @@ class TestSecretsHandlers:
                 overwrite=True,
                 project=project,
             )
-            with pytest.raises(ValueError):
-                await run_secrets_sync(args)
+            output = await run_secrets_sync(args)
 
+        assert output["ok"] is False
+        assert str(output["error"]).startswith("refusing to write .env.pmcp: ")
         assert project_env.read_text() == "BAD-NAME=local\n"
 
     @pytest.mark.asyncio

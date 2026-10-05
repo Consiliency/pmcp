@@ -114,6 +114,22 @@ _MAX_LINK_HOPS = 40
 _REPARSE_POINT = 0x400
 
 
+#: The refusal's opening words, by what the caller was doing to the file. Spelled
+#: out as literals rather than interpolating the verb, so every message the
+#: code can emit stays a checkable literal (tests/test_migration_doc.py matches
+#: quoted messages against the source's templates).
+_REFUSING = {
+    "write": "refusing to write",
+    "read": "refusing to read",
+    "load": "refusing to load",
+}
+
+
+def refusing(verb: str) -> str:
+    """``"refusing to write"`` / ``"refusing to read"`` / ``"refusing to load"``."""
+    return _REFUSING[verb]
+
+
 class ConfinedWriteError(PermissionError):
     """A confined write whose path, or a step of its link chain, leaves the root.
 
@@ -195,7 +211,9 @@ class _Walk:
                 pass
 
 
-def _walk_confined(path: Path, confine_to: Path, label: str) -> _Walk:
+def _walk_confined(
+    path: Path, confine_to: Path, label: str, verb: str = "write"
+) -> _Walk:
     """Resolve ``path`` inside ``confine_to`` as the kernel would, holding descriptors.
 
     See the module docstring. The caller owns the returned descriptors and must
@@ -205,13 +223,13 @@ def _walk_confined(path: Path, confine_to: Path, label: str) -> _Walk:
     where a directory is needed, and ``FileNotFoundError`` for a missing one.
     """
     refusal = ConfinedWriteError(
-        f"refusing to write {path.name}: it is a symlink that leaves the {label}"
+        f"{refusing(verb)} {path.name}: it is a symlink that leaves the {label}"
     )
     try:
         rel = PurePath(path).relative_to(PurePath(confine_to))
     except ValueError:
         raise ConfinedWriteError(
-            f"refusing to write {path.name}: it is outside the {label}"
+            f"{refusing(verb)} {path.name}: it is outside the {label}"
         ) from None
 
     root_real = os.path.realpath(confine_to)
@@ -372,7 +390,9 @@ def atomic_write(
     return walk.target
 
 
-def read_confined(path: Path, confine_to: Path, label: str = "project") -> bytes | None:
+def read_confined(
+    path: Path, confine_to: Path, label: str = "project", verb: str = "write"
+) -> bytes | None:
     """Read ``path`` through the SAME confined walk a write would take, or refuse.
 
     A command that rewrites a repository-controlled store reads it first; that
@@ -381,16 +401,25 @@ def read_confined(path: Path, confine_to: Path, label: str = "project") -> bytes
     is opened -- and the final component is opened ``O_NOFOLLOW`` relative to
     the directory the walk ended on, non-blocking, and refused unless it is a
     REGULAR file (a fifo, ``/dev`` node or socket would hang or misbehave the
-    read). Returns ``None`` when the file does not exist yet (a fresh store, or
-    a dangling link that stays inside). Raises ``ConfinedWriteError`` /
-    ``OSError`` exactly as :func:`atomic_write` would.
+    read). Returns ``None`` when the file does not exist yet (a fresh store, a
+    dangling link that stays inside, or a root directory not created yet).
+    Raises ``ConfinedWriteError`` / ``OSError`` exactly as :func:`atomic_write`
+    would; ``verb`` ("write", "read", "load") names what the caller was doing
+    in the refusal, so a store read only as a SOURCE is not called a write.
     """
     not_regular = ConfinedWriteError(
-        f"refusing to write {path.name}: it is not a regular file"
+        f"{refusing(verb)} {path.name}: it is not a regular file"
     )
     if not _DIR_FD_SUPPORTED:
-        return _read_confined_without_dir_fd(path, confine_to, label, not_regular)
-    walk = _walk_confined(path, confine_to, label)
+        if not os.path.lexists(confine_to):
+            return None
+        return _read_confined_without_dir_fd(path, confine_to, label, not_regular, verb)
+    if not os.path.lexists(confine_to):
+        # Nothing to read under a root that does not exist yet: the write
+        # creates it (a fresh `--project` directory). An empty read, not a
+        # refusal.
+        return None
+    walk = _walk_confined(path, confine_to, label, verb)
     try:
         # Refuse a non-regular file from its directory entry BEFORE opening it:
         # opening a socket fails ENXIO and a device may have side effects. The
@@ -418,10 +447,14 @@ def read_confined(path: Path, confine_to: Path, label: str = "project") -> bytes
 
 
 def _read_confined_without_dir_fd(
-    path: Path, confine_to: Path, label: str, not_regular: ConfinedWriteError
+    path: Path,
+    confine_to: Path,
+    label: str,
+    not_regular: ConfinedWriteError,
+    verb: str,
 ) -> bytes | None:
     """The read half of :func:`_write_confined_without_dir_fd`: same refusals."""
-    text = _checked_direct_child(path, confine_to, label)
+    text = _checked_direct_child(path, confine_to, label, verb)
     try:
         entry = os.lstat(text)
     except FileNotFoundError:
@@ -486,18 +519,20 @@ def _write_confined_without_dir_fd(
     return Path(text)
 
 
-def _checked_direct_child(path: Path, confine_to: Path, label: str) -> str:
+def _checked_direct_child(
+    path: Path, confine_to: Path, label: str, verb: str = "write"
+) -> str:
     """Without dir_fd: only a direct, non-link, non-reparse-point child passes."""
     text = os.fspath(path)
     name = os.path.basename(text)
     root = os.fspath(confine_to).rstrip(_separators()) or os.fspath(confine_to)
     if os.path.dirname(text) != root:
         raise ConfinedWriteError(
-            f"refusing to write {name}: it is not directly inside the {label}"
+            f"{refusing(verb)} {name}: it is not directly inside the {label}"
         )
     if _is_link_or_reparse_point(text):
         raise ConfinedWriteError(
-            f"refusing to write {name}: it is a symlink in the {label}, which "
+            f"{refusing(verb)} {name}: it is a symlink in the {label}, which "
             "cannot be followed safely on this platform"
         )
     return text
