@@ -498,24 +498,54 @@ _PARSE_ERRORS: tuple[type[BaseException], ...] = ()
 
 
 def _is_parse_error(error: BaseException) -> bool:
-    """A parser's own error. Not :class:`pmcp.parsing.ParseError`, which
-    subclasses these types so callers' ``except`` clauses keep their meaning
-    but whose text is value-free by construction (rev 7): it is rendered as
-    ``str(error)``, source label included."""
-    from pmcp.parsing import ParseError
-
+    """Whether a value-bearing error is a parser's (and so is described by
+    :func:`_parse_text`). Which errors are value-bearing at all, and the
+    :class:`pmcp.parsing.ParseError` exemption, are the registry's decision
+    alone (:func:`_is_validation_error`, rev 18)."""
     global _PARSE_ERRORS
     if not _PARSE_ERRORS:
         _PARSE_ERRORS = _parse_error_types()
-    return isinstance(error, _PARSE_ERRORS) and not isinstance(error, ParseError)
+    return isinstance(error, _PARSE_ERRORS)
+
+
+def _value_bearing_types() -> tuple[type[BaseException], ...]:
+    """The registry of value-bearing exception types (rev 18): every type
+    whose own text, ``repr`` or attributes can carry the input it rejected.
+    It is the one place that decides which exceptions are described from
+    their structure, and which wrappers are never rendered from their own
+    message: pydantic's and jsonschema's validation errors (jsonschema's
+    ``SchemaError`` renders the schema it rejected), and every parser's
+    error (:func:`_parse_error_types`). :data:`_VALUE_FREE_TYPES` is the
+    registry's only exemption."""
+    return (
+        ValidationError,
+        jsonschema.ValidationError,
+        jsonschema.SchemaError,
+        *_parse_error_types(),
+    )
+
+
+_VALUE_BEARING: tuple[type[BaseException], ...] = ()
+
+
+def _value_free_types() -> tuple[type[BaseException], ...]:
+    """Subclasses of registered types whose text is value-free by
+    construction: :class:`pmcp.parsing.ParseError` (rev 7), raised outside
+    the parser's ``except`` so that it chains nothing."""
+    from pmcp.parsing import ParseError
+
+    return (ParseError,)
 
 
 def _is_validation_error(error: BaseException) -> bool:
-    """A validation *or parse* error: one whose own text can carry the input
-    it rejected (the parse half since rev 6)."""
-    return isinstance(
-        error, (ValidationError, jsonschema.ValidationError)
-    ) or _is_parse_error(error)
+    """A value-bearing error: an instance of a registered type
+    (:func:`_value_bearing_types`) that is not exempt."""
+    global _VALUE_BEARING
+    if not _VALUE_BEARING:
+        _VALUE_BEARING = _value_bearing_types()
+    return isinstance(error, _VALUE_BEARING) and not isinstance(
+        error, _value_free_types()
+    )
 
 
 def _parse_text(error: BaseException) -> str:
@@ -579,7 +609,7 @@ def _validation_text(error: BaseException) -> str:
             f"{count} validation error{plural} for {error.title}: "
             f"{describe_model_error(error, None, None)}"
         )
-    assert isinstance(error, jsonschema.ValidationError)
+    assert isinstance(error, (jsonschema.ValidationError, jsonschema.SchemaError))
     try:
         declared = _declared_names()
         path = [
@@ -600,33 +630,42 @@ def _validation_text(error: BaseException) -> str:
 
 
 def exception_text(error: BaseException) -> str:
-    """``str(error)``, except where that would carry a validation error's text.
+    """``str(error)``, unless ``error``'s chain holds a value-bearing error.
 
-    A pydantic or jsonschema ``ValidationError`` renders the rejected value;
-    so does any exception whose own text embeds one it chains
-    (``RuntimeError(f"... {e}") from e``). Either is described from its
-    structure instead. Every other exception is ``str(error)`` unchanged.
+    A value-bearing error (a registered type, :func:`_value_bearing_types`)
+    is described from its structure. An exception whose ``__cause__`` /
+    ``__context__`` chain (or exception group) holds one, at any depth and
+    whether or not the context is suppressed, is never rendered from its own
+    message: it reads ``<its class name>: <that error's description>``.
+    Whatever built the wrapper's message -- ``f"{e}"``, ``{e!r}``,
+    ``format()``, ``%r``, a slice, ``e.message`` or ``e.instance``, a nested
+    wrapper -- nothing of it is shown, so no form of it can carry the value
+    (rev 18; until rev 17 the message was kept unless it contained
+    ``str(e)``, which ``repr(e)`` evades). Every other exception is
+    ``str(error)`` unchanged.
 
-    The embedding check is an exact-substring backstop for wrappers built
-    with ``f"{e}"``/``f"{e!r}"``. It does not recognise a truncated or
-    reformatted copy (``str(e)[:200]``, ``e.errors()``), nor validation text
-    that arrives as a plain string -- which is why pmcp never builds such a
-    copy (``tests/test_exception_text_sinks.py`` flags the construction
-    site) and replaces the SDK's stringified parse errors where it receives
-    them (``pmcp.client.manager._downstream_error``).
+    Text that arrives as a plain string, with no exception chained, is not
+    recognised -- which is why pmcp never builds such a copy
+    (``tests/test_exception_text_sinks.py`` flags the construction site) and
+    replaces the SDK's stringified parse errors where it receives them
+    (``pmcp.client.manager._downstream_error``).
     """
     if _is_validation_error(error):
         return _validation_text(error)
-    text = str(error)
+    linked = _chained_value_bearing(error)
+    if linked is not None:
+        return f"{type(error).__name__}: {_validation_text(linked)}"
+    return str(error)
+
+
+def _chained_value_bearing(error: BaseException) -> BaseException | None:
+    """The first value-bearing error in ``error``'s chain other than
+    ``error`` itself: through ``__cause__`` and ``__context__`` (suppressed
+    or not) and exception-group members, at any depth."""
     for linked in _chain(error):
         if linked is not error and _is_validation_error(linked):
-            try:
-                embedded = str(linked)
-            except Exception:
-                embedded = ""
-            if embedded and embedded in text:
-                return f"{type(error).__name__}: {_validation_text(linked)}"
-    return text
+            return linked
+    return None
 
 
 def message_text(message: str, error: BaseException) -> str:
@@ -663,7 +702,7 @@ def _rejected_texts(error: BaseException) -> list[str]:
                 inputs = [item.get("input") for item in linked.errors()]
             except Exception:
                 inputs = []
-        elif isinstance(linked, jsonschema.ValidationError):
+        elif isinstance(linked, (jsonschema.ValidationError, jsonschema.SchemaError)):
             inputs = [linked.instance]
         for value in inputs:
             # The input whole (as itself, JSON and repr), and every string
@@ -741,7 +780,9 @@ def _qualified_name(kind: type[BaseException]) -> str:
 def safe_traceback_text(error: BaseException) -> str:
     """The formatted traceback. When the chain holds a validation or parse
     error, every exception in it is rendered as its frames (file, line,
-    source) and ``Type: exception_text(...)`` -- the frames never carry an
+    source) and ``Type: <text>``, where the text is a value-bearing error's
+    description, a wrapper's description of what it chains (never its own
+    message, rev 18) or else ``str()`` -- the frames never carry an
     exception's text -- so it stays a usable traceback (rev 6)."""
     if safe_exc_info(error) is not None:
         return "".join(
@@ -772,7 +813,13 @@ def safe_traceback_text(error: BaseException) -> str:
         if current.__traceback__ is not None:
             parts.append("Traceback (most recent call last):\n")
             parts.extend(traceback.format_tb(current.__traceback__))
-        parts.append(f"{_qualified_name(type(current))}: {exception_text(current)}\n")
+        # The class is printed once: a wrapper's line is its qualified name
+        # and the description of what it chains (rev 18).
+        linked = (
+            None if _is_validation_error(current) else _chained_value_bearing(current)
+        )
+        text = exception_text(current) if linked is None else _validation_text(linked)
+        parts.append(f"{_qualified_name(type(current))}: {text}\n")
 
     render(error)
     return "".join(parts)

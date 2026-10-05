@@ -1076,6 +1076,257 @@ def test_exception_text_describes_a_wrapper_that_embeds_a_validation_error() -> 
     assert safe_exc_info(plain) is plain
 
 
+# --- rev 18: a wrapper of a value-bearing error is never rendered from its
+# own message (round-16 codex F001: `f"{e!r}"` evaded the substring check).
+# The grid is every leaf type in the registry x every way a wrapper's text
+# can be built from it x `__cause__` / `__context__` / `from None` x chain
+# depth 1-3 x every rendering surface. Two sentinels: one long, and one
+# shorter than any value-matching floor, so the rule cannot be value matching.
+
+
+def _leaf_pydantic(s: str) -> BaseException:
+    try:
+        McpTaskInfo.model_validate({"task_id": {"v": s}})
+    except ValidationError as error:
+        return error
+    raise AssertionError("no error")
+
+
+def _leaf_jsonschema(s: str) -> BaseException:
+    try:
+        jsonschema.validate(s, {"type": "integer"})
+    except jsonschema.ValidationError as error:
+        return error
+    raise AssertionError("no error")
+
+
+def _leaf_schema(s: str) -> BaseException:
+    try:
+        jsonschema.Draft202012Validator.check_schema({"type": s})
+    except jsonschema.SchemaError as error:
+        return error
+    raise AssertionError("no error")
+
+
+def _leaf_yaml(s: str) -> BaseException:
+    import yaml
+
+    try:
+        yaml.safe_load(f"a: b: {s}\n")
+    except yaml.YAMLError as error:
+        return error
+    raise AssertionError("no error")
+
+
+def _leaf_json(s: str) -> BaseException:
+    try:
+        json.loads("{" + s)
+    except json.JSONDecodeError as error:
+        return error
+    raise AssertionError("no error")
+
+
+_GRID_LEAVES: dict[str, Any] = {
+    "pydantic": _leaf_pydantic,
+    "jsonschema": _leaf_jsonschema,
+    "schema_error": _leaf_schema,
+    "yaml": _leaf_yaml,
+    "json": _leaf_json,
+}
+
+
+def _value_attr(error: BaseException) -> Any:
+    """The attribute of `error` that holds what it rejected."""
+    for name in ("instance", "doc"):
+        if hasattr(error, name):
+            return getattr(error, name)
+    if isinstance(error, ValidationError):
+        return error.errors()[0]["input"]
+    mark = getattr(error, "problem_mark", None)
+    return getattr(mark, "buffer", None)
+
+
+def _message_attr(error: BaseException) -> str:
+    """The error's own message field, as a wrapper would read it."""
+    if isinstance(error, ValidationError):
+        return str(error.errors())
+    for name in ("message", "msg"):
+        if isinstance(getattr(error, name, None), str):
+            return str(getattr(error, name))
+    return f"{getattr(error, 'problem', '')} {getattr(error, 'problem_mark', '')}"
+
+
+class _LateStr(Exception):
+    """A wrapper whose text is computed when rendered, from its cause."""
+
+    def __str__(self) -> str:
+        return f"late: {self.__cause__ or self.__context__!r}"
+
+
+_GRID_FORMS: dict[str, Any] = {
+    "fstring": lambda e: f"failed: {e}",
+    "fstring_r": lambda e: f"failed: {e!r}",
+    "fstring_s": lambda e: f"failed: {e!s}",
+    "fstring_a": lambda e: f"failed: {e!a}",
+    "percent_s": lambda e: "failed: %s" % (e,),
+    "percent_r": lambda e: "failed: %r" % (e,),
+    "format": lambda e: "failed: {}".format(e),
+    "format_r": lambda e: "failed: {!r}".format(e),
+    "builtin_format": lambda e: format(e),
+    "ascii": lambda e: ascii(e),
+    "slice": lambda e: str(e)[:60],
+    "repr_slice": lambda e: repr(e)[1:80],
+    "value_attr": lambda e: f"bad value {_value_attr(e)!r}",
+    "value_attr_s": lambda e: f"bad value {_value_attr(e)}",
+    "message_attr": lambda e: f"invalid: {_message_attr(e)}",
+    "args": lambda e: ("failed", e),
+    "late_str": None,
+    "empty": lambda e: "",
+    "unrelated": lambda e: "the request failed",
+}
+
+
+def _wrap(form: str, inner: BaseException, link: str) -> BaseException:
+    """`inner` wrapped once: raised from it, inside its handler, or from None."""
+    kind: type[BaseException] = _LateStr if form == "late_str" else RuntimeError
+    message = None if form == "late_str" else _GRID_FORMS[form](inner)
+    args = (
+        message
+        if isinstance(message, tuple)
+        else (() if message is None else (message,))
+    )
+    try:
+        try:
+            raise inner
+        except BaseException as caught:
+            if link == "cause":
+                raise kind(*args) from caught
+            if link == "suppressed":
+                raise kind(*args) from None
+            raise kind(*args)
+    except BaseException as wrapped:
+        return wrapped
+    raise AssertionError("not raised")
+
+
+def _grid_surfaces(outer: BaseException) -> dict[str, str]:
+    """Every surface that renders `outer`, rendered."""
+    import asyncio
+
+    from pmcp.argument_errors import exception_text, safe_traceback_text
+    from pmcp.server import _described_errors
+
+    factory = logging.getLogRecordFactory()
+    exc_info = (type(outer), outer, outer.__traceback__)
+    records = {
+        "log_msg": factory("pmcp.grid", logging.ERROR, __file__, 1, outer, (), None),
+        "log_args": factory(
+            "pmcp.grid", logging.ERROR, __file__, 1, "failed: %r", (outer,), None
+        ),
+        "log_mapping": factory(
+            "pmcp.grid",
+            logging.ERROR,
+            __file__,
+            1,
+            "failed: %(e)s",
+            ({"e": [outer]},),
+            None,
+        ),
+        "log_exc_info": factory(
+            "pmcp.grid", logging.ERROR, __file__, 1, "failed", (), exc_info
+        ),
+    }
+    out = {name: _record_text(record) for name, record in records.items()}
+    out["exception_text"] = exception_text(outer)
+    out["safe_traceback_text"] = safe_traceback_text(outer)
+
+    async def reject() -> None:
+        raise outer
+
+    try:
+        asyncio.run(_described_errors(reject)())
+    except Exception as raised:
+        out["described_errors"] = f"{type(raised).__name__}: {raised}"
+    return out
+
+
+@pytest.mark.parametrize("sentinel", ["long", "short"])
+@pytest.mark.parametrize("depth", [1, 2, 3])
+@pytest.mark.parametrize("link", ["cause", "context", "suppressed"])
+@pytest.mark.parametrize("leaf", sorted(_GRID_LEAVES))
+def test_a_wrapper_of_a_value_bearing_error_is_never_rendered_from_its_message(
+    leaf: str, link: str, depth: int, sentinel: str
+) -> None:
+    """Whatever form built the wrapper's text, however deep the chain and
+    whichever link holds the error, every surface renders the outermost
+    exception as `<class>: <the leaf's structural description>` and nothing
+    of the value."""
+    from pmcp.argument_errors import (
+        _qualified_name,
+        _validation_text,
+        exception_text,
+    )
+
+    s = _SENTINELS[1] if sentinel == "long" else "Qx7"
+    failures = []
+    for form in _GRID_FORMS:
+        inner = _GRID_LEAVES[leaf](s)
+        description = _validation_text(inner)
+        for _ in range(depth):
+            inner = _wrap(form, inner, link)
+        outer = inner
+        expected = f"{type(outer).__name__}: {description}"
+        surfaces = _grid_surfaces(outer)
+        if exception_text(outer) != expected:
+            failures.append((form, "exception_text", exception_text(outer)))
+        if surfaces.get("described_errors") != f"ValueError: {expected}":
+            failures.append(
+                (form, "described_errors", surfaces.get("described_errors"))
+            )
+        for surface, text in surfaces.items():
+            leaked = (
+                s in text
+                if sentinel == "short"
+                else any(piece in text for piece in _forbidden(s))
+            )
+            if leaked:
+                failures.append((form, surface, text[:200]))
+        last = surfaces["safe_traceback_text"].rstrip("\n").rsplit("\n", 1)[-1]
+        if last != f"{_qualified_name(type(outer))}: {description}":
+            failures.append((form, "traceback last line", last))
+    assert not failures, failures
+
+
+def test_the_value_bearing_registry_is_the_one_decision() -> None:
+    """Every leaf the grid raises is registered; pmcp's own `ParseError` is
+    the exemption, and a wrapper of it -- or of nothing registered -- keeps
+    its own message."""
+    import yaml
+
+    from pmcp.argument_errors import (
+        _is_validation_error,
+        _value_bearing_types,
+        _value_free_types,
+        exception_text,
+    )
+    from pmcp.parsing import ParseError, load_yaml
+
+    registered = _value_bearing_types()
+    for make in _GRID_LEAVES.values():
+        leaf = make("Qx7")
+        assert isinstance(leaf, registered) and _is_validation_error(leaf), leaf
+    assert _value_free_types() == (ParseError,)
+    with pytest.raises(ParseError) as raised:
+        load_yaml("a: b: Qx7\n", source="grid file")
+    assert isinstance(raised.value, yaml.YAMLError)
+    assert not _is_validation_error(raised.value)
+    for link in ("cause", "context", "suppressed"):
+        wrapped = _wrap("fstring", raised.value, link)
+        assert exception_text(wrapped) == f"failed: {raised.value}", link
+        plain = _wrap("fstring", KeyError("missing"), link)
+        assert exception_text(plain) == "failed: 'missing'", link
+
+
 @pytest.mark.parametrize("family", sorted(_FAMILIES))
 def test_describe_exception_renders_a_grouped_validation_error_structurally(
     family: str,

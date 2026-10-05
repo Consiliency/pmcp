@@ -622,7 +622,10 @@ def test_a_failing_log_handler_prints_no_input(
         logger.removeHandler(handler)
     assert "--- Logging error ---" in err
     assert "could not parse YAML (ParserError)" in err, err
-    assert "OSError: disk gone" in err, err
+    # The handler's own error was raised while the parse error was handled:
+    # its message is withheld, its class kept (rev 18).
+    assert "\nOSError: could not parse YAML (ParserError)" in err, err
+    assert "OSError: disk gone" not in err, err  # the frame's source line is code
     assert not any(form in err for form in _forbidden(s)), err
 
 
@@ -801,7 +804,13 @@ def test_a_thread_prints_no_input(tmp_path: Path) -> None:
     assert "yaml.parser.ParserError: could not parse YAML (ParserError)" in (
         result.stderr
     ), result.stderr
-    assert "RuntimeError: boom" in result.stderr
+    # A wrapper of a parse error prints what it chains, never its own
+    # message (rev 18).
+    assert (
+        "RuntimeError: could not parse YAML (ParserError) at line 1, column"
+        in result.stderr
+    ), result.stderr
+    assert "boom" not in result.stderr, result.stderr
     assert not any(form in result.stderr for form in _forbidden(s)), result.stderr
     silent = subprocess.run(
         [sys.executable, "-c", script, f"servers: [{s}}}", "no-stderr"],
@@ -844,12 +853,19 @@ def test_an_uncaught_chain_prints_no_input(tmp_path: Path, origin: str) -> None:
     )
     assert result.returncode == 1, result.stderr
     assert "Traceback (most recent call last)" in result.stderr, result.stderr
-    assert "RuntimeError: boom" in result.stderr, result.stderr
     expected = {
         "yaml": "yaml.parser.ParserError: could not parse YAML (ParserError)",
         "pydantic": "pydantic_core._pydantic_core.ValidationError: 1 validation error",
     }[origin]
     assert expected in result.stderr, result.stderr
+    # The wrapper's line is its class and what it chains, once (rev 18).
+    wrapper = {
+        "yaml": "\nRuntimeError: could not parse YAML (ParserError) at line 1, column",
+        "pydantic": "\nRuntimeError: 1 validation error for int: $: must be an integer\n",
+    }[origin]
+    assert wrapper in result.stderr, result.stderr
+    assert "boom" not in result.stderr, result.stderr
+    assert "RuntimeError: RuntimeError" not in result.stderr, result.stderr
     assert not any(form in result.stderr for form in _forbidden(s)), result.stderr
 
 
