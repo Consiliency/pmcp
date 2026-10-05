@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import io
 import os
 import re
 import stat
@@ -11,7 +12,7 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-from pmcp.atomic_write import atomic_write
+from pmcp.atomic_write import atomic_write, read_confined
 from pmcp.config.loader import find_project_root
 
 ENV_VAR_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -50,7 +51,36 @@ def read_env_file(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
 
-    parsed = dotenv_values(path, interpolate=False)
+    return _env_values(dotenv_values(path, interpolate=False))
+
+
+def read_store_for_update(scope: str, path: Path) -> dict[str, str]:
+    """Read a credential store that the caller is about to rewrite.
+
+    The user store is the operator's and is read as :func:`read_env_file` reads
+    it. The project store is repository-controlled, so it is read through the
+    same confined walk its write takes (:func:`pmcp.atomic_write.read_confined`):
+    a link that leaves the project is refused BEFORE anything is opened, with
+    the write's value-free refusal, and a target that is not a regular file (a
+    fifo, a device, ``/proc/self/fd/0``) is refused instead of hanging the read.
+
+    This covers the commands that rewrite the store -- ``pmcp secrets set``,
+    ``pmcp secrets sync`` and ``gateway.auth_connect`` -- so they never read
+    through a link they would refuse to write. Other readers (startup and spawn
+    env loading, ``pmcp secrets check``) still follow on read: Consiliency/pmcp#367.
+    """
+    confine_to = scope_confinement(scope, path)
+    if confine_to is None:
+        return read_env_file(path)
+    data = read_confined(path, confine_to)
+    if data is None:
+        return {}
+    return _env_values(
+        dotenv_values(stream=io.StringIO(data.decode("utf-8")), interpolate=False)
+    )
+
+
+def _env_values(parsed: Mapping[str, str | None]) -> dict[str, str]:
     values: dict[str, str] = {}
     for key, value in parsed.items():
         if value is None:
@@ -489,7 +519,7 @@ def set_env_value(
         raise ValueError("Credential values must not contain newlines")
 
     path = resolve_scope_path(scope, project)
-    values = read_env_file(path)
+    values = read_store_for_update(scope, path)
     values[key] = value
     write_env_file(path, values, confine_to=scope_confinement(scope, path))
     return path

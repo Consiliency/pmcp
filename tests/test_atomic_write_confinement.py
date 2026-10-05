@@ -386,15 +386,19 @@ def test_confined_writes_use_the_dir_fd_walk_on_posix() -> None:
 def _swap_after_check(
     monkeypatch: pytest.MonkeyPatch, swap: Callable[[], None]
 ) -> None:
-    """Run ``swap`` after the confined walk resolved the path, before the write."""
-    real = atomic_write_module._walk_confined
+    """Run ``swap`` after the WRITE's walk resolved the path, before it writes.
 
-    def walked_then_swapped(path: Path, confine_to: Path, label: str) -> Any:
-        walk = real(path, confine_to, label)
+    Hooked at ``_write_in_dir`` -- the step that consumes the walk's directory
+    descriptor -- so the swap lands between the write's own check and use, not
+    during the read that precedes it.
+    """
+    real = atomic_write_module._write_in_dir
+
+    def swapped_then_written(*args: Any, **kwargs: Any) -> None:
         swap()
-        return walk
+        real(*args, **kwargs)
 
-    monkeypatch.setattr(atomic_write_module, "_walk_confined", walked_then_swapped)
+    monkeypatch.setattr(atomic_write_module, "_write_in_dir", swapped_then_written)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="dir_fd walk is POSIX-only")
@@ -754,3 +758,156 @@ def test_an_absolute_link_through_a_symlinked_parent_is_refused_with_a_hint(
     os.symlink("conf/b.env", project_real / ".env.pmcp")
     set_env_value("project", "K", "v", project_alias)
     assert read_env_file(project_real / "conf" / "b.env") == {"K": "v"}
+
+
+# --------------------------------------------------------------------------- #
+# Round 3: the entry points read a project store only through the write's walk.
+# A link the write would refuse is refused BEFORE it is read, and a store that
+# is not a regular file is refused instead of read (a fifo would hang).
+# --------------------------------------------------------------------------- #
+
+NOT_REGULAR = "refusing to write .env.pmcp: it is not a regular file"
+_ALL_ENTRIES = list(ENTRY_POINTS)
+
+
+def _guarded(entry: str, lay: dict[str, Path]) -> BaseException | None:
+    """Run an entry point in a daemon thread; fail if it does not finish in 10s."""
+    import asyncio
+    import threading
+
+    outcome: list[BaseException | None] = []
+
+    def run() -> None:
+        try:
+            asyncio.run(ENTRY_POINTS[entry](lay))
+            outcome.append(None)
+        except BaseException as exc:  # noqa: BLE001 - handed to the test
+            outcome.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(10)
+    assert not worker.is_alive(), f"{entry} hung reading the store"
+    return outcome[0]
+
+
+@pytest.mark.parametrize("entry", _ALL_ENTRIES, ids=_ALL_ENTRIES)
+def test_an_unreadable_target_outside_is_refused_before_it_is_read(
+    entry: str, layout: dict[str, Path]
+) -> None:
+    """grok F001 (round 3): the leaving link is refused, not read and crashed on."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores mode 000")
+    victim = layout["victim"]
+    os.chmod(victim, 0)
+    os.symlink(victim, layout["project"] / ".env.pmcp")
+    try:
+        outcome = _guarded(entry, layout)
+    finally:
+        os.chmod(victim, 0o644)
+    assert isinstance(outcome, Reported), outcome
+    assert outcome.message == REFUSAL
+    assert victim.read_text(encoding="utf-8") == VICTIM
+    assert os.path.islink(layout["project"] / ".env.pmcp")
+
+
+def _fifo_store(lay: dict[str, Path]) -> None:
+    os.mkfifo(lay["project"] / ".env.pmcp")
+
+
+def _link_to_fifo(lay: dict[str, Path]) -> None:
+    os.mkfifo(lay["project"] / "pipe")
+    os.symlink("pipe", lay["project"] / ".env.pmcp")
+
+
+def _link_to_socket(lay: dict[str, Path]) -> None:
+    import socket
+
+    # AF_UNIX paths are short; bind from inside the project by relative name.
+    here = os.getcwd()
+    os.chdir(lay["project"])
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind("sock")
+        sock.close()
+    finally:
+        os.chdir(here)
+    os.symlink("sock", lay["project"] / ".env.pmcp")
+
+
+NON_REGULAR = {
+    "a fifo at the store path": _fifo_store,
+    "a link to a fifo inside": _link_to_fifo,
+    "a link to a socket inside": _link_to_socket,
+}
+
+
+@pytest.mark.parametrize("entry", _ALL_ENTRIES, ids=_ALL_ENTRIES)
+@pytest.mark.parametrize("shape", list(NON_REGULAR), ids=list(NON_REGULAR))
+def test_a_non_regular_store_is_refused_without_hanging(
+    shape: str, entry: str, layout: dict[str, Path]
+) -> None:
+    NON_REGULAR[shape](layout)
+    outcome = _guarded(entry, layout)
+    assert isinstance(outcome, Reported), outcome
+    assert outcome.message == NOT_REGULAR
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd/0").exists(), reason="needs /proc")
+@pytest.mark.parametrize("entry", _ALL_ENTRIES, ids=_ALL_ENTRIES)
+def test_a_link_to_proc_self_fd_0_is_refused_without_hanging(
+    entry: str, layout: dict[str, Path]
+) -> None:
+    os.symlink("/proc/self/fd/0", layout["project"] / ".env.pmcp")
+    outcome = _guarded(entry, layout)
+    assert isinstance(outcome, Reported), outcome
+    assert outcome.message == REFUSAL
+
+
+def test_a_sync_from_a_leaving_project_store_is_refused_before_reading_it(
+    layout: dict[str, Path],
+) -> None:
+    """The SOURCE of a sync is read through the walk too."""
+    import asyncio
+
+    os.symlink("../outside/victim", layout["project"] / ".env.pmcp")
+    out = asyncio.run(
+        run_secrets_sync(
+            argparse.Namespace(
+                from_scope="project",
+                to_scope="user",
+                project=layout["project"],
+                overwrite=False,
+            )
+        )
+    )
+    assert out["ok"] is False and out["error"] == REFUSAL
+    assert not (Path.home() / ".config" / "pmcp" / "pmcp.env").exists()
+
+
+def test_the_store_is_not_opened_before_the_walk_decides(
+    layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Order, observed: no open/stat of the outside target precedes the refusal."""
+    import builtins
+
+    os.symlink(layout["victim"], layout["project"] / ".env.pmcp")
+    touched: list[str] = []
+    real_open = builtins.open
+    real_os_open = os.open
+
+    def spy_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        touched.append(os.fspath(file) if not isinstance(file, int) else "<fd>")
+        return real_open(file, *args, **kwargs)
+
+    def spy_os_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        touched.append(os.fspath(file))
+        return real_os_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", spy_open)
+    monkeypatch.setattr(os, "open", spy_os_open)
+    with pytest.raises(ConfinedWriteError):
+        set_env_value("project", "K", "v", layout["project"])
+    monkeypatch.undo()
+
+    assert not any(".env.pmcp" in t or "victim" in t for t in touched), touched

@@ -372,6 +372,72 @@ def atomic_write(
     return walk.target
 
 
+def read_confined(path: Path, confine_to: Path, label: str = "project") -> bytes | None:
+    """Read ``path`` through the SAME confined walk a write would take, or refuse.
+
+    A command that rewrites a repository-controlled store reads it first; that
+    read must not follow a link the write would refuse. So the walk decides
+    first -- a link that leaves ``confine_to`` is refused here, before anything
+    is opened -- and the final component is opened ``O_NOFOLLOW`` relative to
+    the directory the walk ended on, non-blocking, and refused unless it is a
+    REGULAR file (a fifo, ``/dev`` node or socket would hang or misbehave the
+    read). Returns ``None`` when the file does not exist yet (a fresh store, or
+    a dangling link that stays inside). Raises ``ConfinedWriteError`` /
+    ``OSError`` exactly as :func:`atomic_write` would.
+    """
+    not_regular = ConfinedWriteError(
+        f"refusing to write {path.name}: it is not a regular file"
+    )
+    if not _DIR_FD_SUPPORTED:
+        return _read_confined_without_dir_fd(path, confine_to, label, not_regular)
+    walk = _walk_confined(path, confine_to, label)
+    try:
+        # Refuse a non-regular file from its directory entry BEFORE opening it:
+        # opening a socket fails ENXIO and a device may have side effects. The
+        # fstat after the O_NOFOLLOW open re-checks against a swap in between.
+        try:
+            entry = os.stat(walk.name, dir_fd=walk.dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(entry.st_mode):
+            raise not_regular
+        try:
+            fd = os.open(
+                walk.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=walk.dir_fd,
+            )
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise not_regular
+            return handle.read()
+    finally:
+        walk.close()
+
+
+def _read_confined_without_dir_fd(
+    path: Path, confine_to: Path, label: str, not_regular: ConfinedWriteError
+) -> bytes | None:
+    """The read half of :func:`_write_confined_without_dir_fd`: same refusals."""
+    text = _checked_direct_child(path, confine_to, label)
+    try:
+        entry = os.lstat(text)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(entry.st_mode):
+        raise not_regular
+    try:
+        fd = os.open(text, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise not_regular
+        return handle.read()
+
+
 # `os.replace` is not listed in `os.supports_dir_fd` even where its dir_fd
 # arguments work: it shares rename(2)/renameat(2) with `os.rename`, which is.
 _DIR_FD_SUPPORTED = (
@@ -415,6 +481,13 @@ def _write_confined_without_dir_fd(
     would be resolved by pathname and written by pathname, and a directory or
     link swapped in between would redirect the write outside the root.
     """
+    text = _checked_direct_child(path, confine_to, label)
+    _write_by_path(Path(text), data, mode=mode, prefix=prefix, suffix=suffix)
+    return Path(text)
+
+
+def _checked_direct_child(path: Path, confine_to: Path, label: str) -> str:
+    """Without dir_fd: only a direct, non-link, non-reparse-point child passes."""
     text = os.fspath(path)
     name = os.path.basename(text)
     root = os.fspath(confine_to).rstrip(_separators()) or os.fspath(confine_to)
@@ -427,8 +500,7 @@ def _write_confined_without_dir_fd(
             f"refusing to write {name}: it is a symlink in the {label}, which "
             "cannot be followed safely on this platform"
         )
-    _write_by_path(Path(text), data, mode=mode, prefix=prefix, suffix=suffix)
-    return Path(text)
+    return text
 
 
 def _write_by_path(

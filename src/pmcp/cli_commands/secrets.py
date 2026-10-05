@@ -10,6 +10,7 @@ from pmcp.config.loader import load_configs
 from pmcp.env_store import (
     read_env_file,
     resolve_project_root,
+    read_store_for_update,
     resolve_scope_path,
     scope_confinement,
     store_write_refusal,
@@ -180,12 +181,13 @@ async def run_secrets_set(args: argparse.Namespace) -> dict[str, object]:
     """Set one secret in user or project PMCP env file."""
     project = getattr(args, "project", None)
     path = resolve_scope_path(args.scope, project)
-    values = read_env_file(path)
-
-    existing_value = values.get(args.key)
-    changed = existing_value != args.value
-
+    # The read sits inside the same boundary as the write, and for the project
+    # store it goes through the write's confined walk: a link the write would
+    # refuse is refused before anything is read (read_store_for_update).
     try:
+        values = read_store_for_update(args.scope, path)
+        existing_value = values.get(args.key)
+        changed = existing_value != args.value
         path = set_env_value(args.scope, args.key, args.value, project)
     except OSError as exc:
         return {
@@ -224,8 +226,29 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
     source_path = resolve_scope_path(from_scope, project)
     target_path = resolve_scope_path(to_scope, project)
 
-    source_values = read_env_file(source_path)
-    target_values = read_env_file(target_path)
+    # Both reads go through the confined walk for a project store and sit
+    # inside the reported-refusal boundary, so a leaving or non-regular store is
+    # refused before it is read, never raised.
+    try:
+        source_values = read_store_for_update(from_scope, source_path)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "command": "secrets.sync",
+            "from_scope": from_scope,
+            "to_scope": to_scope,
+            "error": store_write_refusal(source_path, exc),
+        }
+    try:
+        target_values = read_store_for_update(to_scope, target_path)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "command": "secrets.sync",
+            "from_scope": from_scope,
+            "to_scope": to_scope,
+            "error": store_write_refusal(target_path, exc),
+        }
     for key in source_values:
         validate_env_var_name(key)
     for key in target_values:

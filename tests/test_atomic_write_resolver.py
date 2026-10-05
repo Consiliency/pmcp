@@ -332,3 +332,56 @@ def test_a_directory_swapped_between_lstat_and_open_is_not_followed(
 
     assert swapped, "the seam never fired"
     assert list(outside.iterdir()) == []
+
+
+def test_grok_round3_f001_unreadable_project_store_is_reported_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 board falsifier (grok F001), as written."""
+    import argparse
+    import asyncio
+
+    from pmcp.cli_commands.secrets import run_secrets_set, run_secrets_sync
+
+    refusal = "refusing to write .env.pmcp: it is a symlink that leaves the project"
+    if os.geteuid() == 0:
+        pytest.skip("root ignores mode 000")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    victim = tmp_path / "outside" / "secret"
+    victim.parent.mkdir()
+    victim.write_text("ORIGINAL\n", encoding="utf-8")
+    os.chmod(victim, 0)
+    os.symlink(victim, project / ".env.pmcp")
+
+    async def _set() -> dict[str, object]:
+        return await run_secrets_set(
+            argparse.Namespace(scope="project", key="K", value="v", project=project)
+        )
+
+    async def _sync() -> dict[str, object]:
+        return await run_secrets_sync(
+            argparse.Namespace(
+                from_scope="user",
+                to_scope="project",
+                project=project,
+                overwrite=False,
+            )
+        )
+
+    try:
+        for out in (asyncio.run(_set()), asyncio.run(_sync())):
+            assert out["ok"] is False
+            message = str(out["error"])
+            assert message == refusal
+            assert str(tmp_path) not in message
+            assert "secret" not in message
+            assert "ORIGINAL" not in message
+    finally:
+        os.chmod(victim, 0o600)
+
+    assert victim.read_text(encoding="utf-8") == "ORIGINAL\n"
+    assert os.path.islink(project / ".env.pmcp")
