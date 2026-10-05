@@ -57,12 +57,19 @@ Each is described in full in the section named at the end of the line.
   coercion (`1` for a boolean, `"5"` for an integer) on `invoke.task` is refused, and
   an explicit `null` for an optional argument is now accepted. Policy is judged before
   the schema, and gate rejections are recorded as `audit.rejection` events. *Changed*
-- **Task numbers are bounded.** `invoke.task.ttl` must be an integer from 1 to 2^53−1,
-  and `invoke.task.poll_interval` a finite number above 0 and at most 2^53−1. `NaN` and
+- **Task numbers are bounded.** `invoke.task.ttl` must be an integer from 1 to
+  9,007,199,254,740 (seconds), and `invoke.task.poll_interval` a finite number above 0
+  and at most 9,007,199,254,740. `NaN` and
   `±Infinity` are refused for every numeric argument, and a request carrying a value
   that is not strict JSON fails with `outbound frame is not strict JSON`. A downstream
   task field pmcp cannot use is reported as `null` and named in `unusable_fields`.
   *Changed*
+- **Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire.**
+  pmcp now converts both ways, as MCP 2025-11-25 requires. If you sent milliseconds
+  to work around the old pass-through, your values are now 1000× too long. A tenant
+  server built to the old seconds contract now receives milliseconds and must return
+  `ttl`/`pollInterval`/`poll_interval` in milliseconds. A task's `ttl` is now a
+  fractional number of seconds. *Changed*
 - **Redaction removes more.** `sanitize_auth_diagnostic`, `PolicyManager.redact_secrets`
   and `process_output` now also replace vendor token shapes, JWTs, PEM private keys,
   high-entropy runs, URL userinfo and secret query values with `[REDACTED]`. Existing
@@ -575,6 +582,43 @@ Each is described in full in the section named at the end of the line.
   A task hint pmcp drops as unusable (Consiliency/pmcp#298) is neither returned nor counted in any size. pmcp reads task hints only in a call that runs as a task, and in `tasks/*` answers. Any other answer is returned whole, including one naming an already-recorded task id.
 
   A downstream's own well-formed error message is still shown.
+- **A cancelled caller keeps its cancellation through every server teardown,
+  and the teardown still completes.** A caller cancelled while a server
+  connection is being torn down -- a failed or cancelled handshake,
+  `disconnect_server`, a reconnect's cleanup, `disconnect_all`, shutdown --
+  keeps its cancellation and returns at once; the server's process tree is
+  SIGKILLed (through the process group recorded at spawn, so a grandchild
+  that outlived its leader dies too) and the client dropped synchronously,
+  and a remote transport is abandoned without its graceful close. A stdio
+  server is SIGKILLed even when its termination is cancelled, including by
+  event-loop shutdown, and shutdown also kills and drops every server when
+  its 10 s budget runs out (for example while another operation holds the
+  lifecycle lock) or when its `disconnect_all` is cancelled before it starts.
+  A forced `disconnect_server` cancelled while waiting for a `tasks/cancel`
+  reply, or for the lifecycle lock, finishes its teardown too. A cancelled
+  `disconnect_all()`/`refresh()` does not respawn the servers it was
+  removing. Once shutdown has abandoned every client, nothing connects,
+  reconnects or adopts a server process any more (a `refresh` that was
+  mid-flight returns without reconnecting), and a cancelled forced
+  `disconnect_server` also stops a connect of that server sitting in its
+  retry backoff. Adopting a provisioned server process now waits for a
+  disconnect, `disconnect_all` or `refresh` in progress to finish, so it can
+  no longer be dropped from the registry with its process still running, or
+  respawned by a reconnect a few seconds after `disconnect_all` returned; a
+  provisioning handoff cancelled while it waits kills the process it was
+  handing over. Every bounded wait in `src/pmcp` now uses `pmcp.waits.bounded_wait`
+  instead of `asyncio.wait_for`, which on Python 3.10/3.11 could drop a
+  cancel that landed as the awaited work finished. Where process groups do
+  not exist (Windows) the single-process fallback is used, as before. Known
+  limits, tracked separately: a cancelled *reconnect* can still be revived by
+  auto-reconnect
+  ([Consiliency/pmcp#336](https://github.com/Consiliency/pmcp/issues/336)),
+  and a cancel while the spawn itself is completing can leave a grandchild
+  ([Consiliency/pmcp#344](https://github.com/Consiliency/pmcp/issues/344)),
+  and a connect of a server requested *before* a cancelled forced disconnect
+  can still run afterwards
+  ([Consiliency/pmcp#359](https://github.com/Consiliency/pmcp/issues/359)).
+  See [Consiliency/pmcp#324](https://github.com/Consiliency/pmcp/issues/324).
 - **An auth URL's host is checked as the HTTP client will read it.** A JWKS
   URL, a protected-resource metadata URL or a URL-mode elicitation URL whose
   host was not plain ASCII passed as a "name", but aiohttp (yarl) and
@@ -724,12 +768,14 @@ Each is described in full in the section named at the end of the line.
 - **`tools/call` input-schema rejections are now recorded in the scoped-advisor audit, without argument values ([Consiliency/pmcp#296](https://github.com/Consiliency/pmcp/issues/296)).** A call the transport gate rejects used to return `Input validation error: …` before the audit was reached, so an operator saw no attempt at all. It is now written as a new `audit.rejection` event (not an `audit.invocation`: nothing was invoked, and a reader that correlates invocations to a run skips it) with the tool name (for the scoped-advisor tools; any other tool is recorded with `gateway_tool: null` and a `gateway_tool_digest`), `terminal_status: "invalid_arguments"`, `rejected_argument_path`, the failing location as a JSON array (a key the schema declares, an array index, or `null` for a key the caller chose, since that key can itself be a secret), and `rejected_argument_validator`, the failing JSON Schema keyword (`type`, `pattern`, `required`, …). The record never contains the validation message, the rejected value, correlation IDs, or any digest of the arguments. The capability stays `scoped_advisor_audit.v1`; readers that dispatch on `event` are unaffected. Policy is now judged **before** the schema: a call to a policy-blocked gateway tool is refused with "Gateway tool blocked by policy" and recorded `denied` whatever its arguments, instead of getting an `Input validation error` that described the blocked tool's schema. If the audit sink has failed, a malformed call now gets "Scoped advisor audit channel failed" like every other call, instead of its validation error. The response to a rejected call from an allowed tool is unchanged. An `audit.invocation` record now reads nothing the schema gate did not vouch for: a call refused by policy, or made to an unregistered name, is recorded `denied` with every argument-derived field (`run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`, `evidence_label_digest`, `source_reference_hash`) `null`, a result digest that no longer covers the caller's tool name, and a `gateway_tool_digest` of the registered name (for an unregistered name, of nothing) — previously a correlation-shaped value or a public URL anywhere in such a call's arguments was copied or hashed into the audit. Every other invocation record reads only the top-level arguments the tool's schema declares, so a correlation-shaped key a tool does not declare (e.g. `run_correlation_id` on `gateway.describe`) is no longer recorded; `gateway.invoke` declares every field the record reads, so its records are unchanged.
 - **`gateway.invoke`'s `task.ttl` and `task.poll_interval` are bounded, and
   NaN/Infinity are refused at the gate (see [Consiliency/pmcp#298](https://github.com/Consiliency/pmcp/issues/298)).**
-  - `task.ttl` must be an integer from 1 to 2^53−1. Zero and negative values,
-    which were forwarded downstream unchanged, are now rejected with
-    `Input validation error: …`, and so is any value above 2^53−1.
+  - `task.ttl` must be an integer from 1 to 9,007,199,254,740 seconds, so that
+    it is at most 2^53−1 ms once [Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330) converts it (next
+    entry). Zero and negative values, which were forwarded downstream unchanged,
+    are now rejected with `Input validation error: …`, and so is any value above
+    the maximum.
   - `task.poll_interval` must be a finite number greater than 0 and at most
-    2^53−1. Zero, negative values, `NaN`, `Infinity` and `-Infinity` are now
-    rejected; they were previously accepted and forwarded.
+    9,007,199,254,740. Zero, negative values, `NaN`, `Infinity` and `-Infinity`
+    are now rejected; they were previously accepted and forwarded.
   - The transport gate now treats `NaN` and `±Infinity` as non-numbers for
     every numeric argument. Both transports can deliver them, even though they
     are not JSON. Until [Consiliency/pmcp#297](https://github.com/Consiliency/pmcp/issues/297) lands, a rejection message may
@@ -781,9 +827,59 @@ Each is described in full in the section named at the end of the line.
     originates) that contains one is dropped and logged, never written. Before,
     stdio servers received a non-JSON `NaN` literal, and HTTP/SSE servers
     silently received `null`.
-  - **Known follow-up:** pmcp documents `ttl` and `poll_interval` in seconds,
-    but MCP defines both in milliseconds, and pmcp forwards them unchanged.
-    Tracked as [Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330).
+  - pmcp documented `ttl` and `poll_interval` in seconds, but MCP defines both
+    in milliseconds, and pmcp forwarded them unchanged. The next entry
+    ([Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330)) fixes that.
+- **Task `ttl` and `poll_interval` are now converted between pmcp's seconds and
+  MCP's milliseconds (see [Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330)).** pmcp has always documented
+  `gateway.invoke`'s `task.ttl` and `task.poll_interval` in seconds. MCP
+  2025-11-25 defines `ttl` and `pollInterval` in milliseconds, and pmcp passed
+  the number through unchanged. So `task: {ttl: 300}`, meant as five minutes,
+  gave a spec-conforming server a 300 ms retention, and its task was gone
+  0.3 s later.
+  - **If you worked around this by sending milliseconds, your values are now
+    1000× too long.** `task: {ttl: 300000}` used to mean five minutes to a
+    spec-conforming server. It now asks for 300,000 seconds, about 3.5 days.
+    Send seconds instead: `ttl: 300`. The same applies to `poll_interval`.
+  - **If you run a tenant server built to pmcp's earlier tenant contract**,
+    which described `ttl` in seconds, it now receives milliseconds: a caller's
+    `ttl: 300` arrives as `ttl: 300000`. A server that reads that as seconds
+    keeps the task 1000× longer than asked. It must also return `ttl` and
+    `pollInterval` (or `poll_interval`) in milliseconds, or pmcp reports them
+    1000× too small: a returned `ttl: 300` is shown as `0.3` seconds. See
+    `specs/tenant-code-mode-host-contract.md`.
+  - Outbound: `task.ttl` is sent as `ttl` in milliseconds (seconds × 1000,
+    exact). `task.poll_interval` is sent as `pollInterval` × 1000. MCP's
+    `TaskMetadata` has no `pollInterval`, so a spec-conforming server ignores
+    it.
+  - Inbound: a downstream task's `ttl` and `pollInterval` are read in
+    milliseconds, and so is the snake_case `poll_interval` alias some servers
+    send. When both poll aliases are present, `pollInterval` wins if it is
+    usable after conversion to seconds; otherwise a usable `poll_interval`
+    does. pmcp reports and records them as `ttl` and `poll_interval`
+    in seconds, everywhere a task is returned: `gateway.invoke`'s `task`,
+    `gateway.tasks_list`, `gateway.tasks_get`, `gateway.tasks_result` and
+    `gateway.tasks_cancel`. A task that used to show `ttl: 300000` now shows
+    `ttl: 300.0`. `ttl` is now a number that may be fractional, not an
+    integer: `1500` ms is reported as `1.5`. A `ttl` of `null` still means
+    unlimited.
+  - Bounds: the caller's maximum for both fields is now 9,007,199,254,740
+    seconds, so that the milliseconds pmcp sends stay within 2^53−1. Larger
+    values, which the previous entry accepted up to 2^53−1, are rejected
+    with `Input validation error: …`. A downstream value is checked as sent,
+    in milliseconds, under the previous entry's rules: `ttl` must be an
+    integer from 0 to 2^63−1, and `pollInterval` a finite number greater than
+    0. Only then is it converted. A `pollInterval` so small that it divides to
+    0 seconds is reported as unusable.
+  - `gateway.invoke` now recognises a task the downstream returns at the top
+    level of its `tools/call` reply (`{"taskId": …}`), the same way pmcp
+    already recorded it. Before, `invoke` looked only for the wrapped
+    `{"task": …}` form, so for that shape it returned `task: null`, relayed the
+    reply as `result` in milliseconds, and skipped the default redaction
+    applied to task replies. A call that did not run as a task never reports a
+    task, even if its result has a `taskId`.
+  - Unchanged: a task's `raw` object, and the results pmcp relays as sent,
+    keep the downstream's own milliseconds.
 - **`pmcp config set-startup-policy add|remove|set --source project --apply` now carries your prior trust approval forward when it rewrites `.mcp.json`.** Setting the startup policy changes the file's bytes, and trust approval is content-keyed, so the edit used to silently invalidate your own `pmcp trust approve` of that file and the next startup refused it. When the pre-write bytes were approved, pmcp now re-records the approval for the exact bytes it writes — keyed on the opened descriptor's verified identity (the resolved key must name the same file the descriptor holds open), never re-approving a file that was not already approved, and never approving a substituted file. A target swapped or unlinked mid-operation is refused rather than mis-bound, and on POSIX a symlinked `.mcp.json` is refused up front. If re-recording ever fails because the trust store is unusable, the edit is still written and the failure is surfaced as a diagnostic rather than crashing (an unusable store also fails the approval check, so nothing is silently carried forward). See [Consiliency/pmcp#253](https://github.com/Consiliency/pmcp/issues/253).
 - **Every install spawn now logs the command it runs, at WARNING, before it
   runs.** `start_install`, the legacy `install_server` and `verify_installation`

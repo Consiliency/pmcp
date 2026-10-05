@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pmcp.waits import bounded_wait
 import logging
 import os
 import platform
@@ -73,7 +74,7 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5.0)
+        stdout, stderr = await bounded_wait(process.communicate(), timeout=5.0)
 
         if process.returncode == 0:
             version = stdout.decode().strip() or stderr.decode().strip()
@@ -102,7 +103,7 @@ async def get_cli_help(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10.0)
+        stdout, stderr = await bounded_wait(process.communicate(), timeout=10.0)
 
         output = stdout.decode() or stderr.decode()
         lines = output.strip().split("\n")[:max_lines]

@@ -1670,8 +1670,8 @@ class TestCallTool:
                 "task": {
                     "task_id": "tenant-run-1",
                     "status": "working",
-                    "ttl": 300,
-                    "poll_interval": 2.5,
+                    "ttl": 300000,
+                    "poll_interval": 2500,
                     "diagnostics": {"summary": "queued"},
                 }
             }
@@ -1705,8 +1705,8 @@ class TestCallTool:
             },
             "task": {
                 "metadata": {"run_kind": "smoke"},
-                "ttl": 300,
-                "pollInterval": 2.5,
+                "ttl": 300000,
+                "pollInterval": 2500.0,
                 "requestorContext": {"client": "mobile"},
             },
         }
@@ -1807,8 +1807,8 @@ class TestCallTool:
                             "statusMessage": "needs approval",
                             "createdAt": "2026-01-02T03:04:05Z",
                             "lastUpdatedAt": "2026-01-02T03:04:06Z",
-                            "ttl": 300,
-                            "pollInterval": 2,
+                            "ttl": 300000,
+                            "pollInterval": 2000,
                             "metadata": {"unknown": "kept"},
                         },
                         {
@@ -1816,8 +1816,8 @@ class TestCallTool:
                             "status": "host_custom_waiting",
                             "created_at": 1760000000,
                             "last_updated_at": 1760000001.5,
-                            "ttl": 120,
-                            "poll_interval": 0.5,
+                            "ttl": 120000,
+                            "poll_interval": 500,
                         },
                     ]
                 },
@@ -3990,9 +3990,14 @@ class TestTerminateProcessTree:
         process.returncode = None
         process.wait = AsyncMock(return_value=0)
 
-        # Must not raise; must use the cross-platform single-process path.
+        # Must not raise; must use the cross-platform single-process path --
+        # also with a retained group id passed in (Consiliency/pmcp#324: the
+        # id is never used where groups do not exist; every other kill path
+        # is covered in tests/test_cancel_teardown.py).
         await _terminate_process_tree(process, "browser")
         process.terminate.assert_called_once()
+        await _terminate_process_tree(process, "browser", group_pgid=4321)
+        assert process.terminate.call_count == 2
 
 
 class TestReadStdoutFailureSurfacing:

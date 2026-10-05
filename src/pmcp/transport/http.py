@@ -47,6 +47,7 @@ from pmcp.auth import (
 )
 from pmcp.parsing import load_json
 from pmcp.types import GatewayDiagnosticsInfo
+from pmcp.waits import bounded_wait
 
 if TYPE_CHECKING:
     from mcp.server import Server
@@ -699,7 +700,7 @@ def create_http_app(
         if request.method == "POST":
             original_receive = request._receive
             try:
-                body_bytes, body_too_large = await asyncio.wait_for(
+                body_bytes, body_too_large = await bounded_wait(
                     _read_body_capped(original_receive, _MAX_BODY_BYTES),
                     timeout=request_timeout,
                 )
@@ -783,7 +784,10 @@ def create_http_app(
             )
         else:
             try:
-                await asyncio.wait_for(
+                # A cancelled request (in practice, server shutdown) does not
+                # wait for `handle_request` to unwind -- `wait_for` did; a
+                # cancelled caller waits on nothing (Consiliency/pmcp#324).
+                await bounded_wait(
                     session_manager.handle_request(
                         request.scope, request.receive, tracking_send
                     ),

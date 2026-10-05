@@ -34,6 +34,8 @@ from pmcp.auth import (
 
 from pmcp.client.manager import (
     ClientManager,
+    _kill_process_tree_now,
+    _spawned_group_pgid,
     _terminate_process_tree,
     parse_request_id,
     effective_task_mode,
@@ -210,6 +212,7 @@ from pmcp.manifest.loader import (
     requires_credential,
 )
 from pmcp.parsing import load_json, load_json_file
+from pmcp.waits import bounded_wait
 
 logger = logging.getLogger(__name__)
 
@@ -1667,12 +1670,14 @@ class GatewayTools:
                     )
 
             task_info = None
-            # Rev 17 (round-15 codex F001, claude F003): task handling is gated
-            # on the call's effective task mode, derived once. A call that is
+            # Rev 17 (round-15 codex F001, claude F003; and Consiliency/pmcp#330
+            # round 3 F001, the same gate): task handling follows the call's
+            # effective task mode, derived once before the call. A call that is
             # not a task returns its answer as opaque data, sized as returned:
             # no recognition, no registry lookup, no replacement. A task call
             # returns, and is sized from, the answer reduced to what pmcp
-            # could use (`usable_task_response`, idempotent).
+            # could use (`usable_task_response`, idempotent). The record is the
+            # one the manager made from it, in seconds.
             if task_requested:
                 result = usable_task_response(result)
                 found = task_answer_of(result)
@@ -3424,12 +3429,19 @@ class GatewayTools:
             env=env,
             start_new_session=True,
         )
+        # The spawn contract: `start_new_session=True` makes the probe a group
+        # leader, so its pgid IS its pid -- not looked up, since a probe that
+        # exits at once may already be reaped (Consiliency/pmcp#324, codex
+        # rounds 5 and 6). A grandchild can outlive it.
+        group_pgid = _spawned_group_pgid(process)
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
+            stdout, stderr = await bounded_wait(process.communicate(), timeout=60.0)
         except asyncio.CancelledError:
-            # Reap the tree before propagating; cancellation must not leak a
-            # process. Re-raised unchanged -- a cancellation is not a timeout.
-            await _terminate_process_tree(process, "update-probe")
+            # Kill the tree before propagating; cancellation must not leak a
+            # process. Synchronously: an await here could itself be cancelled
+            # (loop shutdown) and skip the kill (Consiliency/pmcp#324).
+            # Re-raised unchanged -- a cancellation is not a timeout.
+            _kill_process_tree_now(process, group_pgid=group_pgid)
             raise
         except (asyncio.TimeoutError, TimeoutError) as exc:
             # asyncio.TimeoutError is listed EXPLICITLY: it only became an alias
@@ -3438,7 +3450,9 @@ class GatewayTools:
             # the cleanup never runs. CI caught this on 3.10 while 3.11 and 3.12
             # both passed -- the fix silently did nothing on the oldest
             # supported version.
-            await _terminate_process_tree(process, "update-probe")
+            await _terminate_process_tree(
+                process, "update-probe", group_pgid=group_pgid
+            )
             # NORMALISE to the builtin before it reaches a caller, the way
             # ClientManager._send_request does. Re-raising the asyncio class
             # reintroduced the same 3.10 split one frame up: the caller's

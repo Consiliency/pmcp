@@ -4430,7 +4430,7 @@ class TestCapabilityAndProvision:
     ):
         """A hung update probe must come back as ok=False, on every supported version.
 
-        `_run_update_probe_command` bounds the probe with `asyncio.wait_for`, and
+        `_run_update_probe_command` bounds the probe with `bounded_wait` (`asyncio.wait_for` until Consiliency/pmcp#324), and
         on the 3.10 floor `asyncio.TimeoutError` is NOT the builtin `TimeoutError`
         and not a subclass of it -- so a handler catching only the builtin lets the
         timeout escape and `update_server` raises instead of answering. Both classes
@@ -4488,7 +4488,7 @@ class TestCapabilityAndProvision:
     ):
         """The asyncio timeout class must not escape the helper.
 
-        `asyncio.wait_for` raises `asyncio.TimeoutError`, which on 3.10 is not
+        `bounded_wait` (like `asyncio.wait_for`) raises `asyncio.TimeoutError`, which on 3.10 is not
         the builtin and not a subclass of it. The helper converts before the
         exception reaches any caller, so a caller can catch one type on every
         supported version -- the same contract `ClientManager._send_request`
@@ -4515,11 +4515,13 @@ class TestCapabilityAndProvision:
 
         reaped: list[str] = []
 
-        async def _fake_reap(process, label):
+        async def _fake_reap(process, label, **kwargs):
             reaped.append(label)
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
-        monkeypatch.setattr(asyncio, "wait_for", _timing_out)
+        # The probe waits with `bounded_wait` since Consiliency/pmcp#324
+        # round 6 (`asyncio.wait_for` can swallow a same-turn cancel).
+        monkeypatch.setattr("pmcp.tools.handlers.bounded_wait", _timing_out)
         monkeypatch.setattr("pmcp.tools.handlers._terminate_process_tree", _fake_reap)
 
         with pytest.raises(TimeoutError) as excinfo:
@@ -4874,13 +4876,14 @@ async def main():
         "open(%r,'w').write(str(p.pid));"
         "time.sleep(30)" % pidfile
     )
-    real_wait_for = asyncio.wait_for
+    import pmcp.tools.handlers as H
+
+    real_wait = H.bounded_wait
 
     async def fast(aw, timeout=None):
-        return await real_wait_for(aw, timeout=1.5)
+        return await real_wait(aw, timeout=1.5)
 
-    import pmcp.tools.handlers as H
-    H.asyncio.wait_for = fast
+    H.bounded_wait = fast
     try:
         await gt._run_update_probe_command([sys.executable, "-c", script])
     except BaseException:

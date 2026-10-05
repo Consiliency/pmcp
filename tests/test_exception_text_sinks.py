@@ -633,7 +633,9 @@ def exception_sinks(
             and isinstance(call.func, ast.Attribute)
             and not call.args
             and all(k.arg == "timeout" for k in call.keywords)
-            and not isinstance(parents.get(call), (ast.Assign, ast.IfExp))
+            # a bare statement discards it (`waits._retrieve` marks the
+            # outcome retrieved): nothing is rendered
+            and not isinstance(parents.get(call), (ast.Assign, ast.IfExp, ast.Expr))
         ):
             found.append(f"{label}:{call.lineno}: .exception() used inline")
         if callee in _TRACEBACK_RENDERERS:

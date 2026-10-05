@@ -92,6 +92,7 @@ from pmcp.types import (
     LocalMcpServerConfig,
     ResolvedServerConfig,
 )
+from pmcp.waits import bounded_wait
 
 logger = logging.getLogger(__name__)
 
@@ -1158,9 +1159,20 @@ class GatewayServer:
         # deterministically in-process instead (test_listen_registration.py).
         self._listen_handler.close()
         try:
-            await asyncio.wait_for(self._client_manager.disconnect_all(), timeout=10.0)
+            await bounded_wait(self._client_manager.disconnect_all(), timeout=10.0)
+        except asyncio.CancelledError:
+            # `disconnect_all` runs in its own task, which loop shutdown can
+            # cancel before its first instruction -- then neither its
+            # handlers nor its fallback run. Kill and abandon here,
+            # synchronously, and re-raise (Consiliency/pmcp#324, codex round 6).
+            self._client_manager.abandon_all_now()
+            raise
         except asyncio.TimeoutError:
+            # The budget ran out (e.g. another operation held the lifecycle
+            # lock): finish synchronously rather than only log, as on a
+            # cancel (Consiliency/pmcp#324, implementation addition).
             logger.warning("Shutdown timed out, forcing disconnect")
+            self._client_manager.abandon_all_now()
         except Exception as e:
             logger.error(f"Error during shutdown: {exception_text(e)}")
         finally:
