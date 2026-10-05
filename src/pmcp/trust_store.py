@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pmcp.atomic_write import atomic_write
+from pmcp.atomic_write import atomic_write, resolve_store_path
 
 APPROVED = "approved"
 DENIED = "denied"
@@ -236,9 +236,25 @@ def trust_store_path() -> Path:
     Symlinks are resolved *before* the comparison, which is the only reason a
     planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
-    path = (Path.home() / ".config" / "pmcp" / "trust.json").resolve()
+    path = resolve_trust_path(Path.home() / ".config" / "pmcp" / "trust.json")
     refuse_checkout_resident(path, "Trust store")
     return path
+
+
+def resolve_trust_path(path: Path) -> Path:
+    """Resolve an approval store's path with the writer's own resolver.
+
+    Never ``Path.resolve()``: it collapses ``missing/../x`` onto ``x`` where the
+    kernel refuses, and the write would then land on an unrelated file
+    (Consiliency/pmcp#366 round 7, codex F003). A path the kernel cannot
+    resolve is a ``TrustStoreError``.
+    """
+    try:
+        return resolve_store_path(path)
+    except OSError as exc:
+        raise TrustStoreError(
+            f"Cannot resolve {path.name}: {os.strerror(exc.errno) if exc.errno else exc}"
+        ) from exc
 
 
 def refuse_checkout_resident(path: Path, label: str) -> None:

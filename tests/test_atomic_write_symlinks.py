@@ -326,13 +326,15 @@ def test_a_symlink_loop_is_refused_and_left_intact(site: Site, dotfiles: Path) -
     other = _link(dotfiles / "loop-b", link_path)
     link = _link(link_path, other)
 
-    # The trust store resolves its path with Path.resolve(), which raises
-    # RuntimeError on a loop before 3.13 (OSError after); every other site
-    # reaches the helper's ELOOP refusal.
-    with pytest.raises((OSError, RuntimeError)) as info:
+    # The approval stores resolve their path with the writer's own resolver and
+    # report its ELOOP as a TrustStoreError; every other site raises it as is.
+    with pytest.raises((OSError, TrustStoreError)) as info:
         site.write(link)
 
-    if site.name != "trust_store trust.json":
+    if site.name in _RESOLVING_STORES:
+        assert isinstance(info.value, TrustStoreError)
+        assert "Too many levels of symbolic links" in str(info.value)
+    else:
         assert isinstance(info.value, OSError)
         assert info.value.errno == errno.ELOOP
     assert os.path.islink(link) and os.readlink(link) == str(other)

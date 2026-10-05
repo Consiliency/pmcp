@@ -28,13 +28,21 @@ def validate_env_var_name(name: str) -> str:
 def resolve_project_root(project: Path | None = None) -> Path:
     """Resolve project root for project-scope secrets."""
     if project:
-        return project.resolve()
+        # Strict: links resolved before any `..`, as the kernel does. A
+        # `--project` directory that does not exist yet is kept as given
+        # (absolute, never normalised) -- non-strict resolve() would collapse
+        # `missing/../x` onto `x`, which the kernel refuses (round 7, codex F003).
+        try:
+            return Path(os.path.realpath(project, strict=True))
+        except FileNotFoundError:
+            return project if project.is_absolute() else Path.cwd() / project
 
     discovered = find_project_root(Path.cwd())
     if discovered:
         return discovered
 
-    return Path.cwd().resolve()
+    # os.getcwd() is already the kernel's physical path; nothing to resolve.
+    return Path.cwd()
 
 
 def resolve_scope_path(scope: str, project: Path | None = None) -> Path:

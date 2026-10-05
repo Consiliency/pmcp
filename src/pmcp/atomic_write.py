@@ -179,6 +179,31 @@ def resolve_write_target(path: Path) -> Path:
     return walk.target
 
 
+def resolve_store_path(path: Path) -> Path:
+    """Where a store at ``path`` lives, resolved as the kernel would -- for CALLERS.
+
+    A caller that needs the resolved location (a residency check, a lock file)
+    gets it from the same walk the write uses, never from ``realpath`` or
+    ``Path.resolve()``: both collapse ``missing/../x`` lexically onto ``x`` when
+    ``missing`` does not exist, which the kernel refuses (Consiliency/pmcp#366
+    round 7, codex F003). Directories that do not exist yet are allowed only as
+    a plain tail of names -- no ``..``, no ``.``, no trailing separator -- left
+    after every link on the way was followed: the store's own directory not
+    created yet, which the caller then creates (``mkdir -p``). Anything else
+    the kernel would refuse raises the walk's ``OSError``.
+    """
+    walk = _walk(
+        path,
+        confine_to=None,
+        label="",
+        verb="write",
+        backend=_backend(),
+        missing_tail_ok=True,
+    )
+    walk.close()
+    return walk.target
+
+
 def _separators() -> str:
     seps = {"/", os.sep}
     if os.altsep:
@@ -346,6 +371,7 @@ def _walk(
     label: str,
     verb: str,
     backend: _FdBackend | _PathBackend,
+    missing_tail_ok: bool = False,
 ) -> _Walk:
     """THE resolver: ``path`` resolved one component at a time, as the kernel does.
 
@@ -429,6 +455,15 @@ def _walk(
             except FileNotFoundError:
                 if last:
                     final = name
+                    break
+                rest = list(pending)
+                if missing_tail_ok and all(
+                    p not in ("", os.curdir, os.pardir) for p in rest
+                ):
+                    # A plain tail of directories not created yet: no link can
+                    # be among them, so there is nothing left to resolve.
+                    names.extend([name, *rest[:-1]])
+                    final = rest[-1]
                     break
                 raise FileNotFoundError(errno.ENOENT, missing_dir_message) from None
             if _is_link(st):

@@ -44,6 +44,7 @@ from pmcp.atomic_write import atomic_write
 from pmcp.trust_store import (
     TrustStoreError,
     refuse_checkout_resident,
+    resolve_trust_path,
     trust_store_path,
 )
 from pmcp.validation import (
@@ -100,13 +101,11 @@ def package_approvals_path() -> Path:
     did, so a ``package_approvals.json`` linked into a judged checkout would
     otherwise be a checkout-resident store reached through its final component.
     """
-    # os.path.realpath, not Path.resolve(): the latter raises RuntimeError on a
-    # link loop on 3.10-3.12, which would escape `is_package_approved`'s
-    # never-raise contract. A loop resolves to a path that still fails closed
-    # at the read (ELOOP) and is refused at the write.
-    path = Path(
-        os.path.realpath(trust_store_path().parent / PACKAGE_APPROVALS_FILENAME)
-    )
+    # The writer's own resolver, never realpath/resolve(): those collapse
+    # `missing/../x` onto `x` where the kernel refuses (round 7, codex F003).
+    # An unresolvable path is a TrustStoreError, which `is_package_approved`
+    # turns into False and the operator verbs report.
+    path = resolve_trust_path(trust_store_path().parent / PACKAGE_APPROVALS_FILENAME)
     refuse_checkout_resident(path, "Package approvals")
     return path
 

@@ -358,3 +358,10 @@ def test_board_r7_f002_absolute_link_with_trailing_slash_is_refused_like_the_ker
     with pytest.raises(OSError):
         set_env_value("user", "NEW", "v")
     assert dotfiles.read_text(encoding="utf-8") == "KEEP1=alpha\nKEEP2=beta\n"
+
+
+def test_o_path_is_used_wherever_the_platform_has_it() -> None:
+    """The search-only walk must not silently fall back where O_PATH exists."""
+    assert writer._O_PATH == getattr(os, "O_PATH", 0)
+    if writer._O_PATH:
+        assert writer._walk_flags() & writer._O_PATH
