@@ -91,6 +91,13 @@ to do, how to verify it, and how to roll back to 2.7.3.
   `server_version:`, now pins an npx server to that exact version; an invalid pin is
   ignored with a warning. `gateway.update_server` does not move a pinned server, and
   `pmcp update` prints `[PINNED]` for it. *Added*
+- **An overlay entry pmcp cannot use is skipped.** A manifest overlay entry with a
+  field some part of pmcp would fail on (`keywords: [1]`, an `args` or `command` that
+  is not a string, a `cli_alternatives` entry with an empty `check_command`) is skipped
+  when the overlay is read, with a WARNING naming the field but not its value. 2.7.3
+  loaded it, and then `gateway.catalog_search` failed for every query, or startup and
+  `gateway.refresh` failed for every server. A CLI an overlay adds or replaces now
+  ranks after every server and after pmcp's own CLIs. *Fixed*
 - **Downstream servers see more from pmcp.** A server→client request now gets an
   answer (`ping` gets an empty result, anything else `-32601`), cancellation is sent as
   `notifications/cancelled`, and a malformed frame is dropped instead of ending the
@@ -604,6 +611,32 @@ to do, how to verify it, and how to roll back to 2.7.3.
   (D-01); see [Consiliency/pmcp#228](https://github.com/Consiliency/pmcp/pull/228).
 
 ### Fixed
+- **An overlay no longer hides other servers from discovery, and one bad overlay entry
+  no longer takes down the others.** Discovery weighs a keyword by how many servers
+  declare it, and it counted over the merged manifest. So an approved project overlay
+  (or a user or `PMCP_MANIFEST_PATH` overlay) whose server shared a keyword pushed
+  every server with that keyword below the match threshold. `gateway.catalog_search`
+  then returned no candidate, not even the shipped or user server. Keyword weights now
+  come from the shipped manifest alone, so an overlay can add candidates and never
+  removes one, within the result limit.
+
+  Separately, a wrongly typed field in one overlay entry made `catalog_search` fail
+  for every query (`keywords: null`, a bad `cli_alternatives` entry) or for every
+  query that matched the entry (a non-string `transport`), or stopped gateway startup
+  and `gateway.refresh` for every server (an int in `args`). An overlay entry that any part of pmcp would reject is now
+  skipped when the overlay is read; an entry nothing would fail on still loads as
+  before. The warning names the field, never its value, and never shows an overlay
+  entry's name. Loading, discovery, CLI probing and the startup and refresh skip lines
+  no longer log an overlay entry's name or values either, including values a
+  `.mcp.json` entry inherits from an overlay (the self-reference warning now names the
+  field, not the command). A blank (`null`) field now means "not set" and takes its
+  default, instead of dropping the entry. One overlay entry also no longer stops other
+  `.mcp.json` servers from loading when one of them inherits its defaults, or makes
+  `pmcp secrets` drop other servers' auth metadata. An overlay that replaces a shipped
+  server no longer changes how `gateway.request_capability` picks a category for
+  anything else, and a CLI an overlay adds or replaces is recommended only when no
+  server matches and is listed after pmcp's own CLIs in `cli_hints`. See
+  [Consiliency/pmcp#342](https://github.com/Consiliency/pmcp/issues/342).
 - **A cancelled caller keeps its cancellation through every server teardown,
   and the teardown still completes.** A caller cancelled while a server
   connection is being torn down -- a failed or cancelled handshake,

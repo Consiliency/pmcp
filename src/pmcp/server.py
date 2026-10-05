@@ -40,7 +40,7 @@ from mcp.types import (
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
 from pmcp.config.loader import (
-    StartupSkipReason,
+    startup_skip_message,
     build_startup_observation_snapshot,
     is_legacy_manifest_auto_start_enabled,
     load_configs,
@@ -735,7 +735,10 @@ class GatewayServer:
             manifest = load_manifest()
             manifest_servers = manifest.servers
         except Exception as e:
-            logger.warning(f"Failed to load manifest startup configs: {e}")
+            # Class only: an error's text can quote overlay input (Consiliency/pmcp#342).
+            logger.warning(
+                f"Failed to load manifest startup configs: {type(e).__name__}"
+            )
 
         enabled_auto_start = load_enabled_auto_start(
             project_root=self._project_root,
@@ -768,21 +771,7 @@ class GatewayServer:
             f"unknown_auto_start={counts['unknown_auto_start']}"
         )
         for skipped in resolution.skipped:
-            if skipped.reason == StartupSkipReason.MISSING_AUTH:
-                logger.info(
-                    f"Skipping startup entry '{skipped.name}' from {skipped.source}: "
-                    f"missing_auth; set {skipped.env_var} to enable eager startup"
-                )
-            elif skipped.reason == StartupSkipReason.UNKNOWN_AUTO_START:
-                logger.info(
-                    f"Skipping startup entry '{skipped.name}' from {skipped.source}: "
-                    "unknown_auto_start; add a matching mcpServers entry or remove it from autoStart"
-                )
-            else:
-                logger.info(
-                    f"Skipping startup entry '{skipped.name}' from {skipped.source}: "
-                    f"{skipped.reason.value}"
-                )
+            logger.info(startup_skip_message("startup", skipped))
 
         # Kill any orphan processes from a previous PMCP crash before registering servers
         self._kill_orphan_processes(resolution.lazy_configs + resolution.eager_configs)

@@ -73,6 +73,21 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _lazy_log_name(config: ResolvedServerConfig) -> str:
+    """A lazily registered server's name in a log line (Consiliency/pmcp#342).
+
+    A manifest-derived server is named only if pmcp ships that name; an
+    overlay key may be anything an operator pasted. A ``.mcp.json`` entry is
+    the operator's own config and is named as before.
+    """
+    from pmcp.manifest.loader import entry_log_name
+
+    return entry_log_name(
+        config.name, manifest_derived=getattr(config, "source", None) == "manifest"
+    )
+
+
 #: Executables that fetch and run the package they are given at spawn time,
 #: by NORMALIZED name (`normalized_executable_name`), so ``UVX.EXE``,
 #: ``pnpx.cmd`` and ``C:\\tools\\npx.cmd`` are runners without being listed.
@@ -1576,7 +1591,7 @@ class ClientManager:
                 status=ServerStatusEnum.LAZY,
                 tool_count=0,
             )
-            logger.info(f"Registered lazy server: {name}")
+            logger.info(f"Registered lazy server: {_lazy_log_name(config)}")
 
     def prune_lazy_configs(self, keep_names: set[str]) -> None:
         """Drop on-demand (lazy) configs whose name is not in ``keep_names``.

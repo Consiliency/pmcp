@@ -1268,12 +1268,25 @@ relaxer is ignored, and an unset, empty, or unexpanded `${VAR}` value fails
 closed: the credential stays required.
 
 Overlay loading is **fail-soft**: a missing file is skipped silently, and a
-malformed file or a single bad entry logs a warning and is skipped without
-crashing the gateway — the shipped manifest always still loads. pmcp re-reads
+malformed file logs a warning and is skipped; so does a single entry that pmcp
+could not use: a field some part of pmcp would fail on, such as `keywords: [1]`,
+an `args` holding a number, or a CLI alternative with an empty `check_command`.
+Fields pmcp only tests for truth or ignores (`transport` without a `url`,
+`auto_start`, `status`) are accepted as before. The warning names the field, not
+its value, and does not show the entry's name unless pmcp ships it. A blank field
+(`description:` with nothing after it) means "not set". None of this crashes the
+gateway — the shipped manifest always still loads. pmcp re-reads
 overlay files on every manifest load, so edits apply without a restart, and
 logs each warning once per change rather than on every load — except that a
 file that cannot be read or parsed is reported on every load until it is
 fixed.
+
+An overlay's servers are found by their own keywords. Sharing a keyword with
+another server, or replacing a shipped server, never hides another server from
+`gateway.catalog_search` or `gateway.request_capability` (within the result
+limit; ties rank by name; a query that names a server resolves to it). A CLI an
+overlay adds or replaces is recommended only when no server matches, and is listed
+after pmcp's own CLIs.
 
 > **Security:** a manifest entry can specify an arbitrary `command`/`args` to
 > run when provisioned — treat an overlay file with the same trust as your own
