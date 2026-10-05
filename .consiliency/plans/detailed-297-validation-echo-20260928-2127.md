@@ -1,22 +1,24 @@
 # Detailed plan: describe validation errors from their structure, never their value — everywhere pmcp turns an exception into text
 
-> **Revision 17 (2026-10-05), on main `6edf8a4`.** Consiliency/pmcp#297, the
+> **Revision 18 (2026-10-05), on main `6edf8a4`.** Consiliency/pmcp#297, the
 > prerequisite for piece B (`extra="forbid"`) of Consiliency/pmcp#236. The
 > change is **embedded, not described**. The 47 blocks under *Verbatim
 > bodies* are `git apply` patches against `origin/main` @ `6edf8a4`. They are
-> byte-identical to the verified code on the local-only branch
-> `wip/297-code` @ `18824c1`. *Embedding proof* extracts them from this file
+> byte-identical to the verified code on the branch `wip/297-code` @
+> `b34717e` (pushed since rev 18). *Embedding proof* extracts them from this file
 > and applies them on a fresh `6edf8a4`, then compares every file.
 >
-> **What rev 17 changes:** it answers the round-15 board on
-> Consiliency/pmcp#314 @ `360fe3e`. Codex filed one BLOCKING finding
-> (F001); claude PARTIALLY AGREE, with F003; gemini found no leaks.
-> - Task handling is now gated on the call's effective task mode (*Rev 17*).
-> - It merges main `6edf8a4`: Consiliency/pmcp#358 (docs),
->   Consiliency/pmcp#345 (teardown) and Consiliency/pmcp#363 (task units).
->   See *Merge of `6edf8a4`*.
+> **What rev 18 changes:** it answers the round-16 board on
+> Consiliency/pmcp#314 @ `0dc22a4`. Gemini, grok and claude AGREE; codex
+> filed one BLOCKING finding (F001), reproduced here.
+> - A wrapper of a validation or parse error is never rendered from its
+>   own message, whatever built it. One registry decides which errors
+>   count (*Rev 18*).
+> - The base is unchanged (`6edf8a4`). Main has since moved to `b8e4305`
+>   (Consiliency/pmcp#364, docs only); the 47 patches also pass
+>   `git apply --unidiff-zero --check` there.
 
-## History (revs 1–16)
+## History (revs 1–17)
 
 Each revision answered the previous board. The full text is in the plan at
 that sha, at `.consiliency/plans/detailed-297-validation-echo-20260928-2127.md`.
@@ -40,85 +42,83 @@ The line ranges are that file's.
 | 14 | `440d170` | rev 13: 29–58 | 86–139 |
 | 15 | `e6c248f` | rev 14: 30–90 | 118–198 (§12, §14, §15) |
 | 16 | `360fe3e` | rev 15 summary: 48–59; merge of `2adcd9a` and Consiliency/pmcp#348's auth code: 60–85 | 95–114 |
+| 17 | `0dc22a4` | round 15: 51–58; merge of `6edf8a4`: 97–113 | 59–96, 114–121 (§15) |
 
-The code for revs 1–15 is at `19dac95`, `929f693`, `026aadc`, `ee644a9`,
+The code for revs 1–17 is at `19dac95`, `929f693`, `026aadc`, `ee644a9`,
 `1824a09`, `9b24daa`, `dd3f707`, `2d9e736`, `8d33b49`, `6078419`,
-`46c4904`, `0a93265`, `ebcf4fc`, `06a9e01`, `67bd04d` and `403a83a` (rev 16; local
-only). Rev 17 before the merge of `6edf8a4` was `9e5cb57`.
+`46c4904`, `0a93265`, `ebcf4fc`, `06a9e01`, `67bd04d`, `403a83a` (rev 16) and
+`18824c1` (rev 17; local only). Rev 17 before the merge of `6edf8a4` was
+`9e5cb57`.
 
-## Rev 17: task handling gated on the call's effective task mode
+## Rev 18: a wrapper of a value-bearing error is never rendered from its own message
 
-**Round-15.**
-- **Codex F001 (BLOCKING):** `gateway.invoke` looked every answer up as a
-  task. A synchronous answer naming an already-recorded task id therefore
-  lost its content to `result: null` plus that task, even for a
-  `forbidden` tool.
-- **Claude F003:** an unrequested task answer with a colliding id was
-  sized uncleaned.
+**Round 16.** Gemini, grok and claude: AGREE. Codex, F001 (BLOCKING):
+`exception_text` kept a wrapper's message unless it contained
+`str(cause)`. For jsonschema, `repr(cause)` holds the rejected value but
+is not `str(cause)`, so `RuntimeError(f"validation failed: {error!r}")
+from error` passed through unchanged. Reproduced on `18824c1` with codex's
+falsifier (`r18/repro_f001.py`): the value reached all four surfaces it
+names, `exception_text`, `safe_traceback_text`, the scrubbed log record
+and `_described_errors`' non-MCP branch. On rev 18 all four are clean.
+
+**The class.** The substring test was a denylist over the forms a
+wrapper's text can take. `repr`, `format()`, `%r`, `ascii()`, `!s`/`!a`,
+a slice, `.message` or `.instance`, a nested wrapper and a `__str__`
+computed late each evade it. Adding `repr(cause)` would close one form.
+Rev 18 removes the degree of freedom instead: the wrapper's message is
+never read.
 
 **The rule.**
-- `effective_task_mode(tool_info, task)` (`pmcp.client.manager`) is the
-  one derivation: the tool requires a task, or one was requested and not
-  set `enabled: false`.
-- `call_tool` and `gateway.invoke` each compute it once, on the same
-  inputs. Passing the value into `call_tool` would change its public
-  signature, which the CLI and the test fakes use.
-- Every task consult on the invoke path is gated on that value: recording
-  and normalising in `call_tool`; lookup, normalising and sizing in the
-  handler. The `tasks/*` paths are task calls by definition.
-- **A non-task call:** the answer is opaque data. There is no recognition,
-  lookup or replacement; it is returned whole and sized as returned.
-- **A task call:** the answer is reduced (`usable_task_response`, which is
-  idempotent), then returned and sized in that form.
+- One registry decides which exceptions are value-bearing:
+  `_value_bearing_types()`. It holds pydantic's `ValidationError`,
+  jsonschema's `ValidationError` and `SchemaError`, and every parser's
+  error (`_parse_error_types`). `_value_free_types()` is its only
+  exemption: `pmcp.parsing.ParseError`, value-free by construction and
+  chained to nothing (rev 7). `_is_parse_error` no longer repeats that
+  exemption; it only picks the parse description for an error the
+  registry already admitted.
+- A value-bearing error renders as its structural description, as
+  before.
+- An exception whose chain holds one renders as
+  `<its class name>: <that error's description>`. The chain is
+  `__cause__` and `__context__`, suppressed (`from None`) or not, at any
+  depth, with exception-group members. No substring test remains.
+- Every surface inherits this through `exception_text`: `_scrubbed` and
+  `scrub_record`, `_described_errors`' non-MCP branch
+  (`ValueError(described)`), `describe_exception`. `safe_traceback_text`
+  prints each node's qualified class once, then the same text.
+- The `MCPError` branch keeps rev 12's rule: the code is kept, and the
+  message and `data` are kept unless they carry what was rejected.
 
-**No stripping when not a task.** pmcp parses nothing in an unrequested
-answer, so it rejects nothing in it: the answer is accepted downstream
-data. The guarantee: *a task hint pmcp parses and drops as unusable is
-neither returned nor sized; pmcp parses task hints only in the answer to a
-call that runs as a task, and in `tasks/*` answers.*
-
-**Against main `b2884db`, before Consiliency/pmcp#363.**
-- A flat `task_id` answer to a non-task call is kept, as on main.
-- A nested answer whose id is already recorded is now returned whole. Main
-  replaced it with the recorded task, through the same substitution as
-  codex's finding.
+**The cost.** A wrapper's own words are lost whenever it chains a
+registered error, even an unrelated one raised while handling it. For
+example, `OSError("disk gone")` from a failing log handler inside a parse
+error's `except` now reads
+`OSError: could not parse YAML (ParserError) at line L, column C`. pmcp's
+own wrappers lose their prefix the same way. Three tests in
+`test_parse_error_echo.py` pinned the old text (`RuntimeError: boom`,
+`OSError: disk gone`); they now pin the new form.
 
 **Tests.**
-- `test_task_handling_follows_the_calls_effective_task_mode` sweeps
-  `taskSupport` ∈ {required, optional, forbidden, absent} × requested or
-  not × nested, flat or not a task × id recorded or not. That gives 36
-  runnable cases; 12 are refused.
-- Falsifiers: codex's `test_sync_result_survives_cached_task_id`, and
-  claude F003 restated as
-  `test_an_unrequested_task_answer_is_sized_as_returned`.
-- Mutants: M112 (ungated lookup), M113 (sized uncleaned) and M114 (the
-  gate reads only the task argument).
+- `test_a_wrapper_of_a_value_bearing_error_is_never_rendered_from_its_message`
+  is a generated grid with these axes:
+  - 5 leaf types: pydantic, jsonschema, `SchemaError`, YAML and JSON;
+  - 19 wrapping forms;
+  - cause, context or `from None`;
+  - depth 1–3;
+  - two sentinels: a 42-character one, and `Qx7`, under the 4-character
+    floor of value matching;
+  - every surface: `exception_text`, `safe_traceback_text`, a log record
+    holding the exception as `msg`, in `args`, in a mapping or as
+    `exc_info`, and `_described_errors`.
 
-**Merge of `6edf8a4`.**
-- Consiliency/pmcp#363 also gated invoke's task lookup on the call's task
-  mode. Rev 17 keeps its single `effective_task_mode` value, computed
-  before the call; it is the same predicate, required, or requested and
-  `enabled`. It also keeps normalise-then-size.
-- The parser combines Consiliency/pmcp#363's ms→s conversion with
-  `raw=_usable_task_raw(payload)`. "Usable" is Consiliency/pmcp#363's
-  unit-aware check, and `raw` keeps the downstream's milliseconds minus
-  the dropped values.
-- Consiliency/pmcp#363's code-derived tests follow `task_answer_of` too. The
-  reviewed-construction table records that `raw` and the cancel fallback's
-  empty `raw`.
-- The teardown rewrite (Consiliency/pmcp#345) is taken from main, and its
-  new abandoned-owner log uses `safe_traceback_text`. The sink guard allows
-  a bare `.exception()` statement (`waits._retrieve` discards it), which
-  renders nothing.
-
-**Repro (`r17/test_repro17.py`):** rev 15's 11 rows plus these 2. Results for the two new rows:
-- **rev 16 `403a83a`:** both answers are replaced (`result: null`).
-- **main `b2884db`:** codex F001's answer was kept, but claude F003's was
-  replaced by its ungated nested lookup.
-- **main `6edf8a4`:** Consiliency/pmcp#363's gate keeps both.
-- **rev 17:** keeps both, sized as returned, and rev 15's 11 rows stay
-  clean. On `6edf8a4`, those 11 rows still show the round-13 and round-14
-  leaks.
+  Each cell asserts the exact fixed rendering, not only that the
+  sentinel is absent. That is 90 cases and 1,710 wrapper chains.
+- `test_the_value_bearing_registry_is_the_one_decision`: every grid leaf
+  is registered and `ParseError` is the exemption. A wrapper of
+  `ParseError`, or of an unregistered error, keeps its message.
+- All 91 fail on rev 17's code (see *Acceptance criteria*).
+- Mutants: M115–M128 (see *Mutation evidence*).
 
 ## Design in one line per section (full text: `48b7a89` 196–592, `e6c248f` 118–198)
 
@@ -129,7 +129,10 @@ call that runs as a task, and in `tasks/*` answers.*
   (`audit.rejection`).
 - **§6:** the sweep's axes come from the code.
 - **§7–§8:** every exception-to-text sink goes through `exception_text` /
-  `safe_exc_info`, pinned by a dataflow-aware static guard.
+  `safe_exc_info`, pinned by a dataflow-aware static guard. One registry
+  (`_value_bearing_types`) names the value-bearing errors. An exception
+  that chains one renders as its class and that error's description,
+  never its own message (rev 18).
 - **§9:** a record-factory scrubber, installed on `import pmcp`.
 - **§10–§11:** parse errors are described by format, source, position and
   class (`pmcp.parsing`). An unparseable `Origin` port gets a 403.
@@ -143,12 +146,15 @@ call that runs as a task, and in `tasks/*` answers.*
 
 ## Changes
 
-The patches are `git diff 6edf8a4 18824c1 -- <file>`: 47 files, +9037 / −620. This is one
+The patches are `git diff 6edf8a4 b34717e -- <file>`: 47 files, +9351 / −620. This is one
 concern applied at every sink, past the bounded-plan threshold on purpose.
-Per-file accounts are at the shas above. Rev 17 adds `effective_task_mode`
-(`manager.py`), the gate (`handlers.py`), and the sweep and falsifiers
-(`test_argument_error_echo.py`). It also merges `6edf8a4`. All 47 patches
-are one `git apply`: no import cycles, no migration, no config change.
+Per-file accounts are at the shas above. Rev 18 changes
+`argument_errors.py` (the registry, `_chained_value_bearing`,
+`exception_text` and the traceback's node text). It adds the grid and
+registry tests to `test_argument_error_echo.py`, re-pins three tests in
+`test_parse_error_echo.py`, and adds one sentence to `CHANGELOG.md`. All
+47 patches are one `git apply`: no import cycles, no migration, no
+config change.
 
 ## Verification
 
@@ -160,17 +166,19 @@ On a fresh `6edf8a4` with the patches applied:
   `test_log_record_scrubber`, `test_parse_error_echo`,
   `test_scoped_advisor_audit`, `test_gateway_tool_schemas`,
   `test_http_transport`);
+- codex's round-16 falsifier is the grid's `jsonschema` × `fstring_r` ×
+  cause × depth 1 cell, on every surface it names and more (*Rev 18*);
 - run the full suite `-m 'not live and not slow'` with the npm cache
   variables unset.
 
-## Acceptance criteria — measured on `18824c1`
+## Acceptance criteria — measured on `b34717e`
 
-- [x] The eight modules are green: `935 passed in 347.67s (0:05:47)`.
-- [x] Red on main `6edf8a4`, with the eight test files from `18824c1`
+- [x] The eight modules are green: `1026 passed in 476.74s (0:07:56)`.
+- [x] Red on main `6edf8a4`, with the eight test files from `b34717e`
   (`--tb=line`; the errors are a fixture importing `pmcp.argument_errors`):
 
 ```text
-  49 tests/test_argument_error_echo.py
+ 140 tests/test_argument_error_echo.py
   99 tests/test_downstream_frame_echo.py
    2 tests/test_exception_text_sinks.py
    3 tests/test_gateway_tool_schemas.py
@@ -178,23 +186,29 @@ On a fresh `6edf8a4` with the patches applied:
   80 tests/test_log_record_scrubber.py
  100 tests/test_parse_error_echo.py
    6 tests/test_scoped_advisor_audit.py
-285 failed, 593 passed, 57 errors in 127.63s (0:02:07)
+376 failed, 593 passed, 57 errors in 110.69s (0:01:50)
 ```
 
-- [x] Red on `9e5cb57` (rev 17 before this merge), with the same eight files: 0 failures: the merge changes nothing these tests pin. Against rev 16's code `403a83a` (run on `ff3d262`'s files, `/var/tmp/pmcp-297-bt-viperjuice/r28`): `3 failed, 932 passed`, exactly the 3 rev 17 tests, each on the value (the answer replaced by the recorded task).
+- [x] Red on rev 17's code `18824c1`, with the same eight files: the 91 rev 18 tests and the 4 re-pinned ones fail, and nothing else. Run on the grid's 1,710 wrapper chains (`r18/leakcount.py`), rev 17 leaks the sentinel in 686 of them on at least one surface: `safe_traceback_text` 686, the `exc_info` log record 590, `exception_text`, `_described_errors` and the `msg` record 534 each, the `args` and mapping records 528 each. Rev 18 leaks it in 0.
 
 ```text
-
-935 passed in 308.26s (0:05:08)
+  91 tests/test_argument_error_echo.py
+   4 tests/test_parse_error_echo.py
+95 failed, 931 passed in 443.77s (0:07:23)
 ```
 
 - [x] The full suite, with `npm_config_cache`, `npm_config_store_dir` and
-  `pnpm_config_store_dir` unset (dev0 is a team host): `9271 passed, 5 skipped, 80 deselected in 927.52s (0:15:27)`.
+  `pnpm_config_store_dir` unset (dev0 is a team host): `9362 passed, 5 skipped, 80 deselected in 1018.20s (0:16:58)`.
+  A first run, alongside the 12 mutation shards, had one failure outside
+  this change. `test_an_absent_project_mcp_json_warns_about_nothing`
+  caught a `Task exception was never retrieved` log from an earlier
+  test's `_drain_outbound` task (base code), collected late. That module
+  passes alone, and the rerun above is green.
 - [x] Gates: ruff check: `All checks passed!`; ruff format --check: `187 files already formatted`; mypy: `Success: no issues found in 55 source files`.
 
 ## Mutation evidence
 
-`mutants.py` ran on a worktree of `18824c1`. The procedure:
+`mutants.py` ran on a worktree of `b34717e`. The procedure:
 - each mutant's anchor must occur exactly once;
 - the eight modules run with `-x`;
 - a dirty file is refused;
@@ -202,11 +216,15 @@ On a fresh `6edf8a4` with the patches applied:
   checked with `cmp` and against HEAD's blob by sha-256;
 - `git status` after the run: `0` and `0`.
 
-The purposes of M1–M111 are in the history table's plans. Rev 17 adds
-M112–M114.
+The purposes of M1–M114 are in the history table's plans. Rev 18 adds
+M115–M128. It retires two mutants whose anchors are gone. M21 disabled
+the substring check; M115 restores it. M41 deleted `_is_parse_error`'s own
+`ParseError` exemption, which rev 18 deletes; M123 deletes the registry's
+instead.
+M17 and M33 are re-anchored on the rev 18 code.
 
 ```text
-106 mutants applied; 104 killed: M1–M22 M24 M26–M45 M48 M54–M58 M60 M65–M91 M93–M114 G1 S5–S8
+118 mutants applied; 116 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M91 M93–M128 G1 S5–S8
 survived: M23 SDK parse error keeps its message
 survived: M25 malformed error message kept
 ```
@@ -214,7 +232,7 @@ survived: M25 malformed error message kept
 `NO_STATIC=1` deselects the sink guard and the helpers-only rule:
 
 ```text
-106 mutants applied; 100 killed with both sink checks deselected: M1–M18 M21 M24 M26–M34 M36–M45 M48 M54–M58 M60 M65–M91 M93–M114 G1 S5–S8
+118 mutants applied; 112 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M91 M93–M128 G1 S5–S8
 survived: M19 tasks_get response uses str(e)
 survived: M20 tasks_get audit buffer uses str(e)
 survived: M22 installer crash message uses raw exc (static guard)
@@ -228,6 +246,16 @@ die in both passes. M19, M20, M22 and M35 die only on the static guard, by
 design. M112 and M114 die on the effective-mode sweep, and M113 on the
 task sweep.
 
+The 16 rev 18 mutants (M17, M33, M115–M128) die in both passes. Ten die
+first on the grid, M123 on the registry test, M116 and M119 on the
+earlier wrapper test, and M17, M120 and M121 on the handler-raised sweep.
+
+Both passes ran on 6 worktrees each, with `PYTHONDONTWRITEBYTECODE=1`. A
+first attempt was discarded. In it, one shard's first mutant (M3, the same
+byte size as the original) was written in the same mtime second as the
+checkout. So the restored `server.py` kept M3's `.pyc`, and every later
+mutant in that shard ran on M3.
+
 ## Non-goals and unverified
 
 - **Non-goals:**
@@ -240,6 +268,18 @@ task sweep.
   - Repr forms the static rule cannot see (`{x}`, `str(x)`, a local).
   - Copied inputs are traced through one assignment hop only.
   - The SDK adapter swap is by name (`mcp` 2.0.x).
+  - An `MCPError` a handler lets escape keeps rev 12's rule: its message
+    and `data` are kept unless they carry a rejected error's text or an
+    input of 4 or more characters. A shorter input, or a reformatted copy,
+    in an `MCPError`'s own message is not caught. pmcp raises no
+    `MCPError` from a validation error itself.
+  - jsonschema's `FormatError` is not registered: pmcp validates with no
+    `format_checker`, so none is raised. A stdlib conversion error
+    (`int("<value>")`) is not registered either; pmcp converts through
+    `pmcp.parsing` (§10).
+  - The rule follows the exception chain. A validation error held in an
+    unchained wrapper's `args` or attributes, raised outside any
+    `except`, is not seen. pmcp builds no such wrapper.
 - **Execution:** effort=low.
   - A panel CR comes before any PR.
   - Commit and PR text says "see Consiliency/pmcp#297", never a closing
@@ -247,7 +287,7 @@ task sweep.
 
 ## Embedding proof
 
-From **this file**: on a fresh worktree of `6edf8a4` (`origin/main`), each of the 47 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@18824c1`. The proof was run again on the final file, with this section in it, and printed the same listing.
+From **this file**: on a fresh worktree of `6edf8a4`, each of the 47 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@b34717e`. The proof was run again on the final file, with this section in it, and printed the same listing.
 
 ```text
 $ git -C <proof worktree> rev-parse --short HEAD
@@ -258,8 +298,8 @@ $ git apply --unidiff-zero --check p/*.patch
 check: ok
 applied
 changed paths == the 47 patched files
-$ git diff --name-only 6edf8a4 origin/main (6edf8a4), against the patched files
-origin/main 6edf8a4: 0 changed paths since 6edf8a4, 0 of them patched here
+$ git diff --name-only 6edf8a4 origin/main (b8e4305), against the patched files
+origin/main b8e4305: 5 changed paths since 6edf8a4, 2 of them patched here
 cmp: 47 of 47 files identical
 ```
 
@@ -278,7 +318,7 @@ done
 git apply --unidiff-zero --check <scratch>/*.patch && git apply --unidiff-zero <scratch>/*.patch
 ```
 
-The patches are `git diff -U0 6edf8a4 18824c1 -- <file>`. To fit the size
+The patches are `git diff -U0 6edf8a4 b34717e -- <file>`. To fit the size
 budget, each is cut to plain unified-diff form: there are no `diff --git`,
 `index` or `new file mode` lines, and no function context in the hunk
 headers. `git apply` reads them the same way; a new file is created with
@@ -327,7 +367,7 @@ print(f"{out}: {j - i - 1} lines")
 @@ -567,0 +568,17 @@
 +- **A value pmcp rejects is no longer echoed into a response, a log line, a traceback or an audit record (Consiliency/pmcp#297).** A rejected gateway-tool argument used to come back with jsonschema's or pydantic's message, which carried the value (`'Bearer sk-…' is not of type 'object'`, `input_value=…`), in the response, the log and the scoped audit. Rejections now read `<JSON path>: <reason>`, for example `Input validation error: $.options: must be of type object or null`. The reason is a fixed phrase filled only from the tool's own schema or model, and a key the caller chose shows as `*`. A call rejected by the argument model is audited as an `audit.rejection`. **Wording change:** a client matching jsonschema phrases such as `is not of type` must match the new form.
 +
-+  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500.
++  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`. An exception that chains a validation or parse error, as its cause or its context, shows only its class and that error's description, never its own message. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500.
 +
 +  Downstream frames:
 +  - A frame that is not JSON-RPC 2.0 is dropped with a value-free DEBUG record and never settles a request. This holds on stdio, SSE and streamable HTTP.
@@ -383,7 +423,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/src/pmcp/argument_errors.py
-@@ -0,0 +1,1365 @@
+@@ -0,0 +1,1412 @@
 +"""Describe a rejected gateway-tool argument without the value that failed.
 +
 +A gateway tool's arguments are checked twice: by the advertised JSON Schema
@@ -884,24 +924,54 @@ print(f"{out}: {j - i - 1} lines")
 +
 +
 +def _is_parse_error(error: BaseException) -> bool:
-+    """A parser's own error. Not :class:`pmcp.parsing.ParseError`, which
-+    subclasses these types so callers' ``except`` clauses keep their meaning
-+    but whose text is value-free by construction (rev 7): it is rendered as
-+    ``str(error)``, source label included."""
-+    from pmcp.parsing import ParseError
-+
++    """Whether a value-bearing error is a parser's (and so is described by
++    :func:`_parse_text`). Which errors are value-bearing at all, and the
++    :class:`pmcp.parsing.ParseError` exemption, are the registry's decision
++    alone (:func:`_is_validation_error`, rev 18)."""
 +    global _PARSE_ERRORS
 +    if not _PARSE_ERRORS:
 +        _PARSE_ERRORS = _parse_error_types()
-+    return isinstance(error, _PARSE_ERRORS) and not isinstance(error, ParseError)
++    return isinstance(error, _PARSE_ERRORS)
++
++
++def _value_bearing_types() -> tuple[type[BaseException], ...]:
++    """The registry of value-bearing exception types (rev 18): every type
++    whose own text, ``repr`` or attributes can carry the input it rejected.
++    It is the one place that decides which exceptions are described from
++    their structure, and which wrappers are never rendered from their own
++    message: pydantic's and jsonschema's validation errors (jsonschema's
++    ``SchemaError`` renders the schema it rejected), and every parser's
++    error (:func:`_parse_error_types`). :data:`_VALUE_FREE_TYPES` is the
++    registry's only exemption."""
++    return (
++        ValidationError,
++        jsonschema.ValidationError,
++        jsonschema.SchemaError,
++        *_parse_error_types(),
++    )
++
++
++_VALUE_BEARING: tuple[type[BaseException], ...] = ()
++
++
++def _value_free_types() -> tuple[type[BaseException], ...]:
++    """Subclasses of registered types whose text is value-free by
++    construction: :class:`pmcp.parsing.ParseError` (rev 7), raised outside
++    the parser's ``except`` so that it chains nothing."""
++    from pmcp.parsing import ParseError
++
++    return (ParseError,)
 +
 +
 +def _is_validation_error(error: BaseException) -> bool:
-+    """A validation *or parse* error: one whose own text can carry the input
-+    it rejected (the parse half since rev 6)."""
-+    return isinstance(
-+        error, (ValidationError, jsonschema.ValidationError)
-+    ) or _is_parse_error(error)
++    """A value-bearing error: an instance of a registered type
++    (:func:`_value_bearing_types`) that is not exempt."""
++    global _VALUE_BEARING
++    if not _VALUE_BEARING:
++        _VALUE_BEARING = _value_bearing_types()
++    return isinstance(error, _VALUE_BEARING) and not isinstance(
++        error, _value_free_types()
++    )
 +
 +
 +def _parse_text(error: BaseException) -> str:
@@ -965,7 +1035,7 @@ print(f"{out}: {j - i - 1} lines")
 +            f"{count} validation error{plural} for {error.title}: "
 +            f"{describe_model_error(error, None, None)}"
 +        )
-+    assert isinstance(error, jsonschema.ValidationError)
++    assert isinstance(error, (jsonschema.ValidationError, jsonschema.SchemaError))
 +    try:
 +        declared = _declared_names()
 +        path = [
@@ -986,33 +1056,42 @@ print(f"{out}: {j - i - 1} lines")
 +
 +
 +def exception_text(error: BaseException) -> str:
-+    """``str(error)``, except where that would carry a validation error's text.
++    """``str(error)``, unless ``error``'s chain holds a value-bearing error.
 +
-+    A pydantic or jsonschema ``ValidationError`` renders the rejected value;
-+    so does any exception whose own text embeds one it chains
-+    (``RuntimeError(f"... {e}") from e``). Either is described from its
-+    structure instead. Every other exception is ``str(error)`` unchanged.
++    A value-bearing error (a registered type, :func:`_value_bearing_types`)
++    is described from its structure. An exception whose ``__cause__`` /
++    ``__context__`` chain (or exception group) holds one, at any depth and
++    whether or not the context is suppressed, is never rendered from its own
++    message: it reads ``<its class name>: <that error's description>``.
++    Whatever built the wrapper's message -- ``f"{e}"``, ``{e!r}``,
++    ``format()``, ``%r``, a slice, ``e.message`` or ``e.instance``, a nested
++    wrapper -- nothing of it is shown, so no form of it can carry the value
++    (rev 18; until rev 17 the message was kept unless it contained
++    ``str(e)``, which ``repr(e)`` evades). Every other exception is
++    ``str(error)`` unchanged.
 +
-+    The embedding check is an exact-substring backstop for wrappers built
-+    with ``f"{e}"``/``f"{e!r}"``. It does not recognise a truncated or
-+    reformatted copy (``str(e)[:200]``, ``e.errors()``), nor validation text
-+    that arrives as a plain string -- which is why pmcp never builds such a
-+    copy (``tests/test_exception_text_sinks.py`` flags the construction
-+    site) and replaces the SDK's stringified parse errors where it receives
-+    them (``pmcp.client.manager._downstream_error``).
++    Text that arrives as a plain string, with no exception chained, is not
++    recognised -- which is why pmcp never builds such a copy
++    (``tests/test_exception_text_sinks.py`` flags the construction site) and
++    replaces the SDK's stringified parse errors where it receives them
++    (``pmcp.client.manager._downstream_error``).
 +    """
 +    if _is_validation_error(error):
 +        return _validation_text(error)
-+    text = str(error)
++    linked = _chained_value_bearing(error)
++    if linked is not None:
++        return f"{type(error).__name__}: {_validation_text(linked)}"
++    return str(error)
++
++
++def _chained_value_bearing(error: BaseException) -> BaseException | None:
++    """The first value-bearing error in ``error``'s chain other than
++    ``error`` itself: through ``__cause__`` and ``__context__`` (suppressed
++    or not) and exception-group members, at any depth."""
 +    for linked in _chain(error):
 +        if linked is not error and _is_validation_error(linked):
-+            try:
-+                embedded = str(linked)
-+            except Exception:
-+                embedded = ""
-+            if embedded and embedded in text:
-+                return f"{type(error).__name__}: {_validation_text(linked)}"
-+    return text
++            return linked
++    return None
 +
 +
 +def message_text(message: str, error: BaseException) -> str:
@@ -1049,7 +1128,7 @@ print(f"{out}: {j - i - 1} lines")
 +                inputs = [item.get("input") for item in linked.errors()]
 +            except Exception:
 +                inputs = []
-+        elif isinstance(linked, jsonschema.ValidationError):
++        elif isinstance(linked, (jsonschema.ValidationError, jsonschema.SchemaError)):
 +            inputs = [linked.instance]
 +        for value in inputs:
 +            # The input whole (as itself, JSON and repr), and every string
@@ -1127,7 +1206,9 @@ print(f"{out}: {j - i - 1} lines")
 +def safe_traceback_text(error: BaseException) -> str:
 +    """The formatted traceback. When the chain holds a validation or parse
 +    error, every exception in it is rendered as its frames (file, line,
-+    source) and ``Type: exception_text(...)`` -- the frames never carry an
++    source) and ``Type: <text>``, where the text is a value-bearing error's
++    description, a wrapper's description of what it chains (never its own
++    message, rev 18) or else ``str()`` -- the frames never carry an
 +    exception's text -- so it stays a usable traceback (rev 6)."""
 +    if safe_exc_info(error) is not None:
 +        return "".join(
@@ -1158,7 +1239,13 @@ print(f"{out}: {j - i - 1} lines")
 +        if current.__traceback__ is not None:
 +            parts.append("Traceback (most recent call last):\n")
 +            parts.extend(traceback.format_tb(current.__traceback__))
-+        parts.append(f"{_qualified_name(type(current))}: {exception_text(current)}\n")
++        # The class is printed once: a wrapper's line is its qualified name
++        # and the description of what it chains (rev 18).
++        linked = (
++            None if _is_validation_error(current) else _chained_value_bearing(current)
++        )
++        text = exception_text(current) if linked is None else _validation_text(linked)
++        parts.append(f"{_qualified_name(type(current))}: {text}\n")
 +
 +    render(error)
 +    return "".join(parts)
@@ -3621,7 +3708,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/tests/test_argument_error_echo.py
-@@ -0,0 +1,2262 @@
+@@ -0,0 +1,2513 @@
 +"""A rejected gateway-tool argument never echoes its value (Consiliency/pmcp#297).
 +
 +The oracle is a generated sweep, not hand-picked cases. Its axes come from the
@@ -4698,6 +4785,257 @@ print(f"{out}: {j - i - 1} lines")
 +    plain = RuntimeError("no validation here")
 +    assert exception_text(plain) == "no validation here"
 +    assert safe_exc_info(plain) is plain
++
++
++# --- rev 18: a wrapper of a value-bearing error is never rendered from its
++# own message (round-16 codex F001: `f"{e!r}"` evaded the substring check).
++# The grid is every leaf type in the registry x every way a wrapper's text
++# can be built from it x `__cause__` / `__context__` / `from None` x chain
++# depth 1-3 x every rendering surface. Two sentinels: one long, and one
++# shorter than any value-matching floor, so the rule cannot be value matching.
++
++
++def _leaf_pydantic(s: str) -> BaseException:
++    try:
++        McpTaskInfo.model_validate({"task_id": {"v": s}})
++    except ValidationError as error:
++        return error
++    raise AssertionError("no error")
++
++
++def _leaf_jsonschema(s: str) -> BaseException:
++    try:
++        jsonschema.validate(s, {"type": "integer"})
++    except jsonschema.ValidationError as error:
++        return error
++    raise AssertionError("no error")
++
++
++def _leaf_schema(s: str) -> BaseException:
++    try:
++        jsonschema.Draft202012Validator.check_schema({"type": s})
++    except jsonschema.SchemaError as error:
++        return error
++    raise AssertionError("no error")
++
++
++def _leaf_yaml(s: str) -> BaseException:
++    import yaml
++
++    try:
++        yaml.safe_load(f"a: b: {s}\n")
++    except yaml.YAMLError as error:
++        return error
++    raise AssertionError("no error")
++
++
++def _leaf_json(s: str) -> BaseException:
++    try:
++        json.loads("{" + s)
++    except json.JSONDecodeError as error:
++        return error
++    raise AssertionError("no error")
++
++
++_GRID_LEAVES: dict[str, Any] = {
++    "pydantic": _leaf_pydantic,
++    "jsonschema": _leaf_jsonschema,
++    "schema_error": _leaf_schema,
++    "yaml": _leaf_yaml,
++    "json": _leaf_json,
++}
++
++
++def _value_attr(error: BaseException) -> Any:
++    """The attribute of `error` that holds what it rejected."""
++    for name in ("instance", "doc"):
++        if hasattr(error, name):
++            return getattr(error, name)
++    if isinstance(error, ValidationError):
++        return error.errors()[0]["input"]
++    mark = getattr(error, "problem_mark", None)
++    return getattr(mark, "buffer", None)
++
++
++def _message_attr(error: BaseException) -> str:
++    """The error's own message field, as a wrapper would read it."""
++    if isinstance(error, ValidationError):
++        return str(error.errors())
++    for name in ("message", "msg"):
++        if isinstance(getattr(error, name, None), str):
++            return str(getattr(error, name))
++    return f"{getattr(error, 'problem', '')} {getattr(error, 'problem_mark', '')}"
++
++
++class _LateStr(Exception):
++    """A wrapper whose text is computed when rendered, from its cause."""
++
++    def __str__(self) -> str:
++        return f"late: {self.__cause__ or self.__context__!r}"
++
++
++_GRID_FORMS: dict[str, Any] = {
++    "fstring": lambda e: f"failed: {e}",
++    "fstring_r": lambda e: f"failed: {e!r}",
++    "fstring_s": lambda e: f"failed: {e!s}",
++    "fstring_a": lambda e: f"failed: {e!a}",
++    "percent_s": lambda e: "failed: %s" % (e,),
++    "percent_r": lambda e: "failed: %r" % (e,),
++    "format": lambda e: "failed: {}".format(e),
++    "format_r": lambda e: "failed: {!r}".format(e),
++    "builtin_format": lambda e: format(e),
++    "ascii": lambda e: ascii(e),
++    "slice": lambda e: str(e)[:60],
++    "repr_slice": lambda e: repr(e)[1:80],
++    "value_attr": lambda e: f"bad value {_value_attr(e)!r}",
++    "value_attr_s": lambda e: f"bad value {_value_attr(e)}",
++    "message_attr": lambda e: f"invalid: {_message_attr(e)}",
++    "args": lambda e: ("failed", e),
++    "late_str": None,
++    "empty": lambda e: "",
++    "unrelated": lambda e: "the request failed",
++}
++
++
++def _wrap(form: str, inner: BaseException, link: str) -> BaseException:
++    """`inner` wrapped once: raised from it, inside its handler, or from None."""
++    kind: type[BaseException] = _LateStr if form == "late_str" else RuntimeError
++    message = None if form == "late_str" else _GRID_FORMS[form](inner)
++    args = (
++        message
++        if isinstance(message, tuple)
++        else (() if message is None else (message,))
++    )
++    try:
++        try:
++            raise inner
++        except BaseException as caught:
++            if link == "cause":
++                raise kind(*args) from caught
++            if link == "suppressed":
++                raise kind(*args) from None
++            raise kind(*args)
++    except BaseException as wrapped:
++        return wrapped
++    raise AssertionError("not raised")
++
++
++def _grid_surfaces(outer: BaseException) -> dict[str, str]:
++    """Every surface that renders `outer`, rendered."""
++    import asyncio
++
++    from pmcp.argument_errors import exception_text, safe_traceback_text
++    from pmcp.server import _described_errors
++
++    factory = logging.getLogRecordFactory()
++    exc_info = (type(outer), outer, outer.__traceback__)
++    records = {
++        "log_msg": factory("pmcp.grid", logging.ERROR, __file__, 1, outer, (), None),
++        "log_args": factory(
++            "pmcp.grid", logging.ERROR, __file__, 1, "failed: %r", (outer,), None
++        ),
++        "log_mapping": factory(
++            "pmcp.grid",
++            logging.ERROR,
++            __file__,
++            1,
++            "failed: %(e)s",
++            ({"e": [outer]},),
++            None,
++        ),
++        "log_exc_info": factory(
++            "pmcp.grid", logging.ERROR, __file__, 1, "failed", (), exc_info
++        ),
++    }
++    out = {name: _record_text(record) for name, record in records.items()}
++    out["exception_text"] = exception_text(outer)
++    out["safe_traceback_text"] = safe_traceback_text(outer)
++
++    async def reject() -> None:
++        raise outer
++
++    try:
++        asyncio.run(_described_errors(reject)())
++    except Exception as raised:
++        out["described_errors"] = f"{type(raised).__name__}: {raised}"
++    return out
++
++
++@pytest.mark.parametrize("sentinel", ["long", "short"])
++@pytest.mark.parametrize("depth", [1, 2, 3])
++@pytest.mark.parametrize("link", ["cause", "context", "suppressed"])
++@pytest.mark.parametrize("leaf", sorted(_GRID_LEAVES))
++def test_a_wrapper_of_a_value_bearing_error_is_never_rendered_from_its_message(
++    leaf: str, link: str, depth: int, sentinel: str
++) -> None:
++    """Whatever form built the wrapper's text, however deep the chain and
++    whichever link holds the error, every surface renders the outermost
++    exception as `<class>: <the leaf's structural description>` and nothing
++    of the value."""
++    from pmcp.argument_errors import (
++        _qualified_name,
++        _validation_text,
++        exception_text,
++    )
++
++    s = _SENTINELS[1] if sentinel == "long" else "Qx7"
++    failures = []
++    for form in _GRID_FORMS:
++        inner = _GRID_LEAVES[leaf](s)
++        description = _validation_text(inner)
++        for _ in range(depth):
++            inner = _wrap(form, inner, link)
++        outer = inner
++        expected = f"{type(outer).__name__}: {description}"
++        surfaces = _grid_surfaces(outer)
++        if exception_text(outer) != expected:
++            failures.append((form, "exception_text", exception_text(outer)))
++        if surfaces.get("described_errors") != f"ValueError: {expected}":
++            failures.append(
++                (form, "described_errors", surfaces.get("described_errors"))
++            )
++        for surface, text in surfaces.items():
++            leaked = (
++                s in text
++                if sentinel == "short"
++                else any(piece in text for piece in _forbidden(s))
++            )
++            if leaked:
++                failures.append((form, surface, text[:200]))
++        last = surfaces["safe_traceback_text"].rstrip("\n").rsplit("\n", 1)[-1]
++        if last != f"{_qualified_name(type(outer))}: {description}":
++            failures.append((form, "traceback last line", last))
++    assert not failures, failures
++
++
++def test_the_value_bearing_registry_is_the_one_decision() -> None:
++    """Every leaf the grid raises is registered; pmcp's own `ParseError` is
++    the exemption, and a wrapper of it -- or of nothing registered -- keeps
++    its own message."""
++    import yaml
++
++    from pmcp.argument_errors import (
++        _is_validation_error,
++        _value_bearing_types,
++        _value_free_types,
++        exception_text,
++    )
++    from pmcp.parsing import ParseError, load_yaml
++
++    registered = _value_bearing_types()
++    for make in _GRID_LEAVES.values():
++        leaf = make("Qx7")
++        assert isinstance(leaf, registered) and _is_validation_error(leaf), leaf
++    assert _value_free_types() == (ParseError,)
++    with pytest.raises(ParseError) as raised:
++        load_yaml("a: b: Qx7\n", source="grid file")
++    assert isinstance(raised.value, yaml.YAMLError)
++    assert not _is_validation_error(raised.value)
++    for link in ("cause", "context", "suppressed"):
++        wrapped = _wrap("fstring", raised.value, link)
++        assert exception_text(wrapped) == f"failed: {raised.value}", link
++        plain = _wrap("fstring", KeyError("missing"), link)
++        assert exception_text(plain) == "failed: 'missing'", link
 +
 +
 +@pytest.mark.parametrize("family", sorted(_FAMILIES))
@@ -9318,7 +9656,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/tests/test_parse_error_echo.py
-@@ -0,0 +1,898 @@
+@@ -0,0 +1,914 @@
 +"""A parse error never echoes the structured text it rejected
 +(Consiliency/pmcp#297; rev 6, reclassified by origin in rev 7).
 +
@@ -9943,7 +10281,10 @@ print(f"{out}: {j - i - 1} lines")
 +        logger.removeHandler(handler)
 +    assert "--- Logging error ---" in err
 +    assert "could not parse YAML (ParserError)" in err, err
-+    assert "OSError: disk gone" in err, err
++    # The handler's own error was raised while the parse error was handled:
++    # its message is withheld, its class kept (rev 18).
++    assert "\nOSError: could not parse YAML (ParserError)" in err, err
++    assert "OSError: disk gone" not in err, err  # the frame's source line is code
 +    assert not any(form in err for form in _forbidden(s)), err
 +
 +
@@ -10122,7 +10463,13 @@ print(f"{out}: {j - i - 1} lines")
 +    assert "yaml.parser.ParserError: could not parse YAML (ParserError)" in (
 +        result.stderr
 +    ), result.stderr
-+    assert "RuntimeError: boom" in result.stderr
++    # A wrapper of a parse error prints what it chains, never its own
++    # message (rev 18).
++    assert (
++        "RuntimeError: could not parse YAML (ParserError) at line 1, column"
++        in result.stderr
++    ), result.stderr
++    assert "boom" not in result.stderr, result.stderr
 +    assert not any(form in result.stderr for form in _forbidden(s)), result.stderr
 +    silent = subprocess.run(
 +        [sys.executable, "-c", script, f"servers: [{s}}}", "no-stderr"],
@@ -10165,12 +10512,19 @@ print(f"{out}: {j - i - 1} lines")
 +    )
 +    assert result.returncode == 1, result.stderr
 +    assert "Traceback (most recent call last)" in result.stderr, result.stderr
-+    assert "RuntimeError: boom" in result.stderr, result.stderr
 +    expected = {
 +        "yaml": "yaml.parser.ParserError: could not parse YAML (ParserError)",
 +        "pydantic": "pydantic_core._pydantic_core.ValidationError: 1 validation error",
 +    }[origin]
 +    assert expected in result.stderr, result.stderr
++    # The wrapper's line is its class and what it chains, once (rev 18).
++    wrapper = {
++        "yaml": "\nRuntimeError: could not parse YAML (ParserError) at line 1, column",
++        "pydantic": "\nRuntimeError: 1 validation error for int: $: must be an integer\n",
++    }[origin]
++    assert wrapper in result.stderr, result.stderr
++    assert "boom" not in result.stderr, result.stderr
++    assert "RuntimeError: RuntimeError" not in result.stderr, result.stderr
 +    assert not any(form in result.stderr for form in _forbidden(s)), result.stderr
 +
 +
@@ -10612,13 +10966,34 @@ print(f"{out}: {j - i - 1} lines")
 
 Run it as `python mutants.py <worktree> <out-dir> [M4 ...]`; `NO_STATIC=1` deselects both sink checks.
 
-To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f` and `360fe3e`, in that order. Then apply this diff (rev 17: M112–M114).
+To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e` and `0dc22a4`, in that order. Then apply this diff (rev 18: M17 and M33 re-anchored, M21 retired, M115–M128 added).
 
 ````diff
 --- a/mutants.py
 +++ b/mutants.py
-@@ -119,0 +120,3 @@
-+ ("M112 invoke looks every answer up as a task (ungated lookup)", H, [("            if task_requested:\n                result = usable_task_response(result)\n                found = task_answer_of(result)\n                if found is not None:\n                    task_info = self._client_manager.get_task_record(\n                        tool_info.server_name, found[1].task_id\n                    )\n", "            if task_requested:\n                result = usable_task_response(result)\n            found = task_answer_of(result)\n            if found is not None:\n                task_info = self._client_manager.get_task_record(\n                    tool_info.server_name, found[1].task_id\n                )\n")]),
-+ ("M113 a task answer sized from the uncleaned answer", (C, H), [(C, "            return usable_task_response(result)\n\n        return result\n", "            return result\n\n        return result\n"), (H, "                result = usable_task_response(result)\n", "                pass\n")]),
-+ ("M114 the invoke gate reads only the task argument", H, [("        task_requested = effective_task_mode(tool_info, parsed.task)\n", "        task_requested = parsed.task is not None\n")]),
+@@ -38 +38 @@
+- ("M17 exception_text skips validation errors", A, [("    if _is_validation_error(error):\n        return _validation_text(error)\n    text = str(error)\n", "    text = str(error)\n")]),
++ ("M17 exception_text skips validation errors", A, [("    if _is_validation_error(error):\n        return _validation_text(error)\n    linked = _chained_value_bearing(error)\n", "    linked = _chained_value_bearing(error)\n")]),
+@@ -42 +41,0 @@
+- ("M21 exception_text ignores an embedded validation error", A, [("            if embedded and embedded in text:\n", "            if False:\n")]),
+@@ -54 +53 @@
+- ("M33 parse errors not treated as value-bearing", A, [("    ) or _is_parse_error(error)\n", "    )\n")]),
++ ("M33 parse errors not treated as value-bearing", A, [("        *_parse_error_types(),\n", "")]),
+@@ -62 +60,0 @@
+- ("M41 ParseError rendered as a raw parse error", A, [("    return isinstance(error, _PARSE_ERRORS) and not isinstance(error, ParseError)\n", "    return isinstance(error, _PARSE_ERRORS)\n")]),
+@@ -122,0 +121,14 @@
++ ("M115 the rev 17 substring check restored (a repr-wrapped error rendered)", A, [("        if linked is not error and _is_validation_error(linked):\n            return linked\n", "        if linked is not error and _is_validation_error(linked) and str(linked) in str(error):\n            return linked\n")]),
++ ("M116 exception_text renders a wrapper from its own message", A, [("    if linked is not None:\n        return f\"{type(error).__name__}: {_validation_text(linked)}\"\n    return str(error)\n", "    return str(error)\n")]),
++ ("M117 the chain is looked at one link deep", A, [("    for linked in _chain(error):\n        if linked is not error and _is_validation_error(linked):\n            return linked\n", "    for linked in (error.__cause__, error.__context__):\n        if linked is not None and _is_validation_error(linked):\n            return linked\n")]),
++ ("M118 the chain followed through __cause__ only", A, [("        if linked is not error and _is_validation_error(linked):\n            return linked\n", "        if linked is not error and _is_validation_error(linked) and error.__cause__ is not None:\n            return linked\n")]),
++ ("M119 a suppressed context (from None) not followed", A, [("        if linked is not error and _is_validation_error(linked):\n            return linked\n", "        if linked is not error and _is_validation_error(linked) and not error.__suppress_context__:\n            return linked\n")]),
++ ("M120 pydantic dropped from the registry", A, [("        ValidationError,\n        jsonschema.ValidationError,\n", "        jsonschema.ValidationError,\n")]),
++ ("M121 jsonschema ValidationError dropped from the registry", A, [("        jsonschema.ValidationError,\n        jsonschema.SchemaError,\n", "        jsonschema.SchemaError,\n")]),
++ ("M122 SchemaError dropped from the registry", A, [("        jsonschema.SchemaError,\n        *_parse_error_types(),\n", "        *_parse_error_types(),\n")]),
++ ("M123 the exemption removed (ParseError value-bearing)", A, [("    return (ParseError,)\n", "    return ()\n")]),
++ ("M124 the exemption covers every parse error", A, [("    return (ParseError,)\n", "    return (ParseError, *_parse_error_types())\n")]),
++ ("M125 the traceback renders a wrapper node from its own message", A, [("        text = exception_text(current) if linked is None else _validation_text(linked)\n", "        text = exception_text(current) if linked is None else str(current)\n")]),
++ ("M126 _described_errors' non-MCP branch raises str(error)", S, [("                replacement = ValueError(described)\n", "                replacement = ValueError(str(error))\n")]),
++ ("M127 the log scrubber renders an argument wrapper as str()", A, [("        return exception_text(value) if safe_exc_info(value) is None else value\n", "        return (exception_text(value) if _is_validation_error(value) else str(value)) if safe_exc_info(value) is None else value\n")]),
++ ("M128 the exc_info scrub appends the wrapper's own text", A, [("            record.msg = f\"{message} ({exception_text(error)})\"\n", "            record.msg = f\"{message} ({error})\"\n")]),
 ````
