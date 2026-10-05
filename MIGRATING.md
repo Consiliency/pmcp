@@ -1051,12 +1051,14 @@ disconnects, restarts, refreshes or shutdowns are sometimes cancelled or time ou
 
 **What changed.** A teardown whose caller is cancelled now finishes
 synchronously: pmcp SIGKILLs the server's process group (so its children die
-too) instead of sending SIGTERM and waiting. Shutdown does the same when its
-10-second budget runs out. An uncancelled teardown is unchanged: SIGTERM, then
-SIGKILL after the grace period.
+too) instead of waiting out the SIGTERM grace period; if the cancel arrives
+during that wait, SIGTERM has already been sent and the kill follows at once.
+Shutdown does the same when its 10-second budget runs out. An uncancelled
+teardown is unchanged: SIGTERM, then SIGKILL after the 5-second grace period.
 
 **What to do.** Nothing, for most servers. If a server must flush on exit, stop
-it with an uncancelled `gateway.disconnect_server` (or `pmcp` CLI command) and
+it with an uncancelled `gateway.disconnect_server` call (there is no `pmcp`
+subcommand that disconnects a single server) and
 let it return before stopping the gateway, and give the service manager a stop
 timeout longer than the gateway's 10-second shutdown budget.
 
