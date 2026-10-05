@@ -1,54 +1,61 @@
 # Detailed plan: an overlay never hides another server from discovery — weights from the base manifest, and one entry never takes down the others (Consiliency/pmcp#342)
 
 > Written on main `c9206a9` (dev0, a team host), worktree `pmcp-342`, branch
-> `plan/342-catalog-overlay`. For revision 5, `origin/main` was re-fetched and is
-> `2adcd9a`. It adds Consiliency/pmcp#348's auth change in `src/pmcp/auth*.py` and auth
-> tests, and no file this plan touches. The embedding proof and the full suite below run
-> on `2adcd9a`. Every number below was measured this session on one of:
+> `plan/342-catalog-overlay`. For revision 6, `origin/main` was re-fetched and is
+> `6edf8a4` (Consiliency/pmcp#330's task-units change). It touches `handlers.py`,
+> `server.py`, `client/manager.py` and `environment.py` near this patch. The rev-6 patch was
+> merged onto it three-way with no conflict; only one context line differs, and the
+> patch's own added and removed lines are byte-identical to the `b2884db` version. The
+> embedding proof, the new module and the full suite below run on `6edf8a4`. The mutation
+> table was measured on `31d0f40` with the same hunks, and every one of its 59 anchors
+> matches exactly once on `6edf8a4`. Every number below was measured this session on one
+> of:
 > - main;
 > - the commit before the manifest cache (`a622ec5`);
-> - the rev-1 to rev-4 spikes;
-> - the rev-5 spike.
+> - the rev-1 to rev-5 spikes;
+> - the rev-6 spike.
 >
 > The spike was then removed, and this PR carries only this file.
 >
 > **Bounded-plan verdict: within threshold, larger than rev 1.**
-> - Source: eight files change (+881/−225: `cli_commands/secrets.py` +38/−22, `client/manager.py` +16/−1, `config/loader.py` +64/−4, `manifest/environment.py` +26/−8, `manifest/loader.py` +473/−30, `manifest/matcher.py` +105/−62, `server.py` +6/−17, `tools/handlers.py` +153/−81).
-> - Tests: one module is new (`tests/test_catalog_overlay_discovery.py`, 212 tests).
->   Three existing tests are migrated, because the entries they load are now skipped or no
->   longer named in a log (D4, D9).
-> - Docs: one CHANGELOG bullet and one README paragraph.
+> - Source: eight files change (+1020/−252: `cli_commands/secrets.py` +38/−22, `client/manager.py` +16/−1, `config/loader.py` +64/−4, `manifest/environment.py` +26/−8, `manifest/loader.py` +553/−31, `manifest/matcher.py` +127/−64, `server.py` +6/−17, `tools/handlers.py` +190/−105).
+> - Tests: one module is new (`tests/test_catalog_overlay_discovery.py`, 271 tests).
+>   Three existing tests are migrated (D4, D9).
+> - Docs: one CHANGELOG bullet, one CHANGELOG upgrade note, and one README paragraph.
 > - It is still one conceptual change: an overlay can add to discovery, and one entry can
 >   never take the rest down.
 >
-> **Revision 5** (2026-10-04): board round 4 on `f1d6bad` (Consiliency/pmcp#343). Every
-> round-3 fix held, and gemini agreed. There were two blocking findings and three notes:
-> - **B9 (codex F002, grok F001)**: a YAML *parse* error from an overlay was logged with
->   PyYAML's message. That message quotes the offending source line, so a secret pasted into
->   a malformed overlay reached a WARNING. The class covers every place where a YAML or parse
->   error from overlay or manifest input becomes text. Those places were derived by grep
->   (`derive5.txt`), and each now emits only the path, the error class, and the line and
->   column. The D9 sweep now includes malformed documents generated from the YAML grammar
->   (D9; mutants Y1–Y3).
-> - **B10 (codex F001)**: the check validated a throwaway model and kept the raw YAML value.
->   `command: !!binary bnB4` (bytes) passed, inheritance copied the bytes, and
->   `filter_self_references` raised for every config. **Parse, don't validate**: an overlay
->   entry must be JSON-native, and the entry that is kept carries the validated, converted
->   values of each consumer's own model. No consumer reads a raw value. A YAML-tag walk
->   (`!!binary`, timestamps, `!!set`, `!!omap`, `!!float`, `.inf`, `.nan`, `!!python/*`,
->   merge keys) over every field confirms it (D4; mutants P1–P6).
-> - **Claude F001**: an overlay CLI whose keywords covered a category answered
->   `request_capability` before the category tier, which hid every category server. Now an
->   overlay CLI answers only when the category tier finds no server, and a shipped CLI keeps
->   main's precedence. The differential now generates overlay CLIs too (D2; mutants K1, K2).
-> - **N1**: a local entry's metadata URLs, `headers`, `declared_scopes` and
->   `supports_url_elicitation` are now checked and converted through the remote auth model,
->   whatever the transport (D4).
-> - **N2**: counts are exact and re-measured on `2adcd9a`.
-> - **N3**: the derivation's limit is stated, with the generic-reader greps as evidence.
-> - **The rev-4 full-suite failure is pinned down.** It is a pre-existing orphaned task from
->   `tests/test_progressive_disclosure.py`, which the patch does not cause. See
->   *The rev-4 full-suite failure*.
+> **Revision 6** (2026-10-04): board round 5 on `4798034` (Consiliency/pmcp#343). Codex
+> and gemini reviewed, grok timed out, and claude disagreed. The field walk (1039 cases),
+> the value-free parse warnings, the category-tier fix and the flake attribution all held.
+> Rev 6 fixes three blocking findings and checks one note:
+> - **B11 (claude F001, codex F003)**: an overlay CLI named like a shipped server won
+>   `request_capability`'s *name* tier, for 23 of 107 shipped names on rev 5 (98 on main).
+>   Rev 5 had gated one tier. Rev 6 applies **one rule where CLI and server results are
+>   combined: an overlay CLI ranks below every server tier**, in `request_capability` and
+>   `match_capability`. `catalog_search` never combines them. The tiers are derived from
+>   the code (*Every discovery tier, derived*). The differential now generates an overlay
+>   CLI for every shipped server name, every category word and every shipped keyword (D2;
+>   mutants K1, K3, K4).
+> - **B12 (codex F002, claude F002)**: the JSON-native check named an arbitrary overlay key
+>   in its WARNING, and dropped entries main loads (`added: 2026-10-04`). Now only the
+>   schema fields the parsers read are checked (`_SERVER_SCHEMA_KEYS` / `_CLI_SCHEMA_KEYS`,
+>   derived from the parsers' source by a test). Unknown keys are ignored, as on main. A
+>   field that is stored but never consumed drops to its default and keeps its entry, and
+>   a rejection names only the schema field (D4; J1–J3).
+> - **B13 (codex F001)**: a YAML *constructor* error (`!!int x` → `ValueError`, `!!bool x` →
+>   `KeyError`, `!!timestamp x` → `AttributeError`) escaped the overlay parser, which caught
+>   only `YAMLError`. It stopped the shipped manifest from loading, and its text quoted the
+>   value. The parse boundary now contains **every** exception value-free, and a generated
+>   sweep runs 15 invalid-tag documents as user, env and project overlays (D9; E1).
+> - **Gemini's note**: the quoted `kw in category_keywords.get(best_cat, [])` is **not in
+>   the code**. A grep of the rev-5 patch, and of the tree, finds no CLI comparison in
+>   `get_servers_in_category`. `search_by_keyword`'s `matching_clis` compares strings. A
+>   test pins that category selection reads no CLI.
+>
+> **Revision 5** (2026-10-04): board round 4 on `f1d6bad`. Value-free YAML parse errors;
+> parse, don't validate; overlay CLIs kept off the category tier; the rev-4 full-suite
+> failure attributed to a pre-existing leak in `tests/test_progressive_disclosure.py`.
 >
 > **Revision 4** (2026-10-04): board round 3 on `403d7e1`. Every cross-server statistic is
 > base-only, and every field is checked against every consumer that reads it. Both sets
@@ -58,8 +65,16 @@
 > main's keyword counting was restored, and the check runs only what consumers run.
 >
 > **Revision 2** (2026-10-03): board round 1 on `bd5c25f`. Consumer-model checks and
-> per-consumer guards replaced a hand-written field list; `null` is treated as absent; the
-> docs say "within the result limit".
+> per-consumer guards; `null` as absent; "within the result limit".
+
+## Round 5 board findings (Consiliency/pmcp#343 @ `4798034`)
+
+| finding | seat | reproduced (rev-6 tests on the rev-5 patch) | resolution |
+|---|---|---|---|
+| **B11** an overlay CLI named like a shipped server wins the name tier (`airbnb`, `redis`; 23 of 107 names) | claude F001, codex F003 | yes: both falsifiers and the all-terms differential fail on rev 5 (and on main) | D2: one rule at the CLI/server combination point. Overlay CLIs are excluded from the shipped-CLI tier and answer only after every server tier. K1, K3, K4 |
+| **B12** the JSON-native check echoes an overlay key and drops entries main loads | codex F002, claude F002 | yes: both falsifiers, the 5 stored-only cases and the schema-key derivation fail on rev 5 | D4: schema fields only; unknown keys ignored; stored-only fields fall back to their default; messages name schema fields only. J1–J3 |
+| **B13** a YAML constructor error (`ValueError`, `KeyError`, `AttributeError`) escapes the parse boundary, stops the shipped manifest, and quotes the value | codex F001 | yes: codex's `_build_manifest` falsifier and 12 of 45 invalid-tag cases (`!!int`, `!!bool`, `!!timestamp`, `!!float` × user/env/project) fail on rev 5; the other 33 were already `YAMLError`s | D9: the overlay parse contains every exception and logs path, class and position. E1 |
+| gemini: `kw in category_keywords.get(best_cat, [])` never matches | gemini | not present: no such expression exists in the rev-5 patch or the tree (grep) | `test_gemini_note_category_selection_reads_no_cli` pins that category selection reads no CLI |
 
 ## Round 4 board findings (Consiliency/pmcp#343 @ `f1d6bad`)
 
@@ -388,7 +403,7 @@ named here and not built.
 
 ### The test surface this touches
 
-- **New:** `tests/test_catalog_overlay_discovery.py` (212 tests).
+- **New:** `tests/test_catalog_overlay_discovery.py` (271 tests).
 - **Migrated** (verbatim patch below):
   - `tests/test_version_pin.py`:
     - `test_a_pin_on_a_malformed_entry_costs_only_that_entry` (3 cases). An int in `args`,
@@ -401,7 +416,7 @@ named here and not built.
 - **Unchanged and passing:** `tests/test_manifest.py`'s IDF tests (hand-built manifests,
   main's weighting) and `tests/test_manifest_cache.py` (47).
 - **Touched suites, by name (24 files):** `tests/test_catalog_overlay_discovery.py`, `tests/test_client_manager.py`, `tests/test_client_manager_reconnect.py`, `tests/test_config_loader.py`, `tests/test_credential_gates_handlers.py`, `tests/test_credential_gates_startup.py`, `tests/test_credential_optionality_e2e.py`, `tests/test_env_overlay_provenance.py`, `tests/test_lazy_start.py`, `tests/test_manifest.py`, `tests/test_manifest_cache.py`, `tests/test_manifest_overlay.py`, `tests/test_manifest_provision.py`, `tests/test_offline_discovery.py`, `tests/test_phase4_e2e.py`, `tests/test_project_source_consent_manifest.py`, `tests/test_scoped_advisor_audit.py`, `tests/test_server.py`, `tests/test_startup_policy_reapproval.py`, `tests/test_startup_resolver.py`, `tests/test_tools.py`, `tests/test_trust_cli.py`, `tests/test_version_pin.py`, `tests/test_secrets_command.py`.
-  Result: **2430 passed, 1 skipped, 19 deselected, 0 failed** (370.72 s; on 2adcd9a + the rev-5 patch).
+  Result: **2489 passed, 1 skipped, 19 deselected, 0 failed** (874.68 s, on b2884db + the same hunks); on 6edf8a4 the full suite (step 8) covers them.
 
 ### Cost
 
@@ -411,6 +426,30 @@ named here and not built.
 - The rev-3 consumer check costs 1.2 ms for all 107 shipped servers and 12 CLIs, or
   about 0.01 ms per entry. Shipped entries are not checked at load; they are checked by a
   test. An overlay pays that once per entry per cache miss.
+
+### Every discovery tier, derived (rev 6)
+
+Derivation: every `return CapabilityResolution(` in `request_capability`, in source order,
+and the result lists of `catalog_search` and `_keyword_match` (`match_capability`). `awk`
+over `handlers.py` / `matcher.py`.
+
+| entry point | tier (in order) | what answers | overlay CLI, rev 6 |
+|---|---|---|---|
+| `request_capability` | 1. name | a manifest server whose normalised name is in the query; yields to a colliding **shipped** CLI unless the query says "server"/"mcp"/… (main) | cannot collide: `name_match_collides_with_cli` sees only shipped CLIs |
+| | 2. shipped CLI (`use_cli`) | the first available **shipped** CLI hint | excluded |
+| | 3. category (`pick_from_category`) | the base-only category tier (D2) | — |
+| | 4. configured server | a `.mcp.json` server by keyword | — |
+| | **5. overlay CLI (`use_cli`)** | **the first available overlay CLI hint: only here, after every server tier** | answers |
+| | 6. registry | only for an unknown PascalCase service | — |
+| | 7. `not_available` | — | — |
+| `catalog_search` | separate lists | `results` (tools), `manifest_candidates`, `registry_candidates`, `cli_hints` | in `cli_hints` only. CLI and server results are never combined, so nothing to rank |
+| `match_capability` / `_keyword_match` | single best | shipped CLIs and servers, best score ≥ 0.2 (CLI preferred on ties, as on main) | considered only if neither a shipped CLI nor a server reaches 0.2 |
+
+The rule is stated once, at the combination point, and not per tier. Overlay CLIs are
+removed from the shipped-CLI candidate, `cli_hint_match`, before any tier reads it. They
+come back in exactly one place, after the last server tier. That also covers tiers added
+later: a new server tier placed before step 5 outranks overlay CLIs without further
+change.
 
 ### The rev-4 full-suite failure, pinned down (rev 5)
 
@@ -554,6 +593,30 @@ keeps main's precedence (tested with `git commits`). The differential now includ
 overlay-CLI documents: a new CLI, an override of `git`, and a CLI declaring the whole
 category vocabulary. Each is marked available, against every category-vocabulary query.
 
+*Superseded by rev 6: the rev-5 gate covered only the category tier.*
+
+**An overlay CLI ranks below every server tier (rev 6, B11).** Rev 5 suppressed an overlay
+CLI only when the category tier would find servers, so an overlay CLI named like a shipped
+server still won the name tier (`name_match_collides_with_cli`). Rev 6 uses the derived
+tier table above:
+- `cli_hint_match` holds **shipped** CLIs only, so the name-tier collision and the
+  shipped-CLI tier keep main's behaviour exactly;
+- `overlay_cli_match` answers only after the name, category and configured-server tiers;
+- `_keyword_match` (`match_capability`) considers overlay CLIs only when nothing else
+  reaches its threshold;
+- `catalog_search` never combines the two.
+
+The differential `test_no_overlay_cli_outranks_a_server_or_a_shipped_cli_anywhere` builds
+one overlay CLI per discovery term. That is every shipped server name (with the CLI named
+like the server), every category word and name, and every shipped keyword
+(606 terms), all available at once. For every term it asserts:
+- `request_capability` keeps every server candidate, and keeps every shipped-CLI answer;
+- `catalog_search`'s manifest candidates are unchanged;
+- `match_capability` keeps its server or shipped-CLI match.
+
+It also asserts that an overlay CLI still answers where nothing else did (not vacuous).
+
+
 ### D3. Carry the base weights through `_build_manifest_with_config_servers`
 
 `request_capability` builds a merged view with `.mcp.json`-only servers
@@ -615,7 +678,7 @@ Consequences:
 - **Rev 5: parse, don't validate (codex F001).** Rev 4 built each consumer's model, threw
   the result away, and kept the raw YAML value, which a consumer could read unconverted.
   Rev 5 takes two steps:
-  1. **The entry must be JSON-native** (`_require_json_native`): str, int, finite float,
+  1. **The entry must be JSON-native** (`_schema_fields`): str, int, finite float,
      bool, null, lists, and mappings with string keys, which is the value space of a
      `.mcp.json` entry. YAML-only types (`!!binary` bytes, timestamps, `!!set`, `!!omap`
      pairs, `.inf`/`.nan`) reject the entry with a value-free reason. `!!python/*` tags
@@ -641,6 +704,22 @@ Consequences:
   `RemoteMcpServerConfig` (with a placeholder URL when it has none), and its values are
   kept. A local `oidc_issuer_url: 5` or `supports_url_elicitation: maybe` is skipped.
   `"true"` is kept as `True`.
+- **Rev 6: only the schema fields are checked (B12).** Rev 5 required the *whole* entry to
+  be JSON-native. So an unread key the operator added (`added: 2026-10-04`, a YAML date)
+  dropped the entry, which main loads, and the rejection message named that free-text
+  key. Rev 6:
+  - **checks only `_SERVER_SCHEMA_KEYS` / `_CLI_SCHEMA_KEYS`**, exactly the keys
+    `_parse_server_config` and `_parse_cli_alternative` read. A test derives the sets from
+    the parsers' own source, every `data.get("<key>")`, and asserts equality, so a new
+    field cannot be missed;
+  - **ignores unknown keys**, as main does;
+  - **drops to the default a stored-only field** (`discovery_metadata`,
+    `discovery_diagnostics`, `status`, `source`, `replacement`) holding a non-JSON value,
+    and keeps the entry. These are parsed and stored but read by no consumer; the only
+    reader of the last three, `sync_registry_to_manifest`, has no in-tree caller;
+  - **rejects the entry** when a consumed field holds a non-JSON value. The message is
+    `'<schema field>' holds a value that is not JSON`, which names no overlay key or
+    value.
 
 ### D5. No change to consent or the cache key
 
@@ -724,11 +803,25 @@ consumer derivation:
   for example `Configured server '<name>': ignoring its manifest defaults (…)` (rev 4).
 
 **How:**
+- **Every exception from the YAML load (rev 6, B13).** The overlay parse catches every
+  exception, not only `YAMLError`. With PyYAML 6.0.3 a constructor raises `ValueError`
+  (`!!int x`, `!!float x`), `KeyError` (`!!bool x`; its text is the value, lowercased) or
+  `AttributeError` (`!!timestamp x`), and one escaping the parser stopped the shipped
+  manifest from loading. The whole overlay is skipped with `yaml_error_text`: the class,
+  plus the line and column when the exception carries a mark. Shipped servers keep
+  loading. The sweep `test_an_invalid_tag_is_contained_without_any_value` covers
+  `!!int`, `!!float`, `!!bool`, `!!timestamp`, `!!binary`, `!!set`, `!!omap`, `!!pairs`,
+  `!!map`, `!!seq`, `!!str` on a mapping, a custom tag, `!!python/*`, and scalar and
+  list-of-scalar merge keys. Each carries the sentinel, and each runs as a user, env and
+  project overlay (45 cases). The sentinel never appears, case-insensitively, in any
+  record at DEBUG. `!!binary` decodes leniently, so it reaches the entry check and is
+  skipped there.
 - **YAML and parse errors (rev 5).** `grep -rnE "YAMLError|safe_load|load_yaml|yaml\.load|_parse_trusted_(yaml|document)\(|MarkedYAMLError" src/pmcp`
   (`derive5.txt`) finds every YAML parse site. These are the overlay or manifest input
   sites:
-  - the overlay parse (`_parse_overlay_document`): it now logs the path and
-    `yaml_error_text(exc)`, which is the class plus line and column;
+  - the overlay parse (`_parse_overlay_document`): it now catches every exception (rev 6)
+    and logs the path and `yaml_error_text(exc)`, which is the class plus line and
+    column when known;
   - the base or explicit-path parse (`_build_manifest`): it raises to its caller, and the
     callers that log (`server.py` startup, `gateway.refresh`, `load_configs`) now log only
     the class;
@@ -806,7 +899,10 @@ The CHANGELOG and README wording now says "within the result limit".
   - `_canonical_server` and `_canonical_cli` (D4);
   - `_rejection_reason`, `_shipped_cli_names` and `_cli_label` (D9);
   - `_category_keyword_norms` (G10).
-- Rev 5: `yaml_error_text` (D9); `_require_json_native`, `_canonical_server` and
+- Rev 6: `_SERVER_SCHEMA_KEYS`, `_CLI_SCHEMA_KEYS`, `_STORED_ONLY_KEYS`, `_is_json_native`
+  and `_schema_fields` replace rev 5's whole-entry check (D4). The overlay parse catches
+  every exception from the YAML load (D9).
+- Rev 5: `yaml_error_text` (D9); `_schema_fields`, `_canonical_server` and
   `_canonical_cli` replace the two check functions, and `_parse_overlay_document` keeps
   their canonical result (D4). The `Manifest.overlay_cli_names` field records every CLI an
   overlay added or replaced (D2).
@@ -822,14 +918,17 @@ The CHANGELOG and README wording now says "within the result limit".
 - `_manifest_keyword_weights` returns the base weights.
 - `rank_cli_hints`' body moves unchanged into `_rank_one_cli`, which builds its `CLIHint`
   from `cli_hint_fields`. Each CLI is guarded (G4).
-- `_keyword_match` guards each server (G7).
+- `_keyword_match` guards each server (G7). Rev 6: it considers overlay CLIs only when
+  neither a shipped CLI nor a server reaches the threshold (D2).
 
 ### `src/pmcp/tools/handlers.py` (modify)
 - `_build_manifest_with_config_servers` carries the base weights and, in rev 4, the base
   category statistics (D3).
 - Rev 4: `request_capability`'s name index keeps the base name on a normalised tie.
-- Rev 5: `_names_an_unknown_service` (the shared PascalCase pre-check); the CLI tier skips
-  an overlay CLI when the category tier finds servers (D2). `gateway.refresh` logs a
+- Rev 6: `cli_hint_match` holds shipped CLIs only, and `overlay_cli_match` answers after
+  every server tier; `_use_cli_resolution` is shared by both (D2, which replaces rev 5's
+  category-only gate). `_names_an_unknown_service` (rev 5) is the shared PascalCase
+  pre-check. `gateway.refresh` logs a
   manifest-load failure by class only (D9).
 - `_manifest_candidates_for_query` builds its candidate from `manifest_candidate_fields`,
   guards scoring (G2) and the build (G3), and fills the limit from the next-best entry.
@@ -865,7 +964,7 @@ The CHANGELOG and README wording now says "within the result limit".
 - `Registered lazy server` names a manifest-derived server by its label (`_lazy_log_name`,
   D9).
 
-### `tests/test_catalog_overlay_discovery.py` (new, 212 tests; verbatim below)
+### `tests/test_catalog_overlay_discovery.py` (new, 271 tests; verbatim below)
 - **R1, as in rev 1:**
   - the end-to-end approve and revoke through the real CLI, loader and consent gate;
   - no query in any state;
@@ -885,6 +984,12 @@ The CHANGELOG and README wording now says "within the result limit".
   - the three "stricter consumer" derivation tests and their control.
 - **The second line:** one test per guard, G1–G11, F3 and F4, each with a hand-built bad
   entry that bypasses the parse-time check.
+- **Rev 6:**
+  - both round-5 B11 falsifiers (`airbnb`, `redis`);
+  - the all-terms overlay-CLI differential;
+  - the gemini-note test;
+  - both B12 falsifiers, the stored-only fields, and the schema-key derivation;
+  - the 45-case invalid-tag sweep and codex's `_build_manifest` falsifier.
 - **Rev 5:**
   - the malformed-YAML sweep (14 grammar-derived documents × user/env/project) and
     codex's F002 falsifier;
@@ -913,8 +1018,8 @@ The CHANGELOG and README wording now says "within the result limit".
 
 ## Documentation impact
 
-- `CHANGELOG.md`: one bullet under `## [Unreleased]` → `### Fixed` (`CHANGELOG.md:439` on
-  `c9206a9`, verified to sit under `[Unreleased]`):
+- `CHANGELOG.md`: one bullet under `## [Unreleased]` → `### Fixed` (`CHANGELOG.md:567` on
+  `6edf8a4`, verified to sit under `[Unreleased]`):
 
   > **An overlay no longer hides other servers from discovery, and one bad overlay entry no
   > longer takes down the others.** Discovery weighs a keyword by how many servers declare
@@ -941,7 +1046,17 @@ The CHANGELOG and README wording now says "within the result limit".
   > [Consiliency/pmcp#342](https://github.com/Consiliency/pmcp/issues/342).
 
   Never put a closing keyword next to the number.
-- `README.md` § "Private manifest overlay", the "fail-soft" paragraph (`README.md:1157`).
+- `CHANGELOG.md` `### Upgrade notes` (`CHANGELOG.md:10` on `6edf8a4`; "Things 2.7.3 accepted
+  that 2.8.0 refuses"), one bullet:
+
+  > - **An overlay entry that part of pmcp would fail on is skipped when the overlay is
+  >   read**, with a WARNING naming the field, for example an `args` or `command` that is
+  >   not a string, or a `cli_alternatives` entry with an empty `check_command`. Before,
+  >   it loaded and then made `catalog_search` fail, or stopped startup and
+  >   `gateway.refresh` for every server. An overlay CLI no longer outranks a server in
+  >   `gateway.request_capability`. *Fixed*
+- `README.md` § "Private manifest overlay", the "fail-soft" paragraph (`README.md:1261` on
+  `6edf8a4`).
   Replace "a malformed file or a single bad entry logs a warning and is skipped" with:
 
   > "a malformed file logs a warning and is skipped; so does a single entry that pmcp could
@@ -964,7 +1079,9 @@ The CHANGELOG and README wording now says "within the result limit".
 
 ## Dependencies & order
 
-1. Applies to `2adcd9a` (re-fetched for rev 5; no file this plan touches differs from `c9206a9`). Consiliency/pmcp#298 is already on
+1. Applies to `6edf8a4` (re-fetched for rev 6). The source patch below is the three-way
+   merge onto it, with no conflict, and applies with `git apply`. Consiliency/pmcp#330's
+   task-units change sits next to it in `handlers.py` and `server.py` with no overlap. Consiliency/pmcp#298 is already on
    main (PR 337). The other open change in this area is Consiliency/pmcp#297
    (`origin/plan/297-validation-echo` @ `48b7a89`, compared in rev 1):
    - Its `loader.py` hunks are the YAML parse sites, `_shipped_manifest_entries`, and
@@ -981,12 +1098,19 @@ The CHANGELOG and README wording now says "within the result limit".
      If #297 lands first, the overlay parse may call `load_yaml` and keep
      `yaml_error_text`'s output, or #297's equivalent, provided that the sweep
      `test_a_malformed_overlay_is_reported_without_any_value` and Y1 still pass.
+   - **Consiliency/pmcp#314 overlap, re-checked for rev 6.** #297's `load_yaml` wraps the
+     parse and makes YAML errors value-free through `exception_text`. Rev 6 adds one
+     requirement that whichever lands second must keep: the overlay parse boundary
+     contains **every** exception from the load, not only `YAMLError` (codex F001, E1). If
+     `load_yaml` re-raises constructor errors as its own type, the overlay parse must still
+     catch them; the sweep `test_an_invalid_tag_is_contained_without_any_value` and E1
+     check it.
 2. Within the plan, apply the source patch, the new module and the test migration
    together: the migration fails without the source patch, and the source patch fails the
    three migrated tests without it.
 3. Docs last.
 
-## Verification (measured this session on the rev-5 spike; the implementer re-runs each step)
+## Verification (measured this session on the rev-6 spike; the implementer re-runs each step)
 
 Run from the worktree. Before running:
 - A fresh worktree needs `uv sync --all-extras -p 3.10` first.
@@ -994,61 +1118,57 @@ Run from the worktree. Before running:
   `env -u npm_config_cache -u npm_config_store_dir -u pnpm_config_store_dir`.
 - `mkdir -p` the basetemp first. Keep it off `/tmp`, outside the checkout, readable all the
   way up, and under no `.git`. This session used `/var/tmp/pmcp-342-bt-viperjuice`.
-- Check `df -h /mnt/workspace` before a long run. During rev 5 the shared volume reached 0
-  bytes free. A full run died at 13%, and a `git apply -R` in progress truncated two test
-  files in the scratch tree. Those were restored with `git show HEAD:<path> > <path>`.
+- Check `df -h /mnt/workspace` before a long run.
 - Detach long runs with `setsid nohup … < /dev/null &`, and stop them by PID, never with
-  `pkill -f`.
+  `pkill -f`. Restore a mutated file from the driver's `.saved342` copy, and verify the
+  restore by comparing `git diff -- src | sha256sum` with the snapshot's sha256 (done twice
+  this session).
 
 ```bash
-# 1. The new module: red on main and on rev 4, green on rev 5
+# 1. The new module: red on main and on rev 5, green on rev 6
 uv run pytest tests/test_catalog_overlay_discovery.py -q -p no:cacheprovider --no-cov --cov-fail-under=0
-#   rev-5 spike: 212 passed
-#   same file on main 2adcd9a:     148 failed, 64 passed (the 64 pin main's behaviour: must-load, main-weighting, controls)
-#   same file on the rev-4 patch:  63 failed, 149 passed: the 42 malformed-YAML cases, 6 of 8 YAML-tag cases, the 3 overlay-CLI differential cases, the 3 round-4 falsifiers, the catch-site, validated-value, inherited-converted, two metadata-field, provenance, config-view and two shipped-canonical tests (the last two call functions rev 4 does not have)
+#   rev-6 spike: 271 passed
+#   same file on main b2884db:     200 failed, 71 passed (the 71 pin main's behaviour: must-load, main-weighting, controls, no-query)
+#   same file on the rev-5 patch:  25 failed, 246 passed: exactly round 5's findings (12 invalid-tag cases, 5 stored-only fields, the stored-only and schema-key derivations, the all-terms overlay-CLI differential, and the six round-5 falsifiers)
 
-# 2. Round 4's falsifiers, main 2adcd9a vs rev 5 (all three are tests in the module)
-#   codex F002  malformed overlay `args: [<sentinel>`: main logs the sentinel | rev 5: "ScannerError at line N, column M"
-#   codex F001  `command: !!binary bnB4` + partial .mcp.json: main TypeError in filter_self_references | rev 5 keeps healthy
-#   claude F001 overlay CLI on "browser automation": main use_cli, no servers | rev 5 playwright among the candidates
+# 2. Round 5's falsifiers (all are tests in the module), main vs rev 6
+#   claude F001 / codex F003  overlay CLI `airbnb` / `redis`: main and rev 5 use_cli, no server | rev 6 the server is a candidate
+#   codex F002 / claude F002  unknown key holding .nan / a date / !!binary: rev 5 drops the entry and logs the key | rev 6 loads it, logs no key
+#   codex F001                `command: !!int <sentinel>` through _build_manifest: main and rev 5 raise ValueError | rev 6 keeps playwright
 
 # 3. Lint, format, types (CI's own commands)
 uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/
 uv run mypy src/pmcp --exclude baml_client
-#   -> All checks passed! / 175 files already formatted / Success: no issues found in 52 source files
+#   -> All checks passed! / already formatted / Success: no issues found in 52 source files
 
 # 4. Touched suites (24 files, named in "The test surface this touches")
-#   -> **2430 passed, 1 skipped, 19 deselected, 0 failed** (370.72 s; on 2adcd9a + the rev-5 patch)
+#   -> **2489 passed, 1 skipped, 19 deselected, 0 failed** (874.68 s, on b2884db + the same hunks); on 6edf8a4 the full suite (step 8) covers them
 
-# 5. The real gateway, end to end (call.py; R1 table), on the rev-5 spike
+# 5. The real gateway, end to end (call.py; R1 table), on b2884db + rev 6 (same hunks)
 #   -> unapproved demo→[useronly], screenshot→[playwright]; approved demo→[projonly, useronly], screenshot→[playwright, projonly], gadget→[projonly]; revoked as unapproved; the gateway log names neither overlay server (0 lines)
 
 # 6. R1 class: copycat over all 569 shipped keywords
-python copycat.py      # main: 329 of 440 queries lose a candidate, 91 servers; rev 5: 0 of 440, 0 servers
+python copycat.py      # main: 329 of 440 queries lose a candidate, 91 servers; rev 6: 0 of 440, 0 servers
 
-# 7. Mutation driver (53 mutants, appendix). RED requires failed > 0 and errors == 0; -x.
+# 7. Mutation driver (59 mutants, appendix). RED requires failed > 0 and errors == 0; -x.
+#    Run in a /var/tmp scratch worktree of 31d0f40 + the same hunks; all 59 anchors re-checked on 6edf8a4.
 python mutants.py "$PWD"
-#   -> 53 of 53 mutants RED (a real test failure and no errors), every restore byte-identical (table below)
+#   -> 59 of 59 mutants RED (a real test failure and no errors), every restore byte-identical (table below)
 
-# 8. The full suite, once, alone, detached, on 2adcd9a + the rev-5 patch (CI command minus -v)
+# 8. The full suite, once, alone, detached, on 6edf8a4 + the rev-6 patch (CI command minus -v)
 setsid nohup env -u npm_config_cache -u npm_config_store_dir -u pnpm_config_store_dir \
   uv run pytest tests/ -q --tb=short --cov --cov-report= -p no:cacheprovider \
-  --basetemp=/var/tmp/pmcp-342-bt-viperjuice/full5 > full5.log 2>&1 < /dev/null &
-#   -> 8494 passed, 3 skipped, 80 deselected, 0 failed in 1242.43s; coverage 90.28% (2adcd9a + rev 5, alone, npm vars unset, --cov)
+  --basetemp=/var/tmp/pmcp-342-bt-viperjuice/full7 > full7.log 2>&1 < /dev/null &
+#   -> 9035 passed, 5 skipped, 80 deselected, 0 failed in 1364.34s; coverage 90.57% (6edf8a4 + rev 6, alone, npm vars unset, --cov)
 
-# 9. The rev-4 failure (see "The rev-4 full-suite failure, pinned down")
-bash flake_runs.sh; bash flake_runs2.sh   # 2x rev-4 patch, 2x main bb6ddde, full suite with --cov
-bash leak_runs.sh                         # leakfind.py on main and on the patch
-#   -> patch 5669/5669 passed twice; main 5523/5523 passed twice; leaks: main 1, patch **1**, the same RuntimeError
-
-# 10. Gates
+# 9. Gates
 python3 scripts/check_security_claims.py
 python3 scripts/check_plan_consistency.py .consiliency/plans/detailed-342-catalog-overlay-*.md
 #   -> OK, 129 cited node ids / blocking inconsistencies: 0
 
-# 11. Embedding proof: extract the source patch, the test module and the migration patch from
-#     THIS file; on a clean 2adcd9a tree: git apply --check, git apply, write the module, run it
-#   -> apply-check clean on 2adcd9a; source, module and migration cmp-identical to the spike; the module plus the two migrated modules: 396 passed
+# 10. Embedding proof: extract the source patch, the test module and the migration patch from
+#     THIS file; on a clean 6edf8a4 tree: git apply --check, git apply, write the module, run it
+#   -> apply-check clean on 6edf8a4; source, module and migration cmp-identical to the spike; the module plus the two migrated modules: 455 passed
 ```
 
 ## Acceptance criteria
@@ -1096,9 +1216,19 @@ python3 scripts/check_plan_consistency.py .consiliency/plans/detailed-342-catalo
   every YAML tag on every field. Every kept entry carries its consumers' validated values.
   Codex's `!!binary` falsifier keeps `healthy` through `filter_self_references`. Shipped
   entries are already canonical (P1–P6).
-- [ ] **Rev 5, overlay CLIs:** no overlay CLI removes a server from `request_capability`
-  (differential: new CLI, `git` override, and a whole-vocabulary CLI). An overlay CLI
-  still answers when no server does, and shipped CLIs keep main's precedence (K1, K2).
+- [ ] **Rev 6, overlay CLIs (supersedes rev 5's):** an overlay CLI ranks below every server
+  tier. With one overlay CLI per shipped server name, category word and shipped keyword,
+  all available, no term loses a `request_capability` server or a shipped-CLI answer,
+  `catalog_search`'s manifest candidates are unchanged, and `match_capability` keeps
+  its match. Both round-5 falsifiers pass. An overlay CLI still answers where nothing
+  else does (K1–K4).
+- [ ] **Rev 6, schema fields:** unknown keys are ignored. Claude's `added: 2026-10-04`
+  entry loads with no key in any log. A stored-only field's YAML value falls back to its
+  default. A rejection names only a schema field. The schema key sets equal the keys the
+  parsers read (J1–J3).
+- [ ] **Rev 6, YAML constructors:** every invalid tag (15 kinds × user, env and project)
+  is contained at the parse boundary, value-free, with the shipped manifest loaded;
+  codex's `!!int` falsifier keeps `playwright` (E1).
 - [ ] **Main's weighting:** `keyword_weights` equals main's verbatim function on 40
   generated alias-heavy keyword sets, hand-built and explicit-path, and codex's repro picks
   `a-other` (M17).
@@ -1130,7 +1260,7 @@ lives in. The driver (`mutants.py`, appendix):
 
 A mutant is **RED only when at least one test fails and none errors** (round 1, F6). The
 guard mutants narrow the guard's `except` to `ZeroDivisionError`. Each run stops at the first failure (`-x`; the module takes about 200 s), so a row shows
-the failing test and the count up to it. Run on the rev-5 spike text embedded below
+the failing test and the count up to it. Run on the rev-6 spike text embedded below
 (Python 3.10.21).
 
 | id | mutant (the rule it breaks) | result | first failure | failing tests (first 4) |
@@ -1162,7 +1292,7 @@ the failing test and the count up to it. Run on the rev-5 spike text embedded be
 | M6 | R2: check skips the name/keyword scoring every discovery path runs | **RED** 1 failed, 11 passed (restored=True) | 'int' object is not iterable | test_every_server_field_with_every_bad_shape_is_contained[keywords] |
 | M10 | R2: check skips the credential lookups every candidate runs | **RED** 1 failed, 17 passed (restored=True) | catalog_search: skipping an unusable manifest entry (an overlay server (name not shown)): | test_every_server_field_with_every_bad_shape_is_contained[secret_key] |
 | M11 | R2: CLI check skips the _rank_one_cli scoring and CLIHint build | **RED** 1 failed, 41 passed (restored=True) | rank_cli_hints: skipping an unusable entry (cli_alternative 'git'): TypeError | test_every_cli_field_with_every_bad_shape_is_contained[keywords] |
-| M17 | R1: keyword counting de-duplicates after normalising (not main's) | **RED** 1 failed, 92 passed (restored=True) | assert {'alpha beta'...ql': 1.0, ...} == {'alpha beta'...ql': 0.5, ...} | test_weights_equal_mains_for_hand_built_and_explicit_path_manifests[6] |
+| M17 | R1: keyword counting de-duplicates after normalising (not main's) | **RED** 1 failed, 92 passed (restored=True) | assert {'db': 0.5, '...ql': 1.0, ...} == {'db': 0.5, '...ql': 0.5, ...} | test_weights_equal_mains_for_hand_built_and_explicit_path_manifests[6] |
 | L1 | logs: the self-relaxing credential warning echoes the variable | **RED** 1 failed, 127 passed (restored=True) |  | test_a_self_relaxing_credential_is_refused_without_its_value |
 | L2 | logs: probe_clis names each detected CLI | **RED** 1 failed, 128 passed (restored=True) |  | test_probe_clis_never_logs_an_overlay_cli_name |
 | L3 | logs: probe_clis' summary names the detected CLIs | **RED** 1 failed, 128 passed (restored=True) |  | test_probe_clis_never_logs_an_overlay_cli_name |
@@ -1181,15 +1311,21 @@ the failing test and the count up to it. Run on the rev-5 spike text embedded be
 | Y2 | yaml: gateway.refresh logs a manifest-load error's text | **RED** 1 failed, 191 passed (restored=True) |  | test_a_load_failure_is_logged_by_class_on_every_catch_site |
 | Y3 | yaml: load_configs logs a manifest-load error's text | **RED** 1 failed, 191 passed (restored=True) | assert not ['Manifest defaults unavailable during config load: bad token sk-yaml-SENTINEL- | test_a_load_failure_is_logged_by_class_on_every_catch_site |
 | P1 | parse: the kept server is the raw parse, not the canonical one | **RED** 1 failed, 201 passed (restored=True) | assert 'false' is False | test_consumers_read_the_validated_value_not_the_raw_one |
-| P2 | parse: server entries are not required to be JSON-native | **RED** 1 failed, 192 passed (restored=True) | zz-bad-local-requires-api-key | test_no_consumer_ever_sees_a_non_json_value[binary] |
-| P3 | parse: CLI entries are not required to be JSON-native | **RED** 1 failed, 198 passed (restored=True) | badcli-keywords | test_no_consumer_ever_sees_a_non_json_value[set] |
+| P2 | parse: server schema fields are not required to be JSON-native | **RED** 1 failed, 192 passed (restored=True) | zz-bad-local-requires-api-key | test_no_consumer_ever_sees_a_non_json_value[binary] |
+| P3 | parse: CLI schema fields are not required to be JSON-native | **RED** 1 failed, 198 passed (restored=True) | badcli-keywords | test_no_consumer_ever_sees_a_non_json_value[set] |
 | P4 | parse: the auth view's validated value is not kept | **RED** 1 failed, 201 passed (restored=True) | assert 'false' is False | test_consumers_read_the_validated_value_not_the_raw_one |
 | P5 | parse: a local entry's metadata URLs are not checked (claude N1) | **RED** 1 failed, 10 passed (restored=True) | assert 'zz-good-remote' in {'github-remote': {'protected_resource_metadata_url': 'https:// | test_every_server_field_with_every_bad_shape_is_contained[description] |
 | P6 | parse: inheritance's converted command/args are not kept | **RED** 1 failed, 210 passed (restored=True) | assert 'ab' == ['a', 'b'] | test_inherited_fields_are_kept_converted |
-| K1 | cli: an overlay CLI pre-empts the category tier (claude F001) | **RED** 1 failed, 132 passed (restored=True) | assert [('APIs', 're...', ...]), ...] == [] | test_no_overlay_removes_a_non_overlay_server_from_any_discovery_entry_point[cli-everything] |
+| K1 | cli: an overlay CLI takes the shipped-CLI tier (outranks the name and category tiers) | **RED** 1 failed, 132 passed (restored=True) | assert [('APIs', 're...', ...]), ...] == [] | test_no_overlay_removes_a_non_overlay_server_from_any_discovery_entry_point[cli-everything] |
 | K2 | cli: overlay CLIs are not recorded as overlay CLIs | **RED** 1 failed, 132 passed (restored=True) | assert [('APIs', 're...', ...]), ...] == [] | test_no_overlay_removes_a_non_overlay_server_from_any_discovery_entry_point[cli-everything] |
+| K3 | cli: the overlay-CLI fallback after every server tier is removed | **RED** 1 failed, 208 passed (restored=True) | assert 'not_available' == 'use_cli' | test_an_overlay_cli_still_answers_when_no_server_tier_does |
+| K4 | cli: match_capability lets an overlay CLI outrank a server | **RED** 1 failed, 214 passed (restored=True) | assert [('CMS & cont...eroku')), ...] == [] | test_no_overlay_cli_outranks_a_server_or_a_shipped_cli_anywhere |
+| J1 | schema: unknown keys are checked (main ignores them) | **RED** 1 failed, 216 passed (restored=True) | assert 'mytool' in {'playwright': ServerConfig(name='playwright', description='Browser aut | test_claude_f002_falsifier_unknown_keys_neither_drop_nor_log |
+| J2 | schema: a rejection quotes the value | **RED** 1 failed, 217 passed (restored=True) |  | test_codex_f002_falsifier_a_rejection_names_no_overlay_key |
+| J3 | schema: a stored-only field's YAML value costs the entry | **RED** 1 failed, 219 passed (restored=True) | assert 'odd' in {'playwright': ServerConfig(name='playwright', description='Browser automa | test_a_stored_only_field_with_a_yaml_value_keeps_the_entry[discovery_diagnostics] |
+| E1 | yaml: only YAMLError is contained at the overlay parse boundary | **RED** 1 failed, 226 passed (restored=True) | 'sk-tag-sentinel-61d' | test_an_invalid_tag_is_contained_without_any_value[user-bool] |
 
-**53 of 53 mutants RED (a real test failure and no errors), every restore byte-identical.**
+**59 of 59 mutants RED (a real test failure and no errors), every restore byte-identical.**
 
 ## Non-goals
 
@@ -1227,7 +1363,7 @@ the failing test and the count up to it. Run on the rev-5 spike text embedded be
 ## Execution Policy
 
 - execute: effort=medium.
-- reason: eight source files, about 1106 (+881/−225) changed lines, on the discovery, startup and
+- reason: eight source files, about 1272 (+1020/−252) changed lines, on the discovery, startup and
   refresh paths. There is one behaviour change an operator can see: an overlay entry with a
   wrong type is now skipped instead of loading and failing later. Its warning names the
   field.
@@ -1240,7 +1376,7 @@ the failing test and the count up to it. Run on the rev-5 spike text embedded be
 
 ### How to apply
 
-1. Save the source patch below as `342-src.patch` and `git apply` it on `2adcd9a`.
+1. Save the source patch below as `342-src.patch` and `git apply` it on `6edf8a4`.
 2. Write the test module below to `tests/test_catalog_overlay_discovery.py`.
 3. `git apply` the test-migration patch below.
 4. Add the CHANGELOG and README text by hand, as in *Documentation impact*.
@@ -1335,10 +1471,10 @@ index 5b8ee60..3ee20df 100644
      server_required = {
          server_name: sorted(keys) for server_name, keys in per_server.items()
 diff --git a/src/pmcp/client/manager.py b/src/pmcp/client/manager.py
-index cae5645..021fd7f 100644
+index 192c2d8..2fe4fe5 100644
 --- a/src/pmcp/client/manager.py
 +++ b/src/pmcp/client/manager.py
-@@ -70,6 +70,21 @@ except ImportError:
+@@ -73,6 +73,21 @@ except ImportError:
  
  logger = logging.getLogger(__name__)
  
@@ -1360,7 +1496,7 @@ index cae5645..021fd7f 100644
  #: Executables that fetch and run the package they are given at spawn time,
  #: by NORMALIZED name (`normalized_executable_name`), so ``UVX.EXE``,
  #: ``pnpx.cmd`` and ``C:\\tools\\npx.cmd`` are runners without being listed.
-@@ -1269,7 +1284,7 @@ class ClientManager:
+@@ -1576,7 +1591,7 @@ class ClientManager:
                  status=ServerStatusEnum.LAZY,
                  tool_count=0,
              )
@@ -1473,10 +1609,10 @@ index c71e7f8..4337924 100644
      known_names = configured_names | set(manifest_by_name)
      for name in sorted(enabled - known_names):
 diff --git a/src/pmcp/manifest/environment.py b/src/pmcp/manifest/environment.py
-index 613559f..23bb159 100644
+index e8a36ac..18629b6 100644
 --- a/src/pmcp/manifest/environment.py
 +++ b/src/pmcp/manifest/environment.py
-@@ -58,6 +58,13 @@ def detect_platform() -> Platform:
+@@ -59,6 +59,13 @@ def detect_platform() -> Platform:
          return "linux"
  
  
@@ -1490,7 +1626,7 @@ index 613559f..23bb159 100644
  async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
      """Check if a CLI is available and get its info."""
      # First check if command exists in PATH
-@@ -84,10 +91,10 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
+@@ -85,10 +92,10 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
              return CLIInfo(name=name, path=path)
  
      except asyncio.TimeoutError:
@@ -1503,7 +1639,7 @@ index 613559f..23bb159 100644
          return None
  
  
-@@ -108,10 +115,10 @@ async def get_cli_help(
+@@ -109,10 +116,10 @@ async def get_cli_help(
          return "\n".join(lines)
  
      except asyncio.TimeoutError:
@@ -1516,7 +1652,7 @@ index 613559f..23bb159 100644
          return None
  
  
-@@ -120,8 +127,17 @@ async def probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:
+@@ -121,8 +128,17 @@ async def probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:
      detected: dict[str, CLIInfo] = {}
  
      async def check_one(name: str, config: dict) -> tuple[str, CLIInfo | None]:
@@ -1536,7 +1672,7 @@ index 613559f..23bb159 100644
          return name, result
  
      # Check all CLIs in parallel
-@@ -131,9 +147,11 @@ async def probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:
+@@ -132,9 +148,11 @@ async def probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:
      for name, info in results:
          if info:
              detected[name] = info
@@ -1551,7 +1687,7 @@ index 613559f..23bb159 100644
  
  
 diff --git a/src/pmcp/manifest/loader.py b/src/pmcp/manifest/loader.py
-index aa5ec3d..cafbce6 100644
+index dc1596a..e512ad4 100644
 --- a/src/pmcp/manifest/loader.py
 +++ b/src/pmcp/manifest/loader.py
 @@ -91,6 +91,48 @@ def _shipped_manifest_entries() -> dict[str, dict[str, Any]]:
@@ -1723,7 +1859,7 @@ index aa5ec3d..cafbce6 100644
                      if set(kw_norm.split()).issubset(query_words):
                          score += _kw_weight(kw_norm)
  
-@@ -642,8 +749,311 @@ class Manifest:
+@@ -642,8 +749,382 @@ class Manifest:
          return matching_clis, matching_servers
  
  
@@ -1807,49 +1943,120 @@ index aa5ec3d..cafbce6 100644
 +    return name.lower().replace("-", "").replace("_", "").replace(" ", "")
 +
 +
-+def _require_json_native(value: Any, field_name: str = "entry") -> Any:
-+    """``value`` if it is JSON-native all the way down; otherwise reject.
++# The keys an overlay entry is read for: exactly the keys `_parse_server_config`
++# and `_parse_cli_alternative` read (a test derives them from those functions'
++# source and checks these sets). Anything else is ignored, as on main.
++_SERVER_SCHEMA_KEYS = frozenset(
++    {
++        "description",
++        "keywords",
++        "install",
++        "command",
++        "args",
++        "requires_api_key",
++        "env_var",
++        "secret_key",
++        "env_instructions",
++        "extra_env",
++        "api_key_optional_when",
++        "auto_start",
++        "transport",
++        "url",
++        "headers",
++        "protected_resource_metadata_url",
++        "authorization_server_metadata_url",
++        "oidc_issuer_url",
++        "oidc_discovery_url",
++        "client_id_metadata_document_url",
++        "declared_scopes",
++        "supports_url_elicitation",
++        "package",
++        "server_card_url",
++        "declared_capabilities",
++        "discovery_diagnostics",
++        "discovery_metadata",
++        "status",
++        "source",
++        "replacement",
++        "version",
++    }
++)
++_CLI_SCHEMA_KEYS = frozenset(
++    {
++        "keywords",
++        "check_command",
++        "help_command",
++        "description",
++        "examples",
++        "prefer_mcp_for",
++    }
++)
++# Schema keys pmcp parses and stores but no consumer reads (derived: the plan's
++# consumer table; `sync_registry_to_manifest`, the only reader of
++# status/source/replacement, has no in-tree caller). A non-JSON value here is
++# dropped to the default instead of costing the entry, as main never failed on it.
++_STORED_ONLY_KEYS = frozenset(
++    {"discovery_diagnostics", "discovery_metadata", "status", "source", "replacement"}
++)
 +
-+    An overlay entry lives in the same value space as a ``.mcp.json`` entry:
-+    str, int, finite float, bool, null, lists, and mappings with string keys.
-+    YAML can also produce bytes (``!!binary``), datetimes (``!!timestamp``),
-+    sets (``!!set``), pairs (``!!omap``) and non-finite floats; none of them
-+    is a value any consumer is written for, and one (``!!binary`` command) was
-+    kept raw by inheritance and broke ``filter_self_references`` for every
-+    config (Consiliency/pmcp#342 rev 5). The message names the field and the
-+    type, never the value.
++
++def _is_json_native(value: Any) -> bool:
++    """Whether ``value`` is JSON-native all the way down.
++
++    str, int, finite float, bool, null, lists, and mappings with string keys --
++    the value space of a ``.mcp.json`` entry. Iterative, not recursive: a deeply
++    aliased overlay (thousands of chained anchors) loads on main. A shared
++    (aliased) node is checked once.
 +    """
-+    # Iterative, not recursive: a deeply aliased overlay (thousands of chained
-+    # anchors) loads on main, and must not be rejected by a RecursionError here.
-+    # A shared (aliased) node is checked once.
-+    stack: list[tuple[Any, str]] = [(value, field_name)]
++    stack: list[Any] = [value]
 +    seen: set[int] = set()
 +    while stack:
-+        node, where = stack.pop()
++        node = stack.pop()
 +        if node is None or isinstance(node, (str, bool, int)):
 +            continue
 +        if isinstance(node, float):
 +            if node != node or node in (float("inf"), float("-inf")):
-+                raise _EntryRejected(f"'{where}' holds a non-finite float")
++                return False
 +            continue
 +        if isinstance(node, (list, dict)):
 +            if id(node) in seen:
 +                continue
 +            seen.add(id(node))
 +            if isinstance(node, list):
-+                stack.extend((item, where) for item in node)
++                stack.extend(node)
 +                continue
-+            for key, item in node.items():
-+                if not isinstance(key, str):
-+                    raise _EntryRejected(
-+                        f"'{where}' has a {type(key).__name__} key, not a string"
-+                    )
-+                stack.append((item, key if where == "entry" else where))
++            if not all(isinstance(key, str) for key in node):
++                return False
++            stack.extend(node.values())
 +            continue
-+        raise _EntryRejected(
-+            f"'{where}' holds a {type(node).__name__}, not a JSON value"
-+        )
-+    return value
++        return False
++    return True
++
++
++def _schema_fields(data: Any, schema: frozenset[str]) -> dict[str, Any]:
++    """The schema fields of an overlay entry, JSON-native; unknown keys dropped.
++
++    YAML can produce bytes (``!!binary``), datetimes, sets, pairs and
++    non-finite floats; no consumer is written for them, and a ``!!binary``
++    command kept raw broke ``filter_self_references`` for every config
++    (Consiliency/pmcp#342 rev 5). Rev 6: only the keys pmcp reads are looked
++    at -- an unknown key (`added: 2026-10-04`) is ignored, as on main -- and a
++    rejection names the schema field, never a key or value from the overlay.
++    """
++    if not isinstance(data, dict):
++        raise _EntryRejected(f"the entry is a {type(data).__name__}, not a mapping")
++    kept: dict[str, Any] = {}
++    for field_name in sorted(schema):
++        if field_name not in data:
++            continue
++        value = data[field_name]
++        if _is_json_native(value):
++            kept[field_name] = value
++        elif field_name in _STORED_ONLY_KEYS:
++            continue  # stored, never read: the default, and the entry is kept
++        else:
++            raise _EntryRejected(f"'{field_name}' holds a value that is not JSON")
++    return kept
 +
 +
 +_METADATA_PLACEHOLDER_URL = "https://metadata-check.invalid/"
@@ -2036,7 +2243,7 @@ index aa5ec3d..cafbce6 100644
      return CLIAlternative(
          name=name,
          keywords=data.get("keywords", []),
-@@ -671,14 +1081,16 @@ def _parse_extra_env(
+@@ -671,14 +1152,16 @@ def _parse_extra_env(
      if raw is None:
          return {}
      if not isinstance(raw, dict):
@@ -2055,7 +2262,7 @@ index aa5ec3d..cafbce6 100644
              )
              continue
          if isinstance(value, bool):
-@@ -687,7 +1099,7 @@ def _parse_extra_env(
+@@ -687,7 +1170,7 @@ def _parse_extra_env(
              parsed[key] = str(value)
          else:
              logger.warning(
@@ -2064,7 +2271,7 @@ index aa5ec3d..cafbce6 100644
                  f"unsupported value type {type(value).__name__}"
              )
      return parsed
-@@ -708,7 +1120,7 @@ def _parse_api_key_optional_when(
+@@ -708,7 +1191,7 @@ def _parse_api_key_optional_when(
          return []
      if not isinstance(raw, list):
          logger.warning(
@@ -2073,7 +2280,7 @@ index aa5ec3d..cafbce6 100644
          )
          return []
  
-@@ -716,13 +1128,14 @@ def _parse_api_key_optional_when(
+@@ -716,13 +1199,14 @@ def _parse_api_key_optional_when(
      for item in raw:
          if not isinstance(item, str) or not item:
              logger.warning(
@@ -2091,7 +2298,7 @@ index aa5ec3d..cafbce6 100644
                  f"credential cannot relax itself"
              )
              continue
-@@ -994,7 +1407,14 @@ def _materialize_version_pin_soft(server: ServerConfig) -> ServerConfig:
+@@ -994,7 +1478,14 @@ def _materialize_version_pin_soft(server: ServerConfig) -> ServerConfig:
  
  
  def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
@@ -2107,24 +2314,32 @@ index aa5ec3d..cafbce6 100644
      install_data = data.get("install", {})
      install: dict[Platform, list[str]] = {}
  
-@@ -1199,7 +1619,9 @@ def _parse_overlay_document(
+@@ -1198,8 +1689,14 @@ def _parse_overlay_document(
+     """
      try:
          data = yaml.safe_load(content)
-     except yaml.YAMLError as exc:
+-    except yaml.YAMLError as exc:
 -        logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
++    except Exception as exc:
++        # Every exception, not only YAMLError: PyYAML's constructors raise
++        # ValueError (`!!int x`), KeyError (`!!bool x`) or AttributeError
++        # (`!!timestamp x`), whose text quotes the value, and one escaping here
++        # stopped the shipped manifest from loading (Consiliency/pmcp#342 rev 6).
 +        logger.warning(
 +            f"Skipping unreadable manifest overlay {path}: {yaml_error_text(exc)}"
 +        )
          if failures is not None:
              failures.append("parse")
          return {}, {}, {}, {}
-@@ -1217,11 +1639,16 @@ def _parse_overlay_document(
+@@ -1217,11 +1714,18 @@ def _parse_overlay_document(
      if isinstance(raw_servers, dict):
          for name, server_data in raw_servers.items():
              try:
 -                servers[name] = _parse_server_config(name, server_data)
 +                server = _canonical_server(
-+                    _parse_server_config(name, _require_json_native(server_data))
++                    _parse_server_config(
++                        name, _schema_fields(server_data, _SERVER_SCHEMA_KEYS)
++                    )
 +                )
              except Exception as exc:
                  logger.warning(
@@ -2137,13 +2352,15 @@ index aa5ec3d..cafbce6 100644
      elif raw_servers:
          logger.warning(f"Skipping 'servers' in overlay {path}: not a mapping")
  
-@@ -1230,12 +1657,16 @@ def _parse_overlay_document(
+@@ -1230,12 +1734,18 @@ def _parse_overlay_document(
      if isinstance(raw_clis, dict):
          for name, cli_data in raw_clis.items():
              try:
 -                cli_alternatives[name] = _parse_cli_alternative(name, cli_data)
 +                cli = _canonical_cli(
-+                    _parse_cli_alternative(name, _require_json_native(cli_data))
++                    _parse_cli_alternative(
++                        name, _schema_fields(cli_data, _CLI_SCHEMA_KEYS)
++                    )
 +                )
              except Exception as exc:
                  logger.warning(
@@ -2157,7 +2374,7 @@ index aa5ec3d..cafbce6 100644
      elif raw_clis:
          logger.warning(f"Skipping 'cli_alternatives' in overlay {path}: not a mapping")
  
-@@ -1525,6 +1956,13 @@ def _build_manifest(
+@@ -1525,6 +2035,13 @@ def _build_manifest(
      for name, server_data in data.get("servers", {}).items():
          servers[name] = _parse_server_config(name, server_data)
  
@@ -2171,7 +2388,7 @@ index aa5ec3d..cafbce6 100644
      # Merge private/custom overlays over the shipped manifest (default path only).
      if apply_overlays:
          for source in overlays:
-@@ -1572,10 +2010,11 @@ def _build_manifest(
+@@ -1572,10 +2089,11 @@ def _build_manifest(
                  if name in servers:
                      logger.warning(
                          f"Manifest overlay ({label}) from {overlay_path} overrides "
@@ -2184,7 +2401,7 @@ index aa5ec3d..cafbce6 100644
  
              # Applied AFTER this source's whole-entry replaces, so a patch can
              # refine an entry the same overlay just replaced. Patching merges
-@@ -1585,7 +2024,8 @@ def _build_manifest(
+@@ -1585,7 +2103,8 @@ def _build_manifest(
                  if existing is None:
                      logger.warning(
                          f"Manifest overlay ({label}) from {overlay_path} has a "
@@ -2194,7 +2411,7 @@ index aa5ec3d..cafbce6 100644
                      )
                      continue
                  servers[name] = replace(
-@@ -1619,6 +2059,9 @@ def _build_manifest(
+@@ -1619,6 +2138,9 @@ def _build_manifest(
          discovery_queue_path=data.get(
              "discovery_queue_path", ".mcp-gateway/discovery_queue.json"
          ),
@@ -2205,7 +2422,7 @@ index aa5ec3d..cafbce6 100644
  
      logger.info(
 diff --git a/src/pmcp/manifest/matcher.py b/src/pmcp/manifest/matcher.py
-index f9dd835..4cc222b 100644
+index f9dd835..0ad1ebb 100644
 --- a/src/pmcp/manifest/matcher.py
 +++ b/src/pmcp/manifest/matcher.py
 @@ -8,7 +8,15 @@ from dataclasses import dataclass
@@ -2244,10 +2461,7 @@ index f9dd835..4cc222b 100644
 +    if manifest.base_keyword_weights is not None:
 +        return dict(manifest.base_keyword_weights)
 +    return keyword_weights(manifest.servers.values())
- 
--    return {
--        keyword: max(1.0 / frequency, 0.5) for keyword, frequency in frequencies.items()
--    }
++
 +
 +def _rank_one_cli(
 +    query: str,
@@ -2293,7 +2507,10 @@ index f9dd835..4cc222b 100644
 +            "MCP server preferred for "
 +            f"'{matched_prefer_mcp_phrase}' despite matching CLI '{name}'."
 +        )
-+
+ 
+-    return {
+-        keyword: max(1.0 / frequency, 0.5) for keyword, frequency in frequencies.items()
+-    }
 +    hint = CLIHint(
 +        available=is_available,
 +        path=path,
@@ -2324,7 +2541,20 @@ index f9dd835..4cc222b 100644
 -        for example in cli.examples:
 -            score = max(
 -                score, _text_match_score(query_norm, query_words, example) * 0.8
--            )
++        # One CLI entry must never take down every query (Consiliency/pmcp#342);
++        # the loader already skips an overlay entry a consumer cannot use.
++        try:
++            match = _rank_one_cli(
++                query,
++                query_norm,
++                query_words,
++                name,
++                cli,
++                is_available=is_available,
++                detected_infos=detected_infos,
++                include_suppressed=include_suppressed,
++                min_score=min_score,
+             )
 -
 -        matched_prefer_mcp_phrase = None
 -        for phrase in cli.prefer_mcp_for:
@@ -2346,19 +2576,10 @@ index f9dd835..4cc222b 100644
 -            reason = (
 -                "MCP server preferred for "
 -                f"'{matched_prefer_mcp_phrase}' despite matching CLI '{name}'."
-+        # One CLI entry must never take down every query (Consiliency/pmcp#342);
-+        # the loader already skips an overlay entry a consumer cannot use.
-+        try:
-+            match = _rank_one_cli(
-+                query,
-+                query_norm,
-+                query_words,
-+                name,
-+                cli,
-+                is_available=is_available,
-+                detected_infos=detected_infos,
-+                include_suppressed=include_suppressed,
-+                min_score=min_score,
++        except Exception as exc:
++            logger.warning(
++                f"rank_cli_hints: skipping an unusable entry ({_cli_label(name)}): "
++                f"{type(exc).__name__}"
              )
 -
 -        hint = CLIHint(
@@ -2378,11 +2599,7 @@ index f9dd835..4cc222b 100644
 -                score=score,
 -                suppressed_by_prefer_mcp=suppressed,
 -                matched_prefer_mcp_phrase=matched_prefer_mcp_phrase,
-+        except Exception as exc:
-+            logger.warning(
-+                f"rank_cli_hints: skipping an unusable entry ({_cli_label(name)}): "
-+                f"{type(exc).__name__}"
-             )
+-            )
 -        )
 +            continue
 +        if match is not None:
@@ -2390,7 +2607,27 @@ index f9dd835..4cc222b 100644
  
      return sorted(matches, key=lambda match: (-match.score, match.hint.name))
  
-@@ -225,7 +261,14 @@ def _keyword_match(
+@@ -208,8 +244,17 @@ def _keyword_match(
+     best_match: MatchResult | None = None
+     best_score = 0.0
+ 
+-    # Check detected CLIs first (preferred)
+-    for match in rank_cli_hints(query, manifest, available_clis=detected_clis):
++    # Check detected CLIs first (preferred). An overlay CLI ranks below every
++    # server (Consiliency/pmcp#342 rev 6): it is considered only if nothing
++    # else reaches the threshold.
++    overlay_cli_names: frozenset[str] = getattr(
++        manifest, "overlay_cli_names", frozenset()
++    )
++    ranked = rank_cli_hints(query, manifest, available_clis=detected_clis)
++    overlay_ranked = [m for m in ranked if m.hint.name in overlay_cli_names]
++    for match in ranked:
++        if match.hint.name in overlay_cli_names:
++            continue
+         cli = manifest.cli_alternatives[match.hint.name]
+         if match.score > best_score:
+             best_score = match.score
+@@ -225,7 +270,14 @@ def _keyword_match(
      # Check servers
      keyword_weights = _manifest_keyword_weights(manifest)
      for name, server in manifest.servers.items():
@@ -2406,8 +2643,26 @@ index f9dd835..4cc222b 100644
          # Slight preference for CLIs, so server needs higher score
          adjusted_score = score * 0.9
          if adjusted_score > best_score:
+@@ -242,6 +294,17 @@ def _keyword_match(
+     if best_match and best_score >= 0.2:  # Minimum threshold
+         return best_match
+ 
++    for match in overlay_ranked:
++        if match.score >= 0.2:
++            return MatchResult(
++                matched=True,
++                entry_name=match.hint.name,
++                entry_type="cli",
++                confidence=match.score,
++                reasoning=f"Keyword match for installed CLI: {match.hint.name}",
++                cli_config=manifest.cli_alternatives[match.hint.name],
++            )
++
+     return MatchResult(
+         matched=False,
+         entry_name="",
 diff --git a/src/pmcp/server.py b/src/pmcp/server.py
-index ed00259..55ffd5e 100644
+index 290c030..4086d46 100644
 --- a/src/pmcp/server.py
 +++ b/src/pmcp/server.py
 @@ -40,7 +40,7 @@ from mcp.types import (
@@ -2419,7 +2674,7 @@ index ed00259..55ffd5e 100644
      build_startup_observation_snapshot,
      is_legacy_manifest_auto_start_enabled,
      load_configs,
-@@ -736,7 +736,10 @@ class GatewayServer:
+@@ -737,7 +737,10 @@ class GatewayServer:
              manifest = load_manifest()
              manifest_servers = manifest.servers
          except Exception as e:
@@ -2431,7 +2686,7 @@ index ed00259..55ffd5e 100644
  
          enabled_auto_start = load_enabled_auto_start(
              project_root=self._project_root,
-@@ -769,21 +772,7 @@ class GatewayServer:
+@@ -770,21 +773,7 @@ class GatewayServer:
              f"unknown_auto_start={counts['unknown_auto_start']}"
          )
          for skipped in resolution.skipped:
@@ -2455,7 +2710,7 @@ index ed00259..55ffd5e 100644
          # Kill any orphan processes from a previous PMCP crash before registering servers
          self._kill_orphan_processes(resolution.lazy_configs + resolution.eager_configs)
 diff --git a/src/pmcp/tools/handlers.py b/src/pmcp/tools/handlers.py
-index 09e9f34..e68c926 100644
+index 830b877..0f50da5 100644
 --- a/src/pmcp/tools/handlers.py
 +++ b/src/pmcp/tools/handlers.py
 @@ -13,7 +13,7 @@ import platform
@@ -2467,15 +2722,15 @@ index 09e9f34..e68c926 100644
  from typing import Any, Literal, cast, NamedTuple
  
  import anyio
-@@ -34,6 +34,7 @@ from pmcp.auth import (
- from pmcp.client.manager import ClientManager, _terminate_process_tree
+@@ -39,6 +39,7 @@ from pmcp.client.manager import (
+ )
  from pmcp.config.guidance import GuidanceConfig
  from pmcp.config.loader import (
 +    startup_skip_message,
      registry_allow_private_from_config,
      StartupObservationSnapshot,
      StartupSkipReason,
-@@ -79,7 +80,14 @@ from pmcp.manifest.installer import (
+@@ -84,7 +85,14 @@ from pmcp.manifest.installer import (
      get_job_manager,
      InstallError,
  )
@@ -2491,7 +2746,7 @@ index 09e9f34..e68c926 100644
  from pmcp.manifest.package_identity import PackageIdentity, resolve_package_identity
  from pmcp.manifest.matcher import (
      _keyword_match_score,
-@@ -783,6 +791,36 @@ def _summarize_arg_schema(
+@@ -789,6 +797,36 @@ def _summarize_arg_schema(
      return prop_type, None, ""
  
  
@@ -2528,7 +2783,7 @@ index 09e9f34..e68c926 100644
  class GatewayTools:
      """Gateway tool handler implementations."""
  
-@@ -1146,16 +1184,23 @@ class GatewayTools:
+@@ -1152,16 +1190,23 @@ class GatewayTools:
              if not self._policy_manager.is_server_allowed(name):
                  continue
  
@@ -2562,7 +2817,7 @@ index 09e9f34..e68c926 100644
  
              if score >= 0.2:  # Same minimum threshold as the matcher
                  scored.append((score, name, server))
-@@ -1169,16 +1214,17 @@ class GatewayTools:
+@@ -1175,16 +1220,17 @@ class GatewayTools:
          }
  
          candidates: list[CapabilityCandidate] = []
@@ -2587,7 +2842,7 @@ index 09e9f34..e68c926 100644
                      requires_api_key=requires_api_key,
                      api_key_available=self._check_any_api_key_available(
                          self._auth_env_options(name, env_var)
-@@ -1187,18 +1233,16 @@ class GatewayTools:
+@@ -1193,18 +1239,16 @@ class GatewayTools:
                      env_instructions=env_instructions,
                      is_running=name in running_servers,
                      source="manifest",
@@ -2611,7 +2866,7 @@ index 09e9f34..e68c926 100644
          return candidates
  
      async def catalog_search(self, input_data: dict[str, Any]) -> CatalogSearchOutput:
-@@ -1907,7 +1951,11 @@ class GatewayTools:
+@@ -1929,7 +1973,11 @@ class GatewayTools:
                  manifest = load_manifest()
                  manifest_servers = manifest.servers
              except Exception as e:
@@ -2624,7 +2879,7 @@ index 09e9f34..e68c926 100644
  
              provisioned: dict[str, str | None] = {}
              try:
-@@ -1945,21 +1993,7 @@ class GatewayTools:
+@@ -1967,21 +2015,7 @@ class GatewayTools:
                  f"unknown_auto_start={counts['unknown_auto_start']}"
              )
              for skipped in resolution.skipped:
@@ -2647,7 +2902,7 @@ index 09e9f34..e68c926 100644
  
              pending_requests = self._client_manager.get_pending_requests()
              pending_seen = len(pending_requests)
-@@ -3312,6 +3346,9 @@ class GatewayTools:
+@@ -3334,6 +3368,9 @@ class GatewayTools:
              cli_alternatives=dict(manifest.cli_alternatives),
              servers=merged_servers,
              discovery_queue_path=manifest.discovery_queue_path,
@@ -2657,7 +2912,40 @@ index 09e9f34..e68c926 100644
          )
  
      def _get_server_env_metadata(
-@@ -3589,10 +3626,27 @@ class GatewayTools:
+@@ -3587,6 +3624,32 @@ class GatewayTools:
+         )
+         return issue_title, body
+ 
++    def _use_cli_resolution(self, hint: Any) -> CapabilityResolution:
++        """The `use_cli` resolution for one CLI hint (shared by both CLI tiers)."""
++        return CapabilityResolution(
++            status="use_cli",
++            message=(
++                f"Use Bash/direct CLI with '{hint.name}'. PMCP is recommending "
++                "the native command here; it is not executing the command or "
++                "provisioning an MCP server for this path."
++            ),
++            cli=CLIResolution(
++                name=hint.name,
++                path=hint.path,
++                description=hint.description,
++                available=hint.available,
++                check_command=hint.check_command,
++                help_command=hint.help_command,
++                examples=hint.examples,
++                prefer_mcp_for=hint.prefer_mcp_for,
++                reason=hint.reason,
++            ),
++            recommendation=(
++                f"Run '{hint.name}' directly via Bash/direct CLI. "
++                "Use gateway.request_capability again only if you need an MCP server."
++            ),
++        )
++
+     async def request_capability(
+         self, input_data: dict[str, Any]
+     ) -> CapabilityResolution:
+@@ -3620,10 +3683,32 @@ class GatewayTools:
          if cli_hint_matches:
              logger.debug(
                  "Matched CLI hints for future response plumbing: %s",
@@ -2666,28 +2954,33 @@ index 09e9f34..e68c926 100644
 +                    _cli_label(match.hint.name) for match in cli_hint_matches[:3]
 +                ),
              )
-+        # An overlay CLI may add a resolution, never hide servers a query
-+        # already finds (Consiliency/pmcp#342 rev 5, D2): it answers only when
-+        # the category tier would find none. A shipped CLI keeps main's
-+        # precedence.
-+        servers_found = bool(
-+            not _names_an_unknown_service(parsed.query, merged_manifest.servers)
-+            and manifest.get_servers_in_category(parsed.query)
-+        )
++        # One rule, applied where CLI and server results are combined
++        # (Consiliency/pmcp#342 rev 6): an overlay CLI ranks below EVERY server
++        # tier. Shipped CLIs keep main's precedence (`cli_hint_match`, which the
++        # name tier may yield to and which answers before the category tier).
++        # An overlay CLI (`overlay_cli_match`) answers only after the name,
++        # category and configured-server tiers all found nothing.
          cli_hint_match = next(
 -            (match for match in cli_hint_matches if match.hint.available),
 +            (
 +                match
 +                for match in cli_hint_matches
 +                if match.hint.available
-+                and not (
-+                    servers_found and match.hint.name in manifest.overlay_cli_names
-+                )
++                and match.hint.name not in manifest.overlay_cli_names
++            ),
++            None,
++        )
++        overlay_cli_match = next(
++            (
++                match
++                for match in cli_hint_matches
++                if match.hint.available
++                and match.hint.name in manifest.overlay_cli_names
 +            ),
              None,
          )
  
-@@ -3610,10 +3664,17 @@ class GatewayTools:
+@@ -3641,10 +3726,17 @@ class GatewayTools:
          # capability words like "browser" or "search".
          query_lower = parsed.query.lower()
          query_words = query_lower.split()
@@ -2709,7 +3002,7 @@ index 09e9f34..e68c926 100644
          name_match: str | None = None
          for window_size in (3, 2, 1):
              for i in range(len(query_words) - window_size + 1):
-@@ -3636,28 +3697,39 @@ class GatewayTools:
+@@ -3667,28 +3759,39 @@ class GatewayTools:
              cli_hint_match is not None and cli_hint_match.hint.name == name_match
          )
  
@@ -2766,7 +3059,38 @@ index 09e9f34..e68c926 100644
              msg = f"Matched '{name_match}' by name."
              if requires_api_key:
                  if api_key_available:
-@@ -3707,12 +3779,8 @@ class GatewayTools:
+@@ -3708,42 +3811,15 @@ class GatewayTools:
+             )
+ 
+         if cli_hint_match is not None:
+-            hint = cli_hint_match.hint
+-            return CapabilityResolution(
+-                status="use_cli",
+-                message=(
+-                    f"Use Bash/direct CLI with '{hint.name}'. PMCP is recommending "
+-                    "the native command here; it is not executing the command or "
+-                    "provisioning an MCP server for this path."
+-                ),
+-                cli=CLIResolution(
+-                    name=hint.name,
+-                    path=hint.path,
+-                    description=hint.description,
+-                    available=hint.available,
+-                    check_command=hint.check_command,
+-                    help_command=hint.help_command,
+-                    examples=hint.examples,
+-                    prefer_mcp_for=hint.prefer_mcp_for,
+-                    reason=hint.reason,
+-                ),
+-                recommendation=(
+-                    f"Run '{hint.name}' directly via Bash/direct CLI. "
+-                    "Use gateway.request_capability again only if you need an MCP server."
+-                ),
+-            )
++            return self._use_cli_resolution(cli_hint_match.hint)
+ 
+         # --- Tier 2 pre-check: detect unknown named services (Fix C, issue #56) ---
+         # If the query contains a PascalCase word (not the first word of the sentence)
          # that is NOT a known server name, the user is likely requesting a specific
          # external service not in the manifest. Skip category matching and fall
          # through to not_available so search_registry guidance is surfaced.
@@ -2781,7 +3105,7 @@ index 09e9f34..e68c926 100644
          )
  
          # --- Tier 2: category keyword match ---
-@@ -3727,16 +3795,17 @@ class GatewayTools:
+@@ -3758,16 +3834,17 @@ class GatewayTools:
              for scfg in cat_servers:
                  if not self._policy_manager.is_server_allowed(scfg.name):
                      continue
@@ -2808,7 +3132,7 @@ index 09e9f34..e68c926 100644
                          name=scfg.name,
                          candidate_type="server",
                          relevance_score=1.0,
-@@ -3747,7 +3816,10 @@ class GatewayTools:
+@@ -3778,7 +3855,10 @@ class GatewayTools:
                          env_instructions=env_instructions,
                          is_running=scfg.name in running_servers,
                      )
@@ -2820,6 +3144,18 @@ index 09e9f34..e68c926 100644
  
              if not all_candidates:
                  category_result = None
+@@ -3900,6 +3980,11 @@ class GatewayTools:
+                 recommendation=f"Call gateway.provision(server_name='{server_name}')",
+             )
+ 
++        # An overlay CLI answers only here, after every server tier found
++        # nothing (Consiliency/pmcp#342 rev 6).
++        if overlay_cli_match is not None:
++            return self._use_cli_resolution(overlay_cli_match.hint)
++
+         registry_candidates = (
+             await self._registry_candidates_for_query(parsed.query)
+             if _unknown_service
 ````
 
 ### File — `tests/test_catalog_overlay_discovery.py`
@@ -4537,6 +4873,316 @@ def test_an_overlay_cli_is_recorded_as_one() -> None:
     )
     assert load_manifest().overlay_cli_names == frozenset({"zzcli", "git"})
     assert load_manifest(_SHIPPED_MANIFEST_PATH).overlay_cli_names == frozenset()
+
+
+# --- revision 6: an overlay CLI never outranks a server (round 5, F001/F003) ----
+
+
+def test_claude_f001_falsifier_an_overlay_cli_named_like_a_server() -> None:
+    """Round 5: `request_capability("airbnb")` went to `use_cli`, no candidates."""
+    assert "airbnb" in _ask("airbnb")[1]
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump(
+            {
+                "cli_alternatives": {
+                    "airbnb": {
+                        "description": "d",
+                        "keywords": ["airbnb"],
+                        "check_command": [sys.executable, "--version"],
+                    }
+                }
+            }
+        ),
+    )
+    result = asyncio.run(_gateway().request_capability({"query": "airbnb"}))
+    assert "airbnb" in {c.name for c in result.candidates or []}
+
+
+def test_codex_f003_falsifier_an_overlay_cli_cannot_hide_an_exact_match() -> None:
+    before = _ask("redis", ("redis",))
+    assert "redis" in before[1]
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump(
+            {
+                "cli_alternatives": {
+                    "redis": {"keywords": ["redis"], "check_command": ["git"]}
+                }
+            }
+        ),
+    )
+    assert "redis" in _ask("redis", ("redis",))[1]
+
+
+def _every_discovery_term() -> list[str]:
+    """Every shipped server name, every category word, every shipped keyword."""
+    shipped = load_manifest(_SHIPPED_MANIFEST_PATH)
+    terms: set[str] = set(shipped.servers)
+    for cat_name in loader._CATEGORY_MAP:
+        terms.update(cat_name.replace("/", " ").split())
+        terms.add(cat_name)
+    for server in shipped.servers.values():
+        terms.update(server.keywords)
+    return sorted(terms)
+
+
+def test_no_overlay_cli_outranks_a_server_or_a_shipped_cli_anywhere() -> None:
+    """The class, derived from the tiers: one overlay CLI per discovery term --
+    named like the term when it is a server name -- all available at once. For
+    every term: request_capability keeps every non-overlay server and every
+    shipped-CLI answer; catalog_search's manifest candidates are unchanged;
+    match_capability keeps its server or shipped-CLI match."""
+    terms = _every_discovery_term()
+    shipped = load_manifest(_SHIPPED_MANIFEST_PATH)
+    clis: dict[str, Any] = {}
+    for i, term in enumerate(terms):
+        name = term if term in shipped.servers else f"zzcli-{i}"
+        if name in shipped.cli_alternatives:
+            name = f"zzcli-{i}"
+        clis[name] = {"keywords": [term], "check_command": ["git"]}
+    available = tuple(clis)
+    tools = _gateway()
+
+    def snapshot() -> dict[str, Any]:
+        manifest = load_manifest()
+        out: dict[str, Any] = {}
+        for term in terms:
+            result = asyncio.run(
+                tools.request_capability(
+                    {"query": term, "available_clis": list(available)}
+                )
+            )
+            catalog = {
+                c.name
+                for c in tools._manifest_candidates_for_query(
+                    term,
+                    manifest=manifest,
+                    configured_servers={},
+                    exclude_servers=set(),
+                    limit=1000,
+                )
+            }
+            km = _keyword_match(term, manifest, set(available))
+            out[term] = (
+                result.status,
+                result.cli.name if result.cli else None,
+                {c.name for c in result.candidates or []},
+                catalog,
+                (km.entry_type, km.entry_name) if km.matched else None,
+            )
+        return out
+
+    before = snapshot()
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump({"cli_alternatives": clis}),
+    )
+    assert set(load_manifest().overlay_cli_names) == set(clis)
+    after = snapshot()
+    lost = []
+    for term in terms:
+        st0, cli0, rc0, cat0, km0 = before[term]
+        st1, cli1, rc1, cat1, km1 = after[term]
+        if rc0 - rc1:
+            lost.append((term, "request_capability servers", sorted(rc0 - rc1)))
+        if st0 == "use_cli" and (st1, cli1) != (st0, cli0):
+            lost.append((term, "request_capability shipped CLI", cli0))
+        if cat0 != cat1:
+            lost.append((term, "catalog_search", sorted(cat0 ^ cat1)))
+        if km0 is not None and km1 != km0:
+            lost.append((term, "match_capability", km0))
+    assert lost == []
+    # Not vacuous: an overlay CLI still answers where nothing else does.
+    gained = [
+        t for t in terms if before[t][0] == "not_available" and after[t][0] == "use_cli"
+    ]
+    assert gained
+    assert sum(1 for t in terms if before[t][2]) > 100
+
+
+def test_gemini_note_category_selection_reads_no_cli() -> None:
+    """Round 5 (gemini): the claimed `kw in category_keywords.get(best_cat, [])`
+    CLI comparison is not in the code; category selection reads servers only,
+    so an overlay CLI with a category's whole vocabulary changes nothing."""
+    import inspect
+
+    source = inspect.getsource(Manifest.get_servers_in_category)
+    assert "cli_alternatives" not in source
+    before = load_manifest().get_servers_in_category("browser automation")
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump(
+            {"cli_alternatives": {"zzcli": {"keywords": _category_vocabulary()}}}
+        ),
+    )
+    assert load_manifest().get_servers_in_category("browser automation") == before
+
+
+# --- revision 6: only schema fields are checked (round 5, codex F002 / claude F002) --
+
+
+def test_claude_f002_falsifier_unknown_keys_neither_drop_nor_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "sk_live_planted_4f9a"
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        "servers:\n"
+        "  mytool:\n"
+        "    command: npx\n"
+        "    keywords: [mytoolkw]\n"
+        "    added: 2026-10-04\n"
+        f"    {secret}: !!binary aGVsbG8=\n",
+    )
+    with caplog.at_level(logging.DEBUG):
+        manifest = load_manifest()
+    assert "mytool" in manifest.servers
+    assert not any(secret in r.getMessage() for r in caplog.records)
+
+
+def test_codex_f002_falsifier_a_rejection_names_no_overlay_key(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "sk-review-secret-field"
+    document = (
+        f"servers:\n  bad:\n    {sentinel}: .nan\n"
+        f"    extra_env: {{{sentinel}-k: .nan}}\n"
+        f"    args: [!!binary aGVsbG8=]\n"
+    ).encode()
+    with caplog.at_level(logging.DEBUG):
+        loader._parse_overlay_document(Path("overlay.yaml"), document)
+    assert caplog.records
+    assert sentinel not in caplog.text
+    assert any(
+        "'args' holds a value that is not JSON" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+STORED_ONLY = [
+    "discovery_diagnostics",
+    "discovery_metadata",
+    "replacement",
+    "source",
+    "status",
+]
+
+
+def test_the_stored_only_keys_are_the_loaders() -> None:
+    assert set(STORED_ONLY) == set(loader._STORED_ONLY_KEYS)
+
+
+@pytest.mark.parametrize("field_name", STORED_ONLY)
+def test_a_stored_only_field_with_a_yaml_value_keeps_the_entry(field_name: str) -> None:
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        f"servers:\n  odd:\n    command: npx\n    {field_name}: 2026-10-04\n",
+    )
+    assert "odd" in load_manifest().servers
+
+
+def test_the_schema_keys_are_exactly_the_keys_the_parsers_read() -> None:
+    """Derived from the parsers' own source: every `data.get("<key>")`."""
+    import ast
+    import inspect
+
+    def read_keys(func: Any) -> set[str]:
+        tree = ast.parse(inspect.getsource(func))
+        return {
+            node.args[0].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "data"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        }
+
+    assert read_keys(loader._parse_server_config) == set(loader._SERVER_SCHEMA_KEYS)
+    assert read_keys(loader._parse_cli_alternative) == set(loader._CLI_SCHEMA_KEYS)
+
+
+# --- revision 6: every exception from the YAML load is contained (codex F001) ----
+
+TAG_SENTINEL = "sk-tag-SENTINEL-61d"
+
+
+def _invalid_tag_documents() -> dict[str, str]:
+    s = TAG_SENTINEL
+    entry = "servers:\n  bad:\n    command: {}\n  good: {{keywords: [zzgood], command: npx}}\n"
+    docs = {
+        tag: entry.format(value)
+        for tag, value in {
+            "int": f"!!int {s}",
+            "float": f"!!float {s}",
+            "bool": f"!!bool {s}",
+            "timestamp": f"!!timestamp {s}",
+            "binary": f"!!binary {s}!",
+            "set": f"!!set [{s}]",
+            "omap": f"!!omap {{{s}: 1}}",
+            "pairs": f"!!pairs {s}",
+            "map": f"!!map [{s}]",
+            "seq": f"!!seq {{{s}: 1}}",
+            "str-map": f"!!str {{{s}: 1}}",
+            "custom": f"!custom {s}",
+            "python": f"!!python/name:{s}",
+        }.items()
+    }
+    docs["merge-scalar"] = f"servers:\n  bad:\n    <<: {s}\n    command: npx\n"
+    docs["merge-list-scalar"] = f"servers:\n  bad:\n    <<: [{s}]\n    command: npx\n"
+    return docs
+
+
+@pytest.mark.parametrize("case", sorted(_invalid_tag_documents()))
+@pytest.mark.parametrize("source", ["user", "env", "project"])
+def test_an_invalid_tag_is_contained_without_any_value(
+    case: str,
+    source: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approve_project_file: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    text = _invalid_tag_documents()[case]
+    if source == "user":
+        _write(Path.home() / ".pmcp" / "manifest.yaml", text)
+    elif source == "env":
+        monkeypatch.setenv("PMCP_MANIFEST_PATH", str(_write(tmp_path / "e.yaml", text)))
+    else:
+        path = _write(tmp_path / "proj" / ".pmcp" / "manifest.yaml", text)
+        approve_project_file(path)
+        monkeypatch.chdir(tmp_path / "proj")
+    with caplog.at_level(logging.DEBUG):
+        manifest = load_manifest()
+        _candidates(_gateway(), "screenshot")
+    assert "playwright" in manifest.servers
+    assert "bad" not in manifest.servers
+    messages = [r.getMessage() for r in caplog.records]
+    assert not [m for m in messages if TAG_SENTINEL.lower() in m.lower()]
+    # Either the document is refused (the load raised), or it parses and the
+    # entry is skipped (`!!binary` with lenient base64 decodes to bytes).
+    assert any(
+        "Skipping unreadable manifest overlay" in m
+        or "Skipping invalid server entry" in m
+        for m in messages
+    )
+
+
+def test_codex_f001_falsifier_a_bad_numeric_tag_keeps_shipped_servers() -> None:
+    base = loader._SHIPPED_MANIFEST_PATH
+    overlay = loader._OverlaySource(
+        "env",
+        Path("overlay.yaml"),
+        b"servers:\n  bad: {command: !!int sk-review-sentinel}\n",
+        "read",
+    )
+    manifest, _ = loader._build_manifest(
+        base, base.read_bytes(), [overlay], trusted=True
+    )
+    assert "playwright" in manifest.servers
 ````
 
 ### Patch — test migration (`tests/test_version_pin.py`, `tests/test_manifest_overlay.py`)
@@ -5304,7 +5950,7 @@ def pytest_runtest_call(item):  # noqa: ARG001
     yield
 ````
 
-### `mutants.py` (mutation driver, revision 5)
+### `mutants.py` (mutation driver, revision 6)
 
 ````python
 """Mutation driver for the Consiliency/pmcp#342 spike (revision 2).
@@ -5356,7 +6002,7 @@ MUTANTS = [
      TESTS + [GENERIC]),
     # --- R2, parse time ---
     ("M5", "R2: overlay servers neither gated nor checked (raw parse kept)", LOADER,
-     "                server = _canonical_server(\n                    _parse_server_config(name, _require_json_native(server_data))\n                )\n",
+     "                server = _canonical_server(\n                    _parse_server_config(\n                        name, _schema_fields(server_data, _SERVER_SCHEMA_KEYS)\n                    )\n                )\n",
      "                server = _parse_server_config(name, server_data)\n", TESTS),
     ("M7", "R2: the CapabilityCandidate is built without validation", LOADER,
      "    candidate = CapabilityCandidate(\n", "    candidate = CapabilityCandidate.model_construct(\n", TESTS),
@@ -5364,7 +6010,7 @@ MUTANTS = [
      "    # below would read a `str` args as characters, which startup would not.\n    _manifest_server_to_config(canonical, lambda _key: None)\n",
      "    # below would read a `str` args as characters, which startup would not.\n", TESTS),
     ("M9", "R2: overlay CLI alternatives neither gated nor checked", LOADER,
-     "                cli = _canonical_cli(\n                    _parse_cli_alternative(name, _require_json_native(cli_data))\n                )\n",
+     "                cli = _canonical_cli(\n                    _parse_cli_alternative(\n                        name, _schema_fields(cli_data, _CLI_SCHEMA_KEYS)\n                    )\n                )\n",
      "                cli = _parse_cli_alternative(name, cli_data)\n", TESTS),
     ("M12", "R2: CLI check accepts an empty check_command (probe needs slot 0)", LOADER,
      "    if not hint.check_command:\n", "    if False:\n", TESTS),
@@ -5476,14 +6122,14 @@ MUTANTS = [
      "f\"Manifest defaults unavailable during config load: {type(e).__name__}\"",
      "f\"Manifest defaults unavailable during config load: {e}\"", TESTS),
     ("P1", "parse: the kept server is the raw parse, not the canonical one", LOADER,
-     "                server = _canonical_server(\n                    _parse_server_config(name, _require_json_native(server_data))\n                )\n",
-     "                server = _parse_server_config(name, _require_json_native(server_data))\n                _canonical_server(server)\n", TESTS),
-    ("P2", "parse: server entries are not required to be JSON-native", LOADER,
-     "_parse_server_config(name, _require_json_native(server_data))",
-     "_parse_server_config(name, server_data)", TESTS),
-    ("P3", "parse: CLI entries are not required to be JSON-native", LOADER,
-     "_parse_cli_alternative(name, _require_json_native(cli_data))",
-     "_parse_cli_alternative(name, cli_data)", TESTS),
+     "                server = _canonical_server(\n                    _parse_server_config(\n                        name, _schema_fields(server_data, _SERVER_SCHEMA_KEYS)\n                    )\n                )\n",
+     "                server = _parse_server_config(\n                    name, _schema_fields(server_data, _SERVER_SCHEMA_KEYS)\n                )\n                _canonical_server(server)\n", TESTS),
+    ("P2", "parse: server schema fields are not required to be JSON-native", LOADER,
+     "                        name, _schema_fields(server_data, _SERVER_SCHEMA_KEYS)\n",
+     "                        name, server_data\n", TESTS),
+    ("P3", "parse: CLI schema fields are not required to be JSON-native", LOADER,
+     "                        name, _schema_fields(cli_data, _CLI_SCHEMA_KEYS)\n",
+     "                        name, cli_data\n", TESTS),
     ("P4", "parse: the auth view's validated value is not kept", LOADER,
      "        supports_url_elicitation=auth_view.supports_url_elicitation,\n",
      "        supports_url_elicitation=server.supports_url_elicitation,\n", TESTS),
@@ -5493,10 +6139,27 @@ MUTANTS = [
     ("P6", "parse: inheritance's converted command/args are not kept", LOADER,
      "        canonical = replace(canonical, command=local.command, args=list(local.args))\n",
      "        pass\n", TESTS),
-    ("K1", "cli: an overlay CLI pre-empts the category tier (claude F001)", HANDLERS,
-     "servers_found and match.hint.name in manifest.overlay_cli_names", "False", TESTS),
+    ("K1", "cli: an overlay CLI takes the shipped-CLI tier (outranks the name and category tiers)", HANDLERS,
+     "                and match.hint.name not in manifest.overlay_cli_names\n", "", TESTS),
     ("K2", "cli: overlay CLIs are not recorded as overlay CLIs", LOADER,
      "            overlay_cli_names.update(overlay_clis)\n", "", TESTS),
+
+    # --- revision 6 ---
+    ("K3", "cli: the overlay-CLI fallback after every server tier is removed", HANDLERS,
+     "        if overlay_cli_match is not None:\n            return self._use_cli_resolution(overlay_cli_match.hint)\n", "", TESTS),
+    ("K4", "cli: match_capability lets an overlay CLI outrank a server", MATCHER,
+     "        if match.hint.name in overlay_cli_names:\n            continue\n", "", TESTS),
+    ("J1", "schema: unknown keys are checked (main ignores them)", LOADER,
+     "    for field_name in sorted(schema):\n        if field_name not in data:\n",
+     "    for field_name in sorted(set(schema) | {k for k in data if isinstance(k, str)}):\n        if field_name not in data:\n", TESTS),
+    ("J2", "schema: a rejection quotes the value", LOADER,
+     "raise _EntryRejected(f\"'{field_name}' holds a value that is not JSON\")",
+     "raise _EntryRejected(f\"'{field_name}' holds {value!r}\")", TESTS),
+    ("J3", "schema: a stored-only field's YAML value costs the entry", LOADER,
+     "        elif field_name in _STORED_ONLY_KEYS:\n", "        elif False:\n", TESTS),
+    ("E1", "yaml: only YAMLError is contained at the overlay parse boundary", LOADER,
+     "        data = yaml.safe_load(content)\n    except Exception as exc:\n",
+     "        data = yaml.safe_load(content)\n    except yaml.YAMLError as exc:\n", TESTS),
 
 ]
 
