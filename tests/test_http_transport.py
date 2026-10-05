@@ -800,8 +800,8 @@ def test_envelope_rejection_does_not_echo_caller_value() -> None:
 
 
 def test_value_free_rejection_rewrites_only_request_built_parts() -> None:
-    """A result, a handler's error (it has an id) and an SDK literal pass
-    unchanged; the three request-built rejections are rewritten."""
+    """A result, any id-bearing error and an SDK literal pass unchanged; the
+    two request-built out-of-session rejections are rewritten."""
     import json
 
     from pmcp.transport.http import value_free_rejection
@@ -840,157 +840,624 @@ def test_value_free_rejection_rewrites_only_request_built_parts() -> None:
             },
         }
     ).encode()
-    for body in (validation, parse, version):
+    for body in (validation, parse):
         rewritten = value_free_rejection(body, request)
         assert b"SECRETzz" not in rewritten, rewritten
         assert (
             json.loads(rewritten)["error"]["code"] == json.loads(body)["error"]["code"]
         )
-    kept = version.replace(b"SECRETzz", b"2099-01-01")
-    assert (
-        value_free_rejection(kept, request)
-        == json.dumps(json.loads(kept), separators=(",", ":")).encode()
+    # Each says why from the body's structure, not a bare phrase (rev 20).
+    assert json.loads(value_free_rejection(validation, request))["error"][
+        "message"
+    ].startswith("Validation error: 6 validation errors for "), validation
+    assert json.loads(value_free_rejection(parse, b'{"jsonrpc": '))["error"][
+        "message"
+    ] == (
+        "Parse error: could not parse JSON request body at line 1, column 13 "
+        "(JSONDecodeError)"
     )
+    # An id-bearing error is the write side's (`pmcp.sdk_rejections`): this
+    # layer forwards it as sent.
+    assert value_free_rejection(version, request) == version
 
 
-#: Every non-literal message or `data` the SDK's server-transport modules can
-#: put in a rejection, and why it is safe or where pmcp rewrites it. Keyed by
-#: (module, call, the argument's source). An SDK upgrade that adds one fails
-#: `test_every_sdk_rejection_message_is_reviewed` until it is reviewed here.
-_SDK_REJECTION_SITES: dict[tuple[str, str, str], str] = {
+# --- rev 20: the SDK's rejections are rebuilt where they are made, for every
+# transport (round-18 claude F001); its server-side logs are masked (N2). -----
+
+_MODERN = "2026-07-28"
+_META = {
+    "io.modelcontextprotocol/protocolVersion": _MODERN,
+    "io.modelcontextprotocol/clientCapabilities": {},
+}
+
+
+def _sdk_rejection_frames(s: str) -> dict[str, dict[str, object]]:
+    """Requests the SDK itself refuses on a modern connection, each with the
+    sentinel where the caller controls the content (never in the id)."""
+    meta_bad_version = {**_META, "io.modelcontextprotocol/protocolVersion": s}
+    return {
+        "unknown-method": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": s,
+            "params": {"_meta": _META},
+        },
+        "unknown-method-path": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": f"tools/{s}",
+            "params": {"_meta": _META},
+        },
+        "unsupported-version": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {"_meta": meta_bad_version},
+        },
+        "initialize-on-modern": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": s,
+                "capabilities": {},
+                "clientInfo": {"name": s, "version": s},
+            },
+        },
+        "envelope-missing-key": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {
+                "_meta": {"io.modelcontextprotocol/protocolVersion": _MODERN, s: s}
+            },
+        },
+        "invalid-params": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"_meta": _META, "name": {s: s}, "arguments": s},
+        },
+        "unknown-notification": {
+            "jsonrpc": "2.0",
+            "method": f"notifications/{s}",
+            "params": {"_meta": _META},
+        },
+    }
+
+
+def _stdio_exchange(
+    tmp_path: object, frames: list[dict[str, object]]
+) -> tuple[str, str]:
+    """Drive the real `pmcp` entry point over stdio at DEBUG: send `frames`,
+    read until every request among them is answered, then close stdin."""
+    import json
+    import subprocess
+    import sys
+    import threading
+    from pathlib import Path
+
+    root = Path(str(tmp_path))
+    home = root / "home"
+    home.mkdir(exist_ok=True)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("PMCP_", "npm_config_", "pnpm_config_"))
+    }
+    env["HOME"] = str(home)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from pmcp.cli import main; main()",
+            "--log-level",
+            "debug",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=root,
+        env=env,
+    )
+    assert process.stdin and process.stdout and process.stderr
+    err_chunks: list[bytes] = []
+    stderr = process.stderr
+    reader = threading.Thread(target=lambda: err_chunks.append(stderr.read()))
+    reader.start()
+    waiting = {frame["id"] for frame in frames if "id" in frame}
+    out_lines: list[str] = []
+    try:
+        for frame in frames:
+            process.stdin.write((json.dumps(frame) + "\n").encode())
+        process.stdin.flush()
+        while waiting:
+            line = process.stdout.readline().decode()
+            if not line:
+                break
+            out_lines.append(line)
+            try:
+                waiting.discard(json.loads(line).get("id"))
+            except ValueError:
+                pass
+    finally:
+        process.stdin.close()
+        try:
+            process.wait(timeout=60)
+        except subprocess.TimeoutExpired:  # pragma: no cover
+            process.kill()
+        reader.join(timeout=60)
+    assert not waiting, ("unanswered", waiting, "".join(out_lines)[-400:])
+    return "".join(out_lines), b"".join(err_chunks).decode(errors="replace")
+
+
+@pytest.mark.parametrize("sentinel", sorted(_GRID_SENTINELS))
+def test_an_sdk_rejection_over_stdio_echoes_nothing_of_the_request(
+    tmp_path: object, sentinel: str
+) -> None:
+    """pmcp's default transport, at DEBUG: every request the SDK refuses on a
+    modern connection is answered with its id and an error, and neither the
+    answers nor stderr carry any form of the sentinel."""
+    import json
+
+    from tests.test_argument_error_echo import _forbidden
+
+    s = _GRID_SENTINELS[sentinel]
+    opening = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {"_meta": _META},
+    }
+    frames: list[dict[str, object]] = [opening]
+    for index, frame in enumerate(_sdk_rejection_frames(s).values()):
+        frame = dict(frame)
+        if "id" in frame:
+            frame["id"] = 100 + index
+        frames.append(frame)
+    out, err = _stdio_exchange(tmp_path, frames)
+    replies = {
+        reply["id"]: reply
+        for reply in map(json.loads, out.splitlines())
+        if isinstance(reply, dict) and "id" in reply
+    }
+    for frame in frames[1:]:
+        if "id" in frame:
+            assert "error" in replies[frame["id"]], replies[frame["id"]]
+
+    def leaked(text: str) -> bool:
+        if sentinel == "short":
+            return s in text
+        return any(form in text for form in _forbidden(s))
+
+    assert not leaked(out), [line for line in out.splitlines() if leaked(line)]
+    assert not leaked(err), [line for line in err.splitlines() if leaked(line)][:5]
+    assert "[DEBUG]" in err  # the logs were on
+
+
+def test_a_round_18_stdio_rejection_echoes_nothing_of_the_request(
+    tmp_path: object,
+) -> None:
+    """Round-18 claude F001's three stdio cases as filed, with stdin held open
+    until each is answered (closing it at once races the answer)."""
+    secret = "sk-live-SECRETREJECTEDVALUE_31"
+    opening = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {"_meta": _META},
+    }
+    for frame in (
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {
+                "_meta": {**_META, "io.modelcontextprotocol/protocolVersion": secret}
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": secret,
+                "capabilities": {},
+                "clientInfo": {"name": "c", "version": "1"},
+            },
+        },
+        {"jsonrpc": "2.0", "id": 2, "method": secret, "params": {"_meta": _META}},
+    ):
+        out, _ = _stdio_exchange(tmp_path, [opening, frame])
+        assert '"id":2' in out.replace(" ", ""), out[-500:]
+        assert secret not in out
+
+
+@pytest.mark.parametrize("sentinel", sorted(_GRID_SENTINELS))
+def test_an_sdk_rejection_over_http_echoes_nothing_of_the_request(
+    sentinel: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same requests on `/mcp`, both SDK paths, at DEBUG: the modern
+    per-request path (a 4xx JSON body) and the legacy session path (an SSE
+    frame after the initialize handshake). Body, headers and every log
+    record carry no form of the sentinel."""
+    import json
+    import logging
+
+    from mcp.server.lowlevel import Server
+
+    from pmcp.transport.http import create_http_app
+    from tests.test_argument_error_echo import _forbidden, _record_text
+
+    s = _GRID_SENTINELS[sentinel]
+    caplog.set_level(logging.DEBUG)
+    seen: list[str] = []
+    app = create_http_app(Server("rev20"))
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        for name, frame in _sdk_rejection_frames(s).items():
+            if name == "unknown-notification":
+                continue
+            headers = {
+                **_MCP_HEADERS,
+                "mcp-protocol-version": _MODERN,
+                "mcp-method": str(frame["method"]),
+            }
+            if name == "unsupported-version":
+                headers["mcp-protocol-version"] = s
+            response = client.post("/mcp", content=json.dumps(frame), headers=headers)
+            seen.append(
+                f"{name} {response.status_code} {response.text} {dict(response.headers)}"
+            )
+        legacy = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "c", "version": "1"},
+            },
+        }
+        opened = client.post("/mcp", content=json.dumps(legacy), headers=_MCP_HEADERS)
+        session = opened.headers.get("mcp-session-id")
+        assert session, opened.text
+        session_headers = {
+            **_MCP_HEADERS,
+            "mcp-session-id": session,
+            "mcp-protocol-version": "2025-06-18",
+        }
+        client.post(
+            "/mcp",
+            content=json.dumps(
+                {"jsonrpc": "2.0", "method": "notifications/initialized"}
+            ),
+            headers=session_headers,
+        )
+        for frame in (
+            {"jsonrpc": "2.0", "id": 7, "method": s, "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {"name": {s: s}},
+            },
+            {"jsonrpc": "2.0", "method": f"notifications/{s}"},
+        ):
+            response = client.post(
+                "/mcp", content=json.dumps(frame), headers=session_headers
+            )
+            seen.append(f"legacy {response.status_code} {response.text}")
+    logs = "\n".join(_record_text(record) for record in caplog.records)
+
+    def leaked(text: str) -> bool:
+        if sentinel == "short":
+            return s in text
+        return any(form in text for form in _forbidden(s))
+
+    assert not [item for item in seen if leaked(item)], [
+        item for item in seen if leaked(item)
+    ]
+    assert not leaked(logs), [line for line in logs.splitlines() if leaked(line)][:5]
+    assert sum("-32601" in item for item in seen) >= 3, seen
+    assert any(record.name.startswith("sse_starlette") for record in caplog.records)
+
+
+def test_a_pmcp_handler_error_passes_the_write_side_unchanged() -> None:
+    """The rewrite never touches what pmcp's own handler raised: it carries
+    `PMCP_HANDLER_MARK` and is mapped as the SDK maps it. An unmarked error
+    keeps its code; its message only if reviewed; its `data` only in a
+    reviewed shape."""
+    import mcp.shared.jsonrpc_dispatcher as dispatcher
+    from mcp.shared.exceptions import MCPError
+
+    from pmcp.sdk_rejections import PMCP_HANDLER_MARK
+
+    mapping = dispatcher.handler_exception_to_error_data
+    mine = MCPError(code=-32602, message="Unknown tool: x", data={"k": "v"})
+    setattr(mine, PMCP_HANDLER_MARK, True)
+    error = mapping(mine)
+    assert (error.code, error.message, error.data) == (
+        -32602,
+        "Unknown tool: x",
+        {"k": "v"},
+    )
+    error = mapping(MCPError(code=-32601, message="Method not found", data="SECRETzz"))
+    assert (error.code, error.message, error.data) == (-32601, "Method not found", None)
+    error = mapping(MCPError(code=-32602, message="bad SECRETzz", data="SECRETzz"))
+    assert (error.code, error.message, error.data) == (-32602, "Invalid params", None)
+    error = mapping(
+        MCPError(
+            code=-32022,
+            message="Unsupported protocol version",
+            data={"supported": ["2026-07-28"], "requested": "SECRETzz"},
+        )
+    )
+    assert error.data == {"supported": ["2026-07-28"], "requested": ""}
+    error = mapping(
+        MCPError(
+            code=-32022,
+            message="Unsupported protocol version",
+            data={"supported": ["2026-07-28"], "requested": "2099-01-01"},
+        )
+    )
+    assert error.data["requested"] == "2099-01-01"
+
+
+#: Every construction anywhere in the installed `mcp` package that can put a
+#: non-literal message or `data` into a JSON-RPC error, and how pmcp treats
+#: it. Keyed by (module, call, argument, source). Derived by AST from the
+#: whole package (round-18 ruling), exact both ways: an SDK upgrade that adds
+#: one fails here until it is classified.
+_WRITE = "server, in an exchange: rebuilt by pmcp.sdk_rejections"
+_PRE = "server, out of session (id null): rewritten by value_free_rejection"
+_PLUMB = "plumbing: carries an error classified where it is built"
+_CLIENT = "client side: an error pmcp receives or raises as a client"
+_UNUSED = "unreachable: pmcp serves the low-level Server over JSONRPCDispatcher"
+_SDK_ERROR_CONSTRUCTIONS: dict[tuple[str, str, str, str], str] = {
+    ("mcp.client.session", "MCPError", "data", "method"): _CLIENT,
     (
-        "mcp.server.streamable_http",
-        "_create_error_response",
-        "f'Parse error: {str(e)}'",
-    ): "request-built: rewritten by value_free_rejection (PARSE_ERROR, id null)",
+        "mcp.client.session_group",
+        "MCPError",
+        "message",
+        "f'{matching_prompts} already exist in group prompts.'",
+    ): _CLIENT,
     (
-        "mcp.server.streamable_http",
-        "_create_error_response",
-        "f'Validation error: {str(e)}'",
-    ): "request-built: rewritten by value_free_rejection (INVALID_PARAMS, id null)",
+        "mcp.client.session_group",
+        "MCPError",
+        "message",
+        "f'{matching_resources} already exist in group resources.'",
+    ): _CLIENT,
     (
-        "mcp.shared.inbound",
-        "InboundLadderRejection",
-        "UnsupportedProtocolVersionErrorData(supported=list(supported_modern_versions), requested=protocol_version).model_dump(mode='json')",
-    ): "request-built `requested`: rewritten by value_free_rejection",
+        "mcp.client.session_group",
+        "MCPError",
+        "message",
+        "f'{matching_tools} already exist in group tools.'",
+    ): _CLIENT,
+    ("mcp.client.streamable_http", "ErrorData", "message", "message"): _CLIENT,
     (
-        "mcp.server.streamable_http",
+        "mcp.client.streamable_http",
         "ErrorData",
-        "error_message",
-    ): "plumbing: the message of _create_error_response, reviewed at its callers",
+        "message",
+        "f'Failed to parse JSON response: {exc}'",
+    ): _CLIENT,
     (
-        "mcp.server.streamable_http",
-        "Response",
-        "error_response.model_dump_json(by_alias=True, exclude_unset=True)",
-    ): "plumbing: serialises the reviewed ErrorData",
+        "mcp.client.streamable_http",
+        "ErrorData",
+        "message",
+        "f'Failed to parse SSE message: {exc}'",
+    ): _CLIENT,
     (
-        "mcp.server.streamable_http",
-        "Response",
-        "response_message.model_dump_json(by_alias=True, exclude_unset=True) if response_message else None",
-    ): "a handler's own response (JSON mode), not a rejection",
+        "mcp.client.streamable_http",
+        "ErrorData",
+        "message",
+        "f'Unexpected content type: {content_type}'",
+    ): _CLIENT,
     (
-        "mcp.server.streamable_http_manager",
-        "Response",
-        "body.model_dump_json(by_alias=True, exclude_unset=True)",
-    ): "plumbing: `Session not found`, a literal",
+        "mcp.client.subscriptions",
+        "MCPError",
+        "message",
+        "f'subscription backlog exceeded {_MAX_PENDING_EVENTS} unconsumed events; "
+        "re-listen and refetch'",
+    ): _CLIENT,
+    ("mcp.client.subscriptions", "MCPError", "message", "str(error)"): _CLIENT,
     (
         "mcp.server._streamable_http_modern",
         "ErrorData",
+        "message",
         "rejection.message",
-    ): "plumbing: an InboundLadderRejection's message, reviewed at its sites",
+    ): _WRITE,
     (
         "mcp.server._streamable_http_modern",
         "ErrorData",
+        "data",
         "rejection.data",
-    ): "plumbing: an InboundLadderRejection's data, reviewed at its sites",
-    (
-        "mcp.server._streamable_http_modern",
-        "Response",
-        "json.dumps(body, separators=(',', ':'))",
-    ): "plumbing: serialises a reviewed JSON-RPC message",
+    ): _WRITE,
     (
         "mcp.server._streamable_http_modern",
         "InboundLadderRejection",
+        "message",
         "f'{duplicated} header appears more than once'",
-    ): "`duplicated` is one of the SDK's fixed routing-header names",
+    ): _WRITE,
+    (
+        "mcp.server.mcpserver.resolve",
+        "MCPError",
+        "message",
+        "f'Client did not declare the {name} capability required by resolver {key!r}'",
+    ): _UNUSED,
+    (
+        "mcp.server.mcpserver.resolve",
+        "MCPError",
+        "data",
+        "data.model_dump(by_alias=True, mode='json', exclude_none=True)",
+    ): _UNUSED,
+    (
+        "mcp.server.mcpserver.server",
+        "MCPError",
+        "message",
+        "f'Client did not declare required extension {identifier!r}'",
+    ): _UNUSED,
+    (
+        "mcp.server.mcpserver.server",
+        "MCPError",
+        "data",
+        "data.model_dump(by_alias=True, mode='json', exclude_none=True)",
+    ): _UNUSED,
+    ("mcp.server.mcpserver.server", "MCPError", "data", "method.method"): _UNUSED,
+    ("mcp.server.mcpserver.server", "MCPError", "message", "str(err)"): _UNUSED,
+    (
+        "mcp.server.mcpserver.server",
+        "MCPError",
+        "data",
+        "{'uri': str(params.uri)}",
+    ): _UNUSED,
+    (
+        "mcp.server.request_state",
+        "MCPError",
+        "data",
+        "{'reason': 'invalid_request_state'}",
+    ): _WRITE,
+    (
+        "mcp.server.runner",
+        "MCPError",
+        "data",
+        "_initialize_after_modern_data(params)",
+    ): _WRITE,
+    ("mcp.server.runner", "MCPError", "message", "route.message"): _WRITE,
+    ("mcp.server.runner", "MCPError", "data", "route.data"): _WRITE,
+    ("mcp.server.runner", "MCPError", "data", "method"): _WRITE,
+    ("mcp.server.runner", "MCPError", "message", "error.message"): _WRITE,
+    ("mcp.server.runner", "MCPError", "data", "error.data"): _WRITE,
+    ("mcp.server.streamable_http", "ErrorData", "message", "error_message"): _PLUMB,
+    (
+        "mcp.server.streamable_http",
+        "_create_error_response",
+        "error_message",
+        "f'Parse error: {str(e)}'",
+    ): _PRE,
+    (
+        "mcp.server.streamable_http",
+        "_create_error_response",
+        "error_message",
+        "f'Validation error: {str(e)}'",
+    ): _PRE,
+    (
+        "mcp.shared.direct_dispatcher",
+        "MCPError",
+        "message",
+        "f\"Timed out after {opts.get('timeout')}s waiting for {method!r}\"",
+    ): _UNUSED,
+    ("mcp.shared.direct_dispatcher", "MCPError", "message", "str(e)"): _UNUSED,
+    ("mcp.shared.exceptions", "ErrorData", "message", "message"): _PLUMB,
+    ("mcp.shared.exceptions", "ErrorData", "data", "data"): _PLUMB,
     (
         "mcp.shared.inbound",
         "InboundLadderRejection",
-        "f'params._meta must be an object carrying the required {PROTOCOL_VERSION_META_KEY!r} and {CLIENT_CAPABILITIES_META_KEY!r} envelope keys'",
-    ): "SDK constants",
+        "message",
+        "f'params._meta must be an object carrying the required "
+        "{PROTOCOL_VERSION_META_KEY!r} and {CLIENT_CAPABILITIES_META_KEY!r} "
+        "envelope keys'",
+    ): _WRITE,
     (
         "mcp.shared.inbound",
         "InboundLadderRejection",
+        "message",
         "f\"params._meta is missing the required envelope key(s): {', '.join(missing)}\"",
-    ): "`missing` holds SDK constants",
+    ): _WRITE,
     (
         "mcp.shared.inbound",
         "InboundLadderRejection",
-        'f"{MCP_PROTOCOL_VERSION_HEADER} header does not match the request envelope\'s protocol version"',
-    ): "SDK constant",
+        "data",
+        "UnsupportedProtocolVersionErrorData(supported=list(supported_modern_versions), "
+        "requested=protocol_version).model_dump(mode='json')",
+    ): _WRITE,
     (
         "mcp.shared.inbound",
         "InboundLadderRejection",
+        "message",
+        'f"{MCP_PROTOCOL_VERSION_HEADER} header does not match the request '
+        "envelope's protocol version\"",
+    ): _WRITE,
+    (
+        "mcp.shared.inbound",
+        "InboundLadderRejection",
+        "message",
         'f"{MCP_METHOD_HEADER} header does not match the request body\'s method"',
-    ): "SDK constant",
+    ): _WRITE,
     (
         "mcp.shared.inbound",
         "InboundLadderRejection",
-        'f"{MCP_NAME_HEADER} header does not match the request body\'s {name_key!r} parameter"',
-    ): "`name_key` is from the SDK's NAME_BEARING_METHODS",
+        "message",
+        "f\"{MCP_NAME_HEADER} header does not match the request body's {name_key!r} "
+        'parameter"',
+    ): _WRITE,
     (
         "mcp.shared.inbound",
         "InboundLadderRejection",
+        "message",
         "f'{header_name} header appears more than once'",
-    ): "`header_name` is from the tool's own x-mcp-header schema token",
+    ): _WRITE,
     (
         "mcp.shared.inbound",
         "InboundLadderRejection",
-        'f"{header_name} header is present but the request body\'s {argument!r} argument is absent"',
-    ): "schema token and schema path",
+        "message",
+        "f\"{header_name} header is present but the request body's {argument!r} "
+        'argument is absent"',
+    ): _WRITE,
     (
         "mcp.shared.inbound",
         "InboundLadderRejection",
-        'f"{header_name} header does not match the request body\'s {argument!r} argument"',
-    ): "schema token and schema path",
+        "message",
+        "f\"{header_name} header does not match the request body's {argument!r} "
+        'argument"',
+    ): _WRITE,
     (
         "mcp.shared.inbound",
         "InboundLadderRejection",
-        'f"{header_name} header is missing but the request body\'s {argument!r} argument is present"',
-    ): "schema token and schema path",
+        "message",
+        "f\"{header_name} header is missing but the request body's {argument!r} "
+        'argument is present"',
+    ): _WRITE,
     (
         "mcp.shared.inbound",
         "InboundLadderRejection",
+        "message",
         "f'{header_name} header carries a malformed base64 sentinel value'",
-    ): "schema token",
+    ): _WRITE,
+    (
+        "mcp.shared.jsonrpc_dispatcher",
+        "MCPError",
+        "message",
+        "outcome.message",
+    ): _CLIENT,
+    ("mcp.shared.jsonrpc_dispatcher", "MCPError", "data", "outcome.data"): _CLIENT,
+    (
+        "mcp.shared.jsonrpc_dispatcher",
+        "MCPError",
+        "message",
+        "f'Request {method!r} timed out'",
+    ): _CLIENT,
+    ("mcp.shared.jsonrpc_dispatcher", "ErrorData", "message", "str(e)"): _WRITE,
 }
-_SDK_REJECTION_MODULES = (
-    "mcp.server.streamable_http",
-    "mcp.server.streamable_http_manager",
-    "mcp.server._streamable_http_modern",
-    "mcp.shared.inbound",
-    "mcp.server.transport_security",
-)
-_SDK_REJECTION_CALLS = {
-    "_create_error_response",
-    "ErrorData",
-    "InboundLadderRejection",
-    "Response",
-    "JSONResponse",
-    "PlainTextResponse",
-}
+_DATA_CALLS = {"ErrorData", "MCPError", "McpError", "InboundLadderRejection"}
 
 
-def _sdk_rejection_sites() -> set[tuple[str, str, str]]:
+def _sdk_error_constructions() -> set[tuple[str, str, str, str]]:
+    """Every non-literal message or `data` argument of a JSON-RPC error
+    construction in the installed `mcp` package."""
     import ast
-    import importlib.util
+    from pathlib import Path
 
-    found: set[tuple[str, str, str]] = set()
-    for module in _SDK_REJECTION_MODULES:
-        spec = importlib.util.find_spec(module)
-        assert spec is not None and spec.origin, module
-        with open(spec.origin, encoding="utf-8") as handle:
-            tree = ast.parse(handle.read())
+    import mcp
+
+    from pmcp.sdk_rejections import _MESSAGE_ARGUMENTS
+
+    root = Path(mcp.__file__).parent
+    found: set[tuple[str, str, str, str]] = set()
+    for path in sorted(root.rglob("*.py")):
+        module = (
+            path.relative_to(root.parent).with_suffix("").as_posix().replace("/", ".")
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -1000,21 +1467,122 @@ def _sdk_rejection_sites() -> set[tuple[str, str, str]]:
                 if isinstance(func, ast.Attribute)
                 else getattr(func, "id", None)
             )
-            if name not in _SDK_REJECTION_CALLS:
+            if name not in _MESSAGE_ARGUMENTS:
                 continue
-            arguments = list(node.args[:1]) + [
-                keyword.value
-                for keyword in node.keywords
-                if keyword.arg in ("message", "data", "content", "error_message")
+            keyword, index = _MESSAGE_ARGUMENTS[name]
+            arguments: list[tuple[str, ast.expr]] = [
+                (str(item.arg), item.value)
+                for item in node.keywords
+                if item.arg == keyword or (item.arg == "data" and name in _DATA_CALLS)
             ]
-            for argument in arguments:
-                if not isinstance(argument, ast.Constant):
-                    found.add((module, name, ast.unparse(argument)))
+            if index is not None and len(node.args) > index:
+                arguments.append((keyword, node.args[index]))
+            if name in ("MCPError", "McpError") and len(node.args) > 2:
+                arguments.append(("data", node.args[2]))
+            for label, value in arguments:
+                if isinstance(value, ast.Constant):
+                    continue
+                found.add((module, name, label, ast.unparse(value)))
     return found
 
 
-def test_every_sdk_rejection_message_is_reviewed() -> None:
-    """Each non-literal rejection message in the SDK's server transport is
-    reviewed: request-built ones are rewritten, the rest are built from SDK
-    constants or pmcp's schema. The set is exact both ways."""
-    assert _sdk_rejection_sites() == set(_SDK_REJECTION_SITES)
+def test_every_sdk_error_construction_is_classified() -> None:
+    """The whole `mcp` package, exact both ways (round-18 ruling)."""
+    found = _sdk_error_constructions()
+    assert found == set(_SDK_ERROR_CONSTRUCTIONS), (
+        sorted(found - set(_SDK_ERROR_CONSTRUCTIONS)),
+        sorted(set(_SDK_ERROR_CONSTRUCTIONS) - found),
+    )
+
+
+def test_the_reviewed_templates_are_the_ones_the_sdk_builds() -> None:
+    """Each reviewed message template exists in the SDK as written, so none
+    is a dead entry; and each is one this table classifies as written inside
+    an exchange."""
+    from pmcp.sdk_rejections import REVIEWED_MESSAGE_TEMPLATES
+
+    built = {
+        source
+        for (_module, _call, label, source), how in _SDK_ERROR_CONSTRUCTIONS.items()
+        if label == "message" and how == _WRITE
+    }
+    assert set(REVIEWED_MESSAGE_TEMPLATES) <= built
+
+
+@pytest.mark.parametrize(
+    ("logger_name", "msg", "args"),
+    [
+        ("mcp.server.runner", "no handler for notification %s", ("SECRETzz",)),
+        ("mcp.shared.jsonrpc_dispatcher", "handler for %r raised", ("SECRETzz",)),
+        ("sse_starlette.sse", "chunk: %s", (b"data: SECRETzz",)),
+        (
+            "mcp.server.streamable_http_manager",
+            "Rejected request with unknown or expired session ID: SECRETzz",
+            (),
+        ),
+        (
+            "mcp.server.streamable_http",
+            "Session terminated with request SECRETzz in flight; no response to send",
+            (),
+        ),
+    ],
+)
+def test_an_sdk_server_log_record_carries_no_request_text(
+    logger_name: str, msg: str, args: tuple[object, ...]
+) -> None:
+    """An SDK server-side or sse_starlette record (rev 20, round-18 N2): text
+    arguments are masked, and an f-string message the SDK pre-formatted has
+    its placeholders masked -- whatever level it is logged at."""
+    import logging
+
+    import pmcp  # noqa: F401 - installs the record scrubber
+
+    record = logging.getLogRecordFactory()(
+        logger_name, logging.DEBUG, __file__, 1, msg, args, None
+    )
+    assert "SECRETzz" not in record.getMessage(), record.getMessage()
+    other = logging.getLogRecordFactory()(
+        "pmcp.server", logging.DEBUG, __file__, 1, msg, args, None
+    )
+    assert "SECRETzz" in other.getMessage()  # pmcp's own loggers are not masked
+
+
+def test_a_pmcp_handler_error_reaches_the_caller_as_pmcp_wrote_it(
+    tmp_path: object,
+) -> None:
+    """End to end over stdio, on a handshake-era connection (where the SDK
+    sends a handler's error text; the modern era sends `Internal server
+    error` for any non-MCP error, as it always has): an error pmcp's own
+    handler raises keeps its text through the SDK-side rewrite (it carries
+    `PMCP_HANDLER_MARK`); an SDK rejection on the same connection is
+    rebuilt (rev 20)."""
+    import json
+
+    frames = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "c", "version": "1"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "resources/read",
+            "params": {"uri": "x://no-such-resource"},
+        },
+        {"jsonrpc": "2.0", "id": 3, "method": "SECRETzzMETHOD", "params": {}},
+    ]
+    out, _ = _stdio_exchange(tmp_path, frames)
+    replies = {reply.get("id"): reply for reply in map(json.loads, out.splitlines())}
+    assert replies[2]["error"]["message"] == "Unknown resource: x://no-such-resource", (
+        replies[2]
+    )
+    assert replies[3]["error"] == {"code": -32601, "message": "Method not found"}, (
+        replies[3]
+    )

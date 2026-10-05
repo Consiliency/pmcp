@@ -1070,3 +1070,26 @@ def test_a_policy_refusal_still_names_the_file_and_the_refusal(
         assert str(policy) in rendered, rendered
         if scope == "user":
             assert "Refusing to start" in rendered, rendered
+
+
+def test_a_versioned_package_pattern_is_refused_without_its_value(
+    tmp_path: Path,
+) -> None:
+    """A policy's `pkg@1.2.3` package pattern is refused by its list and a
+    fixed reason, never with the operator's entry (rev 20: the validator
+    raised `ValueError(f"package pattern {entry!r} names a version")`)."""
+    from pmcp.argument_errors import exception_text
+    from pmcp.policy.policy import PolicyManager
+
+    s = _R19
+    path = tmp_path / "p.yaml"
+    path.write_text(f"packages:\n  denylist: ['ok-*', '{s}@1.2.3']\n")
+    with pytest.raises(ValueError) as raised:
+        PolicyManager(path)
+    text = exception_text(raised.value)
+    assert text == (
+        f"Failed to load explicit policy {path}: 1 validation error for "
+        "GatewayPolicy: $.packages.denylist: a package pattern names a version; "
+        "package patterns match the package name only"
+    ), text
+    assert not any(form in text for form in _forbidden(s)), text

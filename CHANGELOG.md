@@ -8,8 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Upgrade notes
-Things 2.7.3 accepted that 2.8.0 refuses, and defaults or output that changed.
+Things 2.7.3 accepted that 3.0.0 refuses, and defaults or output that changed. This is a major release because of them: upgrading can stop a project's servers from loading until you approve its files (first item below).
 Each is described in full in the section named at the end of the line.
+[MIGRATING.md](MIGRATING.md) covers each one: how to tell whether you are affected, what
+to do, how to verify it, and how to roll back to 2.7.3.
 
 - **Project files need approval.** A repository's `.pmcp/manifest.yaml`, `.mcp.json`
   and `.mcp-gateway-policy.yaml` are ignored (with a WARNING naming the command) until
@@ -20,8 +22,9 @@ Each is described in full in the section named at the end of the line.
   shell.** A value that came from `.env`, `.env.pmcp` or `~/.config/pmcp/pmcp.env` is
   ignored as if unset. *Security*
 - **Spawned servers no longer inherit the keys pmcp loaded from `.env`**, except a
-  server's own declared `env_var`. Shell-exported variables are still inherited.
-  *Security*
+  server's own declared `env_var`. Shell-exported variables are still inherited. An
+  install spawn under `pmcp --project <dir>` run from another directory no longer
+  inherits a credential stored in `<dir>/.env.pmcp`. *Security*
 - **Discovered servers are default-deny.** `gateway.register_discovered_server` resolves
   and pins the package (and refuses one it cannot pin, or an `env_vars` name that is not
   credential-shaped); `provision`, `connect_server` and `restart_server` refuse it until
@@ -50,20 +53,30 @@ Each is described in full in the section named at the end of the line.
   unknown `kid` refetches the JWKS at most once per 10 s, and any JWKS failure, including
   a key set with no usable keys, is a `503` instead of a `500`. The metadata route's
   `resource` is `--oauth-audience`, or the metadata URL's origin plus `/mcp`, and no
-  longer the request `Host`. *Security*, *Fixed*
+  longer the request `Host`. A forged token pairing an algorithm with a key of
+  another type, and a non-ASCII `Authorization` header, get a `401` instead of a
+  `500`. *Security*, *Fixed*
 - **The `tools/call` gate enforces the schemas pmcp advertises.** Constraints the
   argument models always had are now rejected at the gate as an `isError`
   `Input validation error: …` result instead of an `{"error": true}` payload. Lax
   coercion (`1` for a boolean, `"5"` for an integer) on `invoke.task` is refused, and
   an explicit `null` for an optional argument is now accepted. Policy is judged before
-  the schema, and gate rejections are recorded as `audit.rejection` events. *Changed*
+  the schema, and gate rejections are recorded as `audit.rejection` events, which carry
+  no values taken from the call's arguments: only the failing path and the JSON
+  Schema keyword, never the value or any digest of the arguments. An
+  `audit.invocation` record for a call refused by policy or made to an unregistered
+  name is `denied` with every argument-derived field (`run_correlation_id` and the
+  rest) `null`, and every other record reads only the top-level arguments the tool's
+  schema declares, so a correlation id passed to a tool that does not declare it is
+  no longer recorded. *Changed*
 - **Task numbers are bounded.** `invoke.task.ttl` must be an integer from 1 to
   9,007,199,254,740 (seconds), and `invoke.task.poll_interval` a finite number above 0
   and at most 9,007,199,254,740. `NaN` and
   `±Infinity` are refused for every numeric argument, and a request carrying a value
   that is not strict JSON fails with `outbound frame is not strict JSON`. A downstream
   task field pmcp cannot use is reported as `null` and named in `unusable_fields`.
-  *Changed*
+  Finished tasks past the 100-record cap are evicted in the order pmcp recorded
+  them, not by the downstream's timestamps. *Changed*
 - **Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire.**
   pmcp now converts both ways, as MCP 2025-11-25 requires. If you sent milliseconds
   to work around the old pass-through, your values are now 1000× too long. A tenant
@@ -85,12 +98,38 @@ Each is described in full in the section named at the end of the line.
 - **Logs.** Every install spawn, package-runner start and update probe logs a
   secret-safe command line at WARNING. A manifest's warnings are logged once each time
   its inputs change, not on every load. *Changed*
-- **Dependency floors.** `pyjwt[crypto]>=2.15.0` (was `>=2.10.0`) and
-  `aiohttp>=3.14.2` (was `>=3.9.0`). *Security*
+- **Dependency floors.** `pyjwt[crypto]>=2.15.0` (was `>=2.10.0`),
+  `aiohttp>=3.14.2` (was `>=3.9.0`), `python-dotenv>=1.2.2` (was `>=1.0.0`) and,
+  in the `http` extra, `starlette>=1.3.1` (was `>=0.27.0`); the `dev` extra needs
+  `pytest>=9.0.3` (was `>=7.0`) and adds `pytest-timeout>=2.3`. *Security*
 - **Agent-facing hints.** The `try/catch` code hint is now `try`, and the Playwright
   screenshot pattern and example name `browser_take_screenshot` with `filename`.
   *Changed*
-- **Known issues in 2.8.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
+- **A symlinked `.mcp.json` is no longer edited.** `pmcp config set-startup-policy`
+  and the `gateway.set_startup_policy` tool refuse to rewrite a `.mcp.json` that is a
+  symlink -- for the user, project and custom sources alike, and in a dry-run preview
+  too -- reporting `symlinked_config`/`invalid_source`. 2.7.3 accepted the edit and
+  replaced your symlink with a regular file. Edit the link's target directly. *Changed*
+- **`NaN` from HTTP/SSE servers.** Downstream replies over HTTP and SSE are read as
+  sent: a `NaN` inside a tool result now reaches the caller as a `NaN` token rather
+  than `null` (as stdio servers already did; tracked as
+  [Consiliency/pmcp#335](https://github.com/Consiliency/pmcp/issues/335)), and a
+  `nextCursor` of `NaN` leaves the previous listing in place. *Changed*
+- **Error text names the real failure.** Status, `doctor`, health output and
+  connect/disconnect errors from a remote transport now show the individual
+  exceptions inside an exception group instead of `unhandled errors in a
+  TaskGroup`. One line still prints the old string: the batch-connect
+  `Failed to connect to <server>: …`, also shown as `pmcp`'s "cannot reach PMCP
+  gateway" error; the WARNING lines before it name the cause. Match on the
+  underlying error instead. A hung `gateway.update_server` probe on Python 3.10
+  reports `Update probe timed out after 60 seconds.` instead of an empty
+  `Failed to run update probe: `. *Fixed*
+- **A cancelled teardown kills stdio servers at once.** When the caller of a
+  disconnect, restart, refresh or shutdown is cancelled (or shutdown's 10 s budget
+  runs out), pmcp now SIGKILLs the server's whole process group instead of waiting
+  out its SIGTERM grace, so a server that needs a graceful flush on exit can lose
+  it in that case. An uncancelled teardown still sends SIGTERM first. *Fixed*
+- **Known issues in 3.0.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
   but the gateway reads `.mcp-gateway`; until that is fixed, run
   `pmcp refresh --cache-dir .mcp-gateway`
   ([Consiliency/pmcp#352](https://github.com/Consiliency/pmcp/issues/352)).
@@ -198,11 +237,11 @@ Each is described in full in the section named at the end of the line.
   same rules.
   Two properties are worth knowing before you rely on it. The store must live
   **outside** the checkout it judges — a store path that resolves inside the
-  current repository (or, under `pmcp serve --project`, the served project),
+  current repository (or, under `pmcp --project`, the served project),
   directly or through a symlink, is refused rather than
   read, and `pmcp trust approve` also refuses a store inside the checkout that
   contains the file being approved, so it never reports an approval that
-  `pmcp serve --project` would then refuse
+  `pmcp --project` would then refuse
   ([Consiliency/pmcp#252](https://github.com/Consiliency/pmcp/issues/252)),
   because a repository that ships its own approval record must not be
   believed. And every read failure is a refusal: a missing, unreadable or
@@ -324,7 +363,7 @@ Each is described in full in the section named at the end of the line.
   repository's. See [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **An install spawn now strips PMCP-managed credentials using the project root
   the gateway was given, not the directory it happens to be running in.** When a
-  gateway started with `pmcp serve --project X` ran from a different working
+  gateway started with `pmcp --project X` ran from a different working
   directory, the install child's environment was sanitized by walking up from the
   *working directory* to find the project credential store, while the credential
   was written from the gateway's own root `X` — so a project-scoped credential in
@@ -353,13 +392,13 @@ Each is described in full in the section named at the end of the line.
   gateway serves, not only the directory it was launched from.** A trust store
   that resolves inside a checkout is refused, because a repository must not ship
   its own approval record — but the guard discovered the checkout by walking up
-  from `Path.cwd()`, so `pmcp serve --project <checkout>` launched from any other
+  from `Path.cwd()`, so `pmcp --project <checkout>` launched from any other
   directory did not refuse a store planted inside that served checkout, and it
   would load that checkout's self-approved `.mcp.json`. The guard now judges
   residency against the served project root **and** the launch checkout (adding
   the served root, never replacing the cwd walk, so a store resident in a second
   checkout the operator launches from stays refused too). `pmcp status --project`
-  gets the same binding; the `pmcp trust` verbs and a bare `pmcp serve` keep
+  gets the same binding; the `pmcp trust` verbs and a bare `pmcp` (the gateway) keep
   the cwd-derived guard, and `pmcp trust approve` additionally refuses a store
   inside the approved file's checkout (see the trust-store entry under *Added*). See
   [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230), [Consiliency/pmcp#251](https://github.com/Consiliency/pmcp/issues/251).
@@ -567,7 +606,7 @@ Each is described in full in the section named at the end of the line.
 ### Fixed
 - **A value pmcp rejects is no longer echoed into a response, a log line, a traceback or an audit record (Consiliency/pmcp#297).** A rejected gateway-tool argument used to come back with jsonschema's or pydantic's message, which carried the value (`'Bearer sk-…' is not of type 'object'`, `input_value=…`), in the response, the log and the scoped audit. Rejections now read `<JSON path>: <reason>`, for example `Input validation error: $.options: must be of type object or null`. The reason is a fixed phrase filled only from the tool's own schema or model, and a key the caller chose shows as `*`. A call rejected by the argument model is audited as an `audit.rejection`. **Wording change:** a client matching jsonschema phrases such as `is not of type` must match the new form.
 
-  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`. An exception that chains a validation or parse error, as its cause, its context or a group member, shows only its class and that error's description, never its own message; pmcp's own refusals (an invalid policy file, a trust store it cannot parse) chain nothing and still name the file and the refusal. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500. On `/mcp` over HTTP, the MCP SDK's rejection of a body that is not JSON or not a JSON-RPC message no longer quotes it: the error says why from its structure (`Validation error: N validation errors for …: $.<path>: <reason>`), and an unsupported protocol version's `requested` is returned only when it is a protocol revision.
+  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`. An exception that chains a validation or parse error, as its cause, its context or a group member, shows only its class and that error's description, never its own message; pmcp's own refusals (an invalid policy file, a trust store it cannot parse) chain nothing and still name the file and the refusal. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500. The MCP SDK's own rejections no longer quote the request, on every transport: an unknown method's name is no longer returned as `data`, an unsupported protocol version's `requested` is returned only when it is a protocol revision, an SDK message pmcp has not reviewed reads as a fixed phrase for its code, and on `/mcp` a body that is not JSON or not a JSON-RPC message is described from its structure (`Validation error: N validation errors for …: $.<path>: <reason>`). Errors from pmcp's own tools are unchanged, and so is the request id. The SDK's server-side DEBUG logs and `sse_starlette`'s no longer show request text. A failed tool call whose error carries a rejected value is never read as a URL-elicitation request.
 
   Downstream frames:
   - A frame that is not JSON-RPC 2.0 is dropped with a value-free DEBUG record and never settles a request. This holds on stdio, SSE and streamable HTTP.
@@ -764,7 +803,7 @@ Each is described in full in the section named at the end of the line.
   [Consiliency/pmcp#224](https://github.com/Consiliency/pmcp/issues/224).
 
 ### Changed
-- **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree ([Consiliency/pmcp#236](https://github.com/Consiliency/pmcp/issues/236)).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` and `invoke.task.poll_interval` are now range-checked at the gate; the ranges are given in the [Consiliency/pmcp#298](https://github.com/Consiliency/pmcp/issues/298) entry below. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. Inputs the gate now rejects that previously reached the handler were recorded in the scoped-advisor audit as `failure`; they are now recorded as `audit.rejection` events with `terminal_status: "invalid_arguments"` (see the [Consiliency/pmcp#296](https://github.com/Consiliency/pmcp/issues/296) entry below). Unknown keys are still accepted and ignored, as before; forbidding them is tracked on [Consiliency/pmcp#236](https://github.com/Consiliency/pmcp/issues/236). Argument descriptions agents already saw were unchanged by this entry, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description. (Several more descriptions are corrected later in this release; see the agent-visible text entry under Changed.)
+- **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree ([Consiliency/pmcp#236](https://github.com/Consiliency/pmcp/issues/236)).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `anyOf: [X, {"type": "null"}]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. `null` is never an `enum` value or part of a `type` array, because host schema converters do not carry those over: OpenCode's Google provider turns an `enum` value `null` into the string `"null"` and drops the `null` from a type array. That provider sends the `anyOf` form to Gemini as `{"type": X, "nullable": true}`; Claude Code and Codex pass it through unchanged. A client that reads a single flat `type` per argument now finds `anyOf` on these arguments ([Consiliency/pmcp#369](https://github.com/Consiliency/pmcp/issues/369)). The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` and `invoke.task.poll_interval` are now range-checked at the gate; the ranges are given in the [Consiliency/pmcp#298](https://github.com/Consiliency/pmcp/issues/298) entry below. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. Inputs the gate now rejects that previously reached the handler were recorded in the scoped-advisor audit as `failure`; they are now recorded as `audit.rejection` events with `terminal_status: "invalid_arguments"` (see the [Consiliency/pmcp#296](https://github.com/Consiliency/pmcp/issues/296) entry below). Unknown keys are still accepted and ignored, as before; forbidding them is tracked on [Consiliency/pmcp#236](https://github.com/Consiliency/pmcp/issues/236). Argument descriptions agents already saw were unchanged by this entry, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description. (Several more descriptions are corrected later in this release; see the agent-visible text entry under Changed.)
 - **`tools/call` input-schema rejections are now recorded in the scoped-advisor audit, without argument values ([Consiliency/pmcp#296](https://github.com/Consiliency/pmcp/issues/296)).** A call the transport gate rejects used to return `Input validation error: …` before the audit was reached, so an operator saw no attempt at all. It is now written as a new `audit.rejection` event (not an `audit.invocation`: nothing was invoked, and a reader that correlates invocations to a run skips it) with the tool name (for the scoped-advisor tools; any other tool is recorded with `gateway_tool: null` and a `gateway_tool_digest`), `terminal_status: "invalid_arguments"`, `rejected_argument_path`, the failing location as a JSON array (a key the schema declares, an array index, or `null` for a key the caller chose, since that key can itself be a secret), and `rejected_argument_validator`, the failing JSON Schema keyword (`type`, `pattern`, `required`, …). The record never contains the validation message, the rejected value, correlation IDs, or any digest of the arguments. The capability stays `scoped_advisor_audit.v1`; readers that dispatch on `event` are unaffected. Policy is now judged **before** the schema: a call to a policy-blocked gateway tool is refused with "Gateway tool blocked by policy" and recorded `denied` whatever its arguments, instead of getting an `Input validation error` that described the blocked tool's schema. If the audit sink has failed, a malformed call now gets "Scoped advisor audit channel failed" like every other call, instead of its validation error. The response to a rejected call from an allowed tool is unchanged. An `audit.invocation` record now reads nothing the schema gate did not vouch for: a call refused by policy, or made to an unregistered name, is recorded `denied` with every argument-derived field (`run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`, `evidence_label_digest`, `source_reference_hash`) `null`, a result digest that no longer covers the caller's tool name, and a `gateway_tool_digest` of the registered name (for an unregistered name, of nothing) — previously a correlation-shaped value or a public URL anywhere in such a call's arguments was copied or hashed into the audit. Every other invocation record reads only the top-level arguments the tool's schema declares, so a correlation-shaped key a tool does not declare (e.g. `run_correlation_id` on `gateway.describe`) is no longer recorded; `gateway.invoke` declares every field the record reads, so its records are unchanged.
 - **`gateway.invoke`'s `task.ttl` and `task.poll_interval` are bounded, and
   NaN/Infinity are refused at the gate (see [Consiliency/pmcp#298](https://github.com/Consiliency/pmcp/issues/298)).**
@@ -880,7 +919,7 @@ Each is described in full in the section named at the end of the line.
     task, even if its result has a `taskId`.
   - Unchanged: a task's `raw` object, and the results pmcp relays as sent,
     keep the downstream's own milliseconds.
-- **`pmcp config set-startup-policy add|remove|set --source project --apply` now carries your prior trust approval forward when it rewrites `.mcp.json`.** Setting the startup policy changes the file's bytes, and trust approval is content-keyed, so the edit used to silently invalidate your own `pmcp trust approve` of that file and the next startup refused it. When the pre-write bytes were approved, pmcp now re-records the approval for the exact bytes it writes — keyed on the opened descriptor's verified identity (the resolved key must name the same file the descriptor holds open), never re-approving a file that was not already approved, and never approving a substituted file. A target swapped or unlinked mid-operation is refused rather than mis-bound, and on POSIX a symlinked `.mcp.json` is refused up front. If re-recording ever fails because the trust store is unusable, the edit is still written and the failure is surfaced as a diagnostic rather than crashing (an unusable store also fails the approval check, so nothing is silently carried forward). See [Consiliency/pmcp#253](https://github.com/Consiliency/pmcp/issues/253).
+- **`pmcp config set-startup-policy add|remove|set --source project --apply` now carries your prior trust approval forward when it rewrites `.mcp.json`; a symlinked `.mcp.json` is refused for every source (user, project and custom, apply or preview, CLI or `gateway.set_startup_policy`).** Setting the startup policy changes the file's bytes, and trust approval is content-keyed, so the edit used to silently invalidate your own `pmcp trust approve` of that file and the next startup refused it. When the pre-write bytes were approved, pmcp now re-records the approval for the exact bytes it writes — keyed on the opened descriptor's verified identity (the resolved key must name the same file the descriptor holds open), never re-approving a file that was not already approved, and never approving a substituted file. A target swapped or unlinked mid-operation is refused rather than mis-bound, and on POSIX a symlinked `.mcp.json` is refused up front. If re-recording ever fails because the trust store is unusable, the edit is still written and the failure is surfaced as a diagnostic rather than crashing (an unusable store also fails the approval check, so nothing is silently carried forward). See [Consiliency/pmcp#253](https://github.com/Consiliency/pmcp/issues/253).
 - **Every install spawn now logs the command it runs, at WARNING, before it
   runs.** `start_install`, the legacy `install_server` and `verify_installation`
   each log a rendered command line immediately before the subprocess is

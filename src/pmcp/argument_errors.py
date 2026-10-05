@@ -67,6 +67,7 @@ _MAX_MODEL_ERRORS = 5
 CORRELATION_ID_CHARSET = "correlation_id_charset"
 SCOPED_CORRELATION_INCOMPLETE = "scoped_correlation_incomplete"
 PACKAGE_NAME_INVALID = "package_name_invalid"
+PACKAGE_PATTERN_VERSIONED = "package_pattern_versioned"
 
 _PMCP_MESSAGES: dict[str, str] = {
     CORRELATION_ID_CHARSET: "correlation IDs may contain only alphanumerics and ._:-",
@@ -76,6 +77,10 @@ _PMCP_MESSAGES: dict[str, str] = {
     PACKAGE_NAME_INVALID: (
         "package must be a valid npm/pypi identifier (no leading dash, "
         "whitespace, path separators, or shell metacharacters)"
+    ),
+    PACKAGE_PATTERN_VERSIONED: (
+        "a package pattern names a version; package patterns match the "
+        "package name only"
     ),
 }
 
@@ -405,6 +410,19 @@ def _schema_phrase(
     except (KeyError, IndexError, TypeError):
         return "is invalid", None
     if keyword == "type":
+        # X's own type inside a nullable union is X or null (rev 20,
+        # Consiliency/pmcp#371): the union is read from our schema.
+        schema_path = list(error.absolute_schema_path)
+        if schema_path[-3:-1] == ["anyOf", 0]:
+            try:
+                union = _schema_node(schema, schema_path[:-3])
+            except (KeyError, IndexError, TypeError):
+                union = None
+            from pmcp.tools.schema import _is_nullable_union
+
+            if _is_nullable_union(union):
+                names = constraint if isinstance(constraint, list) else [constraint]
+                constraint = [*names, "null"]
         return f"must be of type {_type_names(constraint)}", None
     if keyword == "enum":
         return f"must be one of {json.dumps(constraint)}", None
@@ -432,6 +450,18 @@ def _schema_phrase(
         return "is required", _missing_required(constraint, error, arguments)
     if keyword in ("additionalProperties", "unevaluatedProperties"):
         return "has a property that is not accepted", None
+    if keyword == "anyOf":
+        # A nullable union refused as a whole (Consiliency/pmcp#371): the gate
+        # reports what X refused instead (`gate_error_for`); an error that did
+        # not come through it is read from our schema only.
+        from pmcp.tools.schema import _is_nullable_union
+
+        if _is_nullable_union(node):
+            inner = constraint[0] if isinstance(constraint, list) else None
+            kind = inner.get("type") if isinstance(inner, dict) else None
+            if kind is not None:
+                return f"must be null or a valid {_type_names(kind)}", None
+            return "must be null or match its schema", None
     return f"fails the schema's {keyword} constraint", None
 
 
@@ -1067,6 +1097,11 @@ def scrub_record(record: logging.LogRecord) -> logging.LogRecord:
     an exception's text. Every other record is returned unchanged.
     """
     try:
+        # The MCP SDK's server-side loggers and sse_starlette log request
+        # content as text (rev 20): masked before anything else.
+        from pmcp.sdk_rejections import scrub_sdk_record
+
+        scrub_sdk_record(record)
         if isinstance(record.msg, BaseException):
             record.msg = _scrubbed(record.msg)
         if record.args:
@@ -1322,6 +1357,9 @@ def install_log_scrubber() -> None:
     _install_handle_error()
     _install_message_rendering()
     _install_strict_client_envelopes()
+    from pmcp.sdk_rejections import install_value_free_sdk_errors
+
+    install_value_free_sdk_errors()
 
 
 def _install_handle_error() -> None:

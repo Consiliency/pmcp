@@ -22,7 +22,6 @@ import hmac
 import ipaddress
 import json
 import logging
-import re
 import uuid
 from collections.abc import AsyncIterator, Mapping, MutableMapping
 from typing import TYPE_CHECKING, Any, Callable, Literal
@@ -299,22 +298,18 @@ def _origin_host_port(origin: str) -> tuple[str, str] | None:
     return hostname, port
 
 
-# --- the SDK's transport rejections, value-free (Consiliency/pmcp#297 rev 19) --
+# --- the SDK's out-of-session rejections, value-free (Consiliency/pmcp#297) ----
 #
-# The MCP SDK's streamable-HTTP transport answers a request it cannot accept
-# before any pmcp handler runs. Three of its rejections are built from the
-# request itself (round-17 grok F001, claude N1):
-# - a body that is not JSON: `"Parse error: {str(e)}"`, the parser's text;
-# - a JSON body that is not a JSON-RPC message: `"Validation error:
-#   {str(e)}"`, pydantic's text, which quotes every rejected `input_value`;
-# - an unsupported protocol version on the per-request-envelope path:
-#   `data.requested`, the caller's string.
-# `tests/test_http_transport.py` enumerates every non-literal message the
-# SDK's server-transport modules can put in a rejection, and fails on one
-# that is not reviewed here. Every other rejection text is an SDK literal or
-# is built from SDK constants and pmcp's own schema.
-
-_PROTOCOL_REVISION = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Every JSON-RPC error the SDK answers *inside* a session or exchange -- the
+# id-bearing ones, on every transport -- is rebuilt where it is made
+# (`pmcp.sdk_rejections`, rev 20). What reaches here is the rest: a body the
+# streamable-HTTP transport writes before any request is dispatched, with
+# `id: null`. Two of those are built from the request itself (round-17 grok
+# F001): `"Parse error: {str(e)}"`, the parser's text, and `"Validation error:
+# {str(e)}"`, pydantic's text with every `input_value`. They are rewritten
+# with pmcp's structural description of the body; every other out-of-session
+# body goes through the same reviewed-message rule as the write side.
+# `tests/test_http_transport.py` enumerates the SDK's out-of-session writers.
 
 
 def _envelope_problem(request_body: bytes) -> str:
@@ -336,46 +331,52 @@ def _envelope_problem(request_body: bytes) -> str:
 
 
 def value_free_rejection(body: bytes, request_body: bytes | None) -> bytes:
-    """`body` (a JSON-RPC error the SDK's transport sent), with each part built
-    from the request replaced by its structural description. Any other body
-    is returned unchanged."""
-    from mcp_types import INVALID_PARAMS, PARSE_ERROR, UNSUPPORTED_PROTOCOL_VERSION
+    """`body`, when it is a JSON-RPC error with `id: null` (one the SDK wrote
+    outside any exchange), rebuilt value-free: a parse or envelope rejection
+    reads its structural description; any other has the reviewed-message rule
+    of `pmcp.sdk_rejections`. Any other body is returned unchanged."""
+    from mcp_types import INVALID_PARAMS, PARSE_ERROR
+
+    from pmcp.sdk_rejections import value_free_error_data
 
     try:
         payload = load_json(body, source="transport rejection")
     except ValueError:
         return body
     error = payload.get("error") if isinstance(payload, dict) else None
-    if (
-        not isinstance(error, dict)
-        or payload.get("id") is not None
-        and not (error.get("code") == UNSUPPORTED_PROTOCOL_VERSION)
-    ):
+    if not isinstance(error, dict) or payload.get("id") is not None:
         return body
-    code, message = error.get("code"), error.get("message")
-    changed = dict(error)
-    if code == PARSE_ERROR and isinstance(message, str):
-        changed["message"] = "Parse error: " + (
-            _envelope_problem(request_body)
-            if request_body is not None
-            else "the request body is not JSON"
-        )
-    elif code == INVALID_PARAMS and isinstance(message, str):
-        changed["message"] = "Validation error: " + (
-            _envelope_problem(request_body)
-            if request_body is not None
-            else "the request is not a JSON-RPC message"
-        )
-    elif code == UNSUPPORTED_PROTOCOL_VERSION and isinstance(changed.get("data"), dict):
-        data = dict(changed["data"])
-        requested = data.get("requested")
-        data["requested"] = (
-            requested
-            if isinstance(requested, str) and _PROTOCOL_REVISION.fullmatch(requested)
-            else ""
-        )
-        changed["data"] = data
+    code = error.get("code")
+    if code == PARSE_ERROR:
+        changed: dict[str, Any] = {
+            "code": code,
+            "message": "Parse error: "
+            + (
+                _envelope_problem(request_body)
+                if request_body is not None
+                else "the request body is not JSON"
+            ),
+        }
+    elif code == INVALID_PARAMS:
+        changed = {
+            "code": code,
+            "message": "Validation error: "
+            + (
+                _envelope_problem(request_body)
+                if request_body is not None
+                else "the request is not a JSON-RPC message"
+            ),
+        }
     else:
+        from types import SimpleNamespace
+
+        raw = SimpleNamespace(
+            code=code, message=error.get("message"), data=error.get("data")
+        )
+        changed = value_free_error_data(raw).model_dump(
+            by_alias=True, exclude_none=True
+        )
+    if changed == error:
         return body
     payload = {**payload, "error": changed}
     return json.dumps(payload, separators=(",", ":")).encode()

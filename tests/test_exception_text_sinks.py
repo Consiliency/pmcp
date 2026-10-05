@@ -23,6 +23,13 @@ is:
   variable over any exception name or over `<x>.exceptions`;
 - an alias of any of these (`last = e`), wherever it is later used.
 
+Since rev 20 (round-18 codex F001) an exception name is also a parameter
+annotated with an exception type that can be a registered error, over the
+whole function; and a read is also safe once the registry check passed
+(`safe_exc_info(x) is not None`, or after `if safe_exc_info(x) is None:`
+returned or raised). A callee an exception may be handed to is exempt only
+with a reason a test enforces (`_EXEMPT_CALLEES`), never by name alone.
+
 A **use** of an exception name is safe only as: an argument to a renderer
 (by its bare name, imported from `pmcp` -- `self._sanitize_error` is the one
 method), `type()`/`isinstance()`, `raise`, a comparison or truthiness test,
@@ -86,37 +93,51 @@ _RENDERER_HOMES = {
 }
 #: The one renderer called as a method.
 _RENDERER_METHODS = {"_sanitize_error"}
-#: Callees that receive an exception and do not render its text, each read:
-_NON_RENDERING_CALLEES = {
-    # manager.py: a boolean predicate over the message.
-    "_is_protocol_version_initialize_error",
-    # manager.py: hands the exception to the awaiting connect caller, whose
-    # own `except` is checked here like any other.
-    "set_exception",
-    # policy.py: renders its `error` argument with `exception_text`.
-    "_warn_unparseable",
-    # scoped_advisor_audit.py (#296): records path and keyword only.
-    "record_rejected_arguments",
-    # parsing.py (rev 7): reads a MarkedYAMLError's mark line and column only.
-    "_yaml_position",
-    # server.py (rev 12): a predicate, whether a message or `data` carries
-    # what the chain rejected; it renders nothing.
-    "carries_rejected_value",
-    # manager.py: flattens a group into leaves; its callers render each leaf
-    # with `exception_text` (`describe_exception`).
-    "_iter_leaf_exceptions",
-    # auth.py: see `_NON_RENDERING_FUNCTIONS`.
-    "parse_url_elicitation_error",
+#: Callees an exception may be handed to, each with the reason its output
+#: cannot carry a registered error's value -- a reason a test enforces
+#: (rev 20, round-18 codex F001: no exemption by name alone):
+#: - ``predicate``: defined in pmcp, annotated ``-> bool``, and every
+#:   ``return`` is a boolean expression
+#:   (`test_every_predicate_exemption_returns_only_booleans`);
+#: - ``scanned``: defined in pmcp with the exception as an annotated
+#:   exception parameter, so this scanner checks its body like any other
+#:   (`test_every_scanned_exemption_takes_an_annotated_exception`);
+#: - ``guarded``: defined in pmcp, and refuses a registered error's chain
+#:   (``safe_exc_info(x) is None``) before it reads the exception
+#:   (`test_every_guarded_exemption_checks_the_registry_first`);
+#: - ``handoff``: hands the exception object on, and its result is
+#:   discarded (`test_every_handoff_call_discards_its_result`);
+#: - ``passthrough``: defined in pmcp, yields or returns only exception
+#:   objects (plain names) and reads no text from them
+#:   (`test_every_passthrough_exemption_reads_no_text`);
+#: - ``reregisters``: defined in pmcp, annotated to return a registered
+#:   value-bearing type (or a list or iterator of one), so its output is
+#:   rendered by the registry like the input
+#:   (`test_every_reregisters_exemption_returns_a_registered_type`).
+_EXEMPT_CALLEES: dict[str, tuple[str, str]] = {
+    "_is_protocol_version_initialize_error": ("predicate", "client/manager.py"),
+    "carries_rejected_value": ("predicate", "argument_errors.py"),
+    "_warn_unparseable": ("scanned", "policy/policy.py"),
+    "record_rejected_arguments": ("scanned", "scoped_advisor_audit.py"),
+    "_yaml_position": ("scanned", "parsing.py"),
+    "_iter_leaf_exceptions": ("passthrough", "client/manager.py"),
+    "parse_url_elicitation_error": ("guarded", "auth.py"),
+    # tools/schema.py (Consiliency/pmcp#371): rebuild a registered error from
+    # one; the result is itself registered, so every renderer treats it.
+    "_rerooted": ("reregisters", "tools/schema.py"),
+    "_unfolded": ("reregisters", "tools/schema.py"),
+    # asyncio: the awaiting caller's own `except` is checked like any other.
+    "set_exception": ("handoff", ""),
+    # server.py (rev 20): marks the exception as pmcp's handler's own.
+    "setattr": ("handoff", ""),
 }
-#: Functions that read an exception's text to parse it and return no text.
+_NON_RENDERING_CALLEES = set(_EXEMPT_CALLEES)
+#: Functions whose body may read an exception's text: the ``predicate``
+#: exemptions (their output is a bool, enforced above).
 _NON_RENDERING_FUNCTIONS = {
-    # auth.py: finds a JSON-RPC -32042 payload in `args[0]` / `str()` and
-    # returns structured `UrlElicitationInfo` (URLs the server sent).
-    "parse_url_elicitation_error",
-    # manager.py: a predicate (above).
-    "_is_protocol_version_initialize_error",
-    # manager.py: yields leaves; never renders.
-    "_iter_leaf_exceptions",
+    name
+    for name, (kind, _home) in _EXEMPT_CALLEES.items()
+    if kind in ("predicate", "passthrough", "reregisters")
 }
 #: Attributes that carry an exception's text or the rejected value.
 _TEXT_ATTRIBUTES = {
@@ -162,7 +183,10 @@ def _sources() -> list[Path]:
         path
         for path in sorted(root.rglob("*.py"))
         if not any(part in ("baml_client",) for part in path.relative_to(root).parts)
-        and path.name != "argument_errors.py"
+        # The renderers themselves: `argument_errors.py`, and (rev 20)
+        # `sdk_rejections.py`, which rebuilds the SDK's errors and is bound
+        # end to end by `test_http_transport.py`'s stdio and HTTP grids.
+        and path.name not in ("argument_errors.py", "sdk_rejections.py")
     ]
 
 
@@ -517,12 +541,108 @@ def _in_loop_iterable(use: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     return False
 
 
+def _exception_parameters(
+    function: ast.FunctionDef | ast.AsyncFunctionDef, namespace: dict[str, Any]
+) -> list[str]:
+    """The parameters annotated with an exception type that can hold a
+    registered (value-bearing) error -- `Exception`, `BaseException`,
+    `ValueError`, ... -- resolved in the module's namespace."""
+    names = []
+    arguments = function.args
+    for argument in [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]:
+        annotation = argument.annotation
+        if annotation is None:
+            continue
+        try:
+            value = eval(  # noqa: S307 -- pmcp's own annotation, its own namespace
+                ast.unparse(annotation), {**vars(builtins), **namespace}
+            )
+        except Exception:
+            continue
+        import types as _types
+
+        union = typing.get_origin(value) in (typing.Union, _types.UnionType)
+        members = [
+            item
+            for item in (typing.get_args(value) if union else (value,))
+            if item is not type(None)
+        ]
+        try:
+            exceptional = bool(members) and all(
+                isinstance(item, type)
+                and not typing.get_args(item)
+                and issubclass(item, BaseException)
+                for item in members
+            )
+        except TypeError:
+            exceptional = False
+        if exceptional and _catches_validation(annotation, namespace):
+            names.append(argument.arg)
+    return names
+
+
+def _is_registry_check(test: ast.AST, name: str, *, passed: bool) -> bool:
+    """`safe_exc_info(name) is not None` (`passed`) or `... is None` (not),
+    alone or as one operand of an `and`."""
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return any(_is_registry_check(v, name, passed=passed) for v in test.values)
+    return (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.IsNot if passed else ast.Is)
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value is None
+        and isinstance(test.left, ast.Call)
+        and _callee(test.left) == "safe_exc_info"
+        and len(test.left.args) == 1
+        and isinstance(test.left.args[0], ast.Name)
+        and test.left.args[0].id == name
+    )
+
+
+def _registry_guarded(use: ast.Name, parents: dict[ast.AST, ast.AST]) -> bool:
+    """Whether `use` runs only after the registry check on its name passed:
+    inside the body of `if safe_exc_info(x) is not None:`, or after an
+    earlier `if safe_exc_info(x) is None: <return/raise>` in an enclosing
+    block (rev 20, round-18 codex F001)."""
+    node: ast.AST = use
+    while node in parents:
+        parent = parents[node]
+        if (
+            isinstance(parent, ast.If)
+            and node in parent.body
+            and _is_registry_check(parent.test, use.id, passed=True)
+        ):
+            return True
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(parent, field, None)
+            if isinstance(block, list) and node in block:
+                for earlier in block[: block.index(node)]:
+                    if (
+                        isinstance(earlier, ast.If)
+                        and _is_registry_check(earlier.test, use.id, passed=False)
+                        and _exits(earlier.body)
+                    ):
+                        return True
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+        node = parent
+    return False
+
+
 def exception_sinks(
     source: str, label: str, namespace: dict[str, Any] | None = None
 ) -> list[str]:
     """Every exception-to-text sink in `source` (see the module docstring)."""
     tree = ast.parse(source)
     namespace = {**(namespace or {}), **_snippet_namespace(tree)}
+    for function in ast.walk(tree):
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+            function.name in _NON_RENDERING_FUNCTIONS
+            and label.endswith(_EXEMPT_CALLEES[function.name][1])
+        ):
+            # Its reason is enforced by the exemption tests below.
+            function.body = [ast.Pass()]
     for function in ast.walk(tree):
         if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
             function.name in _NON_RENDERING_FUNCTIONS
@@ -538,6 +658,11 @@ def exception_sinks(
         child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
     }
     found: list[str] = []
+    functions = {
+        id(node.body): node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
     for function in ast.walk(tree):
         if (
             isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -549,6 +674,12 @@ def exception_sinks(
             )
     for body in _scopes(tree):
         regions = _exception_regions(body, namespace)
+        owner = functions.get(id(body))
+        if owner is not None:
+            # A parameter annotated as an exception that can be a registered
+            # error holds one over the whole body (rev 20).
+            for name in _exception_parameters(owner, namespace):
+                _widen(regions, name, _ids(body))
         for use in _own_nodes(body):
             if not (
                 isinstance(use, ast.Name)
@@ -558,6 +689,8 @@ def exception_sinks(
                 continue
             if _in_loop_iterable(use, parents):
                 continue  # the loop's targets are tracked instead
+            if _registry_guarded(use, parents):
+                continue  # read only once the registry check passed (rev 20)
             parent = parents.get(use)
             if isinstance(parent, ast.keyword):
                 parent = parents.get(parent)
@@ -1213,3 +1346,246 @@ def test_the_described_raise_rule_sees_its_spellings(
     snippet: str, flagged: bool
 ) -> None:
     assert bool(_described_raises_in_handlers(snippet)) is flagged, snippet
+
+
+# --- rev 20: every exemption's reason is enforced (round-18 codex F001) -----
+
+
+def _definition(name: str, home: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
+    tree = ast.parse((root / home).read_text())
+    found = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == name
+    ]
+    assert len(found) == 1, (name, home, len(found))
+    return found[0]
+
+
+def _kinds(kind: str) -> list[tuple[str, str]]:
+    return [(name, home) for name, (k, home) in _EXEMPT_CALLEES.items() if k == kind]
+
+
+def _boolean(node: ast.AST | None) -> bool:
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, bool)
+    if isinstance(node, (ast.Compare, ast.UnaryOp)) and (
+        not isinstance(node, ast.UnaryOp) or isinstance(node.op, ast.Not)
+    ):
+        return True
+    if isinstance(node, ast.BoolOp):
+        return all(_boolean(value) for value in node.values)
+    if isinstance(node, ast.Call):
+        return _callee(node) in ("isinstance", "bool", "any", "all", "callable")
+    return False
+
+
+def test_every_predicate_exemption_returns_only_booleans() -> None:
+    assert _kinds("predicate")
+    for name, home in _kinds("predicate"):
+        function = _definition(name, home)
+        assert (
+            function.returns is not None and ast.unparse(function.returns) == "bool"
+        ), name
+        own = [
+            node
+            for node in _own_nodes(function.body)
+            if not any(
+                node in ast.walk(inner)
+                for inner in ast.walk(function)
+                if inner is not function
+                and isinstance(
+                    inner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+                )
+            )
+        ]
+        returns = [n for n in own if isinstance(n, ast.Return)]
+        assert returns and all(_boolean(r.value) for r in returns), (
+            name,
+            [ast.unparse(r) for r in returns if not _boolean(r.value)],
+        )
+
+
+def test_every_scanned_exemption_takes_an_annotated_exception() -> None:
+    """The scanner seeds an annotated exception parameter over the whole
+    body, so a `scanned` callee's body is checked like any other."""
+    assert _kinds("scanned")
+    root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
+    for name, home in _kinds("scanned"):
+        function = _definition(name, home)
+        assert _exception_parameters(function, _namespace_for(root / home)), name
+
+
+def test_every_guarded_exemption_checks_the_registry_first() -> None:
+    """A `guarded` callee reads its exception only after
+    `safe_exc_info(x) is None` returned or raised: the scanner, run on its
+    body unblanked, finds nothing."""
+    assert _kinds("guarded")
+    root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
+    for name, home in _kinds("guarded"):
+        function = _definition(name, home)
+        assert name not in _NON_RENDERING_FUNCTIONS
+        guards = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.If)
+            and any(
+                _is_registry_check(node.test, arg.arg, passed=False)
+                for arg in function.args.args
+            )
+            and _exits(node.body)
+        ]
+        assert guards, name
+        found = exception_sinks(
+            (root / home).read_text(), home, _namespace_for(root / home)
+        )
+        inside = [
+            item
+            for item in found
+            if function.lineno <= int(item.split(":")[1]) <= (function.end_lineno or 0)
+        ]
+        assert inside == [], (name, inside)
+
+
+def test_every_handoff_call_discards_its_result() -> None:
+    """A `handoff` callee is only ever called as a statement in pmcp."""
+    names = {name for name, _ in _kinds("handoff")}
+    for path in _sources():
+        tree = ast.parse(path.read_text())
+        parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        for call in ast.walk(tree):
+            if isinstance(call, ast.Call) and _callee(call) in names:
+                assert isinstance(parents.get(call), ast.Expr), (path, call.lineno)
+
+
+_PASSTHROUGH_ATTRIBUTES = {"exceptions"}
+
+
+def test_every_passthrough_exemption_reads_no_text() -> None:
+    assert _kinds("passthrough")
+    for name, home in _kinds("passthrough"):
+        function = _definition(name, home)
+        for node in ast.walk(function):
+            assert not isinstance(node, (ast.JoinedStr, ast.FormattedValue)), name
+            if isinstance(node, ast.Call):
+                assert _callee(node) not in ("str", "repr", "format", "ascii"), name
+                if _callee(node) == "getattr":
+                    attribute = node.args[1] if len(node.args) > 1 else None
+                    assert isinstance(attribute, ast.Constant), name
+                    assert attribute.value in _PASSTHROUGH_ATTRIBUTES, name
+            if isinstance(node, ast.Attribute):
+                assert node.attr not in _TEXT_ATTRIBUTES - _PASSTHROUGH_ATTRIBUTES, name
+            if isinstance(node, (ast.Yield, ast.YieldFrom, ast.Return)) and node.value:
+                assert isinstance(node.value, (ast.Name, ast.Call)), name
+                if isinstance(node.value, ast.Call):
+                    assert _callee(node.value) == name, name  # recursion only
+
+
+def test_every_reregisters_exemption_returns_a_registered_type() -> None:
+    from pmcp.argument_errors import _value_bearing_types
+
+    assert _kinds("reregisters")
+    root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
+    registered = _value_bearing_types()
+    for name, home in _kinds("reregisters"):
+        function = _definition(name, home)
+        assert function.returns is not None, name
+        namespace = {**vars(builtins), **_namespace_for(root / home)}
+        returned = eval(ast.unparse(function.returns), namespace)  # noqa: S307
+        inner = typing.get_args(returned) or (returned,)
+        assert all(
+            isinstance(item, type) and issubclass(item, registered) for item in inner
+        ), (name, returned)
+
+
+def test_the_elicitation_parser_reads_no_registered_error() -> None:
+    """Round-18 codex F001's falsifier, as filed: a genuine elicitation still
+    parses; neither a registered error carrying elicitation-shaped JSON nor
+    its wrapper is read as one."""
+    import json as _json
+
+    from pmcp.auth import parse_url_elicitation_error
+
+    sentinel = "SENTINEL_ELICITATION_REJECTED_9137"
+    payload = _json.dumps(
+        {
+            "code": -32042,
+            "data": {"elicitationId": sentinel, "url": "https://example.com/consent"},
+        }
+    )
+    assert parse_url_elicitation_error(payload)[0].elicitation_id == sentinel
+    try:
+        jsonschema.validate(payload, {"type": "integer"})
+    except jsonschema.ValidationError as rejected:
+        bare = rejected
+        try:
+            raise RuntimeError(rejected.message) from rejected
+        except RuntimeError as caught:
+            wrapped = caught
+    else:  # pragma: no cover
+        raise AssertionError("The input must fail validation")
+    observed = [parse_url_elicitation_error(error) for error in (bare, wrapped)]
+    assert observed == [[], []], observed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["bare", "wrapped"])
+async def test_gateway_invoke_reads_no_elicitation_from_a_rejected_value(
+    shape: str,
+) -> None:
+    """Round-18 codex F001 end to end, through `gateway.invoke`: a downstream
+    call that fails with a registered error -- or a wrapper of one -- whose
+    rejected value is elicitation-shaped JSON gets no `url_elicitations`, and
+    no part of the value reaches the result."""
+    import json as _json
+
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+    from pmcp.types import RiskHint, ToolInfo
+    from tests.test_tools import MockClientManager
+
+    sentinel = "SENTINEL_ELICITATION_REJECTED_9137"
+    payload = _json.dumps(
+        {
+            "error": {
+                "code": -32042,
+                "data": {
+                    "elicitationId": sentinel,
+                    "url": f"https://example.com/{sentinel}",
+                },
+            }
+        }
+    )
+    try:
+        jsonschema.validate(payload, {"type": "integer"})
+    except jsonschema.ValidationError as rejected:
+        error: BaseException = rejected
+        if shape == "wrapped":
+            try:
+                raise RuntimeError(rejected.message) from rejected
+            except RuntimeError as caught:
+                error = caught
+    tool = ToolInfo(
+        tool_id="remote-auth::login",
+        server_name="remote-auth",
+        tool_name="login",
+        description="Login",
+        short_description="Login",
+        input_schema={},
+        tags=[],
+        risk_hint=RiskHint.LOW,
+    )
+    client_manager = MockClientManager([tool])
+
+    async def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise error
+
+    client_manager.call_tool = fail  # type: ignore[method-assign]
+    tools = GatewayTools(client_manager=client_manager, policy_manager=PolicyManager())  # type: ignore[arg-type]
+    result = await tools.invoke({"tool_id": "remote-auth::login", "arguments": {}})
+    assert result.ok is False
+    assert not result.url_elicitations, result.url_elicitations
+    assert result.auth_state != "elicitation_required"
+    assert sentinel not in result.model_dump_json(), result.model_dump_json()

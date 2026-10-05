@@ -116,12 +116,10 @@ def _object_schemas(schema: dict[str, Any]) -> list[dict[str, Any]]:
 
     def walk(node: Any) -> None:
         if isinstance(node, dict):
-            kind = node.get("type")
-            # An optional nested object is typed ["object", "null"] (A1).
-            is_object = kind == "object" or (
-                isinstance(kind, list) and "object" in kind
-            )
-            if is_object and "properties" in node:
+            # An optional nested object is the first branch of
+            # `anyOf: [{"type": "object", ...}, {"type": "null"}]`
+            # (Consiliency/pmcp#369); the walk reaches it through `anyOf`.
+            if node.get("type") == "object" and "properties" in node:
                 found.append(node)
             for key, value in node.items():
                 if key == "properties" and isinstance(value, dict):
@@ -225,7 +223,9 @@ def test_advertised_schema_is_a_self_contained_mcp_input_schema(name: str) -> No
     assert not keywords & {"$ref", "$defs", "title"}, keywords
     for obj in _object_schemas(schema):
         for prop_name, prop in obj["properties"].items():
-            assert "anyOf" not in prop, f"{name}.{prop_name}: nullable anyOf survived"
+            assert not isinstance(prop.get("type"), list), (
+                f"{name}.{prop_name}: a type array is not portable (Consiliency/pmcp#369)"
+            )
             assert isinstance(prop.get("description"), str) and prop["description"], (
                 f"{name}.{prop_name}: every advertised argument needs a description"
             )
@@ -276,7 +276,7 @@ def test_input_schema_for_normalises_pydantic_output() -> None:
         "properties": {
             "name": {"type": "string", "minLength": 1, "description": "Name"},
             "title": {
-                "type": ["string", "null"],
+                "anyOf": [{"type": "string"}, {"type": "null"}],
                 "description": "A field called title",
             },
             "count": {
@@ -287,19 +287,28 @@ def test_input_schema_for_normalises_pydantic_output() -> None:
                 "description": "Count",
             },
             "inner": {
-                "type": ["object", "null"],
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "level": {
+                                "anyOf": [
+                                    {"type": "string", "enum": ["a", "b"]},
+                                    {"type": "null"},
+                                ],
+                                "description": "Level",
+                            }
+                        },
+                    },
+                    {"type": "null"},
+                ],
                 "description": "Inner",
-                "properties": {
-                    "level": {
-                        "type": ["string", "null"],
-                        "enum": ["a", "b", None],
-                        "description": "Level",
-                    }
-                },
             },
             "_meta": {
-                "type": ["object", "null"],
-                "additionalProperties": True,
+                "anyOf": [
+                    {"type": "object", "additionalProperties": True},
+                    {"type": "null"},
+                ],
                 "description": "Meta",
             },
         },
@@ -311,8 +320,8 @@ class _RequiredNullable(BaseModel):
 
 
 def test_required_nullable_field_is_left_as_pydantic_wrote_it() -> None:
-    """The collapse is defined for `X | None = None` only; a required nullable
-    field has no `default: null` and keeps its `anyOf`."""
+    """A required nullable field has no `default: null`; it gets the same
+    `anyOf: [X, {"type": "null"}]` an optional one does, and stays required."""
     prop = input_schema_for(_RequiredNullable)["properties"]["value"]
     assert prop == {
         "anyOf": [{"type": "string"}, {"type": "null"}],
@@ -577,6 +586,9 @@ def _unbounded_integers(node: Any, path: str = "") -> list[str]:
         kinds = kind if isinstance(kind, list) else [kind]
         if "integer" in kinds and ("minimum" not in node or "maximum" not in node):
             found.append(path or "<root>")
+        for branch in node.get("anyOf") or []:
+            # A nullable integer is `anyOf: [{"type": "integer", ...}, null]`.
+            found += _unbounded_integers(branch, path)
         for name, prop in (node.get("properties") or {}).items():
             found += _unbounded_integers(prop, f"{path}.{name}")
         if isinstance(node.get("items"), dict):

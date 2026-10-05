@@ -850,7 +850,9 @@ def test_the_site_check_sees_every_site() -> None:
                 counts["raise"] += 1
             if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_reject":
                 counts["_reject"] += 1
-    assert counts == {"raise": 42, "_reject": 7}, counts  # +2 #341 r2, +1 r3
+    assert counts == {"raise": 43, "_reject": 7}, (
+        counts
+    )  # +2 #341 r2, +1 r3, +1 #297 r20 (pyjwt_text registry guard)
 
 
 _STATIC_SHAPES = {

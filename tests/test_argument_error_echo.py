@@ -146,19 +146,53 @@ def _types(node: dict[str, Any]) -> list[str]:
     return declared if isinstance(declared, list) else [declared]
 
 
+def _view(node: dict[str, Any]) -> dict[str, Any]:
+    """`node` as the sweep reads it: a nullable union (`anyOf: [X, {"type":
+    "null"}]`, Consiliency/pmcp#371) is X with `null` added to its types, so
+    X's own constraints are swept (rev 20: until then such a position had no
+    `type` and yielded no case)."""
+    any_of = node.get("anyOf")
+    if (
+        isinstance(any_of, list)
+        and len(any_of) == 2
+        and any_of[1] == {"type": "null"}
+        and isinstance(any_of[0], dict)
+    ):
+        inner = _view(any_of[0])
+        types = _types(inner)
+        rest = {k: v for k, v in node.items() if k != "anyOf"}
+        return {**rest, **inner, **({"type": [*types, "null"]} if types else {})}
+    return node
+
+
 def _positions(
     node: dict[str, Any], path: tuple[str | int, ...] = ()
 ) -> list[tuple[tuple[str | int, ...], dict[str, Any]]]:
-    """Every declared position below the root, depth-first."""
+    """Every declared position below the root, depth-first, each read through
+    `_view`."""
     found: list[tuple[tuple[str | int, ...], dict[str, Any]]] = []
+    node = _view(node)
     for key, child in sorted((node.get("properties") or {}).items()):
-        found.append(((*path, key), child))
+        found.append(((*path, key), _view(child)))
         found.extend(_positions(child, (*path, key)))
     items = node.get("items")
     if isinstance(items, dict):
-        found.append(((*path, 0), items))
+        found.append(((*path, 0), _view(items)))
         found.extend(_positions(items, (*path, 0)))
     return found
+
+
+def test_every_position_the_sweep_reads_is_typed_or_open() -> None:
+    """No silent shrink under a schema shape the sweep does not read: every
+    declared position has a type once nullable unions are unfolded, or is
+    deliberately open (`{}` -- any JSON value)."""
+    untyped = [
+        (name, path)
+        for name, tool in _tools().items()
+        for path, node in _positions(tool.input_schema)
+        if not _types(node) and set(node) - {"description", "default"}
+    ]
+    assert not untyped, untyped
 
 
 def _invalid_values(node: dict[str, Any], s: str) -> list[tuple[str, Any]]:
@@ -878,16 +912,35 @@ def test_a_schema_rejection_names_the_field_and_the_reason_only(
     arguments: dict, expected: str
 ) -> None:
     from pmcp.argument_errors import describe_schema_error
+    from pmcp.tools.schema import gate_error_for
 
     schema = _tools()["gateway.invoke"].input_schema
-    error = jsonschema.exceptions.best_match(
-        jsonschema.validators.validator_for(schema)(schema).iter_errors(arguments)
-    )
+    # The error the gate reports: a nullable union's refusal unfolded into what
+    # X refused (Consiliency/pmcp#371's `gate_error_for`), as the server does.
+    error = gate_error_for(arguments, schema)
     assert error is not None
     error.__class__ = _PoisonedSchemaError
     described = describe_schema_error(error, schema, arguments)
     assert described == expected
     assert "sk-" not in described and "SECRET" not in described
+
+
+def test_a_raw_nullable_union_refusal_is_read_from_the_schema() -> None:
+    """An `anyOf: [X, null]` refusal that did not come through `gate_error_for`
+    is described from our schema alone (rev 20): X's type, or null."""
+    from pmcp.argument_errors import describe_schema_error
+
+    schema = _tools()["gateway.invoke"].input_schema
+    arguments = {"tool_id": "a::b", "options": "sk-SECRET-VALUE"}
+    error = jsonschema.exceptions.best_match(
+        jsonschema.validators.validator_for(schema)(schema).iter_errors(arguments)
+    )
+    assert error is not None and error.validator == "anyOf"
+    error.__class__ = _PoisonedSchemaError
+    assert (
+        describe_schema_error(error, schema, arguments)
+        == "$.options: must be null or a valid object"
+    )
 
 
 def test_a_caller_chosen_key_in_a_path_is_redacted() -> None:

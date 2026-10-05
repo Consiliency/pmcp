@@ -21,6 +21,7 @@ from pmcp.argument_errors import (
     CORRELATION_ID_CHARSET,
     PACKAGE_NAME_INVALID,
     SCOPED_CORRELATION_INCOMPLETE,
+    PACKAGE_PATTERN_VERSIONED,
     argument_error,
 )
 from pmcp.parsing import parse_timestamp
@@ -1398,10 +1399,9 @@ class PackagePolicy(BaseModel):
     def _reject_version_qualified_entries(cls, value: list[str]) -> list[str]:
         for entry in value:
             if version_separator_index(entry) != -1:
-                raise ValueError(
-                    f"package pattern {entry!r} names a version; package "
-                    "patterns match the package name only"
-                )
+                # Fixed text: the entry is the operator's own value, and the
+                # error's path names it (Consiliency/pmcp#297 rev 20).
+                raise argument_error(PACKAGE_PATTERN_VERSIONED)
         return value
 
 

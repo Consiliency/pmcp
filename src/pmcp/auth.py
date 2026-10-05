@@ -20,7 +20,7 @@ import aiohttp
 import jwt
 from jwt import PyJWKSet
 
-from pmcp.argument_errors import exception_text
+from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
 from pmcp.parsing import load_json
 from pmcp.redaction_additive import redact_additive
@@ -304,6 +304,12 @@ def pyjwt_text(exc: BaseException) -> PyJwtText:
     if not isinstance(exc, _FIXED_TEXT_CLAIM_ERRORS):
         raise TypeError(
             f"pyjwt_text() takes a fixed-text pyjwt error, not {type(exc).__name__}"
+        )
+    if safe_exc_info(exc) is None:
+        # Its chain holds a registered value-bearing error: never read
+        # (Consiliency/pmcp#297 rev 20).
+        raise TypeError(
+            "pyjwt_text() takes a pyjwt error that chains no rejected value"
         )
     return PyJwtText(str(exc), _mint=_PYJWT_MINT)
 
@@ -1425,8 +1431,16 @@ def normalize_auth_metadata(
 
 
 def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
-    """Parse JSON-RPC URLElicitationRequiredError payloads."""
+    """Parse JSON-RPC URLElicitationRequiredError payloads.
+
+    An exception whose chain holds a registered value-bearing error yields
+    nothing: an elicitation comes from the SDK or a downstream, never from
+    validation, and the rejected value must not be read back as an
+    elicitation id or URL (Consiliency/pmcp#297 rev 20, round-18 codex F001).
+    """
     if isinstance(payload, BaseException):
+        if safe_exc_info(payload) is None:
+            return []
         payload = payload.args[0] if payload.args else str(payload)
     if isinstance(payload, str):
         payload_text = payload
