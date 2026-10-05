@@ -1900,6 +1900,8 @@ class TestCallTool:
             manager_with_tool._task_info_from_payload(
                 {"taskId": "done", "status": "completed"}
             ),
+            requestor_context=None,
+            connection=None,
         )
 
         ok, returned, message = await manager_with_tool.cancel_task("test", "done")
@@ -1909,14 +1911,17 @@ class TestCallTool:
         assert "already terminal" in message
 
     def test_terminal_task_records_are_evicted_past_cap(self) -> None:
-        """Terminal task records are pruned past the cap; active ones survive."""
+        """The per-server cap counts every record; finished ones are evicted
+        first, so the active one survives (Consiliency/pmcp#338)."""
         manager = ClientManager()
-        manager._max_terminal_tasks = 5
+        manager._tasks.per_server = 5
 
-        # An active (non-terminal) record must never be evicted.
+        # Finished records go before an active (non-terminal) one.
         manager._record_task(
             "srv",
             McpTaskInfo(task_id="active", status="working", updated_at=0.0),
+            requestor_context=None,
+            connection=None,
         )
 
         # Record many terminal tasks with increasing updated_at timestamps.
@@ -1926,15 +1931,17 @@ class TestCallTool:
                 McpTaskInfo(
                     task_id=f"done-{i}", status="completed", updated_at=float(i + 1)
                 ),
+                requestor_context=None,
+                connection=None,
             )
 
         terminal = [
             t for t in manager.get_tracked_tasks("srv") if manager._terminal_task(t)
         ]
-        assert len(terminal) == 5
+        assert len(terminal) == 4
         # Oldest terminal records were dropped; newest survive.
         surviving = {t.task_id for t in terminal}
-        assert surviving == {f"done-{i}" for i in range(15, 20)}
+        assert surviving == {f"done-{i}" for i in range(16, 20)}
         # The active task is untouched.
         assert manager.get_task_record("srv", "active") is not None
 
@@ -4503,7 +4510,7 @@ class TestDownstreamReconcileScheduler:
             task_id="t-1",
             status="working",
         )
-        manager._tasks[("srv", "t-1")] = record
+        manager._tasks.put(record)
 
         manager._handle_downstream_notification(
             "srv", managed, "notifications/tools/list_changed"

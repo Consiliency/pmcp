@@ -810,7 +810,8 @@ to do, how to verify it, and how to roll back to 2.7.3.
     `updated_at`, `ttl`, `poll_interval`). "Cannot use" covers:
     - non-finite numbers and out-of-range values;
     - a boolean;
-    - a string where a number is expected;
+    - a string for `ttl` or `pollInterval` (a numeric or ISO 8601 string is
+      still accepted for `createdAt` and `lastUpdatedAt`/`updatedAt`);
     - a non-string or blank status;
     - a blank timestamp;
     - a `null` the downstream sent.
@@ -833,15 +834,18 @@ to do, how to verify it, and how to roll back to 2.7.3.
     - **A `nextCursor` of `NaN` now makes that listing unreadable.** pmcp keeps
       the previous tools/resources/prompts and publishes no change, instead of
       treating page one as the whole listing.
-    - **A `NaN` inside a tool result now reaches the caller as a `NaN` token
-      instead of `null`.** Fixing that for every transport is tracked as
-      [Consiliency/pmcp#335](https://github.com/Consiliency/pmcp/issues/335).
+    - **A `NaN` in a downstream value that pmcp relays as sent now reaches the
+      caller as a `NaN` token instead of `null`.** That is a tool result
+      (`gateway.invoke`) and a task result (`gateway.tasks_result`), not only
+      the first. A task's `raw` still shows `null`, and resource and prompt
+      reads pass on only their text. Fixing that for every transport is
+      tracked as [Consiliency/pmcp#335](https://github.com/Consiliency/pmcp/issues/335).
   - Finished tasks past the 100-record cap are now evicted in the order pmcp
     last recorded them. A downstream's own timestamps play no part: a
     far-future `lastUpdatedAt` can no longer keep one server's tasks while
     another's are dropped, and a server whose clock runs behind no longer
-    loses its tasks first. (The cap is still shared across servers;
-    [Consiliency/pmcp#338](https://github.com/Consiliency/pmcp/issues/338).)
+    loses its tasks first. [Consiliency/pmcp#338](https://github.com/Consiliency/pmcp/issues/338) then made the cap per server
+    (next entry).
   - pmcp no longer sends a downstream server anything that is not strict JSON:
     `NaN`, `±Infinity`, or a value JSON cannot encode. A request whose
     `arguments` or task metadata contain one now fails with `outbound frame is
@@ -902,6 +906,105 @@ to do, how to verify it, and how to roll back to 2.7.3.
     task, even if its result has a `taskId`.
   - Unchanged: a task's `raw` object, and the results pmcp relays as sent,
     keep the downstream's own milliseconds.
+- **Tracked MCP tasks are capped per server, and the cap now covers
+  unfinished tasks (see [Consiliency/pmcp#338](https://github.com/Consiliency/pmcp/issues/338)).**
+  - pmcp tracks at most 100 tasks per downstream server, finished and
+    unfinished alike, and at most 1000 across all servers. Before, one
+    100-record cap was shared by every server and counted only finished
+    tasks. So a server whose tasks a caller listed could evict another
+    server's finished tasks, and a server could keep any number of records
+    alive by reporting them as `working`, or with a status pmcp cannot use.
+  - Past a server's cap, that server gives up its own records: finished ones
+    first, then unfinished ones, each in the order pmcp last recorded them.
+    Past the total, the server holding the most records gives one up.
+    Recording a task never evicts that same task, so `gateway.invoke` keeps
+    the record of the task it just started. A listing is recorded one task at
+    a time, so a `tasks/list` reply longer than the cap keeps only its last
+    100 tasks.
+  - Eviction forgets pmcp's record, not the downstream's task.
+    `gateway.tasks_get` and `gateway.tasks_result` still reach it and track
+    it again. Until then:
+    - `gateway.tasks_cancel` reports it as not found;
+    - it does not count as an active task;
+    - a disconnect neither waits for it nor cancels it. A stdio server's task
+      ends with its process. **A remote server's task keeps running** after
+      the disconnect, until the downstream ends it;
+    - a `requestor_context` pmcp stored with it is forgotten, so send it
+      again.
+  - `gateway.tasks_list` still returns every task the downstream listed,
+    even past the cap.
+  - A task that a request is working on is never evicted while that request
+    is in flight: `gateway.tasks_get`, `gateway.tasks_result`,
+    `gateway.tasks_cancel`, and the one `tasks/cancel` a forced teardown has
+    in flight. While such requests are in flight, a server may hold more than
+    100 records: at most one more than the requests in flight at that moment,
+    and it is back under its cap as soon as they finish. The 1000 total works
+    the same way.
+  - A forced `gateway.disconnect_server`, `gateway.restart_server` or
+    `gateway.refresh` cancels every task that was active on the server when
+    it was requested, with each task's newest `requestor_context`, so a
+    remote downstream still gets it. What it owes is fixed when it starts: a
+    task the cap evicts while the teardown works through the others is still
+    cancelled, and still with its context. Those tasks do not count against
+    the caps, so overlapping forced disconnects cannot keep growing a server
+    past its cap, but they still count as the server's active tasks: another
+    forced teardown cancels them too, a disconnect without `force` is refused
+    while any remains, and `gateway.refresh` counts them. A teardown that is
+    interrupted -- its caller cancelled, a downstream error, or a forced
+    disconnect of another server -- puts every task it did not cancel back
+    among the tracked ones, so a retry cancels them. They come back as the
+    server's newest tasks and under its cap again: when they and the
+    server's other tasks exceed it, the cap gives up, in its usual order,
+    the server's finished tasks, then its older unfinished ones, then the
+    oldest returned ones: a task pmcp owed a cancel outranks newer tasks it
+    never owed. A forced disconnect that is
+    itself interrupted still disconnects
+    ([Consiliency/pmcp#324](https://github.com/Consiliency/pmcp/issues/324)) without the
+    cancels it had not sent, so a remote server's remaining tasks keep
+    running. Eviction never fails the teardown.
+    One kind of snapshot task is skipped: one whose original connection
+    cannot take a task request at that moment. That covers four cases: a
+    concurrent disconnect removed the server, a reconnect has it listed but
+    not yet connected, a reconnect replaced it with a new connection, or it
+    does not advertise task support. No `tasks/cancel` is sent for such a
+    task, and it is not an error. On a
+    remote server that is reconnecting, the task is not cancelled.
+    `gateway.disconnect_server` and `gateway.restart_server` still include it
+    in `cancelled_task_count`. That field counts the active tasks pmcp no
+    longer tracks after the call (before minus after), as it always has.
+    Reporting the cancels actually sent is a separate change (see
+    [Consiliency/pmcp#349](https://github.com/Consiliency/pmcp/issues/349)).
+  - When pmcp records a downstream reply about a task (`tasks/get`,
+    `tasks/result`, `tasks/cancel`), the task keeps the `requestor_context`
+    pmcp holds for it. That is the newest one: if `gateway.invoke` supplied a
+    newer context for the same task while the request was in flight, the
+    reply keeps that one. A later cancel sends it. A reply that names a
+    different task does not take this task's context.
+  - Task state is bound to the connection it came from. A reconnect drops the
+    server's tracked tasks, as before. A reply that arrives on the old
+    connection after a reconnect is no longer recorded. pmcp never sends a
+    stored task id or `requestor_context` on a connection other than the one
+    the task came from, so a reconnect to another URL or tenant cannot
+    receive the old tenant's context, or cancel an unrelated task that has
+    the same id. For a record from a previous connection,
+    `gateway.tasks_get`, `gateway.tasks_result` and `gateway.tasks_cancel`
+    fail with `Server <name> was reconnected; this task belongs to its
+    previous connection`, and a forced teardown skips it. `gateway.invoke`,
+    `gateway.tasks_result` and `gateway.tasks_list` report the task the way
+    *this* reply describes it. They never report a same-id task that a new
+    connection tracks, which could belong to another tenant. They also never
+    merge its `created_at`, `tool_id` or `requestor_context`. Each request
+    uses one connection, captured when it starts. If that connection is
+    replaced while `tasks/result` is in flight, its `tasks/get` fallback is
+    not sent anywhere else: `gateway.tasks_result` returns the result with
+    no task. `gateway.invoke`
+    still redacts by default when the call requested a task and the reply
+    carries one.
+  - A forced `gateway.refresh` that cannot disconnect a server now says so.
+    It returns `ok: false` with
+    `Server '<name>' could not be disconnected: <reason>`. Before, it
+    reported success, and the server stayed connected even if it had been
+    removed from the config or denied by policy.
 - **`pmcp config set-startup-policy add|remove|set --source project --apply` now carries your prior trust approval forward when it rewrites `.mcp.json`; a symlinked `.mcp.json` is refused for every source (user, project and custom, apply or preview, CLI or `gateway.set_startup_policy`).** Setting the startup policy changes the file's bytes, and trust approval is content-keyed, so the edit used to silently invalidate your own `pmcp trust approve` of that file and the next startup refused it. When the pre-write bytes were approved, pmcp now re-records the approval for the exact bytes it writes — keyed on the opened descriptor's verified identity (the resolved key must name the same file the descriptor holds open), never re-approving a file that was not already approved, and never approving a substituted file. A target swapped or unlinked mid-operation is refused rather than mis-bound, and on POSIX a symlinked `.mcp.json` is refused up front. If re-recording ever fails because the trust store is unusable, the edit is still written and the failure is surfaced as a diagnostic rather than crashing (an unusable store also fails the approval check, so nothing is silently carried forward). See [Consiliency/pmcp#253](https://github.com/Consiliency/pmcp/issues/253).
 - **Every install spawn now logs the command it runs, at WARNING, before it
   runs.** `start_install`, the legacy `install_server` and `verify_installation`

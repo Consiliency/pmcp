@@ -33,6 +33,7 @@ from pmcp.tools.handlers import (
     _refresh_config_unchanged,
     get_gateway_tool_definitions,
 )
+from tests.task_reply_double import TaskReplyDouble
 from pmcp.types import (
     CLIHint,
     CLIResolution,
@@ -103,7 +104,7 @@ def test_cli_resolution_legacy_shape_remains_valid() -> None:
     }
 
 
-class MockClientManager:
+class MockClientManager(TaskReplyDouble):
     """Mock client manager for testing."""
 
     def __init__(self, tools: list[ToolInfo] | None = None) -> None:

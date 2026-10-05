@@ -480,6 +480,8 @@ async def test_phase4_lifecycle_refuses_and_forces_active_tasks() -> None:
     manager._record_task(
         "task-server",
         manager._task_info_from_payload({"taskId": "active", "status": "working"}),
+        requestor_context=None,
+        connection=None,
     )
     gateway = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
 
