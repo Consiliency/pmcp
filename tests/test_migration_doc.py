@@ -30,9 +30,10 @@ What a wrong guide fails on:
 * **Snippets.** Every YAML/JSON block is tagged and parses through its real
   loader with the stated outcome.
 * **Rollback.** The rollback section's ``rollback-table`` has exactly one row per
-  breaking-change section, each starting "Safe on 2.7.3" or "Reverse:" (with a
-  concrete step), and the sections verified to read differently on 2.7.3 must
-  stay "Reverse:".
+  breaking-change section, each starting "Safe on 2.7.3" or "Reverse:". Every
+  "Reverse:" row is one whose behaviour on 2.7.3 was verified, and its cell
+  must contain that section's pinned phrases in ``_REVERSE_STEPS``: what 2.7.3
+  does and the step (with code) that undoes the migration.
 * **Runs.** Tagged ``run:`` blocks are executed: the approval recipes against a
   scratch checkout with the real CLI, the backup recipe under bash and zsh.
 * **2.7.3 facts.** Behaviour of 2.7.3 cannot be re-derived from this tree, so the
@@ -43,7 +44,8 @@ What a wrong guide fails on:
 this test's first version in review of Consiliency/pmcp#364, plus three more
 (a log grep that misses ignored pins, an invented refusal message, a backup
 that copies symlinks as links), plus two from the round-3 board (a rollback
-that drops or "safes" the task-unit reversal); each must fail.
+that drops or "safes" the task-unit reversal) and six from round 4 (rollback
+rows that reverse the wrong way or name no step); each must fail.
 """
 
 from __future__ import annotations
@@ -1040,20 +1042,51 @@ def _check_backup_run(text: str, tmp: Path) -> list[str]:
 # -- rollback ------------------------------------------------------------------
 
 #: Sections whose migration step 2.7.3 reads differently, verified by running
-#: 2.7.3 against the migrated form (Consiliency/pmcp#364). Their rollback row
-#: must stay "Reverse:"; any other row may be either, but must be present.
-_REVERSE_ON_273: frozenset[str] = frozenset(
-    {
-        "Project files need approval",
-        "New `packages:` policy section",
-        "Auth responses changed",
-        "The `tools/call` gate enforces the schemas pmcp advertises",
-        "Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire",
-        "Manifest version pins",
-        "Agent-facing hints",
-        "Error text names the real failure",
-    }
-)
+#: 2.7.3 against the migrated form (Consiliency/pmcp#364), each with the exact
+#: phrases its "Reverse:" cell must contain: what 2.7.3 does, and the step that
+#: undoes the migration (every step phrase carries a code span). A row that says
+#: the opposite -- divide instead of multiply, keep instead of remove, "merges"
+#: instead of "instead of" -- loses its phrase and fails. Any other row may be
+#: "Safe on 2.7.3", but a "Reverse:" row for a section not listed here fails
+#: until its step is pinned here too.
+_REVERSE_STEPS: dict[str, tuple[str, ...]] = {
+    "Project files need approval": (
+        "2.7.3 uses the project file *instead of* yours",
+        "Move the project file aside (`mv .mcp-gateway-policy.yaml .mcp-gateway-policy.yaml.3x`)",
+    ),
+    "New `packages:` policy section": (
+        "remove every `packages:` section",
+        "or 2.7.3 refuses to start",
+    ),
+    "Feedback submission is off by default": (
+        "then `GITHUB_TOKEN`",
+        "then a `gh` CLI on the gateway's `PATH` using its stored login",
+        "run `pmcp guidance --telemetry off` before you restart on 2.7.3",
+        "unset `PMCP_FEEDBACK_TOKEN` and `GITHUB_TOKEN`",
+        "keep `gh` off the gateway's `PATH`",
+    ),
+    "Auth responses changed": ("must match the 2.7.3 texts and `500`s again",),
+    "The `tools/call` gate enforces the schemas pmcp advertises": (
+        "don't send an explicit `null` for an optional argument; 2.7.3 rejects it",
+    ),
+    "Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire": (
+        "a migrated `ttl: 300` keeps a task for 0.3 s",
+        "Multiply by 1000 again (`ttl: 300000`, `poll_interval: 2500`)",
+        "Switch a tenant server you changed back to reading and returning seconds",
+    ),
+    "Manifest version pins": (
+        "2.7.3 ignores `version:` and `server_version:` silently",
+        "put it in that server's `args` in `~/.mcp.json`",
+    ),
+    "Agent-facing hints": (
+        "see `try/catch` and `playwright::browser_screenshot` again",
+        "Match both.",
+    ),
+    "Error text names the real failure": (
+        "2.7.3 logs only `unhandled errors in a TaskGroup (1 sub-exception)`",
+        "Match both.",
+    ),
+}
 
 
 def _breaking_sections(text: str) -> list[str]:
@@ -1108,12 +1141,23 @@ def _check_rollback(text: str) -> list[str]:
             problems.append(
                 f"rollback row {title!r} must start 'Safe on 2.7.3' or 'Reverse:'"
             )
-        if status.startswith("Reverse:") and "`" not in status:
-            problems.append(f"rollback row {title!r} reverses with no concrete step")
-        if title in _REVERSE_ON_273 and not status.startswith("Reverse:"):
+        steps = _REVERSE_STEPS.get(title)
+        if status.startswith("Reverse:") and steps is None:
+            problems.append(
+                f"rollback row {title!r} reverses with no pinned step in _REVERSE_STEPS"
+            )
+        if steps is None:
+            continue
+        if not status.startswith("Reverse:"):
             problems.append(
                 f"rollback row {title!r} must say how to reverse it on 2.7.3"
             )
+        cell = _norm(status)
+        for phrase in steps:
+            if _norm(phrase) not in cell:
+                problems.append(f"rollback row {title!r} no longer says {phrase!r}")
+        if not any("`" in phrase for phrase in steps):
+            problems.append(f"rollback row {title!r}: no pinned step names code")
     return problems
 
 
@@ -1257,6 +1301,32 @@ def _seeded_wrong_guides(text: str) -> dict[str, str]:
             "| Reverse: 2.7.3 sends `ttl` and `poll_interval`",
             "| Safe on 2.7.3: it sends `ttl` and `poll_interval`",
         ),
+        # Round 4 (Consiliency/pmcp#364): rows that reverse the wrong way.
+        "m-rollback-divides-task-units": lambda t: t.replace(
+            "Multiply by 1000 again (`ttl: 300000`, `poll_interval: 2500`)",
+            "Divide by 1000 again (`ttl: 0.3`, `poll_interval: 0.0025`)",
+        ),
+        "n-rollback-keeps-packages": lambda t: t.replace(
+            "Reverse: remove every `packages:` section (step 1 above), or 2.7.3 refuses to start.",
+            "Reverse: keep every `packages:` section; 2.7.3 ignores it.",
+        ),
+        "o-rollback-says-policies-merge": lambda t: t.replace(
+            "2.7.3 uses the project file *instead of* yours",
+            "2.7.3 merges the project file with yours",
+        ),
+        "p-rollback-keeps-sending-null": lambda t: t.replace(
+            "don't send an explicit `null` for an optional argument; 2.7.3 rejects it",
+            "keep sending an explicit `null` for an optional argument; 2.7.3 accepts it",
+        ),
+        "q-rollback-reverse-without-a-step": lambda t: re.sub(
+            r"(\| \[Feedback submission is off by default\]\([^)]*\) \| )[^\n]*",
+            r"\1Reverse: something. The enable_feedback_submission key is ignored, as is `confirm_submission=true`. |",
+            t,
+        ),
+        "r-rollback-feedback-only-github-token": lambda t: t.replace(
+            "run `pmcp guidance --telemetry off` before you restart on 2.7.3",
+            "unset `GITHUB_TOKEN` before you restart on 2.7.3",
+        ),
         # Beyond the seven: the review's F004 and F006 shapes, and an invented message.
         "h-log-grep-misses-ignored-pins": lambda t: t.replace(
             "\\[WARNING\\] (Ignoring |Spawning ",
@@ -1333,9 +1403,20 @@ def test_rollback_restores_task_duration_contract() -> None:
     )
     assert current(None, migrated) == {"ttl": 300000, "pollInterval": 2500.0}
     assert previous(None, migrated) == {"ttl": 300, "pollInterval": 2.5}
-    assert re.search(r"\bttl\b|\bpoll_interval\b", rollback) and re.search(
-        r"1000|1,000|millisecond", rollback, re.IGNORECASE
-    ), (
-        "Rollback omits restoring task caller units after the prescribed "
-        "migration: five-minute retention becomes 300 milliseconds."
+    # On 2.7.3 the caller must send what 3.0 puts on the wire for the same
+    # duration, so the rollback row must name exactly those values.
+    wire = current(None, migrated)
+    row = next(
+        (status for title, _a, status in _rollback_rows(_guide()) if "ttl" in title),
+        "",
     )
+    expected = (
+        f"`ttl: {wire['ttl']}`",
+        f"`poll_interval: {wire['pollInterval']:g}`",
+    )
+    assert "## Rolling back to 2.7.3" in _guide() and rollback
+    for literal in expected:
+        assert literal in row, (
+            "Rollback must restore task caller units: on 2.7.3 send "
+            f"{literal}, what 3.0 sends for ttl 300 s / poll_interval 2.5 s."
+        )

@@ -1146,8 +1146,10 @@ against a home directory 3.0 had written to:
 - `PMCP_*` redirects from `.env` are honoured.
 - Every key from `.env` reaches every spawned server.
 - Discovered packages provision without approval.
-- `gateway.submit_feedback` with `confirm_submission=true` can post again
-  using an ambient `GITHUB_TOKEN`/`GH_TOKEN` or the `gh` CLI.
+- `gateway.submit_feedback` with `confirm_submission=true` can post again,
+  with no operator switch, using `PMCP_FEEDBACK_TOKEN` or `GITHUB_TOKEN`
+  (including one a checkout's `.env.pmcp` planted) or a logged-in `gh` CLI.
+  See the feedback row in the table below.
 
 ### Undo what you changed for 3.0
 
@@ -1166,7 +1168,7 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
 | [Spawned servers no longer inherit the keys pmcp loaded from `.env`](#spawned-servers-no-longer-inherit-the-keys-pmcp-loaded-from-env) | Safe on 2.7.3: shell exports are inherited, a server's `env` block in `~/.mcp.json` is passed as written,† and `pmcp secrets set` works the same. |
 | [Discovered servers are default-deny](#discovered-servers-are-default-deny) | Safe on 2.7.3: package approvals are ignored and discovered packages provision without one. A `packages.allowlist` must go, as for the next row. |
 | [New `packages:` policy section](#new-packages-policy-section) | Reverse: remove every `packages:` section (step 1 above), or 2.7.3 refuses to start.† |
-| [Feedback submission is off by default](#feedback-submission-is-off-by-default) | Safe on 2.7.3: the `enable_feedback_submission` key is ignored.† Note that 2.7.3 posts on `confirm_submission=true` without that switch, and also with an ambient `GITHUB_TOKEN`. Unset `GITHUB_TOKEN`/`GH_TOKEN` in the gateway's environment if you don't want that. |
+| [Feedback submission is off by default](#feedback-submission-is-off-by-default) | Reverse: 2.7.3 ignores `enable_feedback_submission`† and posts on `confirm_submission=true` through the first of these that works: `PMCP_FEEDBACK_TOKEN`, then `GITHUB_TOKEN` (each exported, or loaded from a `.env`, a checkout's `.env.pmcp` or `~/.config/pmcp/pmcp.env`), then a `gh` CLI on the gateway's `PATH` using its stored login.† It posts to `ViperJuice/pmcp`, a repository this project does not own, unless `PMCP_FEEDBACK_REPO` names another.† To stop every channel, run `pmcp guidance --telemetry off` before you restart on 2.7.3; the call then refuses before it reads any token.† 3.0 honours the same setting. Otherwise unset `PMCP_FEEDBACK_TOKEN` and `GITHUB_TOKEN`, delete them from those files, and keep `gh` off the gateway's `PATH`.† `GH_TOKEN` alone posts nothing without `gh`.† |
 | [Auth URLs must be canonical](#auth-urls-must-be-canonical) | Safe on 2.7.3: it accepts every rewritten URL in the table.† |
 | [Auth responses changed](#auth-responses-changed) | Reverse: monitoring or tests that now match `Empty token.`, `The token's algorithm is not supported.` or a `503` must match the 2.7.3 texts and `500`s again (or both). `--oauth-audience` exists in 2.7.3. |
 | [The `tools/call` gate enforces the schemas pmcp advertises](#the-toolscall-gate-enforces-the-schemas-pmcp-advertises) | Reverse: don't send an explicit `null` for an optional argument; 2.7.3 rejects it (`Input validation error: None is not of type 'object'` for `"options": null`).† Correct JSON types are accepted by both. An audit reader that handles `audit.rejection` sees none. |
@@ -1176,7 +1178,7 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
 | [Manifest version pins](#manifest-version-pins) | Reverse: 2.7.3 ignores `version:` and `server_version:` silently,† so a pinned server runs whatever npm resolves. To keep a version, put it in that server's `args` in `~/.mcp.json` (for example `"args": ["-y", "firecrawl-mcp@3.25.5"]`). |
 | [Downstream servers see more from pmcp](#downstream-servers-see-more-from-pmcp) | Safe on 2.7.3: a server that handles `-32601` and `notifications/cancelled` simply doesn't receive them. |
 | [Logs](#logs) | Safe on 2.7.3: alert exclusions for the new WARNINGs match nothing. |
-| [Dependency floors](#dependency-floors) | Safe on 2.7.3: its floors are lower and it has no upper bounds.† |
+| [Dependency floors](#dependency-floors) | Safe on 2.7.3: its floors for `pyjwt`, `aiohttp`, `python-dotenv` and `starlette` are lower, with no upper bound on any of the four.† (2.7.3 caps other packages: `mcp<3.0.0`, `httpx<1.0`, `httpx2<3.0.0`, `jsonschema<5.0.0` and `semver<4`; installing 2.7.3 resolves those itself.) |
 | [Agent-facing hints](#agent-facing-hints) | Reverse: matchers that now expect `try` or `playwright::browser_take_screenshot` see `try/catch` and `playwright::browser_screenshot` again.† Match both. |
 | [A symlinked `.mcp.json` is no longer edited](#a-symlinked-mcpjson-is-no-longer-edited) | Safe on 2.7.3: `--path` exists there.† Don't run `set-startup-policy` with `--source` against a symlink on 2.7.3: it replaces the link with a file.† |
 | [`NaN` from HTTP/SSE servers](#nan-from-httpsse-servers) | Safe on 2.7.3: a lenient parser also reads the `null` 2.7.3 sends. |
