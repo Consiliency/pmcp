@@ -22,8 +22,9 @@ to do, how to verify it, and how to roll back to 2.7.3.
   shell.** A value that came from `.env`, `.env.pmcp` or `~/.config/pmcp/pmcp.env` is
   ignored as if unset. *Security*
 - **Spawned servers no longer inherit the keys pmcp loaded from `.env`**, except a
-  server's own declared `env_var`. Shell-exported variables are still inherited.
-  *Security*
+  server's own declared `env_var`. Shell-exported variables are still inherited. An
+  install spawn under `pmcp --project <dir>` run from another directory no longer
+  inherits a credential stored in `<dir>/.env.pmcp`. *Security*
 - **Discovered servers are default-deny.** `gateway.register_discovered_server` resolves
   and pins the package (and refuses one it cannot pin, or an `env_vars` name that is not
   credential-shaped); `provision`, `connect_server` and `restart_server` refuse it until
@@ -52,7 +53,9 @@ to do, how to verify it, and how to roll back to 2.7.3.
   unknown `kid` refetches the JWKS at most once per 10 s, and any JWKS failure, including
   a key set with no usable keys, is a `503` instead of a `500`. The metadata route's
   `resource` is `--oauth-audience`, or the metadata URL's origin plus `/mcp`, and no
-  longer the request `Host`. *Security*, *Fixed*
+  longer the request `Host`. A forged token pairing an algorithm with a key of
+  another type, and a non-ASCII `Authorization` header, get a `401` instead of a
+  `500`. *Security*, *Fixed*
 - **The `tools/call` gate enforces the schemas pmcp advertises.** Constraints the
   argument models always had are now rejected at the gate as an `isError`
   `Input validation error: …` result instead of an `{"error": true}` payload. Lax
@@ -60,13 +63,19 @@ to do, how to verify it, and how to roll back to 2.7.3.
   an explicit `null` for an optional argument is now accepted. Policy is judged before
   the schema, and gate rejections are recorded as `audit.rejection` events, which carry
   no values taken from the call's arguments: only the failing path and the JSON
-  Schema keyword, never the value or any digest of the arguments. *Changed*
+  Schema keyword, never the value or any digest of the arguments. An
+  `audit.invocation` record for a call refused by policy or made to an unregistered
+  name is `denied` with every argument-derived field (`run_correlation_id` and the
+  rest) `null`, and every other record reads only the top-level arguments the tool's
+  schema declares, so a correlation id passed to a tool that does not declare it is
+  no longer recorded. *Changed*
 - **Task numbers are bounded.** `invoke.task.ttl` must be an integer from 1 to 2^53−1,
   and `invoke.task.poll_interval` a finite number above 0 and at most 2^53−1. `NaN` and
   `±Infinity` are refused for every numeric argument, and a request carrying a value
   that is not strict JSON fails with `outbound frame is not strict JSON`. A downstream
   task field pmcp cannot use is reported as `null` and named in `unusable_fields`.
-  *Changed*
+  Finished tasks past the 100-record cap are evicted in the order pmcp recorded
+  them, not by the downstream's timestamps. *Changed*
 - **Redaction removes more.** `sanitize_auth_diagnostic`, `PolicyManager.redact_secrets`
   and `process_output` now also replace vendor token shapes, JWTs, PEM private keys,
   high-entropy runs, URL userinfo and secret query values with `[REDACTED]`. Existing
@@ -84,7 +93,8 @@ to do, how to verify it, and how to roll back to 2.7.3.
   its inputs change, not on every load. *Changed*
 - **Dependency floors.** `pyjwt[crypto]>=2.15.0` (was `>=2.10.0`),
   `aiohttp>=3.14.2` (was `>=3.9.0`), `python-dotenv>=1.2.2` (was `>=1.0.0`) and,
-  in the `http` extra, `starlette>=1.3.1` (was `>=0.27.0`). *Security*
+  in the `http` extra, `starlette>=1.3.1` (was `>=0.27.0`); the `dev` extra needs
+  `pytest>=9.0.3` (was `>=7.0`) and adds `pytest-timeout>=2.3`. *Security*
 - **Agent-facing hints.** The `try/catch` code hint is now `try`, and the Playwright
   screenshot pattern and example name `browser_take_screenshot` with `filename`.
   *Changed*
@@ -104,7 +114,9 @@ to do, how to verify it, and how to roll back to 2.7.3.
   TaskGroup`. One line still prints the old string: the batch-connect
   `Failed to connect to <server>: …`, also shown as `pmcp`'s "cannot reach PMCP
   gateway" error; the WARNING lines before it name the cause. Match on the
-  underlying error instead. *Fixed*
+  underlying error instead. A hung `gateway.update_server` probe on Python 3.10
+  reports `Update probe timed out after 60 seconds.` instead of an empty
+  `Failed to run update probe: `. *Fixed*
 - **Known issues in 3.0.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
   but the gateway reads `.mcp-gateway`; until that is fixed, run
   `pmcp refresh --cache-dir .mcp-gateway`

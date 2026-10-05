@@ -49,15 +49,21 @@ log is `~/.pmcp/logs/gateway.log`.
 1. **Back up your user-scoped configuration.** Project files are already in
    their repositories.
 
+   <!-- run: backup -->
    ```bash
-   mkdir -p ~/pmcp-backup-2.7.3
-   cp -a ~/.claude/gateway-policy.* ~/.claude/gateway-guidance.yaml ~/.mcp.json ~/.claude/.mcp.json ~/.pmcp/manifest.yaml ~/.config/pmcp ~/pmcp-backup-2.7.3/ 2>/dev/null
-   ls -A ~/pmcp-backup-2.7.3
+   backup=~/pmcp-backup-2.7.3
+   for f in ~/.claude/gateway-policy.yaml ~/.claude/gateway-policy.json ~/.claude/gateway-guidance.yaml ~/.mcp.json ~/.claude/.mcp.json ~/.pmcp/manifest.yaml ~/.config/pmcp; do
+     if [ -e "$f" ]; then dest="$backup/${f#"$HOME"/}"; mkdir -p "$(dirname "$dest")" && cp -RLp "$f" "$dest" && echo "saved $f"; fi
+   done
    ```
 
-   `cp` complains about any file you don't have and copies the rest.
-   `~/.config/pmcp` holds the credentials pmcp stored (`pmcp.env`), and
-   `cp -a` keeps its `0600` mode.
+   This works in bash and zsh. It skips files you don't have, prints one
+   `saved` line per file it copies, and keeps each file's path under the
+   backup directory, so `~/.mcp.json` and `~/.claude/.mcp.json` don't collide.
+   `cp -RLp` copies the *contents* of a symlink, such as a `~/.mcp.json` that
+   points into a dotfiles repository, and keeps file modes. `~/.config/pmcp`
+   holds the credentials pmcp stored (`pmcp.env`, mode `0600`). Start from a
+   backup directory that doesn't exist yet.
 
 2. **Upgrade.** Use whichever matches how you installed pmcp:
 
@@ -94,11 +100,14 @@ log is `~/.pmcp/logs/gateway.log`.
 6. **Check the gateway log for the new WARNINGs**:
 
    ```bash
-   grep -E "Ignoring (project|PMCP_|a '(server_)?version' pin)|Spawning |Installing |Starting install job|Running update probe" ~/.pmcp/logs/gateway.log | tail -n 50
+   grep -E '\[WARNING\] (Ignoring |Spawning |Installing |Starting install job |Verifying installation of |Running update probe)' ~/.pmcp/logs/gateway.log | tail -n 50
    journalctl --user -u pmcp --since today | grep -E 'Ignoring|Fatal error'
    ```
 
-   The first command reads a service's log. For a gateway started from a
+   The first command shows every WARNING that 3.0 adds or rewords: anything
+   pmcp ignored (project files, `PMCP_*` variables, invalid version pins,
+   malformed config) and every package-runner start, install and update
+   probe. It reads a service's log. For a gateway started from a
    checkout, read `<checkout>/.pmcp/logs/gateway.log` instead. `pmcp logs`
    prints the same file, but its `--level` filter matches nothing at
    `warn` (log lines say `[WARNING]`), so use `grep`.
@@ -155,6 +164,7 @@ before.
 `.mcp.json` starts servers. If you trust it, approve it by absolute path from
 anywhere:
 
+<!-- run: approve -->
 ```bash
 cd /path/to/repo
 git log -p -- .mcp.json | head -n 40     # review what you are about to trust
@@ -167,8 +177,9 @@ The command prints `Approved <path>` and the file's sha256. A relative path
 also works, because pmcp resolves it. To approve every project file in the
 current checkout at once:
 
+<!-- run: approve-loop -->
 ```bash
-for f in .mcp.json .mcp-gateway-policy.yaml .mcp-gateway-policy.json .pmcp/manifest.yaml; do [ -f "$f" ] && pmcp trust approve "$PWD/$f"; done
+for f in .mcp.json .mcp-gateway-policy.yaml .mcp-gateway-policy.json .pmcp/manifest.yaml; do if [ -f "$f" ]; then pmcp trust approve "$PWD/$f"; fi; done
 ```
 
 Approve again after every change you accept, including a `git pull` that
@@ -284,7 +295,11 @@ spawns. A server still gets **its own declared `env_var`**: the variable a
 manifest entry names as its credential, resolved from `.env` if necessary.
 Variables you export in your shell are still inherited, deliberately.
 Credentials stored with `pmcp secrets set` or `gateway.auth_connect` reach only
-the server they belong to, as in 2.7.3.
+the server they belong to, as in 2.7.3. That now also holds for an install
+spawn when the gateway runs with `--project <dir>` from another directory.
+2.7.3 looked for the project credential store under the working directory,
+so the install child could inherit another server's credential from
+`<dir>/.env.pmcp`.
 
 **What to do.** Pick whichever of these fits the variable:
 
@@ -312,21 +327,42 @@ the server they belong to, as in 2.7.3.
   the manifest declares. You are prompted for the value:
   `pmcp secrets set FIRECRAWL_API_KEY --scope user`.
 
-**How to verify.** Add a throwaway server to `~/.mcp.json` that writes down the
-names of the variables it receives, and probe it:
+**How to verify.** Add a throwaway server to the `mcpServers` of your
+`~/.mcp.json` that writes down the names of the variables it receives:
 
 <!-- snippet: mcp-json -->
 ```json
 {"mcpServers": {"envcheck": {"command": "/bin/sh", "args": ["-c", "env | cut -d= -f1 | sort > /tmp/pmcp-envcheck.txt"]}}}
 ```
 
-```bash
-pmcp status --probe --server envcheck     # reports "envcheck error (Server envcheck disconnected)"; that is expected
-grep -c . /tmp/pmcp-envcheck.txt && grep -E 'YOUR_KEY_NAME' /tmp/pmcp-envcheck.txt
-```
+Then make the gateway start it with the gateway's own environment. Don't use
+`pmcp status --probe` while a gateway is running: `pmcp status` then asks the
+running gateway, which has not loaded `envcheck`, and nothing is written.
+
+- **Gateway running as a service.** Mark `envcheck` to start with the gateway,
+  restart the service, and read the file:
+
+  ```bash
+  pmcp config set-startup-policy add envcheck --source user --apply
+  systemctl --user restart pmcp
+  sleep 5; grep -c . /tmp/pmcp-envcheck.txt && grep -E 'YOUR_KEY_NAME' /tmp/pmcp-envcheck.txt
+  ```
+
+  If `~/.mcp.json` is a symlink, add `--path "$(readlink -f ~/.mcp.json)"`
+  instead of `--source user` (see
+  [A symlinked `.mcp.json` is no longer edited](#a-symlinked-mcpjson-is-no-longer-edited)).
+- **No service.** Stop any gateway you started by hand (Ctrl-C in its
+  terminal, or `kill` its process), then probe from the shell you start pmcp
+  from:
+
+  ```bash
+  pmcp status --probe --server envcheck     # reports "envcheck error (Server envcheck disconnected)"; that is expected
+  grep -c . /tmp/pmcp-envcheck.txt && grep -E 'YOUR_KEY_NAME' /tmp/pmcp-envcheck.txt
+  ```
 
 A key you exported is in the list. A key that only `.env` sets is not.
-Remove `envcheck` afterwards.
+Afterwards, run `pmcp config set-startup-policy remove envcheck --source user --apply`,
+delete the `envcheck` entry and restart the gateway.
 
 ### Discovered servers are default-deny
 
@@ -548,7 +584,8 @@ pmcp --transport http --auth-mode resource-server --oauth-issuer https://auth.ex
 
 It keeps running, `curl -s http://127.0.0.1:3344/health` answers, and a
 request to `/mcp` without a token gets `401` with
-`WWW-Authenticate: Bearer resource="https://pmcp.example.com/mcp"`.
+a `WWW-Authenticate` header carrying
+`resource="https://pmcp.example.com/mcp"`.
 
 ### Auth responses changed
 
@@ -571,6 +608,10 @@ grep -rnE 'Missing bearer token|Unsupported token algorithm|shared-secret auth m
   `pmcp.auth.AuthMessage`.
 - An unknown `kid` refetches the JWKS at most once per 10 s. Within that
   window it gets a `401`.
+- A forged token that pairs an algorithm with a key of another type, and an
+  `Authorization` header containing non-ASCII bytes, now get a `401` instead
+  of a `500`. Token errors whose library text could quote the token back get
+  a fixed description.
 - Any JWKS failure, including a key set with no usable keys, is a `503`
   (`error="temporarily_unavailable"`) instead of a `500`. A failed fetch backs
   off for 5 s, shared by every waiting request, and each fetch has a 5 s
@@ -582,7 +623,8 @@ grep -rnE 'Missing bearer token|Unsupported token algorithm|shared-secret auth m
   `create_http_app` serves that route and sees this change.
 
 **What to do.** Match the new strings, or better, match the status code and
-the `error` parameter of `WWW-Authenticate`. Treat `503` from the auth layer
+the `error` parameter of `WWW-Authenticate`. Stop alerting on the `500`s a
+malformed token used to cause. Treat `503` from the auth layer
 as "the issuer's key set is unavailable", not as a pmcp crash. Behind a
 reverse proxy, set `--oauth-audience` to the public URL clients use (for
 example `https://pmcp.example.com/mcp`), because the metadata no longer
@@ -616,6 +658,15 @@ with an `{"error": true, …}` JSON payload instead. Some cases checked on 3.0:
 | `gateway.submit_feedback` with a 5-character title | reached the handler | `Input validation error: 'short' is too short` (titles are 8–160 characters) |
 | `gateway.catalog_search` with `query: null` | `Input validation error: None is not of type 'string'` | accepted |
 
+<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": 1}}} => 1 is not of type 'boolean' -->
+<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": "5"}}} => '5' is not of type 'integer', 'null' -->
+<!-- gate-case: {"name": "gateway.describe", "arguments": {"tool_id": ""}} => '' should be non-empty -->
+<!-- gate-case: {"name": "gateway.submit_feedback", "arguments": {"title": "short", "description": "x"}} => 'short' is too short -->
+<!-- gate-case: {"name": "gateway.catalog_search", "arguments": {"query": null}} => accepted -->
+<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": 0}}} => 0 is less than the minimum of 1 -->
+<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "poll_interval": NaN}}} => nan is not of type 'number', 'null' -->
+<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": 60000}}} => accepted -->
+
 An explicit `null` for any optional argument is now accepted; 28 arguments
 used to reject it. Policy is judged before the schema, so a blocked tool gets
 `Gateway tool blocked by policy` whatever its arguments. Unknown keys are
@@ -625,10 +676,28 @@ audit as an `audit.rejection` event with `terminal_status:
 `rejected_argument_validator`. It carries no values from the call's arguments.
 In 2.7.3 these calls were recorded as `audit.invocation` with `failure`.
 
+`audit.invocation` records change too:
+
+- A call refused by policy, or made to a tool name pmcp doesn't have, is
+  recorded `denied`, and every field taken from the arguments is `null`:
+  `run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`,
+  `evidence_label_digest` and `source_reference_hash`. 2.7.3 copied a
+  correlation id from such a call's arguments into the record.
+- For an unregistered name, `gateway_tool_digest` is now the digest of
+  nothing rather than of the caller's string, and the result digest no longer
+  covers the caller's tool name.
+- Every other record reads only the top-level arguments that tool's schema
+  declares. For example, a `run_correlation_id` passed to `gateway.describe`
+  is no longer recorded. `gateway.invoke` declares every field the record
+  reads, so its records are unchanged.
+
 **What to do.** Send real JSON types: `true`/`false`, numbers rather than
 numeric strings, and non-empty identifiers. Check `result.isError` before
 parsing the text. If you read the audit, handle `"event": "audit.rejection"`,
-or dispatch on `event` and skip it. Here is a call the gate accepts:
+or dispatch on `event` and skip it. If you correlate audit records by
+`run_correlation_id`, pass it to `gateway.invoke` (which declares it); on
+other tools and on denied calls it is now `null`. Here is a call the gate
+accepts:
 
 <!-- snippet: tools-call-accepted -->
 ```json
@@ -637,14 +706,15 @@ or dispatch on `event` and skip it. Here is a call the gate accepts:
 
 and the shape it now refuses:
 
-<!-- snippet: tools-call-rejected -->
+<!-- snippet: tools-call-rejected reason="1 is not of type 'boolean'" path="task.enabled" -->
 ```json
-{"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": 1, "ttl": "5"}}}
+{"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": 1, "ttl": 60000}}}
 ```
 
 **How to verify.** Replay your client's calls. None should come back as
 `isError` with `Input validation error`. With `--audit-jsonl`, the audit
-file shows `audit.rejection` lines only for calls you meant to be invalid.
+file shows `audit.rejection` lines only for calls you meant to be invalid,
+and `run_correlation_id` is set only on `gateway.invoke` records.
 
 ### Task numbers are bounded
 
@@ -662,6 +732,8 @@ a request whose `arguments` contain `NaN` fails with `outbound frame is not
 strict JSON`. A downstream task field pmcp cannot use (`ttl`, `poll_interval`,
 `created_at`, `updated_at` or `status`) is reported as `null` and named in the
 task's new `unusable_fields` array. 2.7.3 coerced or stored such values.
+Finished tasks beyond the 100-record cap are evicted in the order pmcp
+recorded them, no longer by the downstream's own timestamps.
 
 **What to do.** Send positive values. pmcp forwards `ttl` and `poll_interval`
 unchanged, and MCP defines both in **milliseconds**, although pmcp's own
@@ -817,6 +889,7 @@ other packages pin older versions of these:
 | `aiohttp` | `>=3.9.0` | `>=3.14.2` |
 | `python-dotenv` | `>=1.0.0` | `>=1.2.2` |
 | `starlette` (the `http` extra) | `>=0.27.0` | `>=1.3.1` |
+| `pytest` (the `dev` extra) | `>=7.0` | `>=9.0.3`, plus `pytest-timeout>=2.3` |
 
 **What changed.** The floors exclude versions with published advisories on
 the auth path and its dependencies.
@@ -834,13 +907,13 @@ prompts, tests or tooling.
 
 **What changed.** The `try/catch` code hint is now `try`; at the default
 `max_hint_length` of 8 it used to be cut to `try/catc`. The Playwright
-screenshot pattern and example now name the real tool,
-`playwright::browser_take_screenshot`, with its `filename` argument. 2.7.3
-named `browser_screenshot` with `path`. Tool and argument descriptions are
-clearer, and the shipped snippets are valid Python.
+screenshot pattern and example now name the server's real tool and argument:
+`playwright::browser_screenshot` → `playwright::browser_take_screenshot`, and
+its `path` argument → `filename`. Tool and argument descriptions are clearer,
+and the shipped snippets are valid Python.
 
 **What to do.** Update any matcher that expects `try/catch` or
-`browser_screenshot`.
+`playwright::browser_screenshot`.
 
 **How to verify.** The shipped data is in the installed `pmcp` package:
 `manifest/code_patterns.yaml` maps `playwright::browser_take_screenshot` to
@@ -903,7 +976,10 @@ The text passes through the auth-diagnostic redactor first. One place still
 prints the old string: the batch-connect line
 `Failed to connect to <server>: unhandled errors in a TaskGroup (1 sub-exception)`,
 which also appears in the CLI's `Error: cannot reach PMCP gateway: …` when
-the gateway is down. The WARNING lines just before it name the cause.
+the gateway is down. The WARNING lines just before it name the cause. A
+`gateway.update_server` probe that hangs on Python 3.10 now reports
+`Update probe timed out after 60 seconds.` instead of an empty
+`Failed to run update probe: `.
 
 **What to do.** Match on the underlying error (`ConnectError`, `Timeout`,
 `ConnectionResetError` …) instead of the group string.
@@ -956,6 +1032,7 @@ Rolling back works, but do the first step **before** you reinstall 2.7.3:
    from any file you pass with `--policy` or `PMCP_POLICY`, and from any
    project policy. 2.7.3 does not know the key and **refuses to start**:
 
+   <!-- quote: 2.7.3 -->
    ```text
    Fatal error: Invalid policy file ~/.claude/gateway-policy.yaml: 1 validation error for GatewayPolicy
    packages
@@ -981,7 +1058,8 @@ against a home directory 3.0 had written to:
 | `guidance.enable_feedback_submission` in `~/.claude/gateway-guidance.yaml` | Ignored. `pmcp guidance` loads the file without an error. |
 | `server_version:` / `version:` pins in overlays | Ignored silently. The servers run unpinned again (`npx -y firecrawl-mcp`). |
 | `packages:` in any policy | **2.7.3 refuses to start.** Remove it first (step 1). |
-| Explicit `--config`/`--policy`, user-scoped files, `pmcp.env` | Unchanged. |
+| `~/.config/pmcp/pmcp.env` and a project `.env.pmcp` | Read as before. 3.0 writes the same `KEY="value"` format with mode `0600`, so 2.7.3 reads what 3.0 stored. |
+| Explicit `--config`/`--policy`, user-scoped `.mcp.json` files | Unchanged. |
 
 **2.7.3 also gives up the 3.0 protections.** These come back:
 
