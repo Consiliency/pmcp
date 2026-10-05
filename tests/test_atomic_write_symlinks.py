@@ -74,10 +74,6 @@ def _check_user_secret(data: bytes) -> None:
     assert b"PMCP_LINK_TEST=through-the-link" in data
 
 
-def _write_project_secret(path: Path) -> None:
-    set_env_value("project", "PMCP_LINK_TEST", "through-the-link", path.parent)
-
-
 def _write_trust(_path: Path) -> None:
     approved = _home() / "approved.json"
     approved.write_bytes(b"{}")
@@ -134,12 +130,6 @@ SITES = [
         "env_store user pmcp.env",
         lambda home: home / ".config" / "pmcp" / "pmcp.env",
         _write_user_secret,
-        _check_user_secret,
-    ),
-    Site(
-        "env_store project .env.pmcp",
-        lambda home: home / "project" / ".env.pmcp",
-        _write_project_secret,
         _check_user_secret,
     ),
     Site(

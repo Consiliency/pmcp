@@ -714,9 +714,12 @@ def save_registry_cache(cache: RegistryCache, cache_path: Path | None = None) ->
     path = _cache_path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(asdict(cache), indent=2, sort_keys=True) + "\n"
+    # confine_to=None: $XDG_CACHE_HOME or ~/.cache, or a path the library
+    # caller passed explicitly -- never derived from a checkout.
     atomic_write(
         path,
         payload.encode("utf-8"),
+        confine_to=None,
         mode=0o600,
         prefix=f".{path.name}.",
         suffix=".tmp",

@@ -130,7 +130,25 @@ def _format_env_value(value: str) -> str:
     return f'"{escaped}"'
 
 
-def write_env_file(path: Path, values: dict[str, str]) -> None:
+def scope_confinement(scope: str, project: Path | None = None) -> Path | None:
+    """The root a credential write for ``scope`` must stay inside, or ``None``.
+
+    The project store ``<project>/.env.pmcp`` lives in a checkout, and a cloned
+    repository can ship it as a symlink to anywhere the user can write; its
+    writes are confined to the project root. The user store
+    ``~/.config/pmcp/pmcp.env`` is the operator's own, so its links -- a dotfiles
+    repository, typically -- are followed wherever they point.
+    """
+    if scope == "project":
+        return resolve_project_root(project)
+    if scope == "user":
+        return None
+    raise ValueError(f"Unsupported secret scope: {scope}")
+
+
+def write_env_file(
+    path: Path, values: dict[str, str], *, confine_to: Path | None
+) -> None:
     """Write key/value pairs to a .env file atomically, at mode 0600.
 
     The write is atomic: the content is written to a temporary file in the same
@@ -146,6 +164,12 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
     repository -- is written THROUGH: the replace lands on the link's target and
     the link is left in place, as 2.7.3's plain write did. A dangling link
     creates its target; a link loop is refused (:func:`pmcp.atomic_write.atomic_write`).
+
+    ``confine_to`` is required and comes from :func:`scope_confinement`: the
+    project root for the project store, whose link may only be followed while it
+    stays inside the project (a link out is refused with
+    ``ConfinedWriteError``, never written through and never replaced), and
+    ``None`` for the user store.
     """
     _validate_env_values(values)
 
@@ -168,7 +192,13 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
 
     # Write-then-rename so the destination is never observed truncated, at 0600,
     # through a symlinked store rather than over it (see pmcp.atomic_write).
-    atomic_write(path, content.encode("utf-8"), mode=0o600, prefix=".pmcp-env-")
+    atomic_write(
+        path,
+        content.encode("utf-8"),
+        confine_to=confine_to,
+        mode=0o600,
+        prefix=".pmcp-env-",
+    )
 
 
 # Env-var keys PMCP itself introduced into its OWN environment from a dotenv
@@ -438,5 +468,5 @@ def set_env_value(
     path = resolve_scope_path(scope, project)
     values = read_env_file(path)
     values[key] = value
-    write_env_file(path, values)
+    write_env_file(path, values, confine_to=scope_confinement(scope, project))
     return path

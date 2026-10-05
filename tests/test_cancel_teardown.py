@@ -2183,9 +2183,6 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "task root: its own cancel ends the loop",
     ),
-    # The one atomic whole-file write every user-owned store goes through
-    # (env_store, trust_store, package_approvals, registry cache, pmcp setup).
-    ("atomic_write.py", "atomic_write", "reraises"): (1, "sync temp-file cleanup"),
     ("client/manager.py", "ClientManager._own_remote_transport", "reraises"): (
         1,
         "hands a pre-handoff failure to `ready`, otherwise re-raises",

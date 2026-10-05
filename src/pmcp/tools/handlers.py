@@ -55,6 +55,7 @@ from pmcp.config.loader import (
     summarize_startup_resolution,
 )
 from pmcp.errors import ErrorCode, GatewayException, make_error
+from pmcp.atomic_write import ConfinedWriteError
 from pmcp.env_store import (
     record_dotenv_keys,
     record_pmcp_introduced_keys,
@@ -4611,7 +4612,9 @@ class GatewayTools:
 
         try:
             path = self._write_secret(parsed.scope, env_var, parsed.credential)
-        except ValueError as exc:
+        except (ValueError, ConfinedWriteError) as exc:
+            # ConfinedWriteError: a project `.env.pmcp` that is a symlink leaving
+            # the project. Refused, never written through (pmcp.atomic_write).
             self._audit(
                 method="gateway.auth_connect",
                 action="auth_connect",

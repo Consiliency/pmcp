@@ -167,7 +167,9 @@ class TestHelperFunctions:
         other = tmp_path / "other"
         project.mkdir()
         other.mkdir()
-        write_env_file(project / ".env.pmcp", {"REMOTE_TOKEN": "project-token"})
+        write_env_file(
+            project / ".env.pmcp", {"REMOTE_TOKEN": "project-token"}, confine_to=None
+        )
         monkeypatch.chdir(other)
         monkeypatch.delenv("REMOTE_TOKEN", raising=False)
 
@@ -186,7 +188,9 @@ class TestHelperFunctions:
     def test_remote_headers_process_env_precedence_with_project_root(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        write_env_file(tmp_path / ".env.pmcp", {"REMOTE_TOKEN": "project-token"})
+        write_env_file(
+            tmp_path / ".env.pmcp", {"REMOTE_TOKEN": "project-token"}, confine_to=None
+        )
         monkeypatch.setenv("REMOTE_TOKEN", "process-token")
 
         headers = _remote_headers(
@@ -1367,7 +1371,9 @@ class TestRemoteConnectSseHeaders:
     ) -> None:
         manager = ClientManager()
         credential = r'token with spaces # "quotes" and \ slash = value'
-        write_env_file(tmp_path / ".env.pmcp", {"PMCP_TEST_TOKEN": credential})
+        write_env_file(
+            tmp_path / ".env.pmcp", {"PMCP_TEST_TOKEN": credential}, confine_to=None
+        )
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv("PMCP_TEST_TOKEN", raising=False)
 

@@ -352,7 +352,11 @@ def _write_store(path: Path, records: list[TrustRecord]) -> None:
     # `trust_store_path()`, so the helper's symlink-following is the identity
     # here and the residency check above judged the file actually written.
     text = json.dumps(payload, indent=2) + "\n"
-    atomic_write(path, text.encode("utf-8"), mode=0o600, prefix=".trust-")
+    # confine_to=None: the operator's own ~/.config/pmcp, already resolved and
+    # refused if checkout-resident (C-15).
+    atomic_write(
+        path, text.encode("utf-8"), confine_to=None, mode=0o600, prefix=".trust-"
+    )
 
 
 def _ensure_store_dir(parent: Path) -> None:

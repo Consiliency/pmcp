@@ -105,7 +105,7 @@ class TestSecretsHandlers:
         monkeypatch.setattr("pmcp.env_store.os.open", open_spy)
         monkeypatch.setattr("pmcp.env_store.os.replace", replace_spy)
 
-        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"})
+        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"}, confine_to=None)
 
         # Committed by renaming a temp onto the destination -- not truncated in place.
         assert replaced == [env_path]
@@ -468,7 +468,7 @@ class TestSecretDirectoryPermissions:
         secret_dir = tmp_path / ".config" / "pmcp"
         env_path = secret_dir / "pmcp.env"
 
-        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"})
+        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"}, confine_to=None)
 
         assert stat.S_IMODE(secret_dir.stat().st_mode) == 0o700
         assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
@@ -480,7 +480,7 @@ class TestSecretDirectoryPermissions:
         os.chmod(tmp_path, 0o755)
         env_path = tmp_path / ".env.pmcp"
 
-        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"})
+        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"}, confine_to=None)
 
         assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o755
         assert stat.S_IMODE(env_path.stat().st_mode) == 0o600

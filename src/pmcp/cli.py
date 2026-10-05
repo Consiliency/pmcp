@@ -1877,7 +1877,11 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(data, indent=2) + "\n"
-    atomic_write(path, text.encode("utf-8"), mode=0o600, prefix=".pmcp-setup-")
+    # confine_to=None: the target is ~/.mcp.json or ~/.config/opencode/opencode.json,
+    # fixed under the operator's home; no checkout chooses it.
+    atomic_write(
+        path, text.encode("utf-8"), confine_to=None, mode=0o600, prefix=".pmcp-setup-"
+    )
 
 
 def run_setup(args: argparse.Namespace) -> None:

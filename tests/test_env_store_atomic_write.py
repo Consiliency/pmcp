@@ -34,7 +34,7 @@ def test_an_interrupted_write_leaves_the_existing_store_intact(
     the regression it pins.)
     """
     store = tmp_path / "store" / ".env"
-    write_env_file(store, {"KEEP": "original-secret"})
+    write_env_file(store, {"KEEP": "original-secret"}, confine_to=None)
     assert read_env_file(store) == {"KEEP": "original-secret"}
 
     real_fsync = os.fsync
@@ -44,7 +44,7 @@ def test_an_interrupted_write_leaves_the_existing_store_intact(
 
     monkeypatch.setattr(os, "fsync", boom)
     with pytest.raises(OSError):
-        write_env_file(store, {"REPLACEMENT": "new-secret"})
+        write_env_file(store, {"REPLACEMENT": "new-secret"}, confine_to=None)
     monkeypatch.setattr(os, "fsync", real_fsync)
 
     # The existing store is byte-intact -- not truncated, not the new content.
@@ -58,8 +58,8 @@ def test_a_successful_write_replaces_content_at_0600_with_no_temp_left(
 ) -> None:
     """The happy path still replaces content, at mode 0600, leaving no temp."""
     store = tmp_path / "store" / ".env"
-    write_env_file(store, {"A": "1"})
-    write_env_file(store, {"B": "2"})
+    write_env_file(store, {"A": "1"}, confine_to=None)
+    write_env_file(store, {"B": "2"}, confine_to=None)
 
     assert read_env_file(store) == {"B": "2"}
     assert (os.stat(store).st_mode & 0o777) == 0o600

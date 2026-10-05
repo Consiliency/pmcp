@@ -297,7 +297,15 @@ def _write_store(path: Path, records: list[PackageApproval]) -> None:
     # the withdrawn approval, but a platform that cannot fsync a directory must
     # not turn a completed write into an error (pmcp.atomic_write).
     text = json.dumps(payload, indent=2) + "\n"
-    atomic_write(path, text.encode("utf-8"), mode=0o600, prefix=".package-approvals-")
+    # confine_to=None: beside the trust store, resolved and refused if
+    # checkout-resident by package_approvals_path().
+    atomic_write(
+        path,
+        text.encode("utf-8"),
+        confine_to=None,
+        mode=0o600,
+        prefix=".package-approvals-",
+    )
 
 
 @contextlib.contextmanager
