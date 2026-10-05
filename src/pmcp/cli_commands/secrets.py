@@ -6,13 +6,13 @@ import argparse
 import re
 from pathlib import Path
 
-from pmcp.atomic_write import ConfinedWriteError
 from pmcp.config.loader import load_configs
 from pmcp.env_store import (
     read_env_file,
     resolve_project_root,
     resolve_scope_path,
     scope_confinement,
+    store_write_refusal,
     set_env_value,
     validate_env_var_name,
     write_env_file,
@@ -187,12 +187,12 @@ async def run_secrets_set(args: argparse.Namespace) -> dict[str, object]:
 
     try:
         path = set_env_value(args.scope, args.key, args.value, project)
-    except ConfinedWriteError as exc:
+    except OSError as exc:
         return {
             "ok": False,
             "command": "secrets.set",
             "scope": args.scope,
-            "error": str(exc),
+            "error": store_write_refusal(path, exc),
         }
 
     return {
@@ -249,15 +249,15 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
         write_env_file(
             target_path,
             target_values,
-            confine_to=scope_confinement(to_scope, project),
+            confine_to=scope_confinement(to_scope, target_path),
         )
-    except ConfinedWriteError as exc:
+    except OSError as exc:
         return {
             "ok": False,
             "command": "secrets.sync",
             "from_scope": from_scope,
             "to_scope": to_scope,
-            "error": str(exc),
+            "error": store_write_refusal(target_path, exc),
         }
 
     return {

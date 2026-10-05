@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import errno
 import os
 import stat
 from collections.abc import Callable
@@ -31,6 +32,7 @@ from pmcp.env_store import (
     read_env_file,
     scope_confinement,
     set_env_value,
+    store_write_refusal,
     write_env_file,
 )
 
@@ -121,18 +123,30 @@ def _assert_refused_and_untouched(
 REFUSAL = "refusing to write .env.pmcp: it is a symlink that leaves the project"
 
 
+class Reported(Exception):
+    """An entry point answered ``ok: false``; ``message`` is what the operator saw."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
 async def _reported(awaitable: Any) -> Any:
-    """The operator-facing entry points must REPORT the refusal, not raise it."""
+    """The operator-facing entry points must REPORT a failed write, never raise it."""
     try:
         return await awaitable
-    except ConfinedWriteError as exc:
+    except OSError as exc:
         raise AssertionError(
-            "the entry point raised instead of reporting the refusal"
+            f"the entry point raised {type(exc).__name__} instead of reporting it"
         ) from exc
 
 
 async def _via_set_env_value(lay: dict[str, Path]) -> None:
-    set_env_value("project", "K", "v", lay["project"])
+    """The library call RAISES; the boundary helper is what turns it into a report."""
+    try:
+        set_env_value("project", "K", "v", lay["project"])
+    except OSError as exc:
+        raise Reported(store_write_refusal(lay["project"] / ".env.pmcp", exc)) from exc
 
 
 async def _via_secrets_set(lay: dict[str, Path]) -> None:
@@ -144,8 +158,7 @@ async def _via_secrets_set(lay: dict[str, Path]) -> None:
         )
     )
     if out["ok"] is False:
-        assert out["error"] == REFUSAL
-        raise ConfinedWriteError(str(out["error"]))
+        raise Reported(str(out["error"]))
 
 
 async def _via_secrets_sync(lay: dict[str, Path]) -> None:
@@ -162,8 +175,7 @@ async def _via_secrets_sync(lay: dict[str, Path]) -> None:
         )
     )
     if out["ok"] is False:
-        assert out["error"] == REFUSAL
-        raise ConfinedWriteError(str(out["error"]))
+        raise Reported(str(out["error"]))
 
 
 async def _via_auth_connect(lay: dict[str, Path]) -> None:
@@ -193,8 +205,7 @@ async def _via_auth_connect(lay: dict[str, Path]) -> None:
     if result.env_var:
         os.environ.pop(result.env_var, None)
     if result.ok is False:
-        assert result.message == REFUSAL
-        raise ConfinedWriteError(result.message)
+        raise Reported(result.message)
 
 
 ENTRY_POINTS = {
@@ -214,8 +225,9 @@ async def test_a_project_store_link_that_leaves_the_project_is_refused(
     link_text = os.readlink(layout["project"] / ".env.pmcp")
     before = _outside_snapshot(layout)
 
-    with pytest.raises(ConfinedWriteError, match="leaves the project"):
+    with pytest.raises(Reported) as info:
         await ENTRY_POINTS[entry](layout)
+    assert info.value.message == REFUSAL
 
     _assert_refused_and_untouched(layout, before, link_text)
 
@@ -313,12 +325,12 @@ def test_the_user_store_still_follows_its_link_out_of_any_checkout(
     assert read_env_file(target) == {"K": "v"}
 
 
-def test_scope_confinement() -> None:
-    project = Path.cwd()
-    assert scope_confinement("project", project) == project.resolve()
-    assert scope_confinement("user") is None
+def test_scope_confinement_is_derived_from_the_store_path() -> None:
+    store = Path.cwd() / ".env.pmcp"
+    assert scope_confinement("project", store) == store.parent
+    assert scope_confinement("user", Path.home() / ".config/pmcp/pmcp.env") is None
     with pytest.raises(ValueError):
-        scope_confinement("global")
+        scope_confinement("global", store)
 
 
 def test_a_path_outside_the_root_is_refused(tmp_path: Path) -> None:
@@ -374,22 +386,27 @@ def test_confined_writes_use_the_dir_fd_walk_on_posix() -> None:
 def _swap_after_check(
     monkeypatch: pytest.MonkeyPatch, swap: Callable[[], None]
 ) -> None:
-    real = atomic_write_module.resolve_confined_target
+    """Run ``swap`` after the confined walk resolved the path, before the write."""
+    real = atomic_write_module._walk_confined
 
-    def checked_then_swapped(path: Path, confine_to: Path, label: str) -> Path:
-        result = real(path, confine_to, label)
+    def walked_then_swapped(path: Path, confine_to: Path, label: str) -> Any:
+        walk = real(path, confine_to, label)
         swap()
-        return result
+        return walk
 
-    monkeypatch.setattr(
-        atomic_write_module, "resolve_confined_target", checked_then_swapped
-    )
+    monkeypatch.setattr(atomic_write_module, "_walk_confined", walked_then_swapped)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="dir_fd walk is POSIX-only")
-def test_a_directory_swapped_for_a_link_after_the_check_is_not_followed(
+def test_a_directory_swapped_for_a_link_after_the_walk_is_not_followed(
     layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The walk HOLDS the directory it checked; the write lands in that directory.
+
+    The swap moves the real directory aside and plants a link to the outside
+    under its name. The write goes into the descriptor the walk opened -- the
+    original directory, now ``sub-old``, still inside -- never through the link.
+    """
     project = layout["project"]
     (project / "sub").mkdir()
     (project / "sub" / "real.env").write_text("", encoding="utf-8")
@@ -401,10 +418,62 @@ def test_a_directory_swapped_for_a_link_after_the_check_is_not_followed(
         os.symlink("../outside", project / "sub")
 
     _swap_after_check(monkeypatch, swap)
-    with pytest.raises(OSError):
-        set_env_value("project", "victim", "pwned", project)
+    set_env_value("project", "K", "v", project)
 
     assert _outside_snapshot(layout) == before
+    assert read_env_file(project / "sub-old" / "real.env") == {"K": "v"}
+
+
+@pytest.mark.parametrize("swap_kind", ["directory to link", "link retargeted"])
+def test_a_forced_fallback_refuses_any_link_instead_of_following_a_swap(
+    swap_kind: str, layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without dir_fd (Windows) a confined write never follows a link at all.
+
+    A pathname check followed by a pathname write is exactly the window a swap
+    redirects; the fallback refuses instead (codex F002 on round 2).
+    """
+    project = layout["project"]
+    (project / "sub").mkdir()
+    (project / "sub" / "pmcp.env").write_text("OLD=1\n", encoding="utf-8")
+    os.symlink("sub/pmcp.env", project / ".env.pmcp")
+    before = _outside_snapshot(layout)
+    monkeypatch.setattr(atomic_write_module, "_DIR_FD_SUPPORTED", False)
+    if swap_kind == "directory to link":
+        os.rename(project / "sub", project / "sub-old")
+        os.symlink("../outside", project / "sub")
+    else:
+        os.unlink(project / ".env.pmcp")
+        os.symlink("../outside/victim", project / ".env.pmcp")
+
+    with pytest.raises(ConfinedWriteError, match="cannot be followed safely"):
+        set_env_value("project", "K", "v", project)
+
+    assert _outside_snapshot(layout) == before
+    assert os.path.islink(project / ".env.pmcp")
+
+
+def test_a_forced_fallback_still_writes_a_plain_project_store(
+    layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(atomic_write_module, "_DIR_FD_SUPPORTED", False)
+    set_env_value("project", "K", "v", layout["project"])
+    store = layout["project"] / ".env.pmcp"
+    assert not store.is_symlink()
+    assert read_env_file(store) == {"K": "v"}
+    assert stat.S_IMODE(store.stat().st_mode) == 0o600
+
+
+def test_a_forced_fallback_refuses_a_path_below_a_subdirectory(
+    layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(atomic_write_module, "_DIR_FD_SUPPORTED", False)
+    (layout["project"] / "sub").mkdir()
+    with pytest.raises(ConfinedWriteError, match="not directly inside"):
+        atomic_write(
+            layout["project"] / "sub" / "x.env", b"K=v\n", confine_to=layout["project"]
+        )
+    assert not (layout["project"] / "sub" / "x.env").exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="dir_fd walk is POSIX-only")
@@ -440,11 +509,11 @@ CALL_SITES: dict[tuple[str, str, str], tuple[str, str]] = {
         "passes its own required confine_to through",
     ),
     ("env_store.py", "set_env_value", "write_env_file"): (
-        "scope_confinement(scope, project)",
+        "scope_confinement(scope, path)",
         "project store is repo-controlled -> project root; user store -> None",
     ),
     ("cli_commands/secrets.py", "run_secrets_sync", "write_env_file"): (
-        "scope_confinement(to_scope, project)",
+        "scope_confinement(to_scope, target_path)",
         "the sync TARGET may be the repo-controlled project store",
     ),
     ("trust_store.py", "_write_store", "atomic_write"): (
@@ -533,3 +602,155 @@ def test_project_env_link_out_of_checkout_is_not_written_through(
         set_env_value("project", "K", "v", project)
     assert victim.read_text() == original
     assert os.readlink(project / ".env.pmcp") == "../.bashrc"
+
+
+# --------------------------------------------------------------------------- #
+# Every OSError on the write is a REPORTED, value-free refusal at the boundary.
+# --------------------------------------------------------------------------- #
+
+_REPORTING = {k: v for k, v in ENTRY_POINTS.items() if k != "set_env_value"}
+
+
+def _link_to_root(lay: dict[str, Path]) -> None:
+    os.symlink(".", lay["project"] / ".env.pmcp")
+
+
+def _link_to_inner_dir(lay: dict[str, Path]) -> None:
+    (lay["project"] / "sub").mkdir()
+    os.symlink("sub", lay["project"] / ".env.pmcp")
+
+
+def _directory_at_store(lay: dict[str, Path]) -> None:
+    (lay["project"] / ".env.pmcp").mkdir()
+
+
+def _loop_inside(lay: dict[str, Path]) -> None:
+    os.symlink("b", lay["project"] / "a")
+    os.symlink("a", lay["project"] / "b")
+    os.symlink("a", lay["project"] / ".env.pmcp")
+
+
+def _read_only_target_dir(lay: dict[str, Path]) -> None:
+    ro = lay["project"] / "ro"
+    ro.mkdir()
+    os.symlink("ro/x.env", lay["project"] / ".env.pmcp")
+    os.chmod(ro, 0o500)
+
+
+def _missing_inner_dir(lay: dict[str, Path]) -> None:
+    os.symlink("nope/x.env", lay["project"] / ".env.pmcp")
+
+
+def _through_a_file(lay: dict[str, Path]) -> None:
+    (lay["project"] / "afile").write_text("", encoding="utf-8")
+    os.symlink("afile/x.env", lay["project"] / ".env.pmcp")
+
+
+ERRNO_SHAPES: dict[str, tuple[Callable[[dict[str, Path]], None], int]] = {
+    "link to the project root (.)": (_link_to_root, errno.EISDIR),
+    "link to a directory inside": (_link_to_inner_dir, errno.EISDIR),
+    "a directory at the store path": (_directory_at_store, errno.EISDIR),
+    "a link loop inside": (_loop_inside, errno.ELOOP),
+    "a read-only target directory": (_read_only_target_dir, errno.EACCES),
+    "a dangling link into a missing directory": (_missing_inner_dir, errno.ENOENT),
+    "a link through a regular file": (_through_a_file, errno.ENOTDIR),
+}
+
+
+@pytest.mark.parametrize("entry", list(_REPORTING), ids=list(_REPORTING))
+@pytest.mark.parametrize("shape", list(ERRNO_SHAPES), ids=list(ERRNO_SHAPES))
+async def test_every_os_error_on_the_write_is_a_reported_value_free_refusal(
+    shape: str, entry: str, layout: dict[str, Path]
+) -> None:
+    plant, expected_errno = ERRNO_SHAPES[shape]
+    if expected_errno == errno.EACCES and os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    plant(layout)
+    try:
+        with pytest.raises(Reported) as info:
+            await _REPORTING[entry](layout)
+    finally:
+        for d in layout["project"].iterdir():
+            if d.is_dir() and not d.is_symlink():
+                os.chmod(d, 0o700)
+
+    assert info.value.message == (
+        f"refusing to write .env.pmcp: {os.strerror(expected_errno)}"
+    )
+    assert str(layout["base"]) not in info.value.message
+
+
+# --------------------------------------------------------------------------- #
+# The root is the store path's parent by construction, not a second discovery.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "entry", ["set_env_value", "pmcp secrets sync --to-scope project"]
+)
+async def test_the_confinement_root_cannot_drift_from_the_store_path(
+    entry: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second project-root discovery that lands on an ANCESTOR must not widen it.
+
+    Discovery is made to answer the inner project first and its enclosing
+    checkout afterwards (a marker vanishing mid-command). The store is the inner
+    project's, so its link out to the ancestor must still be refused.
+    """
+    import pmcp.env_store as env_store_module
+
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    (inner / ".git").mkdir(parents=True)
+    os.symlink("../escape.env", inner / ".env.pmcp")
+    answers = iter([inner, outer, outer, outer])
+    monkeypatch.setattr(
+        env_store_module, "resolve_project_root", lambda _project=None: next(answers)
+    )
+    monkeypatch.chdir(inner)
+
+    if entry == "set_env_value":
+        with pytest.raises(ConfinedWriteError):
+            set_env_value("project", "K", "v", None)
+    else:
+        out = await run_secrets_sync(
+            argparse.Namespace(
+                from_scope="user", to_scope="project", project=None, overwrite=False
+            )
+        )
+        assert out["ok"] is False and out["error"] == REFUSAL
+
+    assert not (outer / "escape.env").exists()
+
+
+# --------------------------------------------------------------------------- #
+# A legitimate absolute link spelled through a symlinked parent gets a hint.
+# --------------------------------------------------------------------------- #
+
+
+def test_an_absolute_link_through_a_symlinked_parent_is_refused_with_a_hint(
+    tmp_path: Path,
+) -> None:
+    real = tmp_path / "real"
+    project_real = real / "proj"
+    (project_real / ".git").mkdir(parents=True)
+    (project_real / "conf").mkdir()
+    alias = tmp_path / "alias"
+    os.symlink(real, alias)
+    project_alias = alias / "proj"
+    os.symlink(project_alias / "conf" / "b.env", project_real / ".env.pmcp")
+
+    with pytest.raises(ConfinedWriteError) as info:
+        set_env_value("project", "K", "v", project_alias)
+
+    message = str(info.value)
+    assert message.startswith(REFUSAL)
+    assert "use a relative link" in message
+    assert str(tmp_path) not in message
+    assert not (project_real / "conf" / "b.env").exists()
+
+    # The hint's advice works.
+    os.unlink(project_real / ".env.pmcp")
+    os.symlink("conf/b.env", project_real / ".env.pmcp")
+    set_env_value("project", "K", "v", project_alias)
+    assert read_env_file(project_real / "conf" / "b.env") == {"K": "v"}

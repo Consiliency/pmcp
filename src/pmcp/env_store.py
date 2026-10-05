@@ -130,20 +130,43 @@ def _format_env_value(value: str) -> str:
     return f'"{escaped}"'
 
 
-def scope_confinement(scope: str, project: Path | None = None) -> Path | None:
-    """The root a credential write for ``scope`` must stay inside, or ``None``.
+def scope_confinement(scope: str, store_path: Path) -> Path | None:
+    """The root a credential write to ``store_path`` must stay inside, or ``None``.
 
     The project store ``<project>/.env.pmcp`` lives in a checkout, and a cloned
     repository can ship it as a symlink to anywhere the user can write; its
-    writes are confined to the project root. The user store
-    ``~/.config/pmcp/pmcp.env`` is the operator's own, so its links -- a dotfiles
-    repository, typically -- are followed wherever they point.
+    writes are confined to the project root. The root is DERIVED from the store
+    path -- ``store_path.parent``, which is the root by construction of
+    :func:`resolve_scope_path` -- rather than resolved a second time, so the
+    path written and the root it is judged against can never disagree (a
+    second project-root discovery could land on an ancestor if a marker changed
+    in between). The user store ``~/.config/pmcp/pmcp.env`` is the operator's
+    own, so its links -- a dotfiles repository, typically -- are followed
+    wherever they point.
     """
     if scope == "project":
-        return resolve_project_root(project)
+        return store_path.parent
     if scope == "user":
         return None
     raise ValueError(f"Unsupported secret scope: {scope}")
+
+
+def store_write_refusal(store_path: Path, exc: OSError) -> str:
+    """The operator-facing, value-free report of a failed credential-store write.
+
+    The one conversion the entry points (``pmcp secrets set``/``sync``,
+    ``gateway.auth_connect``) apply at their boundary, so every ``OSError`` from
+    the store -- a confinement refusal, ``EISDIR``, ``ENOTDIR``, ``ELOOP``,
+    ``EACCES``, ``ENOENT``, ``ENOSPC`` -- becomes an ``ok: false`` instead of an
+    uncaught traceback. It names only the store's file name: never a path or a
+    link target, which a repository may have chosen.
+    """
+    from pmcp.atomic_write import ConfinedWriteError
+
+    if isinstance(exc, ConfinedWriteError):
+        return str(exc)
+    reason = os.strerror(exc.errno) if exc.errno else "the write failed"
+    return f"refusing to write {store_path.name}: {reason}"
 
 
 def write_env_file(
@@ -468,5 +491,5 @@ def set_env_value(
     path = resolve_scope_path(scope, project)
     values = read_env_file(path)
     values[key] = value
-    write_env_file(path, values, confine_to=scope_confinement(scope, project))
+    write_env_file(path, values, confine_to=scope_confinement(scope, path))
     return path

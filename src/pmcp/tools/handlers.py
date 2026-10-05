@@ -55,12 +55,13 @@ from pmcp.config.loader import (
     summarize_startup_resolution,
 )
 from pmcp.errors import ErrorCode, GatewayException, make_error
-from pmcp.atomic_write import ConfinedWriteError
 from pmcp.env_store import (
     record_dotenv_keys,
     record_pmcp_introduced_keys,
+    resolve_scope_path,
     sanitized_subprocess_env,
     set_env_value,
+    store_write_refusal,
 )
 from pmcp.feedback_egress import (
     FeedbackProgress,
@@ -4612,9 +4613,18 @@ class GatewayTools:
 
         try:
             path = self._write_secret(parsed.scope, env_var, parsed.credential)
-        except (ValueError, ConfinedWriteError) as exc:
-            # ConfinedWriteError: a project `.env.pmcp` that is a symlink leaving
-            # the project. Refused, never written through (pmcp.atomic_write).
+        except (ValueError, OSError) as exc:
+            # OSError: the store write failed or was refused -- a project
+            # `.env.pmcp` that is a symlink leaving the project (pmcp.atomic_write),
+            # a directory at the path, a loop, no permission. Reported as a
+            # value-free refusal naming only the store's file, never raised.
+            message = (
+                store_write_refusal(
+                    resolve_scope_path(parsed.scope, self._project_root), exc
+                )
+                if isinstance(exc, OSError)
+                else str(exc)
+            )
             self._audit(
                 method="gateway.auth_connect",
                 action="auth_connect",
@@ -4623,12 +4633,12 @@ class GatewayTools:
                 server_name=server_name,
                 auth_state="missing_auth",
                 auth_event="missing_credential",
-                error=str(exc),
+                error=message,
             )
             return AuthConnectOutput(
                 ok=False,
                 server=server_name,
-                message=str(exc),
+                message=message,
                 auth_state="missing_auth",
                 env_var=env_var,
             )
