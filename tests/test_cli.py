@@ -249,9 +249,19 @@ class TestSetupLogging:
 class TestMain:
     """Tests for main entry point."""
 
-    def test_main_loads_dotenv(self) -> None:
-        """Test that main loads .env file."""
+    def test_main_loads_dotenv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test that main loads .env file.
+
+        Run from a directory holding a regular ``.env.pmcp``: the project store is
+        loaded only when present, through the confined reader, as a stream
+        (Consiliency/pmcp#366 round 4).
+        """
         from pmcp.cli import main
+
+        (tmp_path / ".env.pmcp").write_text("R4_MAIN_PROBE=1\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
 
         with patch("pmcp.cli.load_dotenv") as mock_dotenv:
             with patch("pmcp.cli.parse_args") as mock_parse:
@@ -270,8 +280,11 @@ class TestMain:
 
                     main()
 
-            # main() loads .env, then two pmcp env stores — 3 calls total
+            # main() loads .env, then two pmcp env stores — 3 calls total; the
+            # project store arrives as a stream read through the confined walk.
             assert mock_dotenv.call_count == 3
+            assert "stream" in mock_dotenv.call_args_list[2].kwargs
+            assert mock_dotenv.call_args_list[2].kwargs["override"] is False
 
     def test_main_handles_keyboard_interrupt(self) -> None:
         """Test that main handles KeyboardInterrupt gracefully."""
