@@ -456,6 +456,143 @@ async def test_a_call_not_run_as_a_task_never_reports_a_task() -> None:
         assert out.ok and out.task is None and out.result is not None, out
 
 
+# --- invoke's task-mode gate, over every taskSupport x task argument x reply ------
+#
+# `gateway.invoke` reports a task exactly when the manager ran the call as a
+# task (#363 board F001: the `required` branch was unbound). The oracle is what
+# the manager actually sent downstream -- a `task` in `tools/call` params --
+# not a re-statement of the gate; `_GATE_EXPECTED` additionally pins the
+# manager's rule so every branch is known to be exercised.
+
+_SUPPORTS = ["required", "optional", "forbidden", None]
+_TASK_ARGS: dict[str, Any] = {
+    "absent": None,
+    "enabled": {"ttl": 300},
+    "disabled": {"enabled": False, "ttl": 300},
+}
+_REPLIES: dict[str, dict[str, Any]] = {
+    "wrapped": {"task": dict(_WIRE_TASK)},
+    "top": dict(_WIRE_TASK),
+}
+#: (taskSupport, task argument) -> "task" (ran as a task), "sync" (ran
+#: synchronously) or "refused" (the manager refuses a task for a tool that does
+#: not support one; `taskSupport` absent means "forbidden").
+_GATE_EXPECTED: dict[tuple[Any, str], str] = {
+    ("required", "absent"): "task",
+    ("required", "enabled"): "task",
+    ("required", "disabled"): "task",
+    ("optional", "absent"): "sync",
+    ("optional", "enabled"): "task",
+    ("optional", "disabled"): "sync",
+    ("forbidden", "absent"): "sync",
+    ("forbidden", "enabled"): "refused",
+    ("forbidden", "disabled"): "refused",
+    (None, "absent"): "sync",
+    (None, "enabled"): "refused",
+    (None, "disabled"): "refused",
+}
+_GATE_CASES = [
+    (support, arg, reply)
+    for support in _SUPPORTS
+    for arg in _TASK_ARGS
+    for reply in _REPLIES
+]
+
+
+@pytest.mark.parametrize(
+    ("support", "task_arg", "reply_shape"),
+    _GATE_CASES,
+    ids=[f"{s or 'absent'}-task_{a}-{r}" for s, a, r in _GATE_CASES],
+)
+@pytest.mark.asyncio
+async def test_invoke_reports_a_task_exactly_when_the_manager_ran_one(
+    support: Any, task_arg: str, reply_shape: str
+) -> None:
+    manager = _manager()
+    manager._tools[TOOL_ID].execution = (
+        {"taskSupport": support} if support is not None else None
+    )
+    # A record under the reply's task id already exists, so a gate that looks
+    # at a synchronous reply would find something to (wrongly) report.
+    manager._record_task(SERVER, McpTaskInfo(task_id="t1", status="working"))
+    sent: list[dict[str, Any]] = []
+
+    async def downstream(
+        managed: Any, method: str, params: dict[str, Any], **_: Any
+    ) -> Any:
+        assert method == "tools/call", method
+        sent.append(params)
+        return dict(_REPLIES[reply_shape])
+
+    manager._send_request = downstream  # type: ignore[method-assign]
+    gateway = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
+    args: dict[str, Any] = {"tool_id": TOOL_ID}
+    if _TASK_ARGS[task_arg] is not None:
+        args["task"] = _TASK_ARGS[task_arg]
+    out = await gateway.invoke(args)
+
+    expected = _GATE_EXPECTED[(support, task_arg)]
+    if expected == "refused":
+        assert not out.ok and out.task is None and sent == [], out
+        return
+    ran_as_task = "task" in sent[0]
+    assert ran_as_task is (expected == "task"), (sent, expected)
+    assert out.ok, out
+    if ran_as_task:
+        assert out.task is not None, out.result
+        assert (out.task.ttl, out.task.poll_interval) == (300.0, 2.5)
+        assert out.result is None
+    else:
+        assert out.task is None and out.result is not None, out
+
+
+def test_the_gate_table_covers_every_task_support_value() -> None:
+    """Every `taskSupport` the manager distinguishes (and its absence) x every
+    form of the task argument is in the table, and each outcome occurs."""
+    assert set(_GATE_EXPECTED) == {(s, a) for s in _SUPPORTS for a in _TASK_ARGS}
+    assert set(_GATE_EXPECTED.values()) == {"task", "sync", "refused"}
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"taskId": "t1", "status": "working", "ttl": 300_000, "pollInterval": 2500},
+        {
+            "task": {
+                "taskId": "t1",
+                "status": "working",
+                "ttl": 300_000,
+                "pollInterval": 2500,
+            }
+        },
+    ],
+    ids=["top", "wrapped"],
+)
+@pytest.mark.asyncio
+async def test_a_required_task_tool_reports_its_task_without_a_task_argument(
+    reply: dict[str, Any],
+) -> None:
+    """The #363 seat's falsifier: a `taskSupport: required` tool called with no
+    `task` is run as a task by the manager, and invoke reports that record."""
+    manager = _manager()
+    manager._tools[TOOL_ID].execution = {"taskSupport": "required"}
+    sent: list[dict[str, Any]] = []
+
+    async def downstream(
+        managed: Any, method: str, params: dict[str, Any], **_: Any
+    ) -> Any:
+        sent.append(params)
+        return reply
+
+    manager._send_request = downstream  # type: ignore[method-assign]
+    gateway = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
+    out = await gateway.invoke({"tool_id": TOOL_ID})
+    assert "task" in sent[0]
+    assert out.ok and out.task is not None, out.result
+    assert (out.task.ttl, out.task.poll_interval) == (300.0, 2.5)
+    assert out.result is None
+
+
 # --- round trip -----------------------------------------------------------------
 
 
