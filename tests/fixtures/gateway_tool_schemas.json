@@ -291,9 +291,9 @@
       ]
      },
      "poll_interval": {
-      "description": "Seconds between task status polls",
+      "description": "Seconds between task status polls (sent to the downstream server in milliseconds)",
       "exclusiveMinimum": 0,
-      "maximum": 9007199254740991,
+      "maximum": 9007199254740,
       "type": [
        "number",
        "null"
@@ -308,8 +308,8 @@
       ]
      },
      "ttl": {
-      "description": "Requested task TTL in seconds",
-      "maximum": 9007199254740991,
+      "description": "Requested task TTL in seconds (sent to the downstream server in milliseconds)",
+      "maximum": 9007199254740,
       "minimum": 1,
       "type": [
        "integer",

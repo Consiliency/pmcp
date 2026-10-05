@@ -132,8 +132,8 @@ def _tenant_gateway(policy_manager: PolicyManager | None = None) -> GatewayTools
                 else "queued",
                 "createdAt": "2026-01-02T03:04:05Z",
                 "lastUpdatedAt": "2026-01-02T03:04:06Z",
-                "ttl": 300,
-                "pollInterval": 0.1,
+                "ttl": 300000,
+                "pollInterval": 100,
             }
             return {"task": tasks[task_id]}
         if method == "tasks/list":
