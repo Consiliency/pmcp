@@ -1163,6 +1163,11 @@ SIGTERM no longer outlives a cancelled disconnect or a timed-out shutdown
   repository configures. None of these readers hangs on a fifo. Until it is
   fixed, check `ls -l .env.pmcp` in repositories you clone and delete a link
   you didn't create.
+
+  Separately, the startup load of a plain `.env` finds that file by walking up
+  from where pmcp is installed. When pmcp is installed in a virtualenv inside
+  a checkout, that walk reaches the checkout's `.env` and follows its link
+  too.
 - **Tenant-aware header resolution for remote servers is not wired yet**
   ([Consiliency/pmcp#353](https://github.com/Consiliency/pmcp/issues/353)).
   pmcp never reads per-tenant credentials from `.pmcp/tenants/<id>/pmcp.env`,

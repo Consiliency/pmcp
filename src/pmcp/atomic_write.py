@@ -201,9 +201,43 @@ def _is_absolute_link(text: str) -> bool:
     return bool(text) and (text[0] in _separators() or PurePath(text).is_absolute())
 
 
+def _strip_root_prefix(rest: list[str], root_parts: list[str]) -> list[str] | None:
+    """``rest`` with the root's real path consumed from its front, or ``None``.
+
+    The prefix must spell the root component for component (``""`` and ``"."``
+    between them are no-ops, ``..`` is not); what follows is returned VERBATIM,
+    trailing ``""``/``"."`` included, so the walk applies the kernel's rule that
+    a path ending in a separator names a directory.
+    """
+    i = 0
+    for want in root_parts:
+        while i < len(rest) and rest[i] in ("", os.curdir):
+            i += 1
+        if i >= len(rest) or rest[i] != want:
+            return None
+        i += 1
+    return rest[i:]
+
+
 def _inside(candidate: str, root: str) -> bool:
     """Message-only helper: is the real path ``candidate`` at or under ``root``."""
     return candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep)
+
+
+#: How a directory is opened only to walk THROUGH it. ``O_PATH`` (Linux) needs
+#: search permission on the way, exactly as the kernel's own lookup does, not
+#: read permission on the directory -- so a search-only ancestor (a hardened
+#: ``/home`` at 0711) does not refuse a path the kernel resolves. It changes no
+#: confinement property: ``O_PATH | O_DIRECTORY | O_NOFOLLOW`` on a symlink still
+#: fails (``ENOTDIR``) instead of following it, an ``O_PATH`` descriptor works as
+#: the ``dir_fd`` of every ``*at`` call the walk and the write make (``fstatat``,
+#: ``readlinkat``, ``openat``, ``renameat``, ``unlinkat``), and it grants no
+#: access the user did not have. Elsewhere (macOS, the BSDs) it is ``O_RDONLY``.
+_O_PATH = getattr(os, "O_PATH", 0)
+
+
+def _walk_flags() -> int:
+    return (_O_PATH or os.O_RDONLY) | os.O_DIRECTORY
 
 
 class _FdBackend:
@@ -212,7 +246,7 @@ class _FdBackend:
     no_links = False
 
     def start(self, where: str) -> int:
-        return os.open(where, os.O_RDONLY | os.O_DIRECTORY)
+        return os.open(where, _walk_flags())
 
     def lstat(self, at: int, name: str) -> os.stat_result:
         return os.stat(name, dir_fd=at, follow_symlinks=False)
@@ -222,7 +256,7 @@ class _FdBackend:
 
     def enter(self, at: int, name: str) -> int:
         # O_NOFOLLOW: a directory swapped for a link after its lstat fails here.
-        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=at)
+        return os.open(name, _walk_flags() | os.O_NOFOLLOW, dir_fd=at)
 
     def close(self, at: object) -> None:
         if isinstance(at, int):
@@ -262,7 +296,16 @@ class _PathBackend:
 
 
 def _backend(*, confined: bool = False) -> _FdBackend | _PathBackend:
-    if _DIR_FD_SUPPORTED:
+    """The walk for this platform and mode.
+
+    Confined: descriptors where ``dir_fd`` exists (with ``O_PATH`` where that
+    exists too), else pathnames with every link refused. Unconfined (the
+    operator's own links): descriptors only where ``O_PATH`` lets them walk
+    through search-only directories like the kernel; otherwise pathnames, which
+    need only search permission -- the operator's links need no descriptor
+    protection.
+    """
+    if _DIR_FD_SUPPORTED and (confined or _O_PATH):
         return _FdBackend()
     return _PathBackend(no_links=confined)
 
@@ -397,9 +440,16 @@ def _walk(
                 text = backend.readlink(held[-1], name)
                 link_parts = split_link_text(text)
                 if _is_absolute_link(text):
-                    kept = [p for p in link_parts if p not in ("", os.curdir)]
+                    # Components after the anchor, kept VERBATIM: a trailing ""
+                    # (text ending in a separator) or "." is what makes the
+                    # component before it have to be a directory -- exactly as
+                    # for a relative link. Filtering them out made `/x/file/`
+                    # resolve to `/x/file`, which the kernel refuses (ENOTDIR).
+                    link_anchor = PurePath(text).anchor or os.sep
+                    rest = split_link_text(text[len(link_anchor) :])
                     if confined:
-                        if kept[: len(root_parts)] != root_parts:
+                        remainder = _strip_root_prefix(rest, root_parts)
+                        if remainder is None:
                             # realpath shapes the MESSAGE only, never the decision.
                             if _inside(os.path.realpath(text), anchor):
                                 raise ConfinedWriteError(
@@ -408,11 +458,10 @@ def _walk(
                                     "relative link instead"
                                 )
                             raise refusal
-                        link_parts = kept[len(root_parts) :]
+                        link_parts = remainder
                         new_start = start
                     else:
-                        link_anchor = PurePath(text).anchor or anchor
-                        link_parts = list(PurePath(text).parts[1:])
+                        link_parts = rest
                         anchor = link_anchor
                         new_start = link_anchor
                     while held:
@@ -757,7 +806,29 @@ def _write_in_dir(
                 os.unlink(tmp_name, dir_fd=dir_fd)
             except OSError:
                 pass
+    _fsync_dir(dir_fd)
+
+
+def _fsync_dir(dir_fd: int) -> None:
+    """Make the rename durable, best effort.
+
+    An ``O_PATH`` descriptor cannot be ``fsync``-ed (``EBADF``), so the directory
+    is reopened through it for reading; where that is not allowed (a
+    search-only directory) or not supported (macOS ``EINVAL``, some network and
+    overlay mounts), the replace has already landed and is not reported failed.
+    """
     try:
         os.fsync(dir_fd)
+        return
     except OSError:
         pass
+    try:
+        readable = os.open(".", os.O_RDONLY | os.O_DIRECTORY, dir_fd=dir_fd)
+    except OSError:
+        return
+    try:
+        os.fsync(readable)
+    except OSError:
+        pass
+    finally:
+        os.close(readable)

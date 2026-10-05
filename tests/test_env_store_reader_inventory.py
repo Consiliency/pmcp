@@ -43,7 +43,10 @@ NOT_A_PROJECT_LINK_FOLLOWER = {
     "primitive": "the reader itself; classified at its callers",
     "user store only": "reads only the operator's own ~/.config/pmcp/pmcp.env",
     "confined": "reads the project store through atomic_write.read_confined",
-    "plain .env": "load_dotenv() discovery of `.env` from pmcp's own module dir",
+    "plain .env": (
+        "load_dotenv() discovery of `.env` upward from pmcp's own install "
+        "location; a residual of its own (documented, Consiliency/pmcp#372)"
+    ),
 }
 
 #: (file, enclosing qualname, callee) -> (number of calls, class).
@@ -87,31 +90,111 @@ INVENTORY: dict[tuple[str, str, str], tuple[int, str]] = {
 }
 
 
-def _calls() -> Counter[tuple[str, str, str]]:
-    found: Counter[tuple[str, str, str]] = Counter()
+def _aliases(tree: ast.AST) -> dict[str, str]:
+    """Local names bound to a primitive by import: ``from x import y as z``."""
+    bound: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in PRIMITIVES:
+                    bound[alias.asname or alias.name] = alias.name
+    return bound
 
-    def visit(node: ast.AST, scope: list[str], rel: str) -> None:
-        for child in ast.iter_child_nodes(node):
-            inner = scope
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                inner = [*scope, child.name]
-            if isinstance(child, ast.Call):
-                func = child.func
-                name = (
-                    func.id
-                    if isinstance(func, ast.Name)
-                    else func.attr
-                    if isinstance(func, ast.Attribute)
-                    else None
-                )
-                if name in PRIMITIVES:
-                    found[(rel, ".".join(scope) or "<module>", name)] += 1
-            visit(child, inner, rel)
+
+def _scan() -> tuple[Counter[tuple[str, str, str]], list[str]]:
+    """Every call to a primitive, by its real name, and every non-call use of one.
+
+    Calls are matched through import aliases (``dotenv_values as _dv``) and as
+    attributes (``dotenv.dotenv_values``). Any other reference to a primitive --
+    assigning it, passing it, rebinding it -- would let a call escape the scan,
+    so it is reported separately and must not exist.
+    """
+    found: Counter[tuple[str, str, str]] = Counter()
+    escapes: list[str] = []
+
+    def primitive_of(expr: ast.expr, bound: dict[str, str]) -> str | None:
+        if isinstance(expr, ast.Name):
+            return bound.get(expr.id)
+        if isinstance(expr, ast.Attribute) and expr.attr in PRIMITIVES:
+            return expr.attr
+        return None
+
+    def visit(node: ast.AST, scope: list[str], rel: str, bound: dict[str, str]) -> None:
+        """Handle ``node`` ITSELF, then every child (a call's callee excluded)."""
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            scope = [*scope, node.name]
+        children = list(ast.iter_child_nodes(node))
+        if isinstance(node, ast.Call):
+            name = primitive_of(node.func, bound)
+            if name is not None:
+                found[(rel, ".".join(scope) or "<module>", name)] += 1
+            for arg in [*node.args, *(k.value for k in node.keywords)]:
+                if primitive_of(arg, bound) is not None:
+                    escapes.append(f"{rel}:{arg.lineno} passes a store reader")
+            # A plain callee is accounted for above; do not re-visit it as a use.
+            # A computed callee (`partial(reader)(...)`) is visited normally.
+            if isinstance(node.func, (ast.Name, ast.Attribute)):
+                children = [c for c in children if c is not node.func]
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            if primitive_of(node.value, bound) is not None:
+                escapes.append(f"{rel}:{node.lineno} rebinds a store reader")
+        for child in children:
+            visit(child, scope, rel, bound)
 
     for source in sorted(SRC.rglob("*.py")):
         rel = source.relative_to(SRC).as_posix()
-        visit(ast.parse(source.read_text(encoding="utf-8")), [], rel)
-    return found
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        bound = _aliases(tree)
+        bound.update({p: p for p in PRIMITIVES if p not in bound})
+        visit(tree, [], rel, bound)
+    return found, escapes
+
+
+def _calls() -> Counter[tuple[str, str, str]]:
+    return _scan()[0]
+
+
+def test_no_store_reader_escapes_the_scan() -> None:
+    assert _scan()[1] == []
+
+
+def test_the_scan_resolves_aliases_and_flags_escapes(tmp_path: Path) -> None:
+    """Positive control on a synthetic module (round 7 N-1)."""
+    import textwrap
+
+    module = textwrap.dedent(
+        """
+        from dotenv import dotenv_values as _dv
+        import dotenv
+        import functools
+        from pmcp import env_store
+
+        def sneaky(root):
+            a = _dv(root / ".env.pmcp")
+            b = dotenv.load_dotenv(root / ".env.pmcp")
+            c = env_store.read_env_file(root)
+            r = _dv
+            map(_dv, [root])
+            functools.partial(dotenv.dotenv_values)(root)
+            return a, b, c, r
+        """
+    )
+    global SRC
+    real_src = SRC
+    (tmp_path / "sneaky.py").write_text(module, encoding="utf-8")
+    SRC = tmp_path
+    try:
+        found, escapes = _scan()
+    finally:
+        SRC = real_src
+    assert found == Counter(
+        {
+            ("sneaky.py", "sneaky", "dotenv_values"): 1,
+            ("sneaky.py", "sneaky", "load_dotenv"): 1,
+            ("sneaky.py", "sneaky", "read_env_file"): 1,
+        }
+    )
+    assert len(escapes) == 3, escapes
 
 
 def test_every_store_reader_is_inventoried_and_classified() -> None:
