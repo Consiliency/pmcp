@@ -46,6 +46,15 @@ pip install pmcp
 
 ```
 
+### Upgrading from 2.x
+
+3.0.0 refuses several things 2.7.3 accepted. Most importantly, a repository's
+`.mcp.json`, `.pmcp/manifest.yaml` and `.mcp-gateway-policy.yaml` are ignored
+until you approve them with `pmcp trust approve <absolute path>`.
+[MIGRATING.md](MIGRATING.md) has an upgrade checklist, a section for each
+breaking change (with a check, the fix and how to verify it), and how to roll
+back. To stay on 2.x for now, pin `pmcp<3`.
+
 > **Capability matching is built-in** — no API key needed. `gateway.request_capability`
 > uses a pure-Python matcher that can return direct CLI guidance for installed
 > native tools, MCP server candidates, or registry search guidance.
@@ -1549,7 +1558,13 @@ Tenant runs use the existing task broker. Submit long-running work with
 `gateway.invoke` and non-secret `task.metadata`, `task.ttl`,
 `task.poll_interval`, `task.requestor_context`, and trace keys such as
 `_meta.traceparent`; PMCP forwards those fields to the downstream server only
-when the server and tool advertise task support. The returned downstream MCP
+when the server and tool advertise task support. `task.ttl` and
+`task.poll_interval` are in seconds, at most 9,007,199,254,740. PMCP sends them
+downstream in milliseconds, which is the unit MCP 2025-11-25 uses (`ttl: 300`
+reaches the server as `ttl: 300000`). The `ttl` and `poll_interval` of every
+task PMCP returns are converted back from the server's milliseconds to seconds,
+and may be fractional (`1500` ms is reported as `1.5`). A task's `raw` object
+keeps the values exactly as the server sent them. The returned downstream MCP
 task ID is then used with `gateway.tasks_list`, `gateway.tasks_get`,
 `gateway.tasks_result`, and `gateway.tasks_cancel`. Do not use PMCP request IDs
 from `gateway.list_pending` or `gateway.cancel` for tenant task operations.

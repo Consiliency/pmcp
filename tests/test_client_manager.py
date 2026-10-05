@@ -1676,8 +1676,8 @@ class TestCallTool:
                 "task": {
                     "task_id": "tenant-run-1",
                     "status": "working",
-                    "ttl": 300,
-                    "poll_interval": 2.5,
+                    "ttl": 300000,
+                    "poll_interval": 2500,
                     "diagnostics": {"summary": "queued"},
                 }
             }
@@ -1711,8 +1711,8 @@ class TestCallTool:
             },
             "task": {
                 "metadata": {"run_kind": "smoke"},
-                "ttl": 300,
-                "pollInterval": 2.5,
+                "ttl": 300000,
+                "pollInterval": 2500.0,
                 "requestorContext": {"client": "mobile"},
             },
         }
@@ -1813,8 +1813,8 @@ class TestCallTool:
                             "statusMessage": "needs approval",
                             "createdAt": "2026-01-02T03:04:05Z",
                             "lastUpdatedAt": "2026-01-02T03:04:06Z",
-                            "ttl": 300,
-                            "pollInterval": 2,
+                            "ttl": 300000,
+                            "pollInterval": 2000,
                             "metadata": {"unknown": "kept"},
                         },
                         {
@@ -1822,8 +1822,8 @@ class TestCallTool:
                             "status": "host_custom_waiting",
                             "created_at": 1760000000,
                             "last_updated_at": 1760000001.5,
-                            "ttl": 120,
-                            "poll_interval": 0.5,
+                            "ttl": 120000,
+                            "poll_interval": 500,
                         },
                     ]
                 },

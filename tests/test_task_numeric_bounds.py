@@ -34,6 +34,7 @@ from pmcp.tools.handlers import GATEWAY_TOOL_INPUT_MODELS, get_gateway_tool_defi
 from pmcp.tools.schema import GATE_VALIDATOR
 from pmcp.types import (
     MAX_FORWARDED_TASK_NUMBER,
+    MAX_TASK_SECONDS,
     GatewayArguments,
     LocalMcpServerConfig,
     McpTaskInfo,
@@ -153,8 +154,9 @@ def test_gate_rejects_a_boolean_for_every_numeric_argument(
         (("task", "ttl"), 0, False),
         (("task", "ttl"), -5, False),
         (("task", "ttl"), 1, True),
-        (("task", "ttl"), MAX_FORWARDED_TASK_NUMBER, True),
-        (("task", "ttl"), MAX_FORWARDED_TASK_NUMBER + 1, False),
+        (("task", "ttl"), MAX_TASK_SECONDS, True),
+        (("task", "ttl"), MAX_TASK_SECONDS + 1, False),
+        (("task", "ttl"), MAX_FORWARDED_TASK_NUMBER, False),
         (("task", "poll_interval"), 0, False),
         (("task", "poll_interval"), -0.5, False),
         (("task", "poll_interval"), float("nan"), False),
@@ -164,7 +166,8 @@ def test_gate_rejects_a_boolean_for_every_numeric_argument(
         (("task", "poll_interval"), -BIG, False),
         (("task", "poll_interval"), 1e-300, True),
         (("task", "poll_interval"), 0.1, True),
-        (("task", "poll_interval"), MAX_FORWARDED_TASK_NUMBER, True),
+        (("task", "poll_interval"), MAX_TASK_SECONDS, True),
+        (("task", "poll_interval"), MAX_TASK_SECONDS + 1, False),
     ],
 )
 def test_task_hint_bounds(path: tuple[str, ...], value: Any, accepted: bool) -> None:
@@ -309,11 +312,12 @@ UNUSABLE: list[tuple[str, str, Any]] = [
     ],
 ]
 USABLE: list[tuple[str, str, Any, Any]] = [
-    ("ttl", "ttl", 0, 0),
-    ("ttl", "ttl", 60000, 60000),
-    ("ttl", "ttl", 300000.0, 300000),
-    ("pollInterval", "poll_interval", 2, 2.0),
-    ("pollInterval", "poll_interval", 2.5, 2.5),
+    # durations arrive in ms and are kept in seconds (Consiliency/pmcp#330)
+    ("ttl", "ttl", 0, 0.0),
+    ("ttl", "ttl", 60000, 60.0),
+    ("ttl", "ttl", 300000.0, 300.0),
+    ("pollInterval", "poll_interval", 2000, 2.0),
+    ("pollInterval", "poll_interval", 2.5, 0.0025),
     ("createdAt", "created_at", "2025-11-25T10:00:00Z", 1764064800.0),
     ("createdAt", "created_at", -5, -5.0),
     ("createdAt", "created_at", "5", 5.0),
@@ -854,7 +858,7 @@ def test_every_downstream_writer_encodes_through_the_strict_encoder() -> None:
 def test_forwarded_task_hints_are_spec_shaped() -> None:
     manager = ClientManager()
     wire = manager._task_wire_metadata({"ttl": 300, "poll_interval": 2.5})
-    assert wire == {"ttl": 300, "pollInterval": 2.5}
+    assert wire == {"ttl": 300000, "pollInterval": 2500.0}  # ms (#330)
     assert type(wire["ttl"]) is int and math.isfinite(wire["pollInterval"])
     _encode_outbound_frame(wire)
     for bad in (
@@ -899,8 +903,8 @@ def test_a_usable_timestamp_alias_wins_over_an_unusable_one(
     ("payload", "attr", "kept"),
     [
         ({"createdAt": None, "created_at": 5}, "created_at", 5.0),
-        ({"pollInterval": None, "poll_interval": 2.5}, "poll_interval", 2.5),
-        ({"pollInterval": 0, "poll_interval": 2.5}, "poll_interval", 2.5),
+        ({"pollInterval": None, "poll_interval": 2500}, "poll_interval", 2.5),
+        ({"pollInterval": 0, "poll_interval": 2500}, "poll_interval", 2.5),
     ],
 )
 def test_every_aliased_hint_prefers_its_usable_alias(
