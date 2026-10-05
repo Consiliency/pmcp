@@ -20,7 +20,9 @@ import collections
 import contextlib
 import hmac
 import ipaddress
+import json
 import logging
+import re
 import uuid
 from collections.abc import AsyncIterator, Mapping, MutableMapping
 from typing import TYPE_CHECKING, Any, Callable, Literal
@@ -45,6 +47,7 @@ from pmcp.auth import (
     sanitize_public_auth_url,
     validate_resource_server_token,
 )
+from pmcp.argument_errors import exception_text
 from pmcp.parsing import load_json
 from pmcp.types import GatewayDiagnosticsInfo
 from pmcp.waits import bounded_wait
@@ -294,6 +297,88 @@ def _origin_host_port(origin: str) -> tuple[str, str] | None:
     default_port = "443" if parsed.scheme == "https" else "80"
     port = str(explicit_port) if explicit_port is not None else default_port
     return hostname, port
+
+
+# --- the SDK's transport rejections, value-free (Consiliency/pmcp#297 rev 19) --
+#
+# The MCP SDK's streamable-HTTP transport answers a request it cannot accept
+# before any pmcp handler runs. Three of its rejections are built from the
+# request itself (round-17 grok F001, claude N1):
+# - a body that is not JSON: `"Parse error: {str(e)}"`, the parser's text;
+# - a JSON body that is not a JSON-RPC message: `"Validation error:
+#   {str(e)}"`, pydantic's text, which quotes every rejected `input_value`;
+# - an unsupported protocol version on the per-request-envelope path:
+#   `data.requested`, the caller's string.
+# `tests/test_http_transport.py` enumerates every non-literal message the
+# SDK's server-transport modules can put in a rejection, and fails on one
+# that is not reviewed here. Every other rejection text is an SDK literal or
+# is built from SDK constants and pmcp's own schema.
+
+_PROTOCOL_REVISION = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _envelope_problem(request_body: bytes) -> str:
+    """Why `request_body` is not a JSON-RPC message, from its structure: the
+    parse error's format, position and class, or the validation error's
+    paths and phrases -- never the body's text."""
+    from mcp_types import jsonrpc_message_adapter
+    from pydantic import ValidationError
+
+    try:
+        raw = load_json(request_body, source="request body")
+    except ValueError as error:
+        return exception_text(error)
+    try:
+        jsonrpc_message_adapter.validate_python(raw, by_name=False)
+    except ValidationError as error:
+        return exception_text(error)
+    return "the request is not a JSON-RPC message"
+
+
+def value_free_rejection(body: bytes, request_body: bytes | None) -> bytes:
+    """`body` (a JSON-RPC error the SDK's transport sent), with each part built
+    from the request replaced by its structural description. Any other body
+    is returned unchanged."""
+    from mcp_types import INVALID_PARAMS, PARSE_ERROR, UNSUPPORTED_PROTOCOL_VERSION
+
+    try:
+        payload = load_json(body, source="transport rejection")
+    except ValueError:
+        return body
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if (
+        not isinstance(error, dict)
+        or payload.get("id") is not None
+        and not (error.get("code") == UNSUPPORTED_PROTOCOL_VERSION)
+    ):
+        return body
+    code, message = error.get("code"), error.get("message")
+    changed = dict(error)
+    if code == PARSE_ERROR and isinstance(message, str):
+        changed["message"] = "Parse error: " + (
+            _envelope_problem(request_body)
+            if request_body is not None
+            else "the request body is not JSON"
+        )
+    elif code == INVALID_PARAMS and isinstance(message, str):
+        changed["message"] = "Validation error: " + (
+            _envelope_problem(request_body)
+            if request_body is not None
+            else "the request is not a JSON-RPC message"
+        )
+    elif code == UNSUPPORTED_PROTOCOL_VERSION and isinstance(changed.get("data"), dict):
+        data = dict(changed["data"])
+        requested = data.get("requested")
+        data["requested"] = (
+            requested
+            if isinstance(requested, str) and _PROTOCOL_REVISION.fullmatch(requested)
+            else ""
+        )
+        changed["data"] = data
+    else:
+        return body
+    payload = {**payload, "error": changed}
+    return json.dumps(payload, separators=(",", ":")).encode()
 
 
 def create_http_app(
@@ -760,11 +845,41 @@ def create_http_app(
 
         response_started = False
         original_send = request._send
+        request_body = body_bytes if request.method == "POST" else None
+        held_start: MutableMapping[str, Any] | None = None
+        held_body: list[bytes] = []
 
         async def tracking_send(message: MutableMapping[str, Any]) -> None:
-            nonlocal response_started
-            if message.get("type") == "http.response.start":
+            # A JSON response the SDK sends with an error status is held until
+            # complete and passed through `value_free_rejection` (rev 19).
+            nonlocal response_started, held_start
+            kind = message.get("type")
+            if kind == "http.response.start":
+                headers = dict(message.get("headers") or [])
+                if int(message.get("status", 200)) >= 400 and headers.get(
+                    b"content-type", b""
+                ).startswith(b"application/json"):
+                    held_start = message
+                    return
                 response_started = True
+            elif kind == "http.response.body" and held_start is not None:
+                held_body.append(message.get("body", b""))
+                if message.get("more_body", False):
+                    return
+                body = value_free_rejection(b"".join(held_body), request_body)
+                start = dict(held_start)
+                start["headers"] = [
+                    (key, value)
+                    for key, value in held_start.get("headers") or []
+                    if key.lower() != b"content-length"
+                ] + [(b"content-length", str(len(body)).encode())]
+                held_start = None
+                response_started = True
+                await original_send(start)
+                await original_send(
+                    {"type": "http.response.body", "body": body, "more_body": False}
+                )
+                return
             await original_send(message)
 
         # subscriptions/listen opens a long-lived stream by design (a

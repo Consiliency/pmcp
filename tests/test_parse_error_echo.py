@@ -912,3 +912,161 @@ def test_an_unparseable_auth_url_port_is_not_chained_into_a_traceback() -> None:
         with pytest.raises(ValueError) as caught:
             call()
         assert s not in "".join(traceback.format_exception(caught.value))
+
+
+# --- rev 19: pmcp's own refusals keep their words (round-17 claude F001) ----
+#
+# Since rev 18 a wrapper whose chain holds a validation or parse error shows
+# only that error's description. pmcp's own refusals are built from
+# `exception_text` and raised after their handler, so they chain nothing and
+# are shown whole: the file, the description and, for a discovered policy,
+# the fail-closed refusal. Each case runs the real entry point.
+
+_R19 = _FAMILIES["alpha"][0]
+_R19_SCHEMA = (
+    "1 validation error for GatewayPolicy: $.tools.allowlist: must be an array"
+)
+
+
+def _r19_case(case: str, root: Path) -> tuple[list[str], str]:
+    """Set up `case` under `root`; return the CLI arguments and the exact
+    stderr line the operator must see."""
+    home = root / "home"
+    s = _R19
+    if case == "user-policy-yaml-schema":
+        path = home / ".claude" / "gateway-policy.yaml"
+        path.write_text(f"tools:\n  allowlist: {s}\n")
+        return [], (
+            f"Fatal error: Invalid policy file {path}: {_R19_SCHEMA}. "
+            "Refusing to start rather than fall back to an unrestricted gateway."
+        )
+    if case == "user-policy-json-schema":
+        path = home / ".claude" / "gateway-policy.json"
+        path.write_text(json.dumps({"tools": {"allowlist": s}}))
+        return [], (
+            f"Fatal error: Invalid policy file {path}: {_R19_SCHEMA}. "
+            "Refusing to start rather than fall back to an unrestricted gateway."
+        )
+    if case == "user-policy-root-list":
+        path = home / ".claude" / "gateway-policy.yaml"
+        path.write_text(f"- {s}\n")
+        return [], (
+            f"Fatal error: Invalid policy file {path}: policy root must be an "
+            "object, got list. Refusing to start rather than fall back to an "
+            "unrestricted gateway."
+        )
+    if case == "explicit-policy-yaml-schema":
+        path = root / "p.yaml"
+        path.write_text(f"tools:\n  allowlist: {s}\n")
+        return ["--policy", str(path)], (
+            f"Fatal error: Failed to load explicit policy {path}: {_R19_SCHEMA}"
+        )
+    if case == "explicit-policy-json-schema":
+        path = root / "p.json"
+        path.write_text(json.dumps({"tools": {"allowlist": s}}))
+        return ["--policy", str(path)], (
+            f"Fatal error: Failed to load explicit policy {path}: {_R19_SCHEMA}"
+        )
+    if case == "explicit-policy-yaml-parse":
+        path = root / "p.yaml"
+        path.write_text(f"tools: [{s}}}\n")
+        return ["--policy", str(path)], (
+            f"Fatal error: Failed to load explicit policy {path}: could not "
+            "parse YAML policy file at line 1, column "
+        )
+    if case == "explicit-policy-missing":
+        path = root / "absent.yaml"
+        return ["--policy", str(path)], (
+            f"Fatal error: Failed to load explicit policy {path}: [Errno 2] "
+        )
+    if case == "trust-store-parse":
+        path = home / ".config" / "pmcp" / "trust.json"
+        path.parent.mkdir(parents=True)
+        path.write_text('{"records": [' + s + "}")
+        path.chmod(0o600)
+        return ["trust", "list"], (
+            f"Error: Cannot parse trust store {path.resolve()}: could not parse "
+            "JSON trust store at line 1, column 14 (JSONDecodeError)"
+        )
+    assert case == "auth-jwks-url", case
+    return [
+        "--transport",
+        "http",
+        "--auth-mode",
+        "resource-server",
+        "--oauth-jwks-url",
+        f"https://a.example.com:{s}/",
+    ], "error: Invalid public auth URL."
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "user-policy-yaml-schema",
+        "user-policy-json-schema",
+        "user-policy-root-list",
+        "explicit-policy-yaml-schema",
+        "explicit-policy-json-schema",
+        "explicit-policy-yaml-parse",
+        "explicit-policy-missing",
+        "trust-store-parse",
+        "auth-jwks-url",
+    ],
+)
+def test_a_startup_refusal_names_the_file_and_the_refusal(
+    tmp_path: Path, case: str
+) -> None:
+    """The real CLI: a refusal reads as pmcp wrote it -- path, description and
+    consequence -- and carries nothing of the value."""
+    (tmp_path / "home" / ".claude").mkdir(parents=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    args, expected = _r19_case(case, tmp_path)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("PMCP_", "npm_config_", "pnpm_config_"))
+    }
+    env["HOME"] = str(tmp_path / "home")
+    result = subprocess.run(
+        [sys.executable, "-c", "from pmcp.cli import main; main()", *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=project,
+        env=env,
+        stdin=subprocess.DEVNULL,
+    )
+    assert result.returncode != 0, result.stderr
+    lines = result.stderr.splitlines()
+    assert any(line.startswith(expected) for line in lines), result.stderr
+    assert not any(form in result.stderr for form in _forbidden(_R19)), result.stderr
+
+
+@pytest.mark.parametrize("scope", ["explicit", "user"])
+def test_a_policy_refusal_still_names_the_file_and_the_refusal(
+    scope: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-17 claude F001's falsifier, as filed: every rendering of the
+    refusal -- `exception_text` and the traceback's last line -- names the
+    file, and the discovered policy's says it refuses to start."""
+    from pmcp.argument_errors import exception_text, safe_traceback_text
+    from pmcp.policy.policy import PolicyManager
+
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(project)
+    policy = home / ".claude" / "gateway-policy.yaml"
+    policy.write_text("tools:\n  allowlist: 5\n")
+
+    with pytest.raises(ValueError) as raised:
+        PolicyManager(policy if scope == "explicit" else None)
+    text = exception_text(raised.value)
+    last = safe_traceback_text(raised.value).rstrip("\n").rsplit("\n", 1)[-1]
+    for rendered in (text, last):
+        assert str(policy) in rendered, rendered
+        if scope == "user":
+            assert "Refusing to start" in rendered, rendered

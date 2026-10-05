@@ -358,13 +358,15 @@ class PolicyManager:
         try:
             content = policy_path.read_text()
         except Exception as e:
-            if fatal:
-                raise ValueError(
-                    f"Failed to load explicit policy {policy_path}: {exception_text(e)}"
-                ) from e
-            self._warn_unparseable(policy_path, e)
-            return None
-        return self._parse_policy(content, policy_path, fatal=fatal)
+            if not fatal:
+                self._warn_unparseable(policy_path, e)
+                return None
+            failure = exception_text(e)
+        else:
+            return self._parse_policy(content, policy_path, fatal=fatal)
+        # Raised outside the handler, so it chains nothing and its own
+        # description is shown (Consiliency/pmcp#297 rev 19).
+        raise ValueError(f"Failed to load explicit policy {policy_path}: {failure}")
 
     def _warn_unparseable(self, policy_path: Path, error: Exception) -> None:
         """The one warning for a discovered file we could not turn into a policy.
@@ -411,18 +413,26 @@ class PolicyManager:
         Both parsers accept bytes, so undecodable content raises inside the
         parse step and takes the warn path like any other unreadable file.
         """
+        # Each refusal is raised outside its handler: a pmcp-authored message
+        # built from `exception_text` chains nothing, so the operator sees it
+        # whole (Consiliency/pmcp#297 rev 19). A wrapper raised inside the
+        # handler of a validation error would be shown only as that error's
+        # description.
+        failure: str | None
         try:
             if policy_path.suffix in (".yaml", ".yml"):
                 data = load_yaml(content, source="policy file")
             else:
                 data = load_json(content, source="policy file")
         except Exception as e:
-            if fatal:
-                raise ValueError(
-                    f"Failed to load explicit policy {policy_path}: {exception_text(e)}"
-                ) from e
-            self._warn_unparseable(policy_path, e)
-            return None
+            if not fatal:
+                self._warn_unparseable(policy_path, e)
+                return None
+            failure = exception_text(e)
+        else:
+            failure = None
+        if failure is not None:
+            raise ValueError(f"Failed to load explicit policy {policy_path}: {failure}")
 
         try:
             if not isinstance(data, dict):
@@ -431,17 +441,16 @@ class PolicyManager:
                 )
             policy = GatewayPolicy.model_validate(data)
         except Exception as e:
-            if fatal:
-                raise ValueError(
-                    f"Failed to load explicit policy {policy_path}: {exception_text(e)}"
-                ) from e
-            raise ValueError(
-                f"Invalid policy file {policy_path}: {exception_text(e)}. "
-                "Refusing to start rather than fall back to an unrestricted gateway."
-            ) from e
-
-        logger.info(f"Loaded policy from {policy_path}")
-        return policy
+            failure = exception_text(e)
+        else:
+            logger.info(f"Loaded policy from {policy_path}")
+            return policy
+        if fatal:
+            raise ValueError(f"Failed to load explicit policy {policy_path}: {failure}")
+        raise ValueError(
+            f"Invalid policy file {policy_path}: {failure}. "
+            "Refusing to start rather than fall back to an unrestricted gateway."
+        )
 
     def _compile_redaction_patterns(self) -> None:
         """Compile the union of the two **effective** pattern sets.

@@ -797,14 +797,14 @@ _LEADS = (
     "\r",
     "\x0c",
     "\x0b",
-    " ",
-    " ",
-    "　",
-    "​",
-    "﻿",
+    "\u00a0",
+    "\u2028",
+    "\u3000",
+    "\u200b",
+    "\ufeff",
     "\x00",
     "\x1b",
-    " ﻿\t",
+    " \ufeff\t",
 )
 #: Prefixes a downstream might write before a whole frame on the same line
 #: (round-8 claude N1), each a different class of first character.
@@ -984,7 +984,7 @@ def _broken_frame_streams(s: str) -> list[tuple[str, list[bytes]]]:
         streams.append(
             (f"raw newline #{index}", lines + [good.encode(), banner.encode()])
         )
-    for codec, char in (("utf-16-le", "Ċ"), ("utf-16-be", "਀")):
+    for codec, char in (("utf-16-le", "\u010a"), ("utf-16-be", "\u0a00")):
         data = json.dumps({"k": f"{char} {s}"}, ensure_ascii=False).encode(codec)
         lines = data.split(b"\n")
         assert len(lines) > 1, codec

@@ -1086,3 +1086,130 @@ def test_the_repr_rejection_rule_sees_its_spellings(
     snippet: str, flagged: bool
 ) -> None:
     assert bool(_repr_rejections(snippet)) is flagged, snippet
+
+
+# --- rev 19: a pmcp-authored description is raised outside the handler ------
+#
+# Since rev 18 an exception whose chain holds a validation or parse error is
+# rendered as its class and that error's description, never its own message.
+# A pmcp message built with a renderer (`f"Invalid policy file {path}:
+# {exception_text(e)}"`) and raised inside the handler of such an error would
+# therefore be withheld, and the operator would lose the file and the
+# refusal. pmcp builds the description in the handler and raises after it,
+# so the exception chains nothing (round-17 claude F001).
+
+_DESCRIBERS = _RENDERERS - {"safe_exc_info"}
+
+
+def _calls_a_describer(node: ast.AST) -> bool:
+    return any(
+        isinstance(inner, ast.Call)
+        and (_callee(inner) in _DESCRIBERS or _callee(inner) in _RENDERER_METHODS)
+        for inner in ast.walk(node)
+    )
+
+
+def _handler_nodes(handler: ast.ExceptHandler) -> list[ast.AST]:
+    """The handler's own statements' nodes, not those of a nested function
+    or class (which run later, outside the handler)."""
+    out: list[ast.AST] = []
+    pending: list[ast.AST] = list(handler.body)
+    while pending:
+        node = pending.pop()
+        out.append(node)
+        if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+        ):
+            continue
+        pending.extend(ast.iter_child_nodes(node))
+    return out
+
+
+def _described_raises_in_handlers(source: str) -> list[int]:
+    """Lines of each `raise` inside an `except` body whose exception carries a
+    renderer's output: called in the raise itself, or through a name the same
+    handler bound to an expression that calls one (`failure =
+    exception_text(e)`, then `raise X(f"... {failure}")` or `raise error`)."""
+    lines: list[int] = []
+    for handler in ast.walk(ast.parse(source)):
+        if not isinstance(handler, ast.ExceptHandler):
+            continue
+        nodes = _handler_nodes(handler)
+        described: set[str] = set()
+        for node in nodes:
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                value = node.value
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                if value is not None and _calls_a_describer(value):
+                    described |= {t.id for t in targets if isinstance(t, ast.Name)}
+        for node in nodes:
+            if not isinstance(node, ast.Raise) or node.exc is None:
+                continue
+            names = {n.id for n in ast.walk(node.exc) if isinstance(n, ast.Name)}
+            if _calls_a_describer(node.exc) or names & described:
+                lines.append(node.lineno)
+    return sorted(lines)
+
+
+def test_no_pmcp_description_is_raised_inside_a_handler() -> None:
+    """Every pmcp exception whose message holds a renderer's description is
+    raised after its handler, so its own text is what the operator sees."""
+    found = [
+        f"{path.relative_to(path.parents[2])}:{line}"
+        for path in _sources()
+        for line in _described_raises_in_handlers(path.read_text())
+    ]
+    assert not found, found
+
+
+@pytest.mark.parametrize(
+    ("snippet", "flagged"),
+    [
+        (
+            "try:\n    f()\nexcept ValueError as e:\n"
+            "    raise RuntimeError(f'bad {exception_text(e)}') from e\n",
+            True,
+        ),
+        (
+            "try:\n    f()\nexcept ValueError as e:\n"
+            "    raise RuntimeError(f'bad {exception_text(e)}')\n",
+            True,
+        ),
+        (
+            "try:\n    f()\nexcept ValueError as e:\n"
+            "    if x:\n        raise RuntimeError(describe_model_error(e, s, a)) from None\n",
+            True,
+        ),
+        (
+            "try:\n    f()\nexcept ValueError as e:\n"
+            "    error = RuntimeError('bad ' + exception_text(e))\n    raise error\n",
+            True,
+        ),
+        (
+            "try:\n    f()\nexcept ValueError as e:\n"
+            "    failure = exception_text(e)\nraise RuntimeError(f'bad {failure}')\n",
+            False,
+        ),
+        (
+            "try:\n    f()\nexcept ValueError as e:\n"
+            "    failure = exception_text(e)\n"
+            "    raise RuntimeError(f'bad {failure}') from e\n",
+            True,
+        ),
+        (
+            "try:\n    f()\nexcept ValueError as e:\n    raise RuntimeError('fixed') from e\n",
+            False,
+        ),
+        (
+            "try:\n    f()\nexcept ValueError as e:\n"
+            "    def later():\n        raise RuntimeError(exception_text(e))\n",
+            False,
+        ),
+    ],
+)
+def test_the_described_raise_rule_sees_its_spellings(
+    snippet: str, flagged: bool
+) -> None:
+    assert bool(_described_raises_in_handlers(snippet)) is flagged, snippet

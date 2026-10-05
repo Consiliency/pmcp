@@ -268,12 +268,15 @@ def _decode(entry: Any) -> TrustRecord:
     if decision not in DECISIONS:
         raise TrustStoreError(f"Unknown trust decision: {decision!r}")
 
+    # Raised outside the handler, chaining nothing, so the description shows
+    # (Consiliency/pmcp#297 rev 19).
+    failure: str | None = None
     try:
         parsed_at = parse_timestamp(str(recorded_at), source="trust store record")
     except ValueError as exc:
-        raise TrustStoreError(
-            f"Unparseable trust timestamp: {exception_text(exc)}"
-        ) from exc
+        failure = exception_text(exc)
+    if failure is not None:
+        raise TrustStoreError(f"Unparseable trust timestamp: {failure}")
 
     return TrustRecord(
         absolute_path=Path(str(absolute_path)),
@@ -298,12 +301,14 @@ def _read_store(path: Path) -> list[TrustRecord]:
     except OSError as exc:
         raise TrustStoreError(f"Cannot read trust store {path}: {exc}") from exc
 
+    failure: str | None = None
     try:
         data = load_json(raw, source="trust store")
     except ValueError as exc:
-        raise TrustStoreError(
-            f"Cannot parse trust store {path}: {exception_text(exc)}"
-        ) from exc
+        failure = exception_text(exc)
+    if failure is not None:
+        # Outside the handler: chains nothing (Consiliency/pmcp#297 rev 19).
+        raise TrustStoreError(f"Cannot parse trust store {path}: {failure}")
 
     if not isinstance(data, dict):
         raise TrustStoreError(f"Trust store {path} is not a JSON object")

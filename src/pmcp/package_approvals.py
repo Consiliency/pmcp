@@ -128,12 +128,15 @@ def _decode(entry: Any) -> PackageApproval:
     except KeyError as exc:
         raise PackageApprovalError(f"Package approval entry is missing {exc}") from exc
 
+    # Raised outside the handler, chaining nothing, so the description shows
+    # (Consiliency/pmcp#297 rev 19).
+    failure: str | None = None
     try:
         _require_identity_fields(registry, name, version)
     except ValueError as exc:
-        raise PackageApprovalError(
-            f"Invalid package approval entry: {exception_text(exc)}"
-        ) from exc
+        failure = exception_text(exc)
+    if failure is not None:
+        raise PackageApprovalError(f"Invalid package approval entry: {failure}")
     if integrity is not None and not isinstance(integrity, str):
         raise PackageApprovalError("Package approval integrity is not a string")
     if decision not in DECISIONS:
@@ -141,9 +144,9 @@ def _decode(entry: Any) -> PackageApproval:
     try:
         parsed_at = parse_timestamp(str(recorded_at), source="package approval record")
     except ValueError as exc:
-        raise PackageApprovalError(
-            f"Unparseable package approval timestamp: {exception_text(exc)}"
-        ) from exc
+        failure = exception_text(exc)
+    if failure is not None:
+        raise PackageApprovalError(f"Unparseable package approval timestamp: {failure}")
 
     return PackageApproval(
         registry=registry,
@@ -176,12 +179,14 @@ def _read_store_and_stale(
         raise PackageApprovalError(
             f"Cannot read package approvals {path}: {exc}"
         ) from exc
+    failure: str | None = None
     try:
         data = load_json(raw, source="package approvals")
     except ValueError as exc:
-        raise PackageApprovalError(
-            f"Cannot parse package approvals {path}: {exception_text(exc)}"
-        ) from exc
+        failure = exception_text(exc)
+    if failure is not None:
+        # Outside the handler: chains nothing (Consiliency/pmcp#297 rev 19).
+        raise PackageApprovalError(f"Cannot parse package approvals {path}: {failure}")
     if not isinstance(data, dict):
         raise PackageApprovalError(f"Package approvals {path} is not a JSON object")
     entries = data.get("records")

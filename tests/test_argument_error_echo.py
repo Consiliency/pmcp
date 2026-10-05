@@ -1186,8 +1186,21 @@ _GRID_FORMS: dict[str, Any] = {
 }
 
 
+def _exception_group() -> type[Exception]:
+    """`ExceptionGroup` (3.11+), or anyio's backport on Python 3.10."""
+    import builtins
+
+    group = getattr(builtins, "ExceptionGroup", None)
+    if group is None:  # Python 3.10
+        from exceptiongroup import ExceptionGroup as group
+    return cast(type[Exception], group)
+
+
 def _wrap(form: str, inner: BaseException, link: str) -> BaseException:
-    """`inner` wrapped once: raised from it, inside its handler, or from None."""
+    """`inner` wrapped once: raised from it, inside its handler, from None,
+    or (rev 19, round-17 claude F002) held as the only member of an exception
+    group whose own message is the form's text, raised outside any handler,
+    so only the group's members reach it."""
     kind: type[BaseException] = _LateStr if form == "late_str" else RuntimeError
     message = None if form == "late_str" else _GRID_FORMS[form](inner)
     args = (
@@ -1195,6 +1208,14 @@ def _wrap(form: str, inner: BaseException, link: str) -> BaseException:
         if isinstance(message, tuple)
         else (() if message is None else (message,))
     )
+    if link == "group":
+        text = message if isinstance(message, str) else f"failed: {inner!r}"
+        group = _exception_group()(text, [cast(Exception, inner)])
+        try:
+            raise group
+        except BaseException as raised:
+            assert raised.__context__ is None and raised.__cause__ is None
+            return raised
     try:
         try:
             raise inner
@@ -1252,7 +1273,7 @@ def _grid_surfaces(outer: BaseException) -> dict[str, str]:
 
 @pytest.mark.parametrize("sentinel", ["long", "short"])
 @pytest.mark.parametrize("depth", [1, 2, 3])
-@pytest.mark.parametrize("link", ["cause", "context", "suppressed"])
+@pytest.mark.parametrize("link", ["cause", "context", "suppressed", "group"])
 @pytest.mark.parametrize("leaf", sorted(_GRID_LEAVES))
 def test_a_wrapper_of_a_value_bearing_error_is_never_rendered_from_its_message(
     leaf: str, link: str, depth: int, sentinel: str
@@ -1325,6 +1346,51 @@ def test_the_value_bearing_registry_is_the_one_decision() -> None:
         assert exception_text(wrapped) == f"failed: {raised.value}", link
         plain = _wrap("fstring", KeyError("missing"), link)
         assert exception_text(plain) == "failed: 'missing'", link
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_a_group_member_value_never_reaches_a_log_or_traceback(wrapped: bool) -> None:
+    """Round-17 claude F002's binding test, as filed: a validation error that
+    is a member of an exception group -- bare, or inside a `{e!r}` wrapper --
+    reaches neither `logger.exception`, `exception_text` nor the traceback.
+    Only `_chain`'s walk over group members finds it."""
+    import io
+
+    import pmcp  # noqa: F401 - installs the record scrubber
+    from pmcp.argument_errors import exception_text, safe_traceback_text
+
+    s = "SENTINEL_GROUP_MEMBER_VALUE_9137"
+    group_type = _exception_group()
+    try:
+        McpTaskInfo.model_validate({"task_id": {"v": s}})
+    except ValidationError as error:
+        member: BaseException = error
+    if wrapped:
+        try:
+            raise member
+        except BaseException as caught:
+            try:
+                raise RuntimeError(f"failed: {caught!r}") from caught
+            except RuntimeError as wrapper:
+                member = wrapper
+    try:
+        raise group_type("unhandled errors in a TaskGroup", [member])
+    except Exception as group:
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger = logging.getLogger("pmcp.finding_f002")
+        logger.addHandler(handler)
+        try:
+            logger.exception("transport owner failed")
+        finally:
+            logger.removeHandler(handler)
+        rendered = {
+            "log": stream.getvalue(),
+            "exception_text": exception_text(group),
+            "traceback": safe_traceback_text(group),
+        }
+    leaked = [name for name, text in rendered.items() if s in text]
+    assert not leaked, leaked
 
 
 @pytest.mark.parametrize("family", sorted(_FAMILIES))
