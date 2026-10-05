@@ -989,6 +989,28 @@ the gateway is down. The WARNING lines just before it name the cause. A
 **How to verify.** With no gateway running, `pmcp update --all` logs
 `Connection to pmcp-gateway failed (attempt 1/3), retrying in 1.0s: ExceptionGroup(1 sub-exception): ConnectError: All connection attempts failed`.
 
+### A cancelled teardown kills stdio servers at once
+
+**Am I affected?** You are if a stdio server you run needs its SIGTERM handler
+to flush state on exit (e.g. a browser saving its profile), and your gateway's
+disconnects, restarts, refreshes or shutdowns are sometimes cancelled or time out
+-- a client hanging up mid-call, or a service manager stopping the gateway.
+
+**What changed.** A teardown whose caller is cancelled now finishes
+synchronously: pmcp SIGKILLs the server's process group (so its children die
+too) instead of sending SIGTERM and waiting. Shutdown does the same when its
+10-second budget runs out. An uncancelled teardown is unchanged: SIGTERM, then
+SIGKILL after the grace period.
+
+**What to do.** Nothing, for most servers. If a server must flush on exit, stop
+it with an uncancelled `gateway.disconnect_server` (or `pmcp` CLI command) and
+let it return before stopping the gateway, and give the service manager a stop
+timeout longer than the gateway's 10-second shutdown budget.
+
+**How to verify.** The gateway log shows the teardown; a server that ignores
+SIGTERM no longer outlives a cancelled disconnect or a timed-out shutdown
+(`ps` shows no leftover process group).
+
 ### Known issues in 3.0.0
 
 - **`pmcp refresh` writes to the wrong cache directory.** By default it

@@ -117,6 +117,11 @@ to do, how to verify it, and how to roll back to 2.7.3.
   underlying error instead. A hung `gateway.update_server` probe on Python 3.10
   reports `Update probe timed out after 60 seconds.` instead of an empty
   `Failed to run update probe: `. *Fixed*
+- **A cancelled teardown kills stdio servers at once.** When the caller of a
+  disconnect, restart, refresh or shutdown is cancelled (or shutdown's 10 s budget
+  runs out), pmcp now SIGKILLs the server's whole process group instead of waiting
+  out its SIGTERM grace, so a server that needs a graceful flush on exit can lose
+  it in that case. An uncancelled teardown still sends SIGTERM first. *Fixed*
 - **Known issues in 3.0.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
   but the gateway reads `.mcp-gateway`; until that is fixed, run
   `pmcp refresh --cache-dir .mcp-gateway`
