@@ -16,33 +16,49 @@
     "type": "boolean"
    },
    "credential": {
-    "description": "API key, token, or subscription credential to store",
-    "minLength": 1,
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "minLength": 1,
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "API key, token, or subscription credential to store"
    },
    "elicitation_id": {
-    "description": "URL-mode elicitation identifier",
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "URL-mode elicitation identifier"
    },
    "elicitation_url": {
-    "description": "Sanitized URL-mode elicitation URL",
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Sanitized URL-mode elicitation URL"
    },
    "env_var": {
-    "description": "Optional explicit environment variable key",
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Optional explicit environment variable key"
    },
    "scope": {
     "default": "user",
@@ -85,43 +101,58 @@
  "gateway.catalog_search": {
   "properties": {
    "filters": {
-    "description": "Narrow results by server, tags, or risk level",
-    "properties": {
-     "risk_max": {
-      "description": "Maximum risk level to include",
-      "enum": [
-       "low",
-       "medium",
-       "high",
-       null
-      ],
-      "type": [
-       "string",
-       "null"
-      ]
-     },
-     "server": {
-      "description": "Filter to tools from a specific server",
-      "type": [
-       "string",
-       "null"
-      ]
-     },
-     "tags": {
-      "description": "Filter to tools with any of these tags",
-      "items": {
-       "type": "string"
+    "anyOf": [
+     {
+      "properties": {
+       "risk_max": {
+        "anyOf": [
+         {
+          "enum": [
+           "low",
+           "medium",
+           "high"
+          ],
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "Maximum risk level to include"
+       },
+       "server": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "Filter to tools from a specific server"
+       },
+       "tags": {
+        "anyOf": [
+         {
+          "items": {
+           "type": "string"
+          },
+          "type": "array"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "Filter to tools with any of these tags"
+       }
       },
-      "type": [
-       "array",
-       "null"
-      ]
+      "type": "object"
+     },
+     {
+      "type": "null"
      }
-    },
-    "type": [
-     "object",
-     "null"
-    ]
+    ],
+    "description": "Narrow results by server, tags, or risk level"
    },
    "include_offline": {
     "default": false,
@@ -136,11 +167,15 @@
     "type": "integer"
    },
    "query": {
-    "description": "Search query to match against tool names, descriptions, and tags",
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Search query to match against tool names, descriptions, and tags"
    }
   },
   "type": "object"
@@ -204,12 +239,16 @@
  "gateway.invoke": {
   "properties": {
    "_meta": {
-    "additionalProperties": true,
-    "description": "Request metadata; trace context keys are forwarded downstream",
-    "type": [
-     "object",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "additionalProperties": true,
+      "type": "object"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Request metadata; trace context keys are forwarded downstream"
    },
    "arguments": {
     "additionalProperties": true,
@@ -217,110 +256,150 @@
     "type": "object"
    },
    "evidence_label_digest": {
-    "description": "SHA-256 digest of the caller evidence label",
-    "maxLength": 64,
-    "minLength": 64,
-    "pattern": "^[0-9a-f]{64}$",
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "SHA-256 digest of the caller evidence label"
    },
    "options": {
-    "description": "Timeout, output truncation, and redaction options",
-    "properties": {
-     "max_output_chars": {
-      "description": "Output size budget for this call: output is truncated at 4x this many UTF-8 bytes",
-      "maximum": 100000,
-      "minimum": 100,
-      "type": [
-       "integer",
-       "null"
-      ]
+    "anyOf": [
+     {
+      "properties": {
+       "max_output_chars": {
+        "anyOf": [
+         {
+          "maximum": 100000,
+          "minimum": 100,
+          "type": "integer"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "Output size budget for this call: output is truncated at 4x this many UTF-8 bytes"
+       },
+       "redact_secrets": {
+        "default": false,
+        "description": "Redact detected secrets from output. Without options, task results are redacted and plain results are not",
+        "type": "boolean"
+       },
+       "timeout_ms": {
+        "default": 30000,
+        "description": "Timeout in milliseconds",
+        "maximum": 300000,
+        "minimum": 1000,
+        "type": "integer"
+       }
+      },
+      "type": "object"
      },
-     "redact_secrets": {
-      "default": false,
-      "description": "Redact detected secrets from output. Without options, task results are redacted and plain results are not",
-      "type": "boolean"
-     },
-     "timeout_ms": {
-      "default": 30000,
-      "description": "Timeout in milliseconds",
-      "maximum": 300000,
-      "minimum": 1000,
-      "type": "integer"
+     {
+      "type": "null"
      }
-    },
-    "type": [
-     "object",
-     "null"
-    ]
+    ],
+    "description": "Timeout, output truncation, and redaction options"
    },
    "run_correlation_id": {
-    "description": "Scoped-advisor run correlation ID",
-    "maxLength": 128,
-    "minLength": 1,
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "maxLength": 128,
+      "minLength": 1,
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Scoped-advisor run correlation ID"
    },
    "seat_correlation_id": {
-    "description": "Scoped-advisor seat correlation ID",
-    "maxLength": 128,
-    "minLength": 1,
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "maxLength": 128,
+      "minLength": 1,
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Scoped-advisor seat correlation ID"
    },
    "task": {
-    "description": "Run as an MCP task (long-running invocation)",
-    "properties": {
-     "enabled": {
-      "default": true,
-      "description": "Run as an MCP task when the server supports it",
-      "type": "boolean"
+    "anyOf": [
+     {
+      "properties": {
+       "enabled": {
+        "default": true,
+        "description": "Run as an MCP task when the server supports it",
+        "type": "boolean"
+       },
+       "metadata": {
+        "anyOf": [
+         {
+          "additionalProperties": true,
+          "type": "object"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "Opaque task metadata forwarded downstream"
+       },
+       "poll_interval": {
+        "anyOf": [
+         {
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740,
+          "type": "number"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "Seconds between task status polls (sent to the downstream server in milliseconds)"
+       },
+       "requestor_context": {
+        "anyOf": [
+         {
+          "additionalProperties": true,
+          "type": "object"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "Opaque requestor context forwarded downstream"
+       },
+       "ttl": {
+        "anyOf": [
+         {
+          "maximum": 9007199254740,
+          "minimum": 1,
+          "type": "integer"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "Requested task TTL in seconds (sent to the downstream server in milliseconds)"
+       }
+      },
+      "type": "object"
      },
-     "metadata": {
-      "additionalProperties": true,
-      "description": "Opaque task metadata forwarded downstream",
-      "type": [
-       "object",
-       "null"
-      ]
-     },
-     "poll_interval": {
-      "description": "Seconds between task status polls (sent to the downstream server in milliseconds)",
-      "exclusiveMinimum": 0,
-      "maximum": 9007199254740,
-      "type": [
-       "number",
-       "null"
-      ]
-     },
-     "requestor_context": {
-      "additionalProperties": true,
-      "description": "Opaque requestor context forwarded downstream",
-      "type": [
-       "object",
-       "null"
-      ]
-     },
-     "ttl": {
-      "description": "Requested task TTL in seconds (sent to the downstream server in milliseconds)",
-      "maximum": 9007199254740,
-      "minimum": 1,
-      "type": [
-       "integer",
-       "null"
-      ]
+     {
+      "type": "null"
      }
-    },
-    "type": [
-     "object",
-     "null"
-    ]
+    ],
+    "description": "Run as an MCP task (long-running invocation)"
    },
    "tool_id": {
     "description": "The tool ID in format \"server_name::tool_name\"",
@@ -328,34 +407,50 @@
     "type": "string"
    },
    "trace_context": {
-    "description": "Trace context forwarded to the downstream server",
-    "properties": {
-     "baggage": {
-      "description": "W3C baggage header value",
-      "type": [
-       "string",
-       "null"
-      ]
+    "anyOf": [
+     {
+      "properties": {
+       "baggage": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "W3C baggage header value"
+       },
+       "traceparent": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "W3C traceparent header value"
+       },
+       "tracestate": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "W3C tracestate header value"
+       }
+      },
+      "type": "object"
      },
-     "traceparent": {
-      "description": "W3C traceparent header value",
-      "type": [
-       "string",
-       "null"
-      ]
-     },
-     "tracestate": {
-      "description": "W3C tracestate header value",
-      "type": [
-       "string",
-       "null"
-      ]
+     {
+      "type": "null"
      }
-    },
-    "type": [
-     "object",
-     "null"
-    ]
+    ],
+    "description": "Trace context forwarded to the downstream server"
    }
   },
   "required": [
@@ -366,11 +461,15 @@
  "gateway.list_pending": {
   "properties": {
    "server": {
-    "description": "Filter to pending requests on a specific server (optional)",
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Filter to pending requests on a specific server (optional)"
    }
   },
   "type": "object"
@@ -409,23 +508,30 @@
     "type": "boolean"
    },
    "reason": {
-    "description": "Reason for refresh (for logging)",
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Reason for refresh (for logging)"
    },
    "source": {
-    "description": "Config source to reload from",
-    "enum": [
-     "claude_config",
-     "custom",
-     null
+    "anyOf": [
+     {
+      "enum": [
+       "claude_config",
+       "custom"
+      ],
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
     ],
-    "type": [
-     "string",
-     "null"
-    ]
+    "description": "Config source to reload from"
    }
   },
   "type": "object"
@@ -464,14 +570,18 @@
  "gateway.request_capability": {
   "properties": {
    "available_clis": {
-    "description": "Optional: CLIs known to be available in the environment",
-    "items": {
-     "type": "string"
-    },
-    "type": [
-     "array",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "items": {
+       "type": "string"
+      },
+      "type": "array"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Optional: CLIs known to be available in the environment"
    },
    "query": {
     "description": "Natural language description of the capability needed (e.g., 'I need to scrape a website', 'browser automation')",
@@ -551,24 +661,31 @@
     "type": "string"
    },
    "path": {
-    "description": "Explicit config file path (overrides source)",
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Explicit config file path (overrides source)"
    },
    "source": {
-    "description": "Config source to edit (project, user, or custom)",
-    "enum": [
-     "project",
-     "user",
-     "custom",
-     null
+    "anyOf": [
+     {
+      "enum": [
+       "project",
+       "user",
+       "custom"
+      ],
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
     ],
-    "type": [
-     "string",
-     "null"
-    ]
+    "description": "Config source to edit (project, user, or custom)"
    }
   },
   "required": [
@@ -589,11 +706,15 @@
     "type": "string"
    },
    "failed_tool_call": {
-    "description": "Specific failed tool call (if known)",
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Specific failed tool call (if known)"
    },
    "issue_type": {
     "default": "bug",
@@ -605,11 +726,15 @@
     "type": "string"
    },
    "subordinate_server": {
-    "description": "Subordinate MCP server involved (if known)",
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Subordinate MCP server involved (if known)"
    },
    "title": {
     "description": "Issue title",
@@ -627,28 +752,35 @@
  "gateway.sync_environment": {
   "properties": {
    "detected_clis": {
-    "description": "Override detected CLIs (optional)",
-    "items": {
-     "type": "string"
-    },
-    "type": [
-     "array",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "items": {
+       "type": "string"
+      },
+      "type": "array"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Override detected CLIs (optional)"
    },
    "platform": {
-    "description": "Override detected platform (optional)",
-    "enum": [
-     "mac",
-     "wsl",
-     "linux",
-     "windows",
-     null
+    "anyOf": [
+     {
+      "enum": [
+       "mac",
+       "wsl",
+       "linux",
+       "windows"
+      ],
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
     ],
-    "type": [
-     "string",
-     "null"
-    ]
+    "description": "Override detected platform (optional)"
    }
   },
   "type": "object"
@@ -661,12 +793,16 @@
     "type": "boolean"
    },
    "requestor_context": {
-    "additionalProperties": true,
-    "description": "Opaque requestor context forwarded downstream",
-    "type": [
-     "object",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "additionalProperties": true,
+      "type": "object"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Opaque requestor context forwarded downstream"
    },
    "server_name": {
     "description": "Server that owns the task",
@@ -688,12 +824,16 @@
  "gateway.tasks_get": {
   "properties": {
    "requestor_context": {
-    "additionalProperties": true,
-    "description": "Opaque requestor context forwarded downstream",
-    "type": [
-     "object",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "additionalProperties": true,
+      "type": "object"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Opaque requestor context forwarded downstream"
    },
    "server_name": {
     "description": "Server that owns the task",
@@ -715,26 +855,38 @@
  "gateway.tasks_list": {
   "properties": {
    "cursor": {
-    "description": "Optional downstream pagination cursor",
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Optional downstream pagination cursor"
    },
    "requestor_context": {
-    "additionalProperties": true,
-    "description": "Opaque requestor context forwarded downstream",
-    "type": [
-     "object",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "additionalProperties": true,
+      "type": "object"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Opaque requestor context forwarded downstream"
    },
    "server_name": {
-    "description": "Optional server filter",
-    "type": [
-     "string",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Optional server filter"
    }
   },
   "type": "object"
@@ -742,42 +894,54 @@
  "gateway.tasks_result": {
   "properties": {
    "options": {
-    "description": "Output redaction and truncation options",
-    "properties": {
-     "max_output_chars": {
-      "description": "Output size budget for this call: output is truncated at 4x this many UTF-8 bytes",
-      "maximum": 100000,
-      "minimum": 100,
-      "type": [
-       "integer",
-       "null"
-      ]
+    "anyOf": [
+     {
+      "properties": {
+       "max_output_chars": {
+        "anyOf": [
+         {
+          "maximum": 100000,
+          "minimum": 100,
+          "type": "integer"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "Output size budget for this call: output is truncated at 4x this many UTF-8 bytes"
+       },
+       "redact_secrets": {
+        "default": false,
+        "description": "Redact detected secrets from output. Without options, task results are redacted and plain results are not",
+        "type": "boolean"
+       },
+       "timeout_ms": {
+        "default": 30000,
+        "description": "Timeout in milliseconds",
+        "maximum": 300000,
+        "minimum": 1000,
+        "type": "integer"
+       }
+      },
+      "type": "object"
      },
-     "redact_secrets": {
-      "default": false,
-      "description": "Redact detected secrets from output. Without options, task results are redacted and plain results are not",
-      "type": "boolean"
-     },
-     "timeout_ms": {
-      "default": 30000,
-      "description": "Timeout in milliseconds",
-      "maximum": 300000,
-      "minimum": 1000,
-      "type": "integer"
+     {
+      "type": "null"
      }
-    },
-    "type": [
-     "object",
-     "null"
-    ]
+    ],
+    "description": "Output redaction and truncation options"
    },
    "requestor_context": {
-    "additionalProperties": true,
-    "description": "Opaque requestor context forwarded downstream",
-    "type": [
-     "object",
-     "null"
-    ]
+    "anyOf": [
+     {
+      "additionalProperties": true,
+      "type": "object"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "description": "Opaque requestor context forwarded downstream"
    },
    "server_name": {
     "description": "Server that owns the task",
