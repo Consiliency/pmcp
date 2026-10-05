@@ -510,3 +510,20 @@ def test_codex_r6_f001_unresolvable_user_store_link_does_not_overwrite(
         atomic_write(link, b"K=v\n", confine_to=None)
     assert existing.read_bytes() == b"UNRELATED=1\n"
     assert os.readlink(link) == "hop/../existing.env"
+
+
+def test_an_unconfined_absolute_link_climbing_past_the_root_stays_at_the_root(
+    tmp_path: Path,
+) -> None:
+    """`/..` is `/` in the kernel: extra `..` at the anchor are absorbed, not refused."""
+    store_dir = Path(os.path.realpath(tmp_path)) / "pmcp"
+    store_dir.mkdir()
+    real = store_dir / "real.env"
+    real.write_bytes(b"OLD=1\n")
+    link = store_dir / "pmcp.env"
+    os.symlink("/../../.." + str(real), link)
+    with open(link, "rb") as handle:  # the kernel's own reading of the text
+        assert handle.read() == b"OLD=1\n"
+
+    assert atomic_write(link, DATA, confine_to=None) == real
+    assert real.read_bytes() == DATA
