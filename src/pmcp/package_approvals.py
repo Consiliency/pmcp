@@ -40,11 +40,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 
-from pmcp.atomic_write import atomic_write
+from pmcp.atomic_write import atomic_write, make_store_dirs, resolve_write_target
 from pmcp.trust_store import (
     TrustStoreError,
     refuse_checkout_resident,
-    resolve_trust_path,
     trust_store_path,
 )
 from pmcp.validation import (
@@ -93,20 +92,23 @@ class PackageApproval:
 
 
 def package_approvals_path() -> Path:
-    """Where the store lives, symlinks resolved. Raises ``TrustStoreError`` if checkout-resident.
+    """Where the store lives. Raises ``TrustStoreError`` if checkout-resident.
 
     The directory is the trust store's, whose residency ``trust_store_path``
-    checks. The file itself is resolved and checked too: writes follow a
-    symlinked store to its target (``pmcp.atomic_write``), and reads always
-    did, so a ``package_approvals.json`` linked into a judged checkout would
-    otherwise be a checkout-resident store reached through its final component.
+    checks. Writes follow a symlinked store's final link chain
+    (``pmcp.atomic_write``), and reads always did, so where that chain lands is
+    checked too -- found by the writer's own chain follower, judged by file
+    identity -- or a ``package_approvals.json`` linked into a judged checkout
+    would be a checkout-resident store reached through its final component.
     """
-    # The writer's own resolver, never realpath/resolve(): those collapse
-    # `missing/../x` onto `x` where the kernel refuses (round 7, codex F003).
-    # An unresolvable path is a TrustStoreError, which `is_package_approved`
-    # turns into False and the operator verbs report.
-    path = resolve_trust_path(trust_store_path().parent / PACKAGE_APPROVALS_FILENAME)
-    refuse_checkout_resident(path, "Package approvals")
+    path = trust_store_path().parent / PACKAGE_APPROVALS_FILENAME
+    try:
+        target = resolve_write_target(path)
+    except OSError as exc:
+        raise TrustStoreError(
+            f"Cannot resolve {path.name}: {os.strerror(exc.errno) if exc.errno else exc}"
+        ) from exc
+    refuse_checkout_resident(target, "Package approvals")
     return path
 
 
@@ -258,18 +260,14 @@ def _ensure_store_dir(parent: Path) -> None:
     which another account in the group can plant a forged store. A directory
     that already exists is never tightened -- it is the operator's.
     """
-    missing: list[Path] = []
-    probe = parent
-    while not probe.exists():
-        missing.append(probe)
-        if probe.parent == probe:
-            break
-        probe = probe.parent
-    for component in reversed(missing):
-        component.mkdir(mode=0o700, exist_ok=True)
+    # Walked as the kernel would; only the plain tail of directories that do
+    # not exist yet is created, each at 0o700 (restrictive AT CREATION),
+    # relative to the last directory the walk reached. Never treated as absent
+    # and created when the path cannot be resolved for another reason.
+    for created in make_store_dirs(parent):
         with contextlib.suppress(OSError):
             # Only for a umask that stripped owner bits; never loosens.
-            os.chmod(component, 0o700)
+            os.chmod(created, 0o700)
 
 
 def _write_store(path: Path, records: list[PackageApproval]) -> None:

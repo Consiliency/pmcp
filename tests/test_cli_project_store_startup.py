@@ -25,11 +25,11 @@ pytestmark = pytest.mark.skipif(
     os.name != "posix", reason="symlinks, fifos and sockets: POSIX"
 )
 
-REFUSAL = "refusing to write .env.pmcp: it is a symlink that leaves the project"
+# Round 8 (owner's ruling): every project-store symlink is refused with one
+# message; the board falsifiers' original constant named "leaves the project".
+REFUSAL = "refusing to write .env.pmcp: it is a symlink"
 NOT_REGULAR = "refusing to write .env.pmcp: it is not a regular file"
-LOAD_REFUSAL = (
-    "pmcp: refusing to load .env.pmcp: it is a symlink that leaves the project"
-)
+LOAD_REFUSAL = "pmcp: refusing to load .env.pmcp: it is a symlink"
 LOAD_NOT_REGULAR = "pmcp: refusing to load .env.pmcp: it is not a regular file"
 PROBE = "R4_STARTUP_PROBE"
 
@@ -165,30 +165,29 @@ def test_a_readable_file_outside_is_not_loaded_into_the_environment(
     assert LOAD_REFUSAL in proc.stderr
 
 
-@pytest.mark.parametrize(
-    "shape",
-    ["a regular store", "a relative link inside", "a dangling link inside"],
-)
-def test_a_store_inside_the_project_still_loads_at_startup(
+def test_a_regular_store_still_loads_at_startup(layout: dict[str, Path]) -> None:
+    """Positive control: a plain project store loads as before."""
+    (layout["project"] / ".env.pmcp").write_text(f"{PROBE}=inside\n", encoding="utf-8")
+    proc = _run(layout, SET, code=_PROBE_MAIN)
+    assert _json(proc) == {"probe": "inside"}
+    assert "refusing" not in proc.stderr
+
+
+@pytest.mark.parametrize("shape", ["a relative link inside", "a dangling link inside"])
+def test_a_link_inside_the_project_is_not_loaded_at_startup_either(
     shape: str, layout: dict[str, Path]
 ) -> None:
-    """Positive control: the refusal is the link's direction, not loading itself."""
+    """Round 8 (owner's ruling): no project-store symlink is followed at all."""
     project = layout["project"]
-    if shape == "a regular store":
-        (project / ".env.pmcp").write_text(f"{PROBE}=inside\n", encoding="utf-8")
-        expected: str | None = "inside"
-    elif shape == "a relative link inside":
-        (project / "conf").mkdir()
+    (project / "conf").mkdir()
+    if shape == "a relative link inside":
         (project / "conf" / "s.env").write_text(f"{PROBE}=inside\n", encoding="utf-8")
         os.symlink("conf/s.env", project / ".env.pmcp")
-        expected = "inside"
     else:
         os.symlink("conf/not-yet.env", project / ".env.pmcp")
-        (project / "conf").mkdir()
-        expected = None
     proc = _run(layout, SET, code=_PROBE_MAIN)
-    assert _json(proc) == {"probe": expected}
-    assert "refusing" not in proc.stderr
+    assert _json(proc) == {"probe": None}
+    assert LOAD_REFUSAL in proc.stderr
 
 
 # --------------------------------------------------------------------------- #
@@ -222,6 +221,9 @@ NON_REGULAR: dict[str, Callable[[dict[str, Path]], None]] = {
     "a link to a fifo": _link_to_fifo,
     "a link to a socket": _link_to_socket,
 }
+#: A LINK to a non-regular file is refused as a symlink before its target is
+#: ever looked at; the store itself is "not a regular file".
+_IS_LINK = {"a link to a fifo", "a link to a socket"}
 
 
 @pytest.mark.parametrize("command", [SET, SYNC], ids=["secrets set", "secrets sync"])
@@ -232,8 +234,9 @@ def test_a_non_regular_store_is_refused_without_hanging(
     NON_REGULAR[shape](layout)
     proc = _run(layout, command)
     out = _json(proc)
-    assert out["ok"] is False and out["error"] == NOT_REGULAR
-    assert LOAD_NOT_REGULAR in proc.stderr
+    linked = shape in _IS_LINK
+    assert out["ok"] is False and out["error"] == (REFUSAL if linked else NOT_REGULAR)
+    assert (LOAD_REFUSAL if linked else LOAD_NOT_REGULAR) in proc.stderr
     _value_free(layout, proc)
 
 
@@ -243,7 +246,7 @@ def test_auth_connect_does_not_hang_on_a_non_regular_store(
 ) -> None:
     NON_REGULAR[shape](layout)
     proc = _run(layout, AUTH)
-    assert LOAD_NOT_REGULAR in proc.stderr
+    assert (LOAD_REFUSAL if shape in _IS_LINK else LOAD_NOT_REGULAR) in proc.stderr
     assert str(layout["base"]) not in proc.stdout + proc.stderr
 
 
@@ -339,43 +342,29 @@ def _run_in(
         pytest.fail(f"`pmcp {' '.join(args)}` hung")
 
 
-def test_a_subdirectory_link_to_the_project_store_loads_from_the_subdirectory(
+def test_a_subdirectory_link_to_the_project_store_is_not_followed(
     layout: dict[str, Path],
 ) -> None:
+    """Round 8: even a link to the project's own store is a link, so it is skipped."""
     project = layout["project"]
     (project / ".env.pmcp").write_text(f"{PROBE}=root\n", encoding="utf-8")
     sub = project / "packages" / "app"
     sub.mkdir(parents=True)
     os.symlink("../../.env.pmcp", sub / ".env.pmcp")
     proc = _run_in(layout, sub, SET, code=_PROBE_MAIN)
-    assert _json(proc) == {"probe": "root"}
-    assert "refusing" not in proc.stderr
-
-
-def test_a_subdirectory_link_out_of_the_project_is_still_refused(
-    layout: dict[str, Path],
-) -> None:
-    sub = layout["project"] / "packages" / "app"
-    sub.mkdir(parents=True)
-    os.symlink("../../../outside/victim", sub / ".env.pmcp")
-    proc = _run_in(layout, sub, SET, code=_PROBE_MAIN)
     assert _json(proc) == {"probe": None}
     assert LOAD_REFUSAL in proc.stderr
 
 
-def test_outside_any_project_the_load_is_confined_to_the_current_directory_and_says_so(
+def test_a_link_outside_any_project_is_skipped_the_same_way(
     layout: dict[str, Path],
 ) -> None:
-    """No project root: confined to the cwd, and the refusal names the cwd."""
     loose = layout["base"] / "loose"
     loose.mkdir()
     os.symlink("../outside/victim", loose / ".env.pmcp")
     proc = _run_in(layout, loose, SET, code=_PROBE_MAIN)
     assert _json(proc) == {"probe": None}
-    assert (
-        "pmcp: refusing to load .env.pmcp: it is a symlink that leaves the "
-        "current directory"
-    ) in proc.stderr
+    assert LOAD_REFUSAL in proc.stderr
 
 
 # --------------------------------------------------------------------------- #
@@ -390,7 +379,7 @@ def test_secrets_check_does_not_hang_on_a_non_regular_store(
 ) -> None:
     NON_REGULAR[shape](layout)
     proc = _run_in(layout, layout["project"], ["secrets", "check"])
-    assert LOAD_NOT_REGULAR in proc.stderr
+    assert (LOAD_REFUSAL if shape in _IS_LINK else LOAD_NOT_REGULAR) in proc.stderr
     assert "Traceback" not in proc.stderr
 
 

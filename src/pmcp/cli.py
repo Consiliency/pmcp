@@ -33,7 +33,6 @@ from pmcp.cli_commands.secrets import (
     run_secrets_sync,
 )
 from pmcp.config.loader import (
-    find_project_root,
     get_startup_policy,
     load_configs,
     set_startup_policy,
@@ -3125,13 +3124,12 @@ def _load_project_store_at_startup(path: Path) -> None:
     BEFORE any subcommand -- including ``pmcp secrets set``/``sync`` and
     ``pmcp auth connect``, which rewrite or report on that store -- so it must
     not follow a link those commands would refuse, nor block on a fifo. It reads
-    through :func:`pmcp.atomic_write.read_confined` (the write's own walk,
-    confined to the project root ``--scope project`` uses, or to the current
-    directory where no project root is found): a link that leaves it, a non-regular
-    file, an unreadable or non-UTF-8 store are each skipped with one value-free
-    line on stderr, and the command goes on. A regular store, or a link that
-    stays inside, loads exactly as ``load_dotenv(path, override=False)`` did
-    (same parser, interpolation and precedence, from the same bytes).
+    through :func:`pmcp.atomic_write.read_confined` (the write's own walk): a
+    symlinked store of any kind, a non-regular file, an unreadable or non-UTF-8
+    store are each skipped with one value-free line on stderr, and the command
+    goes on. A regular store loads exactly as ``load_dotenv(path,
+    override=False)`` did (same parser, interpolation and precedence, from the
+    same bytes).
 
     Other readers of a project ``.env.pmcp`` -- remote-header auth, the tenant store, the gateway's credential-availability
     check, env stripping, the feedback gate's planted-key check and ``pmcp secrets
@@ -3141,19 +3139,10 @@ def _load_project_store_at_startup(path: Path) -> None:
     """
     if not os.path.lexists(path):
         return
-    # Confined to the SAME project root `--scope project` uses (one root, derived
-    # one way: config.loader.find_project_root, as env_store.resolve_project_root
-    # does), so a subdirectory's `.env.pmcp -> ../.env.pmcp` that stays inside
-    # the project still loads. Where no project root is found, the walk is
-    # confined to the current directory, and the refusal says so.
-    project_root = find_project_root(path.parent)
-    confine_to, label = (
-        (project_root, "project")
-        if project_root is not None and path.is_relative_to(project_root)
-        else (path.parent, "current directory")
-    )
+    # Confined to the store's own directory: a project `.env.pmcp` that is a
+    # symlink of any kind is refused, so no other directory is ever walked.
     try:
-        data = read_confined(path, confine_to, label=label, verb="load")
+        data = read_confined(path, path.parent, verb="load")
         text = data.decode("utf-8") if data is not None else None
     except (OSError, ValueError) as exc:
         print(f"pmcp: {store_refusal(path, exc, verb='load')}", file=sys.stderr)

@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pmcp.atomic_write import atomic_write, resolve_store_path
+from pmcp.atomic_write import atomic_write, make_store_dirs
 
 APPROVED = "approved"
 DENIED = "denied"
@@ -236,40 +236,57 @@ def trust_store_path() -> Path:
     Symlinks are resolved *before* the comparison, which is the only reason a
     planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
-    path = resolve_trust_path(Path.home() / ".config" / "pmcp" / "trust.json")
+    path = (Path.home() / ".config" / "pmcp" / "trust.json").resolve()
     refuse_checkout_resident(path, "Trust store")
     return path
 
 
-def resolve_trust_path(path: Path) -> Path:
-    """Resolve an approval store's path with the writer's own resolver.
+def refuse_checkout_resident(path: Path | str, label: str) -> None:
+    """Raise ``TrustStoreError`` if ``path``'s directory lies inside a judged checkout.
 
-    Never ``Path.resolve()``: it collapses ``missing/../x`` onto ``x`` where the
-    kernel refuses, and the write would then land on an unrelated file
-    (Consiliency/pmcp#366 round 7, codex F003). A path the kernel cannot
-    resolve is a ``TrustStoreError``.
+    By FILE IDENTITY, never path strings (``//x`` and ``/x`` are one directory
+    but compare unequal): walk up from the directory holding ``path`` with
+    ``..``, as the kernel does, comparing each directory's ``(st_dev, st_ino)``
+    with every checkout root's. Shared by every approval store.
     """
-    try:
-        return resolve_store_path(path)
-    except OSError as exc:
-        raise TrustStoreError(
-            f"Cannot resolve {path.name}: {os.strerror(exc.errno) if exc.errno else exc}"
-        ) from exc
-
-
-def refuse_checkout_resident(path: Path, label: str) -> None:
-    """Raise ``TrustStoreError`` if the RESOLVED ``path`` lies inside a judged checkout.
-
-    ``path`` must already be resolved (symlinks followed); the checkouts are
-    ``_checkout_roots``. Shared by every approval store so the rule is stated once.
-    """
+    name = os.path.basename(os.fspath(path))
     for checkout in _checkout_roots():
-        if path.is_relative_to(checkout):
+        if _resides_in(path, checkout):
             raise TrustStoreError(
-                f"{label} {path} resolves inside the checkout at {checkout}. "
+                f"{label} {name} resolves inside the checkout at {checkout}. "
                 "A checkout-resident store lets a repository approve its own "
                 "content; move it under a home directory outside the repository."
             )
+
+
+def _resides_in(path: Path | str, checkout: Path) -> bool:
+    try:
+        root = os.stat(checkout)
+    except OSError:
+        return False
+    current = os.path.dirname(os.fspath(path)) or os.curdir
+    while True:
+        try:
+            here = os.stat(current)
+        except FileNotFoundError:
+            # A directory not created yet: judge the one that will hold it.
+            parent = os.path.dirname(current)
+            if parent == current:
+                return False
+            current = parent
+            continue
+        except OSError:
+            return False
+        if (here.st_dev, here.st_ino) == (root.st_dev, root.st_ino):
+            return True
+        above = os.path.join(current, os.pardir)
+        try:
+            up = os.stat(above)
+        except OSError:
+            return False
+        if (up.st_dev, up.st_ino) == (here.st_dev, here.st_ino):
+            return False  # the filesystem root
+        current = above
 
 
 def _decode(entry: Any) -> TrustRecord:
@@ -386,32 +403,14 @@ def _ensure_store_dir(parent: Path) -> None:
     helper, one decision. As before, never tighten a directory the user already
     had (mirrors ``env_store.write_env_file``).
     """
-    if parent.exists():
-        return
-    # Create every missing component RESTRICTIVE AT CREATION, one at a time.
-    # `mkdir(parents=True, mode=0o700)` is not enough on two counts, both
-    # measured: the intermediates are created with the default mode because
-    # pathlib deliberately ignores `mode` for parents (mimicking `mkdir -p`), so
-    # a freshly created `~/.config` lands 0o775 under umask 002; and creating
-    # loosely and tightening afterwards leaves a window in which another account
-    # in the user's group can insert a forged `trust.json` that a later
-    # `record()` will read and carry forward. `mkdir`'s mode is applied by the
-    # kernel at creation and umask can only remove bits, never add them.
-    missing: list[Path] = []
-    probe = parent
-    while not probe.exists():
-        missing.append(probe)
-        if probe.parent == probe:
-            break
-        probe = probe.parent
-    for component in reversed(missing):
-        component.mkdir(mode=0o700, exist_ok=True)
-        try:
-            # Only for a pathological umask that stripped owner bits from the
-            # mode above; it can never loosen a directory beyond 0o700.
-            os.chmod(component, 0o700)
-        except OSError:
-            pass
+    # Walked as the kernel would; only the plain tail of directories that do
+    # not exist yet is created, each at 0o700 (restrictive AT CREATION),
+    # relative to the last directory the walk reached. Never treated as absent
+    # and created when the path cannot be resolved for another reason.
+    for created in make_store_dirs(parent):
+        with contextlib.suppress(OSError):
+            # Only for a umask that stripped owner bits; never loosens.
+            os.chmod(created, 0o700)
 
 
 @contextlib.contextmanager
@@ -507,7 +506,7 @@ def assert_store_outside_path_checkout(path: Path) -> None:
     store = trust_store_path()
     approved = Path(path).resolve()
     for checkout in _enclosing_checkouts(approved.parent):
-        if store.is_relative_to(checkout):
+        if _resides_in(store, checkout):
             raise TrustStoreError(
                 f"Trust store {store} resolves inside the checkout at {checkout} "
                 f"that contains {approved}. A checkout-resident store lets a "

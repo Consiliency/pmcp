@@ -6,8 +6,8 @@ non-strict ``os.path.realpath`` on the store path before calling the writer. Wit
 (``missing`` does not exist), but realpath collapsed it lexically onto
 ``unrelated.json``, and ``approve_package()`` rewrote that unrelated file -- the
 walker never saw the original path. The class: every function that writes a
-store, and every function that produces a store's path, must leave resolution to
-the single resolver (``atomic_write._walk`` / ``resolve_store_path``).
+store, and every function that produces a store's path, passes the path as
+spelled and leaves its resolution to the kernel, through the writer.
 
 1. An AST inventory finds every caller of the writers and pins it; neither it
    nor any store-path producer it calls may call ``realpath`` (unless
@@ -36,7 +36,6 @@ WRITERS = {"atomic_write", "write_env_file"}
 #: Functions that produce a store's path for a writer (file, qualname).
 PRODUCERS = {
     ("trust_store.py", "trust_store_path"),
-    ("trust_store.py", "resolve_trust_path"),
     ("package_approvals.py", "package_approvals_path"),
     ("env_store.py", "resolve_scope_path"),
     ("env_store.py", "resolve_project_root"),
@@ -47,6 +46,32 @@ PRODUCERS = {
 }
 
 LEXICAL = {"realpath", "resolve", "abspath", "normpath"}
+
+#: Known exceptions, each with its reason and tracking issue.
+EXEMPT = {
+    ("trust_store.py", "trust_store_path"): (
+        "pre-#366 `Path.resolve()` kept by the owner's round-8 ruling; a "
+        "`trust.json` linked through a missing directory is Consiliency/pmcp#374"
+    ),
+    ("trust_store.py", "revoke"): (
+        "resolves the APPROVED file's path -- the record's lookup key, the same "
+        "canonicalisation `record` uses -- never the trust store's own path"
+    ),
+}
+
+
+def _aliases(tree: ast.AST) -> dict[str, str]:
+    """Local names bound by `from x import y as z` to a writer or a resolver."""
+    bound: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in WRITERS | LEXICAL:
+                    bound[alias.asname or alias.name] = alias.name
+    return bound
+
+
+_ALIASES: dict[str, dict[str, str]] = {}
 
 
 def _functions() -> dict[tuple[str, str], ast.AST]:
@@ -64,19 +89,18 @@ def _functions() -> dict[tuple[str, str], ast.AST]:
 
     for source in sorted(SRC.rglob("*.py")):
         rel = source.relative_to(SRC).as_posix()
-        visit(ast.parse(source.read_text(encoding="utf-8")), [], rel)
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        _ALIASES[rel] = _aliases(tree)
+        visit(tree, [], rel)
     return out
 
 
-def _callee(call: ast.Call) -> str | None:
+def _callee(call: ast.Call, rel: str | None = None) -> str | None:
+    """The called name, through `from x import y as z` aliases (N-1, round 8)."""
     f = call.func
-    return (
-        f.id
-        if isinstance(f, ast.Name)
-        else f.attr
-        if isinstance(f, ast.Attribute)
-        else None
-    )
+    if isinstance(f, ast.Name):
+        return _ALIASES.get(rel or "", {}).get(f.id, f.id)
+    return f.attr if isinstance(f, ast.Attribute) else None
 
 
 def _writer_callers() -> set[tuple[str, str]]:
@@ -84,38 +108,58 @@ def _writer_callers() -> set[tuple[str, str]]:
         key
         for key, fn in _functions().items()
         if key[0] != "atomic_write.py"
-        and any(isinstance(n, ast.Call) and _callee(n) in WRITERS for n in ast.walk(fn))
+        and any(
+            isinstance(n, ast.Call) and _callee(n, key[0]) in WRITERS
+            for n in ast.walk(fn)
+        )
     }
 
 
-def _lexical_calls(fn: ast.AST) -> list[str]:
+def _callers_of(targets: set[tuple[str, str]]) -> set[tuple[str, str]]:
+    """Functions that call one of ``targets`` by name (one level up)."""
+    names = {name.split(".")[-1] for _rel, name in targets}
+    return {
+        key
+        for key, fn in _functions().items()
+        if key[0] != "atomic_write.py"
+        and any(
+            isinstance(n, ast.Call) and _callee(n, key[0]) in names
+            for n in ast.walk(fn)
+        )
+    }
+
+
+def _lexical_calls(fn: ast.AST, rel: str | None = None) -> list[str]:
     bad = []
     for n in ast.walk(fn):
-        if isinstance(n, ast.Call) and _callee(n) in LEXICAL:
+        if isinstance(n, ast.Call) and _callee(n, rel) in LEXICAL:
             strict = any(
                 k.arg == "strict"
                 and isinstance(k.value, ast.Constant)
                 and k.value.value is True
                 for k in n.keywords
             )
-            if not (_callee(n) == "realpath" and strict):
-                bad.append(f"{_callee(n)} at line {n.lineno}")
+            if not (_callee(n, rel) == "realpath" and strict):
+                bad.append(f"{_callee(n, rel)} at line {n.lineno}")
     return bad
 
 
 def test_no_writer_caller_or_store_path_producer_resolves_lexically() -> None:
     functions = _functions()
-    checked = _writer_callers() | PRODUCERS
+    writers = _writer_callers()
+    # One level up too: a caller that hands a writer caller a path it already
+    # resolved (round 8 N-1) is as bad as resolving it in place.
+    checked = writers | _callers_of(writers) | PRODUCERS
     assert PRODUCERS <= set(functions), PRODUCERS - set(functions)
     offenders = {
         f"{rel}:{name}": bad
         for rel, name in sorted(checked)
-        if (bad := _lexical_calls(functions[(rel, name)]))
+        if (rel, name) not in EXEMPT
+        and (bad := _lexical_calls(functions[(rel, name)], rel))
     }
     assert offenders == {}, (
-        "a store path is resolved outside the writer's resolver -- pass the "
-        "original path, or get the resolved one from atomic_write."
-        f"resolve_store_path: {offenders}"
+        "a store path is resolved before the writer sees it -- pass the path as "
+        f"spelled and let the writer and the kernel resolve it: {offenders}"
     )
 
 
@@ -132,16 +176,23 @@ def test_every_path_helper_a_writer_caller_uses_is_a_checked_producer() -> None:
 
 
 def test_the_lexical_scan_sees_each_form() -> None:
-    """Positive control."""
+    """Positive control, aliases included (round 8 N-1)."""
     tree = ast.parse(
+        "from os.path import realpath as _rp\n"
+        "from pmcp.atomic_write import atomic_write as _aw\n"
         "def f(p):\n"
         "    os.path.realpath(p)\n"
         "    p.resolve()\n"
         "    os.path.abspath(p)\n"
         "    os.path.normpath(p)\n"
         "    os.path.realpath(p, strict=True)\n"
+        "    _rp(p)\n"
+        "    _aw(p, b'', confine_to=None)\n"
     )
-    assert len(_lexical_calls(tree)) == 4
+    _ALIASES["<control>"] = _aliases(tree)
+    assert len(_lexical_calls(tree, "<control>")) == 5
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    assert sum(_callee(n, "<control>") == "atomic_write" for n in calls) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -151,11 +202,11 @@ def test_the_lexical_scan_sees_each_form() -> None:
 UNRELATED = b"UNRELATED=keep\n"
 
 
-def _plant(link: Path) -> Path:
+def _plant(link: Path, content: bytes = UNRELATED) -> Path:
     """`link -> missing/../unrelated.x`; return the unrelated file."""
     link.parent.mkdir(parents=True, exist_ok=True)
     unrelated = link.parent / "unrelated.x"
-    unrelated.write_bytes(UNRELATED)
+    unrelated.write_bytes(content)
     os.symlink("missing/../unrelated.x", link)
     # The kernel's own reading: `missing` does not exist, so the link names
     # nothing (while a lexical collapse would name the unrelated file).
@@ -208,7 +259,10 @@ def _drive_secrets_sync(home: Path, project: Path) -> Path:
 def _drive_trust_store(home: Path, project: Path) -> Path:
     from pmcp import trust_store
 
-    unrelated = _plant(home / ".config" / "pmcp" / "trust.json")
+    # A VALID empty store, so a lexical collapse reaches the write (#374).
+    unrelated = _plant(
+        home / ".config" / "pmcp" / "trust.json", b'{"version": 1, "records": []}\n'
+    )
     approved = home / "approved.json"
     approved.write_bytes(b"{}")
     with pytest.raises((OSError, trust_store.TrustStoreError)):
@@ -276,7 +330,22 @@ def test_every_writer_caller_has_a_missing_dotdot_driver() -> None:
     assert set(DRIVERS) == _writer_callers()
 
 
-@pytest.mark.parametrize("caller", sorted(DRIVERS), ids=lambda k: f"{k[0]}:{k[1]}")
+#: Writer callers whose `missing/../x` behaviour is a tracked known issue.
+KNOWN_ISSUES = {
+    ("trust_store.py", "_write_store"): "Consiliency/pmcp#374",
+}
+
+
+@pytest.mark.parametrize(
+    "caller",
+    [
+        pytest.param(k, marks=pytest.mark.xfail(strict=True, reason=KNOWN_ISSUES[k]))
+        if k in KNOWN_ISSUES
+        else k
+        for k in sorted(DRIVERS)
+    ],
+    ids=lambda k: f"{k[0]}:{k[1]}",
+)
 def test_a_missing_dotdot_link_never_lands_on_the_unrelated_file(
     caller: tuple[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -288,4 +357,80 @@ def test_a_missing_dotdot_link_never_lands_on_the_unrelated_file(
     monkeypatch.setenv("XDG_CACHE_HOME", str(home / ".cache"))
     monkeypatch.chdir(base)
     unrelated = DRIVERS[caller](home, project)
-    assert unrelated.read_bytes() == UNRELATED
+    planted = (
+        b'{"version": 1, "records": []}\n'
+        if caller == ("trust_store.py", "_write_store")
+        else UNRELATED
+    )
+    assert unrelated.read_bytes() == planted
+
+
+# --------------------------------------------------------------------------- #
+# Round 8 (codex F001): trust and residency decisions compare FILE IDENTITY.
+# `//x` and `/x` are one directory but unequal strings, which let a `//`-spelled
+# link past a string containment check. No string containment in these modules.
+# --------------------------------------------------------------------------- #
+
+IDENTITY_MODULES = (
+    "trust_store.py",
+    "package_approvals.py",
+    "env_store.py",
+    "atomic_write.py",
+    "project_consent.py",
+    "policy/policy.py",
+)
+STRING_CONTAINMENT = {"is_relative_to", "commonpath", "commonprefix", "startswith"}
+
+
+def _string_containment(tree: ast.AST) -> list[str]:
+    found = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            if n.func.attr in STRING_CONTAINMENT:
+                found.append(f"{n.func.attr} at line {n.lineno}")
+    return found
+
+
+def test_trust_and_residency_modules_compare_identity_not_strings() -> None:
+    offenders = {}
+    for rel in IDENTITY_MODULES:
+        source = SRC / rel
+        if not source.exists():
+            continue
+        bad = _string_containment(ast.parse(source.read_text(encoding="utf-8")))
+        if bad:
+            offenders[rel] = bad
+    assert offenders == {}, (
+        "a trust or residency decision compares path strings; compare "
+        f"(st_dev, st_ino) instead: {offenders}"
+    )
+
+
+def test_the_containment_scan_sees_each_form() -> None:
+    tree = ast.parse(
+        "p.is_relative_to(q)\nos.path.commonpath([a, b])\nstr(p).startswith(r)\n"
+    )
+    assert len(_string_containment(tree)) == 3
+
+
+@pytest.mark.parametrize("spelling", ["/", "//"], ids=["single-slash", "double-slash"])
+def test_a_package_approvals_link_into_the_checkout_is_refused_however_spelled(
+    spelling: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import package_approvals
+    from pmcp.trust_store import TrustStoreError
+
+    base = Path(os.path.realpath(tmp_path))
+    checkout = base / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    planted = checkout / "approvals.json"
+    planted.write_text('{"version": 1, "records": []}\n', encoding="utf-8")
+    home = base / "home"
+    store = home / ".config" / "pmcp" / "package_approvals.json"
+    store.parent.mkdir(parents=True)
+    os.symlink(spelling + str(planted).lstrip("/"), store)
+    assert os.path.samefile(store, planted)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(checkout)
+    with pytest.raises(TrustStoreError, match="inside the checkout"):
+        package_approvals.package_approvals_path()

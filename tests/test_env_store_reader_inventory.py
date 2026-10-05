@@ -244,7 +244,7 @@ def test_every_link_following_reader_is_documented() -> None:
         ),
         "MIGRATING What changed": _between(
             guide,
-            "### A project `.env.pmcp` that is a symlink leaving the project is refused",
+            "### A symlinked project `.env.pmcp` is refused",
             "**What to do.**",
         ),
         "MIGRATING Known issues": _between(

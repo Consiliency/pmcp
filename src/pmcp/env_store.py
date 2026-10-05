@@ -12,7 +12,7 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-from pmcp.atomic_write import atomic_write, read_confined
+from pmcp.atomic_write import atomic_write, make_store_dirs, read_confined
 from pmcp.config.loader import find_project_root
 
 ENV_VAR_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -28,14 +28,15 @@ def validate_env_var_name(name: str) -> str:
 def resolve_project_root(project: Path | None = None) -> Path:
     """Resolve project root for project-scope secrets."""
     if project:
-        # Strict: links resolved before any `..`, as the kernel does. A
-        # `--project` directory that does not exist yet is kept as given
-        # (absolute, never normalised) -- non-strict resolve() would collapse
-        # `missing/../x` onto `x`, which the kernel refuses (round 7, codex F003).
-        try:
-            return Path(os.path.realpath(project, strict=True))
-        except FileNotFoundError:
-            return project if project.is_absolute() else Path.cwd() / project
+        # Never realpath, strict or not (strict collapses `file/..` on 3.12,
+        # non-strict `missing/..`): the root is kept as the operator spelled it,
+        # absolute, and the kernel resolves it at every use. One that does not
+        # exist yet is allowed only as a plain tail of names (created later by
+        # make_store_dirs); any other failure -- `missing/../x`, `file/../x`, a
+        # loop, no permission -- raises: a refusal, never "absent".
+        root = project if project.is_absolute() else Path.cwd() / project
+        _require_plain_missing_tail(root)
+        return root
 
     discovered = find_project_root(Path.cwd())
     if discovered:
@@ -43,6 +44,22 @@ def resolve_project_root(project: Path | None = None) -> Path:
 
     # os.getcwd() is already the kernel's physical path; nothing to resolve.
     return Path.cwd()
+
+
+def _require_plain_missing_tail(directory: Path) -> None:
+    """Raise unless ``directory`` exists as a directory or only a plain tail is missing."""
+    current = os.fspath(directory)
+    while True:
+        try:
+            st = os.stat(current)
+        except FileNotFoundError:
+            if os.path.basename(current) in ("", os.curdir, os.pardir):
+                raise
+            current = os.path.dirname(current)
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, "Not a directory", current)
+        return
 
 
 def resolve_scope_path(scope: str, project: Path | None = None) -> Path:
@@ -98,9 +115,9 @@ def read_store_for_update(
     The user store is the operator's and is read as :func:`read_env_file` reads
     it. The project store is repository-controlled, so it is read through the
     same confined walk its write takes (:func:`pmcp.atomic_write.read_confined`):
-    a link that leaves the project is refused BEFORE anything is opened, with
-    the write's value-free refusal, and a target that is not a regular file (a
-    fifo, a device, ``/proc/self/fd/0``) is refused instead of hanging the read.
+    a symlinked store (or one below a symlinked directory) is refused BEFORE
+    anything is opened, with the write's value-free refusal, and a store that is
+    not a regular file (a fifo, a device) is refused instead of hanging the read.
 
     This covers the commands that rewrite the store -- ``pmcp secrets set``,
     ``pmcp secrets sync`` and ``gateway.auth_connect`` -- so they never read
@@ -202,6 +219,11 @@ def _format_env_value(value: str) -> str:
     return f'"{escaped}"'
 
 
+def scope_store_name(scope: str) -> str:
+    """The store's file name for ``scope``, without resolving any path."""
+    return {"user": "pmcp.env", "project": ".env.pmcp"}.get(scope, "pmcp.env")
+
+
 def scope_confinement(scope: str, store_path: Path) -> Path | None:
     """The root a credential write to ``store_path`` must stay inside, or ``None``.
 
@@ -275,10 +297,9 @@ def write_env_file(
     creates its target; a link loop is refused (:func:`pmcp.atomic_write.atomic_write`).
 
     ``confine_to`` is required and comes from :func:`scope_confinement`: the
-    project root for the project store, whose link may only be followed while it
-    stays inside the project (a link out is refused with
-    ``ConfinedWriteError``, never written through and never replaced), and
-    ``None`` for the user store.
+    project root for the project store, which pmcp never reads or writes through
+    a symlink (one is refused with ``ConfinedWriteError``, never written through
+    and never replaced), and ``None`` for the user store.
     """
     _validate_env_values(values)
 
@@ -290,12 +311,12 @@ def write_env_file(
     # Tighten only directories PMCP itself creates (e.g. ~/.config/pmcp for
     # user-scope secrets) to 0700. Never chmod a pre-existing directory such as
     # a project root, which for project-scope secrets is path.parent.
-    parent = path.parent
-    parent_created = not parent.exists()
-    parent.mkdir(parents=True, exist_ok=True)
-    if parent_created:
+    # Only the plain tail of directories that do not exist yet is created
+    # (make_store_dirs walks the path as the kernel would): `mkdir(parents=True)`
+    # on an unresolvable `missing/../x` would create `missing` and land on `x`.
+    for created in make_store_dirs(path.parent):
         try:
-            os.chmod(parent, 0o700)
+            os.chmod(created, 0o700)  # a umask that stripped owner bits
         except OSError:
             pass
 

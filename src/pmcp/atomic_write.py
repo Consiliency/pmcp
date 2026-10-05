@@ -3,136 +3,74 @@
 Every PMCP-owned file that is rewritten whole -- the credential stores
 (``pmcp.env``, ``.env.pmcp``), the trust store, package approvals, the registry
 cache, and the client config ``pmcp setup --write`` emits -- goes through
-:func:`atomic_write`. The write is atomic: the bytes go to a temporary file in
-the destination's directory, are ``fsync``-ed, and are ``os.replace``-d over
-the destination, so a write that fails partway leaves the old file byte-intact
-(Consiliency/pmcp#248).
+:func:`atomic_write`. The bytes go to a temporary file in the destination's
+directory, are ``fsync``-ed, and are ``os.replace``-d over the destination, so
+a write that fails partway leaves the old file byte-intact (Consiliency/pmcp#248).
 
-**A symlinked destination is written through, not replaced.** Users keep these
-files in a dotfiles repository and symlink them into place. ``os.replace`` over
-the *link* would swap the link for a regular file, after which the dotfiles copy
-is never updated again and the two drift apart silently -- the regression the
-#248 atomic write introduced against 2.7.3, whose plain ``open(path, "w")``
-followed the link. So the destination is resolved first (following a chain of
-links and relative links), the temporary is created in the **target's**
-directory (``os.replace`` is only atomic within one filesystem), and the replace
-lands on the **target**. The link itself is never touched.
+The module does NOT reimplement the kernel's path resolution. Two rules, each
+small enough to leave every hard case to the kernel:
 
-**A path a repository controls is confined to that repository.** Following a
-link is only safe when the operator made the link. ``<project>/.env.pmcp`` lives
-inside a checkout, and a cloned repository can ship it as a symlink to
-``../.bashrc`` or to any path the user can write; following it would let the
-repository choose where PMCP writes the user's secrets. Every caller therefore
-states ``confine_to`` -- keyword-only with no default, so a new call site has to
-decide -- and a confined write is refused (``ConfinedWriteError``) when the path,
-or ANY step of its link chain, leaves ``confine_to``: a link out, an absolute
-link out, a dangling link out, and a chain that leaves and comes back. It is
-refused rather than replaced: silently replacing the link would destroy the
-operator's link and hide the problem. A link that stays inside is followed.
+**Operator-owned files (``confine_to=None``): follow the final link chain by
+pathname.** Users keep ``~/.config/pmcp/pmcp.env`` and friends in a dotfiles
+repository and symlink them into place; replacing the link would stop the
+dotfiles copy from receiving updates (the #248 regression against 2.7.3). So
+only the final component's chain is followed: ``lstat`` it; if it is a link,
+``readlink`` and join the text to the link's directory with plain
+``os.path.join`` -- no ``normpath``, no ``realpath`` of any strictness -- and
+loop, up to 40 hops (``ELOOP``). Every syscall gets the user's own spelling, so
+the kernel applies its own rules to ``missing/..``, ``file/..``, ``//``,
+mode-000 and search-only directories. A target that ends in a separator is
+refused (``ENOTDIR``, as the kernel would). The temporary is created in the
+target's directory and renamed over the target; the link is left alone.
 
-**One resolver, the kernel's rules, and the path checked is the path written.**
-A confined write resolves the link chain one component at a time from an
-``O_DIRECTORY`` descriptor of the confinement root, exactly as the kernel does:
-each component is ``lstat``-ed relative to the directory descriptor before it;
-a directory is opened ``O_NOFOLLOW`` relative to that descriptor and pushed; a
-symlink is read with ``readlink`` and its text spliced in -- a relative link
-continues from the link's own directory, an absolute one from the root -- and
-``..`` pops back to the directory the walk actually came from, *after* every
-link before it was resolved. There is no lexical shortcut (no ``normpath``, no
-``abspath``) anywhere on an unresolved path: ``hop/../x`` with ``hop -> a/b``
-is ``a/x``, never ``x``. Link text is split on ``/`` and on ``os.sep`` and
-``os.altsep``, so a git-recorded ``../.bashrc`` is two components everywhere.
-The temporary is then created, ``fsync``-ed and renamed *relative to the same
-directory descriptor the walk ended on* (``dir_fd``): nothing is re-resolved
-between the check and the write. A directory swapped for a symlink after it was
-opened cannot redirect the write (the descriptor is held); one swapped before it
-is opened fails the ``O_NOFOLLOW`` open; a final component swapped for a link is
-replaced as a directory entry -- ``rename`` never follows its destination.
-
-The walk is refused (``ConfinedWriteError``) the moment it would leave the
-root: a ``..`` from the root itself, or an absolute link that does not spell
-the root's real path, component for component, with no ``..`` and no symlinked
-directory on the way. An absolute link that reaches the project through a
-symlinked parent (a ``$WORKTREE_ROOT`` that is itself a link, say) is refused
-too, with a hint to use a relative link. A link out, an absolute link out, a
-dangling link out and a chain that leaves and comes back are all refused rather
-than replaced: silently replacing the link would destroy the operator's link
-and hide the problem.
+**Repository-controlled files (``confine_to=<project root>``): no symlinks at
+all.** ``<project>/.env.pmcp`` ships with a checkout, so a clone could link it
+anywhere the user can write. The walk starts at an ``O_DIRECTORY`` descriptor of
+the root and opens each component ``O_NOFOLLOW`` relative to the previous one;
+every component is ``lstat``-ed and ANY symlink -- intermediate or final, out of
+the project or inside it -- is refused, as is any ``.``, ``..`` or empty
+component (pmcp builds these paths itself). The final component must be a
+regular file or absent. The temporary is created, ``fsync``-ed and renamed
+relative to the directory descriptor the walk ended on, so the path checked is
+the path written. Kernel behaviour relied on: ``O_NOFOLLOW``, ``fstat`` type
+bits and ``renameat`` at a directory descriptor. Where ``dir_fd`` is
+unavailable (Windows) the same rules run over pathnames, also refusing a reparse
+point. Refusals are ``ConfinedWriteError`` with a value-free message naming
+only the file.
 
 **What is guaranteed, and against whom.** The guarantees are about what a
-repository SHIPS: links, directories and file types present in the checkout
-before the command runs. Against those, nothing is read or written outside the
-root, and no fifo or device is read. A process already running as the user and
-writing into the store's directory WHILE the command runs is out of scope: it
-can write the user's files directly. The swap checks below -- the read's
-identity check and the rename-time check of the temporary's name -- narrow
-that window as a best effort; they do not close it. In particular POSIX has no
-rename-by-descriptor, so a temporary's NAME swapped between its last check and
-the ``rename`` is moved into place (the store can end as whatever was swapped
-in -- a link, say -- and the submitted value is lost); even then nothing is
-written outside the root. The root itself is opened by its path (its ancestors
-are not the repository's).
+repository SHIPS: links, directories and file types present before the command
+runs. A process already running as the user and rewriting these directories
+WHILE a command runs is out of scope -- it can write the user's files directly.
+Against it the read's identity check (the descriptor must be the file its
+``lstat`` saw) and the rename-time check of the temporary's name narrow the
+window as a best effort; neither closes it (POSIX has no rename-by-descriptor).
+For operator-owned files the pathname chain is re-resolved by the kernel at
+each step, the same residual.
 
-**Where traversal cannot be protected, a confined write fails closed.** Without
-``dir_fd`` support (Windows) the same walk runs over pathnames, and for a
-confined write it refuses every link or reparse point on the way: a path under
-the root is accepted only when every component is a real directory and the
-final one is not a link, and a read must then open exactly the file it checked
-(``st_dev``/``st_ino``). Nothing is resolved by pathname and then written
-through a link.
-
-**Unconfined (operator-owned) writes use the same walk, unconfined.** The
-operator's own links are followed anywhere, but in the kernel's order: a
-``hop/../x`` whose ``hop`` is missing, a regular file or a loop is refused as
-the kernel refuses it, never collapsed lexically onto ``x`` (which non-strict
-``os.path.realpath`` does). On POSIX the unconfined write also happens in the
-directory descriptor the walk ended on.
-
-Two shapes are decided here rather than left to fall out:
-
-* **A dangling link creates its target**, at the requested mode. That is what
-  2.7.3 did, it is the ordinary dotfiles shape (a committed link to a
-  git-ignored secrets file that does not exist yet on a fresh machine), and it
-  agrees with the read side, which treats a store whose link target is gone as
-  *not there* (``env_store._read_env_file_strict``). Only the target FILE is
-  created: if the target's *directory* does not exist the write is refused with
-  ``FileNotFoundError``.
-* **A symlink loop is refused** with ``ELOOP``. On Python 3.10-3.12
-  ``os.path.realpath`` does not raise on a loop; it returns a path that is still
-  a link, and replacing that would silently break the loop.
-
-The temporary is a hidden ``.pmcp-*`` / ``*.tmp`` name and is removed on every
-exception. A process killed outright (SIGKILL, power loss) between the write and
-the rename can still leave it behind, in the TARGET's directory -- for a
-dotfiles user that may be a git checkout, where it holds the full file content.
-
-Callers keep their own directory-creation policy (each tightens only the
-directories PMCP itself creates); a link's own directory necessarily exists.
-The one deliberate exception is ``config.loader._atomic_write_json``: it writes
-a project ``.mcp.json`` to a key pinned by an ``O_NOFOLLOW`` open, refuses a
-symlinked ``.mcp.json`` outright (``symlinked_config``), and must not re-resolve
-the path, so it does not use this helper.
+**A dangling link creates its target**, at the requested mode, when the
+target's directory exists (2.7.3 did; the fresh-machine dotfiles shape); it
+never creates a missing target DIRECTORY (callers that create directories --
+:func:`make_store_dirs` -- create only a plain tail of names that do not exist
+yet). The temporary is a hidden ``.pmcp-*`` / ``*.tmp`` name, removed on every
+exception; a process killed outright between the write and the rename can leave
+it behind in the target's directory.
 """
 
 from __future__ import annotations
 
 import errno
 import os
-import re
 import secrets
 import stat
 import tempfile
-from collections import deque
-from dataclasses import dataclass, field
 from pathlib import Path, PurePath
-from typing import Any
 
 #: Same bound the kernel applies to one path resolution (Linux MAXSYMLINKS).
 _MAX_LINK_HOPS = 40
 
 #: FILE_ATTRIBUTE_REPARSE_POINT: a Windows symlink, junction or mount point.
 _REPARSE_POINT = 0x400
-
 
 #: The refusal's opening words, by what the caller was doing to the file. Spelled
 #: out as literals rather than interpolating the verb, so every message the
@@ -151,188 +89,105 @@ def refusing(verb: str) -> str:
 
 
 class ConfinedWriteError(PermissionError):
-    """A confined write whose path, or a step of its link chain, leaves the root.
+    """A repository-controlled file pmcp refuses to read or write.
 
-    The message names the file and the root kind only -- never the link target,
-    which a repository chose and which could be anything. Built from the message
-    alone, so ``str()`` is exactly that sentence (no ``[Errno ..]`` prefix) and
-    entry points can hand it to the operator verbatim.
+    The message names the file only -- never a link target, which a repository
+    chose. Built from the message alone, so ``str()`` is exactly that sentence
+    (no ``[Errno ..]`` prefix) and entry points can hand it to the operator;
+    ``errno`` is still ``EACCES``, as for any other permission refusal.
     """
 
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.errno = errno.EACCES
+        self.strerror = message
 
-def resolve_write_target(path: Path) -> Path:
-    """The file an unconfined atomic write of ``path`` replaces: links followed.
+    def __str__(self) -> str:
+        return str(self.strerror)
 
-    Resolved by the SAME kernel-order walk as a confined write (:func:`_walk`),
-    with no confinement: every intermediate component must exist and be a
-    directory (or a link to one) when it is reached, ``..`` applies after the
-    links before it are resolved, and only the final component may be missing
-    (a dangling link creates its target). Never ``os.path.realpath``: non-strict
-    realpath collapses ``hop/../x`` lexically when ``hop`` is missing, a regular
-    file or a loop -- shapes the kernel refuses -- and would overwrite ``x``.
-    Raises ``OSError(ELOOP)`` for a loop, ``FileNotFoundError`` when a directory
-    on the way does not exist, ``NotADirectoryError`` for a non-directory on the
-    way, ``IsADirectoryError`` when the path resolves to a directory.
+
+# --------------------------------------------------------------------------- #
+# Operator-owned files: the final link chain, by pathname.
+# --------------------------------------------------------------------------- #
+
+
+def resolve_write_target(path: Path | str) -> str:
+    """The pathname an unconfined write of ``path`` replaces: its final link chain.
+
+    Only the final component's chain is followed, by ``readlink`` and plain
+    ``os.path.join`` onto the link's own directory -- never normalised -- so the
+    kernel resolves every directory on the way by its own rules. Raises
+    ``OSError(ELOOP)`` after 40 hops, ``NotADirectoryError`` for a target that
+    ends in a separator, ``IsADirectoryError`` for a directory; the target may
+    be absent (a dangling link creates it).
     """
-    walk = _walk(path, confine_to=None, label="", verb="write", backend=_backend())
-    walk.close()
-    return walk.target
+    current = os.fspath(path)
+    for _hop in range(_MAX_LINK_HOPS + 1):
+        if os.path.basename(current) == "":
+            raise NotADirectoryError(errno.ENOTDIR, "Not a directory", current)
+        try:
+            st = os.lstat(current)
+        except FileNotFoundError:
+            return current
+        if stat.S_ISLNK(st.st_mode):
+            text = os.readlink(current)
+            current = os.path.join(os.path.dirname(current), text)
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            raise IsADirectoryError(errno.EISDIR, "Is a directory", current)
+        return current
+    raise OSError(errno.ELOOP, "Too many levels of symbolic links", os.fspath(path))
 
 
-def resolve_store_path(path: Path) -> Path:
-    """Where a store at ``path`` lives, resolved as the kernel would -- for CALLERS.
+def make_store_dirs(directory: Path | str, mode: int = 0o700) -> list[str]:
+    """Create the plain tail of ``directory`` that does not exist yet; nothing else.
 
-    A caller that needs the resolved location (a residency check, a lock file)
-    gets it from the same walk the write uses, never from ``realpath`` or
-    ``Path.resolve()``: both collapse ``missing/../x`` lexically onto ``x`` when
-    ``missing`` does not exist, which the kernel refuses (Consiliency/pmcp#366
-    round 7, codex F003). Directories that do not exist yet are allowed only as
-    a plain tail of names -- no ``..``, no ``.``, no trailing separator -- left
-    after every link on the way was followed: the store's own directory not
-    created yet, which the caller then creates (``mkdir -p``). Anything else
-    the kernel would refuse raises the walk's ``OSError``.
+    The kernel decides: ``stat`` the directory; while it is ABSENT, step to its
+    parent by ``os.path.dirname``, but only across a plain name -- a ``.``,
+    ``..`` or empty component in the missing part is refused (``mkdir -p`` of
+    ``missing/../x`` would create ``missing`` and land on ``x``). Any other
+    ``stat`` failure (``file/..``, a loop, no permission) is raised, never
+    treated as absent. The tail is then created one name at a time, each at
+    ``mode``. Returns the directories created.
     """
-    walk = _walk(
-        path,
-        confine_to=None,
-        label="",
-        verb="write",
-        backend=_backend(),
-        missing_tail_ok=True,
-    )
-    walk.close()
-    return walk.target
+    current = os.fspath(directory)
+    tail: list[str] = []
+    while True:
+        try:
+            st = os.stat(current)
+        except FileNotFoundError:
+            name = os.path.basename(current)
+            if name in ("", os.curdir, os.pardir):
+                raise
+            tail.append(name)
+            current = os.path.dirname(current)
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, "Not a directory", current)
+        break
+    created: list[str] = []
+    for name in reversed(tail):
+        current = os.path.join(current, name)
+        try:
+            os.mkdir(current, mode)
+        except FileExistsError:
+            continue
+        created.append(current)
+    return created
 
 
-def _separators() -> str:
-    seps = {"/", os.sep}
-    if os.altsep:
-        seps.add(os.altsep)
-    return "".join(sorted(seps))
+# --------------------------------------------------------------------------- #
+# Repository-controlled files: no symlink anywhere, walked by descriptor.
+# --------------------------------------------------------------------------- #
 
-
-def split_link_text(text: str) -> list[str]:
-    """Split symlink text into components on EVERY separator the platform reads.
-
-    Git records a link target with ``/``; Windows also reads ``\\``. Splitting on
-    ``os.sep`` alone would leave ``../.bashrc`` one component there, and the
-    ``..`` rule would never see it. Empty components (``a//b``, a leading ``/``)
-    are kept as ``""`` and skipped by the walk, as the kernel skips them.
-    """
-    return re.split("[" + re.escape(_separators()) + "]", text)
-
-
-def _is_absolute_link(text: str) -> bool:
-    return bool(text) and (text[0] in _separators() or PurePath(text).is_absolute())
-
-
-def _strip_root_prefix(rest: list[str], root_parts: list[str]) -> list[str] | None:
-    """``rest`` with the root's real path consumed from its front, or ``None``.
-
-    The prefix must spell the root component for component (``""`` and ``"."``
-    between them are no-ops, ``..`` is not); what follows is returned VERBATIM,
-    trailing ``""``/``"."`` included, so the walk applies the kernel's rule that
-    a path ending in a separator names a directory.
-    """
-    i = 0
-    for want in root_parts:
-        while i < len(rest) and rest[i] in ("", os.curdir):
-            i += 1
-        if i >= len(rest) or rest[i] != want:
-            return None
-        i += 1
-    return rest[i:]
-
-
-def _inside(candidate: str, root: str) -> bool:
-    """Message-only helper: is the real path ``candidate`` at or under ``root``."""
-    return candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep)
-
-
-#: How a directory is opened only to walk THROUGH it. ``O_PATH`` (Linux) needs
-#: search permission on the way, exactly as the kernel's own lookup does, not
-#: read permission on the directory -- so a search-only ancestor (a hardened
-#: ``/home`` at 0711) does not refuse a path the kernel resolves. It changes no
-#: confinement property: ``O_PATH | O_DIRECTORY | O_NOFOLLOW`` on a symlink still
-#: fails (``ENOTDIR``) instead of following it, an ``O_PATH`` descriptor works as
-#: the ``dir_fd`` of every ``*at`` call the walk and the write make (``fstatat``,
-#: ``readlinkat``, ``openat``, ``renameat``, ``unlinkat``), and it grants no
-#: access the user did not have. Elsewhere (macOS, the BSDs) it is ``O_RDONLY``.
+#: Directories are walked through with ``O_PATH`` where it exists (search
+#: permission is all the kernel requires for a lookup; every lookup IN the
+#: directory is still checked by the kernel itself), else ``O_RDONLY``.
 _O_PATH = getattr(os, "O_PATH", 0)
 
 
 def _walk_flags() -> int:
     return (_O_PATH or os.O_RDONLY) | os.O_DIRECTORY
-
-
-class _FdBackend:
-    """Walk by directory descriptors: what is checked is what is written."""
-
-    no_links = False
-
-    def start(self, where: str) -> int:
-        return os.open(where, _walk_flags())
-
-    def lstat(self, at: int, name: str) -> os.stat_result:
-        return os.stat(name, dir_fd=at, follow_symlinks=False)
-
-    def readlink(self, at: int, name: str) -> str:
-        return os.readlink(name, dir_fd=at)
-
-    def enter(self, at: int, name: str) -> int:
-        # O_NOFOLLOW: a directory swapped for a link after its lstat fails here.
-        return os.open(name, _walk_flags() | os.O_NOFOLLOW, dir_fd=at)
-
-    def close(self, at: object) -> None:
-        if isinstance(at, int):
-            try:
-                os.close(at)
-            except OSError:
-                pass
-
-
-class _PathBackend:
-    """Walk by pathnames, where ``dir_fd`` is unavailable (Windows).
-
-    Pathnames are only as good as the moment they were checked, so for a
-    CONFINED walk ``no_links`` is set: any link or reparse point on the way is
-    refused rather than followed, and every directory must be a real one.
-    """
-
-    def __init__(self, *, no_links: bool) -> None:
-        self.no_links = no_links
-
-    def start(self, where: str) -> str:
-        if not stat.S_ISDIR(os.stat(where).st_mode):
-            raise NotADirectoryError(errno.ENOTDIR, "Not a directory", where)
-        return where
-
-    def lstat(self, at: str, name: str) -> os.stat_result:
-        return os.lstat(os.path.join(at, name))
-
-    def readlink(self, at: str, name: str) -> str:
-        return os.readlink(os.path.join(at, name))
-
-    def enter(self, at: str, name: str) -> str:
-        return os.path.join(at, name)
-
-    def close(self, at: object) -> None:
-        return None
-
-
-def _backend(*, confined: bool = False) -> _FdBackend | _PathBackend:
-    """The walk for this platform and mode.
-
-    Confined: descriptors where ``dir_fd`` exists (with ``O_PATH`` where that
-    exists too), else pathnames with every link refused. Unconfined (the
-    operator's own links): descriptors only where ``O_PATH`` lets them walk
-    through search-only directories like the kernel; otherwise pathnames, which
-    need only search permission -- the operator's links need no descriptor
-    protection.
-    """
-    if _DIR_FD_SUPPORTED and (confined or _O_PATH):
-        return _FdBackend()
-    return _PathBackend(no_links=confined)
 
 
 def _is_link(st: os.stat_result) -> bool:
@@ -341,219 +196,118 @@ def _is_link(st: os.stat_result) -> bool:
     )
 
 
-@dataclass
-class _Walk:
-    """The end of a walk: the directory reached and the name to replace in it.
+class _Confined:
+    """The end of a confined walk: the directory reached and the final entry.
 
-    ``at`` is a directory descriptor (``_FdBackend``) or a pathname
-    (``_PathBackend``).
+    ``at`` is a directory descriptor, or a pathname where ``dir_fd`` is
+    unavailable. ``entry`` is the final component's ``lstat`` (``None`` if
+    absent); it is a regular file when present.
     """
 
-    at: Any
-    name: str
-    target: Path
-    backend: Any
-    _held: list[Any] = field(default_factory=list)
+    def __init__(
+        self, at: int | str, name: str, entry: os.stat_result | None, held: list[int]
+    ) -> None:
+        self.at, self.name, self.entry, self._held = at, name, entry, held
 
     @property
     def dir_fd(self) -> int:
-        return int(self.at)
+        assert isinstance(self.at, int)
+        return self.at
 
     def close(self) -> None:
         while self._held:
-            self.backend.close(self._held.pop())
-
-
-def _walk(
-    path: Path,
-    *,
-    confine_to: Path | None,
-    label: str,
-    verb: str,
-    backend: _FdBackend | _PathBackend,
-    missing_tail_ok: bool = False,
-) -> _Walk:
-    """THE resolver: ``path`` resolved one component at a time, as the kernel does.
-
-    Each component is ``lstat``-ed relative to the directory reached so far; a
-    directory is entered; a link's text is read and spliced in -- a relative
-    link continues from the link's own directory, an absolute one from its
-    anchor -- and ``..`` returns to the directory the walk actually came from,
-    AFTER every link before it was resolved. Nothing is resolved lexically.
-    Every intermediate component must exist and be a directory when reached;
-    only the final one may be missing.
-
-    With ``confine_to`` the walk starts at that root and is refused
-    (``ConfinedWriteError``) the moment it would leave it: a ``..`` from the
-    root, or an absolute link that does not spell the root's real path. Without
-    it the walk starts at the path's own anchor (``/``; a drive on Windows) and
-    follows links anywhere, ``/..`` staying at ``/`` as in the kernel.
-
-    The caller owns what the walk holds and must ``close()`` it. Raises
-    ``OSError(ELOOP)`` for a loop, ``IsADirectoryError`` when the path resolves
-    to a directory, ``NotADirectoryError`` for a non-directory on the way, and
-    ``FileNotFoundError`` for a missing directory on the way.
-    """
-    confined = confine_to is not None
-    refusal = ConfinedWriteError(
-        f"{refusing(verb)} {path.name}: it is a symlink that leaves the {label}"
-    )
-    unsafe_link = ConfinedWriteError(
-        f"{refusing(verb)} {path.name}: it is a symlink in the {label}, which "
-        "cannot be followed safely on this platform"
-    )
-    missing_dir_message = (
-        f"Cannot write {path.name}: a directory on its symlink path does not exist"
-        if confined
-        else f"Cannot write {path}: the directory of its symlink target does not "
-        "exist; create it, or point the link somewhere that exists"
-    )
-
-    if confine_to is not None:
-        try:
-            parts = list(PurePath(path).relative_to(PurePath(confine_to)).parts)
-        except ValueError:
-            raise ConfinedWriteError(
-                f"{refusing(verb)} {path.name}: it is outside the {label}"
-            ) from None
-        anchor = os.path.realpath(confine_to, strict=True)
-        root_parts = [p for p in split_link_text(anchor) if p not in ("", os.curdir)]
-        start = os.fspath(confine_to)
-    else:
-        whole = PurePath(path)
-        if not whole.is_absolute():
-            # Joined, never normalised: the walk applies `..` itself.
-            whole = PurePath(os.getcwd()) / whole
-        anchor = whole.anchor
-        parts = list(whole.parts[1:])
-        root_parts = []
-        start = anchor
-
-    held: list[Any] = [backend.start(start)]
-    names: list[str] = []
-    handed_over = False
-    try:
-        pending: deque[str] = deque(parts)
-        hops = 0
-        final: str | None = None
-        while pending:
-            name = pending.popleft()
-            last = not pending
-            final = None
-            if name in ("", os.curdir):
-                continue
-            if name == os.pardir:
-                if len(held) == 1:
-                    if confined:
-                        raise refusal
-                    continue  # `/..` is `/`
-                backend.close(held.pop())
-                names.pop()
-                continue
             try:
-                st = backend.lstat(held[-1], name)
-            except FileNotFoundError:
-                if last:
-                    final = name
-                    break
-                rest = list(pending)
-                if missing_tail_ok and all(
-                    p not in ("", os.curdir, os.pardir) for p in rest
-                ):
-                    # A plain tail of directories not created yet: no link can
-                    # be among them, so there is nothing left to resolve.
-                    names.extend([name, *rest[:-1]])
-                    final = rest[-1]
-                    break
-                raise FileNotFoundError(errno.ENOENT, missing_dir_message) from None
-            if _is_link(st):
-                if backend.no_links:
-                    raise unsafe_link
-                hops += 1
-                if hops > _MAX_LINK_HOPS:
-                    raise OSError(errno.ELOOP, "Symlink loop; refusing to write")
-                text = backend.readlink(held[-1], name)
-                link_parts = split_link_text(text)
-                if _is_absolute_link(text):
-                    # Components after the anchor, kept VERBATIM: a trailing ""
-                    # (text ending in a separator) or "." is what makes the
-                    # component before it have to be a directory -- exactly as
-                    # for a relative link. Filtering them out made `/x/file/`
-                    # resolve to `/x/file`, which the kernel refuses (ENOTDIR).
-                    link_anchor = PurePath(text).anchor or os.sep
-                    rest = split_link_text(text[len(link_anchor) :])
-                    if confined:
-                        remainder = _strip_root_prefix(rest, root_parts)
-                        if remainder is None:
-                            # realpath shapes the MESSAGE only, never the decision.
-                            if _inside(os.path.realpath(text), anchor):
-                                raise ConfinedWriteError(
-                                    f"{refusal}; it is an absolute link spelled "
-                                    "through a symlinked directory, so use a "
-                                    "relative link instead"
-                                )
-                            raise refusal
-                        link_parts = remainder
-                        new_start = start
-                    else:
-                        link_parts = rest
-                        anchor = link_anchor
-                        new_start = link_anchor
-                    while held:
-                        backend.close(held.pop())
-                    names.clear()
-                    held.append(backend.start(new_start))
-                pending.extendleft(reversed(link_parts))
-                continue
-            if stat.S_ISDIR(st.st_mode):
-                if last:
-                    break  # resolves to a directory: final stays None
-                held.append(backend.enter(held[-1], name))
-                names.append(name)
-                continue
-            if last:
-                final = name
-                break
-            raise NotADirectoryError(
-                errno.ENOTDIR, f"Cannot write {path.name}: not a directory"
-            )
-        if final is None:
-            raise IsADirectoryError(errno.EISDIR, f"Cannot write {path.name}")
-        walk = _Walk(
-            at=held[-1],
-            name=final,
-            target=Path(anchor, *names, final),
-            backend=backend,
-            _held=held,
-        )
-        handed_over = True
-        return walk
-    finally:
-        # On any failure what was opened so far is released here; on success
-        # the caller owns it through `_Walk.close()`.
-        if not handed_over:
-            for at in held:
-                backend.close(at)
+                os.close(self._held.pop())
+            except OSError:
+                pass
 
 
 def _walk_confined(
     path: Path, confine_to: Path, label: str, verb: str = "write"
-) -> _Walk:
-    """:func:`_walk` confined to ``confine_to``, on this platform's backend."""
-    return _walk(
-        path,
-        confine_to=confine_to,
-        label=label,
-        verb=verb,
-        backend=_backend(confined=True),
-    )
+) -> _Confined:
+    """Walk ``path`` from ``confine_to``, refusing every symlink on the way.
+
+    See the module docstring. Raises ``ConfinedWriteError`` for a symlink (or
+    reparse point), a ``.``/``..``/empty component, a path outside the root and
+    a final entry that is not a regular file; ``OSError`` for anything the
+    kernel refuses (a missing or non-directory component, no permission).
+    """
+    name_of = os.path.basename(os.fspath(path))
+    try:
+        parts = PurePath(path).relative_to(PurePath(confine_to)).parts
+    except ValueError:
+        raise ConfinedWriteError(
+            f"{refusing(verb)} {name_of}: it is outside the {label}"
+        ) from None
+    if not parts or any(p in ("", os.curdir, os.pardir) for p in parts):
+        raise ConfinedWriteError(
+            f"{refusing(verb)} {name_of}: it is outside the {label}"
+        )
+    is_symlink = ConfinedWriteError(f"{refusing(verb)} {name_of}: it is a symlink")
+    by_fd = _DIR_FD_SUPPORTED
+    held: list[int] = []
+    handed_over = False
+    at: int | str
+    if by_fd:
+        at = os.open(confine_to, _walk_flags())
+        held.append(at)
+    else:
+        at = os.fspath(confine_to)
+    try:
+        *dirs, final = parts
+        for name in dirs:
+            st = (
+                os.stat(name, dir_fd=at, follow_symlinks=False)
+                if isinstance(at, int)
+                else os.lstat(os.path.join(at, name))
+            )
+            if _is_link(st):
+                raise is_symlink
+            if not stat.S_ISDIR(st.st_mode):
+                raise NotADirectoryError(
+                    errno.ENOTDIR, f"Cannot write {name_of}: not a directory"
+                )
+            if isinstance(at, int):
+                # O_NOFOLLOW: a directory swapped for a link after its lstat
+                # fails here instead of being followed.
+                at = os.open(name, _walk_flags() | os.O_NOFOLLOW, dir_fd=at)
+                held.append(at)
+            else:
+                at = os.path.join(at, name)
+        try:
+            entry: os.stat_result | None = (
+                os.stat(final, dir_fd=at, follow_symlinks=False)
+                if isinstance(at, int)
+                else os.lstat(os.path.join(at, final))
+            )
+        except FileNotFoundError:
+            entry = None
+        if entry is not None:
+            if _is_link(entry):
+                raise is_symlink
+            if stat.S_ISDIR(entry.st_mode):
+                raise IsADirectoryError(errno.EISDIR, f"Cannot write {name_of}")
+            if not stat.S_ISREG(entry.st_mode):
+                raise ConfinedWriteError(
+                    f"{refusing(verb)} {name_of}: it is not a regular file"
+                )
+        walk = _Confined(at, final, entry, held)
+        handed_over = True
+        return walk
+    finally:
+        # On failure release what was opened; on success the caller owns it.
+        if not handed_over:
+            for fd in held:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 def resolve_confined_target(path: Path, confine_to: Path, label: str) -> Path:
-    """Where a confined write of ``path`` would land, by the same walk the write uses."""
-    walk = _walk_confined(path, confine_to, label)
-    walk.close()
-    return walk.target
+    """The file a confined write of ``path`` would replace (it IS ``path``)."""
+    _walk_confined(path, confine_to, label).close()
+    return Path(path)
 
 
 def atomic_write(
@@ -566,40 +320,28 @@ def atomic_write(
     prefix: str = ".pmcp-",
     suffix: str = ".tmp",
 ) -> Path:
-    """Atomically replace the file at ``path`` (or its symlink target) with ``data``.
+    """Atomically replace the file at ``path`` (or its link target) with ``data``.
 
-    ``confine_to`` is required: ``None`` for a path the operator owns (under
-    ``~/.config/pmcp``, ``~`` or ``$XDG_*``), whose links are followed anywhere;
-    the repository root for a path a repository controls, whose links are
-    followed only while every step stays inside it (``ConfinedWriteError``
-    otherwise). ``confine_label`` names that root in the refusal.
-
-    The file is created or replaced at ``mode``; the temporary is created at
-    that mode, so the content is never readable at a looser one. The file is
-    ``fsync``-ed before the replace; the directory is ``fsync``-ed after it,
-    best effort (macOS returns ``EINVAL``, some network and overlay mounts
-    ``ENOTSUP``, Windows cannot open a directory) -- the replace has already
-    landed by then. On any failure before the replace the destination is
-    untouched and the temporary is removed.
-
-    Returns the path actually written: the symlink target when ``path`` is a link.
+    ``confine_to`` is required: ``None`` for a file the operator owns (its final
+    link chain is followed), the repository root for a file a repository
+    controls (no symlink anywhere; ``ConfinedWriteError`` otherwise).
+    ``confine_label`` names that root in a refusal. The file is created or
+    replaced at ``mode``, ``fsync``-ed, renamed over the destination, and the
+    directory ``fsync``-ed best effort. Returns the path actually written.
     """
-    backend = _backend(confined=confine_to is not None)
-    walk = _walk(
-        path,
-        confine_to=confine_to,
-        label=confine_label,
-        verb="write",
-        backend=backend,
-    )
+    if confine_to is None:
+        target = resolve_write_target(path)
+        _write_by_path(target, data, mode=mode, prefix=prefix, suffix=suffix)
+        return Path(target)
+    walk = _walk_confined(path, confine_to, confine_label)
     try:
-        if isinstance(backend, _FdBackend):
+        if isinstance(walk.at, int):
             _write_in_dir(
-                walk.dir_fd, walk.name, data, mode=mode, prefix=prefix, suffix=suffix
+                walk.at, walk.name, data, mode=mode, prefix=prefix, suffix=suffix
             )
-        else:  # no dir_fd (Windows): a confined walk refused every link on the way
+        else:
             _write_by_path(
-                Path(os.path.join(walk.at, walk.name)),
+                os.path.join(walk.at, walk.name),
                 data,
                 mode=mode,
                 prefix=prefix,
@@ -607,157 +349,72 @@ def atomic_write(
             )
     finally:
         walk.close()
-    return walk.target
+    return Path(path)
 
 
 def read_confined(
     path: Path, confine_to: Path, label: str = "project", verb: str = "write"
 ) -> bytes | None:
-    """Read ``path`` through the SAME confined walk a write would take, or refuse.
+    """Read a repository-controlled file by the same walk a write takes, or refuse.
 
-    A command that rewrites a repository-controlled store reads it first; that
-    read must not follow a link the write would refuse. So the walk decides
-    first -- a link that leaves ``confine_to`` is refused here, before anything
-    is opened -- and the final component is opened ``O_NOFOLLOW`` relative to
-    the directory the walk ended on, non-blocking, and refused unless it is a
-    REGULAR file (a fifo, ``/dev`` node or socket would hang or misbehave the
-    read). Returns ``None`` when the file does not exist yet (a fresh store, a
-    dangling link that stays inside, or a root directory not created yet).
-    Raises ``ConfinedWriteError`` / ``OSError`` exactly as :func:`atomic_write`
-    would; ``verb`` ("write", "read", "load") names what the caller was doing
-    in the refusal, so a store read only as a SOURCE is not called a write.
+    ``None`` when it does not exist yet (or the root does not). Any symlink, a
+    non-regular file, a file swapped between its ``lstat`` and its open: a
+    ``ConfinedWriteError`` -- nothing is read. ``verb`` names what the caller
+    was doing ("write", "read", "load") in the refusal.
     """
-    not_regular = ConfinedWriteError(
-        f"{refusing(verb)} {path.name}: it is not a regular file"
-    )
     if not os.path.lexists(confine_to):
-        # Nothing to read under a root that does not exist yet: the write
-        # creates it (a fresh `--project` directory). An empty read, not a
-        # refusal.
         return None
     walk = _walk_confined(path, confine_to, label, verb)
-    if not isinstance(walk.backend, _FdBackend):
-        try:
-            return _read_by_path(
-                path, os.path.join(walk.at, walk.name), not_regular, verb
-            )
-        finally:
-            walk.close()
     try:
-        # Refuse a non-regular file from its directory entry BEFORE opening it:
-        # opening a socket fails ENXIO and a device may have side effects. The
-        # fstat after the O_NOFOLLOW open re-checks against a swap in between.
-        try:
-            entry = os.stat(walk.name, dir_fd=walk.dir_fd, follow_symlinks=False)
-        except FileNotFoundError:
+        if walk.entry is None:
             return None
-        if not stat.S_ISREG(entry.st_mode):
-            raise not_regular
+        changed = ConfinedWriteError(
+            f"{refusing(verb)} {walk.name}: it changed while it was being read"
+        )
+        flags = (
+            os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
         try:
-            fd = os.open(
-                walk.name,
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                dir_fd=walk.dir_fd,
+            fd = (
+                os.open(walk.name, flags, dir_fd=walk.at)
+                if isinstance(walk.at, int)
+                else os.open(os.path.join(walk.at, walk.name), flags)
             )
         except FileNotFoundError:
             return None
         except OSError as exc:
-            _raise_if_swapped_to_a_link(exc, path, verb)
+            if exc.errno in (errno.ELOOP, errno.EMLINK):  # swapped for a link
+                raise changed from None
             raise
         with os.fdopen(fd, "rb") as handle:
-            _require_same_regular_file(
-                entry, os.fstat(handle.fileno()), path, verb, not_regular
-            )
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode) or not _same_file(walk.entry, opened):
+                raise changed
             return handle.read()
     finally:
         walk.close()
-
-
-def _read_by_path(
-    path: Path, text: str, not_regular: ConfinedWriteError, verb: str
-) -> bytes | None:
-    """The no-``dir_fd`` read of a confined walk's end (every link already refused)."""
-    try:
-        entry = os.lstat(text)
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISREG(entry.st_mode):
-        raise not_regular
-    # The pathname is not trusted between the lstat and the open: O_NOFOLLOW
-    # where the platform has it, and -- everywhere -- the opened descriptor must
-    # be the very file the lstat saw (same st_dev/st_ino), a regular file. A
-    # swap to a link (or anything else) in between is refused, never read.
-    try:
-        fd = os.open(
-            text,
-            os.O_RDONLY
-            | getattr(os, "O_NONBLOCK", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_BINARY", 0),
-        )
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        _raise_if_swapped_to_a_link(exc, path, verb)
-        raise
-    with os.fdopen(fd, "rb") as handle:
-        _require_same_regular_file(
-            entry, os.fstat(handle.fileno()), path, verb, not_regular
-        )
-        return handle.read()
-
-
-#: What an ``O_NOFOLLOW`` open of a symlink fails with: ``ELOOP`` on Linux and
-#: macOS, ``EMLINK`` on FreeBSD.
-_NOFOLLOW_ON_A_LINK = {errno.ELOOP, errno.EMLINK}
-
-
-def _raise_if_swapped_to_a_link(exc: OSError, path: Path, verb: str) -> None:
-    """The entry was checked as a regular file; a link at open means it changed."""
-    if exc.errno in _NOFOLLOW_ON_A_LINK:
-        raise ConfinedWriteError(
-            f"{refusing(verb)} {path.name}: it changed while it was being read"
-        ) from None
 
 
 def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
     return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
 
 
-def _require_same_regular_file(
-    entry: os.stat_result,
-    opened: os.stat_result,
-    path: Path,
-    verb: str,
-    not_regular: ConfinedWriteError,
-) -> None:
-    """The descriptor must be the regular file the directory entry showed."""
-    if not stat.S_ISREG(opened.st_mode):
-        raise not_regular
-    if not _same_file(entry, opened):
-        raise ConfinedWriteError(
-            f"{refusing(verb)} {path.name}: it changed while it was being read"
-        )
-
-
-# `os.replace` is not listed in `os.supports_dir_fd` even where its dir_fd
-# arguments work: it shares rename(2)/renameat(2) with `os.rename`, which is.
 _DIR_FD_SUPPORTED = (
     os.open in os.supports_dir_fd
     and os.rename in os.supports_dir_fd
     and os.unlink in os.supports_dir_fd
     and os.stat in os.supports_dir_fd
     and os.stat in os.supports_follow_symlinks
-    and os.readlink in os.supports_dir_fd
     and hasattr(os, "O_DIRECTORY")
     and hasattr(os, "O_NOFOLLOW")
 )
 
 
 def _write_by_path(
-    target: Path, data: bytes, *, mode: int, prefix: str, suffix: str
+    target: str, data: bytes, *, mode: int, prefix: str, suffix: str
 ) -> None:
-    parent = target.parent
+    # Strings, never Path: the user's spelling reaches the kernel unnormalised.
+    parent = os.path.dirname(target) or os.curdir
     fd, tmp_name = tempfile.mkstemp(dir=parent, prefix=prefix, suffix=suffix)
     committed = False
     try:
@@ -780,7 +437,7 @@ def _write_by_path(
         current = os.lstat(tmp_name)
         if stat.S_ISLNK(current.st_mode) or not _same_file(current, written):
             raise ConfinedWriteError(
-                f"refusing to write {target.name}: its temporary file changed "
+                f"refusing to write {os.path.basename(target)}: its temporary file changed "
                 "before it could be committed"
             )
         os.replace(tmp_name, target)

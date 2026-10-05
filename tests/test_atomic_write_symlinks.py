@@ -279,13 +279,12 @@ def test_a_dangling_symlink_creates_its_target_at_0600(
     _assert_written_through(link, str(target), target, site)
 
 
-#: The approval stores resolve their path up front (for the residency check) and
-#: then create the store directory 0700 themselves (`_ensure_store_dir`), as the
-#: trust store always has; the helper's own refusal applies to every other site.
-_RESOLVING_STORES = {
-    "trust_store trust.json",
-    "package_approvals package_approvals.json",
-}
+#: The trust store resolves its path up front with `Path.resolve()` (its
+#: pre-#366 form; a link through a missing directory is Consiliency/pmcp#374)
+#: and creates the store directory 0700 itself (`_ensure_store_dir`). Every
+#: other site, package approvals included, follows only the final link chain
+#: and never creates a missing target directory.
+_RESOLVING_STORES = {"trust_store trust.json"}
 _NON_RESOLVING = [s for s in SITES if s.name not in _RESOLVING_STORES]
 _RESOLVING = [s for s in SITES if s.name in _RESOLVING_STORES]
 
@@ -298,7 +297,7 @@ def test_a_dangling_symlink_into_a_missing_directory_is_refused(
     target = dotfiles / "missing-dir" / "file"
     link = _link(site.path(_home()), target)
 
-    with pytest.raises(FileNotFoundError, match="symlink target"):
+    with pytest.raises(FileNotFoundError):
         site.write(link)
 
     assert os.path.islink(link) and os.readlink(link) == str(target)
@@ -326,15 +325,16 @@ def test_a_symlink_loop_is_refused_and_left_intact(site: Site, dotfiles: Path) -
     other = _link(dotfiles / "loop-b", link_path)
     link = _link(link_path, other)
 
-    # The approval stores resolve their path with the writer's own resolver and
-    # report its ELOOP as a TrustStoreError; every other site raises it as is.
-    with pytest.raises((OSError, TrustStoreError)) as info:
+    # trust.json: Path.resolve() raises RuntimeError on a loop before 3.13
+    # (OSError after). package_approvals.json: the residency lookup reports the
+    # chain follower's ELOOP as a TrustStoreError. Every other site: ELOOP.
+    with pytest.raises((OSError, RuntimeError)) as info:
         site.write(link)
 
-    if site.name in _RESOLVING_STORES:
+    if site.name == "package_approvals package_approvals.json":
         assert isinstance(info.value, TrustStoreError)
         assert "Too many levels of symbolic links" in str(info.value)
-    else:
+    elif site.name not in _RESOLVING_STORES:
         assert isinstance(info.value, OSError)
         assert info.value.errno == errno.ELOOP
     assert os.path.islink(link) and os.readlink(link) == str(other)
@@ -685,8 +685,8 @@ def test_the_temp_file_is_created_beside_the_target_not_the_link(
         dirs.append(str(dotfiles.resolve()) if same else "/not-the-target-dir")
         real_in_dir(dir_fd, name, *args, **kwargs)
 
-    def spy_by_path(target: Path, *args: Any, **kwargs: Any) -> None:
-        dirs.append(os.fspath(target.parent))
+    def spy_by_path(target: str, *args: Any, **kwargs: Any) -> None:
+        dirs.append(os.path.dirname(target))
         real_by_path(target, *args, **kwargs)
 
     monkeypatch.setattr(writer, "_write_in_dir", spy_in_dir)

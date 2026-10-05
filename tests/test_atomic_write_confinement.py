@@ -6,10 +6,11 @@ follows its links (a dotfiles repository, see ``test_atomic_write_symlinks``);
 the project store must not follow one out of the project. Every shape that
 leaves -- a relative link out, an absolute link out, a dangling link out, a
 chain that leaves and comes back, a directory component that leaves -- is
-REFUSED: the outside file is untouched and the link is left as it was. A link
-that stays inside is followed. Driven through the three entry points that write
-the project store: ``pmcp secrets set``, ``pmcp secrets sync --to-scope
-project`` and ``gateway.auth_connect`` with ``scope="project"``.
+REFUSED: the outside file is untouched and the link is left as it was. Since
+round 8 a link that stays inside is refused too -- pmcp follows no symlink in a
+project store at all. Driven through the three entry points that write the
+project store: ``pmcp secrets set``, ``pmcp secrets sync --to-scope project``
+and ``gateway.auth_connect`` with ``scope="project"``.
 """
 
 from __future__ import annotations
@@ -120,7 +121,7 @@ def _assert_refused_and_untouched(
     assert stray == []
 
 
-REFUSAL = "refusing to write .env.pmcp: it is a symlink that leaves the project"
+REFUSAL = "refusing to write .env.pmcp: it is a symlink"
 
 
 class Reported(Exception):
@@ -283,21 +284,21 @@ INSIDE: dict[str, Callable[[dict[str, Path]], Path]] = {
 
 @pytest.mark.parametrize("entry", list(ENTRY_POINTS), ids=list(ENTRY_POINTS))
 @pytest.mark.parametrize("shape", list(INSIDE), ids=list(INSIDE))
-async def test_a_project_store_link_that_stays_inside_is_written_through(
+async def test_a_project_store_link_that_stays_inside_is_refused_too(
     shape: str, entry: str, layout: dict[str, Path]
 ) -> None:
+    """Round 8 (owner's ruling): no symlink is followed in a project store."""
     target = INSIDE[shape](layout)
     link = layout["project"] / ".env.pmcp"
     link_text = os.readlink(link)
-    before = _outside_snapshot(layout)
+    before_target = target.read_bytes() if target.exists() else None
 
-    await ENTRY_POINTS[entry](layout)
+    with pytest.raises(Reported) as info:
+        await ENTRY_POINTS[entry](layout)
 
+    assert info.value.message == REFUSAL
     assert os.path.islink(link) and os.readlink(link) == link_text
-    assert target.is_file() and not target.is_symlink()
-    assert read_env_file(target), "the target received no entries"
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
-    assert _outside_snapshot(layout) == before
+    assert (target.read_bytes() if target.exists() else None) == before_target
 
 
 async def test_a_plain_project_store_is_still_written_at_0600(
@@ -346,9 +347,8 @@ def test_a_link_loop_inside_the_project_is_refused(layout: dict[str, Path]) -> N
     os.symlink("b", project / "a")
     os.symlink("a", project / "b")
     os.symlink("a", project / ".env.pmcp")
-    with pytest.raises(OSError) as info:
+    with pytest.raises(ConfinedWriteError, match="it is a symlink"):
         set_env_value("project", "K", "v", project)
-    assert info.value.errno == 40  # ELOOP
     assert os.readlink(project / ".env.pmcp") == "a"
 
 
@@ -414,7 +414,6 @@ def test_a_directory_swapped_for_a_link_after_the_walk_is_not_followed(
     project = layout["project"]
     (project / "sub").mkdir()
     (project / "sub" / "real.env").write_text("", encoding="utf-8")
-    os.symlink("sub/real.env", project / ".env.pmcp")
     before = _outside_snapshot(layout)
 
     def swap() -> None:
@@ -422,7 +421,7 @@ def test_a_directory_swapped_for_a_link_after_the_walk_is_not_followed(
         os.symlink("../outside", project / "sub")
 
     _swap_after_check(monkeypatch, swap)
-    set_env_value("project", "K", "v", project)
+    atomic_write(project / "sub" / "real.env", b"K=v\n", confine_to=project)
 
     assert _outside_snapshot(layout) == before
     assert read_env_file(project / "sub-old" / "real.env") == {"K": "v"}
@@ -450,7 +449,7 @@ def test_a_forced_fallback_refuses_any_link_instead_of_following_a_swap(
         os.unlink(project / ".env.pmcp")
         os.symlink("../outside/victim", project / ".env.pmcp")
 
-    with pytest.raises(ConfinedWriteError, match="cannot be followed safely"):
+    with pytest.raises(ConfinedWriteError, match="it is a symlink"):
         set_env_value("project", "K", "v", project)
 
     assert _outside_snapshot(layout) == before
@@ -501,9 +500,9 @@ def test_a_forced_fallback_still_refuses_any_link_on_a_nested_path(
         (project / "real" / "s.env").write_bytes(b"K=old\n")
         os.symlink("../real/s.env", project / "d0" / ".env.pmcp")
         store = project / "d0" / ".env.pmcp"
-    with pytest.raises(ConfinedWriteError, match="cannot be followed safely"):
+    with pytest.raises(ConfinedWriteError, match="it is a symlink"):
         atomic_write(store, b"K=v\n", confine_to=project)
-    with pytest.raises(ConfinedWriteError, match="cannot be followed safely"):
+    with pytest.raises(ConfinedWriteError, match="it is a symlink"):
         read_confined(store, project)
 
 
@@ -513,20 +512,20 @@ def test_a_final_component_swapped_for_a_link_is_replaced_in_place(
 ) -> None:
     """rename(2) never follows the destination: the planted link is replaced, in-root."""
     project = layout["project"]
-    (project / "real.env").write_text("", encoding="utf-8")
-    os.symlink("real.env", project / ".env.pmcp")
+    store = project / ".env.pmcp"
+    store.write_text("", encoding="utf-8")
     before = _outside_snapshot(layout)
 
     def swap() -> None:
-        os.unlink(project / "real.env")
-        os.symlink(layout["victim"], project / "real.env")
+        os.unlink(store)
+        os.symlink(layout["victim"], store)
 
     _swap_after_check(monkeypatch, swap)
     set_env_value("project", "K", "v", project)
 
     assert _outside_snapshot(layout) == before
-    assert not (project / "real.env").is_symlink()
-    assert read_env_file(project / "real.env") == {"K": "v"}
+    assert not store.is_symlink()
+    assert read_env_file(store) == {"K": "v"}
 
 
 # --------------------------------------------------------------------------- #
@@ -642,49 +641,38 @@ def test_project_env_link_out_of_checkout_is_not_written_through(
 _REPORTING = {k: v for k, v in ENTRY_POINTS.items() if k != "set_env_value"}
 
 
-def _link_to_root(lay: dict[str, Path]) -> None:
-    os.symlink(".", lay["project"] / ".env.pmcp")
-
-
-def _link_to_inner_dir(lay: dict[str, Path]) -> None:
-    (lay["project"] / "sub").mkdir()
-    os.symlink("sub", lay["project"] / ".env.pmcp")
-
-
 def _directory_at_store(lay: dict[str, Path]) -> None:
     (lay["project"] / ".env.pmcp").mkdir()
 
 
-def _loop_inside(lay: dict[str, Path]) -> None:
-    os.symlink("b", lay["project"] / "a")
-    os.symlink("a", lay["project"] / "b")
-    os.symlink("a", lay["project"] / ".env.pmcp")
+def _read_only_project(lay: dict[str, Path]) -> None:
+    os.chmod(lay["project"], 0o500)
 
 
-def _read_only_target_dir(lay: dict[str, Path]) -> None:
-    ro = lay["project"] / "ro"
-    ro.mkdir()
-    os.symlink("ro/x.env", lay["project"] / ".env.pmcp")
-    os.chmod(ro, 0o500)
+def _project_through_a_file(lay: dict[str, Path]) -> None:
+    (lay["base"] / "afile").write_text("", encoding="utf-8")
+    lay["project"] = lay["base"] / "afile" / ".." / "project"
 
 
-def _missing_inner_dir(lay: dict[str, Path]) -> None:
-    os.symlink("nope/x.env", lay["project"] / ".env.pmcp")
+def _project_through_a_missing_dir(lay: dict[str, Path]) -> None:
+    lay["project"] = lay["base"] / "missing" / ".." / "project"
 
 
-def _through_a_file(lay: dict[str, Path]) -> None:
-    (lay["project"] / "afile").write_text("", encoding="utf-8")
-    os.symlink("afile/x.env", lay["project"] / ".env.pmcp")
+def _project_link_loop(lay: dict[str, Path]) -> None:
+    os.symlink("loop-b", lay["base"] / "loop-a")
+    os.symlink("loop-a", lay["base"] / "loop-b")
+    lay["project"] = lay["base"] / "loop-a"
 
 
+#: Shapes the SYSTEM refuses, each with the errno it reports. No symlink at
+#: the store (that is the "it is a symlink" refusal, tested above): the
+#: project path itself, or the store's own type or permissions.
 ERRNO_SHAPES: dict[str, tuple[Callable[[dict[str, Path]], None], int]] = {
-    "link to the project root (.)": (_link_to_root, errno.EISDIR),
-    "link to a directory inside": (_link_to_inner_dir, errno.EISDIR),
     "a directory at the store path": (_directory_at_store, errno.EISDIR),
-    "a link loop inside": (_loop_inside, errno.ELOOP),
-    "a read-only target directory": (_read_only_target_dir, errno.EACCES),
-    "a dangling link into a missing directory": (_missing_inner_dir, errno.ENOENT),
-    "a link through a regular file": (_through_a_file, errno.ENOTDIR),
+    "a read-only project directory": (_read_only_project, errno.EACCES),
+    "a --project through a regular file": (_project_through_a_file, errno.ENOTDIR),
+    "a --project through a missing dir": (_project_through_a_missing_dir, errno.ENOENT),
+    "a --project that is a link loop": (_project_link_loop, errno.ELOOP),
 }
 
 
@@ -696,14 +684,13 @@ async def test_every_os_error_on_the_write_is_a_reported_value_free_refusal(
     plant, expected_errno = ERRNO_SHAPES[shape]
     if expected_errno == errno.EACCES and os.geteuid() == 0:
         pytest.skip("root ignores directory permissions")
+    project = layout["project"]
     plant(layout)
     try:
         with pytest.raises(Reported) as info:
             await _REPORTING[entry](layout)
     finally:
-        for d in layout["project"].iterdir():
-            if d.is_dir() and not d.is_symlink():
-                os.chmod(d, 0o700)
+        os.chmod(project, 0o700)
 
     assert info.value.message == (
         f"refusing to write .env.pmcp: {os.strerror(expected_errno)}"
@@ -741,7 +728,7 @@ async def test_the_confinement_root_cannot_drift_from_the_store_path(
     monkeypatch.chdir(inner)
 
     if entry == "set_env_value":
-        with pytest.raises(ConfinedWriteError):
+        with pytest.raises(ConfinedWriteError, match="it is a symlink"):
             set_env_value("project", "K", "v", None)
     else:
         out = await run_secrets_sync(
@@ -752,39 +739,6 @@ async def test_the_confinement_root_cannot_drift_from_the_store_path(
         assert out["ok"] is False and out["error"] == REFUSAL
 
     assert not (outer / "escape.env").exists()
-
-
-# --------------------------------------------------------------------------- #
-# A legitimate absolute link spelled through a symlinked parent gets a hint.
-# --------------------------------------------------------------------------- #
-
-
-def test_an_absolute_link_through_a_symlinked_parent_is_refused_with_a_hint(
-    tmp_path: Path,
-) -> None:
-    real = tmp_path / "real"
-    project_real = real / "proj"
-    (project_real / ".git").mkdir(parents=True)
-    (project_real / "conf").mkdir()
-    alias = tmp_path / "alias"
-    os.symlink(real, alias)
-    project_alias = alias / "proj"
-    os.symlink(project_alias / "conf" / "b.env", project_real / ".env.pmcp")
-
-    with pytest.raises(ConfinedWriteError) as info:
-        set_env_value("project", "K", "v", project_alias)
-
-    message = str(info.value)
-    assert message.startswith(REFUSAL)
-    assert "use a relative link" in message
-    assert str(tmp_path) not in message
-    assert not (project_real / "conf" / "b.env").exists()
-
-    # The hint's advice works.
-    os.unlink(project_real / ".env.pmcp")
-    os.symlink("conf/b.env", project_real / ".env.pmcp")
-    set_env_value("project", "K", "v", project_alias)
-    assert read_env_file(project_real / "conf" / "b.env") == {"K": "v"}
 
 
 # --------------------------------------------------------------------------- #
@@ -862,10 +816,27 @@ def _link_to_socket(lay: dict[str, Path]) -> None:
     os.symlink("sock", lay["project"] / ".env.pmcp")
 
 
+def _socket_store(lay: dict[str, Path]) -> None:
+    import socket
+
+    here = os.getcwd()
+    os.chdir(lay["project"])
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(".env.pmcp")
+        sock.close()
+    finally:
+        os.chdir(here)
+
+
+#: Non-regular stores, each with the refusal it gets: the store itself is
+#: "not a regular file"; a LINK to one is refused as a symlink before its target
+#: is ever looked at.
 NON_REGULAR = {
-    "a fifo at the store path": _fifo_store,
-    "a link to a fifo inside": _link_to_fifo,
-    "a link to a socket inside": _link_to_socket,
+    "a fifo at the store path": (_fifo_store, "not regular"),
+    "a socket at the store path": (_socket_store, "not regular"),
+    "a link to a fifo inside": (_link_to_fifo, "symlink"),
+    "a link to a socket inside": (_link_to_socket, "symlink"),
 }
 
 
@@ -874,10 +845,11 @@ NON_REGULAR = {
 def test_a_non_regular_store_is_refused_without_hanging(
     shape: str, entry: str, layout: dict[str, Path]
 ) -> None:
-    NON_REGULAR[shape](layout)
+    plant, kind = NON_REGULAR[shape]
+    plant(layout)
     outcome = _guarded(entry, layout)
     assert isinstance(outcome, Reported), outcome
-    assert outcome.message == NOT_REGULAR
+    assert outcome.message == (NOT_REGULAR if kind == "not regular" else REFUSAL)
 
 
 @pytest.mark.skipif(not Path("/proc/self/fd/0").exists(), reason="needs /proc")
@@ -910,7 +882,7 @@ def test_a_sync_from_a_leaving_project_store_is_refused_before_reading_it(
     )
     # N2 (round 4): the project store is only the SOURCE here -- "read".
     assert out["ok"] is False and out["error"] == (
-        "refusing to read .env.pmcp: it is a symlink that leaves the project"
+        "refusing to read .env.pmcp: it is a symlink"
     )
     assert not (Path.home() / ".config" / "pmcp" / "pmcp.env").exists()
 

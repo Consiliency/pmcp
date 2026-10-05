@@ -60,8 +60,8 @@ from pmcp.env_store import (
     record_dotenv_keys,
     read_env_text,
     record_pmcp_introduced_keys,
-    resolve_scope_path,
     sanitized_subprocess_env,
+    scope_store_name,
     set_env_value,
     store_refusal,
 )
@@ -4644,7 +4644,9 @@ class GatewayTools:
             # is reported without its bytes; other ValueErrors are input
             # validation messages and stay as they were.
             message = (
-                store_refusal(resolve_scope_path(parsed.scope, self._project_root), exc)
+                # Named from the scope alone: re-resolving the path here could
+                # raise the very error being reported.
+                store_refusal(Path(scope_store_name(parsed.scope)), exc)
                 if isinstance(exc, (OSError, UnicodeDecodeError))
                 else str(exc)
             )
