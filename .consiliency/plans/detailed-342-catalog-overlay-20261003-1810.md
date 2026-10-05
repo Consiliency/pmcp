@@ -29,6 +29,30 @@
 > - It is still one conceptual change: an overlay can add to discovery, and one entry can
 >   never take the rest down.
 >
+> **Revision 8** (2026-10-05): board round 7 on `717fe38` (Consiliency/pmcp#343). Codex
+> partially agreed with no findings, gemini agreed, grok was degraded, and claude partially
+> agreed with one docs finding (F001). Rev 8 changes only the docs patch; the source,
+> the module and the migrated tests are byte-identical to rev 7. Each verify command was
+> run against the rev-7 tree, with a real gateway for `catalog_search`:
+> - **How to verify** in the new `MIGRATING.md` section no longer greps `gateway.log`,
+>   which keeps earlier runs' lines (append mode, rotating), so its count never returns
+>   to 0 after a fix. It now runs `pmcp config status 2>&1 | grep -c 'Skipping invalid '`,
+>   which loads the manifest and overlays fresh. Measured: 1 with `args: ["-y", 5]`, 0
+>   after the fix; an approved project overlay is reported when run from the project
+>   directory, and not from another directory.
+> - **`catalog_search` needs `include_offline: true`** to return manifest candidates
+>   (`CatalogSearchInput.include_offline` defaults to false). Measured on a real gateway
+>   with the guide's `inventory-tool` snippet: `{"query": "inventory"}` → `[]`;
+>   `{"query": "inventory", "include_offline": true}` → `[inventory-tool, square]`;
+>   `{"query": "stock levels", "include_offline": true}` → `[inventory-tool]`. The guide
+>   now uses a keyword only the entry declares, with the flag, and says what happens
+>   without it.
+> - **What 2.7.3 did, exactly.** `keywords: [1]` and an empty `check_command` failed every
+>   `catalog_search` query; a non-string `transport` failed only the queries that matched
+>   the entry; a number in `args` or `command` stopped startup and `gateway.refresh`. The
+>   same split is now stated in `MIGRATING.md`, its rollback row and the CHANGELOG Fixed
+>   bullet (which had listed `transport` under "every query").
+>
 > **Revision 7** (2026-10-05): board round 6 on `9a6c2fd` (Consiliency/pmcp#343). Grok and
 > gemini agreed, claude partially agreed (one non-blocking note), codex disagreed with two
 > blocking findings. All three falsifiers reproduce natively on rev 6 (`b8e4305` + the
@@ -1248,10 +1272,12 @@ passes (37 passed).
 - `MIGRATING.md`:
   - a `### An overlay entry pmcp cannot use is skipped` section after *Manifest version
     pins*, with the four questions, a `manifest-overlay` snippet that loads cleanly, and
-    the `grep -c 'Skipping invalid '` check;
+    a `How to verify` step that runs `pmcp config status 2>&1 | grep -c 'Skipping invalid '`
+    (fresh load, no log history) and `catalog_search` with `include_offline: true` and
+    a keyword only the entry declares (rev 8);
   - its `rollback-table` row: "Safe on 2.7.3: it loads a corrected entry the same way. An
-    entry 3.0 skips loads again on 2.7.3, and can again make `gateway.catalog_search` fail
-    for every query." No † claim: 2.7.3 was not run for this row;
+    entry 3.0 skips loads again on 2.7.3, and can again make `gateway.catalog_search` fail,
+    for every query or for every query that matches it." No † claim: 2.7.3 was not run for this row;
   - its link in *Contents*;
   - `Skipping invalid ` added to the checklist's log `grep` (step 6), whose text promises
     "every WARNING that 3.0 adds or rewords"; the rev-6 skip lines are reworded.
@@ -6767,7 +6793,7 @@ index 4f4eead..3ba6157 100644
 
 ````diff
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 9fa0441..111b563 100644
+index 9fa0441..131ccb8 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -91,6 +91,13 @@ to do, how to verify it, and how to roll back to 2.7.3.
@@ -6798,9 +6824,9 @@ index 9fa0441..111b563 100644
 +  removes one, within the result limit.
 +
 +  Separately, a wrongly typed field in one overlay entry made `catalog_search` fail
-+  for every query, or stopped gateway startup and `gateway.refresh` for every server.
-+  Examples: `keywords: null`, a non-string `transport`, an int in `args`, or a bad
-+  `cli_alternatives` entry. An overlay entry that any part of pmcp would reject is now
++  for every query (`keywords: null`, a bad `cli_alternatives` entry) or for every
++  query that matched the entry (a non-string `transport`), or stopped gateway startup
++  and `gateway.refresh` for every server (an int in `args`). An overlay entry that any part of pmcp would reject is now
 +  skipped when the overlay is read; an entry nothing would fail on still loads as
 +  before. The warning names the field, never its value, and never shows an overlay
 +  entry's name. Loading, discovery, CLI probing and the startup and refresh skip lines
@@ -6818,7 +6844,7 @@ index 9fa0441..111b563 100644
    and the teardown still completes.** A caller cancelled while a server
    connection is being torn down -- a failed or cancelled handshake,
 diff --git a/MIGRATING.md b/MIGRATING.md
-index 337f767..ed5153c 100644
+index 337f767..aece3b7 100644
 --- a/MIGRATING.md
 +++ b/MIGRATING.md
 @@ -34,6 +34,7 @@ log is `~/.pmcp/logs/gateway.log`.
@@ -6846,7 +6872,7 @@ index 337f767..ed5153c 100644
     "Ignoring PMCP_…" lines for `PMCP_*` variables set in a `.env` file go only
     to the gateway's stderr, not to `gateway.log`; the `journalctl` line catches
     them for a service, or watch the terminal for a gateway you started by hand.
-@@ -879,6 +881,55 @@ entry sets an npm setting, when the gateway's environment sets any
+@@ -879,6 +881,69 @@ entry sets an npm setting, when the gateway's environment sets any
  gateway's working directory holds a `package.json` or `node_modules`. The pin
  is still applied in those cases.
  
@@ -6857,8 +6883,10 @@ index 337f767..ed5153c 100644
 +`$PMCP_MANIFEST_PATH`) and one of its entries has a field of the wrong type:
 +`keywords: [1]`, a number in `args` or `command`, a `transport` that is not a
 +string, or a `cli_alternatives` entry with an empty `check_command`. On 2.7.3
-+such an entry loaded, and then `gateway.catalog_search` failed for every
-+query, or startup and `gateway.refresh` failed for every server. You are also
++such an entry loaded, and then `gateway.catalog_search` failed: for every query
++with `keywords: [1]` or an empty `check_command`, and for every query that
++matched the entry with a non-string `transport`. A number in `args` or
++`command` instead stopped startup and `gateway.refresh` for every server. You are also
 +affected if an overlay adds or replaces a `cli_alternatives` entry that you
 +expect `gateway.request_capability` to recommend.
 +
@@ -6895,18 +6923,30 @@ index 337f767..ed5153c 100644
 +CLI directly; `gateway.catalog_search` still lists it in `cli_hints` when it
 +is installed.
 +
-+**How to verify.** After a restart,
-+`grep -c 'Skipping invalid ' ~/.pmcp/logs/gateway.log` prints `0`, and
-+`gateway.catalog_search` with one of the entry's keywords returns it.
++**How to verify.** `pmcp config status` loads the manifest and its overlays
++fresh, so it reports a skipped entry directly, with no log history:
++
++```bash
++pmcp config status 2>&1 | grep -c 'Skipping invalid '   # prints 0 once every entry loads
++```
++
++Run it from the directory the gateway runs in, so it reads the same project
++overlay. The gateway's own log keeps the lines from earlier runs, so a count
++there does not drop to 0 after a fix. After restarting the gateway,
++`gateway.catalog_search` with `include_offline: true` and a keyword that only
++your entry declares returns it: for the example above,
++`{"query": "stock levels", "include_offline": true}` returns `inventory-tool`.
++Without `include_offline: true`, `catalog_search` returns no manifest
++candidates at all.
 +
  ### Downstream servers see more from pmcp
  
  **Am I affected?** You are if you maintain an MCP server that pmcp connects
-@@ -1176,6 +1227,7 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
+@@ -1176,6 +1241,7 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
  | [Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire](#task-ttl-and-poll_interval-are-seconds-in-pmcp-and-milliseconds-on-the-wire) | Reverse: 2.7.3 sends `ttl` and `poll_interval` to the server unchanged and reports the server's values back unchanged.† Which step undoes the migration depends on the server, so do **one** of these per downstream server, never both. **A spec-conforming (third-party) server** reads milliseconds, so a migrated `ttl: 300` keeps a task for 0.3 s, not five minutes:† Multiply by 1000 again (`ttl: 300000`, `poll_interval: 2500`) in the callers of that server; tasks pmcp returns from it show milliseconds again (`poll_interval: 2500.0`).† **A pmcp tenant server built to the old seconds contract that you switched to milliseconds for 3.0**: Switch it back to reading and returning seconds, and keep its callers sending seconds (`ttl: 300`), as they did on 2.7.3; tasks it returns show seconds again. Doing both keeps a five-minute task for 300000 seconds. |
  | [Redaction removes more](#redaction-removes-more) | Safe on 2.7.3: it redacts less. |
  | [Manifest version pins](#manifest-version-pins) | Reverse: 2.7.3 ignores `version:` and `server_version:` silently,† so a pinned server runs whatever npm resolves. To keep a version, put it in that server's `args` in `~/.mcp.json` (for example `"args": ["-y", "firecrawl-mcp@3.25.5"]`). |
-+| [An overlay entry pmcp cannot use is skipped](#an-overlay-entry-pmcp-cannot-use-is-skipped) | Safe on 2.7.3: it loads a corrected entry the same way. An entry 3.0 skips loads again on 2.7.3, and can again make `gateway.catalog_search` fail for every query. |
++| [An overlay entry pmcp cannot use is skipped](#an-overlay-entry-pmcp-cannot-use-is-skipped) | Safe on 2.7.3: it loads a corrected entry the same way. An entry 3.0 skips loads again on 2.7.3, and can again make `gateway.catalog_search` fail, for every query or for every query that matches it. |
  | [Downstream servers see more from pmcp](#downstream-servers-see-more-from-pmcp) | Safe on 2.7.3: a server that handles `-32601` and `notifications/cancelled` simply doesn't receive them. |
  | [Logs](#logs) | Safe on 2.7.3: alert exclusions for the new WARNINGs match nothing. |
  | [Dependency floors](#dependency-floors) | Safe on 2.7.3: its floors for `pyjwt`, `aiohttp`, `python-dotenv` and `starlette` are lower, with no upper bound on any of the four.† (2.7.3 caps other packages: `mcp<3.0.0`, `httpx<1.0`, `httpx2<3.0.0`, `jsonschema<5.0.0` and `semver<4`; installing 2.7.3 resolves those itself.) |
