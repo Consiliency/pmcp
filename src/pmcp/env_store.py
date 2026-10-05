@@ -30,13 +30,11 @@ def resolve_project_root(project: Path | None = None) -> Path:
     if project:
         # Never realpath, strict or not (strict collapses `file/..` on 3.12,
         # non-strict `missing/..`): the root is kept as the operator spelled it,
-        # absolute, and the kernel resolves it at every use. One that does not
-        # exist yet is allowed only as a plain tail of names (created later by
-        # make_store_dirs); any other failure -- `missing/../x`, `file/../x`, a
-        # loop, no permission -- raises: a refusal, never "absent".
-        root = project if project.is_absolute() else Path.cwd() / project
-        _require_plain_missing_tail(root)
-        return root
+        # absolute, and the kernel resolves it at every use. A root that does
+        # not exist yet is created by make_store_dirs before a write -- only as
+        # a plain tail of new directories; `missing/../x`, `file/../x`, a loop
+        # or no permission is refused there, never treated as absent.
+        return project if project.is_absolute() else Path.cwd() / project
 
     discovered = find_project_root(Path.cwd())
     if discovered:
@@ -44,22 +42,6 @@ def resolve_project_root(project: Path | None = None) -> Path:
 
     # os.getcwd() is already the kernel's physical path; nothing to resolve.
     return Path.cwd()
-
-
-def _require_plain_missing_tail(directory: Path) -> None:
-    """Raise unless ``directory`` exists as a directory or only a plain tail is missing."""
-    current = os.fspath(directory)
-    while True:
-        try:
-            st = os.stat(current)
-        except FileNotFoundError:
-            if os.path.basename(current) in ("", os.curdir, os.pardir):
-                raise
-            current = os.path.dirname(current)
-            continue
-        if not stat.S_ISDIR(st.st_mode):
-            raise NotADirectoryError(errno.ENOTDIR, "Not a directory", current)
-        return
 
 
 def resolve_scope_path(scope: str, project: Path | None = None) -> Path:

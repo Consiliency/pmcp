@@ -19,8 +19,8 @@ only the final component's chain is followed: ``lstat`` it; if it is a link,
 ``os.path.join`` -- no ``normpath``, no ``realpath`` of any strictness -- and
 loop, up to 40 hops (``ELOOP``). Every syscall gets the user's own spelling, so
 the kernel applies its own rules to ``missing/..``, ``file/..``, ``//``,
-mode-000 and search-only directories. A target that ends in a separator is
-refused (``ENOTDIR``, as the kernel would). The temporary is created in the
+mode-000 and search-only directories, and to a target that ends in a
+separator. The temporary is created in the
 target's directory and renamed over the target; the link is left alone.
 
 **Repository-controlled files (``confine_to=<project root>``): no symlinks at
@@ -116,15 +116,14 @@ def resolve_write_target(path: Path | str) -> str:
 
     Only the final component's chain is followed, by ``readlink`` and plain
     ``os.path.join`` onto the link's own directory -- never normalised -- so the
-    kernel resolves every directory on the way by its own rules. Raises
-    ``OSError(ELOOP)`` after 40 hops, ``NotADirectoryError`` for a target that
-    ends in a separator, ``IsADirectoryError`` for a directory; the target may
-    be absent (a dangling link creates it).
+    kernel resolves every directory on the way by its own rules -- including a
+    target that ends in a separator, which it refuses (``ENOTDIR`` from the
+    ``lstat``, or ``ENOENT`` when the temp file is created). Raises
+    ``OSError(ELOOP)`` after 40 hops and ``IsADirectoryError`` for a directory;
+    the target may be absent (a dangling link creates it).
     """
     current = os.fspath(path)
     for _hop in range(_MAX_LINK_HOPS + 1):
-        if os.path.basename(current) == "":
-            raise NotADirectoryError(errno.ENOTDIR, "Not a directory", current)
         try:
             st = os.lstat(current)
         except FileNotFoundError:

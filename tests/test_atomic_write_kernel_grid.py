@@ -412,3 +412,30 @@ def test_board_r7_f002_absolute_link_with_trailing_slash_is_refused_like_the_ker
     with pytest.raises(OSError):
         set_env_value("user", "NEW", "v")
     assert dotfiles.read_text(encoding="utf-8") == "KEEP1=alpha\nKEEP2=beta\n"
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["missing/../x", "afile/../x", "missing/./x", "plain/new/x"],
+)
+def test_make_store_dirs_creates_only_a_plain_missing_tail(
+    spelling: str, tmp_path: Path
+) -> None:
+    """Never `mkdir -p` past a component the kernel refuses (round 8, codex F002)."""
+    base = Path(os.path.realpath(tmp_path))
+    (base / "afile").write_bytes(b"")
+    (base / "x").mkdir()
+    before = sorted(p.name for p in base.iterdir())
+    target = f"{base}/{spelling}"
+    if spelling == "plain/new/x":
+        created = writer.make_store_dirs(target)
+        assert [os.path.relpath(c, base) for c in created] == [
+            "plain",
+            "plain/new",
+            "plain/new/x",
+        ]
+        assert all(stat.S_IMODE(os.stat(c).st_mode) == 0o700 for c in created)
+        return
+    with pytest.raises(OSError):
+        writer.make_store_dirs(target)
+    assert sorted(p.name for p in base.iterdir()) == before
