@@ -52,6 +52,10 @@
 >   the entry; a number in `args` or `command` stopped startup and `gateway.refresh`. The
 >   same split is now stated in `MIGRATING.md`, its rollback row and the CHANGELOG Fixed
 >   bullet (which had listed `transport` under "every query").
+> - **Re-proved on `b8e4305`:** the bodies extracted from this file apply cleanly to a fresh
+>   worktree (`/var/tmp/pmcp-342-rev8-proof-viperjuice`, its own venv); all 16 files are
+>   cmp-identical to the spike; ruff and ruff format are clean; `test_migration_doc.py`,
+>   the module, the three migrated modules and `test_identity.py`: 559 passed.
 >
 > **Revision 7** (2026-10-05): board round 6 on `9a6c2fd` (Consiliency/pmcp#343). Grok and
 > gemini agreed, claude partially agreed (one non-blocking note), codex disagreed with two
