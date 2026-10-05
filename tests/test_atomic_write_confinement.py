@@ -468,16 +468,43 @@ def test_a_forced_fallback_still_writes_a_plain_project_store(
     assert stat.S_IMODE(store.stat().st_mode) == 0o600
 
 
-def test_a_forced_fallback_refuses_a_path_below_a_subdirectory(
-    layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("depth", [1, 2, 3])
+def test_a_forced_fallback_writes_and_reads_a_store_in_nested_real_directories(
+    depth: int, layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Round 6 codex F002: below the root is fine when every directory is real."""
+    from pmcp.atomic_write import read_confined
+
     monkeypatch.setattr(atomic_write_module, "_DIR_FD_SUPPORTED", False)
-    (layout["project"] / "sub").mkdir()
-    with pytest.raises(ConfinedWriteError, match="not directly inside"):
-        atomic_write(
-            layout["project"] / "sub" / "x.env", b"K=v\n", confine_to=layout["project"]
-        )
-    assert not (layout["project"] / "sub" / "x.env").exists()
+    sub = layout["project"].joinpath(*[f"d{i}" for i in range(depth)])
+    sub.mkdir(parents=True)
+    store = sub / ".env.pmcp"
+    atomic_write(store, b"K=v\n", confine_to=layout["project"])
+    assert store.read_bytes() == b"K=v\n" and not store.is_symlink()
+    assert read_confined(store, layout["project"]) == b"K=v\n"
+
+
+@pytest.mark.parametrize("where", ["directory link", "final link"])
+def test_a_forced_fallback_still_refuses_any_link_on_a_nested_path(
+    where: str, layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.atomic_write import read_confined
+
+    monkeypatch.setattr(atomic_write_module, "_DIR_FD_SUPPORTED", False)
+    project = layout["project"]
+    (project / "real").mkdir()
+    if where == "directory link":
+        os.symlink("real", project / "d0")
+        store = project / "d0" / ".env.pmcp"
+    else:
+        (project / "d0").mkdir()
+        (project / "real" / "s.env").write_bytes(b"K=old\n")
+        os.symlink("../real/s.env", project / "d0" / ".env.pmcp")
+        store = project / "d0" / ".env.pmcp"
+    with pytest.raises(ConfinedWriteError, match="cannot be followed safely"):
+        atomic_write(store, b"K=v\n", confine_to=project)
+    with pytest.raises(ConfinedWriteError, match="cannot be followed safely"):
+        read_confined(store, project)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="dir_fd walk is POSIX-only")

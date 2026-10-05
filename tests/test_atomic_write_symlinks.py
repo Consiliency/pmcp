@@ -22,7 +22,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any
 
 import pytest
 
@@ -669,18 +669,26 @@ def test_the_temp_file_is_created_beside_the_target_not_the_link(
     """``os.replace`` is atomic only within one filesystem, and a dotfiles target
     commonly lives on another mount than ``~/.config`` -- so the temp must share
     the TARGET's directory. (Within one test filesystem a temp beside the link
-    would still rename successfully, so this is observed at ``mkstemp``.)
+    would still rename successfully, so this is observed where the temp is made:
+    the directory descriptor the walk ended on, or the fallback's directory.)
     """
-    import tempfile
+    from pmcp import atomic_write as writer
 
-    real_mkstemp = tempfile.mkstemp
     dirs: list[str] = []
+    real_in_dir = writer._write_in_dir
+    real_by_path = writer._write_by_path
 
-    def spy(*args: object, **kwargs: object) -> tuple[int, str]:
-        dirs.append(os.fspath(cast(str, kwargs["dir"])))
-        return real_mkstemp(*args, **kwargs)  # type: ignore[call-overload]
+    def spy_in_dir(dir_fd: int, name: str, *args: Any, **kwargs: Any) -> None:
+        same = os.path.samestat(os.fstat(dir_fd), os.stat(dotfiles))
+        dirs.append(str(dotfiles.resolve()) if same else "/not-the-target-dir")
+        real_in_dir(dir_fd, name, *args, **kwargs)
 
-    monkeypatch.setattr(tempfile, "mkstemp", spy)
+    def spy_by_path(target: Path, *args: Any, **kwargs: Any) -> None:
+        dirs.append(os.fspath(target.parent))
+        real_by_path(target, *args, **kwargs)
+
+    monkeypatch.setattr(writer, "_write_in_dir", spy_in_dir)
+    monkeypatch.setattr(writer, "_write_by_path", spy_by_path)
     target = dotfiles / "file"
     link = _link(site.path(_home()), target)
 

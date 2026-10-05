@@ -91,7 +91,7 @@ class TestSecretsHandlers:
             **kwargs: object,
         ) -> int:
             opened.append((Path(path), flags, mode))
-            return real_open(path, flags, mode)
+            return real_open(path, flags, mode, *args, **kwargs)
 
         def replace_spy(
             src: os.PathLike[str] | str,
@@ -99,8 +99,15 @@ class TestSecretsHandlers:
             *args: object,
             **kwargs: object,
         ) -> None:
-            replaced.append(Path(dst))
-            real_replace(src, dst)
+            # The rename is relative to the walk's directory descriptor now
+            # (dst_dir_fd), so record the directory it lands in, too.
+            dst_dir_fd = kwargs.get("dst_dir_fd")
+            if isinstance(dst_dir_fd, int):
+                assert os.path.samestat(os.fstat(dst_dir_fd), os.stat(tmp_path))
+                replaced.append(tmp_path / Path(dst))
+            else:
+                replaced.append(Path(dst))
+            real_replace(src, dst, *args, **kwargs)
 
         monkeypatch.setattr("pmcp.env_store.os.open", open_spy)
         monkeypatch.setattr("pmcp.env_store.os.replace", replace_spy)

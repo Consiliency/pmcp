@@ -385,3 +385,128 @@ def test_grok_round3_f001_unreadable_project_store_is_reported_not_raised(
 
     assert victim.read_text(encoding="utf-8") == "ORIGINAL\n"
     assert os.path.islink(project / ".env.pmcp")
+
+
+# --------------------------------------------------------------------------- #
+# Round 6 codex F001: the UNCONFINED (operator-owned) path resolves in kernel
+# order too. Non-strict realpath collapsed `hop/../existing.env` onto
+# `existing.env` when `hop` was missing, a regular file or a loop -- shapes the
+# kernel refuses -- and overwrote an unrelated file. Oracle: the kernel itself.
+# Each case is built twice; the kernel opens one copy for writing
+# (O_WRONLY|O_CREAT|O_TRUNC through the link), the writer writes the other, and
+# the two trees must end byte-identical, with the same refuse/accept outcome.
+# --------------------------------------------------------------------------- #
+
+HOP_KINDS = ["missing", "regular file", "loop", "real directory", "link to a directory"]
+
+
+def _hop_texts(store_dir: Path) -> dict[str, str]:
+    return {
+        "hop/..": "hop/../existing.env",
+        "hop/sub/../..": "hop/sub/../../existing.env",
+        "../pmcp/hop/..": "../pmcp/hop/../existing.env",
+        "absolute hop/..": str(store_dir / "hop") + "/../existing.env",
+    }
+
+
+def _build_unconfined(base: Path, hop: str, text_id: str) -> Path:
+    store_dir = base / "cfg" / "pmcp"
+    store_dir.mkdir(parents=True)
+    (base / "other" / "child" / "sub").mkdir(parents=True)
+    (store_dir / "existing.env").write_bytes(b"UNRELATED=1\n")
+    hop_path = store_dir / "hop"
+    if hop == "regular file":
+        hop_path.write_bytes(b"")
+    elif hop == "loop":
+        os.symlink("hop2", hop_path)
+        os.symlink("hop", store_dir / "hop2")
+    elif hop == "real directory":
+        (hop_path / "sub").mkdir(parents=True)
+    elif hop == "link to a directory":
+        os.symlink("../../other/child", hop_path)
+    link = store_dir / "pmcp.env"
+    os.symlink(_hop_texts(store_dir)[text_id], link)
+    return link
+
+
+def _tree(base: Path) -> dict[str, bytes]:
+    out: dict[str, bytes] = {}
+    for dirpath, _dirs, files in os.walk(base, followlinks=False):
+        for f in files:
+            p = Path(dirpath, f)
+            if not p.is_symlink() and not f.startswith(".pmcp-"):
+                out[str(p.relative_to(base))] = p.read_bytes()
+    return out
+
+
+@pytest.mark.parametrize("text_id", list(_hop_texts(Path("/x"))))
+@pytest.mark.parametrize("hop", HOP_KINDS)
+def test_an_unconfined_write_lands_where_the_kernel_opens_or_is_refused(
+    hop: str, text_id: str, tmp_path: Path
+) -> None:
+    base = Path(os.path.realpath(tmp_path))
+    kernel_link = _build_unconfined(base / "kernel", hop, text_id)
+    writer_link = _build_unconfined(base / "writer", hop, text_id)
+    if text_id == "absolute hop/..":
+        # Absolute text names its own tree; rebuild the writer's link to match.
+        os.unlink(writer_link)
+        os.symlink(_hop_texts(writer_link.parent)[text_id], writer_link)
+
+    try:
+        fd = os.open(kernel_link, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    except OSError:
+        kernel_refused = True
+    else:
+        os.write(fd, DATA)
+        os.close(fd)
+        kernel_refused = False
+
+    try:
+        atomic_write(writer_link, DATA, confine_to=None)
+    except OSError:
+        writer_refused = True
+    else:
+        writer_refused = False
+
+    assert writer_refused == kernel_refused, (hop, text_id)
+    assert _tree(base / "writer") == _tree(base / "kernel"), (hop, text_id)
+    assert os.path.islink(writer_link)
+
+
+def test_the_unconfined_grid_has_both_outcomes() -> None:
+    """Positive control: the kernel refuses the missing/file/loop hops, not the dirs."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(os.path.realpath(d))
+        outcomes = {}
+        for hop in HOP_KINDS:
+            link = _build_unconfined(base / hop.replace(" ", "-"), hop, "hop/..")
+            try:
+                os.close(os.open(link, os.O_WRONLY | os.O_CREAT, 0o600))
+                outcomes[hop] = "opened"
+            except OSError:
+                outcomes[hop] = "refused"
+    assert outcomes == {
+        "missing": "refused",
+        "regular file": "refused",
+        "loop": "refused",
+        "real directory": "opened",
+        "link to a directory": "opened",
+    }
+
+
+def test_codex_r6_f001_unresolvable_user_store_link_does_not_overwrite(
+    tmp_path: Path,
+) -> None:
+    """Round-6 codex falsifier shape: the user store links through a missing hop."""
+    store_dir = Path(os.path.realpath(tmp_path)) / "pmcp"
+    store_dir.mkdir()
+    existing = store_dir / "existing.env"
+    existing.write_bytes(b"UNRELATED=1\n")
+    link = store_dir / "pmcp.env"
+    os.symlink("hop/../existing.env", link)
+    with pytest.raises(OSError):
+        atomic_write(link, b"K=v\n", confine_to=None)
+    assert existing.read_bytes() == b"UNRELATED=1\n"
+    assert os.readlink(link) == "hop/../existing.env"
