@@ -45,7 +45,9 @@ this test's first version in review of Consiliency/pmcp#364, plus three more
 (a log grep that misses ignored pins, an invented refusal message, a backup
 that copies symlinks as links), plus two from the round-3 board (a rollback
 that drops or "safes" the task-unit reversal) and six from round 4 (rollback
-rows that reverse the wrong way or name no step); each must fail.
+rows that reverse the wrong way or name no step), and two from round 5 (a task
+row that applies both reversals to every server, a pin example 2.7.3 ignores);
+each must fail.
 """
 
 from __future__ import annotations
@@ -1070,13 +1072,16 @@ _REVERSE_STEPS: dict[str, tuple[str, ...]] = {
         "don't send an explicit `null` for an optional argument; 2.7.3 rejects it",
     ),
     "Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire": (
+        "do **one** of these per downstream server, never both",
+        "**A spec-conforming (third-party) server** reads milliseconds",
         "a migrated `ttl: 300` keeps a task for 0.3 s",
-        "Multiply by 1000 again (`ttl: 300000`, `poll_interval: 2500`)",
-        "Switch a tenant server you changed back to reading and returning seconds",
+        "Multiply by 1000 again (`ttl: 300000`, `poll_interval: 2500`) in the callers of that server",
+        "**A pmcp tenant server built to the old seconds contract that you switched to milliseconds for 3.0**: Switch it back to reading and returning seconds, and keep its callers sending seconds (`ttl: 300`)",
     ),
     "Manifest version pins": (
         "2.7.3 ignores `version:` and `server_version:` silently",
         "put it in that server's `args` in `~/.mcp.json`",
+        '(for example `"args": ["-y", "firecrawl-mcp@3.25.5"]`)',
     ),
     "Agent-facing hints": (
         "see `try/catch` and `playwright::browser_screenshot` again",
@@ -1323,6 +1328,21 @@ def _seeded_wrong_guides(text: str) -> dict[str, str]:
             r"\1Reverse: something. The enable_feedback_submission key is ignored, as is `confirm_submission=true`. |",
             t,
         ),
+        # Round 5 (Consiliency/pmcp#364): grok's row that applies both steps to
+        # every server, and claude's pin example 2.7.3 does not read.
+        "s-rollback-task-units-both-steps": lambda t: re.sub(
+            r"(\| \[Task `ttl` and `poll_interval`[^|]*\| )[^\n]*",
+            lambda m: m.group(1)
+            + "Reverse: 2.7.3 sends `ttl` and `poll_interval` to the server unchanged, "
+            "and MCP reads them as milliseconds, so a migrated `ttl: 300` keeps a task "
+            "for 0.3 s, not five minutes. Multiply by 1000 again (`ttl: 300000`, "
+            "`poll_interval: 2500`) in the callers of that server. Switch a tenant "
+            "server you changed back to reading and returning seconds. |",
+            t,
+        ),
+        "t-rollback-pin-example-uses-ignored-key": lambda t: t.replace(
+            '"args": ["-y", "firecrawl-mcp@3.25.5"]', '"version": "3.25.5"', 1
+        ),
         "r-rollback-feedback-only-github-token": lambda t: t.replace(
             "run `pmcp guidance --telemetry off` before you restart on 2.7.3",
             "unset `GITHUB_TOKEN` before you restart on 2.7.3",
@@ -1420,3 +1440,69 @@ def test_rollback_restores_task_duration_contract() -> None:
             "Rollback must restore task caller units: on 2.7.3 send "
             f"{literal}, what 3.0 sends for ttl 300 s / poll_interval 2.5 s."
         )
+
+
+def _task_rollback_branches() -> tuple[str, str]:
+    """The task-units rollback cell, split into its spec-server and tenant branches."""
+    row = next(
+        status
+        for title, _anchor_, status in _rollback_rows(_guide())
+        if title.startswith("Task `ttl` and `poll_interval`")
+    )
+    spec_label = "**A spec-conforming (third-party) server**"
+    tenant_label = "**A pmcp tenant server"
+    assert spec_label in row and tenant_label in row, row
+    spec = row[row.index(spec_label) : row.index(tenant_label)]
+    tenant = row[row.index(tenant_label) :]
+    return spec, tenant
+
+
+def test_task_rollback_preserves_duration_on_each_kind_of_downstream() -> None:
+    """Grok's round-5 falsifier on Consiliency/pmcp#364, as a passing property.
+
+    Run 2.7.3's real ``_task_wire_metadata`` on the value each rollback branch
+    tells the caller to send, and read the wire value the way that branch's
+    server does: a spec-conforming server in milliseconds, a tenant switched
+    back to seconds in seconds. Each must keep the five minutes a 3.0
+    ``ttl: 300`` asked for. Applying the spec branch's value to a seconds
+    tenant (both steps at once) would keep it 300000 s, which is why the row
+    must say "never both".
+    """
+    from types import SimpleNamespace
+
+    old = subprocess.run(
+        ["git", "show", "v2.7.3:src/pmcp/client/manager.py"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if old.returncode != 0:
+        pytest.skip("v2.7.3 is not in this checkout")
+    forward = _function(
+        old.stdout, "_task_wire_metadata", {"TaskMetadataInput": SimpleNamespace}
+    )
+    spec, tenant = _task_rollback_branches()
+
+    def sent(branch: str) -> int:
+        # The value the branch tells callers to send: inside its "(`ttl: N`"
+        # instruction, not the `ttl: 300` it quotes as the problem.
+        match = re.search(r"(?:again|sending seconds) \(`ttl: (\d+)`", branch)
+        assert match, branch
+        caller = SimpleNamespace(
+            ttl=int(match.group(1)),
+            poll_interval=None,
+            metadata=None,
+            requestor_context=None,
+        )
+        return int(forward(None, caller)["ttl"])
+
+    assert sent(spec) / 1000 == 300, "spec-server branch must keep 300 s"
+    assert sent(tenant) == 300, "seconds-tenant branch must keep 300 s"
+    both = sent(spec)  # the spec value read as seconds by a reverted tenant
+    assert both != 300
+    row = next(
+        status
+        for title, _anchor_, status in _rollback_rows(_guide())
+        if title.startswith("Task `ttl` and `poll_interval`")
+    )
+    assert "never both" in row
