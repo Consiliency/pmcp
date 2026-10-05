@@ -400,13 +400,17 @@ UTF-8, comes back as `"ok": false` instead of crashing the command; when
 `pmcp secrets sync` only reads the project store, the refusal says
 `refusing to read`. On Windows, any symlinked project `.env.pmcp` is refused.
 The user store `~/.config/pmcp/pmcp.env` still follows its link anywhere. A
-link from a subdirectory to a store elsewhere in the same project still loads;
-outside any project the startup load is confined to the current directory. A
-running gateway's spawn-time credential checks and `pmcp secrets check` still
-follow a project link when they read (Consiliency/pmcp#367), but no longer
-hang on a fifo. These protections are about what a repository ships; a
-process already running as you that rewrites the store's directory while a
-command runs is out of scope.
+link from a subdirectory to a store elsewhere in the same project still loads.
+The project is the nearest enclosing directory with `.mcp.json`, `.git`,
+`package.json` or `pyproject.toml`, the same root `--scope project` writes
+use; outside any project the startup load is confined to the current
+directory. Six other readers still follow a project link (Consiliency/pmcp#367):
+remote-header auth, the tenant store, the gateway's credential-availability
+check, env stripping, the feedback gate's planted-key check and
+`pmcp secrets check`. See [Known issues](#known-issues-in-300) for what each
+reads and what that exposes. None of them hangs on a fifo. These protections
+are about what a repository ships; a process already running as you that
+rewrites the store's directory while a command runs is out of scope.
 
 **What to do.** If the link pointed somewhere you meant, such as a shared
 secrets file that the gateway used to load, store those keys in your user
@@ -1137,6 +1141,28 @@ SIGTERM no longer outlives a cancelled disconnect or a timed-out shutdown
 
   How to verify: `ls -l .mcp-gateway/descriptions.yaml` shows a fresh
   timestamp.
+- **Six readers still follow a project `.env.pmcp` that links out of the
+  project** ([Consiliency/pmcp#367](https://github.com/Consiliency/pmcp/issues/367)).
+  The commands that rewrite the store, and the startup load, refuse such a
+  link; these do not:
+  - remote-header auth: a `${VAR}` in a remote server's `headers` is resolved
+    from the user and project stores when the gateway resolves its startup
+    configs, connects a remote server or checks its auth, and by
+    `pmcp status` and `pmcp doctor`;
+  - the tenant store `.pmcp/tenants/<id>/pmcp.env`, resolved the same way per
+    tenant (no production caller passes a tenant yet; see the next item);
+  - the gateway's credential-availability check, which loads `<cwd>/.env`,
+    `<cwd>/.env.pmcp` and the user store into the gateway's own environment;
+  - env stripping, which reads the stores' key names at every server spawn;
+  - the feedback gate's planted-key check, which reads the same key names;
+  - `pmcp secrets check`.
+
+  So a repository can still link its `.env.pmcp` to another file of yours,
+  and through remote-header auth or the gateway's credential-availability
+  check that file's values can be sent as a header to a remote server the
+  repository configures. None of these readers hangs on a fifo. Until it is
+  fixed, check `ls -l .env.pmcp` in repositories you clone and delete a link
+  you didn't create.
 - **Tenant-aware header resolution for remote servers is not wired yet**
   ([Consiliency/pmcp#353](https://github.com/Consiliency/pmcp/issues/353)).
   pmcp never reads per-tenant credentials from `.pmcp/tenants/<id>/pmcp.env`,

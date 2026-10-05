@@ -3133,8 +3133,9 @@ def _load_project_store_at_startup(path: Path) -> None:
     stays inside, loads exactly as ``load_dotenv(path, override=False)`` did
     (same parser, interpolation and precedence, from the same bytes).
 
-    Other readers of a project ``.env.pmcp`` -- a running gateway's spawn-time
-    credential checks and env stripping, ``pmcp secrets check`` -- still follow
+    Other readers of a project ``.env.pmcp`` -- remote-header auth, the tenant store, the gateway's credential-availability
+    check, env stripping, the feedback gate's planted-key check and ``pmcp secrets
+    check``, inventoried in tests/test_env_store_reader_inventory.py -- still follow
     its link (Consiliency/pmcp#367, stays open); they no longer block on a fifo
     (``env_store.read_env_text``).
     """

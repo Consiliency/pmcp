@@ -98,8 +98,9 @@ def read_store_for_update(
     ``pmcp secrets sync`` and ``gateway.auth_connect`` -- so they never read
     through a link they would refuse to write; the startup load
     (``cli._load_project_store_at_startup``) reads the same way. Other readers --
-    a running gateway's spawn-time credential checks and env stripping, ``pmcp
-    secrets check`` -- still follow a link on read (Consiliency/pmcp#367, stays
+    remote-header auth, the tenant store, the gateway's credential-availability
+    check, env stripping, the feedback gate's planted-key check and ``pmcp secrets
+    check``, inventoried in tests/test_env_store_reader_inventory.py -- still follow a link on read (Consiliency/pmcp#367, stays
     open), though none of them blocks on a fifo any more (:func:`read_env_text`).
     """
     confine_to = scope_confinement(scope, path)
