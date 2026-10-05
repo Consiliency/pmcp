@@ -127,25 +127,72 @@ def test_every_store_reader_is_inventoried_and_classified() -> None:
         assert cls in FOLLOWS_A_PROJECT_LINK or cls in NOT_A_PROJECT_LINK_FOLLOWER, key
 
 
+def _norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _between(text: str, start: str, end: str) -> str:
+    i = text.index(start)
+    return text[i : text.index(end, i + len(start))]
+
+
+#: The short name each class goes by in running prose.
+SHORT_NAMES = {
+    "remote-header auth": "remote-header auth",
+    "tenant store": "the tenant store",
+    "credential-availability check": "the gateway's credential-availability check",
+    "env stripping": "env stripping",
+    "feedback gate": "the feedback gate's planted-key check",
+    "secrets check": "`pmcp secrets check`",
+}
+
+
 def test_every_link_following_reader_is_documented() -> None:
+    """Each class is named in EVERY place the residual is stated, not just somewhere.
+
+    The CHANGELOG's #248 entry; MIGRATING.md's section "What changed" paragraph;
+    and its Known-issues item for Consiliency/pmcp#367.
+    """
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     guide = (ROOT / "MIGRATING.md").read_text(encoding="utf-8")
+    places = {
+        "CHANGELOG #248 entry": _between(
+            changelog, "- **A symlinked `pmcp.env` is written through", "\n- **"
+        ),
+        "MIGRATING What changed": _between(
+            guide,
+            "### A project `.env.pmcp` that is a symlink leaving the project is refused",
+            "**What to do.**",
+        ),
+        "MIGRATING Known issues": _between(
+            guide, "- **Six readers still follow a project `.env.pmcp`", "\n- **"
+        ),
+    }
     classes_in_code = {cls for _count, cls in INVENTORY.values()}
-    for cls, phrase in FOLLOWS_A_PROJECT_LINK.items():
+    assert set(SHORT_NAMES) == set(FOLLOWS_A_PROJECT_LINK)
+    for cls in FOLLOWS_A_PROJECT_LINK:
         assert cls in classes_in_code, f"documented class {cls!r} has no call site"
-        assert phrase in changelog, f"CHANGELOG.md does not name {phrase!r}"
-        assert phrase in guide, f"MIGRATING.md does not name {phrase!r}"
-    count = len(FOLLOWS_A_PROJECT_LINK)
+        for where, text in places.items():
+            assert _norm(SHORT_NAMES[cls]) in _norm(text), (
+                f"{where} does not name {SHORT_NAMES[cls]!r}"
+            )
+    for where in ("CHANGELOG #248 entry", "MIGRATING Known issues"):
+        assert FOLLOWS_A_PROJECT_LINK["tenant store"] in places[where], where
+    # The Known-issues item is a LIST: each class is its own bullet, so a class
+    # mentioned only in passing elsewhere in the item does not count.
+    known = _norm(places["MIGRATING Known issues"])
+    for cls, name in SHORT_NAMES.items():
+        assert f"- {name}" in known, f"Known issues has no bullet for {cls!r}"
+    for where, text in places.items():
+        assert "Consiliency/pmcp#367" in text, where
+        assert "Six" in text or "six" in text.lower(), where
     assert (
-        f"{['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight'][count]} readers"
-        in changelog
+        "can be sent as a header to a remote server the repository configures"
+        in _norm(places["CHANGELOG #248 entry"])
     )
     assert (
-        f"{['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight'][count]} other readers"
-        in changelog.lower()
-    )
-    assert (
-        "consiliency/pmcp#367" in changelog.lower() and "Consiliency/pmcp#367" in guide
+        "can be sent as a header to a remote server the repository configures"
+        in _norm(places["MIGRATING Known issues"])
     )
 
 
