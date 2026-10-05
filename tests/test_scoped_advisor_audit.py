@@ -1485,8 +1485,12 @@ def _open_containers(tool: Any, baseline: dict[str, Any]) -> list[str]:
     """Declared object-typed keys the gate lets generated content into."""
     containers = []
     for name, prop in sorted((tool.input_schema.get("properties") or {}).items()):
-        types = prop.get("type")
-        types = types if isinstance(types, list) else [types]
+        # A nullable object is `anyOf: [{"type": "object", ...}, {"type": "null"}]`
+        # (Consiliency/pmcp#369); a plain one is `{"type": "object", ...}`.
+        types = []
+        for schema in [prop, *(prop.get("anyOf") or [])]:
+            kind = schema.get("type")
+            types += kind if isinstance(kind, list) else [kind]
         if "object" not in types:
             continue
         probe = {**baseline, name: _mixed(_generated_keys(set(), _TAGS[1]), _TAGS[1])}
@@ -1496,6 +1500,22 @@ def _open_containers(tool: Any, baseline: dict[str, Any]) -> list[str]:
             continue
         containers.append(name)
     return containers
+
+
+def test_open_containers_see_every_nullable_object_argument() -> None:
+    """The sweep below injects generated keys into every container this finds;
+    a walker that stops seeing nullable objects (their spelling changed in
+    Consiliency/pmcp#369) would shrink that sweep silently, not fail it."""
+    tools = _gateway_tools_by_name()
+    found = {
+        name: _open_containers(tools[name], _declared_baseline(tools[name]))
+        for name in ("gateway.invoke", "gateway.tasks_result", "gateway.tasks_get")
+    }
+    assert found == {
+        "gateway.invoke": ["_meta", "arguments", "options", "task", "trace_context"],
+        "gateway.tasks_result": ["options", "requestor_context"],
+        "gateway.tasks_get": ["requestor_context"],
+    }
 
 
 #: Constructor arguments for raised exception classes whose `__init__` needs
