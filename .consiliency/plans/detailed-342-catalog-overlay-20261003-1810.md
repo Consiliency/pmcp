@@ -1,29 +1,67 @@
 # Detailed plan: an overlay never hides another server from discovery — weights from the base manifest, and one entry never takes down the others (Consiliency/pmcp#342)
 
 > Written on main `c9206a9` (dev0, a team host), worktree `pmcp-342`, branch
-> `plan/342-catalog-overlay`. For revision 6, `origin/main` was re-fetched and is
-> `6edf8a4` (Consiliency/pmcp#330's task-units change). It touches `handlers.py`,
-> `server.py`, `client/manager.py` and `environment.py` near this patch. The rev-6 patch was
-> merged onto it three-way with no conflict; only one context line differs, and the
-> patch's own added and removed lines are byte-identical to the `b2884db` version. The
-> embedding proof, the new module and the full suite below run on `6edf8a4`. The mutation
-> table was measured on `31d0f40` with the same hunks, and every one of its 59 anchors
-> matches exactly once on `6edf8a4`. Every number below was measured this session on one
-> of:
+> `plan/342-catalog-overlay`. For revision 7, `origin/main` was re-fetched and is
+> `b8e4305` (Consiliency/pmcp#351's migration guide, which adds `MIGRATING.md` and
+> `tests/test_migration_doc.py`). The rev-6 patch applied to it with `git apply` and no
+> conflict. Every rev-7 number below was measured on `b8e4305`: the embedding proof, the
+> new module, the red runs, the mutation table (all 68 anchors), the full suite, the real
+> gateway and the copycat. Earlier numbers were measured this session on one of:
 > - main;
 > - the commit before the manifest cache (`a622ec5`);
-> - the rev-1 to rev-5 spikes;
-> - the rev-6 spike.
+> - the rev-1 to rev-6 spikes;
+> - the rev-7 spike.
 >
-> The spike was then removed, and this PR carries only this file.
+> This PR carries only this file. The rev-7 spike is kept, detached, at
+> `/var/tmp/pmcp-342-rev7-viperjuice` (`b8e4305` + the patches below, uncommitted), and the
+> step-10 proof tree at `/var/tmp/pmcp-342-rev7-proof-viperjuice` (the same, extracted from
+> this file); the next board can inspect either.
 >
-> **Bounded-plan verdict: within threshold, larger than rev 1.**
-> - Source: eight files change (+1020/−252: `cli_commands/secrets.py` +38/−22, `client/manager.py` +16/−1, `config/loader.py` +64/−4, `manifest/environment.py` +26/−8, `manifest/loader.py` +553/−31, `manifest/matcher.py` +127/−64, `server.py` +6/−17, `tools/handlers.py` +190/−105).
-> - Tests: one module is new (`tests/test_catalog_overlay_discovery.py`, 271 tests).
->   Three existing tests are migrated (D4, D9).
-> - Docs: one CHANGELOG bullet, one CHANGELOG upgrade note, and one README paragraph.
+> **Bounded-plan verdict: within threshold, larger than rev 6.**
+> - Source: nine files change (+1286/−429: `cli_commands/secrets.py` +38/−22, `client/manager.py` +16/−1, `config/loader.py` +64/−4, `identity.py` +41/−24, `manifest/environment.py` +26/−8, `manifest/loader.py` +553/−31, `manifest/matcher.py` +143/−66, `server.py` +6/−17, `tools/handlers.py` +399/−255). `handlers.py` grows because `request_capability`'s tiers move, unchanged in substance, into one method each (D2, rev 7).
+> - Tests: one module is new (`tests/test_catalog_overlay_discovery.py`, 309 tests).
+>   Four existing tests are migrated (D4, D9; rev 7 adds one allowlist row in
+>   `tests/test_credential_predicate_guard.py`, because the code it names moved).
+> - Docs: two CHANGELOG bullets (Fixed, Upgrade notes), two README paragraphs, and a
+>   `MIGRATING.md` section, rollback row, contents link and log-grep alternative, all as a
+>   verbatim patch (rev 7: `tests/test_migration_doc.py` requires the section and row for
+>   the Upgrade note).
 > - It is still one conceptual change: an overlay can add to discovery, and one entry can
 >   never take the rest down.
+>
+> **Revision 7** (2026-10-05): board round 6 on `9a6c2fd` (Consiliency/pmcp#343). Grok and
+> gemini agreed, claude partially agreed (one non-blocking note), codex disagreed with two
+> blocking findings. All three falsifiers reproduce natively on rev 6 (`b8e4305` + the
+> rev-6 patch) and pass on rev 7:
+> - **B14 (codex F001)**: an overlay CLI still pre-empted the **registry** tier. Rev 6
+>   returned the overlay CLI before it asked the registry, so `connect Reviewservice`
+>   went from `candidates: [review-registry-server]` to `use_cli: reviewcli`, and the
+>   606-term differential never generated an unknown-service query. Rev 7 states the
+>   order **once**, as `REQUEST_CAPABILITY_TIERS = (name, shipped_cli, category,
+>   configured, registry, overlay_cli)`. `request_capability` asks each tier through
+>   `_capability_tier_<tier>` and returns only from that loop, so no return path can put
+>   an overlay CLI ahead of a later tier. The differential is generated **per declared
+>   tier** (every shipped server name, every shipped-CLI keyword, every category word, 8
+>   configured servers, 8 registry services), records which tier answered, and fails if a
+>   declared tier has no generator or never answers (D2; T1–T5, K3).
+> - **B15 (codex F002)**: discovery logged values a `.mcp.json` entry inherited from an
+>   overlay. `filter_self_references`' WARNING and `is_self_reference`'s three DEBUG lines
+>   printed `command` and `args`, which a command-less entry inherits from the manifest
+>   entry of the same name. Every diagnostic on D9's paths now renders a config field
+>   through one function, `identity.config_field_diagnostic` (the server's label and the
+>   field's name, never a value). A test derives every diagnostic in `src/pmcp` that reads
+>   a config field (38 sites in 31 functions) and fails on any that is not outside D9's
+>   paths with a stated reason. A new walk plants a sentinel in every server field of kept
+>   overlay entries that command-less `.mcp.json` entries inherit (local, remote,
+>   self-referencing by path, by `uvx` and by `python -m`; overlay-only and shipped names;
+>   the injected credential) and drives load, startup, discovery, refresh and lazy
+>   registration at DEBUG (D9; V1–V3).
+> - **N1 (claude, non-blocking)**: in `cli_hints`, an overlay CLI was listed above a
+>   shipped CLI on a tie or with an inflated score. Fixed rather than documented: the same
+>   origin rule now orders every CLI-hint list in `rank_cli_hints`, shipped first (D2; H1).
+> - **Docs.** `b8e4305`'s `tests/test_migration_doc.py` requires a `MIGRATING.md` section
+>   and rollback row for every Upgrade-notes title, so the docs are now a verbatim patch
+>   and part of the proof.
 >
 > **Revision 6** (2026-10-04): board round 5 on `4798034` (Consiliency/pmcp#343). Codex
 > and gemini reviewed, grok timed out, and claude disagreed. The field walk (1039 cases),
@@ -66,6 +104,14 @@
 >
 > **Revision 2** (2026-10-03): board round 1 on `bd5c25f`. Consumer-model checks and
 > per-consumer guards; `null` as absent; "within the result limit".
+
+## Round 6 board findings (Consiliency/pmcp#343 @ `9a6c2fd`)
+
+| finding | seat | reproduced (natively, `b8e4305` + rev 6) | resolution |
+|---|---|---|---|
+| **B14** an overlay CLI pre-empts the registry tier (`connect Reviewservice` → `use_cli: reviewcli`, registry never asked) | codex F001 | yes: codex's falsifier fails on rev 6 (`'use_cli' == 'candidates'`); so do the per-tier differential's 8 registry scenarios | D2: one declared tier list, one return path; differential generated per declared tier with a coverage check. T1–T5, K3 |
+| **B15** discovery logs `command`/`args` a `.mcp.json` entry inherited from an overlay (`Excluding server 'puppeteer' … (command: pmcp sk-review-overlay-only-61d)`) | codex F002 | yes: codex's falsifier fails on rev 6 (the sentinel is in the DEBUG and WARNING records) | D9: `config_field_diagnostic` is the one renderer; the diagnostic sites are derived; the inherited-data walk. V1–V3 |
+| N1 an overlay CLI is listed above a shipped CLI in `cli_hints` (overlay `aaa`, keyword `json`: `['aaa', 'jq']`) | claude (non-blocking) | yes: claude's falsifier fails on rev 6 and on main (`assert 1 < 0`) | D2: `rank_cli_hints` orders shipped CLIs first, so every CLI-hint list follows the tier rule. H1 |
 
 ## Round 5 board findings (Consiliency/pmcp#343 @ `4798034`)
 
@@ -403,7 +449,7 @@ named here and not built.
 
 ### The test surface this touches
 
-- **New:** `tests/test_catalog_overlay_discovery.py` (271 tests).
+- **New:** `tests/test_catalog_overlay_discovery.py` (309 tests).
 - **Migrated** (verbatim patch below):
   - `tests/test_version_pin.py`:
     - `test_a_pin_on_a_malformed_entry_costs_only_that_entry` (3 cases). An int in `args`,
@@ -413,10 +459,24 @@ named here and not built.
       skipped whole, so there are 9 refusal lines instead of 10.
   - `tests/test_manifest_overlay.py::test_server_env_unknown_server_warns_and_skips`. The
     warning no longer shows the overlay's own key.
+  - `tests/test_credential_predicate_guard.py` (rev 7): its allowlist of functions that
+    read the `CapabilityCandidate.requires_api_key` wire field names
+    `request_capability`; that read (the category tier's free / key-ready / key-missing
+    grouping) moved, unchanged, into `_capability_tier_category`, so the row moves with
+    it. Without it, `test_no_unallowlisted_attribute_reads` and
+    `test_allowlisted_entries_still_present` fail: the first rev-7 full suite measured
+    exactly those 2 failures (9108 passed), before this row was migrated.
 - **Unchanged and passing:** `tests/test_manifest.py`'s IDF tests (hand-built manifests,
   main's weighting) and `tests/test_manifest_cache.py` (47).
 - **Touched suites, by name (24 files):** `tests/test_catalog_overlay_discovery.py`, `tests/test_client_manager.py`, `tests/test_client_manager_reconnect.py`, `tests/test_config_loader.py`, `tests/test_credential_gates_handlers.py`, `tests/test_credential_gates_startup.py`, `tests/test_credential_optionality_e2e.py`, `tests/test_env_overlay_provenance.py`, `tests/test_lazy_start.py`, `tests/test_manifest.py`, `tests/test_manifest_cache.py`, `tests/test_manifest_overlay.py`, `tests/test_manifest_provision.py`, `tests/test_offline_discovery.py`, `tests/test_phase4_e2e.py`, `tests/test_project_source_consent_manifest.py`, `tests/test_scoped_advisor_audit.py`, `tests/test_server.py`, `tests/test_startup_policy_reapproval.py`, `tests/test_startup_resolver.py`, `tests/test_tools.py`, `tests/test_trust_cli.py`, `tests/test_version_pin.py`, `tests/test_secrets_command.py`.
-  Result: **2489 passed, 1 skipped, 19 deselected, 0 failed** (874.68 s, on b2884db + the same hunks); on 6edf8a4 the full suite (step 8) covers them.
+  Rev 7 adds `tests/test_identity.py` and `tests/test_baseline_constraints.py`
+  (`identity.py`), `tests/test_credential_predicate_guard.py` (the moved tier code) and
+  `tests/test_migration_doc.py` (the docs patch). Result on `b8e4305`: the full suite
+  (Verification step 8) covers all 28. The regression run right
+  after the rev-7 source change (the module, `test_tools.py`, `test_identity.py`,
+  `test_baseline_constraints.py`, `test_offline_discovery.py` and the three round-6
+  falsifiers) was 548 passed, 0 failed; `test_migration_doc.py` with the docs patch: 37
+  passed.
 
 ### Cost
 
@@ -427,29 +487,37 @@ named here and not built.
   about 0.01 ms per entry. Shipped entries are not checked at load; they are checked by a
   test. An overlay pays that once per entry per cache miss.
 
-### Every discovery tier, derived (rev 6)
+### Every discovery tier, declared (rev 7; derived in rev 6)
 
-Derivation: every `return CapabilityResolution(` in `request_capability`, in source order,
-and the result lists of `catalog_search` and `_keyword_match` (`match_capability`). `awk`
-over `handlers.py` / `matcher.py`.
+Rev 6 derived this table from the code, and the code then disagreed with it: the overlay
+CLI answered at step 5, **before** the registry at step 6 (codex F001). Rev 7 makes the
+code read the table. `handlers.REQUEST_CAPABILITY_TIERS` is the only statement of the
+order; `request_capability` builds one `_CapabilityRequest` and asks each tier in turn
+through `_capability_tier_<tier>`, returning the first answer. The bodies of the tiers are
+main's, moved.
 
-| entry point | tier (in order) | what answers | overlay CLI, rev 6 |
+| entry point | tier (in order) | what answers | overlay CLI, rev 7 |
 |---|---|---|---|
-| `request_capability` | 1. name | a manifest server whose normalised name is in the query; yields to a colliding **shipped** CLI unless the query says "server"/"mcp"/… (main) | cannot collide: `name_match_collides_with_cli` sees only shipped CLIs |
-| | 2. shipped CLI (`use_cli`) | the first available **shipped** CLI hint | excluded |
-| | 3. category (`pick_from_category`) | the base-only category tier (D2) | — |
-| | 4. configured server | a `.mcp.json` server by keyword | — |
-| | **5. overlay CLI (`use_cli`)** | **the first available overlay CLI hint: only here, after every server tier** | answers |
-| | 6. registry | only for an unknown PascalCase service | — |
-| | 7. `not_available` | — | — |
-| `catalog_search` | separate lists | `results` (tools), `manifest_candidates`, `registry_candidates`, `cli_hints` | in `cli_hints` only. CLI and server results are never combined, so nothing to rank |
-| `match_capability` / `_keyword_match` | single best | shipped CLIs and servers, best score ≥ 0.2 (CLI preferred on ties, as on main) | considered only if neither a shipped CLI nor a server reaches 0.2 |
+| `request_capability` | 1. `name` | a manifest server whose normalised name is in the query; yields to a colliding **shipped** CLI unless the query says "server"/"mcp"/… (main) | cannot collide: the collision check sees only the shipped-CLI match |
+| | 2. `shipped_cli` (`use_cli`) | the first available **shipped** CLI hint | excluded |
+| | 3. `category` (`pick_from_category`) | the base-only category tier (D2); skipped for an unknown named service | — |
+| | 4. `configured` | a `.mcp.json` server by keyword | — |
+| | 5. `registry` | MCP Registry candidates, only for an unknown PascalCase service | — |
+| | **6. `overlay_cli` (`use_cli`)** | **the first available overlay CLI hint: only here, after every other tier** | answers |
+| | then `not_available` | the one return after the loop | — |
+| `catalog_search` | separate lists | `results` (tools), `manifest_candidates`, `registry_candidates`, `cli_hints` | `cli_hints` **is** a ranking (claude N1): `rank_cli_hints` lists every shipped hint before every overlay hint, then by score and name as on main |
+| `match_capability` / `_keyword_match` | single best | shipped CLIs and servers, best score ≥ 0.2 (CLI preferred on ties, as on main) | considered only if neither a shipped CLI nor a server reaches 0.2 (rev 6, unchanged) |
 
-The rule is stated once, at the combination point, and not per tier. Overlay CLIs are
-removed from the shipped-CLI candidate, `cli_hint_match`, before any tier reads it. They
-come back in exactly one place, after the last server tier. That also covers tiers added
-later: a new server tier placed before step 5 outranks overlay CLIs without further
-change.
+Three tests hold the table to the code:
+- `test_the_declared_tiers_are_the_only_tiers_and_the_overlay_cli_is_last`: `overlay_cli`
+  is last; the `_capability_tier_*` methods are exactly the declared tiers; the AST of
+  `request_capability` has exactly two `return`s, one inside the loop over
+  `REQUEST_CAPABILITY_TIERS` and the `not_available` after it.
+- `test_every_declared_tier_has_a_scenario_generator`: a tier added to the tuple without a
+  generator fails.
+- `test_an_overlay_cli_answers_after_every_declared_tier`: the differential (D2).
+
+A tier added later goes before `overlay_cli` and outranks it with no further change.
 
 ### The rev-4 full-suite failure, pinned down (rev 5)
 
@@ -616,6 +684,47 @@ like the server), every category word and name, and every shipped keyword
 
 It also asserts that an overlay CLI still answers where nothing else did (not vacuous).
 
+*Rev 6's "one rule at the combination point" was still a hand-placed `return`: it sat
+before the registry tier, and the 606 terms never named an unknown service (codex F001).*
+
+**One declared order, one return path (rev 7, B14).** `REQUEST_CAPABILITY_TIERS` in
+`handlers.py` is the order, and `request_capability` is a loop over it (see *Every
+discovery tier, declared*). An overlay CLI is the last tier by construction: the
+shipped-CLI tier and the name-tier collision read only `shipped_cli_match`, and
+`overlay_cli_match` is read only by `_capability_tier_overlay_cli`. The registry is now
+asked before an overlay CLI answers, exactly as it is when no overlay exists, so an
+unknown-service query that also matches an overlay CLI costs the same registry lookup it
+costs without the overlay.
+
+**The differential is generated per declared tier, with coverage (rev 7).**
+`test_an_overlay_cli_answers_after_every_declared_tier` takes one generator per tier in
+`REQUEST_CAPABILITY_TIERS` except `overlay_cli`:
+
+| tier | generated scenarios |
+|---|---|
+| `name` | every shipped server name (107) |
+| `shipped_cli` | every keyword of every shipped CLI, with that CLI available |
+| `category` | every category word and name (the category vocabulary) |
+| `configured` | 8 `~/.mcp.json` servers, each queried by its own argument |
+| `registry` | 8 unknown PascalCase services (`connect Reviewservice`, …), registry stubbed as in codex's falsifier |
+
+It wraps every `_capability_tier_*` method to record which tier answered. It runs every
+scenario, then adds one AVAILABLE overlay CLI per scenario term (named like the term where
+the name is free) and runs them again. For every scenario that a tier answered, the same
+tier answers with the same response (`model_dump()` equal). Every declared tier other than
+`overlay_cli` must answer at least once, and an overlay CLI must still answer somewhere
+that nothing else did. The rev-6 606-term differential stays as well: it also checks
+`catalog_search` and `match_capability`.
+
+**Every CLI-hint list follows the same rule (rev 7, claude N1).** `rank_cli_hints` sorts
+by `(is an overlay CLI, -score, name)`, so `catalog_search`'s `cli_hints` lists every
+shipped CLI before any overlay CLI, whatever the overlay's score or name; within each
+origin the order is main's. `request_capability`'s two CLI tiers read the same list.
+`test_every_shipped_cli_hint_precedes_every_overlay_cli_hint` generates an overlay CLI for
+every keyword of every shipped CLI, named to sort first (`aaa-<i>`) and repeating its
+keyword five times to inflate its score; every shipped hint is still listed first and no
+shipped hint is lost.
+
 
 ### D3. Carry the base weights through `_build_manifest_with_config_servers`
 
@@ -773,13 +882,16 @@ The rule is uniform because an overlay entry is a whole-entry replacement: there
 ### D9. No overlay name or value in a log line on the paths this plan touches
 
 **The promise, exactly.** No log record emitted by the following carries an overlay entry's
-key (unless pmcp ships that name) or a value from an overlay entry:
+key (unless pmcp ships that name) or a value from an overlay entry, **including a value a
+`.mcp.json` entry inherited from one** (rev 7):
 - manifest loading and overlay parsing, **including a document that fails to parse**
   (rev 5);
 - the four sites that catch a `load_manifest()` failure and log it: gateway startup,
   `gateway.refresh`, `load_configs`' defaults, and `pmcp secrets` (which logs nothing)
   (rev 5);
-- discovery: `catalog_search`, `request_capability`, `match_capability`, `rank_cli_hints`;
+- discovery: `catalog_search`, `request_capability`, `match_capability`, `rank_cli_hints`,
+  and the configured-server load they run (`load_configs` → `filter_self_references`)
+  (rev 7);
 - CLI probing: `probe_clis`, `check_cli`, `get_cli_help`;
 - startup and refresh resolution: the shared skip lines;
 - lazy registration (`Registered lazy server`);
@@ -803,6 +915,64 @@ consumer derivation:
   for example `Configured server '<name>': ignoring its manifest defaults (…)` (rev 4).
 
 **How:**
+- **Every config field through one renderer (rev 7, B15).** A command-less `.mcp.json`
+  entry inherits `command`, `args`, the manifest's `extra_env` and the credential from the
+  manifest entry of the same name (`_merge_manifest_defaults`), which an overlay may have
+  added or replaced. So any field of a configured entry may hold overlay data. On D9's
+  paths a diagnostic names a config field through `identity.config_field_diagnostic`:
+  the server by `entry_log_name` and the field by its name, never a value. The
+  self-reference check now returns the field that makes a config spawn the gateway
+  (`_self_reference_field`: `command`, `args` or `name`), and both its DEBUG line and
+  `filter_self_references`' WARNING render that, for example
+  `Excluding server 'puppeteer' (field 'command') to prevent recursive spawning: it invokes the gateway`.
+  `is_self_reference` keeps its signature, so `tests/test_identity.py` is unchanged.
+- **The diagnostic sites are derived, and the table fails closed (rev 7).**
+  `test_no_diagnostic_on_these_paths_reads_a_config_field` walks every function in
+  `src/pmcp`. A *diagnostic* is a logger call, `warnings.warn` or a raised exception's
+  arguments. It *reads a config field* when an argument reads an attribute, subscript key
+  or `getattr`/`.get` name that is a field of `ServerConfig`, `CLIAlternative`,
+  `LocalMcpServerConfig` or `RemoteMcpServerConfig`, directly, through a local assigned
+  from one (a fixpoint over assignments and loop targets), or through a parameter named
+  like a field. On rev 6 it also finds `identity.py`'s four sites (in
+  `is_self_reference` and `filter_self_references`); on rev 7 it finds 38 sites in 31
+  functions, none in `identity.py`, each function listed in
+  `DIAGNOSTIC_SITES_OUTSIDE_D9` with its reason:
+
+  | reason | functions |
+  |---|---|
+  | lifecycle, from the first start attempt (out of scope, above) | `client/manager.py` `_connect_stdio`, `_remote_headers` |
+  | provisioning, install or update (an explicit operator action) | `manifest/installer.py` `start_install`, `install_server`, `verify_installation`, `_monitor_install`; `version_checker._npm_package_arg` (update and package checks); `handlers._run_update_probe_command` |
+  | `pmcp refresh` (out of scope, above) | `manifest/refresher.py` `refresh_server`, `refresh_all`, `refresh_target`, `check_staleness` |
+  | not a config field (a count, an HTTP status, a request URL or header) | `redirect_request` ×3, `transport/http.py` ×2, `_build_manifest`'s count line, `server.initialize`'s count line, `provision_status`, the four registry `get_*_version` HTTP-status lines, `client/manager.py` `call_tool`, `read_resource`, `get_prompt`; `cli.py` `run_status` and `_run_trust_revoke_package` (an argparse namespace named `args`) |
+  | not manifest input (a discovered or registry package) | `register_discovered_server`, `package_approvals._require_identity_fields` |
+
+  A site the walk finds that is not in the table fails the test, and so does a row that no
+  longer matches a site, so the table cannot drift into an unchecked list.
+- **The inherited-data walk (rev 7).** `test_no_inherited_overlay_value_reaches_any_diagnostic`
+  runs once per server field that can hold a string (27 of 31; `requires_api_key`,
+  `auto_start`, `transport` and `supports_url_elicitation` cannot), plus once with no
+  field: 28 cases. Each overlay holds **kept** entries with a field-specific
+  sentinel: an overlay-only local server, a replaced shipped one (`github`), a remote
+  one, and four self-referencing ones (a `…/pmcp` path in `command`, `uvx …/pmcp`,
+  `python -m pmcp`, and codex's `puppeteer` with `command: pmcp`), each with a
+  command-less `~/.mcp.json` entry of the same name, so `load_configs` inherits from it,
+  and the credential set in the environment, so `_merge_manifest_defaults` injects it.
+  It drives `load_manifest`, `load_configs` → `filter_self_references` →
+  `resolve_startup_configs` (gateway startup's sequence), the startup skip lines,
+  `catalog_search` (`include_offline` both ways), `request_capability`,
+  `match_capability`, `gateway.refresh`, `register_lazy_configs` and `pmcp secrets` at
+  DEBUG, and asserts no log record and no Python warning carries any sentinel
+  (case-insensitive).
+- **Responses carry only what a candidate is for (rev 7).** The same walk serialises every
+  `catalog_search` and `request_capability` response and asserts that no sentinel appears
+  in it except a field a response exists to return: what `manifest_candidate_fields`
+  copies (`description`, `transport`, `url`, `package`, `server_card_url`,
+  `declared_scopes`, `declared_capabilities`), the credential metadata
+  (`env_var`, `env_instructions`) and the `keywords` the configured tier quotes.
+  `test_the_response_fields_are_the_candidate_projection` derives the first set from
+  `manifest_candidate_fields`' source, so a field added to the candidate is added here
+  with it. `command`, `args`, `install`, `extra_env`, `headers`, the metadata URLs and
+  the credential value never reach a response.
 - **Every exception from the YAML load (rev 6, B13).** The overlay parse catches every
   exception, not only `YAMLError`. With PyYAML 6.0.3 a constructor raises `ValueError`
   (`!!int x`, `!!float x`), `KeyError` (`!!bool x`; its text is the value, lowercased) or
@@ -862,6 +1032,11 @@ consumer derivation:
 - `probe_clis` / `check_cli` log the label and the exception class.
 
 **Tests:**
+- the inherited-data walk (rev 7, above) plants field sentinels in **kept** entries that
+  `.mcp.json` entries inherit, including self-references, and checks logs, Python
+  warnings and responses; codex's round-6 falsifier and
+  `test_the_field_diagnostic_names_a_field_never_a_value` pin the renderer; the derived
+  site table (above) is a test;
 - the field walk plants a name and a value sentinel in **rejected** entries;
 - `test_no_overlay_name_or_value_reaches_any_log_on_these_paths` plants them in **kept**
   entries, then drives:
@@ -874,8 +1049,9 @@ consumer derivation:
   - the real `ClientManager.register_lazy_configs`.
 
   It asserts that no record at DEBUG carries either sentinel.
-- Mutants L1–L6 each reintroduce one leak, and Y1–Y3 reintroduce an error's text; each
-  is red.
+- Mutants L1–L6 each reintroduce one leak, Y1–Y3 reintroduce an error's text, and V1–V3
+  reintroduce the inherited-value leak in the self-reference WARNING, its DEBUG line, and
+  an overlay key in the renderer; each is red.
 
 ### D10. Ties and the result limit (claude F4)
 
@@ -885,6 +1061,10 @@ not removal: `playwright` is still a candidate at a larger limit. The class test
 limit for that reason. The plan keeps the tie-break as it is: preferring shipped servers on
 ties is a ranking-policy change of its own, and nothing in Consiliency/pmcp#342 asks for it.
 The CHANGELOG and README wording now says "within the result limit".
+
+This is about servers. Rev 7 does order CLI hints by origin (shipped first, D2), because
+there it is the same tier rule `request_capability` already applies, not a new tie-break
+policy: within each origin the order is still score, then name.
 
 ## Changes
 
@@ -920,14 +1100,21 @@ The CHANGELOG and README wording now says "within the result limit".
   from `cli_hint_fields`. Each CLI is guarded (G4).
 - `_keyword_match` guards each server (G7). Rev 6: it considers overlay CLIs only when
   neither a shipped CLI nor a server reaches the threshold (D2).
+- Rev 7: `rank_cli_hints` sorts by `(is an overlay CLI, -score, name)`, so every CLI-hint
+  list puts shipped CLIs first (D2, claude N1).
 
 ### `src/pmcp/tools/handlers.py` (modify)
 - `_build_manifest_with_config_servers` carries the base weights and, in rev 4, the base
   category statistics (D3).
 - Rev 4: `request_capability`'s name index keeps the base name on a normalised tie.
-- Rev 6: `cli_hint_match` holds shipped CLIs only, and `overlay_cli_match` answers after
-  every server tier; `_use_cli_resolution` is shared by both (D2, which replaces rev 5's
-  category-only gate). `_names_an_unknown_service` (rev 5) is the shared PascalCase
+- Rev 7: `REQUEST_CAPABILITY_TIERS` (module level) and `_CapabilityRequest` (what every
+  tier reads, computed once). `request_capability` is a loop over the tuple; each tier's
+  body moves, unchanged in substance, into `_capability_tier_name`, `_shipped_cli`,
+  `_category`, `_configured`, `_registry` and `_overlay_cli` (D2, B14). The registry
+  tier now precedes the overlay CLI.
+- Rev 6: `cli_hint_match` (rev 7: `shipped_cli_match`) holds shipped CLIs only, and
+  `overlay_cli_match` answers last; `_use_cli_resolution` is shared by both (D2, which
+  replaces rev 5's category-only gate). `_names_an_unknown_service` (rev 5) is the shared PascalCase
   pre-check. `gateway.refresh` logs a
   manifest-load failure by class only (D9).
 - `_manifest_candidates_for_query` builds its candidate from `manifest_candidate_fields`,
@@ -937,6 +1124,15 @@ The CHANGELOG and README wording now says "within the result limit".
 - `_log_unusable_manifest_entry`: one helper for all of the guards' warnings.
 - Both name matches use `normalized_server_name`. `Matched CLI hints` logs labels, and
   the refresh skip lines go through `startup_skip_message` (D9).
+
+### `src/pmcp/identity.py` (modify, rev 7)
+- `_self_reference_field(config)`: the field that makes a config spawn the gateway
+  (`command`, `args` or `name`), or `None`. `is_self_reference` wraps it and keeps its
+  signature.
+- `config_field_diagnostic(config, field_name)`: the one renderer for a config field on
+  D9's paths: `server <entry_log_name> (field '<name>')`.
+- `is_self_reference`'s DEBUG line and `filter_self_references`' WARNING render through
+  it and print no `command` or `args` (D9, B15). The file keeps its CRLF line endings.
 
 ### `src/pmcp/manifest/environment.py` (modify)
 - `probe_clis` guards each `check_command` (G5). `probe_clis`, `check_cli` and
@@ -964,7 +1160,14 @@ The CHANGELOG and README wording now says "within the result limit".
 - `Registered lazy server` names a manifest-derived server by its label (`_lazy_log_name`,
   D9).
 
-### `tests/test_catalog_overlay_discovery.py` (new, 271 tests; verbatim below)
+### `tests/test_catalog_overlay_discovery.py` (new, 309 tests; verbatim below)
+- **Rev 7:**
+  - the three round-6 falsifiers: codex F001 (registry), codex F002 (inherited argument),
+    claude N1 (`cli_hints`);
+  - the declared-tier test, the generator-coverage test and the per-tier differential;
+  - the `cli_hints` origin class test;
+  - the derived diagnostic-site table, the field-renderer test, the response-field
+    derivation, and the inherited-data walk (28 cases).
 - **R1, as in rev 1:**
   - the end-to-end approve and revoke through the real CLI, loader and consent gate;
   - no query in any state;
@@ -1013,75 +1216,53 @@ The CHANGELOG and README wording now says "within the result limit".
     `load_configs`, partial `.mcp.json` entries and `pmcp secrets`, and fails on any
     value-bearing Python warning.
 
-### `tests/test_version_pin.py`, `tests/test_manifest_overlay.py` (migrate, +18/−7; verbatim below)
+### `tests/test_version_pin.py`, `tests/test_manifest_overlay.py`, `tests/test_credential_predicate_guard.py` (migrate, +27/−8; verbatim below)
 - See *The test surface this touches*.
+
+### `CHANGELOG.md`, `README.md`, `MIGRATING.md` (modify, rev 7; verbatim below)
+- See *Documentation impact*.
 
 ## Documentation impact
 
-- `CHANGELOG.md`: one bullet under `## [Unreleased]` → `### Fixed` (`CHANGELOG.md:567` on
-  `6edf8a4`, verified to sit under `[Unreleased]`):
+Rev 7 ships the documentation as a verbatim patch (*Patch — docs*, below), because
+`b8e4305`'s `tests/test_migration_doc.py` checks it: every bolded title in the CHANGELOG's
+first `### Upgrade notes` block needs a `MIGRATING.md` section answering the four
+questions (with something to run or write under *What to do*) and exactly one
+`rollback-table` row; every message the guide quotes must match a template in `src/pmcp`;
+every alternative of the checklist's log `grep` must match a real WARNING; every
+`manifest-overlay` snippet must load with no warning. With the patch applied the test
+passes (37 passed).
 
-  > **An overlay no longer hides other servers from discovery, and one bad overlay entry no
-  > longer takes down the others.** Discovery weighs a keyword by how many servers declare
-  > it, and it counted over the merged manifest. So an approved project overlay (or a user
-  > or `PMCP_MANIFEST_PATH` overlay) whose server shared a keyword pushed every server with
-  > that keyword below the match threshold. `gateway.catalog_search` then returned no
-  > candidate, not even the shipped or user server. Keyword weights now come from the
-  > shipped manifest alone, so an overlay can add candidates and never removes one, within
-  > the result limit.
-  >
-  > Separately, a wrongly typed field in one overlay entry made `catalog_search` fail for
-  > every query, or stopped gateway startup and `gateway.refresh` for every server.
-  > Examples: `keywords: null`, a non-string `transport`, an int in `args`, or a bad
-  > `cli_alternatives` entry. An overlay entry that any part of pmcp would reject is now
-  > skipped when the overlay is read; an entry nothing would fail on still loads as
-  > before. The warning names the field, never its value, and never shows an overlay
-  > entry's name. Loading, discovery, CLI probing and the startup and refresh skip lines no
-  > longer log an overlay entry's name or values either. A blank (`null`) field now means "not set" and
-  > takes its default, instead of dropping the entry. One overlay entry also no longer
-  > stops other `.mcp.json` servers from loading when one of them inherits its defaults,
-  > or makes `pmcp secrets` drop other servers' auth metadata. An overlay that replaces a
-  > shipped server no longer changes how `gateway.request_capability` picks a category
-  > for anything else. See
-  > [Consiliency/pmcp#342](https://github.com/Consiliency/pmcp/issues/342).
-
-  Never put a closing keyword next to the number.
-- `CHANGELOG.md` `### Upgrade notes` (`CHANGELOG.md:10` on `6edf8a4`; "Things 2.7.3 accepted
-  that 2.8.0 refuses"), one bullet:
-
-  > - **An overlay entry that part of pmcp would fail on is skipped when the overlay is
-  >   read**, with a WARNING naming the field, for example an `args` or `command` that is
-  >   not a string, or a `cli_alternatives` entry with an empty `check_command`. Before,
-  >   it loaded and then made `catalog_search` fail, or stopped startup and
-  >   `gateway.refresh` for every server. An overlay CLI no longer outranks a server in
-  >   `gateway.request_capability`. *Fixed*
-- `README.md` § "Private manifest overlay", the "fail-soft" paragraph (`README.md:1261` on
-  `6edf8a4`).
-  Replace "a malformed file or a single bad entry logs a warning and is skipped" with:
-
-  > "a malformed file logs a warning and is skipped; so does a single entry that pmcp could
-  > not use: a field some part of pmcp would fail on, such as `keywords: [1]`, an `args`
-  > holding a number, or a CLI alternative with an empty `check_command`. Fields pmcp only
-  > tests for truth or ignores (`transport` without a `url`, `auto_start`, `status`) are
-  > accepted as before. The
-  > warning names the field, not its value, and does not show the entry's name unless pmcp
-  > ships it. A blank field (`description:` with nothing after it) means 'not set'."
-
-  Then add:
-
-  > "An overlay's servers are found by their own keywords. Sharing a keyword with another
-  > server, or replacing a shipped server, never hides another server from
-  > `gateway.catalog_search` or `gateway.request_capability` (within the result limit;
-  > ties rank by name; a query that names a server resolves to it)."
+- `CHANGELOG.md` `## [Unreleased]` → `### Fixed` (the block's first bullet, `CHANGELOG.md:606`
+  on `b8e4305`): the rev-6 bullet, extended for rev 7 with inherited `.mcp.json` values,
+  the self-reference warning, and overlay CLIs ranking after servers and after pmcp's own
+  CLIs in `cli_hints`. It links
+  [Consiliency/pmcp#342](https://github.com/Consiliency/pmcp/issues/342) with no closing
+  keyword.
+- `CHANGELOG.md` `### Upgrade notes`, after **Manifest version pins** (`CHANGELOG.md:93`):
+  **An overlay entry pmcp cannot use is skipped.** The title is shorter than rev 6's,
+  because it is now also a `MIGRATING.md` heading and anchor.
+- `README.md` § "Private manifest overlay": the "fail-soft" paragraph (`README.md:1270` on
+  `b8e4305`) is replaced with rev 6's wording, and the "found by their own keywords"
+  paragraph is added before the security note, with one more sentence for overlay CLIs.
+- `MIGRATING.md`:
+  - a `### An overlay entry pmcp cannot use is skipped` section after *Manifest version
+    pins*, with the four questions, a `manifest-overlay` snippet that loads cleanly, and
+    the `grep -c 'Skipping invalid '` check;
+  - its `rollback-table` row: "Safe on 2.7.3: it loads a corrected entry the same way. An
+    entry 3.0 skips loads again on 2.7.3, and can again make `gateway.catalog_search` fail
+    for every query." No † claim: 2.7.3 was not run for this row;
+  - its link in *Contents*;
+  - `Skipping invalid ` added to the checklist's log `grep` (step 6), whose text promises
+    "every WARNING that 3.0 adds or rewords"; the rev-6 skip lines are reworded.
 - No `SECURITY.md` change. Consent semantics are unchanged (D5). D9 strengthens an existing
   property, that overlay keys and values are not logged, and adds no claim the security
-  checker would need to track. Run `scripts/check_security_claims.py`.
+  checker would need to track. `scripts/check_security_claims.py`: OK, 131 cited node ids.
 
 ## Dependencies & order
 
-1. Applies to `6edf8a4` (re-fetched for rev 6). The source patch below is the three-way
-   merge onto it, with no conflict, and applies with `git apply`. Consiliency/pmcp#330's
-   task-units change sits next to it in `handlers.py` and `server.py` with no overlap. Consiliency/pmcp#298 is already on
+1. Applies to `b8e4305` (re-fetched for rev 7). The source patch below applies with
+   `git apply`; `b8e4305` changed no file the source patch touches. Consiliency/pmcp#298 is already on
    main (PR 337). The other open change in this area is Consiliency/pmcp#297
    (`origin/plan/297-validation-echo` @ `48b7a89`, compared in rev 1):
    - Its `loader.py` hunks are the YAML parse sites, `_shipped_manifest_entries`, and
@@ -1107,10 +1288,10 @@ The CHANGELOG and README wording now says "within the result limit".
      check it.
 2. Within the plan, apply the source patch, the new module and the test migration
    together: the migration fails without the source patch, and the source patch fails the
-   three migrated tests without it.
+   four migrated tests without it.
 3. Docs last.
 
-## Verification (measured this session on the rev-6 spike; the implementer re-runs each step)
+## Verification (measured this session on the rev-7 spike, on `b8e4305`; the implementer re-runs each step)
 
 Run from the worktree. Before running:
 - A fresh worktree needs `uv sync --all-extras -p 3.10` first.
@@ -1125,50 +1306,51 @@ Run from the worktree. Before running:
   this session).
 
 ```bash
-# 1. The new module: red on main and on rev 5, green on rev 6
+# 1. The new module: red on main and on rev 6, green on rev 7 (all on b8e4305)
 uv run pytest tests/test_catalog_overlay_discovery.py -q -p no:cacheprovider --no-cov --cov-fail-under=0
-#   rev-6 spike: 271 passed
-#   same file on main b2884db:     200 failed, 71 passed (the 71 pin main's behaviour: must-load, main-weighting, controls, no-query)
-#   same file on the rev-5 patch:  25 failed, 246 passed: exactly round 5's findings (12 invalid-tag cases, 5 stored-only fields, the stored-only and schema-key derivations, the all-terms overlay-CLI differential, and the six round-5 falsifiers)
+#   rev-7 spike: 309 passed
+#   same file on main b8e4305:      238 failed, 71 passed (the 71 pin main's behaviour, as in rev 6: must-load, main-weighting, controls, no-query)
+#   same file on the rev-6 patch:   37 failed, 272 passed: exactly the rev-7 tests (codex's two round-6 falsifiers, claude's N1 falsifier, the declared-tier, generator-coverage and per-tier differential tests, the `cli_hints` class test, the derived site table, the field-renderer test, and all 28 walk cases). `test_the_response_fields_are_the_candidate_projection` passes there, as a derivation of unchanged code should
 
-# 2. Round 5's falsifiers (all are tests in the module), main vs rev 6
-#   claude F001 / codex F003  overlay CLI `airbnb` / `redis`: main and rev 5 use_cli, no server | rev 6 the server is a candidate
-#   codex F002 / claude F002  unknown key holding .nan / a date / !!binary: rev 5 drops the entry and logs the key | rev 6 loads it, logs no key
-#   codex F001                `command: !!int <sentinel>` through _build_manifest: main and rev 5 raise ValueError | rev 6 keeps playwright
+# 2. Round 6's falsifiers (all are tests in the module), rev 6 vs rev 7
+#   codex F001   `connect Reviewservice`, overlay CLI `reviewcli`: rev 6 use_cli, registry never asked | rev 7 the registry candidate, registry asked both times
+#   codex F002   inherited `command: pmcp`, `args: [sk-review-overlay-only-61d]`: rev 6 the sentinel in the DEBUG and WARNING records | rev 7 `server 'puppeteer' (field 'command')`
+#   claude N1    overlay `aaa` (keyword `json`): rev 6 and main ['aaa', 'jq'] | rev 7 ['jq', 'aaa']
 
 # 3. Lint, format, types (CI's own commands)
 uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/
 uv run mypy src/pmcp --exclude baml_client
-#   -> All checks passed! / already formatted / Success: no issues found in 52 source files
+#   -> All checks passed! / 182 files already formatted / Success: no issues found in 53 source files
 
-# 4. Touched suites (24 files, named in "The test surface this touches")
-#   -> **2489 passed, 1 skipped, 19 deselected, 0 failed** (874.68 s, on b2884db + the same hunks); on 6edf8a4 the full suite (step 8) covers them
+# 4. Touched suites (28 files, named in "The test surface this touches")
+#   -> covered by the full suite (step 8); the regression run right after the source change: 548 passed
 
-# 5. The real gateway, end to end (call.py; R1 table), on b2884db + rev 6 (same hunks)
-#   -> unapproved demo→[useronly], screenshot→[playwright]; approved demo→[projonly, useronly], screenshot→[playwright, projonly], gadget→[projonly]; revoked as unapproved; the gateway log names neither overlay server (0 lines)
+# 5. The real gateway, end to end (call.py; R1 table), on b8e4305 + rev 7
+#   -> unapproved demo→[useronly], screenshot→[playwright]; approved demo→[projonly, useronly], screenshot→[playwright, projonly], gadget→[projonly]; revoked as unapproved; no query → []; the gateway log (152 lines) names neither overlay server (0 lines)
 
-# 6. R1 class: copycat over all 569 shipped keywords
-python copycat.py      # main: 329 of 440 queries lose a candidate, 91 servers; rev 6: 0 of 440, 0 servers
+# 6. R1 class: copycat over all 569 shipped keywords (b8e4305 and b8e4305 + rev 7)
+python copycat.py      # main: 329 of 440 queries lose a candidate, 91 servers; rev 7: 0 of 440, 0 servers
 
-# 7. Mutation driver (59 mutants, appendix). RED requires failed > 0 and errors == 0; -x.
-#    Run in a /var/tmp scratch worktree of 31d0f40 + the same hunks; all 59 anchors re-checked on 6edf8a4.
-python mutants.py "$PWD"
-#   -> 59 of 59 mutants RED (a real test failure and no errors), every restore byte-identical (table below)
+# 7. Mutation driver (68 mutants, appendix). RED requires failed > 0 and errors == 0; -x.
+#    Six lanes, each a `git archive b8e4305` + the rev-7 patch, PYTHONPATH=<lane>/src, run concurrently.
+python mutants.py "$PWD" [ids...]
+#   -> 68 of 68 mutants RED (a real test failure and no errors), every restore byte-identical (table below). The lanes ran the module before two reason strings in `DIAGNOSTIC_SITES_OUTSIDE_D9` were reworded; no assertion reads them
 
-# 8. The full suite, once, alone, detached, on 6edf8a4 + the rev-6 patch (CI command minus -v)
+# 8. The full suite, once, alone, detached, on b8e4305 + rev 7 + docs (CI command minus -v)
 setsid nohup env -u npm_config_cache -u npm_config_store_dir -u pnpm_config_store_dir \
   uv run pytest tests/ -q --tb=short --cov --cov-report= -p no:cacheprovider \
-  --basetemp=/var/tmp/pmcp-342-bt-viperjuice/full7 > full7.log 2>&1 < /dev/null &
-#   -> 9035 passed, 5 skipped, 80 deselected, 0 failed in 1364.34s; coverage 90.57% (6edf8a4 + rev 6, alone, npm vars unset, --cov)
+  --basetemp=/var/tmp/pmcp-342-rev7-tmp-viperjuice/bt/full > full.log 2>&1 < /dev/null &
+#   -> 9110 passed, 5 skipped, 80 deselected, 0 failed in 1457.70s; coverage 90.56% (the step-10 proof tree: b8e4305 + the bodies extracted from this file, its own venv, alone, npm vars unset, --cov). The first run, on the spike before the predicate-guard row was migrated, was 9108 passed and exactly those 2 failed
 
 # 9. Gates
 python3 scripts/check_security_claims.py
 python3 scripts/check_plan_consistency.py .consiliency/plans/detailed-342-catalog-overlay-*.md
-#   -> OK, 129 cited node ids / blocking inconsistencies: 0
+#   -> OK, 131 cited node ids / 0 lane-contracted, 0 EC node ids, blocking inconsistencies: 0. That script checks phase plans (lane tables, EC node ids, roadmap pins), so it is vacuous here; the plan's own cross-check (every test the prose names is defined in the module, every cited mutant id is in the driver and the table, no stale base commit): 0 missing
 
-# 10. Embedding proof: extract the source patch, the test module and the migration patch from
-#     THIS file; on a clean 6edf8a4 tree: git apply --check, git apply, write the module, run it
-#   -> apply-check clean on 6edf8a4; source, module and migration cmp-identical to the spike; the module plus the two migrated modules: 455 passed
+# 10. Embedding proof: extract the source patch, the test module, the migration patch and
+#     the docs patch from THIS file; on a clean `git archive b8e4305` tree: git apply --check,
+#     git apply, write the module, run it with the migrated modules and test_migration_doc.py
+#   -> apply-check clean on a fresh `b8e4305` worktree for all three patches; the 16 changed files (9 source, 3 migrated tests, 3 docs, the module) cmp-identical to the spike; ruff, ruff format and mypy clean there; the module, the three migrated modules, `test_identity.py` and `test_migration_doc.py`: 559 passed (the module alone: 309)
 ```
 
 ## Acceptance criteria
@@ -1229,6 +1411,29 @@ python3 scripts/check_plan_consistency.py .consiliency/plans/detailed-342-catalo
 - [ ] **Rev 6, YAML constructors:** every invalid tag (15 kinds × user, env and project)
   is contained at the parse boundary, value-free, with the shipped manifest loaded;
   codex's `!!int` falsifier keeps `playwright` (E1).
+- [ ] **Rev 7, one declared tier order (supersedes rev 6's placement):**
+  `REQUEST_CAPABILITY_TIERS` is the only statement of `request_capability`'s order,
+  `overlay_cli` is its last element, and `request_capability` returns a tier's answer only
+  from the loop over it. In the per-tier differential (every shipped server name, every
+  shipped-CLI keyword, every category word, 8 configured servers, 8 registry services),
+  an available overlay CLI per term changes no scenario's answering tier or response,
+  every declared tier but `overlay_cli` answers at least once, and an overlay CLI still
+  answers where nothing else does. Codex's round-6 falsifier keeps
+  `review-registry-server` and asks the registry both times (T1–T5, K3).
+- [ ] **Rev 7, CLI hints:** every CLI-hint list puts shipped CLIs first; for every keyword
+  of every shipped CLI, an overlay CLI that sorts first by name and repeats the keyword
+  is listed after every shipped hint and removes none. Claude's round-6 falsifier lists
+  `jq` before `aaa` (H1).
+- [ ] **Rev 7, inherited values:** a diagnostic on D9's paths names a config field only
+  through `config_field_diagnostic`. The derived diagnostic sites are exactly
+  `DIAGNOSTIC_SITES_OUTSIDE_D9`, none in `identity.py`. For every string-holding server
+  field, kept overlay entries inherited by command-less `.mcp.json` entries (local,
+  remote, three self-reference shapes and codex's `puppeteer`; overlay-only and shipped
+  names; the injected credential) put no sentinel in any log record or Python warning
+  on load, startup, discovery, refresh or lazy registration, and none in a response
+  outside the candidate projection. Codex's round-6 falsifier passes (V1–V3).
+- [ ] **Rev 7, docs:** the docs patch applies, and `tests/test_migration_doc.py` passes
+  with it.
 - [ ] **Main's weighting:** `keyword_weights` equals main's verbatim function on 40
   generated alias-heavy keyword sets, hand-built and explicit-path, and codex's repro picks
   `a-other` (M17).
@@ -1241,8 +1446,9 @@ python3 scripts/check_plan_consistency.py .consiliency/plans/detailed-342-catalo
 - [ ] **The second line:** each of G1–G11 contains a hand-built bad entry on its own, and
   each guard mutant is red.
 - [ ] Every shipped server and CLI passes the parse-time checks.
-- [ ] Three existing tests are migrated exactly as in the patch below; no other existing
-  test changes.
+- [ ] Four existing tests are migrated exactly as in the patch below; no other existing
+  test changes (`tests/test_identity.py` and `tests/test_baseline_constraints.py` pass
+  unchanged against the new `identity.py`).
 - [ ] No query gives no manifest candidates in every consent state.
 - [ ] The full suite passes; ruff, ruff format and mypy (CI's commands) are clean;
   `check_security_claims.py` is OK; `check_plan_consistency.py` reports 0 blocking.
@@ -1259,9 +1465,10 @@ lives in. The driver (`mutants.py`, appendix):
 3. restores the file from a saved copy, never with git, and checks it with `cmp`.
 
 A mutant is **RED only when at least one test fails and none errors** (round 1, F6). The
-guard mutants narrow the guard's `except` to `ZeroDivisionError`. Each run stops at the first failure (`-x`; the module takes about 200 s), so a row shows
-the failing test and the count up to it. Run on the rev-6 spike text embedded below
-(Python 3.10.21).
+guard mutants narrow the guard's `except` to `ZeroDivisionError`. Each run stops at the first failure (`-x`), so a row shows
+the failing test and the count up to it. Run on the rev-7 spike text embedded below, on
+`b8e4305` (Python 3.10.21), in six concurrent lanes. Rev 7 re-anchors G9, G11 and K3
+(their code moved into the tier methods) and adds T1–T5, H1 and V1–V3.
 
 | id | mutant (the rule it breaks) | result | first failure | failing tests (first 4) |
 |---|---|---|---|---|
@@ -1269,8 +1476,8 @@ the failing test and the count up to it. Run on the rev-6 spike text embedded be
 | M2 | R1: base weights computed after the overlays are merged | **RED** 1 failed (restored=True) | assert [] == ['projonly', 'useronly'] | test_approve_then_revoke_through_the_cli_keeps_every_source_discoverable |
 | M3 | R1: request_capability's config-server view drops the base weights | **RED** 1 failed, 8 passed (restored=True) | assert None is not None | test_the_config_server_view_keeps_the_base_weights |
 | M4 | instance fix instead of the class: raise the IDF floor so a shared keyword passes | **RED** 1 failed, 7 passed (restored=True) | assert {'api': 0.7} == {'api': 0.5} | test_a_hand_built_manifest_is_still_weighted_by_its_own_servers |
-| M5 | R2: overlay servers neither gated nor checked (raw parse kept) | **RED** 1 failed, 10 passed (restored=True) | catalog_search: skipping an unusable manifest entry (an overlay server (name not shown)): | test_every_server_field_with_every_bad_shape_is_contained[description] |
-| M7 | R2: the CapabilityCandidate is built without validation | **RED** 1 failed, 10 passed (restored=True) | catalog_search: skipping an unusable manifest entry (an overlay server (name not shown)): | test_every_server_field_with_every_bad_shape_is_contained[description] |
+| M5 | R2: overlay servers neither gated nor checked (raw parse kept) | **RED** 1 failed, 10 passed (restored=True) | catalog_search: skipping an unusable manifest entry (an overlay server (name not shown)):  | test_every_server_field_with_every_bad_shape_is_contained[description] |
+| M7 | R2: the CapabilityCandidate is built without validation | **RED** 1 failed, 10 passed (restored=True) | catalog_search: skipping an unusable manifest entry (an overlay server (name not shown)):  | test_every_server_field_with_every_bad_shape_is_contained[description] |
 | M8 | R2: check skips the startup/refresh conversion | **RED** 1 failed, 51 passed (restored=True) | assert not ({'args-str', 'command-int', 'headers-int', 'keywords-ints', 'oidc-issuer-int', | test_the_board_repros_are_skipped_with_a_value_free_warning |
 | M9 | R2: overlay CLI alternatives neither gated nor checked | **RED** 1 failed, 41 passed (restored=True) | rank_cli_hints: skipping an unusable entry (cli_alternative 'git'): TypeError | test_every_cli_field_with_every_bad_shape_is_contained[keywords] |
 | M12 | R2: CLI check accepts an empty check_command (probe needs slot 0) | **RED** 1 failed, 51 passed (restored=True) | assert not ({'cli-check-empty', 'cli-check-int', 'cli-description-int', 'cli-examples-ints | test_the_board_repros_are_skipped_with_a_value_free_warning |
@@ -1290,9 +1497,9 @@ the failing test and the count up to it. Run on the rev-6 spike text embedded be
 | G10 | guard: request_capability category keywords let one server raise | **RED** 1 failed, 69 passed (restored=True) | 'NoneType' object is not iterable | test_guard_request_capability_category_keywords_skip_an_unusable_server |
 | G11 | guard: request_capability category candidates let one server raise | **RED** 1 failed, 70 passed (restored=True) | 1 validation error for CapabilityCandidate | test_guard_request_capability_category_candidate_skips_an_unusable_server |
 | M6 | R2: check skips the name/keyword scoring every discovery path runs | **RED** 1 failed, 11 passed (restored=True) | 'int' object is not iterable | test_every_server_field_with_every_bad_shape_is_contained[keywords] |
-| M10 | R2: check skips the credential lookups every candidate runs | **RED** 1 failed, 17 passed (restored=True) | catalog_search: skipping an unusable manifest entry (an overlay server (name not shown)): | test_every_server_field_with_every_bad_shape_is_contained[secret_key] |
+| M10 | R2: check skips the credential lookups every candidate runs | **RED** 1 failed, 17 passed (restored=True) | catalog_search: skipping an unusable manifest entry (an overlay server (name not shown)):  | test_every_server_field_with_every_bad_shape_is_contained[secret_key] |
 | M11 | R2: CLI check skips the _rank_one_cli scoring and CLIHint build | **RED** 1 failed, 41 passed (restored=True) | rank_cli_hints: skipping an unusable entry (cli_alternative 'git'): TypeError | test_every_cli_field_with_every_bad_shape_is_contained[keywords] |
-| M17 | R1: keyword counting de-duplicates after normalising (not main's) | **RED** 1 failed, 92 passed (restored=True) | assert {'db': 0.5, '...ql': 1.0, ...} == {'db': 0.5, '...ql': 0.5, ...} | test_weights_equal_mains_for_hand_built_and_explicit_path_manifests[6] |
+| M17 | R1: keyword counting de-duplicates after normalising (not main's) | **RED** 1 failed, 92 passed (restored=True) | assert {'alpha beta'...ql': 1.0, ...} == {'db': 0.5, '...ql': 0.5, ...} | test_weights_equal_mains_for_hand_built_and_explicit_path_manifests[6] |
 | L1 | logs: the self-relaxing credential warning echoes the variable | **RED** 1 failed, 127 passed (restored=True) |  | test_a_self_relaxing_credential_is_refused_without_its_value |
 | L2 | logs: probe_clis names each detected CLI | **RED** 1 failed, 128 passed (restored=True) |  | test_probe_clis_never_logs_an_overlay_cli_name |
 | L3 | logs: probe_clis' summary names the detected CLIs | **RED** 1 failed, 128 passed (restored=True) |  | test_probe_clis_never_logs_an_overlay_cli_name |
@@ -1324,8 +1531,17 @@ the failing test and the count up to it. Run on the rev-6 spike text embedded be
 | J2 | schema: a rejection quotes the value | **RED** 1 failed, 217 passed (restored=True) |  | test_codex_f002_falsifier_a_rejection_names_no_overlay_key |
 | J3 | schema: a stored-only field's YAML value costs the entry | **RED** 1 failed, 219 passed (restored=True) | assert 'odd' in {'playwright': ServerConfig(name='playwright', description='Browser automa | test_a_stored_only_field_with_a_yaml_value_keeps_the_entry[discovery_diagnostics] |
 | E1 | yaml: only YAMLError is contained at the overlay parse boundary | **RED** 1 failed, 226 passed (restored=True) | 'sk-tag-sentinel-61d' | test_an_invalid_tag_is_contained_without_any_value[user-bool] |
+| T1 | tiers: the overlay CLI answers before the registry (codex F001) | **RED** 1 failed, 271 passed (restored=True) |  | test_codex_r6_f001_falsifier_an_overlay_cli_keeps_registry_candidates |
+| T2 | tiers: the overlay CLI answers before the configured-server tier | **RED** 1 failed, 271 passed (restored=True) |  | test_codex_r6_f001_falsifier_an_overlay_cli_keeps_registry_candidates |
+| T3 | tiers: the overlay CLI answers first (before the name tier) | **RED** 1 failed, 132 passed (restored=True) | assert [('APIs', 're...', ...]), ...] == [] | test_no_overlay_removes_a_non_overlay_server_from_any_discovery_entry_point[cli-everything] |
+| T4 | tiers: a declared tier is dropped (the registry) | **RED** 1 failed, 271 passed (restored=True) | assert 'not_available' == 'candidates' | test_codex_r6_f001_falsifier_an_overlay_cli_keeps_registry_candidates |
+| T5 | tiers: a return path outside the declared loop (rev 6's early overlay answer) | **RED** 1 failed, 271 passed (restored=True) |  | test_codex_r6_f001_falsifier_an_overlay_cli_keeps_registry_candidates |
+| H1 | cli_hints: an overlay CLI ranks with shipped CLIs by score (claude N1) | **RED** 1 failed, 272 passed (restored=True) | assert 1 < 0 | test_claude_r6_n1_falsifier_a_shipped_cli_hint_precedes_an_overlay_one |
+| V1 | diagnostics: the self-reference warning prints command and args (codex F002) | **RED** 1 failed, 278 passed (restored=True) | assert ['sk-r7-selfr...lay-only-61d'] == [] | test_no_inherited_overlay_value_reaches_any_diagnostic[None] |
+| V2 | diagnostics: the self-reference DEBUG line prints the command | **RED** 1 failed, 306 passed (restored=True) | assert {('identity.p...f_reference')} == set() | test_no_diagnostic_on_these_paths_reads_a_config_field |
+| V3 | diagnostics: the field renderer names a manifest-derived entry by its key | **RED** 1 failed, 308 passed (restored=True) |  | test_the_field_diagnostic_names_a_field_never_a_value |
 
-**59 of 59 mutants RED (a real test failure and no errors), every restore byte-identical.**
+**68 of 68 mutants RED (a real test failure and no errors), every restore byte-identical.**
 
 ## Non-goals
 
@@ -1355,6 +1571,10 @@ the failing test and the count up to it. Run on the rev-6 spike text embedded be
 - **`tests/runtime/test_hang_diagnostics.py` and the basetemp.** In rev 3 its two async-hang
   tests failed only because `--basetemp` sat under the unreadable `/mnt/workspace/users`.
   Rev 4's full run uses `/var/tmp/pmcp-342-bt-viperjuice`, and both pass in it.
+- **The diagnostic derivation's reach (rev 7).** It is intraprocedural, plus parameters
+  named like a field. A value passed to a helper under another parameter name and logged
+  there is not found by the AST walk; the inherited-data walk is the check for that, and
+  it covers only the paths it drives. The derivation was run on 3.10.21 only.
 - **The rev-4 full-suite failure** is no longer unverified: it is attributed to a
   pre-existing orphaned task from `tests/test_progressive_disclosure.py` (see *The rev-4
   full-suite failure, pinned down*). Whether it surfaces depends on when the garbage
@@ -1363,8 +1583,9 @@ the failing test and the count up to it. Run on the rev-6 spike text embedded be
 ## Execution Policy
 
 - execute: effort=medium.
-- reason: eight source files, about 1272 (+1020/−252) changed lines, on the discovery, startup and
-  refresh paths. There is one behaviour change an operator can see: an overlay entry with a
+- reason: nine source files, about 1715 (+1286/−429) changed lines, on the discovery, startup and
+  refresh paths. Most of rev 7's growth in `handlers.py` is `request_capability`'s tiers
+  moving, unchanged in substance, into one method each. There is one behaviour change an operator can see: an overlay entry with a
   wrong type is now skipped instead of loading and failing later. Its warning names the
   field.
 - Apply the source patch, the new module and the test migration verbatim. Re-run
@@ -1376,12 +1597,15 @@ the failing test and the count up to it. Run on the rev-6 spike text embedded be
 
 ### How to apply
 
-1. Save the source patch below as `342-src.patch` and `git apply` it on `6edf8a4`.
+1. Save the source patch below as `342-src.patch` and `git apply` it on `b8e4305`.
+   `src/pmcp/identity.py` has CRLF line endings, and so do its hunks here: extract the
+   patch from this file's bytes with `extract.py` (appendix; Verification step 10), not
+   from a rendered or pasted copy, or `git apply` rejects those hunks.
 2. Write the test module below to `tests/test_catalog_overlay_discovery.py`.
 3. `git apply` the test-migration patch below.
-4. Add the CHANGELOG and README text by hand, as in *Documentation impact*.
+4. `git apply` the docs patch below (`CHANGELOG.md`, `README.md`, `MIGRATING.md`).
 
-### Patch — source (`src/pmcp/manifest/{loader,matcher,environment}.py`, `src/pmcp/tools/handlers.py`, `src/pmcp/config/loader.py`, `src/pmcp/cli_commands/secrets.py`, `src/pmcp/server.py`, `src/pmcp/client/manager.py`)
+### Patch — source (`src/pmcp/manifest/{loader,matcher,environment}.py`, `src/pmcp/tools/handlers.py`, `src/pmcp/config/loader.py`, `src/pmcp/cli_commands/secrets.py`, `src/pmcp/server.py`, `src/pmcp/client/manager.py`, `src/pmcp/identity.py`)
 
 ````diff
 diff --git a/src/pmcp/cli_commands/secrets.py b/src/pmcp/cli_commands/secrets.py
@@ -1608,6 +1832,111 @@ index c71e7f8..4337924 100644
  
      known_names = configured_names | set(manifest_by_name)
      for name in sorted(enabled - known_names):
+diff --git a/src/pmcp/identity.py b/src/pmcp/identity.py
+index c309a0b..6076664 100644
+--- a/src/pmcp/identity.py
++++ b/src/pmcp/identity.py
+@@ -50,6 +50,21 @@ def is_self_reference(config: ResolvedServerConfig) -> bool:
+     Returns:
+         True if this config would spawn another gateway instance
+     """
++    field_name = _self_reference_field(config)
++    if field_name is not None:
++        logger.debug(
++            f"Self-reference detected: {config_field_diagnostic(config, field_name)}"
++        )
++    return field_name is not None
++
++
++def _self_reference_field(config: ResolvedServerConfig) -> str | None:
++    """The config field that makes *config* spawn this gateway, or ``None``.
++
++    Returns a field NAME (``command``, ``args`` or ``name``), never its value:
++    a ``.mcp.json`` entry can inherit ``command`` and ``args`` from a manifest
++    overlay, and an overlay's values are never logged (Consiliency/pmcp#342 D9).
++    """
+     # Handle both nested config (ResolvedServerConfig) and flat config (mock/test)
+     if hasattr(config, "config") and config.config is not None:
+         nested_config = config.config
+@@ -67,8 +82,7 @@ def is_self_reference(config: ResolvedServerConfig) -> bool:
+     # Direct gateway command (e.g., command: pmcp)
+     command_base = Path(command).name
+     if command_base in GATEWAY_COMMANDS:
+-        logger.debug(f"Self-reference detected: direct command '{command}'")
+-        return True
++        return "command"
+ 
+     # Check if command is a package manager invoking the gateway
+     if command_base in PACKAGE_MANAGERS:
+@@ -76,19 +90,33 @@ def is_self_reference(config: ResolvedServerConfig) -> bool:
+         for arg in args_lower:
+             # Handle: uvx pmcp, pipx run pmcp, python -m pmcp
+             if arg in GATEWAY_COMMANDS:
+-                logger.debug(f"Self-reference detected: {command} invoking '{arg}'")
+-                return True
++                return "args"
+             # Handle paths like /path/to/pmcp
+             if Path(arg).name in GATEWAY_COMMANDS:
+-                logger.debug(f"Self-reference detected: {command} with path '{arg}'")
+-                return True
++                return "args"
+ 
+     # Check config name as fallback (legacy behavior)
+     if config.name.lower() in GATEWAY_COMMANDS or config.name.lower() == "mcp-gateway":
+-        logger.debug(f"Self-reference detected: config name '{config.name}'")
+-        return True
++        return "name"
++
++    return None
++
++
++def config_field_diagnostic(config: ResolvedServerConfig, field_name: str) -> str:
++    """How a diagnostic names one field of a configured server: never its value.
++
++    The one renderer for a config field on the load, discovery, startup and
++    refresh paths (Consiliency/pmcp#342 rev 7, D9). The server is named by
++    ``entry_log_name`` (a manifest-derived entry only if pmcp ships its name)
++    and the field by its name, because any field of a ``.mcp.json`` entry may
++    have been inherited from a manifest overlay.
++    """
++    from pmcp.manifest.loader import entry_log_name
+ 
+-    return False
++    who = entry_log_name(
++        config.name, manifest_derived=getattr(config, "source", None) == "manifest"
++    )
++    return f"server {who} (field '{field_name}')"
+ 
+ 
+ def filter_self_references(
+@@ -105,23 +133,12 @@ def filter_self_references(
+     """
+     filtered = []
+     for config in configs:
+-        if is_self_reference(config):
+-            # Get command info for logging
+-            if hasattr(config, "config") and config.config is not None:
+-                nested_config = config.config
+-                if isinstance(nested_config, LocalMcpServerConfig):
+-                    cmd = nested_config.command
+-                    args = nested_config.args
+-                else:
+-                    cmd = "<remote>"
+-                    args = []
+-            else:
+-                cmd = getattr(config, "command", "")
+-                args = getattr(config, "args", [])
++        field_name = _self_reference_field(config)
++        if field_name is not None:
+             if not suppress_warnings:
+                 logger.warning(
+-                    f"Excluding server '{config.name}' to prevent recursive spawning "
+-                    f"(command: {cmd} {' '.join(args)})"
++                    f"Excluding {config_field_diagnostic(config, field_name)} "
++                    "to prevent recursive spawning: it invokes the gateway"
+                 )
+         else:
+             filtered.append(config)
 diff --git a/src/pmcp/manifest/environment.py b/src/pmcp/manifest/environment.py
 index e8a36ac..18629b6 100644
 --- a/src/pmcp/manifest/environment.py
@@ -2422,7 +2751,7 @@ index dc1596a..e512ad4 100644
  
      logger.info(
 diff --git a/src/pmcp/manifest/matcher.py b/src/pmcp/manifest/matcher.py
-index f9dd835..0ad1ebb 100644
+index f9dd835..e83ef36 100644
 --- a/src/pmcp/manifest/matcher.py
 +++ b/src/pmcp/manifest/matcher.py
 @@ -8,7 +8,15 @@ from dataclasses import dataclass
@@ -2461,7 +2790,10 @@ index f9dd835..0ad1ebb 100644
 +    if manifest.base_keyword_weights is not None:
 +        return dict(manifest.base_keyword_weights)
 +    return keyword_weights(manifest.servers.values())
-+
+ 
+-    return {
+-        keyword: max(1.0 / frequency, 0.5) for keyword, frequency in frequencies.items()
+-    }
 +
 +def _rank_one_cli(
 +    query: str,
@@ -2507,10 +2839,7 @@ index f9dd835..0ad1ebb 100644
 +            "MCP server preferred for "
 +            f"'{matched_prefer_mcp_phrase}' despite matching CLI '{name}'."
 +        )
- 
--    return {
--        keyword: max(1.0 / frequency, 0.5) for keyword, frequency in frequencies.items()
--    }
++
 +    hint = CLIHint(
 +        available=is_available,
 +        path=path,
@@ -2526,7 +2855,7 @@ index f9dd835..0ad1ebb 100644
  
  
  def rank_cli_hints(
-@@ -122,60 +190,28 @@ def rank_cli_hints(
+@@ -122,62 +190,44 @@ def rank_cli_hints(
          is_available = name in available
          if not include_unavailable and not is_available:
              continue
@@ -2541,20 +2870,7 @@ index f9dd835..0ad1ebb 100644
 -        for example in cli.examples:
 -            score = max(
 -                score, _text_match_score(query_norm, query_words, example) * 0.8
-+        # One CLI entry must never take down every query (Consiliency/pmcp#342);
-+        # the loader already skips an overlay entry a consumer cannot use.
-+        try:
-+            match = _rank_one_cli(
-+                query,
-+                query_norm,
-+                query_words,
-+                name,
-+                cli,
-+                is_available=is_available,
-+                detected_infos=detected_infos,
-+                include_suppressed=include_suppressed,
-+                min_score=min_score,
-             )
+-            )
 -
 -        matched_prefer_mcp_phrase = None
 -        for phrase in cli.prefer_mcp_for:
@@ -2576,10 +2892,19 @@ index f9dd835..0ad1ebb 100644
 -            reason = (
 -                "MCP server preferred for "
 -                f"'{matched_prefer_mcp_phrase}' despite matching CLI '{name}'."
-+        except Exception as exc:
-+            logger.warning(
-+                f"rank_cli_hints: skipping an unusable entry ({_cli_label(name)}): "
-+                f"{type(exc).__name__}"
++        # One CLI entry must never take down every query (Consiliency/pmcp#342);
++        # the loader already skips an overlay entry a consumer cannot use.
++        try:
++            match = _rank_one_cli(
++                query,
++                query_norm,
++                query_words,
++                name,
++                cli,
++                is_available=is_available,
++                detected_infos=detected_infos,
++                include_suppressed=include_suppressed,
++                min_score=min_score,
              )
 -
 -        hint = CLIHint(
@@ -2599,15 +2924,37 @@ index f9dd835..0ad1ebb 100644
 -                score=score,
 -                suppressed_by_prefer_mcp=suppressed,
 -                matched_prefer_mcp_phrase=matched_prefer_mcp_phrase,
--            )
++        except Exception as exc:
++            logger.warning(
++                f"rank_cli_hints: skipping an unusable entry ({_cli_label(name)}): "
++                f"{type(exc).__name__}"
+             )
 -        )
+-
+-    return sorted(matches, key=lambda match: (-match.score, match.hint.name))
 +            continue
 +        if match is not None:
 +            matches.append(match)
++
++    # One rule for every list of CLI hints (Consiliency/pmcp#342 rev 7): a CLI
++    # an overlay added or replaced ranks after every shipped CLI, whatever its
++    # score, so `catalog_search`'s `cli_hints` and `request_capability`'s CLI
++    # tiers read the same order. Within each origin: score, then name (main).
++    overlay_cli_names: frozenset[str] = getattr(
++        manifest, "overlay_cli_names", frozenset()
++    )
++    return sorted(
++        matches,
++        key=lambda match: (
++            match.hint.name in overlay_cli_names,
++            -match.score,
++            match.hint.name,
++        ),
++    )
  
-     return sorted(matches, key=lambda match: (-match.score, match.hint.name))
  
-@@ -208,8 +244,17 @@ def _keyword_match(
+ async def match_capability(
+@@ -208,8 +258,17 @@ def _keyword_match(
      best_match: MatchResult | None = None
      best_score = 0.0
  
@@ -2627,7 +2974,7 @@ index f9dd835..0ad1ebb 100644
          cli = manifest.cli_alternatives[match.hint.name]
          if match.score > best_score:
              best_score = match.score
-@@ -225,7 +270,14 @@ def _keyword_match(
+@@ -225,7 +284,14 @@ def _keyword_match(
      # Check servers
      keyword_weights = _manifest_keyword_weights(manifest)
      for name, server in manifest.servers.items():
@@ -2643,7 +2990,7 @@ index f9dd835..0ad1ebb 100644
          # Slight preference for CLIs, so server needs higher score
          adjusted_score = score * 0.9
          if adjusted_score > best_score:
-@@ -242,6 +294,17 @@ def _keyword_match(
+@@ -242,6 +308,17 @@ def _keyword_match(
      if best_match and best_score >= 0.2:  # Minimum threshold
          return best_match
  
@@ -2710,10 +3057,18 @@ index 290c030..4086d46 100644
          # Kill any orphan processes from a previous PMCP crash before registering servers
          self._kill_orphan_processes(resolution.lazy_configs + resolution.eager_configs)
 diff --git a/src/pmcp/tools/handlers.py b/src/pmcp/tools/handlers.py
-index 830b877..0f50da5 100644
+index 830b877..a7abf52 100644
 --- a/src/pmcp/tools/handlers.py
 +++ b/src/pmcp/tools/handlers.py
-@@ -13,7 +13,7 @@ import platform
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import functools
++from dataclasses import dataclass
+ import logging
+ import os
+ import re
+@@ -13,7 +14,7 @@ import platform
  from collections import deque
  from datetime import datetime, timezone
  from pathlib import Path
@@ -2722,7 +3077,7 @@ index 830b877..0f50da5 100644
  from typing import Any, Literal, cast, NamedTuple
  
  import anyio
-@@ -39,6 +39,7 @@ from pmcp.client.manager import (
+@@ -39,6 +40,7 @@ from pmcp.client.manager import (
  )
  from pmcp.config.guidance import GuidanceConfig
  from pmcp.config.loader import (
@@ -2730,7 +3085,7 @@ index 830b877..0f50da5 100644
      registry_allow_private_from_config,
      StartupObservationSnapshot,
      StartupSkipReason,
-@@ -84,7 +85,14 @@ from pmcp.manifest.installer import (
+@@ -84,9 +86,17 @@ from pmcp.manifest.installer import (
      get_job_manager,
      InstallError,
  )
@@ -2745,8 +3100,11 @@ index 830b877..0f50da5 100644
 +)
  from pmcp.manifest.package_identity import PackageIdentity, resolve_package_identity
  from pmcp.manifest.matcher import (
++    CLIHintMatch,
      _keyword_match_score,
-@@ -789,6 +797,36 @@ def _summarize_arg_schema(
+     _manifest_keyword_weights,
+     rank_cli_hints,
+@@ -789,6 +799,66 @@ def _summarize_arg_schema(
      return prop_type, None, ""
  
  
@@ -2780,10 +3138,40 @@ index 830b877..0f50da5 100644
 +    )
 +
 +
++# The order in which `request_capability` answers (Consiliency/pmcp#342 rev 7).
++# This tuple is the only statement of it: `request_capability` asks each tier in
++# turn, through `_capability_tier_<tier>`, and returns the first answer. A CLI an
++# overlay added or replaced answers last, after every server tier and after the
++# shipped CLIs, so no return path can let it pre-empt a server. A tier added
++# later goes before `overlay_cli` and outranks it without further change.
++REQUEST_CAPABILITY_TIERS: tuple[str, ...] = (
++    "name",  # a manifest server the query names (yields to a colliding shipped CLI)
++    "shipped_cli",  # the first available shipped CLI hint (main's precedence)
++    "category",  # the base-only category tier
++    "configured",  # a .mcp.json server, by keyword
++    "registry",  # MCP Registry candidates for an unknown named service
++    "overlay_cli",  # the first available overlay CLI hint: always last
++)
++
++
++@dataclass
++class _CapabilityRequest:
++    """What every `request_capability` tier reads, computed once per request."""
++
++    parsed: CapabilityRequestInput
++    manifest: Manifest
++    merged_manifest: Manifest
++    configured_servers: dict[str, ResolvedServerConfig]
++    shipped_cli_match: CLIHintMatch | None
++    overlay_cli_match: CLIHintMatch | None
++    running_servers: list[str]
++    unknown_service: bool
++
++
  class GatewayTools:
      """Gateway tool handler implementations."""
  
-@@ -1152,16 +1190,23 @@ class GatewayTools:
+@@ -1152,16 +1222,23 @@ class GatewayTools:
              if not self._policy_manager.is_server_allowed(name):
                  continue
  
@@ -2817,7 +3205,7 @@ index 830b877..0f50da5 100644
  
              if score >= 0.2:  # Same minimum threshold as the matcher
                  scored.append((score, name, server))
-@@ -1175,16 +1220,17 @@ class GatewayTools:
+@@ -1175,16 +1252,17 @@ class GatewayTools:
          }
  
          candidates: list[CapabilityCandidate] = []
@@ -2842,7 +3230,7 @@ index 830b877..0f50da5 100644
                      requires_api_key=requires_api_key,
                      api_key_available=self._check_any_api_key_available(
                          self._auth_env_options(name, env_var)
-@@ -1193,18 +1239,16 @@ class GatewayTools:
+@@ -1193,18 +1271,16 @@ class GatewayTools:
                      env_instructions=env_instructions,
                      is_running=name in running_servers,
                      source="manifest",
@@ -2866,7 +3254,7 @@ index 830b877..0f50da5 100644
          return candidates
  
      async def catalog_search(self, input_data: dict[str, Any]) -> CatalogSearchOutput:
-@@ -1929,7 +1973,11 @@ class GatewayTools:
+@@ -1929,7 +2005,11 @@ class GatewayTools:
                  manifest = load_manifest()
                  manifest_servers = manifest.servers
              except Exception as e:
@@ -2879,7 +3267,7 @@ index 830b877..0f50da5 100644
  
              provisioned: dict[str, str | None] = {}
              try:
-@@ -1967,21 +2015,7 @@ class GatewayTools:
+@@ -1967,21 +2047,7 @@ class GatewayTools:
                  f"unknown_auto_start={counts['unknown_auto_start']}"
              )
              for skipped in resolution.skipped:
@@ -2902,7 +3290,7 @@ index 830b877..0f50da5 100644
  
              pending_requests = self._client_manager.get_pending_requests()
              pending_seen = len(pending_requests)
-@@ -3334,6 +3368,9 @@ class GatewayTools:
+@@ -3334,6 +3400,9 @@ class GatewayTools:
              cli_alternatives=dict(manifest.cli_alternatives),
              servers=merged_servers,
              discovery_queue_path=manifest.discovery_queue_path,
@@ -2912,7 +3300,7 @@ index 830b877..0f50da5 100644
          )
  
      def _get_server_env_metadata(
-@@ -3587,6 +3624,32 @@ class GatewayTools:
+@@ -3587,6 +3656,32 @@ class GatewayTools:
          )
          return issue_title, body
  
@@ -2945,7 +3333,7 @@ index 830b877..0f50da5 100644
      async def request_capability(
          self, input_data: dict[str, Any]
      ) -> CapabilityResolution:
-@@ -3620,10 +3683,32 @@ class GatewayTools:
+@@ -3620,31 +3715,96 @@ class GatewayTools:
          if cli_hint_matches:
              logger.debug(
                  "Matched CLI hints for future response plumbing: %s",
@@ -2954,14 +3342,11 @@ index 830b877..0f50da5 100644
 +                    _cli_label(match.hint.name) for match in cli_hint_matches[:3]
 +                ),
              )
-+        # One rule, applied where CLI and server results are combined
-+        # (Consiliency/pmcp#342 rev 6): an overlay CLI ranks below EVERY server
-+        # tier. Shipped CLIs keep main's precedence (`cli_hint_match`, which the
-+        # name tier may yield to and which answers before the category tier).
-+        # An overlay CLI (`overlay_cli_match`) answers only after the name,
-+        # category and configured-server tiers all found nothing.
-         cli_hint_match = next(
+-        cli_hint_match = next(
 -            (match for match in cli_hint_matches if match.hint.available),
++        # Shipped and overlay CLIs are separate tiers (Consiliency/pmcp#342):
++        # `REQUEST_CAPABILITY_TIERS` puts the overlay one last.
++        shipped_cli_match = next(
 +            (
 +                match
 +                for match in cli_hint_matches
@@ -2979,9 +3364,70 @@ index 830b877..0f50da5 100644
 +            ),
              None,
          )
++        request = _CapabilityRequest(
++            parsed=parsed,
++            manifest=manifest,
++            merged_manifest=merged_manifest,
++            configured_servers=configured_servers,
++            shipped_cli_match=shipped_cli_match,
++            overlay_cli_match=overlay_cli_match,
++            running_servers=[
++                s.name
++                for s in self._client_manager.get_all_server_statuses()
++                if s.status.value == "online"
++            ],
++            # Detect unknown named services (Fix C, issue #56): a PascalCase
++            # word (not the first word of the sentence) that is NOT a known
++            # server name skips the category tier and goes to the registry.
++            unknown_service=_names_an_unknown_service(
++                parsed.query, merged_manifest.servers
++            ),
++        )
++        for tier in REQUEST_CAPABILITY_TIERS:
++            answer = await getattr(self, f"_capability_tier_{tier}")(request)
++            if answer is not None:
++                return cast(CapabilityResolution, answer)
  
-@@ -3641,10 +3726,17 @@ class GatewayTools:
-         # capability words like "browser" or "search".
+-        # Get running servers
+-        running_servers = [
+-            s.name
+-            for s in self._client_manager.get_all_server_statuses()
+-            if s.status.value == "online"
+-        ]
++        # --- Tier 3: no match ---
++        logger.info(f"Unmatched capability request: {parsed.query}")
++        self._record_feedback_event(
++            "capability_unmatched", {"query": parsed.query, "path": "no_match"}
++        )
++        return CapabilityResolution(
++            status="not_available",
++            message=f"No matching capability found for: {parsed.query}",
++            logged_for_discovery=True,
++            search_guidance=(
++                f'Call gateway.search_registry(query="{parsed.query}") '
++                "to search the public MCP Registry for external servers. "
++                "Then call gateway.register_discovered_server and gateway.provision to install."
++            ),
++        )
++
++    async def _capability_tier_name(
++        self, request: _CapabilityRequest
++    ) -> CapabilityResolution | None:
++        """Tier `name`: a manifest server whose normalised name is in the query.
+ 
+-        # --- Tier 1: explicit server name match ---
+-        # Match by normalizing server names and query word groups (strips hyphens,
+-        # underscores, spaces) so "bright data" → "brightdata", "brave-search" →
+-        # "bravesearch", etc. Does NOT use keywords to avoid matching generic
+-        # capability words like "browser" or "search".
++        Match by normalizing server names and query word groups (strips hyphens,
++        underscores, spaces) so "bright data" → "brightdata", "brave-search" →
++        "bravesearch", etc. Does NOT use keywords to avoid matching generic
++        capability words like "browser" or "search".
++        """
++        parsed = request.parsed
++        manifest = request.manifest
++        configured_servers = request.configured_servers
          query_lower = parsed.query.lower()
          query_words = query_lower.split()
 -        norm_to_server = {
@@ -2989,7 +3435,7 @@ index 830b877..0f50da5 100644
 -            for n in merged_manifest.servers
 -        }
 +        norm_to_server: dict[str, str] = {}
-+        for n in merged_manifest.servers:
++        for n in request.merged_manifest.servers:
 +            # One unusable name never takes down the name tier (Consiliency/pmcp#342).
 +            try:
 +                # First wins: base (shipped) names come first in the merged
@@ -3002,67 +3448,53 @@ index 830b877..0f50da5 100644
          name_match: str | None = None
          for window_size in (3, 2, 1):
              for i in range(len(query_words) - window_size + 1):
-@@ -3667,28 +3759,39 @@ class GatewayTools:
-             cli_hint_match is not None and cli_hint_match.hint.name == name_match
+@@ -3664,14 +3824,19 @@ class GatewayTools:
+             for word in ("mcp", "server", "servers", "provision", "install", "start")
+         )
+         name_match_collides_with_cli = (
+-            cli_hint_match is not None and cli_hint_match.hint.name == name_match
++            request.shipped_cli_match is not None
++            and request.shipped_cli_match.hint.name == name_match
          )
  
-+        name_candidate: CapabilityCandidate | None = None
-         if (
+-        if (
++        if not (
              name_match
              and self._policy_manager.is_server_allowed(name_match)
              and (explicit_mcp_intent or not name_match_collides_with_cli)
          ):
--            requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
--                name_match, manifest, configured_servers
--            )
--            api_key_available = self._check_any_api_key_available(
--                self._auth_env_options(name_match, env_var)
--            )
--            candidate = CapabilityCandidate(
--                name=name_match,
--                candidate_type="server",
--                relevance_score=1.0,
--                reasoning=f"Explicit name match for '{name_match}' in query.",
--                requires_api_key=requires_api_key,
--                api_key_available=api_key_available,
--                env_var=env_var,
--                env_instructions=env_instructions,
++            return None
++        # An unusable entry is no name match, not a failed request
++        # (Consiliency/pmcp#342).
++        try:
+             requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
+                 name_match, manifest, configured_servers
+             )
+@@ -3687,77 +3852,57 @@ class GatewayTools:
+                 api_key_available=api_key_available,
+                 env_var=env_var,
+                 env_instructions=env_instructions,
 -                is_running=name_match in running_servers,
 -            )
-+            # An unusable entry is no name match, not a failed request
-+            # (Consiliency/pmcp#342).
-+            try:
-+                requires_api_key, env_var, env_instructions = (
-+                    self._get_server_env_metadata(
-+                        name_match, manifest, configured_servers
-+                    )
-+                )
-+                api_key_available = self._check_any_api_key_available(
-+                    self._auth_env_options(name_match, env_var)
-+                )
-+                name_candidate = CapabilityCandidate(
-+                    name=name_match,
-+                    candidate_type="server",
-+                    relevance_score=1.0,
-+                    reasoning=f"Explicit name match for '{name_match}' in query.",
-+                    requires_api_key=requires_api_key,
-+                    api_key_available=api_key_available,
-+                    env_var=env_var,
-+                    env_instructions=env_instructions,
-+                    is_running=name_match in running_servers,
-+                )
-+            except Exception as exc:
-+                _log_unusable_manifest_entry("request_capability", name_match, exc)
-+
-+        if name_match and name_candidate is not None:
-+            candidate = name_candidate
-             msg = f"Matched '{name_match}' by name."
-             if requires_api_key:
-                 if api_key_available:
-@@ -3708,42 +3811,15 @@ class GatewayTools:
-             )
- 
-         if cli_hint_match is not None:
+-            msg = f"Matched '{name_match}' by name."
+-            if requires_api_key:
+-                if api_key_available:
+-                    msg += f" API key ({env_var}) is already set — ready to provision."
+-                else:
+-                    msg += (
+-                        f" Requires API key ({env_var}). "
+-                        f"Set it or call gateway.auth_connect, then gateway.provision."
+-                    )
+-            else:
+-                msg += " No API key required. Call gateway.provision to install."
+-            return CapabilityResolution(
+-                status="candidates",
+-                message=msg,
+-                candidates=[candidate],
+-                recommendation=f"Call gateway.provision(server_name='{name_match}')",
+-            )
+-
+-        if cli_hint_match is not None:
 -            hint = cli_hint_match.hint
 -            return CapabilityResolution(
 -                status="use_cli",
@@ -3086,76 +3518,370 @@ index 830b877..0f50da5 100644
 -                    f"Run '{hint.name}' directly via Bash/direct CLI. "
 -                    "Use gateway.request_capability again only if you need an MCP server."
 -                ),
--            )
-+            return self._use_cli_resolution(cli_hint_match.hint)
++                is_running=name_match in request.running_servers,
+             )
++        except Exception as exc:
++            _log_unusable_manifest_entry("request_capability", name_match, exc)
++            return None
  
-         # --- Tier 2 pre-check: detect unknown named services (Fix C, issue #56) ---
-         # If the query contains a PascalCase word (not the first word of the sentence)
-         # that is NOT a known server name, the user is likely requesting a specific
-         # external service not in the manifest. Skip category matching and fall
-         # through to not_available so search_registry guidance is surfaced.
+-        # --- Tier 2 pre-check: detect unknown named services (Fix C, issue #56) ---
+-        # If the query contains a PascalCase word (not the first word of the sentence)
+-        # that is NOT a known server name, the user is likely requesting a specific
+-        # external service not in the manifest. Skip category matching and fall
+-        # through to not_available so search_registry guidance is surfaced.
 -        _pascal_re = re.compile(r"^[A-Z][a-z]{3,}$")
 -        _unknown_service = any(
 -            idx > 0
 -            and _pascal_re.match(w)
 -            and w.lower().replace("-", "").replace("_", "") not in norm_to_server
 -            for idx, w in enumerate(parsed.query.split())
-+        _unknown_service = _names_an_unknown_service(
-+            parsed.query, merged_manifest.servers
++        msg = f"Matched '{name_match}' by name."
++        if requires_api_key:
++            if api_key_available:
++                msg += f" API key ({env_var}) is already set — ready to provision."
++            else:
++                msg += (
++                    f" Requires API key ({env_var}). "
++                    f"Set it or call gateway.auth_connect, then gateway.provision."
++                )
++        else:
++            msg += " No API key required. Call gateway.provision to install."
++        return CapabilityResolution(
++            status="candidates",
++            message=msg,
++            candidates=[candidate],
++            recommendation=f"Call gateway.provision(server_name='{name_match}')",
          )
  
-         # --- Tier 2: category keyword match ---
-@@ -3758,16 +3834,17 @@ class GatewayTools:
-             for scfg in cat_servers:
-                 if not self._policy_manager.is_server_allowed(scfg.name):
-                     continue
--                requires_api_key, env_var, env_instructions = (
--                    self._get_server_env_metadata(
--                        scfg.name, manifest, configured_servers
-+                # One category server never takes down the tier (Consiliency/pmcp#342).
-+                try:
-+                    requires_api_key, env_var, env_instructions = (
-+                        self._get_server_env_metadata(
-+                            scfg.name, manifest, configured_servers
-+                        )
-                     )
--                )
--                api_key_available = self._check_any_api_key_available(
--                    self._auth_env_options(scfg.name, env_var)
--                )
+-        # --- Tier 2: category keyword match ---
+-        category_result = (
+-            None if _unknown_service else manifest.get_servers_in_category(parsed.query)
+-        )
+-        all_candidates: list[CapabilityCandidate] = []
+-        if category_result:
+-            cat_name, cat_servers = category_result
++    async def _capability_tier_shipped_cli(
++        self, request: _CapabilityRequest
++    ) -> CapabilityResolution | None:
++        """Tier `shipped_cli`: the first available shipped CLI hint."""
++        if request.shipped_cli_match is None:
++            return None
++        return self._use_cli_resolution(request.shipped_cli_match.hint)
+ 
+-            # Build enriched candidates for every server in the category
+-            for scfg in cat_servers:
+-                if not self._policy_manager.is_server_allowed(scfg.name):
+-                    continue
++    async def _capability_tier_category(
++        self, request: _CapabilityRequest
++    ) -> CapabilityResolution | None:
++        """Tier `category`: category keyword match, from the base statistics."""
++        if request.unknown_service:
++            return None
++        manifest = request.manifest
++        configured_servers = request.configured_servers
++        category_result = manifest.get_servers_in_category(request.parsed.query)
++        if not category_result:
++            return None
++        cat_name, cat_servers = category_result
++        all_candidates: list[CapabilityCandidate] = []
++        # Build enriched candidates for every server in the category
++        for scfg in cat_servers:
++            if not self._policy_manager.is_server_allowed(scfg.name):
++                continue
++            # One category server never takes down the tier (Consiliency/pmcp#342).
++            try:
+                 requires_api_key, env_var, env_instructions = (
+                     self._get_server_env_metadata(
+                         scfg.name, manifest, configured_servers
+@@ -3766,83 +3911,86 @@ class GatewayTools:
+                 api_key_available = self._check_any_api_key_available(
+                     self._auth_env_options(scfg.name, env_var)
+                 )
 -                all_candidates.append(
 -                    CapabilityCandidate(
-+                    api_key_available = self._check_any_api_key_available(
-+                        self._auth_env_options(scfg.name, env_var)
-+                    )
-+                    category_candidate = CapabilityCandidate(
-                         name=scfg.name,
-                         candidate_type="server",
-                         relevance_score=1.0,
-@@ -3778,7 +3855,10 @@ class GatewayTools:
-                         env_instructions=env_instructions,
-                         is_running=scfg.name in running_servers,
-                     )
--                )
-+                except Exception as exc:
-+                    _log_unusable_manifest_entry("request_capability", scfg.name, exc)
-+                    continue
-+                all_candidates.append(category_candidate)
+-                        name=scfg.name,
+-                        candidate_type="server",
+-                        relevance_score=1.0,
+-                        reasoning=scfg.description,
+-                        requires_api_key=requires_api_key,
+-                        api_key_available=api_key_available,
+-                        env_var=env_var,
+-                        env_instructions=env_instructions,
+-                        is_running=scfg.name in running_servers,
+-                    )
++                category_candidate = CapabilityCandidate(
++                    name=scfg.name,
++                    candidate_type="server",
++                    relevance_score=1.0,
++                    reasoning=scfg.description,
++                    requires_api_key=requires_api_key,
++                    api_key_available=api_key_available,
++                    env_var=env_var,
++                    env_instructions=env_instructions,
++                    is_running=scfg.name in request.running_servers,
+                 )
++            except Exception as exc:
++                _log_unusable_manifest_entry("request_capability", scfg.name, exc)
++                continue
++            all_candidates.append(category_candidate)
  
-             if not all_candidates:
-                 category_result = None
-@@ -3900,6 +3980,11 @@ class GatewayTools:
-                 recommendation=f"Call gateway.provision(server_name='{server_name}')",
+-            if not all_candidates:
+-                category_result = None
+-
+-        if category_result and all_candidates:
+-            cat_name, _cat_servers = category_result
+-
+-            # Sort: no-key-required first, then key-available, then key-missing
+-            def _sort_key(c: CapabilityCandidate) -> int:
+-                if not c.requires_api_key:
+-                    return 0
+-                if c.api_key_available:
+-                    return 1
+-                return 2
++        if not all_candidates:
++            return None
+ 
+-            all_candidates.sort(key=_sort_key)
++        # Sort: no-key-required first, then key-available, then key-missing
++        def _sort_key(c: CapabilityCandidate) -> int:
++            if not c.requires_api_key:
++                return 0
++            if c.api_key_available:
++                return 1
++            return 2
+ 
+-            # Build a human-readable message grouping the three tiers
+-            free = [c for c in all_candidates if not c.requires_api_key]
+-            key_ready = [
+-                c for c in all_candidates if c.requires_api_key and c.api_key_available
+-            ]
+-            key_missing = [
+-                c
+-                for c in all_candidates
+-                if c.requires_api_key and not c.api_key_available
+-            ]
++        all_candidates.sort(key=_sort_key)
+ 
+-            parts: list[str] = [
+-                f"{len(all_candidates)} options in '{cat_name}' category. "
+-                "Review and call gateway.provision(server_name='...') with your choice."
+-            ]
+-            if free:
+-                names = ", ".join(c.name for c in free)
+-                parts.append(f"No API key required: {names}.")
+-            if key_ready:
+-                names = ", ".join(f"{c.name} ({c.env_var} ✓)" for c in key_ready)
+-                parts.append(f"API key already set — ready to provision: {names}.")
+-            if key_missing:
+-                names = ", ".join(f"{c.name} (needs {c.env_var})" for c in key_missing)
+-                parts.append(
+-                    f"Requires API key (not set): {names}. "
+-                    "Provide the key or call gateway.auth_connect first."
+-                )
++        # Build a human-readable message grouping the three tiers
++        free = [c for c in all_candidates if not c.requires_api_key]
++        key_ready = [
++            c for c in all_candidates if c.requires_api_key and c.api_key_available
++        ]
++        key_missing = [
++            c for c in all_candidates if c.requires_api_key and not c.api_key_available
++        ]
+ 
+-            return CapabilityResolution(
+-                status="pick_from_category",
+-                message=" ".join(parts),
+-                candidates=all_candidates,
+-                category_name=cat_name,
+-                recommendation=(
+-                    "Choose based on your needs and API key availability. "
+-                    "Call gateway.provision(server_name='<chosen>') to install."
+-                ),
++        parts: list[str] = [
++            f"{len(all_candidates)} options in '{cat_name}' category. "
++            "Review and call gateway.provision(server_name='...') with your choice."
++        ]
++        if free:
++            names = ", ".join(c.name for c in free)
++            parts.append(f"No API key required: {names}.")
++        if key_ready:
++            names = ", ".join(f"{c.name} ({c.env_var} ✓)" for c in key_ready)
++            parts.append(f"API key already set — ready to provision: {names}.")
++        if key_missing:
++            names = ", ".join(f"{c.name} (needs {c.env_var})" for c in key_missing)
++            parts.append(
++                f"Requires API key (not set): {names}. "
++                "Provide the key or call gateway.auth_connect first."
              )
  
-+        # An overlay CLI answers only here, after every server tier found
-+        # nothing (Consiliency/pmcp#342 rev 6).
-+        if overlay_cli_match is not None:
-+            return self._use_cli_resolution(overlay_cli_match.hint)
+-        query_norm = parsed.query.lower().replace("-", " ").replace("_", " ")
++        return CapabilityResolution(
++            status="pick_from_category",
++            message=" ".join(parts),
++            candidates=all_candidates,
++            category_name=cat_name,
++            recommendation=(
++                "Choose based on your needs and API key availability. "
++                "Call gateway.provision(server_name='<chosen>') to install."
++            ),
++        )
 +
-         registry_candidates = (
-             await self._registry_candidates_for_query(parsed.query)
-             if _unknown_service
++    async def _capability_tier_configured(
++        self, request: _CapabilityRequest
++    ) -> CapabilityResolution | None:
++        """Tier `configured`: a `.mcp.json` server, by keyword."""
++        manifest = request.manifest
++        configured_servers = request.configured_servers
++        query_norm = request.parsed.query.lower().replace("-", " ").replace("_", " ")
+         configured_query_words = set(query_norm.split())
+         generic_config_keywords = {"mcp", "server", "remote", "sse", "http", "api"}
+         configured_keyword_matches: list[tuple[str, ServerConfig, list[str]]] = []
+         for server_name in configured_servers:
+             if not self._policy_manager.is_server_allowed(server_name):
+                 continue
+-            server_config = merged_manifest.servers.get(server_name)
++            server_config = request.merged_manifest.servers.get(server_name)
+             if not server_config:
+                 continue
+             matched_keywords = []
+@@ -3864,77 +4012,73 @@ class GatewayTools:
+                     (server_name, server_config, matched_keywords)
+                 )
+ 
+-        if configured_keyword_matches:
+-            configured_keyword_matches.sort(key=lambda item: (-len(item[2]), item[0]))
+-            server_name, _server_config, matched_keywords = configured_keyword_matches[
+-                0
+-            ]
+-            requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
+-                server_name, manifest, configured_servers
+-            )
+-            api_key_available = self._check_any_api_key_available(
+-                self._auth_env_options(server_name, env_var)
+-            )
+-            return CapabilityResolution(
+-                status="candidates",
+-                message=(
+-                    f"Matched configured MCP server '{server_name}' by keywords. "
+-                    "Call gateway.provision to start it when needed."
+-                ),
+-                candidates=[
+-                    CapabilityCandidate(
+-                        name=server_name,
+-                        candidate_type="server",
+-                        relevance_score=min(1.0, len(matched_keywords) / 3),
+-                        reasoning=(
+-                            "Keyword match for configured server: "
+-                            f"{', '.join(matched_keywords[:3])}"
+-                        ),
+-                        requires_api_key=requires_api_key,
+-                        api_key_available=api_key_available,
+-                        env_var=env_var,
+-                        env_instructions=env_instructions,
+-                        is_running=server_name in running_servers,
+-                    )
+-                ],
+-                recommendation=f"Call gateway.provision(server_name='{server_name}')",
+-            )
+-
+-        registry_candidates = (
+-            await self._registry_candidates_for_query(parsed.query)
+-            if _unknown_service
+-            else []
++        if not configured_keyword_matches:
++            return None
++        configured_keyword_matches.sort(key=lambda item: (-len(item[2]), item[0]))
++        server_name, _server_config, matched_keywords = configured_keyword_matches[0]
++        requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
++            server_name, manifest, configured_servers
++        )
++        api_key_available = self._check_any_api_key_available(
++            self._auth_env_options(server_name, env_var)
++        )
++        return CapabilityResolution(
++            status="candidates",
++            message=(
++                f"Matched configured MCP server '{server_name}' by keywords. "
++                "Call gateway.provision to start it when needed."
++            ),
++            candidates=[
++                CapabilityCandidate(
++                    name=server_name,
++                    candidate_type="server",
++                    relevance_score=min(1.0, len(matched_keywords) / 3),
++                    reasoning=(
++                        "Keyword match for configured server: "
++                        f"{', '.join(matched_keywords[:3])}"
++                    ),
++                    requires_api_key=requires_api_key,
++                    api_key_available=api_key_available,
++                    env_var=env_var,
++                    env_instructions=env_instructions,
++                    is_running=server_name in request.running_servers,
++                )
++            ],
++            recommendation=f"Call gateway.provision(server_name='{server_name}')",
+         )
+-        if registry_candidates:
+-            return CapabilityResolution(
+-                status="candidates",
+-                message=(
+-                    "Found MCP Registry candidates. PMCP will not install or connect "
+-                    "them until you explicitly choose and register one."
+-                ),
+-                candidates=registry_candidates,
+-                recommendation=(
+-                    "Review the registry metadata, then call "
+-                    "gateway.register_discovered_server for the selected package."
+-                ),
+-            )
+ 
+-        # --- Tier 3: no match ---
+-        logger.info(f"Unmatched capability request: {parsed.query}")
+-        self._record_feedback_event(
+-            "capability_unmatched", {"query": parsed.query, "path": "no_match"}
++    async def _capability_tier_registry(
++        self, request: _CapabilityRequest
++    ) -> CapabilityResolution | None:
++        """Tier `registry`: MCP Registry candidates for an unknown named service."""
++        if not request.unknown_service:
++            return None
++        registry_candidates = await self._registry_candidates_for_query(
++            request.parsed.query
+         )
++        if not registry_candidates:
++            return None
+         return CapabilityResolution(
+-            status="not_available",
+-            message=f"No matching capability found for: {parsed.query}",
+-            logged_for_discovery=True,
+-            search_guidance=(
+-                f'Call gateway.search_registry(query="{parsed.query}") '
+-                "to search the public MCP Registry for external servers. "
+-                "Then call gateway.register_discovered_server and gateway.provision to install."
++            status="candidates",
++            message=(
++                "Found MCP Registry candidates. PMCP will not install or connect "
++                "them until you explicitly choose and register one."
++            ),
++            candidates=registry_candidates,
++            recommendation=(
++                "Review the registry metadata, then call "
++                "gateway.register_discovered_server for the selected package."
+             ),
+         )
+ 
++    async def _capability_tier_overlay_cli(
++        self, request: _CapabilityRequest
++    ) -> CapabilityResolution | None:
++        """Tier `overlay_cli`: the first available overlay CLI hint (always last)."""
++        if request.overlay_cli_match is None:
++            return None
++        return self._use_cli_resolution(request.overlay_cli_match.hint)
++
+     async def provision(self, input_data: dict[str, Any]) -> ProvisionOutput:
+         """gateway.provision - Start background installation of an MCP server."""
+         parsed = ProvisionInput.model_validate(input_data)
 ````
 
 ### File — `tests/test_catalog_overlay_discovery.py`
@@ -5183,11 +5909,782 @@ def test_codex_f001_falsifier_a_bad_numeric_tag_keeps_shipped_servers() -> None:
         base, base.read_bytes(), [overlay], trusted=True
     )
     assert "playwright" in manifest.servers
+
+
+# --- revision 7: one declared tier order; an overlay CLI is the last tier ----------
+# (round 6: codex F001 -- an overlay CLI pre-empted the registry tier; claude N1 --
+# an overlay CLI outranked a shipped one in `cli_hints`.) `REQUEST_CAPABILITY_TIERS`
+# is the only statement of the order. The differential below is generated per
+# declared tier, and a tier without a generator fails the coverage test.
+
+
+def _codex_r6_registry_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[GatewayTools, Any]:
+    from unittest.mock import AsyncMock
+
+    from pmcp.types import CapabilityCandidate
+
+    tools = _gateway()
+    monkeypatch.setattr(tools, "_load_provisioned_registry", lambda: {})
+
+    async def registry(query: str, **_: Any) -> list[CapabilityCandidate]:
+        word = next(w for w in query.split()[1:] if re.fullmatch(r"[A-Z][a-z]{3,}", w))
+        return [
+            CapabilityCandidate(
+                name=f"{word.lower()}-registry-server",
+                candidate_type="server",
+                relevance_score=1.0,
+                reasoning="Registry match",
+                source="registry",
+            )
+        ]
+
+    spy = AsyncMock(side_effect=registry)
+    monkeypatch.setattr(tools, "_registry_candidates_for_query", spy)
+    return tools, spy
+
+
+def test_codex_r6_f001_falsifier_an_overlay_cli_keeps_registry_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 6, codex F001: `connect Reviewservice` went to `use_cli: reviewcli`
+    and the registry was never asked."""
+    tools, registry = _codex_r6_registry_tools(monkeypatch)
+    request = {"query": "connect Reviewservice", "available_clis": ["reviewcli"]}
+    before = asyncio.run(tools.request_capability(request))
+    assert before.status == "candidates"
+    assert [c.name for c in before.candidates or []] == [
+        "reviewservice-registry-server"
+    ]
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump(
+            {
+                "cli_alternatives": {
+                    "reviewcli": {
+                        "keywords": ["reviewservice"],
+                        "check_command": ["git"],
+                    }
+                }
+            }
+        ),
+    )
+    assert "reviewcli" in load_manifest().overlay_cli_names
+    after = asyncio.run(tools.request_capability(request))
+    assert after.model_dump() == before.model_dump()
+    assert registry.await_count == 2
+
+
+def test_claude_r6_n1_falsifier_a_shipped_cli_hint_precedes_an_overlay_one() -> None:
+    """Round 6, claude N1: overlay `aaa` (keyword `json`) was listed above `jq`."""
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump(
+            {
+                "cli_alternatives": {
+                    "aaa": {
+                        "description": "x",
+                        "keywords": ["json"],
+                        "check_command": ["aaa", "--version"],
+                    }
+                }
+            }
+        ),
+    )
+    tools = _gateway()
+    tools._detected_clis = {"jq", "aaa"}
+    result = asyncio.run(
+        tools.catalog_search({"query": "json", "include_offline": True})
+    )
+    names = [h.name for h in result.cli_hints]
+    assert names.index("jq") < names.index("aaa")
+
+
+def test_every_shipped_cli_hint_precedes_every_overlay_cli_hint() -> None:
+    """The class for N1: for every keyword of every shipped CLI, an overlay CLI
+    that sorts first by name and inflates its score by repeating the keyword
+    still lists after every shipped hint, and no shipped hint is lost."""
+    shipped = load_manifest(_SHIPPED_MANIFEST_PATH)
+    queries = sorted(
+        {kw for cli in shipped.cli_alternatives.values() for kw in cli.keywords}
+    )
+    overlay = {
+        f"aaa-{i}": {"keywords": [kw] * 5, "check_command": ["git"]}
+        for i, kw in enumerate(queries)
+    }
+    everything = set(shipped.cli_alternatives) | set(overlay)
+
+    def hints() -> dict[str, list[str]]:
+        manifest = load_manifest()
+        return {
+            q: [
+                m.hint.name
+                for m in rank_cli_hints(q, manifest, available_clis=everything)
+            ]
+            for q in queries
+        }
+
+    before = hints()
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump({"cli_alternatives": overlay}),
+    )
+    after = hints()
+    wrong = []
+    for q in queries:
+        origin = [name in overlay for name in after[q]]
+        if origin != sorted(origin):
+            wrong.append((q, after[q][:6]))
+        if [n for n in after[q] if n not in overlay] != before[q]:
+            wrong.append((q, "shipped hints changed"))
+    assert wrong == []
+    assert sum(1 for q in queries if any(n in overlay for n in after[q])) == len(
+        queries
+    )
+
+
+def test_the_declared_tiers_are_the_only_tiers_and_the_overlay_cli_is_last() -> None:
+    """`request_capability` returns a tier's answer only from the loop over
+    `REQUEST_CAPABILITY_TIERS`; every declared tier has its method and every
+    tier method is declared."""
+    import ast
+    import inspect
+    import textwrap
+
+    from pmcp.tools import handlers
+
+    tiers = handlers.REQUEST_CAPABILITY_TIERS
+    assert tiers[-1] == "overlay_cli"
+    assert len(set(tiers)) == len(tiers)
+    methods = {
+        name.removeprefix("_capability_tier_")
+        for name in vars(GatewayTools)
+        if name.startswith("_capability_tier_")
+    }
+    assert methods == set(tiers)
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(GatewayTools.request_capability))
+    )
+    returns = [n for n in ast.walk(tree) if isinstance(n, ast.Return)]
+    # One return inside the tier loop, one `not_available` after it.
+    assert len(returns) == 2
+    loop = next(n for n in ast.walk(tree) if isinstance(n, ast.For))
+    assert ast.unparse(loop.iter) == "REQUEST_CAPABILITY_TIERS"
+    in_loop = [r for r in returns if r in list(ast.walk(loop))]
+    after_loop = [r for r in returns if r not in in_loop]
+    assert len(in_loop) == 1 and len(after_loop) == 1
+    assert "not_available" in ast.unparse(after_loop[0])
+
+
+def _tier_scenarios_name() -> list[tuple[str, dict[str, Any]]]:
+    shipped = load_manifest(_SHIPPED_MANIFEST_PATH)
+    return [(name, {"query": name}) for name in sorted(shipped.servers)]
+
+
+def _tier_scenarios_shipped_cli() -> list[tuple[str, dict[str, Any]]]:
+    shipped = load_manifest(_SHIPPED_MANIFEST_PATH)
+    return [
+        (kw, {"query": kw, "available_clis": [name]})
+        for name, cli in sorted(shipped.cli_alternatives.items())
+        for kw in cli.keywords
+    ]
+
+
+def _tier_scenarios_category() -> list[tuple[str, dict[str, Any]]]:
+    return [(word, {"query": word}) for word in _category_vocabulary()]
+
+
+CONFIGURED_SERVERS = {f"zzconf-{i}": f"zzconfarg{i}" for i in range(8)}
+
+
+def _tier_scenarios_configured() -> list[tuple[str, dict[str, Any]]]:
+    return [(arg, {"query": f"use {arg}"}) for arg in CONFIGURED_SERVERS.values()]
+
+
+REGISTRY_WORDS = [
+    "Reviewservice",
+    "Ledgerbook",
+    "Paymentsco",
+    "Mailroom",
+    "Ticketdesk",
+    "Shipmate",
+    "Calendarly",
+    "Invoicely",
+]
+
+
+def _tier_scenarios_registry() -> list[tuple[str, dict[str, Any]]]:
+    return [(word.lower(), {"query": f"connect {word}"}) for word in REGISTRY_WORDS]
+
+
+# One generator per declared tier except the overlay CLI's own.
+TIER_SCENARIOS = {
+    "name": _tier_scenarios_name,
+    "shipped_cli": _tier_scenarios_shipped_cli,
+    "category": _tier_scenarios_category,
+    "configured": _tier_scenarios_configured,
+    "registry": _tier_scenarios_registry,
+}
+
+
+def test_every_declared_tier_has_a_scenario_generator() -> None:
+    from pmcp.tools.handlers import REQUEST_CAPABILITY_TIERS
+
+    assert set(TIER_SCENARIOS) == set(REQUEST_CAPABILITY_TIERS) - {"overlay_cli"}
+
+
+def _record_tiers(tools: GatewayTools, answered: list[str]) -> None:
+    """Wrap every declared tier method so a run records which tier answered."""
+    from pmcp.tools.handlers import REQUEST_CAPABILITY_TIERS
+
+    for tier in REQUEST_CAPABILITY_TIERS:
+        method = getattr(tools, f"_capability_tier_{tier}")
+
+        async def spy(request: Any, _method: Any = method, _tier: str = tier) -> Any:
+            answer = await _method(request)
+            if answer is not None:
+                answered.append(_tier)
+            return answer
+
+        setattr(tools, f"_capability_tier_{tier}", spy)
+
+
+def test_an_overlay_cli_answers_after_every_declared_tier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The differential, generated per declared tier: every scenario, then the
+    same scenario with an AVAILABLE overlay CLI for its term (named like the
+    term where it can be) -- the same tier answers, with the same response.
+    Every tier other than the overlay CLI's answers at least once, so no tier
+    goes unexercised (codex F001: the registry tier was never generated)."""
+    from pmcp.tools.handlers import REQUEST_CAPABILITY_TIERS
+
+    _write(
+        Path.home() / ".mcp.json",
+        json.dumps(
+            {
+                "mcpServers": {
+                    name: {"command": "zzconfcmd", "args": [arg]}
+                    for name, arg in CONFIGURED_SERVERS.items()
+                }
+            }
+        ),
+    )
+    scenarios = [
+        (tier, term, request)
+        for tier, generate in TIER_SCENARIOS.items()
+        for term, request in generate()
+    ]
+    shipped = load_manifest(_SHIPPED_MANIFEST_PATH)
+    clis: dict[str, Any] = {}
+    for i, (_tier, term, _request) in enumerate(scenarios):
+        name = term if term not in shipped.cli_alternatives else f"zzcli-{i}"
+        if name in clis:
+            name = f"zzcli-{i}"
+        clis[name] = {"keywords": [term], "check_command": ["git"]}
+    tools, _registry = _codex_r6_registry_tools(monkeypatch)
+    answered: list[str] = []
+    _record_tiers(tools, answered)
+
+    def run() -> list[tuple[str, dict[str, Any]]]:
+        out = []
+        for _tier, _term, request in scenarios:
+            answered.clear()
+            available = list(request.get("available_clis", [])) + list(clis)
+            result = asyncio.run(
+                tools.request_capability({**request, "available_clis": available})
+            )
+            out.append(
+                (answered[0] if answered else "not_available", result.model_dump())
+            )
+        return out
+
+    before = run()
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump({"cli_alternatives": clis}),
+    )
+    assert set(load_manifest().overlay_cli_names) == set(clis)
+    after = run()
+    changed = [
+        (tier, term, b[0], a[0])
+        for (tier, term, _), b, a in zip(scenarios, before, after)
+        if b != a and b[0] != "not_available"
+    ]
+    assert changed == []
+    # Every declared tier but the overlay CLI's answered in the generated set.
+    assert {b[0] for b in before} >= set(REQUEST_CAPABILITY_TIERS) - {"overlay_cli"}
+    # Not vacuous: the overlay CLI still answers where no other tier does.
+    assert any(
+        b[0] == "not_available" and a[0] == "overlay_cli" for b, a in zip(before, after)
+    )
+
+
+# --- revision 7: inherited overlay data reaches no diagnostic (round 6, codex F002) --
+# A command-less `.mcp.json` entry inherits `command`, `args`, `extra_env` and the
+# credential from the manifest entry of the same name -- an overlay's, when an
+# overlay adds or replaces it. Every diagnostic on the load, discovery, startup,
+# refresh and lazy-registration paths renders a config field through
+# `config_field_diagnostic` (name and field name, never the value), and
+# `test_no_diagnostic_on_these_paths_reads_a_config_field` derives the sites.
+
+R7_CRED = "sk-r7-credential-v4lue-5e1f"
+
+
+def _r7_sentinel(field_name: str) -> str:
+    return f"sk-r7-{field_name.replace('_', '-')}-v4lue"
+
+
+def _r7_value(field_name: str) -> Any:
+    """A KEPT value for ``field_name`` carrying its sentinel, or None when the
+    field's type cannot hold one (a bool or a Literal)."""
+    import typing
+
+    hint = str(typing.get_type_hints(ServerConfig)[field_name])
+    s = _r7_sentinel(field_name)
+    if field_name in ("env_var", "secret_key"):
+        return s.upper().replace("-", "_")
+    if field_name == "url" or field_name.endswith("_url"):
+        return f"https://{s}.example.invalid/x"
+    if field_name == "install":
+        return {p: ["npx", "-y", s] for p in ("mac", "wsl", "linux", "windows")}
+    if field_name == "extra_env":
+        return {"ZZ_R7_EXTRA": s}
+    if field_name == "api_key_optional_when":
+        return ["ZZ_R7_EXTRA"]
+    if hint.startswith("list[str]"):
+        return [s]
+    if hint.startswith("dict[str, str]") or hint.startswith("dict[str, typing.Any]"):
+        return {"zzr7key": s}
+    if hint.startswith("<class 'str'>") or hint.startswith("str"):
+        return s
+    return None
+
+
+R7_FIELDS = [f for f in SERVER_FIELDS if _r7_value(f) is not None]
+
+# Self-referencing entries: the gateway's own command, reached by a path or a
+# package manager, each carrying a sentinel that only the overlay holds.
+R7_SELF_REFERENCES = {
+    "zz-r7-self-cmd": {"command": "/opt/sk-r7-selfref-cmd-v4lue/pmcp"},
+    "zz-r7-self-uvx": {
+        "command": "uvx",
+        "args": ["/opt/sk-r7-selfref-uvx-v4lue/pmcp", "sk-r7-selfref-arg-v4lue"],
+    },
+    "zz-r7-self-py": {
+        "command": "python",
+        "args": ["-m", "pmcp", "sk-r7-selfref-py-v4lue"],
+    },
+    # codex F002's own case: a shipped name, replaced, inherited.
+    "puppeteer": {"command": "pmcp", "args": ["sk-review-overlay-only-61d"]},
+}
+R7_SELF_SENTINELS = [
+    "sk-r7-selfref-cmd-v4lue",
+    "sk-r7-selfref-uvx-v4lue",
+    "sk-r7-selfref-arg-v4lue",
+    "sk-r7-selfref-py-v4lue",
+    "sk-review-overlay-only-61d",
+]
+
+
+def _r7_overlay(field_name: str | None) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "description": "r7 walk entry",
+        "keywords": ["zzr7kw", "screenshot"],
+        "command": "npx",
+        "args": ["-y", "zz-r7@1.0.0"],
+        "env_var": "ZZ_R7_CRED_TOKEN",
+    }
+    servers: dict[str, Any] = {}
+    for name in ("zz-r7-local", "github"):  # overlay-only, and a shipped name
+        servers[name] = dict(entry)
+    servers["zz-r7-remote"] = {
+        "description": "r7 walk remote",
+        "keywords": ["zzr7kw"],
+        "url": "https://example.invalid/r7",
+    }
+    for name, self_ref in R7_SELF_REFERENCES.items():
+        servers[name] = {**entry, **self_ref}
+    if field_name is not None:
+        value = _r7_value(field_name)
+        for name, server in servers.items():
+            if name in R7_SELF_REFERENCES and field_name in ("command", "args"):
+                continue  # keep the self-reference itself
+            server[field_name] = value
+    return {"servers": servers}
+
+
+def _r7_drive(tools: GatewayTools, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every load and discovery path, as the gateway runs them; the response
+    bodies, serialised, are returned for the response check."""
+    from pmcp.client.manager import ClientManager
+    from pmcp.config.loader import startup_skip_message
+
+    responses: list[str] = []
+    manifest = load_manifest()
+    configs = load_configs()
+    # Gateway startup's first two calls (server.initialize), then its resolution.
+    configs = filter_self_references(configs)
+    resolution = resolve_startup_configs(
+        configs,
+        manifest_servers=manifest.servers,
+        enabled_auto_start=set(manifest.servers),
+        is_auth_available=lambda _key: False,
+    )
+    for skipped in resolution.skipped:
+        logging.getLogger("pmcp.server").info(startup_skip_message("startup", skipped))
+    for query in ("zzr7kw", "screenshot", "github", "puppeteer", "zz r7 local"):
+        for include_offline in (True, False):
+            responses.append(
+                asyncio.run(
+                    tools.catalog_search(
+                        {"query": query, "include_offline": include_offline}
+                    )
+                ).model_dump_json()
+            )
+        responses.append(
+            asyncio.run(tools.request_capability({"query": query})).model_dump_json()
+        )
+        _keyword_match(query, manifest, set())
+    assert asyncio.run(tools.refresh({"reason": "r7 walk"})).ok is True
+    lazy = resolve_startup_configs(configs, manifest_servers=manifest.servers)
+    ClientManager().register_lazy_configs(lazy.lazy_configs)
+    _extract_required_keys(Path.cwd())
+    return responses
+
+
+# The fields a discovery response is FOR: what a candidate copies
+# (`manifest_candidate_fields`), its credential metadata, and the keywords the
+# configured tier quotes as its reason. A response may carry these; never
+# another field's value.
+R7_RESPONSE_FIELDS = {
+    "description",
+    "transport",
+    "url",
+    "package",
+    "server_card_url",
+    "declared_scopes",
+    "declared_capabilities",
+    "env_var",
+    "env_instructions",
+    "keywords",
+}
+
+
+def test_the_response_fields_are_the_candidate_projection() -> None:
+    import inspect
+
+    source = inspect.getsource(loader.manifest_candidate_fields)
+    read = set(re.findall(r"server\.(\w+)", source))
+    assert read <= R7_RESPONSE_FIELDS
+    assert R7_RESPONSE_FIELDS - read == {"env_var", "env_instructions", "keywords"}
+
+
+@pytest.mark.parametrize("field_name", [None, *R7_FIELDS])
+def test_no_inherited_overlay_value_reaches_any_diagnostic(
+    field_name: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round 6 codex F002, as a class: every server field (each shape it can
+    keep) in overlay entries a command-less `.mcp.json` entry inherits from --
+    local and self-referencing, overlay-only and shipped names, plus a remote
+    entry -- driven through load, startup, discovery, refresh and lazy
+    registration at DEBUG. No log record or Python warning carries a value an
+    overlay holds; no response carries one outside the response fields."""
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump(_r7_overlay(field_name)),
+    )
+    partial = {name: {"args": []} for name in _r7_overlay(None)["servers"]}
+    partial.pop("zz-r7-remote")
+    partial["healthy"] = {"command": "healthy-command"}
+    _write(Path.home() / ".mcp.json", json.dumps({"mcpServers": partial}))
+    # The credential configured-default inheritance injects into `env`.
+    monkeypatch.setenv("ZZ_R7_CRED_TOKEN", R7_CRED)
+    if field_name in ("env_var", "secret_key"):
+        monkeypatch.setenv(_r7_value(field_name), R7_CRED)
+
+    manifest = load_manifest()
+    kept = {"zz-r7-local", "github", "zz-r7-remote", *R7_SELF_REFERENCES}
+    assert kept <= set(manifest.servers), sorted(kept - set(manifest.servers))
+    sentinels = [*R7_SELF_SENTINELS, R7_CRED]
+    if field_name is not None:
+        sentinels.append(_r7_sentinel(field_name))
+    tools = _refresh_tools(monkeypatch)
+    with warnings.catch_warnings(record=True) as caught, caplog.at_level(logging.DEBUG):
+        warnings.simplefilter("always")
+        responses = _r7_drive(tools, monkeypatch)
+    inherited = {c.name: c for c in load_configs()}
+    assert "healthy" in inherited
+    # The walk exercises the credential injection it checks for.
+    assert R7_CRED in (inherited["zz-r7-local"].config.env or {}).values()
+    text = (caplog.text + "\n".join(str(w.message) for w in caught)).lower()
+    assert [s for s in sentinels if s.lower() in text] == []
+    assert any("recursive spawning" in r.getMessage() for r in caplog.records)
+    body = "\n".join(responses).lower()
+    leaked = [s for s in sentinels if s.lower() in body]
+    if field_name in R7_RESPONSE_FIELDS:
+        leaked = [s for s in leaked if s != _r7_sentinel(field_name)]
+    assert leaked == []
+
+
+def _config_field_diagnostics() -> set[tuple[str, str]]:
+    """Every diagnostic in src/pmcp that renders a config field's value, derived.
+
+    A diagnostic is a logger/logging call, ``warnings.warn`` or a raised
+    exception's arguments. It renders a field when an argument reads an
+    attribute, a subscript key, a ``getattr``/``.get`` name that is a field of
+    ``ServerConfig``, ``CLIAlternative``, ``LocalMcpServerConfig`` or
+    ``RemoteMcpServerConfig`` -- directly, through a local assigned from one (a
+    fixpoint over assignments and loop targets), or through a parameter named
+    like a field. Returns (path, function) pairs.
+    """
+    import ast
+
+    from pmcp.types import LocalMcpServerConfig, RemoteMcpServerConfig
+
+    fields = {f.name for f in dataclasses.fields(ServerConfig)}
+    fields |= {f.name for f in dataclasses.fields(CLIAlternative)}
+    fields |= set(LocalMcpServerConfig.model_fields)
+    fields |= set(RemoteMcpServerConfig.model_fields)
+    # `name` is D9's label rule (entry_log_name); `type` and `description` are
+    # a Literal and the response text discovery exists to return.
+    fields -= {"name", "type", "description"}
+    levels = {
+        "debug",
+        "info",
+        "warning",
+        "warn",
+        "error",
+        "exception",
+        "critical",
+        "log",
+    }
+
+    def reads(node: ast.AST, tainted: set[str]) -> bool:
+        called = {id(c.func) for c in ast.walk(node) if isinstance(c, ast.Call)}
+        for n in ast.walk(node):
+            if (
+                isinstance(n, ast.Attribute)
+                and n.attr in fields
+                and id(n) not in called
+            ):
+                return True
+            if (
+                isinstance(n, ast.Subscript)
+                and isinstance(n.slice, ast.Constant)
+                and n.slice.value in fields
+            ):
+                return True
+            if (
+                isinstance(n, ast.Call)
+                and n.args[1:2]
+                and isinstance(n.args[1], ast.Constant)
+                and n.args[1].value in fields
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "getattr"
+            ):
+                return True
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "get"
+                and n.args
+                and isinstance(n.args[0], ast.Constant)
+                and n.args[0].value in fields
+            ):
+                return True
+            if isinstance(n, ast.Name) and n.id in tainted:
+                return True
+        return False
+
+    def names(target: ast.AST) -> list[str]:
+        return [n.id for n in ast.walk(target) if isinstance(n, ast.Name)]
+
+    root = Path(loader.__file__).resolve().parents[1]
+    sites: set[tuple[str, str]] = set()
+    for path in sorted(root.rglob("*.py")):
+        if "baml_client" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            params = fn.args.args + fn.args.kwonlyargs + fn.args.posonlyargs
+            tainted = {a.arg for a in params if a.arg in fields}
+            changed = True
+            while changed:
+                changed = False
+                for n in ast.walk(fn):
+                    if isinstance(n, ast.Assign):
+                        source, targets = n.value, n.targets
+                    elif isinstance(n, (ast.AnnAssign, ast.AugAssign)) and n.value:
+                        source, targets = n.value, [n.target]
+                    elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+                        source, targets = n.iter, [n.target]
+                    else:
+                        continue
+                    if reads(source, tainted):
+                        new = {x for t in targets for x in names(t)} - tainted
+                        if new:
+                            tainted |= new
+                            changed = True
+            for n in ast.walk(fn):
+                args: list[ast.AST] = []
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                    owner = n.func.value
+                    if (
+                        n.func.attr in levels
+                        and isinstance(owner, ast.Name)
+                        and owner.id in {"logger", "log", "logging", "_logger"}
+                    ) or (
+                        n.func.attr == "warn"
+                        and isinstance(owner, ast.Name)
+                        and owner.id == "warnings"
+                    ):
+                        args = [*n.args, *(k.value for k in n.keywords)]
+                elif isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call):
+                    args = list(n.exc.args)
+                if any(reads(a, tainted) for a in args):
+                    sites.add((path.relative_to(root).as_posix(), fn.name))
+    return sites
+
+
+# Every function the derivation finds, and why it is outside D9's paths (load,
+# discovery, CLI probing, startup and refresh resolution, lazy registration).
+# Fail-closed: a NEW site anywhere fails the test until it is made value-free or
+# placed here with its reason.
+_LIFECYCLE = "lifecycle: from the first start attempt (D9 out of scope)"
+_PROVISION = (
+    "provisioning, install or update: an explicit operator action (D9 out of scope)"
+)
+_REFRESHER = "`pmcp refresh` (the descriptions refresher; D9 out of scope)"
+_NOT_A_FIELD = (
+    "not a config field: a count, an HTTP status, a request URL or header, or an "
+    "argparse namespace that happens to be named `args`"
+)
+_NOT_MANIFEST = "a discovered or registry package, not manifest input"
+DIAGNOSTIC_SITES_OUTSIDE_D9 = {
+    ("auth.py", "redirect_request"): _NOT_A_FIELD,
+    ("feedback_egress.py", "redirect_request"): _NOT_A_FIELD,
+    ("manifest/package_identity.py", "redirect_request"): _NOT_A_FIELD,
+    ("transport/http.py", "create_http_app"): _NOT_A_FIELD,
+    ("transport/http.py", "handle_mcp"): _NOT_A_FIELD,
+    ("manifest/loader.py", "_build_manifest"): _NOT_A_FIELD,
+    ("server.py", "initialize"): _NOT_A_FIELD,
+    ("tools/handlers.py", "provision_status"): _NOT_A_FIELD,
+    ("manifest/version_checker.py", "get_npm_version"): _NOT_A_FIELD,
+    ("manifest/version_checker.py", "get_pypi_version"): _NOT_A_FIELD,
+    ("manifest/version_checker.py", "get_cargo_version"): _NOT_A_FIELD,
+    ("manifest/version_checker.py", "get_docker_version"): _NOT_A_FIELD,
+    ("client/manager.py", "call_tool"): _NOT_A_FIELD,
+    ("client/manager.py", "read_resource"): _NOT_A_FIELD,
+    ("client/manager.py", "get_prompt"): _NOT_A_FIELD,
+    ("client/manager.py", "_remote_headers"): _LIFECYCLE,
+    ("client/manager.py", "_connect_stdio"): _LIFECYCLE,
+    ("cli.py", "run_status"): _NOT_A_FIELD,
+    ("manifest/installer.py", "start_install"): _PROVISION,
+    ("manifest/installer.py", "install_server"): _PROVISION,
+    ("manifest/installer.py", "verify_installation"): _PROVISION,
+    ("manifest/installer.py", "_monitor_install"): _PROVISION,
+    ("manifest/version_checker.py", "_npm_package_arg"): _PROVISION,
+    ("tools/handlers.py", "_run_update_probe_command"): _PROVISION,
+    ("manifest/refresher.py", "refresh_server"): _REFRESHER,
+    ("manifest/refresher.py", "refresh_all"): _REFRESHER,
+    ("manifest/refresher.py", "refresh_target"): _REFRESHER,
+    ("manifest/refresher.py", "check_staleness"): _REFRESHER,
+    ("tools/handlers.py", "register_discovered_server"): _NOT_MANIFEST,
+    ("package_approvals.py", "_require_identity_fields"): _NOT_MANIFEST,
+    ("cli.py", "_run_trust_revoke_package"): _NOT_A_FIELD,
+}
+
+
+def test_no_diagnostic_on_these_paths_reads_a_config_field() -> None:
+    """Round 6 codex F002, derived: `filter_self_references` and
+    `is_self_reference` printed `command` and `args`, which a `.mcp.json` entry
+    can inherit from an overlay. Every diagnostic that reads a config field is
+    now either outside D9's paths, with its reason, or gone."""
+    sites = _config_field_diagnostics()
+    assert sites - set(DIAGNOSTIC_SITES_OUTSIDE_D9) == set()
+    # The table holds no stale row (each still exists), so it cannot grow
+    # into a list of names nobody re-checks.
+    assert set(DIAGNOSTIC_SITES_OUTSIDE_D9) - sites == set()
+    assert not any(path == "identity.py" for path, _ in sites)
+
+
+def test_codex_r6_f002_falsifier_an_inherited_argument_reaches_no_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round 6, codex F002, verbatim in substance: a partial `.mcp.json` entry
+    inherits `command: pmcp` and an argument only the overlay holds."""
+    from pmcp.config.loader import _merge_manifest_defaults, parse_config_bytes
+    from pmcp.types import ResolvedServerConfig
+
+    secret = "sk-review-overlay-only-61d"
+    document = (
+        f"servers:\n  puppeteer:\n    command: pmcp\n    args: [{secret}]\n"
+    ).encode()
+    servers, _, _, _ = loader._parse_overlay_document(Path("overlay.yaml"), document)
+    assert "puppeteer" in servers
+    configured = parse_config_bytes(
+        b'{"mcpServers":{"puppeteer":{"args":[]}}}', Path("user.mcp.json")
+    )
+    assert configured is not None
+    partial = configured.mcpServers["puppeteer"]
+    assert secret not in repr(partial)
+    inherited = _merge_manifest_defaults("puppeteer", partial, servers)  # type: ignore[arg-type]
+    assert inherited is not None and secret in inherited.args
+    resolved = ResolvedServerConfig(name="puppeteer", source="user", config=inherited)
+    with caplog.at_level(logging.DEBUG):
+        assert filter_self_references([resolved]) == []
+    assert secret not in caplog.text
+    assert "'puppeteer' (field 'command')" in caplog.text
+
+
+def test_the_field_diagnostic_names_a_field_never_a_value() -> None:
+    """`config_field_diagnostic` is the one renderer: a `.mcp.json` entry by
+    its name, a manifest-derived one only if pmcp ships the name, and the
+    field by its name."""
+    from pmcp.identity import config_field_diagnostic
+    from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+
+    def config(name: str, source: Any) -> ResolvedServerConfig:
+        return ResolvedServerConfig(
+            name=name,
+            source=source,
+            config=LocalMcpServerConfig(command="pmcp", args=[VALUE_SENTINEL]),
+        )
+
+    assert (
+        config_field_diagnostic(config("mine", "user"), "args")
+        == "server 'mine' (field 'args')"
+    )
+    overlay_only = config_field_diagnostic(config(NAME_SENTINEL, "manifest"), "command")
+    assert NAME_SENTINEL not in overlay_only and "field 'command'" in overlay_only
+    assert "'github'" in config_field_diagnostic(config("github", "manifest"), "args")
+    assert VALUE_SENTINEL not in config_field_diagnostic(config("x", "user"), "args")
 ````
 
-### Patch — test migration (`tests/test_version_pin.py`, `tests/test_manifest_overlay.py`)
+### Patch — test migration (`tests/test_version_pin.py`, `tests/test_manifest_overlay.py`, `tests/test_credential_predicate_guard.py`)
 
 ````diff
+diff --git a/tests/test_credential_predicate_guard.py b/tests/test_credential_predicate_guard.py
+index a7bb916..288bca4 100644
+--- a/tests/test_credential_predicate_guard.py
++++ b/tests/test_credential_predicate_guard.py
+@@ -48,7 +48,9 @@ SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "pmcp"
+ # (Consiliency/pmcp#114 board review finding 1, remote variant).
+ ALLOWLISTED_ATTRIBUTE_READS: set[tuple[str, str]] = {
+     ("tools/handlers.py", "_sort_key"),
+-    ("tools/handlers.py", "request_capability"),
++    # The category tier's candidate grouping, moved out of request_capability
++    # into its own tier method (Consiliency/pmcp#342 rev 7).
++    ("tools/handlers.py", "_capability_tier_category"),
+     ("tools/handlers.py", "_configured_duplicate_missing_credential"),
+     ("tools/handlers.py", "_get_server_env_metadata"),
+ }
 diff --git a/tests/test_manifest_overlay.py b/tests/test_manifest_overlay.py
 index c321855..2f15417 100644
 --- a/tests/test_manifest_overlay.py
@@ -5264,6 +6761,188 @@ index 4f4eead..3ba6157 100644
      assert value not in caplog.text
      assert all(
          value not in r.model_dump_json() and value not in line for r, line in outputs
+````
+
+### Patch — docs (`CHANGELOG.md`, `README.md`, `MIGRATING.md`; rev 7)
+
+````diff
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9fa0441..111b563 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -91,6 +91,13 @@ to do, how to verify it, and how to roll back to 2.7.3.
+   `server_version:`, now pins an npx server to that exact version; an invalid pin is
+   ignored with a warning. `gateway.update_server` does not move a pinned server, and
+   `pmcp update` prints `[PINNED]` for it. *Added*
++- **An overlay entry pmcp cannot use is skipped.** A manifest overlay entry with a
++  field some part of pmcp would fail on (`keywords: [1]`, an `args` or `command` that
++  is not a string, a `cli_alternatives` entry with an empty `check_command`) is skipped
++  when the overlay is read, with a WARNING naming the field but not its value. 2.7.3
++  loaded it, and then `gateway.catalog_search` failed for every query, or startup and
++  `gateway.refresh` failed for every server. A CLI an overlay adds or replaces now
++  ranks after every server and after pmcp's own CLIs. *Fixed*
+ - **Downstream servers see more from pmcp.** A server→client request now gets an
+   answer (`ping` gets an empty result, anything else `-32601`), cancellation is sent as
+   `notifications/cancelled`, and a malformed frame is dropped instead of ending the
+@@ -604,6 +611,32 @@ to do, how to verify it, and how to roll back to 2.7.3.
+   (D-01); see [Consiliency/pmcp#228](https://github.com/Consiliency/pmcp/pull/228).
+ 
+ ### Fixed
++- **An overlay no longer hides other servers from discovery, and one bad overlay entry
++  no longer takes down the others.** Discovery weighs a keyword by how many servers
++  declare it, and it counted over the merged manifest. So an approved project overlay
++  (or a user or `PMCP_MANIFEST_PATH` overlay) whose server shared a keyword pushed
++  every server with that keyword below the match threshold. `gateway.catalog_search`
++  then returned no candidate, not even the shipped or user server. Keyword weights now
++  come from the shipped manifest alone, so an overlay can add candidates and never
++  removes one, within the result limit.
++
++  Separately, a wrongly typed field in one overlay entry made `catalog_search` fail
++  for every query, or stopped gateway startup and `gateway.refresh` for every server.
++  Examples: `keywords: null`, a non-string `transport`, an int in `args`, or a bad
++  `cli_alternatives` entry. An overlay entry that any part of pmcp would reject is now
++  skipped when the overlay is read; an entry nothing would fail on still loads as
++  before. The warning names the field, never its value, and never shows an overlay
++  entry's name. Loading, discovery, CLI probing and the startup and refresh skip lines
++  no longer log an overlay entry's name or values either, including values a
++  `.mcp.json` entry inherits from an overlay (the self-reference warning now names the
++  field, not the command). A blank (`null`) field now means "not set" and takes its
++  default, instead of dropping the entry. One overlay entry also no longer stops other
++  `.mcp.json` servers from loading when one of them inherits its defaults, or makes
++  `pmcp secrets` drop other servers' auth metadata. An overlay that replaces a shipped
++  server no longer changes how `gateway.request_capability` picks a category for
++  anything else, and a CLI an overlay adds or replaces is recommended only when no
++  server matches and is listed after pmcp's own CLIs in `cli_hints`. See
++  [Consiliency/pmcp#342](https://github.com/Consiliency/pmcp/issues/342).
+ - **A cancelled caller keeps its cancellation through every server teardown,
+   and the teardown still completes.** A caller cancelled while a server
+   connection is being torn down -- a failed or cancelled handshake,
+diff --git a/MIGRATING.md b/MIGRATING.md
+index 337f767..ed5153c 100644
+--- a/MIGRATING.md
++++ b/MIGRATING.md
+@@ -34,6 +34,7 @@ log is `~/.pmcp/logs/gateway.log`.
+   [task units](#task-ttl-and-poll_interval-are-seconds-in-pmcp-and-milliseconds-on-the-wire) ·
+   [redaction](#redaction-removes-more) ·
+   [version pins](#manifest-version-pins) ·
++  [unusable overlay entries](#an-overlay-entry-pmcp-cannot-use-is-skipped) ·
+   [downstream servers](#downstream-servers-see-more-from-pmcp) ·
+   [logs](#logs) ·
+   [dependency floors](#dependency-floors) ·
+@@ -101,13 +102,14 @@ log is `~/.pmcp/logs/gateway.log`.
+ 6. **Check the gateway log for the new WARNINGs**:
+ 
+    ```bash
+-   grep -E '\[WARNING\] (Ignoring |Spawning |Installing |Starting install job |Verifying installation of |Running update probe)' ~/.pmcp/logs/gateway.log | tail -n 50
++   grep -E '\[WARNING\] (Ignoring |Spawning |Installing |Starting install job |Verifying installation of |Running update probe|Skipping invalid )' ~/.pmcp/logs/gateway.log | tail -n 50
+    journalctl --user -u pmcp --since today | grep -E 'Ignoring|Fatal error'
+    ```
+ 
+    The first command shows every WARNING that 3.0 adds or rewords in the log
+    file: anything pmcp ignored (project files, invalid version pins, malformed
+-   config) and every package-runner start, install and update probe. The
++   config, overlay entries it cannot use) and every package-runner start, install
++   and update probe. The
+    "Ignoring PMCP_…" lines for `PMCP_*` variables set in a `.env` file go only
+    to the gateway's stderr, not to `gateway.log`; the `journalctl` line catches
+    them for a service, or watch the terminal for a gateway you started by hand.
+@@ -879,6 +881,55 @@ entry sets an npm setting, when the gateway's environment sets any
+ gateway's working directory holds a `package.json` or `node_modules`. The pin
+ is still applied in those cases.
+ 
++### An overlay entry pmcp cannot use is skipped
++
++**Am I affected?** You are if you keep a manifest overlay
++(`~/.pmcp/manifest.yaml`, an approved project `.pmcp/manifest.yaml` or
++`$PMCP_MANIFEST_PATH`) and one of its entries has a field of the wrong type:
++`keywords: [1]`, a number in `args` or `command`, a `transport` that is not a
++string, or a `cli_alternatives` entry with an empty `check_command`. On 2.7.3
++such an entry loaded, and then `gateway.catalog_search` failed for every
++query, or startup and `gateway.refresh` failed for every server. You are also
++affected if an overlay adds or replaces a `cli_alternatives` entry that you
++expect `gateway.request_capability` to recommend.
++
++**What changed.** Such an entry is skipped when the overlay is read, with a
++WARNING that names the field but not its value, and not the entry's name
++unless pmcp ships it: `Skipping invalid server entry (…) in overlay …` or
++`Skipping invalid cli_alternative (…) in overlay …`. Every other entry and the
++shipped manifest load as before. A blank field (`description:` with nothing
++after it) means "not set" and takes its default. Discovery weighs keywords
++from the shipped manifest alone, so an overlay server that shares a keyword no
++longer hides another server. A CLI an overlay adds or replaces ranks after
++every server and after pmcp's own CLIs: `gateway.request_capability`
++recommends it only when no server matches, and `gateway.catalog_search` lists
++it after pmcp's own CLIs in `cli_hints`. The warning for a `.mcp.json` entry
++that would start pmcp itself now names the field (`command`, `args` or
++`name`), not the command line, because that entry may have inherited its
++command from an overlay.
++
++**What to do.** Fix the field the WARNING names, or delete the entry. For
++example, `keywords` and `args` are lists of strings:
++
++<!-- snippet: manifest-overlay -->
++```yaml
++# ~/.pmcp/manifest.yaml
++servers:
++  inventory-tool:
++    description: Internal inventory lookups
++    keywords: [inventory, stock levels]
++    command: npx
++    args: ["-y", "inventory-tool-mcp@1.0.0"]
++```
++
++If you relied on an overlay CLI being recommended ahead of a server, run the
++CLI directly; `gateway.catalog_search` still lists it in `cli_hints` when it
++is installed.
++
++**How to verify.** After a restart,
++`grep -c 'Skipping invalid ' ~/.pmcp/logs/gateway.log` prints `0`, and
++`gateway.catalog_search` with one of the entry's keywords returns it.
++
+ ### Downstream servers see more from pmcp
+ 
+ **Am I affected?** You are if you maintain an MCP server that pmcp connects
+@@ -1176,6 +1227,7 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
+ | [Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire](#task-ttl-and-poll_interval-are-seconds-in-pmcp-and-milliseconds-on-the-wire) | Reverse: 2.7.3 sends `ttl` and `poll_interval` to the server unchanged and reports the server's values back unchanged.† Which step undoes the migration depends on the server, so do **one** of these per downstream server, never both. **A spec-conforming (third-party) server** reads milliseconds, so a migrated `ttl: 300` keeps a task for 0.3 s, not five minutes:† Multiply by 1000 again (`ttl: 300000`, `poll_interval: 2500`) in the callers of that server; tasks pmcp returns from it show milliseconds again (`poll_interval: 2500.0`).† **A pmcp tenant server built to the old seconds contract that you switched to milliseconds for 3.0**: Switch it back to reading and returning seconds, and keep its callers sending seconds (`ttl: 300`), as they did on 2.7.3; tasks it returns show seconds again. Doing both keeps a five-minute task for 300000 seconds. |
+ | [Redaction removes more](#redaction-removes-more) | Safe on 2.7.3: it redacts less. |
+ | [Manifest version pins](#manifest-version-pins) | Reverse: 2.7.3 ignores `version:` and `server_version:` silently,† so a pinned server runs whatever npm resolves. To keep a version, put it in that server's `args` in `~/.mcp.json` (for example `"args": ["-y", "firecrawl-mcp@3.25.5"]`). |
++| [An overlay entry pmcp cannot use is skipped](#an-overlay-entry-pmcp-cannot-use-is-skipped) | Safe on 2.7.3: it loads a corrected entry the same way. An entry 3.0 skips loads again on 2.7.3, and can again make `gateway.catalog_search` fail for every query. |
+ | [Downstream servers see more from pmcp](#downstream-servers-see-more-from-pmcp) | Safe on 2.7.3: a server that handles `-32601` and `notifications/cancelled` simply doesn't receive them. |
+ | [Logs](#logs) | Safe on 2.7.3: alert exclusions for the new WARNINGs match nothing. |
+ | [Dependency floors](#dependency-floors) | Safe on 2.7.3: its floors for `pyjwt`, `aiohttp`, `python-dotenv` and `starlette` are lower, with no upper bound on any of the four.† (2.7.3 caps other packages: `mcp<3.0.0`, `httpx<1.0`, `httpx2<3.0.0`, `jsonschema<5.0.0` and `semver<4`; installing 2.7.3 resolves those itself.) |
+diff --git a/README.md b/README.md
+index 077cb0b..246e951 100644
+--- a/README.md
++++ b/README.md
+@@ -1268,13 +1268,26 @@ relaxer is ignored, and an unset, empty, or unexpanded `${VAR}` value fails
+ closed: the credential stays required.
+ 
+ Overlay loading is **fail-soft**: a missing file is skipped silently, and a
+-malformed file or a single bad entry logs a warning and is skipped without
+-crashing the gateway — the shipped manifest always still loads. pmcp re-reads
++malformed file logs a warning and is skipped; so does a single entry that pmcp
++could not use: a field some part of pmcp would fail on, such as `keywords: [1]`,
++an `args` holding a number, or a CLI alternative with an empty `check_command`.
++Fields pmcp only tests for truth or ignores (`transport` without a `url`,
++`auto_start`, `status`) are accepted as before. The warning names the field, not
++its value, and does not show the entry's name unless pmcp ships it. A blank field
++(`description:` with nothing after it) means "not set". None of this crashes the
++gateway — the shipped manifest always still loads. pmcp re-reads
+ overlay files on every manifest load, so edits apply without a restart, and
+ logs each warning once per change rather than on every load — except that a
+ file that cannot be read or parsed is reported on every load until it is
+ fixed.
+ 
++An overlay's servers are found by their own keywords. Sharing a keyword with
++another server, or replacing a shipped server, never hides another server from
++`gateway.catalog_search` or `gateway.request_capability` (within the result
++limit; ties rank by name; a query that names a server resolves to it). A CLI an
++overlay adds or replaces is recommended only when no server matches, and is listed
++after pmcp's own CLIs.
++
+ > **Security:** a manifest entry can specify an arbitrary `command`/`args` to
+ > run when provisioned — treat an overlay file with the same trust as your own
+ > `.mcp.json`. Policy still applies (denied servers stay denied).
 ````
 
 ## Appendix: reproduction and differential scripts
@@ -5950,10 +7629,38 @@ def pytest_runtest_call(item):  # noqa: ARG001
     yield
 ````
 
-### `mutants.py` (mutation driver, revision 6)
+### `extract.py` (rev 7: Verification step 10, the bodies byte for byte)
+
+`src/pmcp/identity.py`'s hunks carry CR bytes, so the bodies are cut from this file's
+bytes, not from a rendered or pasted copy. `python extract.py <this file> <outdir>` writes
+`src.patch`, `mod.py`, `mig.patch` and `docs.patch`.
 
 ````python
-"""Mutation driver for the Consiliency/pmcp#342 spike (revision 2).
+"""Step 10: extract the verbatim bodies from the plan, byte for byte."""
+import sys
+from pathlib import Path
+plan = Path(sys.argv[1]).read_bytes()
+out = Path(sys.argv[2]); out.mkdir(parents=True, exist_ok=True)
+heads = {
+    b"### Patch \xe2\x80\x94 source (": "src.patch",
+    b"### File \xe2\x80\x94 `tests/test_catalog_overlay_discovery.py`": "mod.py",
+    b"### Patch \xe2\x80\x94 test migration (": "mig.patch",
+    b"### Patch \xe2\x80\x94 docs (": "docs.patch",
+}
+for head, name in heads.items():
+    assert plan.count(head) == 1, head
+    i = plan.index(head)
+    start = plan.index(b"\n````", i) + 1
+    start = plan.index(b"\n", start) + 1
+    end = plan.index(b"\n````\n", start) + 1
+    (out / name).write_bytes(plan[start:end])
+    print(name, end - start)
+````
+
+### `mutants.py` (mutation driver, revision 7)
+
+````python
+"""Mutation driver for the Consiliency/pmcp#342 spike (revision 7; first written for revision 2).
 
 Each mutant is an exact-text replacement that must match exactly once. The file
 is restored from a saved copy (never git) and the restore is cmp-checked.
@@ -5983,6 +7690,7 @@ ENVIRON = "src/pmcp/manifest/environment.py"
 CONFIG = "src/pmcp/config/loader.py"
 MANAGER = "src/pmcp/client/manager.py"
 SECRETS = "src/pmcp/cli_commands/secrets.py"
+IDENTITY = "src/pmcp/identity.py"
 TESTS = ["tests/test_catalog_overlay_discovery.py"]
 GENERIC = "tests/test_manifest.py::test_keyword_match_generic_api_alone_stays_below_threshold"
 GUARD_EXC = "except ZeroDivisionError as exc:"
@@ -6056,14 +7764,14 @@ MUTANTS = [
      "            except Exception as exc:\n                _log_unusable_manifest_entry(\"request_capability\", n, exc)\n",
      "            " + GUARD_EXC + "\n                _log_unusable_manifest_entry(\"request_capability\", n, exc)\n", TESTS),
     ("G9", "guard: request_capability name match lets its entry raise", HANDLERS,
-     "            except Exception as exc:\n                _log_unusable_manifest_entry(\"request_capability\", name_match, exc)\n",
-     "            " + GUARD_EXC + "\n                _log_unusable_manifest_entry(\"request_capability\", name_match, exc)\n", TESTS),
+     "        except Exception as exc:\n            _log_unusable_manifest_entry(\"request_capability\", name_match, exc)\n",
+     "        " + GUARD_EXC + "\n            _log_unusable_manifest_entry(\"request_capability\", name_match, exc)\n", TESTS),
     ("G10", "guard: request_capability category keywords let one server raise", LOADER,
      "    except Exception as exc:\n        logger.warning(\n            f\"request_capability: skipping unusable keywords \"\n",
      "    " + GUARD_EXC + "\n        logger.warning(\n            f\"request_capability: skipping unusable keywords \"\n", TESTS),
     ("G11", "guard: request_capability category candidates let one server raise", HANDLERS,
-     "                except Exception as exc:\n                    _log_unusable_manifest_entry(\"request_capability\", scfg.name, exc)\n",
-     "                " + GUARD_EXC + "\n                    _log_unusable_manifest_entry(\"request_capability\", scfg.name, exc)\n", TESTS),
+     "            except Exception as exc:\n                _log_unusable_manifest_entry(\"request_capability\", scfg.name, exc)\n",
+     "            " + GUARD_EXC + "\n                _log_unusable_manifest_entry(\"request_capability\", scfg.name, exc)\n", TESTS),
     # --- revision 3 ---
     ("M6", "R2: check skips the name/keyword scoring every discovery path runs", LOADER,
      "    normalized_server_name(server.name)\n    _keyword_match_score(\"probe\", server.keywords)\n", "", TESTS),
@@ -6146,7 +7854,8 @@ MUTANTS = [
 
     # --- revision 6 ---
     ("K3", "cli: the overlay-CLI fallback after every server tier is removed", HANDLERS,
-     "        if overlay_cli_match is not None:\n            return self._use_cli_resolution(overlay_cli_match.hint)\n", "", TESTS),
+     "        return self._use_cli_resolution(request.overlay_cli_match.hint)\n",
+     "        return None\n", TESTS),
     ("K4", "cli: match_capability lets an overlay CLI outrank a server", MATCHER,
      "        if match.hint.name in overlay_cli_names:\n            continue\n", "", TESTS),
     ("J1", "schema: unknown keys are checked (main ignores them)", LOADER,
@@ -6160,6 +7869,34 @@ MUTANTS = [
     ("E1", "yaml: only YAMLError is contained at the overlay parse boundary", LOADER,
      "        data = yaml.safe_load(content)\n    except Exception as exc:\n",
      "        data = yaml.safe_load(content)\n    except yaml.YAMLError as exc:\n", TESTS),
+
+    # --- revision 7 ---
+    ("T1", "tiers: the overlay CLI answers before the registry (codex F001)", HANDLERS,
+     '    "registry",  # MCP Registry candidates for an unknown named service\n    "overlay_cli",  # the first available overlay CLI hint: always last\n',
+     '    "overlay_cli",  # the first available overlay CLI hint: always last\n    "registry",  # MCP Registry candidates for an unknown named service\n', TESTS),
+    ("T2", "tiers: the overlay CLI answers before the configured-server tier", HANDLERS,
+     '    "configured",  # a .mcp.json server, by keyword\n    "registry",  # MCP Registry candidates for an unknown named service\n    "overlay_cli",  # the first available overlay CLI hint: always last\n',
+     '    "overlay_cli",  # the first available overlay CLI hint: always last\n    "configured",  # a .mcp.json server, by keyword\n    "registry",  # MCP Registry candidates for an unknown named service\n', TESTS),
+    ("T3", "tiers: the overlay CLI answers first (before the name tier)", HANDLERS,
+     '    "name",  # a manifest server the query names (yields to a colliding shipped CLI)\n',
+     '    "overlay_cli",\n    "name",  # a manifest server the query names (yields to a colliding shipped CLI)\n', TESTS),
+    ("T4", "tiers: a declared tier is dropped (the registry)", HANDLERS,
+     '    "registry",  # MCP Registry candidates for an unknown named service\n', "", TESTS),
+    ("T5", "tiers: a return path outside the declared loop (rev 6's early overlay answer)", HANDLERS,
+     "        for tier in REQUEST_CAPABILITY_TIERS:\n",
+     "        if overlay_cli_match is not None and request.unknown_service:\n            return self._use_cli_resolution(overlay_cli_match.hint)\n        for tier in REQUEST_CAPABILITY_TIERS:\n", TESTS),
+    ("H1", "cli_hints: an overlay CLI ranks with shipped CLIs by score (claude N1)", MATCHER,
+     "            match.hint.name in overlay_cli_names,\n            -match.score,\n",
+     "            -match.score,\n", TESTS),
+    ("V1", "diagnostics: the self-reference warning prints command and args (codex F002)", IDENTITY,
+     '                    f"Excluding {config_field_diagnostic(config, field_name)} "\n',
+     '                    f"Excluding {config.name} ({getattr(config.config, \'command\', \'\')} {getattr(config.config, \'args\', \'\')}) "\n', TESTS),
+    ("V2", "diagnostics: the self-reference DEBUG line prints the command", IDENTITY,
+     '            f"Self-reference detected: {config_field_diagnostic(config, field_name)}"\n',
+     '            f"Self-reference detected: {getattr(config.config, \'command\', \'\')}"\n', TESTS),
+    ("V3", "diagnostics: the field renderer names a manifest-derived entry by its key", IDENTITY,
+     '        config.name, manifest_derived=getattr(config, "source", None) == "manifest"\n',
+     '        config.name, manifest_derived=False\n', TESTS),
 
 ]
 
