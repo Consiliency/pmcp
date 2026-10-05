@@ -10964,7 +10964,7 @@ print(f"{out}: {j - i - 1} lines")
 
 ### `mutants.py`
 
-Run it as `python mutants.py <worktree> <out-dir> [M4 ...]`; `NO_STATIC=1` deselects both sink checks.
+Run it as `PYTHONDONTWRITEBYTECODE=1 python mutants.py <worktree> <out-dir> [M4 ...]`; `NO_STATIC=1` deselects both sink checks. Without the bytecode setting, a same-size first mutant written in the checkout's mtime second leaves a stale `.pyc` (see *Mutation evidence*).
 
 To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e` and `0dc22a4`, in that order. Then apply this diff (rev 18: M17 and M33 re-anchored, M21 retired, M115–M128 added).
 
