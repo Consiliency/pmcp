@@ -104,10 +104,12 @@ log is `~/.pmcp/logs/gateway.log`.
    journalctl --user -u pmcp --since today | grep -E 'Ignoring|Fatal error'
    ```
 
-   The first command shows every WARNING that 3.0 adds or rewords: anything
-   pmcp ignored (project files, `PMCP_*` variables, invalid version pins,
-   malformed config) and every package-runner start, install and update
-   probe. It reads a service's log. For a gateway started from a
+   The first command shows every WARNING that 3.0 adds or rewords in the log
+   file: anything pmcp ignored (project files, invalid version pins, malformed
+   config) and every package-runner start, install and update probe. The
+   "Ignoring PMCP_…" lines for `PMCP_*` variables set in a `.env` file go only
+   to the gateway's stderr, not to `gateway.log`; the `journalctl` line catches
+   them for a service, or watch the terminal for a gateway you started by hand. It reads a service's log. For a gateway started from a
    checkout, read `<checkout>/.pmcp/logs/gateway.log` instead. `pmcp logs`
    prints the same file, but its `--level` filter matches nothing at
    `warn` (log lines say `[WARNING]`), so use `grep`.
@@ -1058,7 +1060,7 @@ against a home directory 3.0 had written to:
 | `guidance.enable_feedback_submission` in `~/.claude/gateway-guidance.yaml` | Ignored. `pmcp guidance` loads the file without an error. |
 | `server_version:` / `version:` pins in overlays | Ignored silently. The servers run unpinned again (`npx -y firecrawl-mcp`). |
 | `packages:` in any policy | **2.7.3 refuses to start.** Remove it first (step 1). |
-| `~/.config/pmcp/pmcp.env` and a project `.env.pmcp` | Read as before. 3.0 writes the same `KEY="value"` format with mode `0600`, so 2.7.3 reads what 3.0 stored. |
+| `~/.config/pmcp/pmcp.env` and a project `.env.pmcp` | Read as before. 3.0 writes the same format as 2.7.3 (`KEY=value`, with the value double-quoted only when it contains whitespace, `#`, `=`, a quote or a backslash, or is empty) with mode `0600`, so 2.7.3 reads what 3.0 stored. |
 | Explicit `--config`/`--policy`, user-scoped `.mcp.json` files | Unchanged. |
 
 **2.7.3 also gives up the 3.0 protections.** These come back:
