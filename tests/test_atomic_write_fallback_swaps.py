@@ -138,14 +138,14 @@ def test_the_fallback_read_refuses_a_swap_between_its_check_and_its_open(
     )
     _swap_on_open(monkeypatch, lambda f, kw: os.fspath(f) == str(tree["store"]), swap)
 
-    with pytest.raises(OSError) as info:
+    with pytest.raises(ConfinedWriteError) as info:
         read_confined(tree["store"], tree["project"])
 
-    if not o_nofollow or swap_kind == "to another inside file":
-        assert isinstance(info.value, ConfinedWriteError)
-        assert str(info.value) == (
-            "refusing to write .env.pmcp: it changed while it was being read"
-        )
+    # Round 5 N-C: the O_NOFOLLOW open's ELOOP is the same refusal, not a raw
+    # "Too many levels of symbolic links".
+    assert str(info.value) == (
+        "refusing to write .env.pmcp: it changed while it was being read"
+    )
 
 
 @pytest.mark.skipif(not writer._DIR_FD_SUPPORTED, reason="dir_fd walk")
@@ -233,3 +233,64 @@ def test_a_temp_swapped_before_the_rename_is_refused_not_moved_into_place(
     assert [
         p.name for p in tree["project"].iterdir() if p.name.startswith(".pmcp-")
     ] == []
+
+
+@pytest.mark.skipif(not writer._DIR_FD_SUPPORTED, reason="dir_fd walk")
+def test_a_link_swapped_in_before_the_dir_fd_read_open_is_the_changed_refusal(
+    tree: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N-C on the dir_fd path: ELOOP from O_NOFOLLOW maps to the same message."""
+    _swap_on_open(
+        monkeypatch,
+        lambda f, kw: f == ".env.pmcp" and kw.get("dir_fd") is not None,
+        _to_outside_link(tree),
+    )
+    with pytest.raises(ConfinedWriteError) as info:
+        read_confined(tree["store"], tree["project"])
+    assert str(info.value) == (
+        "refusing to write .env.pmcp: it changed while it was being read"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The honest boundary (round 5, codex F001): a swap of the temporary's NAME in
+# the instant between its last check and the rename is NOT refused -- POSIX has
+# no rename-by-descriptor. That needs a concurrent process already running as
+# the user and writing into the store's directory, which is out of scope (it can
+# write the user's files directly). What still holds, and is pinned here:
+# nothing is written outside, and the outside file is untouched.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("kind", ["dir_fd", "fallback", "unconfined"])
+def test_a_temp_swapped_after_its_last_check_is_out_of_scope_but_writes_nothing_outside(
+    kind: str, tree: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if kind == "dir_fd" and not writer._DIR_FD_SUPPORTED:
+        pytest.skip("dir_fd walk")
+    monkeypatch.setattr(writer, "_DIR_FD_SUPPORTED", kind != "fallback")
+    real_replace = os.replace
+    swapped: list[bool] = []
+
+    def swap_then_replace(src: Any, dst: Any, **kwargs: Any) -> None:
+        temporary = Path(src)
+        if not temporary.is_absolute():
+            temporary = tree["project"] / temporary
+        temporary.unlink()
+        temporary.symlink_to(tree["outside"])
+        swapped.append(True)
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", swap_then_replace)
+    atomic_write(
+        tree["store"],
+        b"NEW=submitted\n",
+        confine_to=None if kind == "unconfined" else tree["project"],
+    )
+    monkeypatch.undo()
+
+    assert swapped
+    # The guarantee: nothing outside was written.
+    assert tree["outside"].read_bytes() == OUTSIDE
+    # The documented residual: the swapped-in entry was moved into place.
+    assert tree["store"].is_symlink()

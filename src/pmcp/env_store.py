@@ -47,11 +47,39 @@ def resolve_scope_path(scope: str, project: Path | None = None) -> Path:
 
 
 def read_env_file(path: Path) -> dict[str, str]:
-    """Read .env key/value pairs from path."""
-    if not path.exists():
-        return {}
+    """Read .env key/value pairs from path.
 
-    return _env_values(dotenv_values(path, interpolate=False))
+    An absent store, and one that is not a regular file (a fifo, a socket, a
+    device, a directory), read as empty -- the read never blocks
+    (:func:`read_env_text`). It still follows a symlink: Consiliency/pmcp#367
+    (stays open).
+    """
+    text = read_env_text(path)
+    if text is None:
+        return {}
+    return _env_values(dotenv_values(stream=io.StringIO(text), interpolate=False))
+
+
+def read_env_text(path: Path) -> str | None:
+    """The UTF-8 text of a dotenv file, or ``None`` if absent or not a regular file.
+
+    Never blocks: a repository can ship ``.env.pmcp`` as a fifo, and every
+    reader that opened it plainly -- the spawn-time ``managed_secret_keys``,
+    ``pmcp secrets check``, the gateway's credential-availability check -- froze
+    there. The entry is ``stat``-ed and must be a regular file, then opened
+    ``O_NONBLOCK`` and re-checked with ``fstat`` against a swap in between.
+    It follows a symlink (Consiliency/pmcp#367, stays open); the confined
+    readers in :mod:`pmcp.atomic_write` are the ones that do not.
+    """
+    if not path.exists():
+        return None
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        return None
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            return None
+        return handle.read().decode("utf-8")
 
 
 def read_store_for_update(
@@ -68,8 +96,11 @@ def read_store_for_update(
 
     This covers the commands that rewrite the store -- ``pmcp secrets set``,
     ``pmcp secrets sync`` and ``gateway.auth_connect`` -- so they never read
-    through a link they would refuse to write. Other readers (startup and spawn
-    env loading, ``pmcp secrets check``) still follow on read: Consiliency/pmcp#367.
+    through a link they would refuse to write; the startup load
+    (``cli._load_project_store_at_startup``) reads the same way. Other readers --
+    a running gateway's spawn-time credential checks and env stripping, ``pmcp
+    secrets check`` -- still follow a link on read (Consiliency/pmcp#367, stays
+    open), though none of them blocks on a fifo any more (:func:`read_env_text`).
     """
     confine_to = scope_confinement(scope, path)
     if confine_to is None:

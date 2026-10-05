@@ -309,3 +309,118 @@ def test_board_r4_f001_cli_secrets_set_refuses_a_leaving_or_fifo_store_from_the_
     assert proc.returncode == 0, proc.stderr[-400:]
     out = json.loads(proc.stdout)
     assert out["ok"] is False and out["error"] == NOT_REGULAR
+
+
+# --------------------------------------------------------------------------- #
+# Round 5 N-A: the startup load is confined to the PROJECT root that
+# `--scope project` uses, not to the current directory.
+# --------------------------------------------------------------------------- #
+
+
+def _run_in(
+    lay: dict[str, Path], cwd: Path, args: list[str], *, code: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    argv = (
+        [sys.executable, "-c", code]
+        if code is not None
+        else [sys.executable, "-m", "pmcp.cli", *args]
+    )
+    try:
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            env=_env(lay),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"`pmcp {' '.join(args)}` hung")
+
+
+def test_a_subdirectory_link_to_the_project_store_loads_from_the_subdirectory(
+    layout: dict[str, Path],
+) -> None:
+    project = layout["project"]
+    (project / ".env.pmcp").write_text(f"{PROBE}=root\n", encoding="utf-8")
+    sub = project / "packages" / "app"
+    sub.mkdir(parents=True)
+    os.symlink("../../.env.pmcp", sub / ".env.pmcp")
+    proc = _run_in(layout, sub, SET, code=_PROBE_MAIN)
+    assert _json(proc) == {"probe": "root"}
+    assert "refusing" not in proc.stderr
+
+
+def test_a_subdirectory_link_out_of_the_project_is_still_refused(
+    layout: dict[str, Path],
+) -> None:
+    sub = layout["project"] / "packages" / "app"
+    sub.mkdir(parents=True)
+    os.symlink("../../../outside/victim", sub / ".env.pmcp")
+    proc = _run_in(layout, sub, SET, code=_PROBE_MAIN)
+    assert _json(proc) == {"probe": None}
+    assert LOAD_REFUSAL in proc.stderr
+
+
+def test_outside_any_project_the_load_is_confined_to_the_current_directory_and_says_so(
+    layout: dict[str, Path],
+) -> None:
+    """No project root: confined to the cwd, and the refusal names the cwd."""
+    loose = layout["base"] / "loose"
+    loose.mkdir()
+    os.symlink("../outside/victim", loose / ".env.pmcp")
+    proc = _run_in(layout, loose, SET, code=_PROBE_MAIN)
+    assert _json(proc) == {"probe": None}
+    assert (
+        "pmcp: refusing to load .env.pmcp: it is a symlink that leaves the "
+        "current directory"
+    ) in proc.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Round 5 N-B: the readers that still follow a link (Consiliency/pmcp#367) no
+# longer block on a fifo.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("shape", list(NON_REGULAR), ids=list(NON_REGULAR))
+def test_secrets_check_does_not_hang_on_a_non_regular_store(
+    shape: str, layout: dict[str, Path]
+) -> None:
+    NON_REGULAR[shape](layout)
+    proc = _run_in(layout, layout["project"], ["secrets", "check"])
+    assert LOAD_NOT_REGULAR in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+@pytest.mark.parametrize("shape", list(NON_REGULAR), ids=list(NON_REGULAR))
+def test_the_spawn_time_readers_do_not_hang_on_a_non_regular_store(
+    shape: str, layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`managed_secret_keys` (every spawn) and the credential-availability check."""
+    import threading
+
+    from pmcp.env_store import managed_secret_keys
+    from pmcp.tools.handlers import GatewayTools
+
+    NON_REGULAR[shape](layout)
+    monkeypatch.setenv("HOME", str(layout["home"]))
+    monkeypatch.chdir(layout["project"])
+    monkeypatch.delenv("R4_ABSENT_VAR", raising=False)
+    results: list[object] = []
+
+    def run() -> None:
+        results.append(managed_secret_keys(layout["project"]))
+        results.append(
+            GatewayTools._check_api_key_available(
+                object(),  # type: ignore[arg-type]
+                "R4_ABSENT_VAR",
+            )
+        )
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(10)
+    assert not worker.is_alive(), "a spawn-time reader blocked on the store"
+    assert results == [set(), False]

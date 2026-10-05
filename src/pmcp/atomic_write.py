@@ -57,10 +57,21 @@ symlinked parent (a ``$WORKTREE_ROOT`` that is itself a link, say) is refused
 too, with a hint to use a relative link. A link out, an absolute link out, a
 dangling link out and a chain that leaves and comes back are all refused rather
 than replaced: silently replacing the link would destroy the operator's link
-and hide the problem. The residual is the root itself, opened by its path (its
-ancestors are not the repository's), and a directory moved OUT of the root
-between being opened and written by a process already running as the user --
-which could write the user's files directly anyway.
+and hide the problem.
+
+**What is guaranteed, and against whom.** The guarantees are about what a
+repository SHIPS: links, directories and file types present in the checkout
+before the command runs. Against those, nothing is read or written outside the
+root, and no fifo or device is read. A process already running as the user and
+writing into the store's directory WHILE the command runs is out of scope: it
+can write the user's files directly. The swap checks below -- the read's
+identity check and the rename-time check of the temporary's name -- narrow
+that window as a best effort; they do not close it. In particular POSIX has no
+rename-by-descriptor, so a temporary's NAME swapped between its last check and
+the ``rename`` is moved into place (the store can end as whatever was swapped
+in -- a link, say -- and the submitted value is lost); even then nothing is
+written outside the root. The root itself is opened by its path (its ancestors
+are not the repository's).
 
 **Where traversal cannot be protected, a confined write fails closed.** Without
 ``dir_fd`` support (Windows), there is no descriptor walk, so a confined write
@@ -438,6 +449,9 @@ def read_confined(
             )
         except FileNotFoundError:
             return None
+        except OSError as exc:
+            _raise_if_swapped_to_a_link(exc, path, verb)
+            raise
         with os.fdopen(fd, "rb") as handle:
             _require_same_regular_file(
                 entry, os.fstat(handle.fileno()), path, verb, not_regular
@@ -476,11 +490,27 @@ def _read_confined_without_dir_fd(
         )
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        _raise_if_swapped_to_a_link(exc, path, verb)
+        raise
     with os.fdopen(fd, "rb") as handle:
         _require_same_regular_file(
             entry, os.fstat(handle.fileno()), path, verb, not_regular
         )
         return handle.read()
+
+
+#: What an ``O_NOFOLLOW`` open of a symlink fails with: ``ELOOP`` on Linux and
+#: macOS, ``EMLINK`` on FreeBSD.
+_NOFOLLOW_ON_A_LINK = {errno.ELOOP, errno.EMLINK}
+
+
+def _raise_if_swapped_to_a_link(exc: OSError, path: Path, verb: str) -> None:
+    """The entry was checked as a regular file; a link at open means it changed."""
+    if exc.errno in _NOFOLLOW_ON_A_LINK:
+        raise ConfinedWriteError(
+            f"{refusing(verb)} {path.name}: it changed while it was being read"
+        ) from None
 
 
 def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
@@ -586,11 +616,13 @@ def _write_by_path(
             handle.flush()
             os.fsync(handle.fileno())
             written = os.fstat(handle.fileno())
-        # The temporary's NAME is not trusted between its creation and the
-        # rename: the entry must still be the file just written, not a link or
-        # another file swapped in under that name (the rename would move that
-        # into place instead). The destination needs no such check -- rename
-        # replaces a link at the destination as an entry, never through it.
+        # Best-effort narrowing, not a guarantee: the temporary is renamed by
+        # NAME, so check that the entry is still the file just written (not a
+        # link or another file swapped in) before renaming it. A concurrent
+        # same-user writer can still swap it between this check and the rename
+        # -- POSIX has no rename-by-descriptor -- which is out of scope (module
+        # docstring); even then nothing is written outside. The destination
+        # needs no check: rename replaces a link there as an entry.
         current = os.lstat(tmp_name)
         if stat.S_ISLNK(current.st_mode) or not _same_file(current, written):
             raise ConfinedWriteError(
@@ -637,6 +669,8 @@ def _write_in_dir(
             handle.flush()
             os.fsync(handle.fileno())
             written = os.fstat(handle.fileno())
+        # Best-effort narrowing of a concurrent swap of the temp's name; see
+        # the comment in _write_by_path and the module docstring.
         current = os.stat(tmp_name, dir_fd=dir_fd, follow_symlinks=False)
         if stat.S_ISLNK(current.st_mode) or not _same_file(current, written):
             raise ConfinedWriteError(

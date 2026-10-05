@@ -400,8 +400,13 @@ UTF-8, comes back as `"ok": false` instead of crashing the command; when
 `pmcp secrets sync` only reads the project store, the refusal says
 `refusing to read`. On Windows, any symlinked project `.env.pmcp` is refused.
 The user store `~/.config/pmcp/pmcp.env` still follows its link anywhere. A
+link from a subdirectory to a store elsewhere in the same project still loads;
+outside any project the startup load is confined to the current directory. A
 running gateway's spawn-time credential checks and `pmcp secrets check` still
-follow a project link when they read (Consiliency/pmcp#367).
+follow a project link when they read (Consiliency/pmcp#367), but no longer
+hang on a fifo. These protections are about what a repository ships; a
+process already running as you that rewrites the store's directory while a
+command runs is out of scope.
 
 **What to do.** If the link pointed somewhere you meant, such as a shared
 secrets file that the gateway used to load, store those keys in your user

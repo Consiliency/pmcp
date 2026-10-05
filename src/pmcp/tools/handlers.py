@@ -6,6 +6,7 @@ import functools
 import logging
 import os
 import re
+import io
 import json
 import asyncio
 import time
@@ -57,6 +58,7 @@ from pmcp.config.loader import (
 from pmcp.errors import ErrorCode, GatewayException, make_error
 from pmcp.env_store import (
     record_dotenv_keys,
+    read_env_text,
     record_pmcp_introduced_keys,
     resolve_scope_path,
     sanitized_subprocess_env,
@@ -2667,9 +2669,13 @@ class GatewayTools:
             Path.cwd() / ".env.pmcp",
             Path.home() / ".config" / "pmcp" / "pmcp.env",
         ]:
-            if env_path.exists():
+            # read_env_text: a fifo (or any non-regular file) a repository ships
+            # at one of these paths reads as absent instead of freezing the
+            # gateway; same parser, interpolation and precedence as before.
+            text = read_env_text(env_path)
+            if text is not None:
                 before = set(os.environ)
-                load_dotenv(env_path)
+                load_dotenv(stream=io.StringIO(text))
                 record_dotenv_keys(set(os.environ) - before)
                 if os.environ.get(env_var):
                     return True
