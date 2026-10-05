@@ -588,17 +588,13 @@ def _matches_exact(message: str) -> bool:
 
 
 def _gate_error(call: dict[str, Any]) -> jsonschema.ValidationError | None:
-    from pmcp.server import GATE_VALIDATOR
     from pmcp.tools.handlers import get_gateway_tool_definitions
+    from pmcp.tools.schema import gate_error_for
 
     tool = next(t for t in get_gateway_tool_definitions() if t.name == call["name"])
-    try:
-        jsonschema.validate(
-            instance=call["arguments"], schema=tool.input_schema, cls=GATE_VALIDATOR
-        )
-    except jsonschema.ValidationError as error:
-        return error
-    return None
+    # The error the server reports, not jsonschema's raw choice: a nullable
+    # argument's refusal is folded first (Consiliency/pmcp#369).
+    return gate_error_for(call["arguments"], tool.input_schema)
 
 
 def _check_gate(text: str) -> list[str]:

@@ -11,19 +11,30 @@ it hoists nested models into ``$defs``/``$ref``, emits a ``title`` on every
 property, spells optional fields as ``anyOf: [X, {"type": "null"}]`` with
 ``default: null``, and carries the model docstring as a top-level
 ``description``. :func:`input_schema_for` post-processes all four so the
-advertised shape is self-contained and title-free, and an optional string is
-``"type": ["string", "null"]`` — flat like the hand-written schemas were, but
-accepting ``null`` exactly where the model does.
-``tests/test_gateway_tool_schemas.py`` pins that post-processing.
+advertised shape is self-contained and title-free, and an optional field is
+``anyOf: [X, {"type": "null"}]`` with no ``default: null`` -- accepting
+``null`` exactly where the model does.
+
+That nullable spelling is the one portable across host schema converters
+(Consiliency/pmcp#369): ``null`` is a type branch, never an ``enum`` member,
+a ``const``, a ``default`` or an entry in a ``type`` array. OpenCode's Google
+provider stringifies every ``enum`` member (``null`` became the string
+``"null"``) and turns ``type: [X, "null"]`` into a typeless node whose
+``nullable`` the AI SDK then drops; the ``anyOf`` form is the one the AI SDK
+folds into Gemini's canonical ``{type: X, nullable: true}``.
+``tests/test_gateway_tool_schemas.py`` and
+``tests/test_nullable_schema_portability.py`` pin that post-processing.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from copy import deepcopy
 import math
 from typing import Any
 
 import jsonschema
+from jsonschema.exceptions import best_match
 from pydantic import BaseModel
 
 #: Advertised for gateway tools that take no arguments at all.
@@ -71,7 +82,7 @@ def input_schema_for(model: type[BaseModel] | None) -> dict[str, Any]:
 
 
 def _normalize(node: Any, defs: dict[str, Any]) -> Any:
-    """Inline ``$ref``s, drop ``title``s, and collapse nullable ``anyOf``s."""
+    """Inline ``$ref``s, drop ``title``s, and canonicalise nullable ``anyOf``s."""
     if isinstance(node, list):
         return [_normalize(item, defs) for item in node]
     if not isinstance(node, dict):
@@ -92,32 +103,126 @@ def _normalize(node: Any, defs: dict[str, Any]) -> Any:
             out[key] = {name: _normalize(prop, defs) for name, prop in value.items()}
         else:
             out[key] = _normalize(value, defs)
-    return _collapse_nullable(out)
+    return _canonical_nullable(out)
 
 
-def _collapse_nullable(node: dict[str, Any]) -> dict[str, Any]:
-    """``anyOf: [X, null]`` + ``default: null`` -> ``X`` with ``null`` still allowed.
+def _canonical_nullable(node: dict[str, Any]) -> dict[str, Any]:
+    """``anyOf: [X, null]`` -> ``anyOf: [X, {"type": "null"}]``, X first, no ``default: null``.
 
-    pydantic spells ``X | None = None`` as that ``anyOf``. The advertised
-    schema keeps ``X``'s keywords flat (no ``anyOf``) and adds ``"null"`` to
-    its ``type`` (and to its ``enum``, if any), so the gate accepts exactly
-    what the model accepts: the field omitted, ``null``, or an ``X``. A
-    nullable field WITHOUT a ``None`` default (required-but-nullable) is left
-    as pydantic wrote it -- the collapse is only defined for the optional case.
+    pydantic spells ``X | None`` (with or without ``= None``) as a two-branch
+    ``anyOf``. The advertised schema keeps that union -- the gate accepts
+    exactly what the model accepts: an ``X``, ``null``, or (when optional)
+    the field omitted -- and drops a ``default: null``, so ``null`` reaches a
+    host only as the ``{"type": "null"}`` branch (Consiliency/pmcp#369).
     """
     any_of = node.get("anyOf")
     if not isinstance(any_of, list) or len(any_of) != 2 or _NULL_SCHEMA not in any_of:
         return node
-    if "default" not in node or node["default"] is not None:
-        return node
     (inner,) = [branch for branch in any_of if branch != _NULL_SCHEMA]
-    rest = {k: v for k, v in node.items() if k not in ("anyOf", "default")}
-    out = {**inner, **rest}
-    inner_type = out.get("type")
-    if isinstance(inner_type, str):
-        out["type"] = [inner_type, "null"]
-    elif isinstance(inner_type, list) and "null" not in inner_type:
-        out["type"] = [*inner_type, "null"]
-    if isinstance(out.get("enum"), list) and None not in out["enum"]:
-        out["enum"] = [*out["enum"], None]
+    out = {k: v for k, v in node.items() if k != "anyOf"}
+    if "description" in out:
+        # The field's description, not an inlined model's docstring: a host
+        # that folds the union (the AI SDK) would let the branch's win.
+        inner = {k: v for k, v in inner.items() if k != "description"}
+    if "default" in out and out["default"] is None:
+        del out["default"]
+    out["anyOf"] = [inner, dict(_NULL_SCHEMA)]
     return out
+
+
+def _is_nullable_union(schema: Any) -> bool:
+    any_of = schema.get("anyOf") if isinstance(schema, dict) else None
+    return isinstance(any_of, list) and len(any_of) == 2 and any_of[1] == _NULL_SCHEMA
+
+
+def _rerooted(
+    parent: jsonschema.ValidationError, child: jsonschema.ValidationError
+) -> jsonschema.ValidationError:
+    """``child`` (an error inside ``parent``'s ``anyOf``) as a top-level error."""
+    message, validator, validator_value, schema = (
+        child.message,
+        child.validator,
+        child.validator_value,
+        child.schema,
+    )
+    if child.validator == "type" and not child.relative_path:
+        # The value is the wrong type for X; it is not null either. Spelled as
+        # the ``type: [X, "null"]`` keyword spelled it, schema included, so the
+        # error ranks (``_matches_type``) as that one did.
+        types = [child.validator_value, "null"]
+        message = f"{child.instance!r} is not of type {', '.join(map(repr, types))}"
+        validator_value = types
+        schema = {**child.schema, "type": types}
+    return jsonschema.ValidationError(
+        message,
+        validator=validator,
+        validator_value=validator_value,
+        instance=child.instance,
+        schema=schema,
+        path=deque([*parent.absolute_path, *child.relative_path]),
+        schema_path=deque([*parent.absolute_schema_path, *child.relative_schema_path]),
+        context=list(child.context),
+        type_checker=child._type_checker,
+    )
+
+
+def _unfolded(error: jsonschema.ValidationError) -> list[jsonschema.ValidationError]:
+    """``error``, or -- for a non-null value a nullable union refused -- the
+    errors its value branch produced, in order, as top-level errors."""
+    if (
+        error.validator != "anyOf"
+        or not _is_nullable_union(error.schema)
+        or error.instance is None
+    ):
+        return [error]
+    return [
+        unfolded
+        for child in error.context
+        if child.relative_schema_path[0] == 0  # the value branch, not the null one
+        for unfolded in _unfolded(_rerooted(error, child))
+    ]
+
+
+def gate_error_for(
+    instance: Any, schema: dict[str, Any]
+) -> jsonschema.ValidationError | None:
+    """The error the gate reports for ``instance``, or ``None`` if it passes.
+
+    ``anyOf: [X, {"type": "null"}]`` refuses a bad value as a whole ("... is
+    not valid under any of the given schemas"). Before ``best_match`` ranks
+    the errors, each such refusal is replaced by the errors ``X`` produced,
+    in place: so the gate picks the same error, with the same message,
+    keyword and path, as under the ``type: [X, "null"]`` spelling
+    (Consiliency/pmcp#369) -- the one difference being that an ``enum``'s
+    message no longer lists ``None``. Which values pass is decided by the
+    validator alone and is unchanged. A failure in the unfold or the ranking
+    falls back to ``jsonschema``'s own choice, and failing that to the first
+    raw error: a refused value always yields an error, so a refusal is never
+    lost (nor left out of the audit).
+    """
+    errors = list(GATE_VALIDATOR(schema).iter_errors(instance))
+    if not errors:
+        return None
+    chosen: jsonschema.ValidationError | None
+    try:
+        chosen = best_match(
+            [unfolded for error in errors for unfolded in _unfolded(error)]
+        )
+    except Exception:  # noqa: BLE001 -- never lose a refusal to the fold
+        chosen = None
+    if chosen is None:
+        try:
+            chosen = best_match(errors)
+        except Exception:  # noqa: BLE001 -- nor to the ranking
+            chosen = None
+    return chosen if chosen is not None else errors[0]
+
+
+def validate_at_gate(instance: Any, schema: dict[str, Any]) -> None:
+    """``jsonschema.validate`` as the transport gate runs it: raise the error
+    :func:`gate_error_for` chooses. Every caller that reports a gate refusal
+    (the server, the migration guide's checker) goes through this."""
+    GATE_VALIDATOR.check_schema(schema)  # as ``jsonschema.validate`` does
+    error = gate_error_for(instance, schema)
+    if error is not None:
+        raise error
