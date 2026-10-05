@@ -6,12 +6,12 @@ import errno
 import os
 import re
 import stat
-import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from dotenv import dotenv_values
 
+from pmcp.atomic_write import atomic_write
 from pmcp.config.loader import find_project_root
 
 ENV_VAR_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -139,8 +139,13 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
     signal -- leaves the existing file byte-intact rather than truncated, so an
     interrupted write can no longer lose the store's other entries
     (Consiliency/pmcp#248). ``os.replace`` is an atomic same-filesystem rename,
-    which is why the temporary shares ``path``'s directory; the directory entry
-    is ``fsync``-ed too so the rename itself survives a crash.
+    which is why the temporary shares the destination's directory; the
+    directory entry is ``fsync``-ed too so the rename itself survives a crash.
+
+    A symlinked store -- ``~/.config/pmcp/pmcp.env`` kept in a dotfiles
+    repository -- is written THROUGH: the replace lands on the link's target and
+    the link is left in place, as 2.7.3's plain write did. A dangling link
+    creates its target; a link loop is refused (:func:`pmcp.atomic_write.atomic_write`).
     """
     _validate_env_values(values)
 
@@ -161,32 +166,9 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
         except OSError:
             pass
 
-    # Write-then-rename so the destination is never observed truncated. mkstemp
-    # creates the temp 0600 in `parent`; the explicit fchmod keeps that guarantee
-    # if the mkstemp default ever changes. On ANY failure the destination is left
-    # untouched and the partial temp is removed.
-    tmp_fd, tmp_name = tempfile.mkstemp(prefix=".pmcp-env-", dir=parent)
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp_file:
-            os.fchmod(tmp_file.fileno(), 0o600)
-            tmp_file.write(content)
-            tmp_file.flush()
-            os.fsync(tmp_file.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-
-    # Best-effort: fsync the directory so the rename is durable across a crash.
-    try:
-        dir_fd = os.open(parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass
+    # Write-then-rename so the destination is never observed truncated, at 0600,
+    # through a symlinked store rather than over it (see pmcp.atomic_write).
+    atomic_write(path, content.encode("utf-8"), mode=0o600, prefix=".pmcp-env-")
 
 
 # Env-var keys PMCP itself introduced into its OWN environment from a dotenv

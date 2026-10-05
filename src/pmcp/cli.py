@@ -13,13 +13,13 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 from pmcp import package_approvals, trust_store
+from pmcp.atomic_write import atomic_write
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
 from pmcp.cli_commands.install import (
@@ -1867,15 +1867,17 @@ def _merge_setup_config(existing: dict, generated: dict) -> dict:
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
-    """Atomically write JSON data to path."""
+    """Atomically write JSON data to path, at 0600, through a symlinked config.
+
+    A client config kept in a dotfiles repository and symlinked into place is
+    written to its target, the link left intact (``pmcp.atomic_write``). This is
+    not the startup-policy editor's ``.mcp.json`` write, which refuses a link
+    (``symlinked_config``) because it records trust against the file's identity;
+    ``pmcp setup`` records no trust.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", dir=path.parent, delete=False, encoding="utf-8"
-    ) as tmp_file:
-        json.dump(data, tmp_file, indent=2)
-        tmp_file.write("\n")
-        tmp_path = Path(tmp_file.name)
-    tmp_path.replace(path)
+    text = json.dumps(data, indent=2) + "\n"
+    atomic_write(path, text.encode("utf-8"), mode=0o600, prefix=".pmcp-setup-")
 
 
 def run_setup(args: argparse.Namespace) -> None:

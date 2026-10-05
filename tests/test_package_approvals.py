@@ -320,11 +320,17 @@ def test_a_failed_write_leaves_the_previous_store_intact(
     approve_package(_identity(version="1.0.0"))
     before = package_approvals_path().read_bytes()
 
-    def broken_dump(*_args: object, **_kwargs: object) -> None:
-        raise OSError("disk full")
+    real_fsync = os.fsync
+
+    def broken_fsync(fd: int) -> None:
+        # Fail the temp file's flush to disk -- after its bytes are written,
+        # before the replace commits them -- as ENOSPC or a quota would.
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("disk full")
+        real_fsync(fd)
 
     with monkeypatch.context() as m, pytest.raises(OSError):
-        m.setattr(package_approvals.json, "dump", broken_dump)
+        m.setattr(os, "fsync", broken_fsync)
         approve_package(_identity(version="2.0.0"))
 
     assert package_approvals_path().read_bytes() == before

@@ -2183,6 +2183,9 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "task root: its own cancel ends the loop",
     ),
+    # The one atomic whole-file write every user-owned store goes through
+    # (env_store, trust_store, package_approvals, registry cache, pmcp setup).
+    ("atomic_write.py", "atomic_write", "reraises"): (1, "sync temp-file cleanup"),
     ("client/manager.py", "ClientManager._own_remote_transport", "reraises"): (
         1,
         "hands a pre-handoff failure to `ready`, otherwise re-raises",
@@ -2192,7 +2195,6 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         "re-raise",
     ),
     ("client/manager.py", "ClientManager._send_request", "reraises"): (1, "re-raise"),
-    ("env_store.py", "write_env_file", "reraises"): (1, "sync temp-file cleanup"),
     ("manifest/installer.py", "JobManager._handle_task_exception", "absorbs"): (
         1,
         "sync done-callback reading a finished task's result; no await",
@@ -2205,16 +2207,10 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "re-raise",
     ),
-    ("manifest/registry.py", "save_registry_cache", "reraises"): (
-        1,
-        "sync temp-file cleanup",
-    ),
-    ("package_approvals.py", "_write_store", "reraises"): (1, "sync temp-file cleanup"),
     ("tools/handlers.py", "GatewayTools._run_update_probe_command", "reraises"): (
         1,
         "SIGKILLs the probe synchronously, then re-raises",
     ),
-    ("trust_store.py", "_write_store", "reraises"): (1, "sync temp-file cleanup"),
 }
 
 # Handlers allowed to await: task roots whose own cancellation ends them.

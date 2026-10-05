@@ -36,12 +36,13 @@ import contextlib
 import hashlib
 import json
 import os
-import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from pmcp.atomic_write import atomic_write
 
 APPROVED = "approved"
 DENIED = "denied"
@@ -236,14 +237,23 @@ def trust_store_path() -> Path:
     planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
     path = (Path.home() / ".config" / "pmcp" / "trust.json").resolve()
+    refuse_checkout_resident(path, "Trust store")
+    return path
+
+
+def refuse_checkout_resident(path: Path, label: str) -> None:
+    """Raise ``TrustStoreError`` if the RESOLVED ``path`` lies inside a judged checkout.
+
+    ``path`` must already be resolved (symlinks followed); the checkouts are
+    ``_checkout_roots``. Shared by every approval store so the rule is stated once.
+    """
     for checkout in _checkout_roots():
         if path.is_relative_to(checkout):
             raise TrustStoreError(
-                f"Trust store {path} resolves inside the checkout at {checkout}. "
+                f"{label} {path} resolves inside the checkout at {checkout}. "
                 "A checkout-resident store lets a repository approve its own "
                 "content; move it under a home directory outside the repository."
             )
-    return path
 
 
 def _decode(entry: Any) -> TrustRecord:
@@ -331,46 +341,18 @@ def _write_store(path: Path, records: list[TrustRecord]) -> None:
     parent = path.parent
     _ensure_store_dir(parent)
 
-    # Write a sibling temp file and rename it into place. `os.replace` is
-    # atomic, so a reader never observes a half-written store and an
+    # Write a temp file beside the store and rename it into place. `os.replace`
+    # is atomic, so a reader never observes a half-written store and an
     # interrupted write leaves the previous one intact rather than truncated.
-    fd, tmp_name = tempfile.mkstemp(dir=parent, prefix=".trust-", suffix=".tmp")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as store_file:
-            json.dump(payload, store_file, indent=2)
-            store_file.write("\n")
-            store_file.flush()
-            os.fsync(store_file.fileno())
-        os.replace(tmp_name, path)
-        # fsync the DIRECTORY too, not just the file. `os.replace` is atomic
-        # against readers, but the rename itself is only durable once the
-        # directory entry is synced -- so a crash right after a revoke can leave
-        # the pre-revoke store on disk and resurrect the approval the operator
-        # just withdrew. That is the same invariant the lock protects against a
-        # race, reached through power loss instead.
-        # Best effort, and deliberately so. Directory fsync is unsupported on
-        # some platforms and filesystems (macOS returns EINVAL, NFS and some
-        # overlay mounts ENOTSUP), and `os.open` on a directory fails outright
-        # on Windows. The replace has ALREADY succeeded by this point, so
-        # raising here would report a failed `record`/`revoke` for a write that
-        # landed -- telling an operator their revoke did not take when it did is
-        # worse than losing a durability guarantee the platform cannot give.
-        try:
-            dir_fd = os.open(parent, os.O_RDONLY)
-        except OSError:
-            pass
-        else:
-            try:
-                os.fsync(dir_fd)
-            except OSError:
-                pass
-            finally:
-                os.close(dir_fd)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    # The DIRECTORY is fsync-ed too (best effort): the rename is only durable
+    # once the directory entry is synced, so a crash right after a revoke must
+    # not leave the pre-revoke store on disk and resurrect the approval the
+    # operator just withdrew -- the invariant the lock protects against a race,
+    # reached through power loss instead. `path` is already fully resolved by
+    # `trust_store_path()`, so the helper's symlink-following is the identity
+    # here and the residency check above judged the file actually written.
+    text = json.dumps(payload, indent=2) + "\n"
+    atomic_write(path, text.encode("utf-8"), mode=0o600, prefix=".trust-")
 
 
 def _ensure_store_dir(parent: Path) -> None:

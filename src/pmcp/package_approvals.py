@@ -33,7 +33,6 @@ import contextlib
 import json
 import logging
 import os
-import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,7 +40,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 
-from pmcp.trust_store import TrustStoreError, trust_store_path
+from pmcp.atomic_write import atomic_write
+from pmcp.trust_store import (
+    TrustStoreError,
+    refuse_checkout_resident,
+    trust_store_path,
+)
 from pmcp.validation import (
     is_valid_package_name,
     is_valid_package_version,
@@ -88,8 +92,23 @@ class PackageApproval:
 
 
 def package_approvals_path() -> Path:
-    """Where the store lives. Raises ``TrustStoreError`` if checkout-resident."""
-    return trust_store_path().parent / PACKAGE_APPROVALS_FILENAME
+    """Where the store lives, symlinks resolved. Raises ``TrustStoreError`` if checkout-resident.
+
+    The directory is the trust store's, whose residency ``trust_store_path``
+    checks. The file itself is resolved and checked too: writes follow a
+    symlinked store to its target (``pmcp.atomic_write``), and reads always
+    did, so a ``package_approvals.json`` linked into a judged checkout would
+    otherwise be a checkout-resident store reached through its final component.
+    """
+    # os.path.realpath, not Path.resolve(): the latter raises RuntimeError on a
+    # link loop on 3.10-3.12, which would escape `is_package_approved`'s
+    # never-raise contract. A loop resolves to a path that still fails closed
+    # at the read (ELOOP) and is refused at the write.
+    path = Path(
+        os.path.realpath(trust_store_path().parent / PACKAGE_APPROVALS_FILENAME)
+    )
+    refuse_checkout_resident(path, "Package approvals")
+    return path
 
 
 def _require_identity_fields(registry: Any, name: Any, version: Any) -> None:
@@ -273,36 +292,12 @@ def _write_store(path: Path, records: list[PackageApproval]) -> None:
     parent = path.parent
     _ensure_store_dir(parent)
 
-    fd, tmp_name = tempfile.mkstemp(
-        dir=parent, prefix=".package-approvals-", suffix=".tmp"
-    )
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as store_file:
-            json.dump(payload, store_file, indent=2)
-            store_file.write("\n")
-            store_file.flush()
-            os.fsync(store_file.fileno())
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
-
-    # Make the rename durable, best effort. A crash after a revoke must not
-    # resurrect the withdrawn approval -- but the replace has already landed, so
-    # a platform that cannot fsync a directory (macOS EINVAL, some network and
-    # overlay mounts, Windows) must not turn a completed write into an error.
-    try:
-        dir_fd = os.open(parent, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
-    finally:
-        os.close(dir_fd)
+    # Atomic, mode 0600, through a symlinked store rather than over it, with the
+    # directory fsync-ed best effort: a crash after a revoke must not resurrect
+    # the withdrawn approval, but a platform that cannot fsync a directory must
+    # not turn a completed write into an error (pmcp.atomic_write).
+    text = json.dumps(payload, indent=2) + "\n"
+    atomic_write(path, text.encode("utf-8"), mode=0o600, prefix=".package-approvals-")
 
 
 @contextlib.contextmanager
