@@ -20,6 +20,7 @@ from pmcp.manifest.loader import (
     requires_credential,
 )
 from pmcp.validation import is_valid_package_version, parse_package_spec
+from pmcp.waits import bounded_wait
 
 logger = logging.getLogger(__name__)
 
@@ -435,7 +436,7 @@ class JobManager:
 
             # Process finished - check return code
             try:
-                await asyncio.wait_for(process.wait(), timeout=5.0)
+                await bounded_wait(process.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 logger.warning(f"Install {job.id}: Process didn't exit cleanly")
                 await self._safe_terminate_process(process, job.id, force=True)
@@ -484,7 +485,7 @@ class JobManager:
                 process.terminate()
 
             try:
-                await asyncio.wait_for(process.wait(), timeout=5.0)
+                await bounded_wait(process.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 if not force:
                     logger.warning(
@@ -492,7 +493,7 @@ class JobManager:
                     )
                     process.kill()
                     try:
-                        await asyncio.wait_for(process.wait(), timeout=2.0)
+                        await bounded_wait(process.wait(), timeout=2.0)
                     except asyncio.TimeoutError:
                         logger.error(f"Install {job_id}: Process won't die!")
         except Exception as e:
@@ -554,7 +555,7 @@ class JobManager:
 
             # Give it a moment to terminate gracefully
             try:
-                await asyncio.wait_for(job.process.wait(), timeout=2.0)
+                await bounded_wait(job.process.wait(), timeout=2.0)
             except asyncio.TimeoutError:
                 job.process.kill()
                 await job.process.wait()
@@ -705,7 +706,7 @@ async def install_server(
             env=build_install_child_env(server_config, project_root),
         )
 
-        stdout, stderr = await asyncio.wait_for(
+        stdout, stderr = await bounded_wait(
             process.communicate(),
             timeout=timeout,
         )
@@ -758,7 +759,7 @@ async def verify_installation(
             env=build_install_child_env(server_config, project_root),
         )
 
-        await asyncio.wait_for(process.communicate(), timeout=5.0)
+        await bounded_wait(process.communicate(), timeout=5.0)
         return True
 
     except Exception:
