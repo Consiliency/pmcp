@@ -439,8 +439,9 @@ def read_confined(
         except FileNotFoundError:
             return None
         with os.fdopen(fd, "rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                raise not_regular
+            _require_same_regular_file(
+                entry, os.fstat(handle.fileno()), path, verb, not_regular
+            )
             return handle.read()
     finally:
         walk.close()
@@ -461,14 +462,45 @@ def _read_confined_without_dir_fd(
         return None
     if not stat.S_ISREG(entry.st_mode):
         raise not_regular
+    # The pathname is not trusted between the lstat and the open: O_NOFOLLOW
+    # where the platform has it, and -- everywhere -- the opened descriptor must
+    # be the very file the lstat saw (same st_dev/st_ino), a regular file. A
+    # swap to a link (or anything else) in between is refused, never read.
     try:
-        fd = os.open(text, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(
+            text,
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0),
+        )
     except FileNotFoundError:
         return None
     with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            raise not_regular
+        _require_same_regular_file(
+            entry, os.fstat(handle.fileno()), path, verb, not_regular
+        )
         return handle.read()
+
+
+def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _require_same_regular_file(
+    entry: os.stat_result,
+    opened: os.stat_result,
+    path: Path,
+    verb: str,
+    not_regular: ConfinedWriteError,
+) -> None:
+    """The descriptor must be the regular file the directory entry showed."""
+    if not stat.S_ISREG(opened.st_mode):
+        raise not_regular
+    if not _same_file(entry, opened):
+        raise ConfinedWriteError(
+            f"{refusing(verb)} {path.name}: it changed while it was being read"
+        )
 
 
 # `os.replace` is not listed in `os.supports_dir_fd` even where its dir_fd
@@ -553,6 +585,18 @@ def _write_by_path(
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+            written = os.fstat(handle.fileno())
+        # The temporary's NAME is not trusted between its creation and the
+        # rename: the entry must still be the file just written, not a link or
+        # another file swapped in under that name (the rename would move that
+        # into place instead). The destination needs no such check -- rename
+        # replaces a link at the destination as an entry, never through it.
+        current = os.lstat(tmp_name)
+        if stat.S_ISLNK(current.st_mode) or not _same_file(current, written):
+            raise ConfinedWriteError(
+                f"refusing to write {target.name}: its temporary file changed "
+                "before it could be committed"
+            )
         os.replace(tmp_name, target)
         committed = True
     finally:
@@ -592,6 +636,13 @@ def _write_in_dir(
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+            written = os.fstat(handle.fileno())
+        current = os.stat(tmp_name, dir_fd=dir_fd, follow_symlinks=False)
+        if stat.S_ISLNK(current.st_mode) or not _same_file(current, written):
+            raise ConfinedWriteError(
+                f"refusing to write {name}: its temporary file changed "
+                "before it could be committed"
+            )
         # rename(2) never follows the destination's final component: a link
         # planted there after the walk is replaced as an entry, in-root.
         os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)

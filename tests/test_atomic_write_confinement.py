@@ -991,3 +991,35 @@ def test_a_store_holding_a_multiline_value_is_a_reported_refusal(
         "refusing to write .env.pmcp: Credential values must not contain newlines"
     )
     assert store.read_text(encoding="utf-8") == 'A="l1\nl2"\n'
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        (b"BAD-NAME=x\n", "Env var name must match"),
+        (b"K=\xff\n", "it is not valid UTF-8"),
+    ],
+    ids=["invalid key", "not utf-8"],
+)
+def test_a_sync_source_that_cannot_be_parsed_is_a_reported_read_refusal(
+    content: bytes, reason: str, layout: dict[str, Path]
+) -> None:
+    """N2+N3: the SOURCE is read, so its refusal says "read" and is never raised."""
+    import asyncio
+
+    source = layout["project"] / ".env.pmcp"
+    source.write_bytes(content)
+    out = asyncio.run(
+        run_secrets_sync(
+            argparse.Namespace(
+                from_scope="project",
+                to_scope="user",
+                project=layout["project"],
+                overwrite=False,
+            )
+        )
+    )
+    assert out["ok"] is False
+    assert str(out["error"]).startswith("refusing to read .env.pmcp: ")
+    assert reason in str(out["error"])
+    assert not (Path.home() / ".config" / "pmcp" / "pmcp.env").exists()
