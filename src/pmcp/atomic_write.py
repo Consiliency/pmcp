@@ -171,7 +171,7 @@ def open_final_directory(path: Path | str) -> tuple[int, str]:
         os.stat(spelled)
     except FileNotFoundError:
         pass  # absent target: the chain below names the file to create
-    fd = os.open(os.path.dirname(spelled) or os.curdir, _walk_flags())
+    fd = open_directory(os.path.dirname(spelled) or os.curdir)
     name = os.path.basename(spelled)
     handed_over = False
     try:
@@ -186,7 +186,7 @@ def open_final_directory(path: Path | str) -> tuple[int, str]:
                 text = os.readlink(name, dir_fd=fd)
                 head, name = os.path.dirname(text), os.path.basename(text)
                 if head:
-                    following = os.open(head, _walk_flags(), dir_fd=fd)
+                    following = open_directory(head, dir_fd=fd)
                     os.close(fd)
                     fd = following
                 continue
@@ -280,6 +280,39 @@ def _walk_flags() -> int:
     return (_O_PATH or os.O_RDONLY) | os.O_DIRECTORY
 
 
+def open_directory(
+    path: Path | str, *, dir_fd: int | None = None, nofollow: bool = False
+) -> int:
+    """THE way pmcp opens a directory to walk through it or to anchor an op on it.
+
+    ``O_PATH`` where it exists (search permission, as the kernel's own lookup
+    needs), else ``O_RDONLY`` (which also needs READ permission). Every caller --
+    the writer, the readers, both approval stores, the residency walk -- opens
+    through here and applies one fallback rule, :func:`falls_back_to_pathname`.
+    A test forbids opening a directory any other way in these modules.
+    """
+    flags = _walk_flags() | (os.O_NOFOLLOW if nofollow else 0)
+    if dir_fd is None:
+        return os.open(path, flags)
+    return os.open(path, flags, dir_fd=dir_fd)
+
+
+def falls_back_to_pathname(exc: BaseException) -> bool:
+    """Should a walk that hit ``exc`` retry by pathname?
+
+    Only without ``O_PATH``, and only for the ``EACCES`` an ``O_RDONLY``
+    directory open gets from a directory the user may search but not list
+    (0300/0311): the pathname form needs only search, as the kernel does.
+    Every other error -- and any error where ``O_PATH`` exists -- stands.
+    """
+    return (
+        not _O_PATH
+        and isinstance(exc, PermissionError)
+        and not isinstance(exc, ConfinedWriteError)
+        and exc.errno == errno.EACCES
+    )
+
+
 def _is_link(st: os.stat_result) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(
         getattr(st, "st_file_attributes", 0) & _REPARSE_POINT
@@ -315,6 +348,21 @@ class _Confined:
 def _walk_confined(
     path: Path, confine_to: Path, label: str, verb: str = "write"
 ) -> _Confined:
+    """:func:`_walk_confined_by` on descriptors, or by pathname where that is
+    unavailable or the descriptor walk hit a directory it may search but not
+    list without ``O_PATH`` (:func:`falls_back_to_pathname`)."""
+    if _DIR_FD_SUPPORTED:
+        try:
+            return _walk_confined_by(path, confine_to, label, verb, by_fd=True)
+        except OSError as exc:
+            if not falls_back_to_pathname(exc):
+                raise
+    return _walk_confined_by(path, confine_to, label, verb, by_fd=False)
+
+
+def _walk_confined_by(
+    path: Path, confine_to: Path, label: str, verb: str, *, by_fd: bool
+) -> _Confined:
     """Walk ``path`` from ``confine_to``, refusing every symlink on the way.
 
     See the module docstring. Raises ``ConfinedWriteError`` for a symlink (or
@@ -334,12 +382,11 @@ def _walk_confined(
             f"{refusing(verb)} {name_of}: it is outside the {label}"
         )
     is_symlink = ConfinedWriteError(f"{refusing(verb)} {name_of}: it is a symlink")
-    by_fd = _DIR_FD_SUPPORTED
     held: list[int] = []
     handed_over = False
     at: int | str
     if by_fd:
-        at = os.open(confine_to, _walk_flags())
+        at = open_directory(confine_to)
         held.append(at)
     else:
         at = os.fspath(confine_to)
@@ -360,7 +407,7 @@ def _walk_confined(
             if isinstance(at, int):
                 # O_NOFOLLOW: a directory swapped for a link after its lstat
                 # fails here instead of being followed.
-                at = os.open(name, _walk_flags() | os.O_NOFOLLOW, dir_fd=at)
+                at = open_directory(name, dir_fd=at, nofollow=True)
                 held.append(at)
             else:
                 at = os.path.join(at, name)
@@ -423,11 +470,11 @@ def atomic_write(
         if _DIR_FD_SUPPORTED:
             try:
                 fd, name = open_final_directory(path)
-            except PermissionError:
+            except OSError as exc:
                 # Without O_PATH, opening a directory needs READ permission the
                 # kernel's own lookup does not (a 0300/0311 directory): write by
                 # pathname instead, which needs only search, as the kernel does.
-                if _O_PATH:
+                if not falls_back_to_pathname(exc):
                     raise
             else:
                 try:

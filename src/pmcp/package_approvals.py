@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 from pmcp import atomic_write as _atomic_write_module
 from pmcp.atomic_write import (
     atomic_write,
+    falls_back_to_pathname,
     is_absent,
     make_store_dirs,
     open_final_directory,
@@ -114,12 +115,20 @@ def package_approvals_path() -> Path:
             # A fresh install: no store, no link to follow. Judge where it will
             # be created (the residency walk steps up across plain names).
             fd, target = None, os.fspath(path)
-        elif _atomic_write_module._DIR_FD_SUPPORTED:
-            # The directory the writer will actually write in, reached hop by
-            # hop (no pathname grows), judged by identity from its descriptor.
-            fd, _name = open_final_directory(path)
         else:
-            fd, target = None, resolve_write_target(path)
+            fd = None
+            if _atomic_write_module._DIR_FD_SUPPORTED:
+                # The directory the writer will actually write in, reached hop
+                # by hop (no pathname grows), judged by identity from its
+                # descriptor -- unless the shared rule says to go by pathname
+                # (no O_PATH and a directory that may be searched, not listed).
+                try:
+                    fd, _name = open_final_directory(path)
+                except OSError as exc:
+                    if not falls_back_to_pathname(exc):
+                        raise
+            if fd is None:
+                target = resolve_write_target(path)
     except OSError as exc:
         raise TrustStoreError(
             f"Cannot resolve {path.name}: {os.strerror(exc.errno) if exc.errno else exc}"

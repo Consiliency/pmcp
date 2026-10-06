@@ -37,13 +37,20 @@ import errno
 import hashlib
 import json
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pmcp.atomic_write import atomic_write, is_absent, make_store_dirs
+from pmcp.atomic_write import (
+    atomic_write,
+    falls_back_to_pathname,
+    is_absent,
+    make_store_dirs,
+    open_directory,
+    resolve_write_target,
+)
 
 APPROVED = "approved"
 DENIED = "denied"
@@ -308,37 +315,68 @@ def _resident_checkout(
         return None
 
     by_fd = hasattr(os, "O_DIRECTORY") and bool(os.supports_dir_fd)
-    if dir_fd is not None and by_fd:
-        fd = os.dup(dir_fd)
-    else:
-        current = os.path.dirname(os.fspath(path)) or os.curdir
-        while True:
-            try:
-                os.stat(current)
-                break
-            except FileNotFoundError:
-                name = os.path.basename(current)
-                parent = os.path.dirname(current)
-                if name in ("", os.curdir, os.pardir) or parent == current:
-                    raise
-                current = parent
-        if not by_fd:
-            real = Path(os.path.realpath(current, strict=True))
-            for ancestor in (real, *real.parents):
-                found = match(os.stat(ancestor))
-                if found is not None:
-                    return found
-            return None
-        flags = (getattr(os, "O_PATH", 0) or os.O_RDONLY) | os.O_DIRECTORY
-        fd = os.open(current, flags)
-    flags = (getattr(os, "O_PATH", 0) or os.O_RDONLY) | os.O_DIRECTORY
+    if by_fd:
+        try:
+            return _resident_by_descriptor(path, match, dir_fd)
+        except OSError as exc:
+            # Without O_PATH a directory the user may search but not list
+            # (0311) refuses the descriptor walk the kernel's lookup would
+            # pass: judge by pathname identity instead (the shared rule).
+            if not falls_back_to_pathname(exc):
+                raise
+            if dir_fd is not None:
+                path = resolve_write_target(path)  # the store's real directory
+    return _resident_by_pathname(path, match)
+
+
+def _existing_directory(path: Path | str) -> str:
+    """The store's directory, or the nearest existing one above it across plain
+    names only (a store directory not created yet)."""
+    current = os.path.dirname(os.fspath(path)) or os.curdir
+    while True:
+        try:
+            os.stat(current)
+            return current
+        except FileNotFoundError:
+            name = os.path.basename(current)
+            parent = os.path.dirname(current)
+            if name in ("", os.curdir, os.pardir) or parent == current:
+                raise
+            current = parent
+
+
+def _resident_by_pathname(
+    path: Path | str, match: Callable[[os.stat_result], Path | None]
+) -> Path | None:
+    """Strictly resolve the store's directory; compare it and each parent by
+    ``(st_dev, st_ino)`` -- needs only search permission, and is the form used
+    where descriptors are unavailable (Windows fills these from the file index)."""
+    real = Path(os.path.realpath(_existing_directory(path), strict=True))
+    for ancestor in (real, *real.parents):
+        found = match(os.stat(ancestor))
+        if found is not None:
+            return found
+    return None
+
+
+def _resident_by_descriptor(
+    path: Path | str,
+    match: Callable[[os.stat_result], Path | None],
+    dir_fd: int | None,
+) -> Path | None:
+    """Walk up with ``..`` relative to each directory reached, by descriptor."""
+    fd = (
+        os.dup(dir_fd)
+        if dir_fd is not None
+        else open_directory(_existing_directory(path))
+    )
     try:
         for _ in range(_MAX_ANCESTORS):
             here = os.fstat(fd)
             found = match(here)
             if found is not None:
                 return found
-            up = os.open(os.pardir, flags, dir_fd=fd)
+            up = open_directory(os.pardir, dir_fd=fd)
             above = os.fstat(up)
             os.close(fd)
             fd = up

@@ -662,3 +662,200 @@ def test_a_served_root_that_does_not_exist_yet_refuses_nothing(
     approved.write_bytes(b"{}")
     trust_store.record(approved, b"{}", trust_store.PROJECT_SCOPE, trust_store.APPROVED)
     assert trust_store.is_approved(approved, b"{}")
+
+
+# --------------------------------------------------------------------------- #
+# Round 11 (codex F001): ONE directory opener and ONE fallback rule for every
+# caller. Without O_PATH, a directory the user may search and write but not
+# list (0300/0311) must not refuse approval reads, approval writes or the
+# residency walk -- as a target directory or as an ancestor.
+# --------------------------------------------------------------------------- #
+
+DIRECTORY_FLAG_NAMES = {"O_DIRECTORY", "O_PATH", "_walk_flags"}
+OPENER_MODULES = (
+    "atomic_write.py",
+    "trust_store.py",
+    "package_approvals.py",
+    "env_store.py",
+)
+#: Functions allowed to open a directory directly, with the reason.
+OPENER_ALLOWED = {
+    ("atomic_write.py", "open_directory"): "the one opener",
+    ("atomic_write.py", "_fsync_dir"): "reopens a held directory for reading, "
+    "only to fsync it, best effort; never used to walk or anchor an operation",
+}
+
+
+def _directory_opens(tree: ast.AST) -> list[tuple[int, str]]:
+    found = []
+
+    def mentions_directory_flag(node: ast.AST) -> bool:
+        return any(
+            (isinstance(n, ast.Attribute) and n.attr in DIRECTORY_FLAG_NAMES)
+            or (isinstance(n, ast.Name) and n.id in DIRECTORY_FLAG_NAMES)
+            for n in ast.walk(node)
+        )
+
+    def visit(node: ast.AST, scope: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            name = scope
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = child.name
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "open"
+                and any(mentions_directory_flag(a) for a in child.args[1:2])
+            ):
+                found.append((child.lineno, scope))
+            visit(child, name)
+
+    visit(tree, "<module>")
+    return found
+
+
+def test_every_directory_is_opened_through_the_one_opener() -> None:
+    offenders = []
+    for rel in OPENER_MODULES:
+        tree = ast.parse((SRC / rel).read_text(encoding="utf-8"))
+        for line, scope in _directory_opens(tree):
+            if (rel, scope) not in OPENER_ALLOWED:
+                offenders.append(f"{rel}:{line} in {scope}")
+    assert offenders == [], (
+        "a directory is opened directly; go through atomic_write.open_directory "
+        f"and apply falls_back_to_pathname: {offenders}"
+    )
+
+
+def test_the_directory_open_scan_sees_each_form() -> None:
+    tree = ast.parse(
+        "def f(p, fd):\n"
+        "    os.open(p, os.O_RDONLY | os.O_DIRECTORY)\n"
+        "    os.open(p, _walk_flags(), dir_fd=fd)\n"
+        "    os.open(p, flags)\n"
+        "    os.open(p, os.O_PATH)\n"
+    )
+    assert len(_directory_opens(tree)) == 3
+
+
+def _approval_payload() -> bytes:
+    import json
+
+    return json.dumps(
+        {
+            "version": 1,
+            "records": [
+                {
+                    "registry": "npm",
+                    "name": "example-mcp",
+                    "resolved_version": "1.2.3",
+                    "integrity": None,
+                    "decision": "approved",
+                    "recorded_at": "2026-10-05T00:00:00+00:00",
+                }
+            ],
+        }
+    ).encode()
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="POSIX, non-root")
+@pytest.mark.parametrize("o_path", [True, False], ids=["O_PATH", "no O_PATH"])
+@pytest.mark.parametrize("where", ["target directory", "ancestor"])
+@pytest.mark.parametrize("dir_mode", [0o300, 0o311, 0o700])
+def test_approval_reads_writes_and_residency_through_a_search_only_directory(
+    dir_mode: int,
+    where: str,
+    o_path: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from pmcp import atomic_write as writer
+    from pmcp import package_approvals, trust_store
+    from pmcp.manifest.package_identity import PackageIdentity
+
+    if o_path and not writer._O_PATH:
+        pytest.skip("no O_PATH")
+    if not o_path:
+        monkeypatch.setattr(writer, "_O_PATH", 0)
+        monkeypatch.setattr(
+            trust_store,
+            "os",
+            SimpleNamespace(**{n: getattr(os, n) for n in dir(os) if n != "O_PATH"}),
+        )
+    base = Path(os.path.realpath(tmp_path))
+    home = base / "home"
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    checkout = base / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    locked = base / "vault"
+    target_dir = locked if where == "target directory" else locked / "inner"
+    target_dir.mkdir(parents=True)
+    # trust.json is linked into the locked directory; package_approvals.json
+    # lives beside the RESOLVED trust store (its pre-#366 location), so both
+    # stores are read, written and residency-checked through that directory.
+    (target_dir / "package_approvals.json").write_bytes(_approval_payload())
+    trust_target = target_dir / "trust.json"
+    trust_target.write_text('{"version": 1, "records": []}\n', encoding="utf-8")
+    os.symlink(trust_target, home / ".config" / "pmcp" / "trust.json")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (checkout,))
+    identity = PackageIdentity(
+        registry="npm", name="example-mcp", resolved_version="1.2.3", integrity=None
+    )
+    other = PackageIdentity(
+        registry="npm", name="example-mcp", resolved_version="2.0.0", integrity=None
+    )
+    approved_file = base / "approved.json"
+    approved_file.write_bytes(b"{}")
+    os.chmod(locked, dir_mode)
+    try:
+        assert package_approvals.is_package_approved(identity)
+        package_approvals.approve_package(other)  # a write through the link
+        assert package_approvals.is_package_approved(other)
+        trust_store.record(
+            approved_file, b"{}", trust_store.PROJECT_SCOPE, trust_store.APPROVED
+        )
+        assert trust_store.is_approved(approved_file, b"{}")
+    finally:
+        os.chmod(locked, 0o700)
+    assert os.path.islink(home / ".config" / "pmcp" / "trust.json")
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="POSIX, non-root")
+def test_the_pathname_fallback_still_refuses_a_planted_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Falling back to pathname identity changes HOW, not WHETHER, residency holds."""
+    from types import SimpleNamespace
+
+    from pmcp import atomic_write as writer
+    from pmcp import package_approvals, trust_store
+    from pmcp.trust_store import TrustStoreError
+
+    monkeypatch.setattr(writer, "_O_PATH", 0)
+    monkeypatch.setattr(
+        trust_store,
+        "os",
+        SimpleNamespace(**{n: getattr(os, n) for n in dir(os) if n != "O_PATH"}),
+    )
+    base = Path(os.path.realpath(tmp_path))
+    checkout = base / "checkout"
+    vault = checkout / "vault"
+    vault.mkdir(parents=True)
+    (checkout / ".git").mkdir()
+    (vault / "approvals.json").write_bytes(_approval_payload())
+    home = base / "home"
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    os.symlink(
+        vault / "approvals.json", home / ".config" / "pmcp" / "package_approvals.json"
+    )
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (checkout,))
+    os.chmod(vault, 0o311)
+    try:
+        with pytest.raises(TrustStoreError, match="inside the checkout"):
+            package_approvals.package_approvals_path()
+    finally:
+        os.chmod(vault, 0o700)
