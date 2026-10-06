@@ -439,3 +439,52 @@ def test_make_store_dirs_creates_only_a_plain_missing_tail(
     with pytest.raises(OSError):
         writer.make_store_dirs(target)
     assert sorted(p.name for p in base.iterdir()) == before
+
+
+# --------------------------------------------------------------------------- #
+# Round 9 (claude F001): the kernel counts EVERY link in one lookup. A chain
+# whose hops each pass a symlinked directory crosses 40 in total while each
+# hop's own count stays small. Generated over chain lengths on both sides of it.
+# --------------------------------------------------------------------------- #
+
+
+def _chain(base: Path, hops: int) -> Path:
+    real = base / "real"
+    real.mkdir(parents=True)
+    (real / "pmcp.env").write_bytes(b"KEEP1=alpha\nKEEP2=beta\n")
+    os.symlink("real", base / "via")
+    prev = base / "via" / "pmcp.env"
+    for i in range(hops):  # each hop: one chain link + the `via` directory link
+        os.symlink(prev, real / f"c{i}")
+        prev = base / "via" / f"c{i}"
+    store = base / "store.env"
+    os.symlink(prev, store)
+    return store
+
+
+@pytest.mark.parametrize("hops", [1, 5, 15, 18, 19, 20, 21, 25])
+def test_a_chain_with_a_linked_directory_on_each_hop_agrees_with_the_kernel(
+    hops: int, tmp_path: Path
+) -> None:
+    root = Path(os.path.realpath(tmp_path))
+    k_store = _chain(root / "kernel", hops)
+    w_store = _chain(root / "writer", hops)
+    kernel_refused = _kernel_write(str(k_store))
+    try:
+        atomic_write(w_store, DATA, confine_to=None)
+        writer_refused = False
+    except OSError:
+        writer_refused = True
+    assert writer_refused == kernel_refused, hops
+    assert _tree(root / "writer") == _tree(root / "kernel"), hops
+
+
+def test_the_chain_grid_crosses_the_kernel_limit() -> None:
+    """Positive control: some lengths resolve, some are ELOOP to the kernel."""
+    import tempfile
+
+    outcomes = set()
+    with tempfile.TemporaryDirectory() as d:
+        for hops in (5, 25):
+            outcomes.add(_kernel_write(str(_chain(Path(d) / str(hops), hops))))
+    assert outcomes == {True, False}

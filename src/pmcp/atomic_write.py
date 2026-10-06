@@ -20,7 +20,10 @@ only the final component's chain is followed: ``lstat`` it; if it is a link,
 loop, up to 40 hops (``ELOOP``). Every syscall gets the user's own spelling, so
 the kernel applies its own rules to ``missing/..``, ``file/..``, ``//``,
 mode-000 and search-only directories, and to a target that ends in a
-separator. The temporary is created in the
+separator. Before any of that the whole path is ``stat``-ed once, so the
+kernel's whole-lookup verdicts -- the 40-link limit counted across the entire
+lookup, permissions, ``ENOTDIR`` -- come first and only ``ENOENT`` (a target
+not created yet) lets the write go on. The temporary is created in the
 target's directory and renamed over the target; the link is left alone.
 
 **Repository-controlled files (``confine_to=<project root>``): no symlinks at
@@ -114,15 +117,23 @@ class ConfinedWriteError(PermissionError):
 def resolve_write_target(path: Path | str) -> str:
     """The pathname an unconfined write of ``path`` replaces: its final link chain.
 
-    Only the final component's chain is followed, by ``readlink`` and plain
-    ``os.path.join`` onto the link's own directory -- never normalised -- so the
-    kernel resolves every directory on the way by its own rules -- including a
-    target that ends in a separator, which it refuses (``ENOTDIR`` from the
-    ``lstat``, or ``ENOENT`` when the temp file is created). Raises
-    ``OSError(ELOOP)`` after 40 hops and ``IsADirectoryError`` for a directory;
-    the target may be absent (a dangling link creates it).
+    The kernel decides first: ``os.stat`` of the whole path as given. Any
+    failure but ``ENOENT`` is raised as is -- the kernel's own whole-lookup rules
+    (``ELOOP`` counted over EVERY link in the lookup, symlinked directories on
+    each hop included; ``EACCES``; ``ENOTDIR``, a target ending in a separator
+    among them) -- so a path the kernel refuses is never written. Only then is
+    the final component's chain followed, by ``readlink`` and plain
+    ``os.path.join`` onto the link's own directory, never normalised, to find
+    the NAME to replace; every directory on the way is still the kernel's to
+    resolve. ``ENOENT`` (a dangling link, or no file yet) is allowed: the
+    target may be absent and is then created, if its directory exists. Raises
+    ``IsADirectoryError`` for a directory.
     """
     current = os.fspath(path)
+    try:
+        os.stat(current)
+    except FileNotFoundError:
+        pass  # absent target: the chain below names the file to create
     for _hop in range(_MAX_LINK_HOPS + 1):
         try:
             st = os.lstat(current)
