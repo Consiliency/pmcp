@@ -12,6 +12,7 @@ import re
 import tempfile
 import threading
 from collections import OrderedDict
+from contextvars import ContextVar
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1120,6 +1121,40 @@ def _error_kind(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+# Set while `_checked_entry` re-runs an entry's check to find the bad field.
+# Those passes must log nothing: the entry's own warnings come once, from the
+# one real pass (Consiliency/pmcp#375 board round 3). A context variable, not
+# `logging.disable`, so another thread's or task's records are never dropped.
+_ATTRIBUTION_PROBE: ContextVar[bool] = ContextVar(
+    "pmcp_overlay_attribution_probe", default=False
+)
+
+
+class _QuietDuringAttribution(logging.Filter):
+    """Drops a record logged while an attribution pass runs in this context."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not _ATTRIBUTION_PROBE.get()
+
+
+_QUIET_DURING_ATTRIBUTION = _QuietDuringAttribution()
+
+
+def _quiet_pmcp_loggers() -> None:
+    """Attach the attribution filter to every ``pmcp`` logger that exists.
+
+    A filter acts only on records logged to its own logger, so it goes on each
+    one, found at run time rather than listed: any module the check can reach
+    is imported, and its logger created, before the check runs.
+    """
+    for name, item in list(logging.root.manager.loggerDict.items()):
+        if (name == "pmcp" or name.startswith("pmcp.")) and isinstance(
+            item, logging.Logger
+        ):
+            if _QUIET_DURING_ATTRIBUTION not in item.filters:
+                item.addFilter(_QUIET_DURING_ATTRIBUTION)
+
+
 def _checked_entry(build: Any, kept: dict[str, Any]) -> Any:
     """``build(kept)``; if it raises, an ``_EntryRejected`` naming the field.
 
@@ -1139,11 +1174,16 @@ def _checked_entry(build: Any, kept: dict[str, Any]) -> Any:
     except Exception as exc:
         kind = _error_kind(exc)
 
+    _quiet_pmcp_loggers()
+
     def fails(data: dict[str, Any]) -> bool:
+        token = _ATTRIBUTION_PROBE.set(True)
         try:
             build(data)
         except Exception:
             return True
+        finally:
+            _ATTRIBUTION_PROBE.reset(token)
         return False
 
     fields = sorted(kept)

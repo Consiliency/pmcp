@@ -3111,7 +3111,7 @@ def test_every_skip_warning_names_its_field(tmp_path: Path) -> None:
     reason = re.compile(r"^'[a-z_]+'(, '[a-z_]+')* [A-Za-z_]+(, [A-Za-z_]+)*$")
     not_json = re.compile(r"^'[a-z_]+' holds a value that is not JSON$")
     wrong = []
-    for kind, field_name, shape, base, got in rows:
+    for kind, field_name, shape, base, got, _count, _repeats in rows:
         if not got.startswith("skipped"):
             continue
         prefix = "skipped [name not shown] "
@@ -3259,3 +3259,72 @@ def test_grok_375_f001_falsifier_the_keywords_example_names_keywords(
     assert len(skips) == 1
     assert skips[0].endswith(": 'keywords' AttributeError")
     assert "while parsing" not in skips[0]
+
+
+def test_every_row_logs_each_warning_once(tmp_path: Path) -> None:
+    """The warning-count column (round 3, claude F001): no generated row logs
+    any WARNING more than once. `_checked_entry` re-runs an entry's check to
+    find the bad field; those passes log nothing."""
+    from tests.overlay_field_table import generate
+
+    rows = generate(tmp_path)
+    assert [r[:5] for r in rows if r[6] > 1] == []
+    assert sum(1 for r in rows if r[5]) > 50  # not vacuous: rows that warn
+
+
+@pytest.mark.parametrize(
+    "entry,marker",
+    [
+        ({"version": "latest", "url": 5}, "'version' pin"),
+        (
+            {"env_var": "ZZ_KEY", "api_key_optional_when": ["ZZ_KEY"], "url": 5},
+            "cannot relax itself",
+        ),
+        ({"extra_env": 5, "keywords": [1]}, "'extra_env'"),
+    ],
+    ids=["version-pin", "self-relax", "extra-env"],
+)
+def test_claude_375_r3_f001_a_skipped_entry_logs_each_parser_warning_once(
+    entry: dict[str, Any], marker: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round 3, claude F001: each attribution pass repeated the parser's own
+    WARNINGs (3-5 times where main logs one)."""
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump(
+            {"servers": {"zz": {"command": "npx", "keywords": ["zz"], **entry}}}
+        ),
+    )
+    with caplog.at_level(logging.DEBUG):
+        servers = load_manifest().servers
+    assert "zz" not in servers
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum(marker in m for m in messages) == 1, messages
+    assert sum(m.startswith("Skipping invalid") for m in messages) == 1
+
+
+def test_attribution_passes_do_not_silence_another_context() -> None:
+    """The silence is scoped to the attribution pass's own context."""
+    import contextvars
+
+    seen: list[str] = []
+
+    class _Keep(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            seen.append(record.getMessage())
+
+    handler = _Keep(level=logging.WARNING)
+    log = logging.getLogger("pmcp.manifest.loader")
+    log.addHandler(handler)
+    try:
+        loader._quiet_pmcp_loggers()
+        token = loader._ATTRIBUTION_PROBE.set(True)
+        try:
+            contextvars.Context().run(log.warning, "outside the probe")
+            log.warning("inside the probe")
+        finally:
+            loader._ATTRIBUTION_PROBE.reset(token)
+        log.warning("after the probe")
+    finally:
+        log.removeHandler(handler)
+    assert seen == ["outside the probe", "after the probe"]

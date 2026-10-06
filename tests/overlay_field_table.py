@@ -24,6 +24,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from collections import Counter
 from typing import Any
 
 # (shape, YAML text of the value)
@@ -82,7 +83,19 @@ def outcome(
     home_root: Path,
     name: str = "zzt",
 ) -> str:
-    """One entry's outcome: a ``kind`` (``server``/``cli``) entry called ``name``
+    """See ``observe``; the outcome only."""
+    return observe(kind, field_name, value, base, home_root, name)[0]
+
+
+def observe(
+    kind: str,
+    field_name: str,
+    value: str,
+    base: str,
+    home_root: Path,
+    name: str = "zzt",
+) -> tuple[str, list[str]]:
+    """One entry's outcome, and every WARNING pmcp logged while loading it: a ``kind`` (``server``/``cli``) entry called ``name``
     on ``base`` (``local``/``url``/``cli``) with ``field_name`` set to the YAML
     text ``value``, as a user overlay.
 
@@ -106,7 +119,7 @@ def outcome(
             records.append(record)
 
     handler = _Collect(level=logging.WARNING)
-    log = logging.getLogger("pmcp.manifest")
+    log = logging.getLogger("pmcp")
     saved_propagate = log.propagate
     log.addHandler(handler)
     log.propagate = False
@@ -117,23 +130,21 @@ def outcome(
         clear_manifest_cache()
         manifest = load_manifest()
         entries = manifest.servers if kind == "server" else manifest.cli_alternatives
-        skips = [
-            r.getMessage()
-            for r in records
-            if r.getMessage().startswith("Skipping invalid")
-        ]
+        messages = [r.getMessage().replace(str(home), "<home>") for r in records]
+        skips = [m for m in messages if m.startswith("Skipping invalid")]
         entry = entries.get(name)
         if not skips:
             if entry is None:
-                return "skipped [no skip warning]"
-            return "loaded " + _describe(getattr(entry, field_name))
+                return "skipped [no skip warning]", messages
+            return "loaded " + _describe(getattr(entry, field_name)), messages
         if len(skips) != 1:
-            return f"skipped [{len(skips)} skip warnings]"
+            return f"skipped [{len(skips)} skip warnings]", messages
         message = skips[0]
         who = (
             "name not shown" if "(name not shown)" in message else "shipped name shown"
         )
-        return f"skipped [{who}] {message.split(f'{overlay}: ', 1)[-1]}"
+        shown = str(overlay).replace(str(home), "<home>")
+        return f"skipped [{who}] {message.split(f'{shown}: ', 1)[-1]}", messages
     finally:
         log.removeHandler(handler)
         log.propagate = saved_propagate
@@ -145,22 +156,31 @@ def outcome(
         clear_manifest_cache()
 
 
-def generate(home_root: Path) -> list[tuple[str, str, str, str, str]]:
-    """Rows of (kind, field, shape, base, outcome) for every field x shape x base."""
+def generate(home_root: Path) -> list[tuple[str, str, str, str, str, int, int]]:
+    """Rows of (kind, field, shape, base, outcome, warnings, most repeats) for
+    every field x shape x base: ``warnings`` is how many WARNINGs pmcp logged
+    while loading the entry, ``most repeats`` how often the most frequent
+    identical one appeared (1 when each appears once; 0 when there are none)."""
     server_fields, cli_fields = _fields()
     plan = [("server", f, b) for f in server_fields for b in SERVER_BASES]
     plan += [("cli", f, "cli") for f in cli_fields]
-    return [
-        (
-            kind,
-            field_name,
-            shape,
-            base,
-            outcome(kind, field_name, value, base, home_root),
-        )
-        for kind, field_name, base in plan
-        for shape, value in SHAPES
-    ]
+    rows = []
+    for kind, field_name, base in plan:
+        for shape, value in SHAPES:
+            got, messages = observe(kind, field_name, value, base, home_root)
+            counts = Counter(messages)
+            rows.append(
+                (
+                    kind,
+                    field_name,
+                    shape,
+                    base,
+                    got,
+                    len(messages),
+                    max(counts.values(), default=0),
+                )
+            )
+    return rows
 
 
 def check_claims(claims: list[dict], home_root: Path, side: str) -> list[str]:
@@ -188,6 +208,52 @@ def main() -> None:
 
     os.environ.pop("PMCP_MANIFEST_PATH", None)
     root = Path(tempfile.mkdtemp(dir=os.environ.get("TMPDIR")))
+    if sys.argv[1:2] == ["--messages"]:
+        # One JSON line per row: the row, loaded/skipped, and every WARNING
+        # pmcp logged loading it. Run on two trees and compare with
+        # --compare-messages.
+        import json
+
+        server_fields, cli_fields = _fields()
+        plan = [("server", f, b) for f in server_fields for b in SERVER_BASES]
+        plan += [("cli", f, "cli") for f in cli_fields]
+        for kind, field_name, base in plan:
+            for shape, value in SHAPES:
+                got, messages = observe(kind, field_name, value, base, root)
+                row = [kind, field_name, shape, base, got.split(" ")[0]]
+                print(
+                    json.dumps(
+                        [*row, sorted(m.replace(str(root), "<root>") for m in messages)]
+                    )
+                )
+        return
+    if sys.argv[1:2] == ["--compare-messages"]:
+        # For every row loaded on both trees: the same WARNINGs, the same
+        # number of times. An overlay entry's name is a label on this branch
+        # (D9), so `an overlay server (name not shown)` reads as the name.
+        import json
+        import re
+
+        def read(path: str) -> list[list]:
+            return [json.loads(line) for line in Path(path).read_text().splitlines()]
+
+        def norm(messages: list[str]) -> list[str]:
+            out = []
+            for message in messages:
+                message = re.sub(r"/[^ ]*", "<path>", message)
+                message = message.replace(
+                    "an overlay server (name not shown)", "server 'zzt'"
+                )
+                out.append(message)
+            return sorted(out)
+
+        mine, theirs = read(sys.argv[2]), read(sys.argv[3])
+        both = [(a, b) for a, b in zip(mine, theirs) if a[4] == b[4] == "loaded"]
+        wrong = [a[:4] for a, b in both if norm(a[5]) != norm(b[5])]
+        print(f"{len(both)} rows loaded on both, {len(wrong)} with different WARNINGs")
+        for row in wrong:
+            print(row)
+        return
     if sys.argv[1:2] == ["--claims"]:
         module = Path(__file__).with_name("test_catalog_overlay_discovery.py")
         source = module.read_text(encoding="utf-8")
@@ -216,7 +282,7 @@ def main() -> None:
             print(line)
         return
     for row in generate(root):
-        print("\t".join(row))
+        print("\t".join(str(cell) for cell in row))
 
 
 if __name__ == "__main__":
