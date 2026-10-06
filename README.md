@@ -1270,11 +1270,13 @@ closed: the credential stays required.
 Overlay loading is **fail-soft**: a missing file is skipped silently, and a
 malformed file logs a warning and is skipped; so does a single entry that pmcp
 could not use: a field some part of pmcp would fail on, such as `keywords: [1]`,
-an `args` holding a number, or a CLI alternative with an empty `check_command`.
-Fields pmcp only tests for truth or ignores are accepted as before, whatever
-their value: `auto_start`, `status`, and a `transport` string without a `url`
-(any string, such as `stdio`). A `transport` that is not a string (`5`,
-`true`, a list) is skipped like any other field pmcp would fail on. The warning names the field, not
+an `args` list holding a number, a `command` or `transport` that is not a
+string, or a CLI alternative with an empty `check_command`. Fields pmcp stores
+but never reads (`status`), or reads only as true or false (`auto_start`,
+`requires_api_key`), are accepted whatever their value, as before. A
+`transport` string without a `url` is accepted as before, whatever the string;
+with a `url` it must be one of pmcp's transport names (`local`, `remote`,
+`sse`, `http`, `streamable-http`). The warning names the field, not
 its value, and does not show the entry's name unless pmcp ships it. A blank field
 (`description:` with nothing after it) means "not set". None of this crashes the
 gateway — the shipped manifest always still loads. pmcp re-reads

@@ -2778,54 +2778,338 @@ def test_the_field_diagnostic_names_a_field_never_a_value() -> None:
     assert VALUE_SENTINEL not in config_field_diagnostic(config("x", "user"), "args")
 
 
-# --- the docs' field claims, run (Consiliency/pmcp#375 board round 1, claude F001) ---
-# README, CHANGELOG and MIGRATING.md say which overlay fields are skipped and which
-# are accepted as before. Each claim is a row here; README said a `transport`
-# "without a `url`" is accepted as before, which held only for a string.
+# --- the docs' field claims, generated and held to the code -----------------------
+# (Consiliency/pmcp#375 board rounds 1 and 2: the docs drifted from the code
+# twice.) DOC_CLAIMS is the only statement of what README, CHANGELOG and
+# MIGRATING.md say about which overlay fields are skipped or accepted. Each
+# claim quotes the doc text it supports and lists the rows that prove it:
+# (kind, field, YAML value, base) with base `local` (no url), `url` or `cli`.
+# `branch` is the expected outcome here; `main` is the expected outcome on
+# main, checked by `python tests/overlay_field_table.py --claims main` with
+# PYTHONPATH at main's src (it cannot run in this tree). The behaviour table
+# itself (every field x every shape x both bases) is `overlay_field_table`.
+# DOC_CLAIMS, _ANY and _NOT_A_STRING use no pmcp import, so that script can run
+# them against another tree.
 
-DOC_FIELD_CLAIMS: list[tuple[str, dict[str, Any], bool]] = [
-    # (case, entry fields, loads)
-    ("keywords-int", {"keywords": [1]}, False),
-    ("args-int", {"args": ["-y", 5]}, False),
-    ("args-str", {"args": "abc"}, False),
-    ("command-int", {"command": 5}, False),
-    ("transport-int", {"transport": 5}, False),
-    ("transport-bool", {"transport": True}, False),
-    ("transport-list", {"transport": ["a"]}, False),
-    ("transport-stdio", {"transport": "stdio"}, True),
-    ("transport-other-string", {"transport": "bogus"}, True),
-    ("auto_start-str", {"auto_start": "yes"}, True),
-    ("auto_start-int", {"auto_start": 5}, True),
-    ("auto_start-list", {"auto_start": [1]}, True),
-    ("status-int", {"status": 5}, True),
-    ("status-list", {"status": [1]}, True),
-    ("keywords-null", {"keywords": None}, True),
-    ("description-null", {"description": None}, True),
+_ANY = [
+    "null",
+    "5",
+    "true",
+    "1.5",
+    '"zz-text"',
+    '["a", "b"]',
+    "[1]",
+    "{a: b}",
+    "2026-10-04",
+    "2026-10-04T12:00:00Z",
+    "!!binary aGVsbG8=",
+    "!!set {a: null, b: null}",
+    "[{a: [1]}]",
+]  # noqa: E501 -- mirrors overlay_field_table.SHAPES; a test checks they agree
+_NOT_A_STRING = [v for v in _ANY if v not in ("null", '"zz-text"')]
+
+DOC_CLAIMS: list[dict[str, Any]] = [
+    {
+        "id": "keywords-number",
+        "docs": [
+            ("README.md", "such as `keywords: [1]`"),
+            ("CHANGELOG.md", "(`keywords: [1]`, an `args` list"),
+            ("MIGRATING.md", "`keywords: [1]`, a number in `args` or `command`"),
+        ],
+        "mentions": ["keywords"],
+        "rows": [("server", "keywords", "[1]", b) for b in ("local", "url")]
+        + [("server", "keywords", '["a", 1]', b) for b in ("local", "url")],
+        "branch": "skipped",
+        "main": "loaded",
+    },
+    {
+        "id": "args-number",
+        "docs": [
+            ("README.md", "an `args` list holding a number"),
+            ("CHANGELOG.md", "an `args` list holding a\n  number"),
+            ("MIGRATING.md", "a number in `args` or `command`"),
+        ],
+        "mentions": ["args"],
+        "rows": [
+            ("server", "args", v, b)
+            for v in ("[1]", '["-y", 5]', '["-y", 1.5]')
+            for b in ("local", "url")
+        ],
+        "branch": "skipped",
+        "main": "loaded",
+    },
+    {
+        "id": "command-not-a-string",
+        "docs": [
+            ("README.md", "a `command` or `transport` that is not a\nstring"),
+            ("CHANGELOG.md", "a `command` or `transport` that is not a string"),
+            ("MIGRATING.md", "a number in `args` or `command`"),
+        ],
+        "mentions": ["command"],
+        "rows": [
+            ("server", "command", v, b) for v in _NOT_A_STRING for b in ("local", "url")
+        ],
+        "branch": "skipped",
+        "main": "loaded",
+    },
+    {
+        "id": "transport-not-a-string",
+        "docs": [
+            ("README.md", "a `command` or `transport` that is not a\nstring"),
+            ("CHANGELOG.md", "a `command` or `transport` that is not a string"),
+            ("MIGRATING.md", "a `transport` that is not a\nstring"),
+        ],
+        "mentions": ["transport"],
+        "rows": [
+            ("server", "transport", v, b)
+            for v in _NOT_A_STRING
+            for b in ("local", "url")
+        ],
+        "branch": "skipped",
+        "main": "loaded",
+    },
+    {
+        "id": "check-command-empty",
+        "docs": [
+            ("README.md", "a CLI alternative with an empty `check_command`"),
+            (
+                "CHANGELOG.md",
+                "a `cli_alternatives`\n  entry with an empty `check_command`",
+            ),
+            (
+                "MIGRATING.md",
+                "a `cli_alternatives` entry with an empty `check_command`",
+            ),
+        ],
+        "mentions": ["check_command"],
+        "rows": [("cli", "check_command", "[]", "cli")],
+        "branch": "skipped",
+        "main": "loaded",
+    },
+    {
+        "id": "stored-or-truth-only-any-value",
+        "docs": [
+            (
+                "README.md",
+                "Fields pmcp stores\nbut never reads (`status`), or reads only as true or false (`auto_start`,\n`requires_api_key`), are accepted whatever their value, as before.",
+            ),
+        ],
+        "mentions": ["status", "auto_start", "requires_api_key"],
+        "rows": [
+            ("server", f, v, b)
+            for f in ("status", "auto_start", "requires_api_key")
+            for v in _ANY
+            for b in ("local", "url")
+        ],
+        "branch": "loaded",
+        "main": "loaded",
+    },
+    {
+        "id": "transport-string-without-url",
+        "docs": [
+            (
+                "README.md",
+                "A\n`transport` string without a `url` is accepted as before, whatever the string;",
+            ),
+        ],
+        "mentions": ["transport", "url"],
+        "rows": [
+            ("server", "transport", v, "local")
+            for v in ("stdio", '"zz-text"', "sse", "local", '""')
+        ],
+        "branch": "loaded",
+        "main": "loaded",
+    },
+    {
+        "id": "transport-with-url-remote-only-accepted",
+        "docs": [
+            (
+                "README.md",
+                "with a `url` it must be one of pmcp's transport names (`local`, `remote`,\n`sse`, `http`, `streamable-http`).",
+            ),
+        ],
+        "mentions": ["transport", "url"],
+        "rows": [
+            ("server", "transport", v, "url")
+            for v in ("local", "remote", "sse", "http", "streamable-http")
+        ],
+        "branch": "loaded",
+        "main": "loaded",
+    },
+    {
+        "id": "transport-with-url-other-string-skipped",
+        "docs": [
+            ("README.md", "with a `url` it must be one of pmcp's transport names"),
+        ],
+        "mentions": ["transport", "url"],
+        "rows": [
+            ("server", "transport", v, "url") for v in ("stdio", '"zz-text"', '""')
+        ],
+        "branch": "skipped",
+        "main": "loaded",
+    },
+    {
+        "id": "blank-means-not-set",
+        "docs": [
+            (
+                "README.md",
+                'A blank field\n(`description:` with nothing after it) means "not set".',
+            ),
+            (
+                "MIGRATING.md",
+                'A blank field (`description:` with nothing\nafter it) means "not set" and takes its default.',
+            ),
+        ],
+        "mentions": ["description"],
+        "rows": [("server", "description", "null", b) for b in ("local", "url")],
+        "branch": "loaded ''",
+        "main": "loaded",
+    },
+]
+
+# The doc passages whose field mentions DOC_CLAIMS must cover: (file, first
+# words, last words) of each passage.
+DOC_PASSAGES = [
+    (
+        "README.md",
+        "Overlay loading is **fail-soft**",
+        "the shipped manifest always still loads.",
+    ),
+    ("CHANGELOG.md", "- **An overlay entry pmcp cannot use is skipped.**", "*Fixed*"),
+    (
+        "MIGRATING.md",
+        "### An overlay entry pmcp cannot use is skipped",
+        "**What to do.**",
+    ),
 ]
 
 
-@pytest.mark.parametrize(
-    "case,fields,loads", DOC_FIELD_CLAIMS, ids=[c[0] for c in DOC_FIELD_CLAIMS]
-)
-def test_the_docs_field_claims_hold(
-    case: str, fields: dict[str, Any], loads: bool
+def _repo_file(name: str) -> str:
+    root = Path(loader.__file__).resolve().parents[3]
+    return (root / name).read_text(encoding="utf-8")
+
+
+def _passage(name: str, start: str, end: str) -> str:
+    text = _repo_file(name)
+    i = text.index(start)
+    return text[i : text.index(end, i) + len(end)]
+
+
+def test_doc_claims_quote_the_docs() -> None:
+    """Every claim's quoted text is in the doc, inside a covered passage."""
+    passages = {f: _passage(f, a, b) for f, a, b in DOC_PASSAGES}
+    missing = [
+        (c["id"], f, q[:50])
+        for c in DOC_CLAIMS
+        for f, q in c["docs"]
+        if q not in passages[f]
+    ]
+    assert missing == []
+
+
+def test_every_field_the_docs_name_has_a_claim() -> None:
+    """The prose says only what DOC_CLAIMS says: every schema field named in
+    backticks in a covered passage is a claim's `mentions`."""
+    fields = set(loader._SERVER_SCHEMA_KEYS) | set(loader._CLI_SCHEMA_KEYS)
+    covered = {m for c in DOC_CLAIMS for m in c["mentions"]}
+    named = set()
+    for f, a, b in DOC_PASSAGES:
+        for token in re.findall(r"`([a-z_]+)(?::[^`]*)?`", _passage(f, a, b)):
+            if token in fields:
+                named.add(token)
+    assert named - covered == set()
+    assert covered - named <= {"url"}  # `url` is named as the condition
+
+
+def test_the_claim_shapes_are_the_table_shapes() -> None:
+    from tests.overlay_field_table import SHAPES
+
+    assert _ANY == [value for _shape, value in SHAPES]
+
+
+@pytest.mark.parametrize("claim_id", [c["id"] for c in DOC_CLAIMS])
+def test_every_doc_claim_holds(claim_id: str, tmp_path: Path) -> None:
+    from tests.overlay_field_table import check_claims
+
+    claim = next(c for c in DOC_CLAIMS if c["id"] == claim_id)
+    assert check_claims([claim], tmp_path, "branch") == []
+
+
+def test_the_behaviour_table_covers_every_field_and_loads_the_shipped_manifest(
+    tmp_path: Path,
 ) -> None:
-    entry = {"command": "npx", "keywords": ["zzdoc"], **fields}
+    """The generated table: every field x shape x base, and no row raises."""
+    from tests.overlay_field_table import SERVER_BASES, SHAPES, generate
+
+    rows = generate(tmp_path)
+    expected = (len(SERVER_FIELDS) * len(SERVER_BASES) + len(CLI_FIELDS)) * len(SHAPES)
+    assert len(rows) == expected
+    assert all(r[4] == "skipped" or r[4].startswith("loaded ") for r in rows)
+
+
+def test_a_yaml_typed_truth_only_field_keeps_mains_meaning() -> None:
+    """Round 2, claude F002: `auto_start: 2026-10-04` skipped the entry, where
+    main loads it and auto-starts it (a date is true). It loads as `True`."""
     _write(
         Path.home() / ".pmcp" / "manifest.yaml",
-        yaml.safe_dump({"servers": {"zzdoc": entry}}),
+        "servers:\n  zz:\n    command: npx\n    keywords: [zz]\n"
+        "    auto_start: 2026-10-04\n    requires_api_key: !!binary aGVsbG8=\n",
     )
-    servers = load_manifest().servers
-    assert ("zzdoc" in servers) is loads
-    assert "playwright" in servers
-    if case == "keywords-null":
-        assert servers["zzdoc"].keywords == []
-    if case == "description-null":
-        assert servers["zzdoc"].description == ""
+    server = load_manifest().servers["zz"]
+    assert server.auto_start is True and server.requires_api_key is True
+
+
+def test_the_truth_only_keys_are_derived_from_every_read() -> None:
+    """`_TRUTH_ONLY_KEYS` is exactly the schema fields whose every attribute
+    read in src/pmcp is a truth test (`if`, `not`, `and`/`or`, a comprehension
+    filter, `bool(...)`). A read of another kind removes a field from it."""
+    import ast
+
+    root = Path(loader.__file__).resolve().parents[1]
+    fields = set(loader._SERVER_SCHEMA_KEYS) - set(loader._STORED_ONLY_KEYS)
+    reads: dict[str, list[bool]] = {f: [] for f in fields}
+
+    def truth(node: ast.AST, parents: dict[int, ast.AST]) -> bool:
+        parent = parents.get(id(node))
+        if isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)):
+            return parent.test is node
+        if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not):
+            return True
+        if isinstance(parent, ast.BoolOp):
+            return truth(parent, parents)
+        if isinstance(parent, ast.comprehension):
+            return node in parent.ifs
+        if isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name):
+            return parent.func.id == "bool" and parent.args[:1] == [node]
+        return False
+
+    for path in root.rglob("*.py"):
+        if "baml_client" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr in fields
+                and isinstance(node.ctx, ast.Load)
+            ):
+                reads[node.attr].append(truth(node, parents))
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and node.args[1:2]
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in fields
+            ):
+                reads[node.args[1].value].append(truth(node, parents))
+    derived = {f for f, r in reads.items() if r and all(r)}
+    assert derived == set(loader._TRUTH_ONLY_KEYS)
 
 
 def test_claude_375_f001_a_non_string_transport_without_a_url_is_skipped() -> None:
-    """The seat's falsifier, with the corrected claim: `transport: 5` and no
+    """Round 1's falsifier, with the corrected claim: `transport: 5` and no
     `url` is skipped (main loaded it, then failed every query that matched it);
     a string `transport` without a `url` still loads."""
     _write(
@@ -2842,29 +3126,3 @@ def test_claude_375_f001_a_non_string_transport_without_a_url_is_skipped() -> No
     servers = load_manifest().servers
     assert "zz" not in servers
     assert "zzs" in servers
-
-
-def test_the_readme_states_the_transport_rule_as_the_code_runs_it() -> None:
-    readme = (Path(loader.__file__).resolve().parents[3] / "README.md").read_text(
-        encoding="utf-8"
-    )
-    text = " ".join(readme.split())
-    assert "(`transport` without a `url`," not in text
-    assert "a `transport` string without a `url`" in text
-    assert "A `transport` that is not a string (`5`, `true`, a list) is skipped" in text
-
-
-def test_the_cli_check_command_claim_holds() -> None:
-    _write(
-        Path.home() / ".pmcp" / "manifest.yaml",
-        yaml.safe_dump(
-            {
-                "cli_alternatives": {
-                    "zzempty": {"keywords": ["zz"], "check_command": []},
-                    "zzgit": {"keywords": ["zz"], "check_command": ["git"]},
-                }
-            }
-        ),
-    )
-    clis = load_manifest().cli_alternatives
-    assert "zzempty" not in clis and "zzgit" in clis

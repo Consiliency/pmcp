@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 import logging
@@ -884,6 +885,12 @@ _CLI_SCHEMA_KEYS = frozenset(
 _STORED_ONLY_KEYS = frozenset(
     {"discovery_diagnostics", "discovery_metadata", "status", "source", "replacement"}
 )
+# Schema keys every consumer reads only for truth (`if server.auto_start`,
+# `bool(server.requires_api_key)`; derived by a test over every read in
+# src/pmcp). A value YAML types beyond JSON (a date, `!!binary`, `!!set`) keeps
+# main's meaning as `bool(value)` instead of costing the entry
+# (Consiliency/pmcp#375 board round 2, F002).
+_TRUTH_ONLY_KEYS = frozenset({"auto_start", "requires_api_key"})
 
 
 def _is_json_native(value: Any) -> bool:
@@ -940,9 +947,28 @@ def _schema_fields(data: Any, schema: frozenset[str]) -> dict[str, Any]:
             kept[field_name] = value
         elif field_name in _STORED_ONLY_KEYS:
             continue  # stored, never read: the default, and the entry is kept
+        elif field_name in _TRUTH_ONLY_KEYS:
+            kept[field_name] = bool(value)  # read only for truth, as on main
         else:
-            raise _EntryRejected(f"'{field_name}' holds a value that is not JSON")
+            # The loader's own parser sees it first, as on main: several map a
+            # value of the wrong type to their default (`extra_env`,
+            # `api_key_optional_when`, `version`). `_json_native_entry` then
+            # checks what the parser KEPT, which is what consumers read.
+            kept[field_name] = value
     return kept
+
+
+def _json_native_entry(entry: Any) -> Any:
+    """``entry`` if every field the parser kept is JSON-native; else rejected.
+
+    Checks the parsed entry, not the overlay's raw value (Consiliency/pmcp#375
+    board round 2): a field the parser already maps to its default loads as on
+    main, and no consumer ever reads a non-JSON value. Names the field only.
+    """
+    for item in dataclasses.fields(entry):
+        if not _is_json_native(getattr(entry, item.name)):
+            raise _EntryRejected(f"'{item.name}' holds a value that is not JSON")
+    return entry
 
 
 _METADATA_PLACEHOLDER_URL = "https://metadata-check.invalid/"
@@ -1715,8 +1741,10 @@ def _parse_overlay_document(
         for name, server_data in raw_servers.items():
             try:
                 server = _canonical_server(
-                    _parse_server_config(
-                        name, _schema_fields(server_data, _SERVER_SCHEMA_KEYS)
+                    _json_native_entry(
+                        _parse_server_config(
+                            name, _schema_fields(server_data, _SERVER_SCHEMA_KEYS)
+                        )
                     )
                 )
             except Exception as exc:
@@ -1735,8 +1763,10 @@ def _parse_overlay_document(
         for name, cli_data in raw_clis.items():
             try:
                 cli = _canonical_cli(
-                    _parse_cli_alternative(
-                        name, _schema_fields(cli_data, _CLI_SCHEMA_KEYS)
+                    _json_native_entry(
+                        _parse_cli_alternative(
+                            name, _schema_fields(cli_data, _CLI_SCHEMA_KEYS)
+                        )
                     )
                 )
             except Exception as exc:
