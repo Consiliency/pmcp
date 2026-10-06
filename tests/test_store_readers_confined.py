@@ -30,6 +30,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -1807,3 +1808,24 @@ def test_a_project_root_that_cannot_be_found_warns_or_raises(
     assert "pmcp: refusing to read .env.pmcp:" in capfd.readouterr().err
     with pytest.raises(OSError):
         env_store.read_store("project", strict=True)
+
+
+def test_a_rewrite_refuses_a_user_store_that_is_not_a_regular_file(
+    lay: dict[str, Path],
+) -> None:
+    """The read before a rewrite is strict for the user store too: a fifo at
+    ``~/.config/pmcp/pmcp.env`` is refused, never replaced by a fresh file."""
+    import argparse
+
+    from pmcp.cli_commands.secrets import run_secrets_set
+
+    store = lay["home"] / ".config" / "pmcp" / "pmcp.env"
+    os.mkfifo(store)
+    out = asyncio.run(
+        run_secrets_set(
+            argparse.Namespace(scope="user", key="K372", value="v", project=None)
+        )
+    )
+    assert out["ok"] is False
+    assert str(out["error"]).startswith("refusing to write pmcp.env:")
+    assert stat.S_ISFIFO(os.lstat(store).st_mode)
