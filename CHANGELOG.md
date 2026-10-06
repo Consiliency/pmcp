@@ -300,6 +300,11 @@ to do, how to verify it, and how to roll back to 2.7.3.
   unchanged. See [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 
 ### Security
+- **Bumped `multidict` 6.7.0 → 6.9.1** to clear advisory `GHSA-54p9-h82j-f925`.
+  `multidict` is transitive (`aiohttp` → `multidict`, and `aiohttp` → `yarl` →
+  `multidict`), so this is lockfile-only, like the `anyio` bump: the repo floors
+  direct dependencies in `pyproject.toml` and locks transitive ones. The D-01
+  `pip-audit --strict` gate is green again.
 - **Unknown-`kid` tokens can no longer drive an outbound JWKS fetch per request.**
   A token whose `kid` is not in the cached key set forced a JWKS refresh every
   time, before rate limiting runs, so an unauthenticated caller sending random
