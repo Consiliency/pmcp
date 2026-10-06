@@ -30,11 +30,13 @@ servers running) is a stub.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import re
 import sys
 import itertools
 import json
+import os
 import warnings
 import logging
 from pathlib import Path
@@ -91,6 +93,87 @@ servers:
 @pytest.fixture(autouse=True)
 def _no_env_overlay(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PMCP_MANIFEST_PATH", raising=False)
+
+
+# Each fresh GatewayTools probes every shipped CLI once (`gcloud --version`,
+# `az --version`, ... take up to a second each), and these tests build many.
+# A CLI's probe result depends only on its name, its exact check_command and
+# PATH, so the real `check_cli` runs once per distinct (name, command, PATH)
+# for the module, and the result is reused. `probe_clis` itself, its guard and
+# its log lines run for real every time; an exception is never cached.
+_CHECK_CLI_RESULTS: dict[tuple[Any, ...], Any] = {}
+
+
+@pytest.fixture(autouse=True)
+def _probe_each_cli_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pmcp.manifest import environment
+
+    real = environment.check_cli
+
+    async def check_cli(name: str, check_command: list[str]) -> Any:
+        key = (name, tuple(check_command), os.environ.get("PATH", ""))
+        if key not in _CHECK_CLI_RESULTS:
+            _CHECK_CLI_RESULTS[key] = await real(name, check_command)
+        return _CHECK_CLI_RESULTS[key]
+
+    monkeypatch.setattr(environment, "check_cli", check_cli)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test here reads the MCP Registry, but `catalog_search` and the
+    registry tier fetch it live when no cache exists, and every test starts
+    with an empty HOME: one network fetch (up to 5 pages, 5 s timeout) per
+    search. An empty registry keeps these tests hermetic and fast; the
+    registry tier itself is driven with stubbed candidates where it matters
+    (codex's round-6 F001 and the per-tier differential)."""
+    from pmcp.manifest.registry import RegistryCache
+
+    async def no_registry(endpoint: str, **_: Any) -> RegistryCache:
+        return RegistryCache(
+            schema_version="test", source_endpoint=endpoint, fetched_at="never"
+        )
+
+    monkeypatch.setattr("pmcp.tools.handlers.fetch_registry_servers", no_registry)
+
+
+@contextlib.contextmanager
+def _one_manifest_parse() -> Any:
+    """Share one ``load_manifest()`` result across the consumers called inside.
+
+    ``load_manifest()`` returns a fresh copy of the cached manifest on every
+    call (a pickle round trip, about 2 ms), and `request_capability`'s
+    category tier calls it once per candidate server, so the differentials
+    spent most of their time copying. Inside this block the overlay files do
+    not change, so every no-argument call returns one parse; an explicit
+    path still loads for real. The parse is fingerprinted on entry and
+    checked on exit, so a consumer that mutated the shared manifest fails
+    the test instead of being hidden by the sharing.
+    """
+    import pickle
+    from unittest.mock import patch as _patch
+
+    real = loader.load_manifest
+    shared: dict[str, Any] = {}
+
+    def load(*args: Any, **kwargs: Any) -> Any:
+        if args or kwargs:
+            return real(*args, **kwargs)
+        if "manifest" not in shared:
+            shared["manifest"] = real()
+            shared["fingerprint"] = pickle.dumps(shared["manifest"])
+        return shared["manifest"]
+
+    with (
+        _patch.object(loader, "load_manifest", load),
+        _patch("pmcp.tools.handlers.load_manifest", load),
+        _patch("pmcp.cli_commands.secrets.load_manifest", load),
+    ):
+        yield
+    if "manifest" in shared:
+        assert pickle.dumps(shared["manifest"]) == shared["fingerprint"], (
+            "a consumer mutated the manifest load_manifest() returned"
+        )
 
 
 def _write(path: Path, text: str) -> Path:
@@ -478,7 +561,8 @@ def test_every_server_field_with_every_bad_shape_is_contained(
             warnings.catch_warnings(record=True) as seen,
         ):
             warnings.simplefilter("always")
-            _drive_every_consumer(tools)
+            with _one_manifest_parse():
+                _drive_every_consumer(tools)
         _assert_nothing_leaked(caplog)
         # rev 4: a pydantic serializer warning quoted the value (input_value=)
         assert not [
@@ -511,7 +595,8 @@ def test_every_cli_field_with_every_bad_shape_is_contained(
             warnings.catch_warnings(record=True) as seen,
         ):
             warnings.simplefilter("always")
-            _drive_every_consumer(tools)
+            with _one_manifest_parse():
+                _drive_every_consumer(tools)
         _assert_nothing_leaked(caplog)
         # rev 4: a pydantic serializer warning quoted the value (input_value=)
         assert not [
@@ -1238,6 +1323,9 @@ def _overlays() -> dict[str, dict[str, Any]]:
     }
 
 
+_NO_OVERLAY_SNAPSHOTS: dict[tuple[str, ...], dict[str, Any]] = {}
+
+
 @pytest.mark.parametrize("case", sorted(_overlays()))
 def test_no_overlay_removes_a_non_overlay_server_from_any_discovery_entry_point(
     case: str,
@@ -1276,12 +1364,19 @@ def test_no_overlay_removes_a_non_overlay_server_from_any_discovery_entry_point(
             )
         return out
 
-    before = snapshot()
+    # Before any overlay the snapshot depends only on `available`: every test
+    # starts from the same empty HOME and the shipped manifest. The cases that
+    # pass the same `available` share one.
+    if available not in _NO_OVERLAY_SNAPSHOTS:
+        with _one_manifest_parse():
+            _NO_OVERLAY_SNAPSHOTS[available] = snapshot()
+    before = _NO_OVERLAY_SNAPSHOTS[available]
     _write(
         Path.home() / ".pmcp" / "manifest.yaml",
         yaml.safe_dump(document),
     )
-    after = snapshot()
+    with _one_manifest_parse():
+        after = snapshot()
     ours = set(overlay_servers)
     names = {loader.normalized_server_name(n) for n in ours}
     lost = []
@@ -1810,13 +1905,15 @@ def test_no_overlay_cli_outranks_a_server_or_a_shipped_cli_anywhere() -> None:
             )
         return out
 
-    before = snapshot()
+    with _one_manifest_parse():
+        before = snapshot()
     _write(
         Path.home() / ".pmcp" / "manifest.yaml",
         yaml.safe_dump({"cli_alternatives": clis}),
     )
     assert set(load_manifest().overlay_cli_names) == set(clis)
-    after = snapshot()
+    with _one_manifest_parse():
+        after = snapshot()
     lost = []
     for term in terms:
         st0, cli0, rc0, cat0, km0 = before[term]
@@ -2311,13 +2408,15 @@ def test_an_overlay_cli_answers_after_every_declared_tier(
             )
         return out
 
-    before = run()
+    with _one_manifest_parse():
+        before = run()
     _write(
         Path.home() / ".pmcp" / "manifest.yaml",
         yaml.safe_dump({"cli_alternatives": clis}),
     )
     assert set(load_manifest().overlay_cli_names) == set(clis)
-    after = run()
+    with _one_manifest_parse():
+        after = run()
     changed = [
         (tier, term, b[0], a[0])
         for (tier, term, _), b, a in zip(scenarios, before, after)
@@ -3041,6 +3140,54 @@ DOC_CLAIMS += [
     },
 ]
 
+
+@pytest.fixture(scope="module")
+def overlay_table(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[list[tuple[Any, ...]], list[tuple[str, str]]]:
+    """The generated behaviour table, built once for the module, with every
+    record any logger emitted during an attribution pass while building it
+    (plus the round-3 falsifier entries). Each row loads in its own HOME, so
+    sharing the build changes nothing a row observes."""
+    from pmcp.manifest.attribution import ATTRIBUTION_PROBE
+    from tests.overlay_field_table import generate, observe
+
+    home_root = tmp_path_factory.mktemp("overlay-table")
+    during: list[tuple[str, str]] = []
+    seen = [0]
+
+    class _Watch(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            seen[0] += 1
+            if ATTRIBUTION_PROBE.get():
+                during.append((record.name, record.getMessage()[:80]))
+
+    # On the root AND on `pmcp`: `observe` stops pmcp records from
+    # propagating past `pmcp` while it collects a row's warnings.
+    handler = _Watch(level=logging.DEBUG)
+    root, pmcp_log = logging.getLogger(), logging.getLogger("pmcp")
+    saved = root.level, pmcp_log.level
+    root.addHandler(handler)
+    pmcp_log.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    pmcp_log.setLevel(logging.DEBUG)
+    try:
+        rows = generate(home_root)
+        for extra in (
+            "version: latest\n    url: 5",
+            "env_var: ZZ_KEY\n    api_key_optional_when: [ZZ_KEY]\n    url: 5",
+            "extra_env: 5\n    keywords: [1]",
+        ):
+            observe("server", "description", '"d"\n    ' + extra, "local", home_root)
+    finally:
+        root.removeHandler(handler)
+        pmcp_log.removeHandler(handler)
+        root.setLevel(saved[0])
+        pmcp_log.setLevel(saved[1])
+    assert seen[0] > 1000  # the watch saw the loader's records: not vacuous
+    return rows, during
+
+
 # The doc passages whose field mentions DOC_CLAIMS must cover: (file, first
 # words, last words) of each passage.
 DOC_PASSAGES = [
@@ -3102,14 +3249,14 @@ def test_every_field_the_docs_name_has_a_claim() -> None:
     assert covered - named <= {"url"}  # `url` is named as the condition
 
 
-def test_every_skip_warning_names_its_field(tmp_path: Path) -> None:
+def test_every_skip_warning_names_its_field(
+    overlay_table: tuple[list[tuple[Any, ...]], list[tuple[str, str]]],
+) -> None:
     """The warning-text column, for every row of the generated table: a skipped
     entry's WARNING names the field the row set (grok F001: `keywords: [1]`
     said `AttributeError while parsing`), only field names and error kinds,
     never `while parsing` or an unattributed reason, and no unshipped name."""
-    from tests.overlay_field_table import generate
-
-    rows = generate(tmp_path)
+    rows, _during = overlay_table
     reason = re.compile(r"^'[a-z_]+'(, '[a-z_]+')* [A-Za-z_]+(, [A-Za-z_]+)*$")
     not_json = re.compile(r"^'[a-z_]+' holds a value that is not JSON$")
     wrong = []
@@ -3143,12 +3290,12 @@ def test_every_doc_claim_holds(claim_id: str, tmp_path: Path) -> None:
 
 
 def test_the_behaviour_table_covers_every_field_and_loads_the_shipped_manifest(
-    tmp_path: Path,
+    overlay_table: tuple[list[tuple[Any, ...]], list[tuple[str, str]]],
 ) -> None:
     """The generated table: every field x shape x base, and no row raises."""
-    from tests.overlay_field_table import SERVER_BASES, SHAPES, generate
+    from tests.overlay_field_table import SERVER_BASES, SHAPES
 
-    rows = generate(tmp_path)
+    rows, _during = overlay_table
     expected = (len(SERVER_FIELDS) * len(SERVER_BASES) + len(CLI_FIELDS)) * len(SHAPES)
     assert len(rows) == expected
     assert all(r[4].startswith(("skipped [", "loaded ")) for r in rows)
@@ -3263,13 +3410,13 @@ def test_grok_375_f001_falsifier_the_keywords_example_names_keywords(
     assert "while parsing" not in skips[0]
 
 
-def test_every_row_logs_each_warning_once(tmp_path: Path) -> None:
+def test_every_row_logs_each_warning_once(
+    overlay_table: tuple[list[tuple[Any, ...]], list[tuple[str, str]]],
+) -> None:
     """The warning-count column (round 3, claude F001): no generated row logs
     any WARNING more than once. `_checked_entry` re-runs an entry's check to
     find the bad field; those passes log nothing."""
-    from tests.overlay_field_table import generate
-
-    rows = generate(tmp_path)
+    rows, _during = overlay_table
     assert [r[:5] for r in rows if r[6] > 1] == []
     assert sum(1 for r in rows if r[5]) > 50  # not vacuous: rows that warn
 
@@ -3331,42 +3478,12 @@ def test_attribution_passes_do_not_silence_another_context() -> None:
     assert seen == ["outside the pass", "after the pass"]
 
 
-def test_no_logger_emits_during_an_attribution_pass(tmp_path: Path) -> None:
+def test_no_logger_emits_during_an_attribution_pass(
+    overlay_table: tuple[list[tuple[Any, ...]], list[tuple[str, str]]],
+) -> None:
     """Derived, not listed: across every row of the generated table and the
     round-3 falsifier entries, no record from ANY logger is emitted while an
     attribution pass runs. A module the check reaches that logs through a
     plain logger fails here."""
-    from pmcp.manifest.attribution import ATTRIBUTION_PROBE
-    from tests.overlay_field_table import SHAPES, observe, _fields
-
-    during: list[tuple[str, str]] = []
-
-    class _Watch(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            if ATTRIBUTION_PROBE.get():
-                during.append((record.name, record.getMessage()[:80]))
-
-    handler = _Watch(level=logging.DEBUG)
-    root = logging.getLogger()
-    saved = root.level
-    root.addHandler(handler)
-    root.setLevel(logging.DEBUG)
-    try:
-        server_fields, cli_fields = _fields()
-        for field_name in server_fields:
-            for _shape, value in SHAPES:
-                for base in ("local", "url"):
-                    observe("server", field_name, value, base, tmp_path)
-        for field_name in cli_fields:
-            for _shape, value in SHAPES:
-                observe("cli", field_name, value, "cli", tmp_path)
-        for extra in (
-            "version: latest\n    url: 5",
-            "env_var: ZZ_KEY\n    api_key_optional_when: [ZZ_KEY]\n    url: 5",
-            "extra_env: 5\n    keywords: [1]",
-        ):
-            observe("server", "description", '"d"\n    ' + extra, "local", tmp_path)
-    finally:
-        root.removeHandler(handler)
-        root.setLevel(saved)
+    _rows, during = overlay_table
     assert during == []
