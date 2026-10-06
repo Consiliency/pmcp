@@ -68,6 +68,7 @@ ENTRY_POINT_INTERNALS = frozenset(
         ("pmcp.env_store", "load_discovered_dotenv"),
         ("pmcp.env_store", "_load_repo_credentials"),
         ("pmcp.env_store", "_repository_values"),
+        ("pmcp.env_store", "read_store_for_update"),
         ("pmcp.env_store", "_read_confined_text"),
         ("pmcp.env_store", "_read_user_text"),
         ("pmcp.env_store", "read_env_file"),

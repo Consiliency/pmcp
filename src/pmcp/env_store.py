@@ -15,6 +15,7 @@ from typing import Literal
 from dotenv import dotenv_values
 
 from pmcp.atomic_write import (
+    is_absent,
     atomic_write,
     make_store_dirs,
     read_confined,
@@ -646,15 +647,26 @@ def _home_and_its_ancestors() -> set[tuple[int, int]]:
     home = pin_user_store_path().parent.parent.parent
     identities: set[tuple[int, int]] = set()
     for directory in (home, *home.parents):
-        try:
-            status = status_following_links(directory)
-        except OSError:
-            # Cannot look: not provably the operator's -- the file is then
-            # treated as a repository's, the safer reading.
-            continue
-        if status is not None:
-            identities.add((status.st_dev, status.st_ino))
+        identity = _identity(directory)
+        if identity is not None:
+            identities.add(identity)
     return identities
+
+
+def _identity(path: Path) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)``, or ``None`` when absent or when it cannot be looked at.
+
+    Absence is :func:`pmcp.atomic_write.is_absent`'s; any other failure to look
+    means "not provably the operator's", so a file is then treated as a
+    repository's -- the safer reading.
+    """
+    try:
+        if is_absent(path):
+            return None
+        status = os.stat(path)
+    except OSError:
+        return None
+    return (status.st_dev, status.st_ino)
 
 
 def load_discovered_dotenv(path: Path) -> None:
@@ -673,13 +685,8 @@ def load_discovered_dotenv(path: Path) -> None:
     """
     from dotenv import load_dotenv
 
-    try:
-        directory = status_following_links(path.parent)
-    except OSError:
-        directory = None
-    operators = directory is not None and (
-        (directory.st_dev, directory.st_ino) in _home_and_its_ancestors()
-    )
+    directory = _identity(path.parent)
+    operators = directory is not None and directory in _home_and_its_ancestors()
     if not operators:
         load_store("project", path=path)
         return
@@ -764,9 +771,9 @@ def read_store_for_update(
     (:func:`scope_confinement`). The user store is read strictly too.
     """
     if scope == "user":
-        # Strict: an unreadable user store must not be rewritten from an
-        # empty read (the lenient read would warn and return {}).
-        return read_store("user", strict=True, verb=verb)
+        # Strict, and the store the caller is about to write: an unreadable
+        # user store must not be rewritten from an empty read.
+        return _read_env_file_strict(path)
     if scope == "project":
         return read_store(
             "project", project=scope_confinement(scope, path), strict=True, verb=verb
