@@ -627,9 +627,10 @@ to do, how to verify it, and how to roll back to 2.7.3.
   query that matched the entry (a non-string `transport`), or stopped gateway startup
   and `gateway.refresh` for every server (an int in `args`). An overlay entry that any part of pmcp would reject is now
   skipped when the overlay is read; an entry nothing would fail on still loads as
-  before. The warning names the field, never its value, and never shows an overlay
-  entry's name. Loading, discovery, CLI probing and the startup and refresh skip lines
-  no longer log an overlay entry's name or values either, including values a
+  before. The warning names the field, never its value, and shows an overlay entry's
+  name only when pmcp ships that name. Loading, discovery, CLI probing and the startup
+  and refresh skip lines no longer log an overlay entry's name (unless pmcp ships it)
+  or values either, including values a
   `.mcp.json` entry inherits from an overlay (the self-reference warning now names the
   field, not the command). A blank (`null`) field now means "not set" and takes its
   default, instead of dropping the entry. One overlay entry also no longer stops other

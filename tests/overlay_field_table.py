@@ -58,13 +58,15 @@ def _fields() -> tuple[list[str], list[str]]:
     return servers, clis
 
 
-def _document(kind: str, base: str, field_name: str, value: str) -> str:
+def _document(
+    kind: str, base: str, field_name: str, value: str, name: str = "zzt"
+) -> str:
     lines = [
         line for line in base.split("\n    ") if not line.startswith(field_name + ":")
     ]
     body = "\n    ".join([*lines, f"{field_name}: {value}"])
     section = "servers" if kind == "server" else "cli_alternatives"
-    return f"{section}:\n  zzt:\n    {body}\n"
+    return f"{section}:\n  {name}:\n    {body}\n"
 
 
 def _describe(value: Any) -> str:
@@ -72,35 +74,69 @@ def _describe(value: Any) -> str:
     return text if len(text) <= 60 else text[:57] + "..."
 
 
-def outcome(kind: str, field_name: str, value: str, base: str, home_root: Path) -> str:
-    """``skipped``, or ``loaded <repr of the kept value>``, for one entry: a
-    ``kind`` (``server``/``cli``) entry on ``base`` (``local``/``url``/``cli``)
-    with ``field_name`` set to the YAML text ``value``, as a user overlay."""
+def outcome(
+    kind: str,
+    field_name: str,
+    value: str,
+    base: str,
+    home_root: Path,
+    name: str = "zzt",
+) -> str:
+    """One entry's outcome: a ``kind`` (``server``/``cli``) entry called ``name``
+    on ``base`` (``local``/``url``/``cli``) with ``field_name`` set to the YAML
+    text ``value``, as a user overlay.
+
+    ``loaded <repr of the kept value>``, or ``skipped [<who>] <reason>``: the
+    skip WARNING's own text, where ``<who>`` is ``name not shown`` or
+    ``shipped name shown`` and ``<reason>`` is what follows the overlay path
+    (the field it names and the error kind)."""
     from pmcp.manifest.loader import clear_manifest_cache, load_manifest
 
     base_text = CLI_BASE if kind == "cli" else SERVER_BASES[base]
     home = Path(tempfile.mkdtemp(dir=home_root))
     (home / ".pmcp").mkdir()
-    (home / ".pmcp" / "manifest.yaml").write_text(
-        _document(kind, base_text, field_name, value), encoding="utf-8"
+    overlay = home / ".pmcp" / "manifest.yaml"
+    overlay.write_text(
+        _document(kind, base_text, field_name, value, name), encoding="utf-8"
     )
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Collect(level=logging.WARNING)
+    log = logging.getLogger("pmcp.manifest")
+    saved_propagate = log.propagate
+    log.addHandler(handler)
+    log.propagate = False
     saved_home, saved_cwd = os.environ.get("HOME"), os.getcwd()
-    previous = logging.root.manager.disable
-    logging.disable(logging.CRITICAL)
     try:
         os.environ["HOME"] = str(home)
         os.chdir(home)
         clear_manifest_cache()
         manifest = load_manifest()
         entries = manifest.servers if kind == "server" else manifest.cli_alternatives
-        entry = entries.get("zzt")
-        return (
-            "skipped"
-            if entry is None
-            else "loaded " + _describe(getattr(entry, field_name))
+        skips = [
+            r.getMessage()
+            for r in records
+            if r.getMessage().startswith("Skipping invalid")
+        ]
+        entry = entries.get(name)
+        if not skips:
+            if entry is None:
+                return "skipped [no skip warning]"
+            return "loaded " + _describe(getattr(entry, field_name))
+        if len(skips) != 1:
+            return f"skipped [{len(skips)} skip warnings]"
+        message = skips[0]
+        who = (
+            "name not shown" if "(name not shown)" in message else "shipped name shown"
         )
+        return f"skipped [{who}] {message.split(f'{overlay}: ', 1)[-1]}"
     finally:
-        logging.disable(previous)
+        log.removeHandler(handler)
+        log.propagate = saved_propagate
         os.chdir(saved_cwd)
         if saved_home is None:
             os.environ.pop("HOME", None)
@@ -133,8 +169,10 @@ def check_claims(claims: list[dict], home_root: Path, side: str) -> list[str]:
     wrong = []
     for claim in claims:
         expected = claim[side]
-        for kind, field_name, value, base in claim["rows"]:
-            got = outcome(kind, field_name, value, base, home_root)
+        for row in claim["rows"]:
+            kind, field_name, value, base = row[:4]
+            name = row[4] if len(row) > 4 else "zzt"
+            got = outcome(kind, field_name, value, base, home_root, name)
             if not got.startswith(expected):
                 wrong.append(
                     f"{claim['id']}: {kind}/{field_name}={value} ({base}) {got} != {expected}"
@@ -159,7 +197,11 @@ def main() -> None:
         wanted = {"_ANY", "_NOT_A_STRING", "DOC_CLAIMS"}
         namespace: dict[str, Any] = {"Any": Any}
         for node in tree.body:
-            target = node.target if isinstance(node, ast.AnnAssign) else None
+            target = (
+                node.target
+                if isinstance(node, (ast.AnnAssign, ast.AugAssign))
+                else None
+            )
             if isinstance(node, ast.Assign) and len(node.targets) == 1:
                 target = node.targets[0]
             if isinstance(target, ast.Name) and target.id in wanted:

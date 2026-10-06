@@ -2967,6 +2967,78 @@ DOC_CLAIMS: list[dict[str, Any]] = [
     },
 ]
 
+DOC_CLAIMS += [
+    {
+        # The warning-text column: every one of these is also checked for
+        # every skipped row of the table by
+        # test_every_skip_warning_names_its_field.
+        "id": "warning-names-the-field-not-the-value",
+        "docs": [
+            ("README.md", "The warning names the field, not\nits value"),
+            ("CHANGELOG.md", "with a WARNING naming the field but not its value"),
+            ("CHANGELOG.md", "The warning names the field, never its value"),
+            ("MIGRATING.md", "WARNING that names the field but not its value"),
+        ],
+        "mentions": [],
+        "rows": [
+            ("server", "keywords", "[1]", "local"),
+        ],
+        "branch": "skipped [name not shown] 'keywords' ",
+        "main": "loaded",
+    },
+    {
+        "id": "warning-args",
+        "docs": [("README.md", "an `args` list holding a number")],
+        "mentions": [],
+        "rows": [("server", "args", "[1]", b) for b in ("local", "url")],
+        "branch": "skipped [name not shown] 'args' ",
+        "main": "loaded",
+    },
+    {
+        "id": "warning-command",
+        "docs": [("README.md", "a `command` or `transport` that is not a\nstring")],
+        "mentions": [],
+        "rows": [("server", "command", "5", b) for b in ("local", "url")],
+        "branch": "skipped [name not shown] 'command' ",
+        "main": "loaded",
+    },
+    {
+        "id": "warning-transport",
+        "docs": [("README.md", "a `command` or `transport` that is not a\nstring")],
+        "mentions": [],
+        "rows": [("server", "transport", "5", b) for b in ("local", "url")],
+        "branch": "skipped [name not shown] 'transport' ",
+        "main": "loaded",
+    },
+    {
+        "id": "warning-check-command",
+        "docs": [("README.md", "a CLI alternative with an empty `check_command`")],
+        "mentions": [],
+        "rows": [("cli", "check_command", "[]", "cli")],
+        "branch": "skipped [name not shown] 'check_command' ",
+        "main": "loaded",
+    },
+    {
+        "id": "warning-shows-only-a-shipped-name",
+        "docs": [
+            ("README.md", "does not show the entry's name unless pmcp ships it"),
+            ("MIGRATING.md", "and not the entry's name\nunless pmcp ships it"),
+            (
+                "CHANGELOG.md",
+                "shows an overlay entry's\n  name only when pmcp ships that name",
+            ),
+        ],
+        "mentions": [],
+        "rows": [
+            ("server", "keywords", "[1]", "local", "playwright"),
+            ("server", "command", "5", "url", "github"),
+            ("cli", "check_command", "[]", "cli", "git"),
+        ],
+        "branch": "skipped [shipped name shown] ",
+        "main": "loaded",
+    },
+]
+
 # The doc passages whose field mentions DOC_CLAIMS must cover: (file, first
 # words, last words) of each passage.
 DOC_PASSAGES = [
@@ -2976,6 +3048,11 @@ DOC_PASSAGES = [
         "the shipped manifest always still loads.",
     ),
     ("CHANGELOG.md", "- **An overlay entry pmcp cannot use is skipped.**", "*Fixed*"),
+    (
+        "CHANGELOG.md",
+        "- **An overlay no longer hides other servers from discovery",
+        "(https://github.com/Consiliency/pmcp/issues/342).",
+    ),
     (
         "MIGRATING.md",
         "### An overlay entry pmcp cannot use is skipped",
@@ -2997,7 +3074,9 @@ def _passage(name: str, start: str, end: str) -> str:
 
 def test_doc_claims_quote_the_docs() -> None:
     """Every claim's quoted text is in the doc, inside a covered passage."""
-    passages = {f: _passage(f, a, b) for f, a, b in DOC_PASSAGES}
+    passages: dict[str, str] = {}
+    for f, a, b in DOC_PASSAGES:
+        passages[f] = passages.get(f, "") + _passage(f, a, b)
     missing = [
         (c["id"], f, q[:50])
         for c in DOC_CLAIMS
@@ -3019,6 +3098,32 @@ def test_every_field_the_docs_name_has_a_claim() -> None:
                 named.add(token)
     assert named - covered == set()
     assert covered - named <= {"url"}  # `url` is named as the condition
+
+
+def test_every_skip_warning_names_its_field(tmp_path: Path) -> None:
+    """The warning-text column, for every row of the generated table: a skipped
+    entry's WARNING names the field the row set (grok F001: `keywords: [1]`
+    said `AttributeError while parsing`), only field names and error kinds,
+    never `while parsing` or an unattributed reason, and no unshipped name."""
+    from tests.overlay_field_table import generate
+
+    rows = generate(tmp_path)
+    reason = re.compile(r"^'[a-z_]+'(, '[a-z_]+')* [A-Za-z_]+(, [A-Za-z_]+)*$")
+    not_json = re.compile(r"^'[a-z_]+' holds a value that is not JSON$")
+    wrong = []
+    for kind, field_name, shape, base, got in rows:
+        if not got.startswith("skipped"):
+            continue
+        prefix = "skipped [name not shown] "
+        text = got[len(prefix) :]
+        if (
+            not got.startswith(prefix)
+            or f"'{field_name}'" not in text
+            or not (reason.match(text) or not_json.match(text))
+        ):
+            wrong.append((kind, field_name, shape, base, got))
+    assert wrong == []
+    assert sum(r[4].startswith("skipped") for r in rows) > 400  # not vacuous
 
 
 def test_the_claim_shapes_are_the_table_shapes() -> None:
@@ -3044,7 +3149,7 @@ def test_the_behaviour_table_covers_every_field_and_loads_the_shipped_manifest(
     rows = generate(tmp_path)
     expected = (len(SERVER_FIELDS) * len(SERVER_BASES) + len(CLI_FIELDS)) * len(SHAPES)
     assert len(rows) == expected
-    assert all(r[4] == "skipped" or r[4].startswith("loaded ") for r in rows)
+    assert all(r[4].startswith(("skipped [", "loaded ")) for r in rows)
 
 
 def test_a_yaml_typed_truth_only_field_keeps_mains_meaning() -> None:
@@ -3126,3 +3231,31 @@ def test_claude_375_f001_a_non_string_transport_without_a_url_is_skipped() -> No
     servers = load_manifest().servers
     assert "zz" not in servers
     assert "zzs" in servers
+
+
+def test_grok_375_f001_falsifier_the_keywords_example_names_keywords(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round 2, grok F001: the docs' own example, `keywords: [1]`, logged
+    `AttributeError while parsing` with no field named."""
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump(
+            {
+                "servers": {
+                    "zz": {"command": "npx", "keywords": [1], "args": ["-y", "pkg"]}
+                }
+            }
+        ),
+    )
+    with caplog.at_level(logging.DEBUG):
+        servers = load_manifest().servers
+    assert "zz" not in servers and "playwright" in servers
+    skips = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("Skipping invalid")
+    ]
+    assert len(skips) == 1
+    assert skips[0].endswith(": 'keywords' AttributeError")
+    assert "while parsing" not in skips[0]

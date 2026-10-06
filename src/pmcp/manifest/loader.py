@@ -1108,6 +1108,55 @@ def _canonical_cli(cli: CLIAlternative) -> CLIAlternative:
     )
 
 
+def _error_kind(exc: BaseException) -> str:
+    """An exception's kind, never its text: pydantic's error types, or the class."""
+    from pydantic import ValidationError
+
+    if isinstance(exc, ValidationError):
+        kinds = sorted(
+            {str(e.get("type", "invalid")) for e in exc.errors(include_url=False)}
+        )
+        return ", ".join(kinds) or "invalid"
+    return type(exc).__name__
+
+
+def _checked_entry(build: Any, kept: dict[str, Any]) -> Any:
+    """``build(kept)``; if it raises, an ``_EntryRejected`` naming the field.
+
+    ``build`` is the whole parse-time check for one overlay entry (parse, the
+    JSON check, and every consumer's own model and scoring), so an entry is
+    rejected before any consumer runs on it. A consumer's error names its own
+    model's field or nothing (``'reasoning'`` for a bad ``description``,
+    ``AttributeError`` for ``keywords: [1]``), so the overlay field is found by
+    the check itself: the fields whose removal makes the entry pass, else the
+    fields that fail on their own (Consiliency/pmcp#375 board round 2, grok
+    F001). Names and kinds only, never a value.
+    """
+    try:
+        return build(kept)
+    except _EntryRejected:
+        raise
+    except Exception as exc:
+        kind = _error_kind(exc)
+
+    def fails(data: dict[str, Any]) -> bool:
+        try:
+            build(data)
+        except Exception:
+            return True
+        return False
+
+    fields = sorted(kept)
+    culprits = [
+        f for f in fields if not fails({k: v for k, v in kept.items() if k != f})
+    ]
+    if not culprits:
+        culprits = [f for f in fields if fails({f: kept[f]})]
+    if not culprits:
+        raise _EntryRejected(f"its fields together ({kind})")
+    raise _EntryRejected(", ".join(f"'{f}'" for f in culprits) + f" {kind}")
+
+
 def _rejection_reason(exc: BaseException) -> str:
     """Why an entry was skipped, without any value or name from the entry.
 
@@ -1740,12 +1789,11 @@ def _parse_overlay_document(
     if isinstance(raw_servers, dict):
         for name, server_data in raw_servers.items():
             try:
-                server = _canonical_server(
-                    _json_native_entry(
-                        _parse_server_config(
-                            name, _schema_fields(server_data, _SERVER_SCHEMA_KEYS)
-                        )
-                    )
+                server = _checked_entry(
+                    lambda data: _canonical_server(
+                        _json_native_entry(_parse_server_config(name, data))
+                    ),
+                    _schema_fields(server_data, _SERVER_SCHEMA_KEYS),
                 )
             except Exception as exc:
                 logger.warning(
@@ -1762,12 +1810,11 @@ def _parse_overlay_document(
     if isinstance(raw_clis, dict):
         for name, cli_data in raw_clis.items():
             try:
-                cli = _canonical_cli(
-                    _json_native_entry(
-                        _parse_cli_alternative(
-                            name, _schema_fields(cli_data, _CLI_SCHEMA_KEYS)
-                        )
-                    )
+                cli = _checked_entry(
+                    lambda data: _canonical_cli(
+                        _json_native_entry(_parse_cli_alternative(name, data))
+                    ),
+                    _schema_fields(cli_data, _CLI_SCHEMA_KEYS),
                 )
             except Exception as exc:
                 logger.warning(
