@@ -558,78 +558,48 @@ def _value_bearing_types() -> tuple[type[BaseException], ...]:
 
 
 #: Every HTTP client module pmcp uses -- the clients it imports and their
-#: transports -- and the base classes of the exceptions whose message can
-#: carry bytes of a response pmcp rejected: a status line, a header, chunk
-#: framing, a body, a MIME type, a reason phrase (rev 22 round-20 codex F001;
-#: rev 23 round-21 claude/grok/codex F001). Registered by class, so every
-#: subclass is covered. `tests/test_parse_error_echo.py` derives the modules
-#: from pmcp's imports and the clients' requirements, and pins every
-#: exception class each defines as registered here or value-free, exactly.
+#: transports -- and the base classes of **every** exception each one raises
+#: (rev 25, round-23 ruling). Until rev 24 only the classes whose message was
+#: shown to carry response bytes were registered, and each round found
+#: another class wrongly held value-free: text built in C (`ssl`'s
+#: "certificate is not valid for '<redirect host>'"), or through a variable
+#: class (httpcore's `to_exc(exc)`, httpx's `mapped_exc(message)`). So no
+#: client exception is value-free: each renders as its class and, when it
+#: has one, its status. `tests/test_parse_error_echo.py` derives the modules
+#: from pmcp's imports and the clients' requirements, and pins that every
+#: exception class each defines is registered.
 HTTP_RESPONSE_ERRORS: dict[str, tuple[str, ...]] = {
     "aiohttp": (
-        "ClientResponseError",  # parser failures, ContentTypeError, statuses
-        "ClientPayloadError",  # chunk framing and body transfer errors
-        "ServerDisconnectedError",  # may carry the partial response message
+        "ClientError",
         "BadContentDispositionHeader",
         "BadContentDispositionParam",
-        "RedirectClientError",  # a rejected `Location` from the response
-        "WebSocketError",  # a server's close message
-        "WSMessageTypeError",  # quotes the message's data (rev 24)
-        # Every connection error (rev 24): its text names the host, port or
-        # URL it connected to, which a followed redirect's `Location` chose.
-        "ClientConnectionError",
+        "EofStream",
+        "WSMessageTypeError",
+        "WebSocketError",
     ),
-    "aiohttp.http_exceptions": ("HttpProcessingError",),  # every parser error
-    # `ProxyError`: a proxy's refusal, `"%d %s" % (status, reason phrase)`
-    # (rev 24, round-22 claude F001). `UnsupportedProtocol`: the scheme of a
-    # followed redirect's `Location` (rev 24).
-    "httpx": (
+    "aiohttp.http_exceptions": ("HttpProcessingError",),
+    "httpx": ("HTTPError", "InvalidURL", "CookieConflict", "StreamError"),
+    "httpx2": ("HTTPError", "InvalidURL", "CookieConflict", "StreamError"),
+    "httpcore": (
+        "ConnectionNotAvailable",
+        "NetworkError",
         "ProtocolError",
-        "DecodingError",
-        "HTTPStatusError",
         "ProxyError",
+        "TimeoutException",
         "UnsupportedProtocol",
     ),
-    "httpx2": (
+    "httpcore2": (
+        "ConnectionNotAvailable",
+        "NetworkError",
         "ProtocolError",
-        "DecodingError",
-        "HTTPStatusError",
-        "SSEError",
         "ProxyError",
+        "TimeoutException",
         "UnsupportedProtocol",
     ),
-    "httpcore": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),
-    "httpcore2": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),
     "h11": ("ProtocolError",),
-    "http.client": ("HTTPException",),  # BadStatusLine, LineTooLong, ...
-    "urllib.error": ("HTTPError",),  # the reason phrase
+    "http.client": ("HTTPException",),
+    "urllib.error": ("URLError",),
 }
-
-#: How a registered HTTP error is described, by the nearest class in its MRO
-#: named here; any other is "rejected an HTTP response" (rev 23). Each phrase
-#: is the class and, at most, a number: never the error's text.
-_HTTP_PHRASES: dict[str, str] = {
-    # A body that parsed but did not decode (rev 22's wording).
-    "DecodingError": "decode",
-    "ContentTypeError": "decode",
-    # A proxy's refusal (rev 24).
-    "ProxyError": "proxy",
-    "ClientHttpProxyError": "proxy",
-    # A URL scheme the client does not speak (rev 24).
-    "UnsupportedProtocol": "scheme",
-    # aiohttp's connection errors (rev 24); a disconnect mid-response stays
-    # a rejected response.
-    "ServerDisconnectedError": "response",
-    "ClientConnectionError": "connection",
-}
-
-
-def _http_phrase(error: BaseException) -> str:
-    for klass in type(error).__mro__:
-        kind = _HTTP_PHRASES.get(klass.__name__)
-        if kind is not None:
-            return kind
-    return "response"
 
 
 def _tunnel_refusal_status(error: BaseException) -> int | None | bool:
@@ -702,6 +672,21 @@ def _response_decode_types() -> tuple[type[BaseException], ...]:
 
 def _is_response_decode_error(error: BaseException) -> bool:
     return isinstance(error, _response_decode_types()) and not _is_parse_error(error)
+
+
+def _http_status(error: BaseException) -> int | None:
+    """The status a registered HTTP error records: a refused tunnel's (from
+    its frame), a response's (:func:`_response_status`), or a
+    ``ProxyError``'s leading digits."""
+    tunnel = _tunnel_refusal_status(error)
+    if tunnel is not False:
+        return tunnel if type(tunnel) is int else None
+    status = _response_status(error)
+    if status is None and any(
+        klass.__name__ == "ProxyError" for klass in type(error).__mro__
+    ):
+        status = _proxy_status(error)
+    return status
 
 
 def _response_status(error: BaseException) -> int | None:
@@ -799,35 +784,12 @@ def _validation_text(error: BaseException) -> str:
     if isinstance(error, UnicodeDecodeError):
         # The codec and class only: never the undecodable bytes.
         return f"could not decode {error.encoding} text (UnicodeDecodeError)"
-    tunnel = _tunnel_refusal_status(error)
-    if tunnel is not False:
-        # The status alone: never the proxy's reason phrase (rev 24).
-        where = f", status {tunnel}" if tunnel is not None else ""
-        return f"the proxy refused the tunnel ({type(error).__name__}{where})"
-    if _is_response_decode_error(error):
-        name = type(error).__name__
-        kind = _http_phrase(error)
-        if kind == "proxy":
-            status = _response_status(error)
-            if status is None:
-                status = _proxy_status(error)
-            where = f", status {status}" if status is not None else ""
-            return f"the proxy refused the tunnel ({name}{where})"
-        if kind == "scheme":
-            return f"the URL's scheme is not supported ({name})"
-        if kind == "connection":
-            # The errno, a number, and never the host, port, URL or OS text.
-            errno = getattr(error, "errno", None)
-            where = f", errno {errno}" if type(errno) is int else ""
-            return f"the connection failed ({name}{where})"
-        if kind == "decode":
-            # Format and class only: never the MIME type or the body.
-            return f"could not decode an HTTP response ({name})"
-        # The class and the status number: never the status line, a header,
-        # the framing, the body or the reason phrase (rev 23).
-        status = _response_status(error)
+    if _tunnel_refusal_status(error) is not False or _is_response_decode_error(error):
+        # The class and the status number: never the error's text, its
+        # attributes or anything it chains (rev 25).
+        status = _http_status(error)
         where = f", status {status}" if status is not None else ""
-        return f"rejected an HTTP response ({name}{where})"
+        return f"an HTTP request failed ({type(error).__name__}{where})"
     if isinstance(error, ValidationError):
         count = error.error_count()
         plural = "" if count == 1 else "s"
