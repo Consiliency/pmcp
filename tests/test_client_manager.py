@@ -1372,10 +1372,10 @@ class TestRemoteConnectSseHeaders:
         manager = ClientManager()
         credential = r'token with spaces # "quotes" and \ slash = value'
         write_env_file(
-            tmp_path / ".env.pmcp", {"PMCP_TEST_TOKEN": credential}, confine_to=None
+            tmp_path / ".env.pmcp", {"SOAK_TEST_TOKEN": credential}, confine_to=None
         )
         monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv("PMCP_TEST_TOKEN", raising=False)
+        monkeypatch.delenv("SOAK_TEST_TOKEN", raising=False)
 
         config = ResolvedServerConfig(
             name="remote-http",
@@ -1383,7 +1383,7 @@ class TestRemoteConnectSseHeaders:
             config=RemoteMcpServerConfig(
                 type="streamable-http",
                 url="https://example.com/mcp",
-                headers={"Authorization": "Bearer ${PMCP_TEST_TOKEN}"},
+                headers={"Authorization": "Bearer ${SOAK_TEST_TOKEN}"},
             ),
         )
         captured_headers: dict[str, str] = {}

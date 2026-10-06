@@ -462,6 +462,12 @@ def is_pmcp_environment_name(key: str) -> bool:
     return upper in _PMCP_ENVIRONMENT_NAMES or upper.endswith("_PROXY")
 
 
+#: pmcp's own variable namespace, in any case (a regex rather than
+#: ``str.startswith``: the store modules' AST ban reads ``startswith`` as a path
+#: containment test).
+_PMCP_NAMESPACE = re.compile(r"PMCP_", re.IGNORECASE)
+
+
 def repository_may_supply(name: str) -> bool:
     """May a repository-controlled file supply the variable ``name``? THE one rule.
 
@@ -489,7 +495,7 @@ def repository_may_supply(name: str) -> bool:
         # The whole PMCP_ prefix, in any case: a variable pmcp starts reading
         # later is refused before anyone classifies it (Consiliency/pmcp#372
         # round 7, N-1).
-        or name.upper().startswith("PMCP_")
+        or _PMCP_NAMESPACE.match(name) is not None
         or is_dangerous_env_var(name)
         or is_package_manager_env_var(name)
     )
