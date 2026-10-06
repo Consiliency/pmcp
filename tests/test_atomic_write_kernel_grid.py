@@ -1,0 +1,721 @@
+"""Both write rules agree with the kernel, on a grid generated from a grammar.
+
+Round 8 on Consiliency/pmcp#366 (owner's ruling): stop reimplementing kernel
+path resolution. The unconfined (operator-owned) rule follows only the final
+link chain by pathname and hands every directory to the kernel; the confined
+(repository-controlled) rule refuses any symlink and any ``..`` and otherwise
+lets the kernel do the rest. Both should agree with the kernel by construction,
+and this grid checks it.
+
+Grammar, never hand-listed:
+
+* a component's KIND on disk: real dir, link->dir, link->file, link->missing,
+  regular file, missing, mode-000 dir, mode-311 dir;
+* how the step through it is SPELLED: ``c/x``, ``c/./x``, ``c/../x``,
+  ``c//x``, and a ``//``-prefixed absolute spelling;
+* a TRAILING form on the end: nothing, ``/``, ``/.``.
+
+Unconfined: the user store is a link whose text is that path; the oracle is the
+kernel's ``open(O_WRONLY|O_CREAT|O_TRUNC)`` through the same link in an
+identical tree, and outcome plus every byte must match. Confined: the store
+path itself is built from the grammar (pathlib already folds ``.`` and empty
+components); the oracle is the kernel, EXCEPT that a symlink anywhere or a
+``..`` must be a refusal that changes nothing -- the ruling.
+"""
+
+from __future__ import annotations
+
+import errno
+import os
+import stat
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+
+from pmcp import atomic_write as writer
+from pmcp.atomic_write import ConfinedWriteError, atomic_write, read_confined
+
+pytestmark = pytest.mark.skipif(os.name != "posix", reason="POSIX semantics")
+
+DATA = b"K=grid\n"
+KINDS = (
+    "real dir",
+    "link->dir",
+    "link->file",
+    "link->missing",
+    "regular file",
+    "missing",
+    "mode-000 dir",
+    "mode-311 dir",
+)
+SPELLINGS = ("name", "dot", "dotdot", "empty", "double-slash-absolute")
+TRAILING = {"none": "", "slash": "/", "slash-dot": "/."}
+_LINKS = {"link->dir", "link->file", "link->missing"}
+
+needs_non_root = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root ignores directory permissions"
+)
+
+
+@dataclass(frozen=True)
+class Case:
+    id: str
+    kind: str
+    spelling: str
+    trailing: str
+
+
+CASES = [
+    Case(f"{k}-{sp}-{t}", k, sp, t) for k in KINDS for sp in SPELLINGS for t in TRAILING
+]
+
+
+def _build(base: Path, kind: str) -> Path:
+    """A directory ``base`` holding component ``c`` of ``kind``; returns ``base``."""
+    base.mkdir(parents=True)
+    (base / "x.env").write_bytes(b"BASE=1\n")
+    (base / "afile").write_bytes(b"AFILE=1\n")
+    real = base / "realdir"
+    real.mkdir()
+    (real / "x.env").write_bytes(b"REAL=1\n")
+    c = base / "c"
+    if kind in ("real dir", "mode-000 dir", "mode-311 dir"):
+        c.mkdir()
+        (c / "x.env").write_bytes(b"C=1\n")
+    elif kind == "link->dir":
+        os.symlink("realdir", c)
+    elif kind == "link->file":
+        os.symlink("afile", c)
+    elif kind == "link->missing":
+        os.symlink("nowhere", c)
+    elif kind == "regular file":
+        c.write_bytes(b"CFILE=1\n")
+    return base
+
+
+def _lock(base: Path, kind: str) -> None:
+    if kind == "mode-000 dir":
+        os.chmod(base / "c", 0o000)
+    elif kind == "mode-311 dir":
+        os.chmod(base / "c", 0o311)
+
+
+def _unlock(base: Path) -> None:
+    c = base / "c"
+    if c.is_dir() and not c.is_symlink():
+        os.chmod(c, 0o755)
+
+
+def _spell(base: Path, case: Case) -> str:
+    step = {
+        "name": "c/x.env",
+        "dot": "c/./x.env",
+        "dotdot": "c/../x.env",
+        "empty": "c//x.env",
+        "double-slash-absolute": "/" + str(base / "c" / "x.env"),
+    }[case.spelling]
+    if case.spelling != "double-slash-absolute":
+        step = str(base / step)
+    return step + TRAILING[case.trailing]
+
+
+def _tree(root: Path) -> dict[str, bytes]:
+    out: dict[str, bytes] = {}
+    for dirpath, _dirs, files in os.walk(root, followlinks=False):
+        for name in files:
+            p = Path(dirpath, name)
+            if not p.is_symlink() and not name.startswith(".pmcp-"):
+                out[str(p.relative_to(root))] = p.read_bytes()
+    return out
+
+
+def _kernel_write(where: str) -> bool:
+    """Open ``where`` for writing the kernel's way; True if refused."""
+    try:
+        fd = os.open(where, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    except OSError:
+        return True
+    try:
+        os.write(fd, DATA)
+    finally:
+        os.close(fd)
+    return False
+
+
+def _skip_if_root(case: Case) -> None:
+    if os.geteuid() == 0 and case.kind.startswith("mode-"):
+        pytest.skip("root ignores directory permissions")
+
+
+# --------------------------------------------------------------------------- #
+# Unconfined: the user store links to a grammar-built path.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("dir_fd", [True, False], ids=["dir_fd", "no dir_fd"])
+@pytest.mark.parametrize("case", CASES, ids=[c.id for c in CASES])
+def test_an_unconfined_write_agrees_with_the_kernel(
+    case: Case, dir_fd: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _skip_if_root(case)
+    monkeypatch.setattr(
+        writer, "_DIR_FD_SUPPORTED", dir_fd and writer._DIR_FD_SUPPORTED
+    )
+    root = Path(os.path.realpath(tmp_path))
+    k_base = _build(root / "kernel", case.kind)
+    w_base = _build(root / "writer", case.kind)
+    k_link = root / "kernel-store.env"
+    w_link = root / "writer-store.env"
+    os.symlink(_spell(k_base, case), k_link)
+    os.symlink(_spell(w_base, case), w_link)
+    _lock(k_base, case.kind)
+    _lock(w_base, case.kind)
+    try:
+        kernel_refused = _kernel_write(str(k_link))
+        try:
+            atomic_write(w_link, DATA, confine_to=None)
+            writer_refused = False
+        except OSError:
+            writer_refused = True
+    finally:
+        _unlock(k_base)
+        _unlock(w_base)
+
+    assert writer_refused == kernel_refused, case.id
+    assert _tree(w_base) == _tree(k_base), case.id
+    assert os.path.islink(w_link)
+
+
+# --------------------------------------------------------------------------- #
+# Confined: the store path itself is grammar-built, inside the project.
+# --------------------------------------------------------------------------- #
+
+CONFINED_CASES = [c for c in CASES if c.spelling != "double-slash-absolute"]
+
+
+def _must_refuse(case: Case) -> bool:
+    return case.kind in _LINKS or case.spelling == "dotdot"
+
+
+@pytest.mark.parametrize("dir_fd", [True, False], ids=["dir_fd", "no dir_fd"])
+@pytest.mark.parametrize("role", ["intermediate", "final"])
+@pytest.mark.parametrize("case", CONFINED_CASES, ids=[c.id for c in CONFINED_CASES])
+def test_a_confined_write_agrees_with_the_kernel_or_refuses_any_link(
+    case: Case,
+    role: str,
+    dir_fd: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_if_root(case)
+    monkeypatch.setattr(
+        writer, "_DIR_FD_SUPPORTED", dir_fd and writer._DIR_FD_SUPPORTED
+    )
+    root = Path(os.path.realpath(tmp_path))
+    k_base = _build(root / "kernel", case.kind)
+    w_base = _build(root / "writer", case.kind)
+
+    def store(base: Path) -> str:
+        if role == "final":
+            # The component IS the store; the spelling is the step to it.
+            step = {
+                "name": "c",
+                "dot": "./c",
+                "dotdot": "realdir/../c",
+                "empty": "/c",
+            }[case.spelling]
+            return f"{base}/{step}"
+        return _spell(base, case)[: -len(TRAILING[case.trailing]) or None]
+
+    before = _tree(w_base)  # before any directory is locked
+    _lock(k_base, case.kind)
+    _lock(w_base, case.kind)
+    try:
+        kernel_refused = _kernel_write(store(k_base))
+        try:
+            atomic_write(Path(store(w_base)), DATA, confine_to=w_base)
+            writer_refused = False
+            refusal = None
+        except OSError as exc:
+            writer_refused = True
+            refusal = exc
+    finally:
+        _unlock(k_base)
+        _unlock(w_base)
+
+    if _must_refuse(case):
+        assert writer_refused, case.id
+        assert isinstance(refusal, ConfinedWriteError), (case.id, refusal)
+        assert _tree(w_base) == before
+        return
+    assert writer_refused == kernel_refused, (case.id, role, refusal)
+    assert _tree(w_base) == _tree(k_base), (case.id, role)
+
+
+@pytest.mark.parametrize("case", CONFINED_CASES, ids=[c.id for c in CONFINED_CASES])
+def test_a_confined_read_agrees_with_the_kernel_or_refuses_any_link(
+    case: Case, tmp_path: Path
+) -> None:
+    _skip_if_root(case)
+    base = _build(Path(os.path.realpath(tmp_path)) / "p", case.kind)
+    path = _spell(base, case)[: -len(TRAILING[case.trailing]) or None]
+    _lock(base, case.kind)
+    try:
+        try:
+            with open(path, "rb") as handle:
+                kernel: object = handle.read()
+        except FileNotFoundError:
+            kernel = None
+        except OSError:
+            kernel = "refused"
+        try:
+            got: object = read_confined(Path(path), base)
+        except FileNotFoundError:
+            got = None
+        except ConfinedWriteError:
+            got = "link-refused"
+        except OSError:
+            got = "refused"
+    finally:
+        _unlock(base)
+    if _must_refuse(case):
+        assert got == "link-refused", case.id
+    else:
+        assert got == kernel, case.id
+
+
+def test_the_grid_has_both_outcomes() -> None:
+    """Positive control: the kernel accepts some unconfined shapes and refuses others."""
+    import tempfile
+
+    seen = set()
+    with tempfile.TemporaryDirectory() as d:
+        for i, case in enumerate(CASES):
+            if case.kind.startswith("mode-"):
+                continue
+            base = _build(Path(os.path.realpath(d)) / str(i), case.kind)
+            seen.add(_kernel_write(_spell(base, case)))
+    assert seen == {True, False}
+
+
+# --------------------------------------------------------------------------- #
+# Search-only directories on the way, as the kernel allows.
+# --------------------------------------------------------------------------- #
+
+
+@needs_non_root
+def test_a_user_store_under_a_search_only_ancestor_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hardened /home (0711): searchable, not listable."""
+    from pmcp.env_store import read_env_file, set_env_value
+
+    homes = Path(os.path.realpath(tmp_path)) / "homes"
+    home = homes / "u"
+    store = home / ".config" / "pmcp" / "pmcp.env"
+    store.parent.mkdir(parents=True)
+    store.write_text("KEEP=1\n", encoding="utf-8")
+    dots = Path(os.path.realpath(tmp_path)) / "dots"
+    (dots / "d").mkdir(parents=True)
+    (dots / "d" / "trust.json").write_text("{}\n", encoding="utf-8")
+    os.chmod(homes, 0o311)
+    os.chmod(dots, 0o311)
+    monkeypatch.setenv("HOME", str(home))
+    try:
+        set_env_value("user", "NEW", "v")
+        assert read_env_file(store) == {"KEEP": "1", "NEW": "v"}
+        link = home / "linked.json"
+        os.symlink(dots / "d" / "trust.json", link)
+        atomic_write(link, b"[]\n", confine_to=None)
+        assert (dots / "d" / "trust.json").read_bytes() == b"[]\n"
+    finally:
+        os.chmod(homes, 0o755)
+        os.chmod(dots, 0o755)
+
+
+@needs_non_root
+def test_a_project_under_a_search_only_ancestor_is_written_and_read(
+    tmp_path: Path,
+) -> None:
+    from pmcp.env_store import read_store_for_update, set_env_value
+
+    ancestor = Path(os.path.realpath(tmp_path)) / "srv"
+    project = ancestor / "proj"
+    (project / ".git").mkdir(parents=True)
+    (project / ".env.pmcp").write_text("KEEP=1\n", encoding="utf-8")
+    os.chmod(ancestor, 0o311)
+    try:
+        set_env_value("project", "NEW", "v", project)
+        assert read_store_for_update("project", project / ".env.pmcp") == {
+            "KEEP": "1",
+            "NEW": "v",
+        }
+    finally:
+        os.chmod(ancestor, 0o755)
+
+
+@needs_non_root
+def test_a_search_only_directory_inside_the_project_is_walked(tmp_path: Path) -> None:
+    if not writer._O_PATH or not writer._DIR_FD_SUPPORTED:
+        pytest.skip("needs O_PATH and dir_fd")
+    project = Path(os.path.realpath(tmp_path)) / "proj"
+    target_dir = project / "vault" / "real"
+    target_dir.mkdir(parents=True)
+    store = target_dir / "s.env"
+    os.chmod(project / "vault", 0o311)
+    try:
+        atomic_write(store, DATA, confine_to=project)
+        assert read_confined(store, project) == DATA
+        assert stat.S_IMODE(store.stat().st_mode) == 0o600
+    finally:
+        os.chmod(project / "vault", 0o755)
+
+
+@pytest.mark.skipif(not getattr(os, "O_PATH", 0), reason="needs O_PATH")
+def test_an_o_path_walk_still_refuses_a_directory_swapped_for_a_link(
+    tmp_path: Path,
+) -> None:
+    base = Path(os.path.realpath(tmp_path))
+    (base / "d").mkdir()
+    os.symlink("d", base / "l")
+    root = os.open(base, writer._walk_flags())
+    try:
+        with pytest.raises(OSError) as info:
+            os.open("l", writer._walk_flags() | os.O_NOFOLLOW, dir_fd=root)
+        assert info.value.errno in (errno.ENOTDIR, errno.ELOOP)
+    finally:
+        os.close(root)
+
+
+def test_o_path_is_used_wherever_the_platform_has_it() -> None:
+    assert writer._O_PATH == getattr(os, "O_PATH", 0)
+    if writer._O_PATH:
+        assert writer._walk_flags() & writer._O_PATH
+
+
+def test_board_r7_f002_absolute_link_with_trailing_slash_is_refused_like_the_kernel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The round-7 seat's data-loss shape: a user store linked to `<file>/`."""
+    from pmcp.env_store import set_env_value
+
+    base = Path(os.path.realpath(tmp_path))
+    dotfiles = base / "dotfiles" / "pmcp.env"
+    dotfiles.parent.mkdir()
+    dotfiles.write_text("KEEP1=alpha\nKEEP2=beta\n", encoding="utf-8")
+    home = base / "home"
+    link = home / ".config" / "pmcp" / "pmcp.env"
+    link.parent.mkdir(parents=True)
+    os.symlink(str(dotfiles) + "/", link)
+    monkeypatch.setenv("HOME", str(home))
+    with pytest.raises(OSError):
+        set_env_value("user", "NEW", "v")
+    assert dotfiles.read_text(encoding="utf-8") == "KEEP1=alpha\nKEEP2=beta\n"
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["missing/../x", "afile/../x", "missing/./x", "plain/new/x"],
+)
+def test_make_store_dirs_creates_only_a_plain_missing_tail(
+    spelling: str, tmp_path: Path
+) -> None:
+    """Never `mkdir -p` past a component the kernel refuses (round 8, codex F002)."""
+    base = Path(os.path.realpath(tmp_path))
+    (base / "afile").write_bytes(b"")
+    (base / "x").mkdir()
+    before = sorted(p.name for p in base.iterdir())
+    target = f"{base}/{spelling}"
+    if spelling == "plain/new/x":
+        created = writer.make_store_dirs(target)
+        assert [os.path.relpath(c, base) for c in created] == [
+            "plain",
+            "plain/new",
+            "plain/new/x",
+        ]
+        assert all(stat.S_IMODE(os.stat(c).st_mode) == 0o700 for c in created)
+        return
+    with pytest.raises(OSError):
+        writer.make_store_dirs(target)
+    assert sorted(p.name for p in base.iterdir()) == before
+
+
+# --------------------------------------------------------------------------- #
+# Round 9 (claude F001): the kernel counts EVERY link in one lookup. A chain
+# whose hops each pass a symlinked directory crosses 40 in total while each
+# hop's own count stays small. Generated over chain lengths on both sides of it.
+# --------------------------------------------------------------------------- #
+
+
+def _chain(base: Path, hops: int) -> Path:
+    real = base / "real"
+    real.mkdir(parents=True)
+    (real / "pmcp.env").write_bytes(b"KEEP1=alpha\nKEEP2=beta\n")
+    os.symlink("real", base / "via")
+    prev = base / "via" / "pmcp.env"
+    for i in range(hops):  # each hop: one chain link + the `via` directory link
+        os.symlink(prev, real / f"c{i}")
+        prev = base / "via" / f"c{i}"
+    store = base / "store.env"
+    os.symlink(prev, store)
+    return store
+
+
+@pytest.mark.parametrize("dir_fd", [True, False], ids=["dir_fd", "no dir_fd"])
+@pytest.mark.parametrize("hops", [1, 5, 15, 18, 19, 20, 21, 25])
+def test_a_chain_with_a_linked_directory_on_each_hop_agrees_with_the_kernel(
+    hops: int, dir_fd: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        writer, "_DIR_FD_SUPPORTED", dir_fd and writer._DIR_FD_SUPPORTED
+    )
+    root = Path(os.path.realpath(tmp_path))
+    k_store = _chain(root / "kernel", hops)
+    w_store = _chain(root / "writer", hops)
+    kernel_refused = _kernel_write(str(k_store))
+    try:
+        atomic_write(w_store, DATA, confine_to=None)
+        writer_refused = False
+    except OSError:
+        writer_refused = True
+    assert writer_refused == kernel_refused, hops
+    assert _tree(root / "writer") == _tree(root / "kernel"), hops
+
+
+def test_the_chain_grid_crosses_the_kernel_limit() -> None:
+    """Positive control: some lengths resolve, some are ELOOP to the kernel."""
+    import tempfile
+
+    outcomes = set()
+    with tempfile.TemporaryDirectory() as d:
+        for hops in (5, 25):
+            outcomes.add(_kernel_write(str(_chain(Path(d) / str(hops), hops))))
+    assert outcomes == {True, False}
+
+
+# --------------------------------------------------------------------------- #
+# Round 9 (codex F003): the temporary's directory is the KERNEL's. `mkstemp`
+# ran `abspath` on it, so `a/jump/../x` (jump -> b/inner) put the temporary in
+# `a/` instead of `b/`. Generated over relative/absolute spellings and depths.
+# --------------------------------------------------------------------------- #
+
+
+def _jump_tree(base: Path) -> None:
+    (base / "a").mkdir(parents=True)
+    (base / "b" / "inner" / "deeper").mkdir(parents=True)
+    (base / "b" / "nested").mkdir()
+    (base / "a" / "nested").mkdir()  # the WRONG directory a lexical collapse picks
+    (base / "b" / "nested" / "t.env").write_bytes(b"KEEP=b\n")
+    (base / "a" / "nested" / "t.env").write_bytes(b"KEEP=a\n")
+    os.symlink(base / "b" / "inner", base / "a" / "jump")
+    os.symlink(base / "b" / "inner" / "deeper", base / "a" / "jump2")
+
+
+JUMPS = {
+    "relative jump/..": "a/jump/../nested/t.env",
+    "absolute jump/..": "{base}/a/jump/../nested/t.env",
+    "jump2/../..": "a/jump2/../../nested/t.env",
+    "missing file after jump/..": "a/jump/../nested/new.env",
+}
+
+
+@pytest.mark.parametrize("form", list(JUMPS))
+def test_the_temporary_goes_where_the_kernel_resolves_the_directory(
+    form: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = Path(os.path.realpath(tmp_path))
+    k_base, w_base = root / "kernel", root / "writer"
+    _jump_tree(k_base)
+    _jump_tree(w_base)
+    os.symlink(JUMPS[form].format(base=k_base), k_base / "store.env")
+    os.symlink(JUMPS[form].format(base=w_base), w_base / "store.env")
+    kernel_refused = _kernel_write(str(k_base / "store.env"))
+
+    placed: list[os.stat_result] = []
+    real_in_dir = writer._write_in_dir
+
+    def spy(dir_fd: int, *args: object, **kwargs: object) -> None:
+        placed.append(os.fstat(dir_fd))
+        real_in_dir(dir_fd, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(writer, "_write_in_dir", spy)
+    try:
+        atomic_write(w_base / "store.env", DATA, confine_to=None)
+        writer_refused = False
+    except OSError:
+        writer_refused = True
+    monkeypatch.undo()
+
+    assert writer_refused == kernel_refused, form
+    assert _tree(w_base) == _tree(k_base), form
+    if not writer_refused and writer._DIR_FD_SUPPORTED:
+        kernel_dir = os.stat(os.path.dirname(os.path.realpath(w_base / "store.env")))
+        assert placed and (placed[0].st_dev, placed[0].st_ino) == (
+            kernel_dir.st_dev,
+            kernel_dir.st_ino,
+        ), "the temporary was not created in the kernel's target directory"
+
+
+# --------------------------------------------------------------------------- #
+# Round 9 (codex F002): a store the kernel refuses to look up is an ERROR on
+# every read path, never "absent" (which the next write would replace).
+# --------------------------------------------------------------------------- #
+
+
+def _eloop_store(base: Path) -> Path:
+    directory = base / "real-config"
+    directory.mkdir(parents=True)
+    alias = base / "config"
+    alias.symlink_to(directory, target_is_directory=True)
+    (directory / "target.env").write_bytes(b"KEEP=original\n")
+    names = ["pmcp.env"] + [f"hop{i}" for i in range(1, 40)]
+    for name, destination in zip(names, names[1:] + ["target.env"]):
+        (directory / name).symlink_to(destination)
+    store = alias / "pmcp.env"
+    with pytest.raises(OSError) as info:
+        store.read_bytes()
+    assert info.value.errno == errno.ELOOP
+    return store
+
+
+def test_every_store_reader_raises_on_a_store_the_kernel_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.env_store import read_env_file, read_store_for_update
+
+    store = _eloop_store(Path(os.path.realpath(tmp_path)))
+    with pytest.raises(OSError):
+        read_env_file(store)
+    with pytest.raises(OSError):
+        read_store_for_update("user", store)
+    assert writer.is_absent(store.parent / "nope.env") is True
+    with pytest.raises(OSError):
+        writer.is_absent(store)
+
+
+def test_secrets_set_on_a_user_store_the_kernel_refuses_keeps_every_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import argparse
+    import asyncio
+
+    from pmcp.cli_commands.secrets import run_secrets_set
+
+    base = Path(os.path.realpath(tmp_path))
+    store = _eloop_store(base)
+    home = base / "home"
+    (home / ".config").mkdir(parents=True)
+    (home / ".config" / "pmcp").mkdir()
+    os.symlink(store, home / ".config" / "pmcp" / "pmcp.env")
+    monkeypatch.setenv("HOME", str(home))
+    out = asyncio.run(
+        run_secrets_set(
+            argparse.Namespace(scope="user", key="NEW", value="v", project=None)
+        )
+    )
+    assert out["ok"] is False
+    assert (base / "real-config" / "target.env").read_bytes() == b"KEEP=original\n"
+
+
+# --------------------------------------------------------------------------- #
+# Round 10 (codex F002): a chain of long RELATIVE link texts whose joined
+# length passes PATH_MAX still resolves for the kernel, so it must for the
+# writer: the descriptor walk never builds a pathname longer than one link.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("repeats", [10, 300, 450, 800])
+def test_a_long_relative_chain_agrees_with_the_kernel(
+    repeats: int, tmp_path: Path
+) -> None:
+    root = Path(os.path.realpath(tmp_path))
+    for side in ("kernel", "writer"):
+        base = root / side
+        (base / "d").mkdir(parents=True)
+        (base / "target.env").write_bytes(b"KEEP=original\n")
+        os.symlink("d/../" * repeats + "target.env", base / "hop")
+        os.symlink("d/../" * repeats + "hop", base / "store.env")
+    kernel_refused = _kernel_write(str(root / "kernel" / "store.env"))
+    try:
+        atomic_write(root / "writer" / "store.env", DATA, confine_to=None)
+        writer_refused = False
+    except OSError:
+        writer_refused = True
+    assert writer_refused == kernel_refused, repeats
+    assert _tree(root / "writer") == _tree(root / "kernel"), repeats
+
+
+def test_the_long_chain_grid_passes_path_max_when_joined() -> None:
+    """Positive control: the longest case's joined text is past PATH_MAX."""
+    joined = len(("d/../" * 800 + "hop")) + len(("d/../" * 800 + "target.env"))
+    assert joined > os.pathconf("/", "PC_PATH_MAX")
+
+
+# --------------------------------------------------------------------------- #
+# Round 10 (claude N-1): without O_PATH, a write-and-search-only (0300/0311)
+# target directory is written, as the kernel allows.
+# --------------------------------------------------------------------------- #
+
+
+@needs_non_root
+@pytest.mark.parametrize("dir_mode", [0o300, 0o311, 0o700])
+@pytest.mark.parametrize("o_path", [True, False], ids=["O_PATH", "no O_PATH"])
+@pytest.mark.parametrize("shape", ["plain store", "linked store"])
+def test_a_search_and_write_only_target_directory_agrees_with_the_kernel(
+    shape: str,
+    o_path: bool,
+    dir_mode: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if o_path and not writer._O_PATH:
+        pytest.skip("no O_PATH")
+    if not o_path:
+        monkeypatch.setattr(writer, "_O_PATH", 0)
+    root = Path(os.path.realpath(tmp_path))
+    stores = {}
+    for side in ("kernel", "writer"):
+        base = root / side
+        (base / "vault").mkdir(parents=True)
+        (base / "vault" / "pmcp.env").write_bytes(b"KEEP=original\n")
+        store = base / "vault" / "pmcp.env"
+        if shape == "linked store":
+            os.symlink("vault/pmcp.env", base / "link.env")
+            store = base / "link.env"
+        stores[side] = store
+        os.chmod(base / "vault", dir_mode)
+    try:
+        kernel_refused = _kernel_write(str(stores["kernel"]))
+        try:
+            atomic_write(stores["writer"], DATA, confine_to=None)
+            writer_refused = False
+        except OSError:
+            writer_refused = True
+    finally:
+        for side in ("kernel", "writer"):
+            os.chmod(root / side / "vault", 0o700)
+    assert writer_refused == kernel_refused, (shape, oct(dir_mode), o_path)
+    assert _tree(root / "writer") == _tree(root / "kernel")
+
+
+@pytest.mark.parametrize("form", list(JUMPS))
+def test_the_fallback_write_also_goes_where_the_kernel_resolves(
+    form: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-dir_fd form joins pathnames; it must still never normalise them."""
+    monkeypatch.setattr(writer, "_DIR_FD_SUPPORTED", False)
+    root = Path(os.path.realpath(tmp_path))
+    k_base, w_base = root / "kernel", root / "writer"
+    _jump_tree(k_base)
+    _jump_tree(w_base)
+    os.symlink(JUMPS[form].format(base=k_base), k_base / "store.env")
+    os.symlink(JUMPS[form].format(base=w_base), w_base / "store.env")
+    kernel_refused = _kernel_write(str(k_base / "store.env"))
+    try:
+        atomic_write(w_base / "store.env", DATA, confine_to=None)
+        writer_refused = False
+    except OSError:
+        writer_refused = True
+    assert writer_refused == kernel_refused, form
+    assert _tree(w_base) == _tree(k_base), form

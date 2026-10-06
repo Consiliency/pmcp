@@ -487,7 +487,12 @@ async def test_a_task_with_unusable_hints_is_recorded_and_reported_null(
         elif path == "get":
             await manager.get_task("tasks", "t1")
         else:
-            manager._record_task("tasks", McpTaskInfo(task_id="t1", status="working"))
+            manager._record_task(
+                "tasks",
+                McpTaskInfo(task_id="t1", status="working"),
+                requestor_context=None,
+                connection=None,
+            )
             await manager.cancel_task("tasks", "t1")
         returned = manager.get_task_record("tasks", "t1")
         assert returned is not None
@@ -512,12 +517,18 @@ async def test_eviction_orders_a_task_without_a_usable_timestamp_by_when_pmcp_sa
     record time, not as the oldest possible (`or 0.0`): an old task with a
     real timestamp is evicted first."""
     manager = ClientManager()
-    manager._max_terminal_tasks = 1
+    manager._tasks.per_server = 1
     manager._record_task(
-        "s", McpTaskInfo(task_id="old", status="completed", updated_at=1.0)
+        "s",
+        McpTaskInfo(task_id="old", status="completed", updated_at=1.0),
+        requestor_context=None,
+        connection=None,
     )
     manager._record_task(
-        "s", McpTaskInfo(task_id="new", status="completed", updated_at=float("nan"))
+        "s",
+        McpTaskInfo(task_id="new", status="completed", updated_at=float("nan")),
+        requestor_context=None,
+        connection=None,
     )
     assert [t.task_id for t in manager.get_tracked_tasks("s")] == ["new"]
 
@@ -527,15 +538,24 @@ def test_created_at_keeps_the_first_usable_value_pmcp_saw() -> None:
     usable one fills it, and the field is no longer named unusable."""
     manager = ClientManager()
     first = manager._record_task(
-        "s", McpTaskInfo(task_id="t", status="working", created_at=float("nan"))
+        "s",
+        McpTaskInfo(task_id="t", status="working", created_at=float("nan")),
+        requestor_context=None,
+        connection=None,
     )
     assert first.created_at is None and first.unusable_fields == ["created_at"]
     second = manager._record_task(
-        "s", McpTaskInfo(task_id="t", status="working", created_at=5.0)
+        "s",
+        McpTaskInfo(task_id="t", status="working", created_at=5.0),
+        requestor_context=None,
+        connection=None,
     )
     assert second.created_at == 5.0 and second.unusable_fields == []
     third = manager._record_task(
-        "s", McpTaskInfo(task_id="t", status="working", created_at=float("nan"))
+        "s",
+        McpTaskInfo(task_id="t", status="working", created_at=float("nan")),
+        requestor_context=None,
+        connection=None,
     )
     assert third.created_at == 5.0 and third.unusable_fields == []
 
@@ -543,23 +563,28 @@ def test_created_at_keeps_the_first_usable_value_pmcp_saw() -> None:
 def test_one_downstream_cannot_keep_its_tasks_by_claiming_a_future_timestamp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The terminal-task cap is shared by every server. A downstream that
-    claims `lastUpdatedAt: 1e300` must not make its records outlive another
-    server's newer ones: the eviction key is the earlier of the downstream's
-    time and pmcp's record time (rev 3, board round 2 R2-N2)."""
+    """Under the total cap (shared by every server, Consiliency/pmcp#338), a
+    downstream that claims `lastUpdatedAt: 1e300` must not make its records
+    outlive another server's newer ones: the eviction key is pmcp's record
+    order (rev 3, board round 2 R2-N2)."""
     clock = {"now": 100.0}
     monkeypatch.setattr("time.time", lambda: clock["now"])
     manager = ClientManager()
-    manager._max_terminal_tasks = 2
+    manager._tasks.total = 2
     for task_id in ("b1", "b2"):
         manager._record_task(
             "liar",
             McpTaskInfo(task_id=task_id, status="completed", updated_at=1e300),
+            requestor_context=None,
+            connection=None,
         )
         clock["now"] += 1
     clock["now"] = 200.0
     manager._record_task(
-        "honest", McpTaskInfo(task_id="a1", status="completed", updated_at=200.0)
+        "honest",
+        McpTaskInfo(task_id="a1", status="completed", updated_at=200.0),
+        requestor_context=None,
+        connection=None,
     )
     kept = {(t.server_name, t.task_id) for t in manager.get_tracked_tasks()}
     assert ("honest", "a1") in kept, kept
@@ -675,7 +700,9 @@ async def test_a_non_finite_downstream_hint_reaches_normalisation_on_every_trans
     info = manager._task_info_from_payload(task)
     assert info is not None
     assert info.unusable_fields == ["updated_at", "ttl", "poll_interval"]
-    record = manager._record_task("srv", info).model_dump()
+    record = manager._record_task(
+        "srv", info, requestor_context=None, connection=None
+    ).model_dump()
     assert record["ttl"] is None and record["updated_at"] is None, record
     assert record["unusable_fields"] == ["updated_at", "ttl", "poll_interval"]
 
@@ -895,7 +922,7 @@ def test_a_usable_timestamp_alias_wins_over_an_unusable_one(
     info = manager._task_info_from_payload({"taskId": "t", **payload})
     assert info is not None
     assert info.updated_at == 1764064800.0 and info.unusable_fields == []
-    record = manager._record_task("s", info)
+    record = manager._record_task("s", info, requestor_context=None, connection=None)
     assert record.updated_at == 1764064800.0 and record.unusable_fields == []
 
 
@@ -928,14 +955,19 @@ def test_an_honest_server_with_a_slow_clock_keeps_its_newer_records() -> None:
     ten minutes behind reports older `lastUpdatedAt`s, but its task was
     recorded after the other server's, so the other is evicted first."""
     manager = ClientManager()
-    manager._max_terminal_tasks = 1
+    manager._tasks.total = 1
     now = 1_000_000.0
     manager._record_task(
-        "on-time", McpTaskInfo(task_id="a", status="completed", updated_at=now)
+        "on-time",
+        McpTaskInfo(task_id="a", status="completed", updated_at=now),
+        requestor_context=None,
+        connection=None,
     )
     manager._record_task(
         "slow-clock",
         McpTaskInfo(task_id="b", status="completed", updated_at=now - 600 + 1),
+        requestor_context=None,
+        connection=None,
     )
     kept = {(t.server_name, t.task_id) for t in manager.get_tracked_tasks()}
     assert kept == {("slow-clock", "b")}, kept
@@ -945,10 +977,13 @@ def test_eviction_ignores_downstream_time_entirely() -> None:
     """Whatever the downstream claims -- far future, far past, or nothing --
     the record pmcp saw least recently goes first."""
     manager = ClientManager()
-    manager._max_terminal_tasks = 2
+    manager._tasks.per_server = 2
     for task_id, stamp in (("x", 1e300), ("y", 0.0), ("z", None)):
         manager._record_task(
-            "s", McpTaskInfo(task_id=task_id, status="completed", updated_at=stamp)
+            "s",
+            McpTaskInfo(task_id=task_id, status="completed", updated_at=stamp),
+            requestor_context=None,
+            connection=None,
         )
     assert {t.task_id for t in manager.get_tracked_tasks()} == {"y", "z"}
 
@@ -981,9 +1016,24 @@ def test_a_task_pmcp_saw_again_is_the_newest_for_eviction() -> None:
     """Re-recording a task (a `tasks_get` refresh) moves it to the back of the
     eviction order: least recently *seen by pmcp* goes first."""
     manager = ClientManager()
-    manager._max_terminal_tasks = 2
+    manager._tasks.per_server = 2
     for task_id in ("a", "b"):
-        manager._record_task("s", McpTaskInfo(task_id=task_id, status="completed"))
-    manager._record_task("s", McpTaskInfo(task_id="a", status="completed"))
-    manager._record_task("s", McpTaskInfo(task_id="c", status="completed"))
+        manager._record_task(
+            "s",
+            McpTaskInfo(task_id=task_id, status="completed"),
+            requestor_context=None,
+            connection=None,
+        )
+    manager._record_task(
+        "s",
+        McpTaskInfo(task_id="a", status="completed"),
+        requestor_context=None,
+        connection=None,
+    )
+    manager._record_task(
+        "s",
+        McpTaskInfo(task_id="c", status="completed"),
+        requestor_context=None,
+        connection=None,
+    )
     assert {t.task_id for t in manager.get_tracked_tasks()} == {"a", "c"}

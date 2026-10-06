@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import errno
+import io
 import os
 import re
 import stat
-import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from dotenv import dotenv_values
 
+from pmcp.atomic_write import atomic_write, make_store_dirs, read_confined
 from pmcp.config.loader import find_project_root
 
 ENV_VAR_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -27,13 +28,20 @@ def validate_env_var_name(name: str) -> str:
 def resolve_project_root(project: Path | None = None) -> Path:
     """Resolve project root for project-scope secrets."""
     if project:
-        return project.resolve()
+        # Never realpath, strict or not (strict collapses `file/..` on 3.12,
+        # non-strict `missing/..`): the root is kept as the operator spelled it,
+        # absolute, and the kernel resolves it at every use. A root that does
+        # not exist yet is created by make_store_dirs before a write -- only as
+        # a plain tail of new directories; `missing/../x`, `file/../x`, a loop
+        # or no permission is refused there, never treated as absent.
+        return project if project.is_absolute() else Path.cwd() / project
 
     discovered = find_project_root(Path.cwd())
     if discovered:
         return discovered
 
-    return Path.cwd().resolve()
+    # os.getcwd() is already the kernel's physical path; nothing to resolve.
+    return Path.cwd()
 
 
 def resolve_scope_path(scope: str, project: Path | None = None) -> Path:
@@ -46,11 +54,81 @@ def resolve_scope_path(scope: str, project: Path | None = None) -> Path:
 
 
 def read_env_file(path: Path) -> dict[str, str]:
-    """Read .env key/value pairs from path."""
-    if not path.exists():
-        return {}
+    """Read .env key/value pairs from path.
 
-    parsed = dotenv_values(path, interpolate=False)
+    An absent store, and one that is not a regular file (a fifo, a socket, a
+    device, a directory), read as empty -- the read never blocks
+    (:func:`read_env_text`). It still follows a symlink: Consiliency/pmcp#367
+    (stays open).
+    """
+    text = read_env_text(path)
+    if text is None:
+        return {}
+    return _env_values(dotenv_values(stream=io.StringIO(text), interpolate=False))
+
+
+def read_env_text(path: Path) -> str | None:
+    """The UTF-8 text of a dotenv file, or ``None`` if absent or not a regular file.
+
+    Never blocks: a repository can ship ``.env.pmcp`` as a fifo, and every
+    reader that opened it plainly -- the spawn-time ``managed_secret_keys``,
+    ``pmcp secrets check``, the gateway's credential-availability check -- froze
+    there. The entry is ``stat``-ed and must be a regular file, then opened
+    ``O_NONBLOCK`` and re-checked with ``fstat`` against a swap in between.
+    It follows a symlink (Consiliency/pmcp#367, stays open); the confined
+    readers in :mod:`pmcp.atomic_write` are the ones that do not.
+    """
+    # The kernel decides absence: only ENOENT/ENOTDIR is "no store"; ELOOP
+    # (too many links in one lookup), EACCES and the rest are raised, never
+    # read as an empty store that the next write would then replace.
+    try:
+        entry = os.stat(path)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None
+        raise
+    if not stat.S_ISREG(entry.st_mode):
+        return None
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            return None
+        return handle.read().decode("utf-8")
+
+
+def read_store_for_update(
+    scope: str, path: Path, verb: str = "write"
+) -> dict[str, str]:
+    """Read a credential store that the caller is about to rewrite.
+
+    The user store is the operator's and is read as :func:`read_env_file` reads
+    it. The project store is repository-controlled, so it is read through the
+    same confined walk its write takes (:func:`pmcp.atomic_write.read_confined`):
+    a symlinked store (or one below a symlinked directory) is refused BEFORE
+    anything is opened, with the write's value-free refusal, and a store that is
+    not a regular file (a fifo, a device) is refused instead of hanging the read.
+
+    This covers the commands that rewrite the store -- ``pmcp secrets set``,
+    ``pmcp secrets sync`` and ``gateway.auth_connect`` -- so they never read
+    through a link they would refuse to write; the startup load
+    (``cli._load_project_store_at_startup``) reads the same way. Other readers --
+    remote-header auth, the tenant store, the gateway's credential-availability
+    check, env stripping, the feedback gate's planted-key check and ``pmcp secrets
+    check``, inventoried in tests/test_env_store_reader_inventory.py -- still follow a link on read (Consiliency/pmcp#367, stays
+    open), though none of them blocks on a fifo any more (:func:`read_env_text`).
+    """
+    confine_to = scope_confinement(scope, path)
+    if confine_to is None:
+        return read_env_file(path)
+    data = read_confined(path, confine_to, verb=verb)
+    if data is None:
+        return {}
+    return _env_values(
+        dotenv_values(stream=io.StringIO(data.decode("utf-8")), interpolate=False)
+    )
+
+
+def _env_values(parsed: Mapping[str, str | None]) -> dict[str, str]:
     values: dict[str, str] = {}
     for key, value in parsed.items():
         if value is None:
@@ -130,7 +208,67 @@ def _format_env_value(value: str) -> str:
     return f'"{escaped}"'
 
 
-def write_env_file(path: Path, values: dict[str, str]) -> None:
+def scope_store_name(scope: str) -> str:
+    """The store's file name for ``scope``, without resolving any path."""
+    return {"user": "pmcp.env", "project": ".env.pmcp"}.get(scope, "pmcp.env")
+
+
+def scope_confinement(scope: str, store_path: Path) -> Path | None:
+    """The root a credential write to ``store_path`` must stay inside, or ``None``.
+
+    The project store ``<project>/.env.pmcp`` lives in a checkout, and a cloned
+    repository can ship it as a symlink to anywhere the user can write; its
+    writes are confined to the project root. The root is DERIVED from the store
+    path -- ``store_path.parent``, which is the root by construction of
+    :func:`resolve_scope_path` -- rather than resolved a second time, so the
+    path written and the root it is judged against can never disagree (a
+    second project-root discovery could land on an ancestor if a marker changed
+    in between). The user store ``~/.config/pmcp/pmcp.env`` is the operator's
+    own, so its links -- a dotfiles repository, typically -- are followed
+    wherever they point.
+    """
+    if scope == "project":
+        return store_path.parent
+    if scope == "user":
+        return None
+    raise ValueError(f"Unsupported secret scope: {scope}")
+
+
+def store_refusal(
+    store_path: Path, exc: OSError | ValueError, verb: str = "write"
+) -> str:
+    """The operator-facing, value-free report of a failed credential-store access.
+
+    The one conversion the entry points (``pmcp secrets set``/``sync``,
+    ``gateway.auth_connect``, the startup load) apply at their boundary, so a
+    store that cannot be read, parsed or written becomes an ``ok: false`` (or a
+    startup warning) instead of an uncaught traceback:
+
+    * an ``OSError`` -- a confinement refusal, ``EISDIR``, ``ENOTDIR``,
+      ``ELOOP``, ``EACCES``, ``ENOENT``, ``ENOSPC``;
+    * a ``UnicodeDecodeError`` -- a store that is not UTF-8 (reported without
+      the offending bytes);
+    * any other ``ValueError`` -- a value with a newline, an invalid key name.
+
+    It names only the store's file name: never a path or a link target, which
+    a repository may have chosen, and never a stored value. ``verb`` says what
+    was being done to THAT file ("write", "read" for a sync source, "load").
+    """
+    from pmcp.atomic_write import ConfinedWriteError, refusing
+
+    if isinstance(exc, ConfinedWriteError):
+        return str(exc)
+    if isinstance(exc, UnicodeDecodeError):
+        return f"{refusing(verb)} {store_path.name}: it is not valid UTF-8"
+    if isinstance(exc, ValueError):
+        return f"{refusing(verb)} {store_path.name}: {exc}"
+    reason = os.strerror(exc.errno) if exc.errno else "the write failed"
+    return f"{refusing(verb)} {store_path.name}: {reason}"
+
+
+def write_env_file(
+    path: Path, values: dict[str, str], *, confine_to: Path | None
+) -> None:
     """Write key/value pairs to a .env file atomically, at mode 0600.
 
     The write is atomic: the content is written to a temporary file in the same
@@ -139,8 +277,18 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
     signal -- leaves the existing file byte-intact rather than truncated, so an
     interrupted write can no longer lose the store's other entries
     (Consiliency/pmcp#248). ``os.replace`` is an atomic same-filesystem rename,
-    which is why the temporary shares ``path``'s directory; the directory entry
-    is ``fsync``-ed too so the rename itself survives a crash.
+    which is why the temporary shares the destination's directory; the
+    directory entry is ``fsync``-ed too so the rename itself survives a crash.
+
+    A symlinked store -- ``~/.config/pmcp/pmcp.env`` kept in a dotfiles
+    repository -- is written THROUGH: the replace lands on the link's target and
+    the link is left in place, as 2.7.3's plain write did. A dangling link
+    creates its target; a link loop is refused (:func:`pmcp.atomic_write.atomic_write`).
+
+    ``confine_to`` is required and comes from :func:`scope_confinement`: the
+    project root for the project store, which pmcp never reads or writes through
+    a symlink (one is refused with ``ConfinedWriteError``, never written through
+    and never replaced), and ``None`` for the user store.
     """
     _validate_env_values(values)
 
@@ -152,41 +300,24 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
     # Tighten only directories PMCP itself creates (e.g. ~/.config/pmcp for
     # user-scope secrets) to 0700. Never chmod a pre-existing directory such as
     # a project root, which for project-scope secrets is path.parent.
-    parent = path.parent
-    parent_created = not parent.exists()
-    parent.mkdir(parents=True, exist_ok=True)
-    if parent_created:
+    # Only the plain tail of directories that do not exist yet is created
+    # (make_store_dirs walks the path as the kernel would): `mkdir(parents=True)`
+    # on an unresolvable `missing/../x` would create `missing` and land on `x`.
+    for created in make_store_dirs(path.parent):
         try:
-            os.chmod(parent, 0o700)
+            os.chmod(created, 0o700)  # a umask that stripped owner bits
         except OSError:
             pass
 
-    # Write-then-rename so the destination is never observed truncated. mkstemp
-    # creates the temp 0600 in `parent`; the explicit fchmod keeps that guarantee
-    # if the mkstemp default ever changes. On ANY failure the destination is left
-    # untouched and the partial temp is removed.
-    tmp_fd, tmp_name = tempfile.mkstemp(prefix=".pmcp-env-", dir=parent)
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp_file:
-            os.fchmod(tmp_file.fileno(), 0o600)
-            tmp_file.write(content)
-            tmp_file.flush()
-            os.fsync(tmp_file.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-
-    # Best-effort: fsync the directory so the rename is durable across a crash.
-    try:
-        dir_fd = os.open(parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass
+    # Write-then-rename so the destination is never observed truncated, at 0600,
+    # through a symlinked store rather than over it (see pmcp.atomic_write).
+    atomic_write(
+        path,
+        content.encode("utf-8"),
+        confine_to=confine_to,
+        mode=0o600,
+        prefix=".pmcp-env-",
+    )
 
 
 # Env-var keys PMCP itself introduced into its OWN environment from a dotenv
@@ -454,7 +585,7 @@ def set_env_value(
         raise ValueError("Credential values must not contain newlines")
 
     path = resolve_scope_path(scope, project)
-    values = read_env_file(path)
+    values = read_store_for_update(scope, path)
     values[key] = value
-    write_env_file(path, values)
+    write_env_file(path, values, confine_to=scope_confinement(scope, path))
     return path

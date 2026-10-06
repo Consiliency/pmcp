@@ -185,9 +185,13 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   PMCP-owned fields or request metadata. Do not put bearer tokens, API keys,
   auth codes, user identifiers, or other secrets in trace baggage.
 - **MCP task records are transient**: task IDs are downstream server identifiers
-  held in gateway memory for visibility and cancellation. They are not durable
-  audit records and do not provide cross-user authorization isolation on
-  unauthenticated local transports.
+  held in gateway memory for visibility and cancellation. pmcp keeps at most
+  100 per server and 1000 in total. A server past its own cap gives up its own
+  records; only past the total does the server holding the most give one up.
+  A forced disconnect cancels only the tasks still tracked when it starts. A
+  remote server's task evicted before then keeps running after the
+  disconnect. They are not durable audit records and do not provide cross-user
+  authorization isolation on unauthenticated local transports.
 - **Two protocol eras are served on one endpoint, through the same policy
   gate**: the `MCP-Protocol-Version: 2026-07-28` header plus a `params._meta`
   envelope route a request to the modern era instead of the

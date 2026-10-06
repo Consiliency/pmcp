@@ -24,6 +24,7 @@ log is `~/.pmcp/logs/gateway.log`.
   [project files](#project-files-need-approval) ·
   [exported `PMCP_*` variables](#pmcp_manifest_path-pmcp_config-and-pmcp_policy-must-be-exported-in-your-shell) ·
   [`.env` keys](#spawned-servers-no-longer-inherit-the-keys-pmcp-loaded-from-env) ·
+  [symlinked `.env.pmcp`](#a-symlinked-project-envpmcp-is-refused) ·
   [discovered servers](#discovered-servers-are-default-deny) ·
   [`packages:` policy](#new-packages-policy-section) ·
   [feedback](#feedback-submission-is-off-by-default) ·
@@ -370,6 +371,58 @@ running gateway, which has not loaded `envcheck`, and nothing is written.
 A key you exported is in the list. A key that only `.env` sets is not.
 Afterwards, run `pmcp config set-startup-policy remove envcheck --source user --apply`,
 delete the `envcheck` entry and restart the gateway.
+
+### A symlinked project `.env.pmcp` is refused
+
+**Am I affected?** You are if a project's `.env.pmcp` is a symlink (to any
+target, inside the project or out of it), a fifo or a socket, and you either
+run `pmcp` (any command, the gateway included) from that project's directory
+or store project credentials with `pmcp secrets set`,
+`pmcp secrets sync --to-scope project` or `gateway.auth_connect` with
+`scope="project"`:
+
+```bash
+ls -l .env.pmcp
+```
+
+**What changed.** pmcp no longer follows a symlink in a project's credential
+store at all. These commands refuse a `.env.pmcp` that is a symlink, or that
+sits below a symlinked directory, before reading or writing it, and report
+`refusing to write .env.pmcp: it is a symlink`. 2.7.3 wrote your secrets
+wherever the link pointed, and in a cloned repository the repository chooses
+that target. Every `pmcp` command also loads `<cwd>/.env.pmcp` at startup; it
+now skips such a store, prints `pmcp: refusing to load .env.pmcp: it is a
+symlink` on stderr and carries on without those keys, where 2.7.3 loaded
+whatever the link pointed at. A `.env.pmcp` that is not a regular file is
+refused with `refusing to write .env.pmcp: it is not a regular file` (and
+skipped at startup) instead of hanging the command. Any other failure to read
+or write the store, including bytes that are not UTF-8 and a `--project` path
+the system cannot resolve, comes back as `"ok": false` instead of crashing the
+command; when `pmcp secrets sync` only reads the project store, the refusal
+says `refusing to read`. The user store `~/.config/pmcp/pmcp.env` still follows
+its link. Six other readers still follow a project link (Consiliency/pmcp#367):
+remote-header auth, the tenant store, the gateway's credential-availability
+check, env stripping, the feedback gate's planted-key check and
+`pmcp secrets check`. See [Known issues](#known-issues-in-300) for what each
+reads and what that exposes. None of them hangs on a fifo. These protections
+are about what a repository ships; a process already running as you that
+rewrites the store's directory while a command runs is out of scope.
+
+**What to do.** Keep credentials you link from elsewhere, such as a shared
+secrets file the gateway used to load, in your user store, then remove the
+project link:
+
+```bash
+pmcp secrets set FIRECRAWL_API_KEY --scope user
+```
+
+If you want a project store, make `.env.pmcp` a regular file. If you didn't
+create the link, the repository did: delete it and don't store project secrets
+there.
+
+**How to verify.** `pmcp secrets set <KEY> --scope project` stores the value
+and reports success, or the key shows up under `--scope user`. `ls -l
+.env.pmcp` shows a regular file, or nothing.
 
 ### Discovered servers are default-deny
 
@@ -1147,6 +1200,33 @@ SIGTERM no longer outlives a cancelled disconnect or a timed-out shutdown
 
   How to verify: `ls -l .mcp-gateway/descriptions.yaml` shows a fresh
   timestamp.
+- **Six readers still follow a project `.env.pmcp` that links out of the
+  project** ([Consiliency/pmcp#367](https://github.com/Consiliency/pmcp/issues/367)).
+  The commands that rewrite the store, and the startup load, refuse such a
+  link; these do not:
+  - remote-header auth: a `${VAR}` in a remote server's `headers` is resolved
+    from the user and project stores when the gateway resolves its startup
+    configs, connects a remote server or checks its auth, and by
+    `pmcp status` and `pmcp doctor`;
+  - the tenant store `.pmcp/tenants/<id>/pmcp.env`, resolved the same way per
+    tenant (no production caller passes a tenant yet; see the next item);
+  - the gateway's credential-availability check, which loads `<cwd>/.env`,
+    `<cwd>/.env.pmcp` and the user store into the gateway's own environment;
+  - env stripping, which reads the stores' key names at every server spawn;
+  - the feedback gate's planted-key check, which reads the same key names;
+  - `pmcp secrets check`.
+
+  So a repository can still link its `.env.pmcp` to another file of yours,
+  and through remote-header auth or the gateway's credential-availability
+  check that file's values can be sent as a header to a remote server the
+  repository configures. None of these readers hangs on a fifo. Until it is
+  fixed, check `ls -l .env.pmcp` in repositories you clone and delete a link
+  you didn't create.
+
+  Separately, the startup load of a plain `.env` finds that file by walking up
+  from where pmcp is installed. When pmcp is installed in a virtualenv inside
+  a checkout, that walk reaches the checkout's `.env` and follows its link
+  too.
 - **Tenant-aware header resolution for remote servers is not wired yet**
   ([Consiliency/pmcp#353](https://github.com/Consiliency/pmcp/issues/353)).
   pmcp never reads per-tenant credentials from `.pmcp/tenants/<id>/pmcp.env`,
@@ -1231,6 +1311,7 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
 | [Project files need approval](#project-files-need-approval) | Reverse: if you moved grants out of a project `.mcp-gateway-policy.yaml` into `~/.claude/gateway-policy.yaml`, 2.7.3 uses the project file *instead of* yours, so a deny-only project file allows everything else. Move the project file aside (`mv .mcp-gateway-policy.yaml .mcp-gateway-policy.yaml.3x`) and copy any of its denials you want into your own policy, or copy your full policy back into the project file.† Approvals in `trust.json` are ignored, and explicit `--config`/`--policy` paths work as before. |
 | [`PMCP_MANIFEST_PATH`, `PMCP_CONFIG` and `PMCP_POLICY` must be exported in your shell](#pmcp_manifest_path-pmcp_config-and-pmcp_policy-must-be-exported-in-your-shell) | Safe on 2.7.3: it honours an exported variable and the `--config`/`--policy` flags. |
 | [Spawned servers no longer inherit the keys pmcp loaded from `.env`](#spawned-servers-no-longer-inherit-the-keys-pmcp-loaded-from-env) | Safe on 2.7.3: shell exports are inherited, a server's `env` block in `~/.mcp.json` is passed as written,† and `pmcp secrets set` works the same. |
+| [A symlinked project `.env.pmcp` is refused](#a-symlinked-project-envpmcp-is-refused) | Safe on 2.7.3: a regular `.env.pmcp` and your user store work the same. 2.7.3 follows a symlinked `.env.pmcp` again, for writes and at startup, wherever it points, and hangs on a fifo `.env.pmcp`, so check `ls -l .env.pmcp` in repositories you clone. |
 | [Discovered servers are default-deny](#discovered-servers-are-default-deny) | Safe on 2.7.3: package approvals are ignored and discovered packages provision without one. A `packages.allowlist` must go, as for the next row. |
 | [New `packages:` policy section](#new-packages-policy-section) | Reverse: remove every `packages:` section (step 1 above), or 2.7.3 refuses to start.† |
 | [Feedback submission is off by default](#feedback-submission-is-off-by-default) | Reverse: 2.7.3 ignores `enable_feedback_submission`† and posts on `confirm_submission=true` through the first of these that works: `PMCP_FEEDBACK_TOKEN`, then `GITHUB_TOKEN` (each exported, or loaded from a `.env`, a checkout's `.env.pmcp` or `~/.config/pmcp/pmcp.env`), then a `gh` CLI on the gateway's `PATH` using its stored login.† It posts to `ViperJuice/pmcp`, the project's former name, which GitHub redirects to `Consiliency/pmcp`, unless `PMCP_FEEDBACK_REPO` names another.† To stop every channel, run `pmcp guidance --telemetry off` before you restart on 2.7.3; the call then refuses before it reads any token.† 3.0 honours the same setting. Otherwise unset `PMCP_FEEDBACK_TOKEN` and `GITHUB_TOKEN`, delete them from those files, and keep `gh` off the gateway's `PATH`.† `GH_TOKEN` alone posts nothing without `gh`.† |

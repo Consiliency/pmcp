@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import tempfile
 import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -16,6 +15,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
+
+from pmcp.atomic_write import atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -705,23 +706,21 @@ def load_registry_cache(cache_path: Path | None = None) -> RegistryCache | None:
 def save_registry_cache(cache: RegistryCache, cache_path: Path | None = None) -> None:
     """Save registry cache JSON atomically with owner-only (0600) permissions.
 
-    The payload is written to a temp file in the same directory then atomically
-    ``os.replace``d into place, so a crash mid-write cannot corrupt the cache.
+    The payload is written to a temp file beside the cache then atomically
+    ``os.replace``d into place, so a crash mid-write cannot corrupt the cache. A
+    symlinked cache file is written through to its target, not replaced
+    (``pmcp.atomic_write``).
     """
     path = _cache_path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(asdict(cache), indent=2, sort_keys=True) + "\n"
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    # confine_to=None: $XDG_CACHE_HOME or ~/.cache, or a path the library
+    # caller passed explicitly -- never derived from a checkout.
+    atomic_write(
+        path,
+        payload.encode("utf-8"),
+        confine_to=None,
+        mode=0o600,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
     )
-    try:
-        os.chmod(tmp_name, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise

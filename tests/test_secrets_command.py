@@ -91,7 +91,7 @@ class TestSecretsHandlers:
             **kwargs: object,
         ) -> int:
             opened.append((Path(path), flags, mode))
-            return real_open(path, flags, mode)
+            return real_open(path, flags, mode, *args, **kwargs)
 
         def replace_spy(
             src: os.PathLike[str] | str,
@@ -99,13 +99,20 @@ class TestSecretsHandlers:
             *args: object,
             **kwargs: object,
         ) -> None:
-            replaced.append(Path(dst))
-            real_replace(src, dst)
+            # The rename is relative to the walk's directory descriptor now
+            # (dst_dir_fd), so record the directory it lands in, too.
+            dst_dir_fd = kwargs.get("dst_dir_fd")
+            if isinstance(dst_dir_fd, int):
+                assert os.path.samestat(os.fstat(dst_dir_fd), os.stat(tmp_path))
+                replaced.append(tmp_path / Path(dst))
+            else:
+                replaced.append(Path(dst))
+            real_replace(src, dst, *args, **kwargs)
 
         monkeypatch.setattr("pmcp.env_store.os.open", open_spy)
         monkeypatch.setattr("pmcp.env_store.os.replace", replace_spy)
 
-        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"})
+        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"}, confine_to=None)
 
         # Committed by renaming a temp onto the destination -- not truncated in place.
         assert replaced == [env_path]
@@ -138,24 +145,31 @@ class TestSecretsHandlers:
         """set rejects invalid keys and multiline credentials before writes."""
         env_path = tmp_path / ".env.pmcp"
 
-        with pytest.raises(ValueError):
-            await run_secrets_set(
-                argparse.Namespace(
-                    scope="project",
-                    key="GOOD=bad",
-                    value="secret",
-                    project=tmp_path,
-                )
+        # Reported as `ok: false` (round-4 N3), never raised and never written.
+        bad_key = await run_secrets_set(
+            argparse.Namespace(
+                scope="project",
+                key="GOOD=bad",
+                value="secret",
+                project=tmp_path,
             )
-        with pytest.raises(ValueError):
-            await run_secrets_set(
-                argparse.Namespace(
-                    scope="project",
-                    key="OPENAI_API_KEY",
-                    value="first\nINJECTED=second",
-                    project=tmp_path,
-                )
+        )
+        assert bad_key["ok"] is False
+        assert str(bad_key["error"]).startswith("refusing to write .env.pmcp: ")
+        multiline = await run_secrets_set(
+            argparse.Namespace(
+                scope="project",
+                key="OPENAI_API_KEY",
+                value="first\nINJECTED=second",
+                project=tmp_path,
             )
+        )
+        assert multiline["ok"] is False
+        assert multiline["error"] == (
+            "refusing to write .env.pmcp: Credential values must not contain newlines"
+        )
+        assert "secret" not in str(bad_key["error"])
+        assert "INJECTED" not in str(multiline["error"])
 
         assert not env_path.exists()
 
@@ -214,9 +228,12 @@ class TestSecretsHandlers:
                 overwrite=True,
                 project=project,
             )
-            with pytest.raises(ValueError):
-                await run_secrets_sync(args)
+            output = await run_secrets_sync(args)
 
+        assert output["ok"] is False
+        assert output["error"] == (
+            "refusing to write .env.pmcp: Credential values must not contain newlines"
+        )
         assert project_env.read_text() == "LOCAL=ok\n"
 
     @pytest.mark.asyncio
@@ -241,9 +258,10 @@ class TestSecretsHandlers:
                 overwrite=True,
                 project=project,
             )
-            with pytest.raises(ValueError):
-                await run_secrets_sync(args)
+            output = await run_secrets_sync(args)
 
+        assert output["ok"] is False
+        assert str(output["error"]).startswith("refusing to write .env.pmcp: ")
         assert project_env.read_text() == "BAD-NAME=local\n"
 
     @pytest.mark.asyncio
@@ -468,7 +486,7 @@ class TestSecretDirectoryPermissions:
         secret_dir = tmp_path / ".config" / "pmcp"
         env_path = secret_dir / "pmcp.env"
 
-        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"})
+        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"}, confine_to=None)
 
         assert stat.S_IMODE(secret_dir.stat().st_mode) == 0o700
         assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
@@ -480,7 +498,7 @@ class TestSecretDirectoryPermissions:
         os.chmod(tmp_path, 0o755)
         env_path = tmp_path / ".env.pmcp"
 
-        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"})
+        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"}, confine_to=None)
 
         assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o755
         assert stat.S_IMODE(env_path.stat().st_mode) == 0o600

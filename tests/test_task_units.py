@@ -246,7 +246,12 @@ async def test_every_inbound_path_reports_seconds(poll_key: str) -> None:
     _assert_seconds(result.task)
     _assert_seconds(recorded())
 
-    manager._record_task(SERVER, McpTaskInfo(task_id="t1", status="working"))
+    manager._record_task(
+        SERVER,
+        McpTaskInfo(task_id="t1", status="working"),
+        requestor_context=None,
+        connection=None,
+    )
     cancelled = await gateway.tasks_cancel({"server_name": SERVER, "task_id": "t1"})
     assert cancelled.ok
     _assert_seconds(cancelled.task)
@@ -296,6 +301,16 @@ def _spec_reply(shape: str, status: str) -> dict[str, Any]:
 
 
 # (manager operation, gateway tool, {method: reply shape}, expected durations)
+#: The `ClientManager` method that parses a reply into a task, and the public
+#: operation (a `REPLY_PATHS` row) that reaches it (Consiliency/pmcp#338).
+PARSER_OPERATION = {
+    "call_tool_with_task": "call_tool",
+    "_fetch_task": "get_task",
+    "list_tasks": "list_tasks",
+    "get_task_result_with_task": "get_task_result",
+    "_send_task_cancel": "cancel_task",
+}
+
 REPLY_PATHS: list[tuple[str, str, dict[str, str], tuple[Any, Any]]] = [
     ("call_tool", "invoke", {"tools/call": "create"}, (300.0, 2.5)),
     # the task at the top level of the reply, which call_tool also accepts
@@ -344,7 +359,12 @@ async def test_every_reply_path_reports_and_records_seconds(
 
     manager._send_request = downstream  # type: ignore[method-assign]
     if operation != "call_tool":
-        manager._record_task(SERVER, McpTaskInfo(task_id="t1", status="working"))
+        manager._record_task(
+            SERVER,
+            McpTaskInfo(task_id="t1", status="working"),
+            requestor_context=None,
+            connection=None,
+        )
     gateway = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
     args: dict[str, Any] = (
         {"tool_id": TOOL_ID, "task": {"ttl": 300}}
@@ -377,7 +397,11 @@ def test_the_reply_path_table_covers_every_task_operation() -> None:
         and name != "_task_info_from_payload"
         and any(_called(n) == "_task_info_from_payload" for n in ast.walk(func))
     }
-    assert parsers == {op for op, _, _, _ in REPLY_PATHS}, parsers
+    # Consiliency/pmcp#338 moved each parse into the helper the public
+    # operation goes through; every parser is mapped to the operation the
+    # rows drive, and the map is compared whole
+    assert parsers == set(PARSER_OPERATION), parsers
+    assert set(PARSER_OPERATION.values()) == {op for op, _, _, _ in REPLY_PATHS}
     no_task_rows = {op for op, _, sh, _ in REPLY_PATHS if "no-task" in sh.values()}
     assert no_task_rows == {"get_task_result", "cancel_task"}
     # get_task's no-task branch raises: test_a_get_reply_without_a_task_reports_no_task
@@ -401,7 +425,12 @@ async def test_a_result_reply_without_a_task_never_records_wire_durations() -> N
         return {"content": [], "ttl": 300_000, "pollInterval": 2500}
 
     manager._send_request = reply  # type: ignore[method-assign]
-    manager._record_task(SERVER, McpTaskInfo(task_id="t1", status="working"))
+    manager._record_task(
+        SERVER,
+        McpTaskInfo(task_id="t1", status="working"),
+        requestor_context=None,
+        connection=None,
+    )
     await manager.get_task_result(SERVER, "t1")
     record = manager.get_task_record(SERVER, "t1")
     assert record is not None
@@ -440,7 +469,12 @@ async def test_a_call_not_run_as_a_task_never_reports_a_task() -> None:
     decides: a plain tool result that happens to carry `taskId` stays a result,
     even when an earlier task call left a record under that id."""
     manager = _manager()
-    manager._record_task(SERVER, McpTaskInfo(task_id="t1", status="working"))
+    manager._record_task(
+        SERVER,
+        McpTaskInfo(task_id="t1", status="working"),
+        requestor_context=None,
+        connection=None,
+    )
 
     async def reply(managed: Any, method: str, params: dict[str, Any], **_: Any) -> Any:
         assert "task" not in params
@@ -514,7 +548,12 @@ async def test_invoke_reports_a_task_exactly_when_the_manager_ran_one(
     )
     # A record under the reply's task id already exists, so a gate that looks
     # at a synchronous reply would find something to (wrongly) report.
-    manager._record_task(SERVER, McpTaskInfo(task_id="t1", status="working"))
+    manager._record_task(
+        SERVER,
+        McpTaskInfo(task_id="t1", status="working"),
+        requestor_context=None,
+        connection=None,
+    )
     sent: list[dict[str, Any]] = []
 
     async def downstream(
@@ -797,7 +836,7 @@ def test_seconds_survive_every_revalidation_unchanged() -> None:
         {"taskId": "t", "ttl": 1500, "pollInterval": 250}
     )
     assert info is not None and (info.ttl, info.poll_interval) == (1.5, 0.25)
-    record = manager._record_task("s", info)
+    record = manager._record_task("s", info, requestor_context=None, connection=None)
     again = McpTaskInfo(
         **{
             k: v
@@ -963,7 +1002,9 @@ TASK_MODEL_CONSTRUCTIONS: dict[tuple[str, str, str, str], tuple[str, str]] = {
         "poll_interval=task_info.poll_interval; raw=task_info.raw; ttl=task_info.ttl",
         "copies a parsed McpTaskInfo (seconds)",
     ),
-    ("client/manager.py", "cancel_task", "McpTaskInfo", "call"): (
+    # `_send_task_cancel`: the one sender `cancel_task` and the forced
+    # teardowns share (Consiliency/pmcp#338)
+    ("client/manager.py", "_send_task_cancel", "McpTaskInfo", "call"): (
         "raw=result",
         "no duration: task_id, status, updated_at; `raw` is verbatim by design",
     ),
@@ -1117,7 +1158,12 @@ async def test_the_cancel_fallback_never_reports_a_wire_duration_as_seconds() ->
         return {"ttl": 300_000, "pollInterval": 2500}  # no taskId: the fallback
 
     manager._send_request = reply  # type: ignore[method-assign]
-    manager._record_task(SERVER, McpTaskInfo(task_id="t1", status="working"))
+    manager._record_task(
+        SERVER,
+        McpTaskInfo(task_id="t1", status="working"),
+        requestor_context=None,
+        connection=None,
+    )
     ok, task, _ = await manager.cancel_task(SERVER, "t1")
     assert ok and task is not None
     assert task.ttl in (None, 300.0) and task.poll_interval in (None, 2.5), task
