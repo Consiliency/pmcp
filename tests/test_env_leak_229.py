@@ -44,7 +44,7 @@ from pmcp.env_store import (
 )
 from pmcp.tools.handlers import GatewayTools
 
-PREFIX = "PMCP_TEST_229_"
+PREFIX = "TEST_PMCP229_"
 SENTINEL = f"{PREFIX}SENTINEL"
 OWN_KEY = f"{PREFIX}OWN_KEY"
 OTHER_KEY = f"{PREFIX}OTHER_KEY"

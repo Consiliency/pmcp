@@ -1922,7 +1922,7 @@ class TestServerLifecycleTools:
                     command="auth-cmd",
                     args=[],
                     requires_api_key=True,
-                    env_var="PMCP_TEST_KEY",
+                    env_var="SOAK_TEST_KEY",
                 ),
             },
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
@@ -1990,7 +1990,7 @@ class TestServerLifecycleTools:
     async def test_connect_server_reports_unknown_policy_and_missing_auth(
         self, gateway_tools: GatewayTools, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv("PMCP_TEST_KEY", raising=False)
+        monkeypatch.delenv("SOAK_TEST_KEY", raising=False)
 
         unknown = await gateway_tools.connect_server({"server_name": "unknown"})
         denied = await gateway_tools.connect_server({"server_name": "denied"})
@@ -2001,7 +2001,7 @@ class TestServerLifecycleTools:
         assert denied.ok is False
         assert "blocked by policy" in denied.message
         assert missing_auth.ok is False
-        assert "PMCP_TEST_KEY" in (missing_auth.errors or [""])[0]
+        assert "SOAK_TEST_KEY" in (missing_auth.errors or [""])[0]
 
     @pytest.mark.asyncio
     async def test_connect_server_reports_missing_remote_header_auth(
@@ -2646,7 +2646,7 @@ class TestHealth:
         # This test is about config_status/startup-policy conformance, not about
         # project-source trust, so record the approval and keep testing that.
         approve_project_file(config_path)
-        monkeypatch.delenv("PMCP_TEST_KEY", raising=False)
+        monkeypatch.delenv("SOAK_TEST_KEY", raising=False)
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_manifest",
             lambda: Manifest(
@@ -2661,7 +2661,7 @@ class TestHealth:
                         command="needs-key-cmd",
                         args=[],
                         requires_api_key=True,
-                        env_var="PMCP_TEST_KEY",
+                        env_var="SOAK_TEST_KEY",
                     )
                 },
                 discovery_queue_path=".mcp-gateway/discovery_queue.json",
@@ -2887,7 +2887,7 @@ class TestHealth:
                     startup_policy="skipped",
                     startup_source="manifest",
                     startup_skip_reason="missing_auth",
-                    startup_env_var="PMCP_TEST_KEY",
+                    startup_env_var="SOAK_TEST_KEY",
                 ),
             }
         )
@@ -2899,7 +2899,7 @@ class TestHealth:
         assert by_name["unknown"].startup_skip_reason == "unknown_auto_start"
         assert by_name["denied"].startup_skip_reason == "policy_denied"
         assert by_name["needs-key"].startup_skip_reason == "missing_auth"
-        assert by_name["needs-key"].startup_env_var == "PMCP_TEST_KEY"
+        assert by_name["needs-key"].startup_env_var == "SOAK_TEST_KEY"
 
     @pytest.mark.asyncio
     async def test_health_includes_remote_header_missing_vars(
@@ -3793,7 +3793,7 @@ class TestCapabilityAndProvision:
                     command="needs-key-cmd",
                     args=[],
                     requires_api_key=True,
-                    env_var="PMCP_TEST_KEY",
+                    env_var="SOAK_TEST_KEY",
                 )
             },
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
@@ -3810,7 +3810,7 @@ class TestCapabilityAndProvision:
         )
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.chdir(project)
-        monkeypatch.delenv("PMCP_TEST_KEY", raising=False)
+        monkeypatch.delenv("SOAK_TEST_KEY", raising=False)
         monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
         gateway_tools = GatewayTools(
             client_manager=MockClientManager(),  # type: ignore
@@ -3836,10 +3836,10 @@ class TestCapabilityAndProvision:
         )
 
         assert missing.auth_state == "missing_auth"
-        assert missing.missing_env_vars == ["PMCP_TEST_KEY"]
+        assert missing.missing_env_vars == ["SOAK_TEST_KEY"]
         assert connected.ok is True
         assert connected.env_path == str(project / ".env.pmcp")
-        assert read_env_file(project / ".env.pmcp")["PMCP_TEST_KEY"] == credential
+        assert read_env_file(project / ".env.pmcp")["SOAK_TEST_KEY"] == credential
         assert retry.ok is True
         assert retry.status == "started"
         assert retry.job_id == "job-auth-soak"

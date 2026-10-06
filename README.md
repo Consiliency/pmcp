@@ -1600,7 +1600,7 @@ repository's, and your user store loads into pmcp's environment at every start
 is credential-shaped (`*_TOKEN`, `*_KEY`, `*_SECRET(S)`, `*_PASSWORD`,
 `*_CREDENTIAL(S)`, `*_PAT`, `*_DSN`, `*_AUTH`) or a server in the manifest
 declares it as its credential (`POSTGRES_URL`, say). Everything else --
-`UV_INDEX_URL`, `PIP_CONFIG_FILE`, `DATABASE_URL`, pmcp's own variables, proxies,
+`UV_INDEX_URL`, `PIP_CONFIG_FILE`, `DATABASE_URL`, anything named `PMCP_*`, proxies,
 `LD_*`/`NODE_*`/`NPM_CONFIG_*` and the like, even when credential-shaped -- is
 skipped, as is any value containing `${` or spanning more than one line. Each
 skipped name prints one `pmcp: Not copying <NAME> from .env.pmcp: ...` line and

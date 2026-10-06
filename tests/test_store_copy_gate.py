@@ -443,3 +443,48 @@ def test_a_synced_project_cannot_steer_the_next_upgrade(lay: dict[str, Path]) ->
     seen = json.loads(proc.stdout.strip().splitlines()[-1])
     assert seen == {**dict.fromkeys(UPGRADE_STEERING), "BRAVE_API_KEY": "legit"}
     assert "evil.invalid" not in proc.stdout + proc.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Round 7 N-1: the whole PMCP_ namespace, in any case, classified or not.
+# --------------------------------------------------------------------------- #
+
+UNCLASSIFIED_PMCP = ["PMCP_NEW_TOKEN", "pmcp_future_api_key", "Pmcp_Something_Secret"]
+
+
+@pytest.mark.parametrize("name", UNCLASSIFIED_PMCP)
+def test_an_unclassified_pmcp_name_is_never_taken_from_a_repository(
+    name: str, lay: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.validation import is_credential_shaped
+
+    assert not env_store.is_pmcp_environment_name(name)  # not classified (yet)
+    assert is_credential_shaped(name.upper()) or name != name.upper()
+    assert not env_store.repository_may_supply(name)
+    # Never copied ...
+    copied, refused = env_store.copyable_from_repository(
+        {name: "x"}, ".env.pmcp", declared={name}
+    )
+    assert copied == {} and refused == [name]
+    # ... never answered from a repository source ...
+    monkeypatch.delenv(name, raising=False)
+    assert env_store.credential_value(name, repository={name: "x"}) is None
+    # ... and never accepted by auth_connect.
+    gateway = _gateway()
+    write_secret = MagicMock()
+    gateway._write_secret = write_secret  # type: ignore[method-assign]
+    out = asyncio.run(
+        gateway.auth_connect(
+            {"server_name": "whatever", "credential": "x", "env_var": name}
+        )
+    )
+    assert out.ok is False
+    write_secret.assert_not_called()
+
+
+def test_an_operator_exported_pmcp_name_still_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prefix rule is about repository sources only."""
+    monkeypatch.setenv("PMCP_NEW_TOKEN", "operator")
+    assert env_store.credential_value("PMCP_NEW_TOKEN", repository={}) == "operator"

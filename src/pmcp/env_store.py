@@ -468,7 +468,8 @@ def repository_may_supply(name: str) -> bool:
     No for anything that decides what pmcp, or a program it starts, loads,
     trusts or connects to: a variable pmcp reads from its own environment
     (:func:`is_pmcp_environment_name`: the classified names in any case, any
-    ``*_proxy``), a code-loading variable (``validation.is_dangerous_env_var``:
+    ``*_proxy``), any name in the ``PMCP_`` namespace (any case, classified or
+    not), a code-loading variable (``validation.is_dangerous_env_var``:
     ``LD_*``, ``DYLD_*``, ``PYTHON*``, ``NODE_OPTIONS``, ``PATH`` ...), and a
     package-manager or runtime family (``validation.is_package_manager_env_var``:
     ``NPM_CONFIG_*``, ``NODE_*``, ``COREPACK_*`` ...). Everything else is a
@@ -485,6 +486,10 @@ def repository_may_supply(name: str) -> bool:
 
     return not (
         is_pmcp_environment_name(name)
+        # The whole PMCP_ prefix, in any case: a variable pmcp starts reading
+        # later is refused before anyone classifies it (Consiliency/pmcp#372
+        # round 7, N-1).
+        or name.upper().startswith("PMCP_")
         or is_dangerous_env_var(name)
         or is_package_manager_env_var(name)
     )

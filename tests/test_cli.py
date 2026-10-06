@@ -579,7 +579,7 @@ class TestRunStatus:
                     "startup_policy": "skipped",
                     "startup_source": "manifest",
                     "startup_skip_reason": "missing_auth",
-                    "startup_env_var": "PMCP_TEST_KEY",
+                    "startup_env_var": "SOAK_TEST_KEY",
                     "auth_state": "missing_auth",
                     "auth_event": "missing_credential",
                     "next_step": "gateway.auth_connect(server_name='needs-key')",

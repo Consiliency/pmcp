@@ -484,7 +484,7 @@ override it. A variable your shell exports as empty stays unavailable.
 credentials only: a credential-shaped name (`*_TOKEN`, `*_KEY`, `*_SECRET`,
 `*_PASSWORD` and the like) or one a manifest server declares as its
 credential (`POSTGRES_URL`). Any other name -- `UV_INDEX_URL`, `DATABASE_URL`,
-pmcp's own variables, proxies, code-loading and package-manager names -- and
+anything named `PMCP_*`, proxies, code-loading and package-manager names -- and
 any value containing `${` or spanning lines is skipped with
 `pmcp: Not copying <NAME> from .env.pmcp: ...` and listed under `"refused"`;
 the rest still sync. If you meant one, set it yourself:

@@ -59,7 +59,7 @@ from pmcp.env_store import (
     reset_pmcp_introduced_keys,
 )
 
-PREFIX = "PMCP_TEST_SL3_"
+PREFIX = "TEST_PMCPSL3_"
 STORE_KEY = f"{PREFIX}USER_STORE"
 PROJECT_KEY = f"{PREFIX}PROJECT_STORE"
 DOTENV_KEY = f"{PREFIX}PLAIN_DOTENV"

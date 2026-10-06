@@ -75,7 +75,7 @@ to do, how to verify it, and how to roll back to 2.7.3.
   ancestor of your home directory) still loads as before. `pmcp secrets sync
   --from-scope project --to-scope user` copies credentials only -- a credential-shaped
   name or one a manifest server declares (`POSTGRES_URL`) -- and skips every other
-  name (`UV_INDEX_URL`, `DATABASE_URL`, pmcp's own variables, proxies, code-loading and
+  name (`UV_INDEX_URL`, `DATABASE_URL`, anything named `PMCP_*`, proxies, code-loading and
   package-manager names) and any value containing `${` or spanning lines, with `pmcp:
   Not copying <NAME> from .env.pmcp: …`, where 2.7.3 copied every key into the store
   pmcp loads into its environment at each start; `gateway.auth_connect` refuses the

@@ -395,7 +395,7 @@ async def test_auth_soak_local_api_key_provision_connect_retry_smoke(
                 command="needs-key",
                 args=[],
                 requires_api_key=True,
-                env_var="PMCP_TEST_KEY",
+                env_var="SOAK_TEST_KEY",
             )
         },
         discovery_queue_path=".mcp-gateway/discovery_queue.json",
@@ -407,7 +407,7 @@ async def test_auth_soak_local_api_key_provision_connect_retry_smoke(
 
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.chdir(project)
-    monkeypatch.delenv("PMCP_TEST_KEY", raising=False)
+    monkeypatch.delenv("SOAK_TEST_KEY", raising=False)
     monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
     monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
     monkeypatch.setattr("pmcp.tools.handlers.get_job_manager", lambda: FakeJobManager())
@@ -437,7 +437,7 @@ async def test_auth_soak_local_api_key_provision_connect_retry_smoke(
 
     assert missing.auth_state == "missing_auth"
     assert connected.ok is True
-    assert read_env_file(project / ".env.pmcp") == {"PMCP_TEST_KEY": credential}
+    assert read_env_file(project / ".env.pmcp") == {"SOAK_TEST_KEY": credential}
     assert retry.ok is True
     assert retry.job_id == "job-auth-soak"
     assert health.audit_events is not None
