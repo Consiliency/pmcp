@@ -66,7 +66,9 @@ to do, how to verify it, and how to roll back to 2.7.3.
   is expanded only from keys defined earlier in the same file: `LEAK=${GITHUB_TOKEN}`,
   which 2.7.3 filled from your environment, is ignored with `pmcp: Ignoring LEAK in
   .env.pmcp: its value refers to a variable the file does not define, …`. Your shell
-  and `~/.config/pmcp/pmcp.env` now win over a project file for every lookup (a tenant
+  and `~/.config/pmcp/pmcp.env` now win over a project file for every lookup, and every
+  reader -- runtime and diagnostics alike -- reads the same values loaded once at startup,
+  a checkout `.env` the startup walk found before `.env.pmcp` (a tenant
   lookup checks the tenant store before the project store), where in 2.7.3 a checkout's
   `.env` won over the user store and `pmcp secrets check` preferred a project
   `.env.pmcp` (a per-project override of a user-store key, such as a tenant id, does not

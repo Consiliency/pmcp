@@ -595,7 +595,6 @@ def credential_value(
     key: str,
     *,
     environ: bool = True,
-    operator: Mapping[str, str] | None = None,
     repository: Mapping[str, str] | None = None,
     startup_files: bool = True,
 ) -> str | None:
@@ -603,16 +602,17 @@ def credential_value(
 
     Every lookup that resolves a name in ``src/pmcp`` -- a server's declared
     credential, a remote ``${VAR}`` header (project and tenant), the
-    availability checks, ``pmcp secrets check`` -- calls this, and nothing else
-    reads the credential map or a store's values
-    (``tests/test_store_reader_inventory.py``). Sources, in order:
+    availability checks, ``pmcp secrets check`` -- calls this (directly, or
+    through :func:`credential_lookup`), and nothing else reads the credential
+    map or a store's values (``tests/test_store_reader_inventory.py``).
+    Sources, in order:
 
-    1. the process environment (``environ``) -- the shell, the user store
-       loaded at startup;
-    2. ``operator`` -- the user store's values, read by the caller;
-    3. ``repository`` -- a project or tenant store's values, read by the caller
-       through :func:`repository_values`;
-    4. the credentials repository files supplied at startup (``startup_files``).
+    1. the process environment (``environ``) -- the shell, then the user store,
+       which the startup load puts there with ``override=False``;
+    2. ``repository`` -- a TENANT store's values (``remote_auth``), the one
+       layer between the user store and the project credentials;
+    3. the ONE map of repository credentials (``startup_files``): the
+       discovered checkout ``.env``, then ``.env.pmcp``, first loaded wins.
 
     Precedence is decided by MEMBERSHIP, not truthiness: the first source that
     HAS the name decides, and an empty value there means "unavailable" -- an
@@ -624,8 +624,6 @@ def credential_value(
     if environ and key in os.environ:
         return os.environ[key] or None
     repository_may_answer = repository_may_supply(key)
-    if operator is not None and key in operator:
-        return operator[key] or None
     if repository_may_answer and repository is not None and key in repository:
         return repository[key] or None
     if repository_may_answer and startup_files and key in _REPO_CREDENTIALS:
@@ -633,24 +631,60 @@ def credential_value(
     return None
 
 
-def credential_lookup(project: Path | None = None) -> Callable[[str], str | None]:
-    """The credential lookup a running pmcp uses, for diagnostics to share.
+#: Has this process run the startup load (``cli.load_startup_env``)? Set by it;
+#: a diagnostic in a process that never ran it runs it first, so every reader
+#: sees the same map. Test-only reset: :func:`reset_startup_load`.
+_STARTUP_LOADED = False
 
-    :func:`credential_value` with the user store and the project store at
-    ``project`` read directly, so the answer is the runtime's whether or not this
-    process ran the startup load: a remote ``${VAR}`` header
-    (``remote_auth.build_remote_header_env_lookup``), ``pmcp doctor`` and ``pmcp
-    secrets check`` all call this, and ``tests/test_credential_parity.py`` checks
-    their verdicts against the runtime gates' on every combination of shell,
-    user store and project store (Consiliency/pmcp#372 round 5).
+
+def mark_startup_loaded() -> None:
+    """Record that ``cli.load_startup_env`` built the credential map."""
+    global _STARTUP_LOADED
+    _STARTUP_LOADED = True
+
+
+def reset_startup_load() -> None:
+    """Forget that the startup load ran. **Test-only seam.**"""
+    global _STARTUP_LOADED
+    _STARTUP_LOADED = False
+
+
+def ensure_startup_load() -> None:
+    """Build the credential map the way a ``pmcp`` process does, once.
+
+    The runtime reads repository credentials from ONE map, built by the startup
+    load (the discovered ``.env``, the user store into the environment, the
+    working directory's ``.env.pmcp``) and extended by the same loader
+    (:func:`load_store`) whenever another store is consulted. A diagnostic that
+    runs in a process which never ran the startup load runs it here rather than
+    reading the stores itself, so it cannot merge them in a different order
+    (Consiliency/pmcp#372 round 7).
     """
-    user_values = read_store("user")
-    project_values = repository_values("project", project=project)
+    if _STARTUP_LOADED:
+        return
+    from pmcp.cli import load_startup_env
 
-    def lookup(key: str) -> str | None:
-        return credential_value(key, operator=user_values, repository=project_values)
+    load_startup_env()
 
-    return lookup
+
+def credential_lookup(project: Path | None = None) -> Callable[[str], str | None]:
+    """The one credential lookup: runtime and diagnostics read the same map.
+
+    The startup load first (:func:`ensure_startup_load`), then -- for a project
+    root that is not the one startup loaded -- that project's ``.env.pmcp``
+    merged into the SAME map by the SAME loader (:func:`load_store`; a key the
+    map already has keeps its value). The answer is then
+    :func:`credential_value` with its defaults -- exactly what the provision
+    gate, the install child and the gateway's credential check read. Remote
+    ``${VAR}`` headers, ``pmcp doctor`` and ``pmcp secrets check`` call this;
+    ``tests/test_credential_parity.py`` checks their verdicts against the
+    runtime's for every combination of shell, user store, checkout ``.env`` and
+    ``.env.pmcp`` (Consiliency/pmcp#372 rounds 5-7).
+    """
+    ensure_startup_load()
+    if project is not None:
+        load_store("project", project=project, verb="read")
+    return credential_value
 
 
 def describe_ignored_store_env_var(variable: str, store_name: str) -> str:

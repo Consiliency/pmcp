@@ -37,25 +37,39 @@ from pmcp.tools.handlers import GatewayTools
 KEY = "BRAVE_API_KEY"
 SHELL = ("set", "empty", "absent")
 USER = ("set", "empty", "absent")
-PROJECT = ("set", "absent")
-GRID = list(itertools.product(SHELL, USER, PROJECT))
+CHECKOUT_ENV = ("set", "empty", "absent")
+PROJECT = ("set", "empty", "absent")
+GRID = list(itertools.product(SHELL, USER, CHECKOUT_ENV, PROJECT))
+VALUES = {
+    "shell": "from-shell",
+    "user": "from-user",
+    "dotenv": "from-dotenv",
+    "project": "from-project",
+}
 
 
-def _expected(shell: str, user: str, project: str) -> bool:
-    """The documented order, by presence: shell, user store, project store."""
-    if shell != "absent":
-        return shell == "set"
-    if user != "absent":
-        return user == "set"
-    return project == "set"
+def _winner(shell: str, user: str, dotenv: str, project: str) -> str | None:
+    """The documented order, by presence: shell, user store, the checkout
+    ``.env`` the startup walk found, then ``.env.pmcp``. An empty value at the
+    first source that has the name is "unavailable"."""
+    for source, state in (
+        ("shell", shell),
+        ("user", user),
+        ("dotenv", dotenv),
+        ("project", project),
+    ):
+        if state != "absent":
+            return VALUES[source] if state == "set" else None
+    return None
 
 
 @pytest.mark.parametrize(
-    ("shell", "user", "project"), GRID, ids=["-".join(c) for c in GRID]
+    ("shell", "user", "dotenv", "project"), GRID, ids=["-".join(c) for c in GRID]
 )
 def test_every_diagnostic_agrees_with_the_runtime(
     shell: str,
     user: str,
+    dotenv: str,
     project: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -69,22 +83,31 @@ def test_every_diagnostic_agrees_with_the_runtime(
     monkeypatch.chdir(root)
     monkeypatch.delenv(KEY, raising=False)
     if shell != "absent":
-        monkeypatch.setenv(KEY, "from-shell" if shell == "set" else "")
+        monkeypatch.setenv(KEY, VALUES["shell"] if shell == "set" else "")
     if user != "absent":
         (home / ".config" / "pmcp" / "pmcp.env").write_text(
-            f"{KEY}={'from-user' if user == 'set' else ''}\n"
+            f"{KEY}={VALUES['user'] if user == 'set' else ''}\n"
         )
-    if project == "set":
-        (root / ".env.pmcp").write_text(f"{KEY}=from-project\n")
+    if dotenv != "absent":
+        # The checkout `.env` the startup walk reaches when pmcp is installed
+        # in the checkout's `.venv` (codex, board round 7).
+        (root / ".env").write_text(
+            f"{KEY}={VALUES['dotenv'] if dotenv == 'set' else ''}\n"
+        )
+    if project != "absent":
+        (root / ".env.pmcp").write_text(
+            f"{KEY}={VALUES['project'] if project == 'set' else ''}\n"
+        )
     monkeypatch.setattr(
         secrets,
         "_extract_required_keys",
         lambda _: ([KEY], {"brave-search": [KEY]}, {}, {}),
     )
 
-    # What a real process does first.
-    cli.load_startup_env(dotenv_path=str(base / "no-such.env"))
-    expected = _expected(shell, user, project)
+    # What a real process does first: the walk finds the checkout `.env`.
+    cli.load_startup_env(dotenv_path=str(root / ".env"))
+    winner = _winner(shell, user, dotenv, project)
+    expected = winner is not None
 
     # The runtime.
     server = load_manifest().get_server("brave-search")
@@ -115,9 +138,6 @@ def test_every_diagnostic_agrees_with_the_runtime(
     assert set(verdicts.values()) == {expected}, verdicts
     if expected:
         # Same value too, not just the same verdict.
-        winner = {"set": "from-shell"}.get(shell) or (
-            "from-user" if user == "set" else "from-project"
-        )
         assert runtime_value == winner
         assert build_remote_header_env_lookup(root)(KEY) == winner
         assert child == winner
@@ -163,3 +183,29 @@ def test_secrets_check_sees_an_exported_key_with_no_store_entry(
     )
     assert result["missing_keys"] == []
     assert result["ok"] is True
+
+
+def test_a_diagnostic_without_a_startup_load_builds_the_same_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``secrets check`` in a process that never ran the startup load runs it,
+    rather than reading the stores in an order of its own."""
+    base = Path(os.path.realpath(tmp_path))
+    home = base / "home"
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    root = base / "project"
+    (root / ".git").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(root)
+    monkeypatch.delenv(KEY, raising=False)
+    monkeypatch.setattr(cli, "find_dotenv", lambda: str(root / ".env"))
+    (root / ".env").write_text(f"{KEY}=\n")
+    (root / ".env.pmcp").write_text(f"{KEY}=from-project\n")
+    monkeypatch.setattr(
+        secrets,
+        "_extract_required_keys",
+        lambda _: ([KEY], {"brave-search": [KEY]}, {}, {}),
+    )
+    report = asyncio.run(secrets.run_secrets_check(argparse.Namespace(project=root)))
+    assert report["missing_keys"] == [KEY]
+    assert env_store.credential_value(KEY) is None

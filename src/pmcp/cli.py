@@ -44,6 +44,7 @@ from pmcp.env_store import (
     record_dotenv_keys,
     load_discovered_dotenv,
     load_store,
+    mark_startup_loaded,
     pin_user_store_path,
     record_pmcp_introduced_keys,
 )
@@ -3134,6 +3135,7 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     its libraries or its children read (Consiliency/pmcp#372 rounds 1-3).
     """
     pin_user_store_path()
+    mark_startup_loaded()
     before = set(os.environ)
     found = dotenv_path if dotenv_path is not None else find_dotenv()
     if found:

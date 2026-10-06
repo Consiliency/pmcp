@@ -470,9 +470,13 @@ is ignored with `pmcp: Ignoring X in .env.pmcp: its value refers to a
 variable the file does not define, ...`. A variable your shell exported, or
 `~/.config/pmcp/pmcp.env` sets, now wins over the same name in a project
 file, for every lookup. Every lookup follows one order, by presence: your
-environment, your user store, then the project store; a tenant lookup checks
-the tenant store before the project store, and with `include_process_env` off
-reads the tenant store alone. In 2.7.3 a checkout's `.env` won over the user
+environment, your user store, then the project files -- a checkout `.env`
+that pmcp's startup walk found before `.env.pmcp`; a tenant lookup checks the
+tenant store before the project files, and with `include_process_env` off
+reads the tenant store alone. Every reader -- the gateway, the provision
+check, a server's credential, `pmcp secrets check`, `pmcp doctor` -- reads
+the same values, loaded once at startup, so the diagnostics answer what the
+gateway will do. In 2.7.3 a checkout's `.env` won over the user
 store, and `pmcp secrets check` preferred a project `.env.pmcp`. (Remote
 `${VAR}` headers in the gateway, `pmcp status` and `pmcp doctor` already
 preferred your user store, which those load first.) So a per-project override

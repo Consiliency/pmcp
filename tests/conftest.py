@@ -61,6 +61,7 @@ from pmcp.env_store import (
     reset_dotenv_keys,
     reset_pmcp_introduced_keys,
     reset_repo_credentials,
+    reset_startup_load,
     reset_store_warnings,
     reset_user_store_pin,
 )
@@ -330,11 +331,13 @@ def _reset_dotenv_provenance() -> Iterator[None]:
     reset_store_warnings()
     reset_user_store_pin()
     reset_repo_credentials()
+    reset_startup_load()
     yield
     reset_dotenv_keys()
     reset_store_warnings()
     reset_user_store_pin()
     reset_repo_credentials()
+    reset_startup_load()
 
 
 @pytest.fixture(autouse=True)

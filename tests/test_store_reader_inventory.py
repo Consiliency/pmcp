@@ -280,7 +280,6 @@ def test_the_inventory_sees_the_readers_it_governs() -> None:
     callers = {key for key, facts in inv.items() if facts.entry_calls}
     modules = {module for module, _ in callers}
     assert {
-        "pmcp.remote_auth",
         "pmcp.cli",
         "pmcp.cli_commands.secrets",
         "pmcp.tools.handlers",
@@ -1022,7 +1021,7 @@ def test_the_credential_value_scan_sees_each_shape() -> None:
         "    return _REPO_CREDENTIALS.get('K')\n"
         "def names_only(p):\n"
         "    values = read_store('user')\n"
-        "    return sorted(values), 'K' in values, credential_value('K', operator=values)\n"
+        "    return sorted(values), 'K' in values, credential_value('K', repository=values)\n"
     )
     hits = credential_value_bypasses({"pmcp.x": source})
     flagged = {h.split(":")[1] for h in hits}

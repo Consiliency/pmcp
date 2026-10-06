@@ -61,6 +61,9 @@ TENANT = "acme"
 READ_REFUSAL = "pmcp: refusing to read .env.pmcp: it is a symlink"
 READ_NOT_REGULAR = "pmcp: refusing to read .env.pmcp: it is not a regular file"
 LOAD_REFUSAL = "pmcp: refusing to load .env.pmcp: it is a symlink"
+#: One map: a CLI process refuses the store once, when its startup load builds
+#: the map; the header lookup then reads that map (Consiliency/pmcp#372 r7).
+LOAD_NOT_REGULAR = "pmcp: refusing to load .env.pmcp: it is not a regular file"
 TENANT_REFUSAL = "pmcp: refusing to read pmcp.env: it is a symlink"
 
 
@@ -368,7 +371,7 @@ def test_pmcp_status_reports_the_header_missing_for_an_outside_store(
     REFUSED[shape](_project_store(lay), lay)
     server, proc = _status(lay)
     assert server["missing_env_vars"] == [VAR]
-    assert (READ_NOT_REGULAR if shape == "fifo" else READ_REFUSAL) in proc.stderr
+    assert (LOAD_NOT_REGULAR if shape == "fifo" else LOAD_REFUSAL) in proc.stderr
     _no_outside_value(proc.stdout, proc.stderr)
     assert str(lay["base"] / "outside") not in proc.stdout + proc.stderr
 
@@ -397,7 +400,7 @@ def test_pmcp_doctor_reports_the_header_missing_for_an_outside_store(
     REFUSED[shape](_project_store(lay), lay)
     proc = _doctor(lay)
     assert f"missing_env={VAR}" in proc.stdout, proc.stdout[-800:] + proc.stderr[-800:]
-    assert (READ_NOT_REGULAR if shape == "fifo" else READ_REFUSAL) in proc.stderr
+    assert (LOAD_NOT_REGULAR if shape == "fifo" else LOAD_REFUSAL) in proc.stderr
     _no_outside_value(proc.stdout, proc.stderr)
 
 
@@ -1760,18 +1763,24 @@ def test_the_user_store_decides_by_membership_over_a_project_store(
 ) -> None:
     """One documented order for every lookup, headers included: environment,
     user store, then project -- and an empty user entry is "unavailable",
-    never a fall-through to the project file."""
+    never a fall-through to the project file. Each case is a fresh process's
+    map: the startup load reads the stores once."""
     from pmcp.remote_auth import build_remote_header_env_lookup
 
-    monkeypatch.delenv("MEMBER372", raising=False)
     user = lay["home"] / ".config" / "pmcp" / "pmcp.env"
     _project_store(lay).write_text("MEMBER372=project\n")
-    user.write_text("MEMBER372=\n")
-    assert build_remote_header_env_lookup(lay["project"])("MEMBER372") is None
-    user.write_text("MEMBER372=user\n")
-    assert build_remote_header_env_lookup(lay["project"])("MEMBER372") == "user"
-    user.write_text("OTHER372=x\n")
-    assert build_remote_header_env_lookup(lay["project"])("MEMBER372") == "project"
+
+    def fresh(user_text: str) -> str | None:
+        monkeypatch.delenv("MEMBER372", raising=False)
+        env_store.reset_startup_load()
+        env_store.reset_repo_credentials()
+        user.write_text(user_text)
+        return build_remote_header_env_lookup(lay["project"])("MEMBER372")
+
+    assert fresh("MEMBER372=\n") is None
+    assert fresh("MEMBER372=user\n") == "user"
+    assert fresh("OTHER372=x\n") == "project"
+    monkeypatch.delenv("MEMBER372", raising=False)
 
 
 def test_the_feedback_gate_denies_a_dangling_project_store_link(
@@ -1838,15 +1847,20 @@ def test_a_rewrite_refuses_a_user_store_that_is_not_a_regular_file(
 def test_a_tenant_lookup_follows_the_documented_order(
     lay: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Environment, user store, tenant store, then the project store -- or, with
-    include_process_env=False, the tenant store alone. The user store is read
-    directly, so this holds without a startup load too."""
-    monkeypatch.delenv("ORDER372", raising=False)
+    """Environment (the user store is in it after the startup load), tenant
+    store, then the project credentials -- or, with include_process_env=False,
+    the tenant store alone. Each case is a fresh process's map."""
     user = lay["home"] / ".config" / "pmcp" / "pmcp.env"
     tenant = _tenant_store(lay)
     tenant.parent.mkdir(parents=True)
+    _project_store(lay).write_text("ORDER372=project\n")
 
-    def header(include: bool = True) -> str:
+    def header(*, user_text: str, tenant_text: str, include: bool = True) -> str:
+        monkeypatch.delenv("ORDER372", raising=False)
+        env_store.reset_startup_load()
+        env_store.reset_repo_credentials()
+        user.write_text(user_text)
+        tenant.write_text(tenant_text)
         return resolve_remote_headers_for_tenant(
             {"X": "${ORDER372}"},
             server_name="r",
@@ -1855,14 +1869,26 @@ def test_a_tenant_lookup_follows_the_documented_order(
             include_process_env=include,
         ).resolved_headers["X"]
 
-    _project_store(lay).write_text("ORDER372=project\n")
-    env_store.load_store("project", project=lay["project"])
-    assert header() == "project"
-    tenant.write_text("ORDER372=tenant\n")
-    assert header() == "tenant"
-    user.write_text("ORDER372=user\n")
-    assert header() == "user"
-    assert header(include=False) == "tenant"
+    assert header(user_text="", tenant_text="") == "project"
+    assert header(user_text="", tenant_text="ORDER372=tenant\n") == "tenant"
+    assert (
+        header(user_text="ORDER372=user\n", tenant_text="ORDER372=tenant\n") == "user"
+    )
+    assert (
+        header(
+            user_text="ORDER372=user\n", tenant_text="ORDER372=tenant\n", include=False
+        )
+        == "tenant"
+    )
     monkeypatch.setenv("ORDER372", "env")
-    assert header() == "env"
-    assert header(include=False) == "tenant"
+    env_store.reset_startup_load()
+    assert (
+        resolve_remote_headers_for_tenant(
+            {"X": "${ORDER372}"},
+            server_name="r",
+            tenant_id=TENANT,
+            project_root=lay["project"],
+        ).resolved_headers["X"]
+        == "env"
+    )
+    monkeypatch.delenv("ORDER372", raising=False)
