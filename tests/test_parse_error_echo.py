@@ -1783,30 +1783,36 @@ def _redirect_every_client(monkeypatch: pytest.MonkeyPatch, port: int) -> None:
         return original_request(self, method, local(), **kwargs)
 
     monkeypatch.setattr(aiohttp.ClientSession, "_request", aiohttp_request)
-    original_open = urllib.request.OpenerDirector.open
 
-    def urllib_open(self: Any, fullurl: Any, *args: Any, **kwargs: Any) -> Any:
-        if isinstance(fullurl, urllib.request.Request):
-            fullurl.full_url = local()
-        else:
-            fullurl = local()
-        return original_open(self, fullurl, *args, **kwargs)
+    def redirect(opener: Any) -> None:
+        # On the instance, from the opener's own class: robust to a test that
+        # left an instance `open` behind or reloaded `urllib.request`.
+        original_open = type(opener).open
 
-    monkeypatch.setattr(urllib.request.OpenerDirector, "open", urllib_open)
-    monkeypatch.setattr(cli, "_get_gateway_health_url", local)
-    # conftest's `_no_live_npm_registry` replaces the packument opener's
-    # `open` on the instance; here every request goes to the local server,
-    # so the class's (redirected) method is used again.
+        def urllib_open(fullurl: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(fullurl, urllib.request.Request):
+                fullurl.full_url = local()
+            else:
+                fullurl = local()
+            return original_open(opener, fullurl, *args, **kwargs)
+
+        monkeypatch.setattr(opener, "open", urllib_open)
+
+    import pmcp.auth as auth
+    import pmcp.feedback_egress as feedback_egress
     from pmcp.manifest import package_identity
 
-    monkeypatch.delattr(package_identity._OPENER, "open")
-    # `pmcp.auth.urlopen` is the opener's `open` bound at import: rebind it to
-    # the (redirected) class method.
-    import pmcp.auth as auth
-
-    monkeypatch.setattr(
-        auth, "urlopen", lambda *a, **k: auth._NO_REDIRECT_OPENER.open(*a, **k)
-    )
+    # conftest's `_no_live_npm_registry` replaced the packument opener's
+    # `open`; here it is replaced again, by the redirect.
+    for opener in (
+        package_identity._OPENER,
+        feedback_egress._OPENER,
+        auth._NO_REDIRECT_OPENER,
+    ):
+        redirect(opener)
+    # `pmcp.auth.urlopen` is the opener's `open` bound at import.
+    monkeypatch.setattr(auth, "urlopen", auth._NO_REDIRECT_OPENER.open)
+    monkeypatch.setattr(cli, "_get_gateway_health_url", local)
 
 
 @pytest.mark.parametrize("shape", sorted(_http_shapes("x")))
