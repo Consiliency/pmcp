@@ -13,13 +13,6 @@ from pmcp.auth import (
 from pmcp.remote_auth import build_remote_header_env_lookup, resolve_remote_headers
 
 
-def _read_user_pmcp_env() -> dict[str, str]:
-    """Read user-scope PMCP env context from ~/.config/pmcp/pmcp.env."""
-    from pmcp.env_store import read_store
-
-    return read_store("user")
-
-
 def collect_remote_header_diagnostics(
     config_data: dict | None,
 ) -> list[tuple[str, str, str]]:

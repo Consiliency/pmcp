@@ -464,11 +464,16 @@ a remote server's `${VAR}` header, the credential checks and `pmcp secrets`
 still find them. pmcp's own settings, `HOME`, `XDG_*`, `PATH`, proxy and CA
 variables in them are ignored, and no child process pmcp starts — a server,
 an installer, `systemctl`, `pmcp upgrade` — sees any of their values unless
-it is that server's own declared credential. A variable your shell exported,
-or `~/.config/pmcp/pmcp.env` sets, now wins over the same name in a project
-file; in 2.7.3 a checkout's `.env` won over the user store. A `.env` that
-pmcp finds outside every project, such as `~/.env` for a `uv tool` install,
-is yours and loads as before. A local server's `env` in `.mcp.json` is passed
+it is that server's own declared credential. A value in such a file is
+expanded only from keys defined earlier in the same file: `X=${GITHUB_TOKEN}`
+is ignored with `pmcp: Ignoring X in .env.pmcp: its value refers to a
+variable the file does not define, ...`. A variable your shell exported, or
+`~/.config/pmcp/pmcp.env` sets, now wins over the same name in a project
+file; in 2.7.3 a checkout's `.env` won over the user store. A variable your
+shell exports as empty stays unavailable. A `.env` that pmcp's startup walk
+finds in your home directory or an ancestor of it, such as `~/.env` for a
+`uv tool` install, is yours and loads as before; one anywhere else, such as
+a checkout with pmcp in its `.venv`, is a project file. A local server's `env` in `.mcp.json` is passed
 as written, as before: `${VAR}` there was never expanded.
 
 **What to do.** Export pmcp's own settings in the shell or service that
@@ -482,8 +487,12 @@ Keep credentials in the project file if you like; servers still get them. A
 variable a server needs that is not its declared credential belongs in that
 server's `env` block in `.mcp.json`.
 
-**How to verify.** Start pmcp from the project. No `pmcp: Ignoring` line is
-printed, and `pmcp secrets check` lists the project keys you expect.
+**How to verify.** Run the grep above: every name it lists is either a
+credential a server or a header uses, or one you have moved to your shell or
+user store. pmcp prints an `Ignoring` line only for its own variables and for
+values it will not expand; any other non-credential variable in a project
+file is ignored without one. `pmcp secrets check` lists the project keys you
+expect.
 
 ### Discovered servers are default-deny
 

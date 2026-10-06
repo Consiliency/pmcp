@@ -53,17 +53,23 @@ to do, how to verify it, and how to roll back to 2.7.3.
   user store too, so pmcp still starts), and one that decides — the feedback gate, a
   rewrite — refuses. *Security*
 - **A project file supplies credentials only.** A checkout's `.env.pmcp`, the `.env`
-  in the directory the gateway runs from (or that pmcp finds inside a project when it is
-  installed in that project's `.venv`), and a tenant `pmcp.env` no longer put anything
+  in the directory the gateway runs from (or that pmcp finds when it is installed in a
+  checkout's `.venv` -- any `.env` its startup walk finds outside your home directory and
+  its ancestors), and a tenant `pmcp.env` no longer put anything
   into pmcp's own environment. Their values are credentials: a server's declared
   credential, a remote `${VAR}` header, the credential checks and the `pmcp secrets`
   commands still find them. Nothing else does — not pmcp's own settings
   (`PMCP_LOG_LEVEL`, `PMCP_PORT`, …), not `HOME`, a proxy or a CA bundle, and not a
   child process pmcp starts. Such a variable prints `pmcp: Ignoring <VAR> in .env.pmcp:
   a project file supplies credentials only, …` and is left unset; in 2.7.3 it applied.
-  Your shell and `~/.config/pmcp/pmcp.env` now win over a project file, where in 2.7.3
-  a checkout's `.env` won over the user store. A `~/.env` outside any project still
-  loads as before. *Security*
+  Any other non-credential variable in such a file is ignored without a line. A value
+  is expanded only from keys defined earlier in the same file: `LEAK=${GITHUB_TOKEN}`,
+  which 2.7.3 filled from your environment, is ignored with `pmcp: Ignoring LEAK in
+  .env.pmcp: its value refers to a variable the file does not define, …`. Your shell
+  and `~/.config/pmcp/pmcp.env` now win over a project file, where in 2.7.3 a checkout's
+  `.env` won over the user store, and a variable your shell exports as empty stays
+  unavailable rather than being filled from a project file. A `~/.env` (or one in an
+  ancestor of your home directory) still loads as before. *Security*
 - **Discovered servers are default-deny.** `gateway.register_discovered_server` resolves
   and pins the package (and refuses one it cannot pin, or an `env_vars` name that is not
   credential-shaped); `provision`, `connect_server` and `restart_server` refuse it until
@@ -340,20 +346,18 @@ to do, how to verify it, and how to roll back to 2.7.3.
   the `.env` and `.env.pmcp` in the gateway's working directory, and the `.env` that
   startup discovers by walking up from pmcp's installed files (which, for pmcp
   installed in a checkout's `.venv` by `uv run` or `pip install -e`, is the
-  checkout's own `.env`) — is read only through the walk confined to the project
-  root that encloses it. The discovery itself is kept: for a `uv tool` or `pip --user`
-  install the walk reaches `~/.env`, outside every project, which is the operator's
-  own and loads as before. A link that
-  leaves the project, or a file that is not regular, is read as empty with one
-  value-free line on stderr (`pmcp: refusing to read .env.pmcp: it is a symlink that
-  leaves the project`, or `refusing to load` for the startup `.env` and the
-  credential check), once per store, reason and file identity in each configuration
+  checkout's own `.env`) — is read only through the confined walk, which refuses a
+  symlink of any kind (Consiliency/pmcp#366). The discovery itself is kept: for a `uv tool` or `pip --user`
+  install the walk reaches `~/.env`, in the home directory, which is the operator's
+  own and loads as before; a `.env` the walk finds anywhere other than the home
+  directory or an ancestor of it is a repository's, whatever marker files the checkout
+  has. A symlinked store, or a file that is not regular, is read as empty with one
+  value-free line on stderr (`pmcp: refusing to read .env.pmcp: it is a symlink`, or
+  `refusing to load` for the startup `.env` and the credential check), once per store, reason and file identity in each configuration
   load, so a store that changes, or is still refused at the next load, is reported
   again; the feedback gate refuses to submit (`gate_error`) instead. A tenant id made
   only of dots is refused: `..` and `.` named `.pmcp/pmcp.env` and
-  `.pmcp/tenants/pmcp.env`, which are no tenant's store. A link that stays inside the project
-  still works, including one from a subdirectory; on Windows a tenant store in real
-  directories reads, and any link on its way is refused.
+  `.pmcp/tenants/pmcp.env`, which are no tenant's store.
 
   Reading confined was not enough on its own. A regular project file could still
   steer what pmcp did next by putting variables into its environment: with `HOME`
@@ -385,9 +389,19 @@ to do, how to verify it, and how to roll back to 2.7.3.
   `credential_value`, if any process is started without an `env=` from the builder,
   if `atomic_write` or `env_store` asks a yes/no existence check, or if `src/pmcp`
   reads an environment variable that is not classified as path-and-trust,
-  provenance-gated or operational. That last inventory sees only pmcp's own reads, not
-  what httpx, ssl or a child process read; with repository files kept out of the
-  environment, that limit no longer matters for them. See Consiliency/pmcp#367.
+  provenance-gated or operational, or if anything but `credential_value` reads the
+  credential map or a store's values. That classification inventory sees only pmcp's
+  own reads, not what httpx, ssl or a child process read; with repository files kept
+  out of the environment, that limit no longer matters for them.
+
+  The values a repository file supplies are expanded only within that file, never from
+  your environment or user store, so `LEAK=${PMCP_AUTH_TOKEN}` cannot copy a secret into
+  a name a repository-configured header then sends. Every lookup -- the startup map,
+  the project and tenant stores behind remote-header resolution, `pmcp secrets check` --
+  goes through the one gate, so a repository's `PMCP_AUTH_TOKEN`, `HTTP_PROXY` or
+  `SSLKEYLOGFILE` never fills a header either, and precedence is by presence: a
+  variable your shell exports, even as empty, is never filled from a project file. See
+  Consiliency/pmcp#367.
 - **Bumped `multidict` 6.7.0 → 6.9.1** to clear advisory `GHSA-54p9-h82j-f925`.
   `multidict` is transitive (`aiohttp` → `multidict`, and `aiohttp` → `yarl` →
   `multidict`), so this is lockfile-only, like the `anyio` bump: the repo floors

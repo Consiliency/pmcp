@@ -85,24 +85,19 @@ def build_remote_header_env_lookup(
     ``.env.pmcp`` linked out of the checkout contributes nothing, so a file the
     repository points at can never fill a ``${VAR}`` header (Consiliency/pmcp#367).
     """
-    from pmcp.env_store import credential_value, read_store
+    from pmcp.env_store import credential_value, read_store, repository_values
 
     user_values = read_store("user")
-    project_values = read_store("project", project=project_root)
+    project_values = repository_values("project", project=project_root)
 
     def lookup(env_var: str) -> str | None:
-        # The process environment, then credentials repository files supplied
-        # at startup (env_store.credential_value), then the stores themselves.
-        value = credential_value(env_var)
-        if value:
-            return value
-        value = project_values.get(env_var)
-        if value:
-            return value
-        value = user_values.get(env_var)
-        if value:
-            return value
-        return None
+        # One gate (env_store.credential_value): the process environment, the
+        # user store, then repository values -- by membership, and never a name
+        # pmcp reads from its own environment from a repository source
+        # (Consiliency/pmcp#372 round 3).
+        return credential_value(
+            env_var, operator=user_values, repository=project_values
+        )
 
     return lookup
 
@@ -121,16 +116,20 @@ def resolve_remote_headers_for_tenant(
             headers, build_remote_header_env_lookup(project_root)
         )
 
-    from pmcp.env_store import credential_value, read_store
+    from pmcp.env_store import credential_value, repository_values
 
-    # Repository-controlled: confined to the project root (Consiliency/pmcp#367).
-    tenant_values = read_store("tenant", project=project_root, tenant_id=tenant_id)
+    # Repository-controlled: confined to the project root (Consiliency/pmcp#367),
+    # expanded within the file only, read through the one gate.
+    tenant_values = repository_values(
+        "tenant", project=project_root, tenant_id=tenant_id
+    )
 
     def lookup(env_var: str) -> str | None:
-        if include_process_env:
-            value = credential_value(env_var)
-            if value:
-                return value
-        return tenant_values.get(env_var) or None
+        return credential_value(
+            env_var,
+            environ=include_process_env,
+            startup_files=include_process_env,
+            repository=tenant_values,
+        )
 
     return resolve_remote_headers(headers, lookup)

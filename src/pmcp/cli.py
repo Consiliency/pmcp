@@ -3120,18 +3120,18 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     The discovered file is classified by WHERE it is
     (``env_store.load_discovered_dotenv``, Consiliency/pmcp#367). The walk starts
     where pmcp is installed, and that can be inside a checkout -- a ``.venv``
-    that ``uv run`` or ``pip install -e`` created there -- so the ``.env`` it
-    reaches can be the repository's: then it is read confined, and its values go
-    to the credential map, never into the process environment. Outside every
-    project -- ``~/.env`` for a ``uv tool`` or ``pip --user`` install, which
-    MIGRATING.md documents as loaded -- it is the operator's own and loads as
-    before.
+    that ``uv run``, ``pip install -e`` or ``pip install -r`` created there -- so
+    the ``.env`` it reaches can be the repository's. Only a file in the home
+    directory or an ancestor of it is the operator's (``~/.env`` for a ``uv
+    tool`` or ``pip --user`` install, which MIGRATING.md documents as loaded) and
+    loads as before; any other is read confined, and its values go to the
+    credential map, never into the process environment.
 
     The user store's path is pinned FIRST (``env_store.pin_user_store_path``),
     before any other file is loaded, so nothing loaded later can move it. No
     repository-controlled file reaches ``os.environ`` (``env_store.load_store``),
     so none can set ``HOME``, a proxy, ``LD_PRELOAD`` or any other variable pmcp,
-    its libraries or its children read (Consiliency/pmcp#372 rounds 1-2).
+    its libraries or its children read (Consiliency/pmcp#372 rounds 1-3).
     """
     pin_user_store_path()
     before = set(os.environ)

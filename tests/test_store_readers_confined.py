@@ -1513,3 +1513,254 @@ def test_is_absent_calls_only_enoent_and_enotdir_absent(
             is_absent(gate / "x")
     finally:
         os.chmod(gate, 0o700)
+
+
+# --------------------------------------------------------------------------- #
+# Round 3 on Consiliency/pmcp#372.
+# --------------------------------------------------------------------------- #
+
+# claude F001: whether a startup-found `.env` is the operator's is decided by
+# where it is relative to HOME, not by project marker files.
+
+
+def _markerless_checkout_venv(lay: dict[str, Path]) -> tuple[Path, Path]:
+    """A `requirements.txt` checkout from an archive: no .git, no pyproject."""
+    checkout = lay["base"] / "archive-checkout"
+    checkout.mkdir()
+    (checkout / "requirements.txt").write_text("pmcp\n")
+    site = checkout / ".venv" / "lib" / "python3" / "site-packages"
+    _install_pmcp_in(site)
+    (site / "runme.py").write_text(_HEADER_RUNNER, encoding="utf-8")
+    return checkout, site
+
+
+_CHILD_STEERING = (
+    "import json, os, subprocess, sys\n"
+    "import pmcp\n"
+    "assert pmcp.__file__.startswith(sys.argv[1]), pmcp.__file__\n"
+    "from pmcp.cli import load_startup_env, _is_pmcp_system_service_active\n"
+    "load_startup_env()\n"
+    "seen = {}\n"
+    "def spy(*a, **k):\n"
+    "    seen.update(k.get('env') or {})\n"
+    "    raise FileNotFoundError\n"
+    "subprocess.run = spy\n"
+    "import shutil; shutil.which = lambda n: '/usr/bin/' + n\n"
+    "_is_pmcp_system_service_active()\n"
+    "keys = ['LD_PRELOAD', 'Https_Proxy', sys.argv[2]]\n"
+    "print(json.dumps({'env': {k: os.environ.get(k) for k in keys},"
+    " 'child': {k: seen.get(k) for k in keys}}))\n"
+)
+
+
+@pytest.mark.parametrize("shape", ["regular", "link-out"])
+def test_a_markerless_checkout_env_is_a_repository_file(
+    shape: str, lay: dict[str, Path]
+) -> None:
+    checkout, site = _markerless_checkout_venv(lay)
+    body = f"LD_PRELOAD={checkout}/x.so\nHttps_Proxy=http://127.0.0.1:9\n{VAR}=v\n"
+    if shape == "regular":
+        (checkout / ".env").write_text(body)
+    else:
+        (lay["outside"] / "steer").write_text(body)
+        os.symlink("../outside/steer", checkout / ".env")
+    (site / "steer.py").write_text(_CHILD_STEERING)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k.upper() not in ("LD_PRELOAD", "HTTPS_PROXY", VAR)
+        and not k.startswith("PMCP")
+    }
+    env.update(HOME=str(lay["home"]), PYTHONPATH=str(site))
+    proc = subprocess.run(
+        [sys.executable, str(site / "steer.py"), str(site), VAR],
+        cwd=checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr[-800:]
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["env"] == {"LD_PRELOAD": None, "Https_Proxy": None, VAR: None}
+    assert out["child"] == {"LD_PRELOAD": None, "Https_Proxy": None, VAR: None}
+
+
+def test_an_env_in_an_ancestor_of_home_is_the_operators(lay: dict[str, Path]) -> None:
+    """A user install's walk can pass HOME's parents; a `.env` there is yours."""
+    site = lay["home"] / ".local" / "lib" / "python3" / "site-packages"
+    _install_pmcp_in(site)
+    (site / "runme.py").write_text(_HEADER_RUNNER, encoding="utf-8")
+    (lay["base"] / ".env").write_text(f"{VAR}={USER_VALUE}\n")
+    out, proc = _header_probe(lay, site)
+    assert out["env"] == USER_VALUE
+    assert "Ignoring" not in proc.stderr and "refusing" not in proc.stderr
+
+
+# grok F001: no interpolation across the trust boundary.
+
+
+@pytest.fixture
+def operator_secrets(
+    lay: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> dict[str, str]:
+    secrets = {
+        "PMCP_AUTH_TOKEN": "operator-token-372",
+        "GITHUB_TOKEN": "user-store-github-372",
+    }
+    for key, value in secrets.items():
+        monkeypatch.setenv(key, value)
+    (lay["home"] / ".config" / "pmcp" / "pmcp.env").write_text(
+        "USER_ONLY_SECRET=user-only-372\n"
+    )
+    for key in ("LEAK", "FROM_USER", "FROM_STORE", "HTTP_PROXY", "SSLKEYLOGFILE"):
+        monkeypatch.delenv(key, raising=False)
+    return {**secrets, "USER_ONLY_SECRET": "user-only-372"}
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "${PMCP_AUTH_TOKEN}",
+        "${GITHUB_TOKEN}",
+        "${USER_ONLY_SECRET}",
+        "pre-${GITHUB_TOKEN}-post",
+        "${NOT_IN_FILE:-x}${GITHUB_TOKEN}",
+        "${A:-${GITHUB_TOKEN}}",
+    ],
+)
+def test_a_repository_file_cannot_launder_an_operator_secret(
+    template: str,
+    lay: dict[str, Path],
+    operator_secrets: dict[str, str],
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    from pmcp.remote_auth import build_remote_header_env_lookup, resolve_remote_headers
+
+    _project_store(lay).write_text(f"LEAK={template}\n")
+    env_store.load_store("project", project=lay["project"])
+    lookup = build_remote_header_env_lookup(lay["project"])
+    resolved = resolve_remote_headers({"Authorization": "Bearer ${LEAK}"}, lookup)
+    tenant_dir = lay["project"] / ".pmcp" / "tenants" / TENANT
+    tenant_dir.mkdir(parents=True)
+    (tenant_dir / "pmcp.env").write_text(f"LEAK={template}\n")
+    tenant = resolve_remote_headers_for_tenant(
+        {"Authorization": "Bearer ${LEAK}"},
+        server_name="r",
+        tenant_id=TENANT,
+        project_root=lay["project"],
+    )
+    for secret in operator_secrets.values():
+        assert secret not in str(env_store.credential_value("LEAK"))
+        assert secret not in str(lookup("LEAK"))
+        assert secret not in resolved.resolved_headers["Authorization"]
+        assert secret not in tenant.resolved_headers["Authorization"]
+    _no_outside_value(capfd.readouterr().err)
+
+
+def test_a_repository_file_expands_its_own_earlier_keys(lay: dict[str, Path]) -> None:
+    _project_store(lay).write_text(
+        "BASE372=https://api.example\n"
+        "URL372=${BASE372}/v1\n"
+        "DEF372=${MISSING372:-fallback}\n"
+        "LITERAL372=$BASE372\n"
+        "LATER372=${AFTER372}\n"
+        "AFTER372=x\n"
+    )
+    env_store.load_store("project", project=lay["project"])
+    assert env_store.credential_value("URL372") == "https://api.example/v1"
+    assert env_store.credential_value("DEF372") == "fallback"
+    assert env_store.credential_value("LITERAL372") == "$BASE372"
+    # Only EARLIER keys, as python-dotenv expands: a forward reference is
+    # outside what the file has defined at that point.
+    assert env_store.credential_value("LATER372") is None
+
+
+def test_an_unexpandable_value_is_ignored_with_one_value_free_line(
+    lay: dict[str, Path],
+    operator_secrets: dict[str, str],
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    _project_store(lay).write_text("LEAK=${GITHUB_TOKEN}\n")
+    env_store.load_store("project", project=lay["project"])
+    err = capfd.readouterr().err
+    assert err.count("pmcp: Ignoring LEAK in .env.pmcp: its value refers to") == 1
+    assert "GITHUB_TOKEN" not in err
+
+
+# codex F001 / grok F001: every header fallback goes through the one gate.
+
+
+@pytest.mark.parametrize(
+    "name", ["PMCP_AUTH_TOKEN", "HTTP_PROXY", "Https_Proxy", "SSLKEYLOGFILE", "home"]
+)
+def test_no_header_resolves_a_pmcp_name_from_a_repository_store(
+    name: str, lay: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.remote_auth import build_remote_header_env_lookup, resolve_remote_headers
+
+    monkeypatch.delenv(name, raising=False)
+    _project_store(lay).write_text(f"{name}=repo-value-372\n")
+    tenant_dir = lay["project"] / ".pmcp" / "tenants" / TENANT
+    tenant_dir.mkdir(parents=True)
+    (tenant_dir / "pmcp.env").write_text(f"{name}=repo-value-372\n")
+    env_store.load_store("project", project=lay["project"])
+    headers = {"Authorization": "Bearer ${%s}" % name}
+    project_result = resolve_remote_headers(
+        headers, build_remote_header_env_lookup(lay["project"])
+    )
+    for include in (True, False):
+        tenant_result = resolve_remote_headers_for_tenant(
+            headers,
+            server_name="remote",
+            tenant_id=TENANT,
+            project_root=lay["project"],
+            include_process_env=include,
+        )
+        assert tenant_result.missing_env_vars == [name]
+    assert project_result.missing_env_vars == [name]
+
+
+# codex F002: precedence by membership.
+
+
+def test_an_exported_empty_value_is_not_filled_from_a_repository_file(
+    lay: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.manifest.installer import MissingApiKeyError, check_api_key
+    from pmcp.manifest.loader import ServerConfig
+    from pmcp.remote_auth import build_remote_header_env_lookup
+
+    monkeypatch.setenv("BRAVE_API_KEY", "")
+    _project_store(lay).write_text("BRAVE_API_KEY=repo-value-372\n")
+    env_store.load_store("project", project=lay["project"])
+    assert env_store.credential_value("BRAVE_API_KEY") is None
+    assert build_remote_header_env_lookup(lay["project"])("BRAVE_API_KEY") is None
+    server = ServerConfig(
+        name="brave-search",
+        description="probe",
+        keywords=[],
+        install={},
+        command="python",
+        args=[],
+        requires_api_key=True,
+        env_var="BRAVE_API_KEY",
+    )
+    with pytest.raises(MissingApiKeyError):
+        asyncio.run(check_api_key(server))
+    assert GatewayTools._check_api_key_available(object(), "BRAVE_API_KEY") is False  # type: ignore[arg-type]
+
+
+def test_a_project_store_entry_decides_by_membership_over_the_user_store(
+    lay: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The project store overrides the user store's file for a header, as it
+    always has -- and an empty project entry is "unavailable", not a fall-through."""
+    from pmcp.remote_auth import build_remote_header_env_lookup
+
+    monkeypatch.delenv("MEMBER372", raising=False)
+    (lay["home"] / ".config" / "pmcp" / "pmcp.env").write_text("MEMBER372=user\n")
+    _project_store(lay).write_text("MEMBER372=\n")
+    assert build_remote_header_env_lookup(lay["project"])("MEMBER372") is None
+    _project_store(lay).write_text("OTHER372=x\n")
+    assert build_remote_header_env_lookup(lay["project"])("MEMBER372") == "user"

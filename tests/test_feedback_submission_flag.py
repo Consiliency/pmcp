@@ -337,9 +337,12 @@ def test_startup_store_loads_are_recorded_as_pmcp_introduced(
         f"{STORE_KEY}=planted-by-a-previous-process\n{EXPORTED_KEY}=from-the-store\n"
     )
     (project / ".env.pmcp").write_text(f"{PROJECT_KEY}=planted-in-the-project\n")
-    (project / ".env").write_text(f"{DOTENV_KEY}=from-a-plain-dotenv\n")
+    # The operator's own plain `.env` (in HOME: a `uv tool` install's walk
+    # reaches it). One elsewhere is a repository file and never reaches the
+    # environment (Consiliency/pmcp#372 round 3).
+    (home / ".env").write_text(f"{DOTENV_KEY}=from-a-plain-dotenv\n")
 
-    cli.load_startup_env(project / ".env")
+    cli.load_startup_env(home / ".env")
 
     introduced = pmcp_introduced_keys()
     sourced = dotenv_sourced_keys()

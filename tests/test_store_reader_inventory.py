@@ -67,6 +67,7 @@ ENTRY_POINT_INTERNALS = frozenset(
         ("pmcp.env_store", "load_store"),
         ("pmcp.env_store", "load_discovered_dotenv"),
         ("pmcp.env_store", "_load_repo_credentials"),
+        ("pmcp.env_store", "_repository_values"),
         ("pmcp.env_store", "_read_confined_text"),
         ("pmcp.env_store", "_read_user_text"),
         ("pmcp.env_store", "read_env_file"),
@@ -280,7 +281,6 @@ def test_the_inventory_sees_the_readers_it_governs() -> None:
     assert {
         "pmcp.remote_auth",
         "pmcp.cli",
-        "pmcp.cli_commands.doctor",
         "pmcp.cli_commands.secrets",
         "pmcp.tools.handlers",
         "pmcp.env_store",
@@ -638,18 +638,63 @@ ENV_BUILDERS = frozenset(
 )
 
 
-def _is_spawn(call: ast.Call) -> bool:
+#: Modules whose functions start a process, by the attribute names that do.
+_SPAWNING_MODULES = {
+    "subprocess": {"run", "Popen", "call", "check_call", "check_output"},
+    "asyncio": {"create_subprocess_exec", "create_subprocess_shell"},
+    "os": {n for n in SPAWN_CALLS if n == "system" or n.startswith(("exec", "spawn"))}
+    | {"posix_spawn", "posix_spawnp"},
+    "anyio": {"run_process", "open_process"},
+    "mcp": {"StdioServerParameters"},
+}
+
+
+def _spawn_aliases(tree: ast.AST) -> tuple[dict[str, str], set[str]]:
+    """``(module aliases, bare spawn names)`` bound by this module's imports.
+
+    ``import subprocess as sp`` binds ``sp`` -> ``subprocess``; ``from
+    subprocess import run as r`` binds the bare name ``r`` to a spawn.
+    """
+    modules: dict[str, str] = {m: m for m in _SPAWNING_MODULES}
+    bare: set[str] = {"StdioServerParameters"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in _SPAWNING_MODULES:
+                    modules[alias.asname or root] = root
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            root = node.module.split(".")[0]
+            for alias in node.names:
+                if root in _SPAWNING_MODULES and alias.name in _SPAWNING_MODULES[root]:
+                    bare.add(alias.asname or alias.name)
+    return modules, bare
+
+
+def _is_spawn(
+    call: ast.Call, aliases: tuple[dict[str, str], set[str]] | None = None
+) -> bool:
+    modules, bare = aliases if aliases is not None else ({}, {"StdioServerParameters"})
+    modules = {**{m: m for m in _SPAWNING_MODULES}, **modules}
     func = call.func
     if isinstance(func, ast.Name):
-        return func.id == "StdioServerParameters"
-    if not isinstance(func, ast.Attribute) or func.attr not in SPAWN_CALLS:
+        return func.id in bare
+    if not isinstance(func, ast.Attribute):
         return False
+    if func.attr in ("subprocess_exec", "subprocess_shell"):
+        return True  # loop.subprocess_exec / loop.subprocess_shell
+    if func.attr == "StdioServerParameters":
+        return True
     owner = func.value.id if isinstance(func.value, ast.Name) else ""
-    if func.attr in ("run", "call", "check_call", "check_output"):
-        return owner == "subprocess"  # not asyncio.run / anyio.run
-    if func.attr == "system" or func.attr.startswith(("exec", "spawn")):
-        return owner == "os"
-    return True
+    real = modules.get(owner)
+    if real is None:
+        # An unknown owner: the unambiguous names still count.
+        return func.attr in (
+            "Popen",
+            "create_subprocess_exec",
+            "create_subprocess_shell",
+        )
+    return func.attr in _SPAWNING_MODULES[real]
 
 
 def _builder_call(node: ast.AST | None) -> bool:
@@ -671,6 +716,7 @@ def spawn_sites(sources: dict[str, str]) -> list[tuple[str, str, bool]]:
     sites: list[tuple[str, str, bool]] = []
     for module, source in sources.items():
         tree = ast.parse(source)
+        aliases = _spawn_aliases(tree)
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -679,7 +725,7 @@ def spawn_sites(sources: dict[str, str]) -> list[tuple[str, str, bool]]:
                 if isinstance(node, ast.Assign) and _builder_call(node.value):
                     built |= {t.id for t in node.targets if isinstance(t, ast.Name)}
             for node in ast.walk(fn):
-                if isinstance(node, ast.Call) and _is_spawn(node):
+                if isinstance(node, ast.Call) and _is_spawn(node, aliases):
                     env = next((k.value for k in node.keywords if k.arg == "env"), None)
                     ok = _builder_call(env) or (
                         isinstance(env, ast.Name) and env.id in built
@@ -706,6 +752,16 @@ def test_the_spawn_scan_sees_each_shape() -> None:
         "    StdioServerParameters(command='x', args=[])\n"
         "def system():\n"
         "    os.system('x')\n"
+        "def aliased():\n"
+        "    import subprocess as sp\n"
+        "    sp.run(['x'])\n"
+        "def from_import():\n"
+        "    from subprocess import run as r\n"
+        "    r(['x'])\n"
+        "async def on_loop(loop):\n"
+        "    await loop.subprocess_exec(object, 'x')\n"
+        "def not_a_spawn():\n"
+        "    asyncio.run(main())\n"
         "def fine():\n"
         "    subprocess.Popen(['x'], env=child_process_env())\n"
         "def fine_by_name():\n"
@@ -717,6 +773,9 @@ def test_the_spawn_scan_sees_each_shape() -> None:
         ("pmcp.x", "inherits", False),
         ("pmcp.x", "sdk_default", False),
         ("pmcp.x", "system", False),
+        ("pmcp.x", "aliased", False),
+        ("pmcp.x", "from_import", False),
+        ("pmcp.x", "on_loop", False),
         ("pmcp.x", "fine", True),
         ("pmcp.x", "fine_by_name", True),
     ]
@@ -844,3 +903,126 @@ def sneaky(root):
     reads = [line for line in found if "reads a store" in line]
     assert len(escapes) == 3, found
     assert len(reads) == 3, found
+
+
+# --------------------------------------------------------------------------- #
+# One gate for credential VALUES (Consiliency/pmcp#372 round 3): nothing reads
+# the credential map, or a store's values, except env_store.credential_value.
+# --------------------------------------------------------------------------- #
+
+#: Calls whose result is a store's ``{name: value}``.
+STORE_VALUE_PRODUCERS = frozenset({"read_store", "repository_values"})
+#: Reading a value out of such a dict. Names alone (``set(d)``, ``sorted(d)``,
+#: ``d.keys()``, ``k in d``) are fine: they are not credentials.
+VALUE_READS = frozenset({"get", "items", "values", "pop", "setdefault", "copy"})
+#: env_store functions that may touch the map itself, and why. Asserted exact.
+MAP_TOUCHERS = {
+    "credential_value": "THE gate",
+    "_load_repo_credentials": "writes it",
+    "reset_repo_credentials": "test-only clear",
+    "repo_credential_names": "names only",
+}
+
+
+def _outermost_functions(tree: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    found: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            found.append(node)
+        elif isinstance(node, ast.ClassDef):
+            found.extend(_outermost_functions(node))
+    return found
+
+
+def credential_value_bypasses(sources: dict[str, str]) -> list[str]:
+    found: list[str] = []
+    for module, source in sources.items():
+        tree = ast.parse(source)
+        for fn in _outermost_functions(tree):
+            bound: set[str] = set()
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.Assign)
+                    and isinstance(node.value, ast.Call)
+                    and getattr(
+                        node.value.func, "id", getattr(node.value.func, "attr", "")
+                    )
+                    in STORE_VALUE_PRODUCERS
+                ):
+                    bound |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+            for node in ast.walk(fn):
+                where = f"{module}:{fn.name}:{getattr(node, 'lineno', '?')}"
+                # The map itself.
+                if isinstance(node, ast.Name) and node.id == "_REPO_CREDENTIALS":
+                    if not (module == "pmcp.env_store" and fn.name in MAP_TOUCHERS):
+                        found.append(f"{where} touches the credential map")
+                    continue
+                if not bound:
+                    continue
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in bound
+                    and node.func.attr in VALUE_READS
+                ):
+                    found.append(
+                        f"{where} reads {node.func.value.id}.{node.func.attr}()"
+                    )
+                elif (
+                    isinstance(node, ast.Subscript)
+                    and isinstance(node.ctx, ast.Load)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in bound
+                ):
+                    found.append(f"{where} reads {node.value.id}[...]")
+                elif isinstance(node, ast.Call):
+                    func = node.func
+                    name = getattr(func, "id", getattr(func, "attr", ""))
+                    if name in ("dict", "update", "ChainMap") and any(
+                        isinstance(a, ast.Name) and a.id in bound for a in node.args
+                    ):
+                        found.append(f"{where} copies a store's values via {name}()")
+                elif isinstance(node, ast.Dict) and any(
+                    k is None and isinstance(v, ast.Name) and v.id in bound
+                    for k, v in zip(node.keys, node.values)
+                ):
+                    found.append(f"{where} copies a store's values via {{**...}}")
+    return found
+
+
+def test_only_credential_value_reads_a_credential() -> None:
+    assert credential_value_bypasses(_src_sources()) == []
+
+
+def test_the_map_touchers_all_exist() -> None:
+    tree = ast.parse(_src_sources()["pmcp.env_store"])
+    names = {f.name for f in _outermost_functions(tree)}
+    assert set(MAP_TOUCHERS) <= names
+
+
+def test_the_credential_value_scan_sees_each_shape() -> None:
+    source = (
+        "from pmcp.env_store import read_store, repository_values, _REPO_CREDENTIALS\n"
+        "def by_get(p):\n"
+        "    values = repository_values('project', project=p)\n"
+        "    return values.get('K')\n"
+        "def by_index(p):\n"
+        "    values = read_store('project', project=p)\n"
+        "    return values['K']\n"
+        "def by_items(p):\n"
+        "    values = read_store('user')\n"
+        "    return [v for _, v in values.items()]\n"
+        "def by_copy(p):\n"
+        "    values = read_store('user')\n"
+        "    merged = dict(values)\n"
+        "    return {**values}\n"
+        "def by_map():\n"
+        "    return _REPO_CREDENTIALS.get('K')\n"
+        "def names_only(p):\n"
+        "    values = read_store('user')\n"
+        "    return sorted(values), 'K' in values, credential_value('K', operator=values)\n"
+    )
+    hits = credential_value_bypasses({"pmcp.x": source})
+    flagged = {h.split(":")[1] for h in hits}
+    assert flagged == {"by_get", "by_index", "by_items", "by_copy", "by_map"}, hits

@@ -102,7 +102,11 @@ def test_a_startup_env_secret_never_reaches_a_spawned_server(
 
     cli.load_startup_env(project / ".env")
 
-    assert os.environ.get(SENTINEL) == "leaked-secret"
+    # A `.env` outside the operator's home is a repository file
+    # (Consiliency/pmcp#372): a credential the gateway can look up, never in
+    # its environment, so no child can inherit it.
+    assert credential_value(SENTINEL) == "leaked-secret"
+    assert SENTINEL not in os.environ
     assert SENTINEL not in sanitized_subprocess_env()
 
 
@@ -291,7 +295,7 @@ def test_the_servers_own_credential_still_resolves(
 
     cli.load_startup_env(project / ".env")
 
-    child = sanitized_subprocess_env({OWN_KEY: os.environ[OWN_KEY]})
+    child = sanitized_subprocess_env({OWN_KEY: credential_value(OWN_KEY) or ""})
 
     assert child[OWN_KEY] == "own-value"
 
@@ -306,10 +310,10 @@ def test_only_the_declared_key_is_injected(
 
     cli.load_startup_env(project / ".env")
 
-    child = sanitized_subprocess_env({OWN_KEY: os.environ[OWN_KEY]})
+    child = sanitized_subprocess_env({OWN_KEY: credential_value(OWN_KEY) or ""})
 
     assert OTHER_KEY not in child
-    assert os.environ[OTHER_KEY] == "other-value"  # the gateway still sees it
+    assert credential_value(OTHER_KEY) == "other-value"  # the gateway still sees it
 
 
 def test_the_registry_is_empty_without_main(

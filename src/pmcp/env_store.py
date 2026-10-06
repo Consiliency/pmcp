@@ -457,22 +457,46 @@ def is_pmcp_environment_name(key: str) -> bool:
     return upper in _PMCP_ENVIRONMENT_NAMES or upper.endswith("_PROXY")
 
 
-def credential_value(key: str) -> str | None:
-    """The credential named ``key``: the process environment, then repository files.
+def credential_value(
+    key: str,
+    *,
+    environ: bool = True,
+    operator: Mapping[str, str] | None = None,
+    repository: Mapping[str, str] | None = None,
+    startup_files: bool = True,
+) -> str | None:
+    """The credential named ``key``: THE one gate every credential read goes through.
 
-    THE lookup every credential read in ``src/pmcp`` uses -- a server's declared
-    credential, a remote ``${VAR}`` header, the availability checks -- so a
-    credential a project's ``.env.pmcp`` supplies still works although it is not
-    in ``os.environ``. The process environment (the shell, the user store) wins.
-    ``None`` for an empty value. A name pmcp reads from its own environment
-    (:func:`is_pmcp_environment_name`) is never answered from a repository file.
+    Every lookup that resolves a name in ``src/pmcp`` -- a server's declared
+    credential, a remote ``${VAR}`` header (project and tenant), the
+    availability checks, ``pmcp secrets check`` -- calls this, and nothing else
+    reads the credential map or a store's values
+    (``tests/test_store_reader_inventory.py``). Sources, in order:
+
+    1. the process environment (``environ``) -- the shell, the user store
+       loaded at startup;
+    2. ``repository`` -- a project or tenant store's values, read by the caller
+       through :func:`repository_values` (a project store overrides the user
+       store's file, as it always has for remote headers and ``secrets check``);
+    3. ``operator`` -- the user store's values, read by the caller;
+    4. the credentials repository files supplied at startup (``startup_files``).
+
+    Precedence is decided by MEMBERSHIP, not truthiness: the first source that
+    HAS the name decides, and an empty value there means "unavailable" -- an
+    operator's exported ``BRAVE_API_KEY=""`` is never filled from a project file.
+    A name pmcp itself reads from its environment (:func:`is_pmcp_environment_name`,
+    any case, any ``*_proxy``) is never answered from a repository source.
     """
-    value = os.environ.get(key)
-    if value:
-        return value
-    if is_pmcp_environment_name(key):
-        return None
-    return _REPO_CREDENTIALS.get(key) or None
+    if environ and key in os.environ:
+        return os.environ[key] or None
+    repository_may_answer = not is_pmcp_environment_name(key)
+    if repository_may_answer and repository is not None and key in repository:
+        return repository[key] or None
+    if operator is not None and key in operator:
+        return operator[key] or None
+    if repository_may_answer and startup_files and key in _REPO_CREDENTIALS:
+        return _REPO_CREDENTIALS[key] or None
+    return None
 
 
 def describe_ignored_store_env_var(variable: str, store_name: str) -> str:
@@ -484,23 +508,95 @@ def describe_ignored_store_env_var(variable: str, store_name: str) -> str:
     )
 
 
-def _load_repo_credentials(text: str, store_path: Path) -> None:
-    """Parse a repository file's text into :data:`_REPO_CREDENTIALS`.
+def describe_unresolved_store_value(variable: str, store_name: str) -> str:
+    """Value-free: a repository file's value refers to a variable it does not define."""
+    return (
+        f"Ignoring {variable} in {store_name}: its value refers to a variable the "
+        "file does not define, and a project file's values are never expanded from "
+        "your environment or your user store."
+    )
 
-    ``dotenv_values(interpolate=True)``: the same parser ``load_dotenv`` uses;
-    ``${X}`` resolves from the file first and then the environment (``load_dotenv``
-    with ``override=False`` preferred the environment), and a key already in the
-    map keeps its first value.
+
+def _repository_values(text: str, store_path: Path) -> dict[str, str]:
+    """A repository file's values, ``${X}`` expanded from the SAME file only.
+
+    Parsed with ``interpolate=False``, then each ``${X}`` is expanded from the
+    keys defined EARLIER in the same file (python-dotenv's own order), or from
+    its ``${X:-default}``. A reference to anything else -- the operator's
+    environment, the user store, another file -- is never expanded: the whole
+    binding is unavailable, with one value-free warning. Otherwise
+    ``LEAK=${PMCP_AUTH_TOKEN}`` would copy an operator secret into a new,
+    unrestricted name that a repository-configured header then sends
+    (Consiliency/pmcp#372 round 3). ``$X`` without braces is a literal, as
+    python-dotenv reads it.
     """
-    for key, value in dotenv_values(stream=io.StringIO(text), interpolate=True).items():
+    from dotenv.variables import Variable, parse_variables
+
+    resolved: dict[str, str] = {}
+    raw = dotenv_values(stream=io.StringIO(text), interpolate=False)
+    for key, value in raw.items():
+        if value is None:
+            continue
+        parts: list[str] = []
+        for atom in parse_variables(value):
+            if isinstance(atom, Variable):
+                if atom.name in resolved:
+                    parts.append(resolved[atom.name])
+                elif atom.default is not None:
+                    parts.append(atom.default)
+                else:
+                    _warn_store_refused(
+                        store_path,
+                        describe_unresolved_store_value(key, store_path.name),
+                    )
+                    break
+            else:
+                parts.append(atom.resolve({}))
+        else:
+            resolved[key] = "".join(parts)
+    return resolved
+
+
+def repository_values(
+    scope: StoreScope,
+    *,
+    project: Path | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, str]:
+    """A project or tenant store's credentials, for ``credential_value(repository=...)``.
+
+    Read as :func:`read_store` reads it (confined; a refused store is empty with
+    one warning), expanded within the file only (:func:`_repository_values`).
+    """
+    if scope == "user":
+        raise ValueError("the user store is the operator's: use read_store")
+    located = _locate_or_warn(
+        scope, project, tenant_id, None, strict=False, verb="read"
+    )
+    if located is None:
+        return {}
+    store_path, confinement = located
+    assert confinement is not None
+    text = _read_confined_text(store_path, confinement, strict=False, verb="read")
+    if text is None:
+        return {}
+    return _repository_values(text, store_path)
+
+
+def _load_repo_credentials(text: str, store_path: Path) -> None:
+    """Add a repository file's credentials to :data:`_REPO_CREDENTIALS`.
+
+    Expanded within the file only (:func:`_repository_values`); a key already in
+    the map keeps its first value, as ``load_dotenv(override=False)`` did.
+    """
+    for key, value in _repository_values(text, store_path).items():
         if is_pmcp_environment_name(key):
             # Warned here; refused where it would be answered -- the one gate is
             # credential_value, whatever put the name into the map.
             _warn_store_refused(
                 store_path, describe_ignored_store_env_var(key, store_path.name)
             )
-        if value is not None:
-            _REPO_CREDENTIALS.setdefault(key, value)
+        _REPO_CREDENTIALS.setdefault(key, value)
 
 
 def load_store(
@@ -536,24 +632,51 @@ def load_store(
         _load_repo_credentials(text, store_path)
 
 
+def _home_and_its_ancestors() -> set[tuple[int, int]]:
+    """``(st_dev, st_ino)`` of the operator's home directory and every ancestor.
+
+    The home directory is the one the user store was pinned under
+    (:func:`pin_user_store_path`). Identity, not path strings: a repository can
+    choose path spellings, not inodes.
+    """
+    home = pin_user_store_path().parent.parent.parent
+    identities: set[tuple[int, int]] = set()
+    for directory in (home, *home.parents):
+        try:
+            status = status_following_links(directory)
+        except OSError:
+            # Cannot look: not provably the operator's -- the file is then
+            # treated as a repository's, the safer reading.
+            continue
+        if status is not None:
+            identities.add((status.st_dev, status.st_ino))
+    return identities
+
+
 def load_discovered_dotenv(path: Path) -> None:
     """Load the ``.env`` python-dotenv's startup walk found, by WHERE it is.
 
-    The walk starts at pmcp's installed files. Inside a project -- pmcp
-    installed in a checkout's ``.venv`` by ``uv run`` or ``pip install -e`` --
-    the file is the repository's: read confined, into the credential map. Outside
-    every project -- ``~/.env`` for a ``uv tool`` or ``pip --user`` install --
-    it is the operator's own and loads into the environment as before, following
-    its link, with no warning.
+    The walk starts at pmcp's installed files. The file is the operator's only
+    when it sits in the home directory itself or in an ANCESTOR of it -- a
+    ``uv tool`` or ``pip --user`` install's walk reaches ``~/.env`` -- and then
+    it loads into the environment as before, following its link, with no
+    warning. Anywhere else it is a repository's: pmcp installed in a checkout's
+    ``.venv`` (``uv run``, ``pip install -e``, ``pip install -r
+    requirements.txt``) reaches that checkout's ``.env`` whatever marker files
+    the checkout has, so it is read confined, into the credential map
+    (Consiliency/pmcp#372 round 3: a marker-file test let a ``setup.py`` or
+    ``requirements.txt`` checkout's ``.env`` through).
     """
     from dotenv import load_dotenv
 
-    project_root = find_project_root(path.parent)
-    cwd_root = find_project_root(Path.cwd())
-    inside_a_project = project_root is not None or (
-        cwd_root is not None and path.is_relative_to(cwd_root)
+    try:
+        directory = status_following_links(path.parent)
+    except OSError:
+        directory = None
+    operators = directory is not None and (
+        (directory.st_dev, directory.st_ino) in _home_and_its_ancestors()
     )
-    if inside_a_project:
+    if not operators:
         load_store("project", path=path)
         return
     text = _read_user_text(path, verb="load")
