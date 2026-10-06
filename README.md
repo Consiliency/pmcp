@@ -1824,7 +1824,13 @@ Hosted operators should require Bearer auth on `/mcp`, tune `--rate-limit` or
 network controls. `gateway.refresh`, `gateway.disconnect_server`, and
 `gateway.restart_server` can disrupt in-flight downstream work unless forced by
 policy; use downstream task IDs with `gateway.tasks_cancel` for tenant run
-cancellation. PMCP task records are transient. Durable sandbox logs, artifacts,
+cancellation. PMCP task records are transient, and bounded: at most 100 per
+server and 1000 in total. To cancel a task pmcp no longer tracks, call
+`gateway.tasks_get` first, which tracks it again. A forced disconnect,
+restart or refresh cancels only the tasks pmcp still tracks when it starts.
+On a remote tenant server, a task that was evicted before then keeps running
+after the disconnect. Cancel it explicitly first, with `gateway.tasks_get`
+and then `gateway.tasks_cancel`. Durable sandbox logs, artifacts,
 tenant authorization, and artifact retention remain responsibilities of the
 companion tenant server and its deployment controls.
 

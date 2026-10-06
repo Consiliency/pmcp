@@ -1847,6 +1847,11 @@ async def test_a_forced_disconnect_cancelled_during_its_task_cancel_kills_the_tr
     pids = [int(p) for p in pidfile.read_text().split()]
     active = MagicMock()
     active.task_id = "task-1"
+    # the teardown sends a task's cancel only on the connection its record
+    # came from (Consiliency/pmcp#338): this one is of server "srv" and
+    # unbound, so it belongs to the current connection
+    active.server_name = "srv"
+    active._connection_id = None
     seen = tmp_path / "srv.pids.cancel"
     try:
         record = MagicMock(requestor_context=None)

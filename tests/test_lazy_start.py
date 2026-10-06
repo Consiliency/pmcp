@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pmcp.manifest.loader import Manifest, ServerConfig
+from pmcp.client.manager import TaskReply
 from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig, ServerStatusEnum
 
 
@@ -807,7 +808,9 @@ class TestGatewayToolsLazyStart:
         mock_client_manager.is_lazy_server.return_value = True
         mock_client_manager.ensure_connected = AsyncMock(return_value=True)
         mock_client_manager.is_server_online.return_value = True
-        mock_client_manager.call_tool = AsyncMock(return_value={"result": "ok"})
+        mock_client_manager.call_tool_with_task = AsyncMock(
+            return_value=TaskReply({"result": "ok"}, None)
+        )
 
         tools = GatewayTools(
             client_manager=mock_client_manager,
@@ -916,7 +919,9 @@ class TestGatewayToolsLazyStart:
         mock_client_manager.get_tool.return_value = tool_info
         mock_client_manager.is_lazy_server.return_value = False
         mock_client_manager.is_server_online.return_value = True
-        mock_client_manager.call_tool = AsyncMock(return_value={"result": "ok"})
+        mock_client_manager.call_tool_with_task = AsyncMock(
+            return_value=TaskReply({"result": "ok"}, None)
+        )
 
         tools = GatewayTools(
             client_manager=mock_client_manager,

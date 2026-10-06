@@ -59,6 +59,7 @@ from pmcp.manifest import loader as manifest_loader
 from pmcp.transport import http as transport_http
 from pmcp.env_store import reset_dotenv_keys, reset_pmcp_introduced_keys
 from pmcp.policy.policy import PolicyManager
+from tests.task_reply_double import TaskReplyDouble
 from pmcp.types import (
     LocalMcpServerConfig,
     ResolvedServerConfig,
@@ -573,7 +574,7 @@ def sample_server_configs() -> list[ResolvedServerConfig]:
 # === Mock Client Manager ===
 
 
-class MockClientManager:
+class MockClientManager(TaskReplyDouble):
     """Mock client manager for testing gateway tools."""
 
     def __init__(
