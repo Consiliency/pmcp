@@ -612,14 +612,16 @@ def _is_response_decode_error(error: BaseException) -> bool:
 
 def _response_status(error: BaseException) -> int | None:
     """The HTTP status a response error records, as an int, if any."""
-    for value in (
-        getattr(error, "status", None),
-        getattr(error, "code", None),
-        getattr(getattr(error, "response", None), "status_code", None),
-    ):
-        if type(value) is int:
-            return value
-    return None
+    # One at a time: aiohttp's deprecated `code` is read only when there is
+    # no `status` (urllib's `HTTPError` has `code` alone).
+    status = getattr(error, "status", None)
+    if type(status) is int:
+        return status
+    code = getattr(error, "code", None)
+    if type(code) is int:
+        return code
+    response_status = getattr(getattr(error, "response", None), "status_code", None)
+    return response_status if type(response_status) is int else None
 
 
 _VALUE_BEARING: tuple[type[BaseException], ...] = ()
