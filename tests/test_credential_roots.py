@@ -895,3 +895,219 @@ def test_an_unspecified_project_is_the_served_one(
     assert env_store.resolve_scope_path("project") == roots["b"] / ".env.pmcp"
     # An explicit project is still that project.
     assert env_store.resolve_project_root(roots["a"]) == roots["a"]
+
+
+# --------------------------------------------------------------------------- #
+# Board round 11, codex F001: ``cli.serve_project(B)`` switched credentials to
+# B while the project manifest overlay was still found by walking up from the
+# working directory, so ``pmcp --project B`` started inside A paired A's
+# approved overlay endpoint with B's token. Every project-scoped input now
+# follows the served root (or an explicit project); this grid gives each root
+# its own manifest overlay, policy and ``.mcp.json`` and checks each one.
+# --------------------------------------------------------------------------- #
+
+
+def _distinct_projects(roots: dict[str, Path], key: str) -> None:
+    """Per root: an approved overlay, an approved policy, an approved .mcp.json."""
+    import json
+
+    from pmcp import trust_store
+
+    for name in ("a", "b"):
+        root = roots[name]
+        overlay = root / ".pmcp" / "manifest.yaml"
+        overlay.parent.mkdir(exist_ok=True)
+        overlay.write_text(
+            json.dumps(
+                {
+                    "servers": {
+                        "review-remote": {
+                            "description": "Project-specific remote",
+                            "keywords": ["review"],
+                            "transport": "streamable-http",
+                            "url": f"https://{name}.example.invalid/mcp",
+                            "headers": {"Authorization": "Bearer ${" + key + "}"},
+                        }
+                    }
+                }
+            )
+        )
+        policy = root / ".mcp-gateway-policy.yaml"
+        policy.write_text(f"servers:\n  denylist:\n    - only-{name}-denies\n")
+        mcp = root / ".mcp.json"
+        mcp.write_text(
+            json.dumps({"mcpServers": {f"local-{name}": {"command": "true"}}})
+        )
+        (root / ".env.pmcp").write_text(f"{key}=credential-{name}\n")
+        for path, scope in (
+            (overlay, "project_manifest"),
+            (policy, "project_policy"),
+            (mcp, "project"),
+        ):
+            trust_store.record(path, path.read_bytes(), "project", trust_store.APPROVED)
+
+
+@pytest.mark.parametrize("mode", ["served", "explicit"])
+def test_every_project_scoped_input_comes_from_the_served_project(
+    mode: str, roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Started in A, serving B: manifest overlay, policy, .mcp.json, credentials -- B's.
+
+    ``served``: the ``pmcp --project B`` startup (``serve_project(B)``), every
+    consumer handed nothing. ``explicit``: the process serves A, and each
+    consumer is handed B (``GatewayServer(project_root=B)`` in library use).
+    """
+    from pmcp.client.manager import _remote_headers
+    from pmcp.config.loader import load_configs, resolve_startup_configs
+    from pmcp.manifest.loader import load_manifest
+    from pmcp.policy.policy import PolicyManager
+
+    key = "REVIEW_SHARED_TOKEN"
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("PMCP_MANIFEST_PATH", raising=False)
+    _distinct_projects(roots, key)
+    _startup(roots)  # in a
+    if mode == "served":
+        cli.serve_project(roots["b"])
+        project = None
+    else:
+        project = roots["b"]
+
+    manifest = load_manifest(project_root=project)
+    assert manifest.servers["review-remote"].url == "https://b.example.invalid/mcp"
+
+    names = {c.name for c in load_configs(project_root=project)}
+    assert "local-b" in names and "local-a" not in names
+
+    policy = PolicyManager(project_root=project)
+    assert not policy.is_server_allowed("only-b-denies")
+    assert policy.is_server_allowed("only-a-denies")
+
+    resolution = resolve_startup_configs(
+        [],
+        manifest_servers=manifest.servers,
+        enabled_auto_start={"review-remote"},
+        project_root=project,
+    )
+    [target] = [c for c in resolution.eager_configs if c.name == "review-remote"]
+    headers = _remote_headers(target.name, target.config, project_root=project)
+    # Endpoint and credential: always one project's.
+    assert (target.config.url, headers) == (
+        "https://b.example.invalid/mcp",
+        {"Authorization": "Bearer credential-b"},
+    )
+
+
+def test_codex_r11_f001_manifest_and_credentials_stay_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex r11 F001, verbatim in substance."""
+    import json
+
+    from pmcp import trust_store
+    from pmcp.client.manager import _remote_headers
+    from pmcp.config.loader import resolve_startup_configs
+    from pmcp.manifest.loader import load_manifest
+
+    home = tmp_path / "home"
+    home.mkdir()
+    a, b = tmp_path / "a", tmp_path / "b"
+    key = "REVIEW_SHARED_TOKEN"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("PMCP_MANIFEST_PATH", raising=False)
+    monkeypatch.setattr(trust_store, "_active_project_root", None)
+    for root in (a, b):
+        (root / ".git").mkdir(parents=True)
+        overlay = root / ".pmcp" / "manifest.yaml"
+        overlay.parent.mkdir()
+        overlay.write_text(
+            json.dumps(
+                {
+                    "servers": {
+                        "review-remote": {
+                            "description": "Project-specific remote",
+                            "keywords": ["review"],
+                            "transport": "streamable-http",
+                            "url": f"https://{root.name}.example.invalid/mcp",
+                            "headers": {"Authorization": "Bearer ${" + key + "}"},
+                        }
+                    }
+                }
+            )
+        )
+        (root / ".env.pmcp").write_text(f"{key}=credential-{root.name}\n")
+    monkeypatch.chdir(a)
+    for root in (a, b):
+        overlay = root / ".pmcp" / "manifest.yaml"
+        trust_store.record(
+            overlay, overlay.read_bytes(), "project", trust_store.APPROVED
+        )
+
+    cli.load_startup_env(dotenv_path=home / "absent.env")
+    cli.serve_project(b)
+    trust_store.set_active_project_root(b)
+    manifest = load_manifest()
+    resolution = resolve_startup_configs(
+        [],
+        manifest_servers=manifest.servers,
+        enabled_auto_start={"review-remote"},
+        project_root=b,
+    )
+    [target] = [c for c in resolution.eager_configs if c.name == "review-remote"]
+    headers = _remote_headers(target.name, target.config, project_root=b)
+    assert (target.config.url, headers) == (
+        "https://b.example.invalid/mcp",
+        {"Authorization": "Bearer credential-b"},
+    ), "A's manifest must not receive B's project credential"
+
+
+@pytest.mark.parametrize("mode", ["served", "explicit"])
+def test_the_gateway_and_the_cli_read_the_served_project(
+    mode: str, roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same rule through the gateway's own construction and the CLI helpers."""
+    import contextlib
+    import io
+
+    from pmcp import server as server_module
+
+    key = "REVIEW_SHARED_TOKEN"
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("PMCP_MANIFEST_PATH", raising=False)
+    _distinct_projects(roots, key)
+    _startup(roots)  # in a
+    if mode == "served":
+        cli.serve_project(roots["b"])
+        project = None
+    else:
+        project = roots["b"]
+
+    # The gateway: its policy, and the manifest its startup resolves.
+    gateway = server_module.GatewayServer(
+        project_root=project, cache_dir=roots["base"] / "cache"
+    )
+    assert not gateway._policy_manager.is_server_allowed("only-b-denies")
+    assert gateway._policy_manager.is_server_allowed("only-a-denies")
+    captured: dict[str, object] = {}
+
+    def capture(*_a: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+        raise _Captured(kwargs)
+
+    monkeypatch.setattr(server_module, "resolve_startup_configs", capture)
+    with pytest.raises(_Captured):
+        asyncio.run(gateway.initialize())
+    servers = captured["manifest_servers"]
+    assert servers["review-remote"].url == "https://b.example.invalid/mcp"  # type: ignore[index]
+
+    # The CLI's local .mcp.json (pmcp doctor), and where pmcp init writes.
+    path, data = cli._load_local_mcp_json(project)
+    assert path == roots["b"] / ".mcp.json"
+    assert data is not None and "local-b" in data["mcpServers"]
+    (roots["b"] / ".mcp.json").unlink()
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+    with contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(cli.run_init(argparse.Namespace(project=project, force=True)))
+    assert (roots["b"] / ".mcp.json").exists()
+    assert "local-a" in (roots["a"] / ".mcp.json").read_text()

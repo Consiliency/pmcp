@@ -369,7 +369,10 @@ def _refresh_config_unchanged(
 
 
 def _materialised_pin(
-    server_name: str, resolved: ResolvedServerConfig, pinned_to: str
+    server_name: str,
+    resolved: ResolvedServerConfig,
+    pinned_to: str,
+    project_root: Path | None = None,
 ) -> str | None:
     """The manifest pin pmcp materialised, if it is what this config runs.
 
@@ -389,7 +392,7 @@ def _materialised_pin(
         return None
     if config.cwd or npm_env_may_redirect(server_name, (config.env or {}).keys()):
         return None
-    manifest_server = load_manifest().get_server(server_name)
+    manifest_server = load_manifest(project_root=project_root).get_server(server_name)
     if manifest_server is None or manifest_server.version is None:
         return None
     if [config.command, *config.args] != [
@@ -1302,7 +1305,7 @@ class GatewayTools:
         scoped_advisor = self._policy_manager.scoped_advisor_active is True
         query = parsed.query.strip() if parsed.query else ""
         if query and not scoped_advisor:
-            manifest = load_manifest()
+            manifest = load_manifest(project_root=self._project_root)
             detected_clis, detected_cli_infos = await self._resolve_cli_availability(
                 manifest
             )
@@ -1410,7 +1413,7 @@ class GatewayTools:
         if parsed.include_offline and parsed.query and not scoped_advisor:
             manifest_candidates = self._manifest_candidates_for_query(
                 parsed.query,
-                manifest=load_manifest(),
+                manifest=load_manifest(project_root=self._project_root),
                 configured_servers=self._load_configured_servers(),
                 exclude_servers=represented_servers,
                 limit=min(5, parsed.limit),
@@ -2005,7 +2008,7 @@ class GatewayTools:
 
             manifest_servers = {}
             try:
-                manifest = load_manifest()
+                manifest = load_manifest(project_root=self._project_root)
                 manifest_servers = manifest.servers
             except Exception as e:
                 # Class only: an error's text can quote overlay input
@@ -2430,7 +2433,7 @@ class GatewayTools:
             project_root=self._project_root,
             custom_config_path=self._custom_config_path,
         )
-        manifest = load_manifest().servers
+        manifest = load_manifest(project_root=self._project_root).servers
         provisioned = self._load_provisioned_registry()
         discovered = self._discovered_server_configs
         enabled = load_enabled_auto_start(
@@ -2525,7 +2528,7 @@ class GatewayTools:
             project_root=self._project_root,
             custom_config_path=self._custom_config_path,
         )
-        manifest = load_manifest().servers
+        manifest = load_manifest(project_root=self._project_root).servers
         known_names = {config.name for config in configured} | set(manifest)
         return get_startup_policy(
             project_root=self._project_root,
@@ -2782,7 +2785,9 @@ class GatewayTools:
         correct after a credential is migrated to the namespaced key.
         """
         options: list[str] = []
-        manifest_server = load_manifest().get_server(server_name)
+        manifest_server = load_manifest(project_root=self._project_root).get_server(
+            server_name
+        )
         for key in credential_lookup_keys(manifest_server):
             if key not in options:
                 options.append(key)
@@ -2815,7 +2820,9 @@ class GatewayTools:
         `(manifest_server, auth_env_options)` when the credential is still
         required and unavailable, else `None`.
         """
-        manifest_server = load_manifest().get_server(server_name)
+        manifest_server = load_manifest(project_root=self._project_root).get_server(
+            server_name
+        )
         if not manifest_server or not manifest_server.env_var:
             return None
 
@@ -3211,7 +3218,7 @@ class GatewayTools:
                 )
             return (configured, None, "configured")
 
-        manifest = load_manifest()
+        manifest = load_manifest(project_root=self._project_root)
         server_config = manifest.get_server(server_name)
         # As in `provision`: the gate's source is which lookup matched.
         source: ProvisionSource = "manifest"
@@ -3489,7 +3496,7 @@ class GatewayTools:
 
     def _get_server_config_for_update(self, server_name: str) -> ServerConfig | None:
         """Resolve server config from manifest or discovered candidates."""
-        manifest = load_manifest()
+        manifest = load_manifest(project_root=self._project_root)
         server_config = manifest.get_server(server_name)
         if server_config:
             return server_config
@@ -3724,7 +3731,7 @@ class GatewayTools:
         self._record_feedback_event("capability_request", {"query": parsed.query})
 
         # Load manifest
-        manifest = load_manifest()
+        manifest = load_manifest(project_root=self._project_root)
         configured_servers = self._load_configured_servers()
 
         merged_manifest = self._build_manifest_with_config_servers(
@@ -4261,7 +4268,7 @@ class GatewayTools:
             )
 
         # Load manifest
-        manifest = load_manifest()
+        manifest = load_manifest(project_root=self._project_root)
         server_config = manifest.get_server(server_name)
         # The gate's `source` is WHICH LOOKUP found the config -- never a field
         # on it, since a discovered config is composed from agent input.
@@ -4701,7 +4708,7 @@ class GatewayTools:
                 auth_state="missing_auth",
             )
 
-        manifest = load_manifest()
+        manifest = load_manifest(project_root=self._project_root)
         server_config = manifest.get_server(server_name)
         # Resolve the server's declared credential variable from both the
         # manifest and the discovered-server registry: discovered servers
@@ -5287,7 +5294,7 @@ class GatewayTools:
                 package_type=package_type,
                 package_name=package_name,
                 pinned_version=_materialised_pin(
-                    server_name, resolved_config, pinned_to
+                    server_name, resolved_config, pinned_to, self._project_root
                 ),
                 message=(
                     f"'{server_name}' is pinned to '{pinned_to}' in {source_desc} "
@@ -5971,7 +5978,7 @@ class GatewayTools:
 
         try:
             # Build config from manifest
-            manifest = load_manifest()
+            manifest = load_manifest(project_root=self._project_root)
             server_config = manifest.get_server(job_server_name)
             if not server_config:
                 raise ValueError(f"Server '{job_server_name}' not found in manifest")
@@ -6158,7 +6165,7 @@ class GatewayTools:
         else:
             platform = detect_platform()
 
-        manifest = load_manifest()
+        manifest = load_manifest(project_root=self._project_root)
 
         # Use provided or probe CLIs
         if parsed.detected_clis:

@@ -80,7 +80,7 @@ def _extract_required_keys(
     configs = load_configs(project_root=project_root)
 
     try:
-        manifest_by_name = load_manifest().servers
+        manifest_by_name = load_manifest(project_root=project_root).servers
     except Exception:
         manifest_by_name = {}
 
@@ -169,7 +169,9 @@ def _extract_required_keys(
             per_server[cfg.name] = server_keys
 
     try:
-        manifest_servers = list(load_manifest().servers.values())
+        manifest_servers = list(
+            load_manifest(project_root=project_root).servers.values()
+        )
     except Exception:
         manifest_servers = []
     for server in manifest_servers:

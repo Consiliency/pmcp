@@ -326,7 +326,9 @@ def _iter_config_source_paths(
     custom_config_path: Path | None = None,
 ) -> list[tuple[ConfigSourceName, Path]]:
     paths: list[tuple[ConfigSourceName, Path]] = []
-    resolved_project_root = project_root or find_project_root(Path.cwd())
+    # The served project, or the caller's (Consiliency/pmcp#372 round 12):
+    # never the working directory's when they differ.
+    resolved_project_root = _project_scope_root(project_root)
     if resolved_project_root:
         paths.append(("project", resolved_project_root / ".mcp.json"))
 
@@ -1150,7 +1152,7 @@ def load_configs(
     try:
         from pmcp.manifest.loader import load_manifest
 
-        manifest_servers = load_manifest().servers
+        manifest_servers = load_manifest(project_root=project_root).servers
     except Exception as e:
         # Class only: an error's text can quote overlay input
         # (Consiliency/pmcp#342 rev 5).
@@ -1195,7 +1197,9 @@ def load_configs(
         )
 
     # 1. Load project config (highest priority)
-    resolved_project_root = project_root or find_project_root(Path.cwd())
+    # The served project, or the caller's (Consiliency/pmcp#372 round 12):
+    # never the working directory's when they differ.
+    resolved_project_root = _project_scope_root(project_root)
     # Credentials a configured entry inherits are its own project's.
     credentials = _credential_value_for(resolved_project_root)
     if resolved_project_root:
@@ -1283,7 +1287,9 @@ def load_disabled_auto_start(
 
     # Check project config -- gated: a repository must not be able to switch
     # off the operator's auto-start just by shipping a file.
-    resolved_project_root = project_root or find_project_root(Path.cwd())
+    # The served project, or the caller's (Consiliency/pmcp#372 round 12):
+    # never the working directory's when they differ.
+    resolved_project_root = _project_scope_root(project_root)
     if resolved_project_root:
         project_config = _parse_gated_project_config(
             resolved_project_root / ".mcp.json"
@@ -1330,7 +1336,9 @@ def load_enabled_auto_start(
 
     # Check project config -- gated: auto-start is the difference between a
     # declared server and a server the operator's shell actually launches.
-    resolved_project_root = project_root or find_project_root(Path.cwd())
+    # The served project, or the caller's (Consiliency/pmcp#372 round 12):
+    # never the working directory's when they differ.
+    resolved_project_root = _project_scope_root(project_root)
     if resolved_project_root:
         project_config = _parse_gated_project_config(
             resolved_project_root / ".mcp.json"
@@ -1416,6 +1424,13 @@ def _coerce_manifest_servers(
     if isinstance(manifest_servers, Mapping):
         return dict(manifest_servers)
     return {server.name: server for server in manifest_servers}
+
+
+def _project_scope_root(project_root: Path | None) -> Path | None:
+    """``env_store.project_scope_root``, imported late (env_store imports this module)."""
+    from pmcp.env_store import project_scope_root
+
+    return project_scope_root(project_root)
 
 
 def _credential_value_for(root: Path | None) -> Callable[[str], str | None]:

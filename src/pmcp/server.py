@@ -146,7 +146,7 @@ class GatewayServer:
         self._lock_dir: Path | None = Path(lock_dir) if lock_dir else None
 
         # Initialize policy manager
-        self._policy_manager = PolicyManager(policy_path)
+        self._policy_manager = PolicyManager(policy_path, project_root=project_root)
         self._scoped_advisor_audit: ScopedAdvisorAudit | None = None
         self._audit_jsonl = Path(audit_jsonl) if audit_jsonl is not None else None
         if audit_jsonl is not None:
@@ -733,7 +733,7 @@ class GatewayServer:
         manifest = None
         manifest_servers = {}
         try:
-            manifest = load_manifest()
+            manifest = load_manifest(project_root=self._project_root)
             manifest_servers = manifest.servers
         except Exception as e:
             # Class only: an error's text can quote overlay input (Consiliency/pmcp#342).

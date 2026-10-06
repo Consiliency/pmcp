@@ -130,7 +130,9 @@ def _value_separator(full_match: str) -> int:
 
 
 # Search order for an auto-discovered policy. The project-local entries are kept
-# RELATIVE on purpose: they are resolved against `Path.cwd()` when a
+# RELATIVE on purpose: they are resolved against the project root (the
+# served one, or the manager's `project_root`; Consiliency/pmcp#372 round 12)
+# -- formerly `Path.cwd()` -- when a
 # `PolicyManager` is constructed, not when this module is imported. Storing them
 # pre-joined froze the working directory as of import, so a gateway that changed
 # directory before constructing its manager looked for a policy in the wrong
@@ -207,9 +209,21 @@ DEFAULT_POLICY_PATHS: Sequence[Path] = _FrozenDefault(
 _FROZEN_DEFAULT_POLICY_PATHS = DEFAULT_POLICY_PATHS
 
 
-def _resolve_against_cwd(paths: Sequence[Path]) -> list[Path]:
-    cwd = Path.cwd()
-    return [path if path.is_absolute() else cwd / path for path in paths]
+def _resolve_against_project(
+    paths: Sequence[Path], project_root: Path | None = None
+) -> list[Path]:
+    """Relative entries against the project: ``project_root``, else the served one.
+
+    The project policy is a project-scoped input, so it follows the same root
+    as the project's ``.mcp.json``, manifest overlay and credentials --
+    ``--project`` when given, never the working directory when the two differ
+    (Consiliency/pmcp#372 round 12, board round 11 codex F001). Absolute
+    entries -- the operator's own -- pass through.
+    """
+    from pmcp.env_store import resolve_project_root
+
+    base = resolve_project_root(project_root)
+    return [path if path.is_absolute() else base / path for path in paths]
 
 
 def _effective_user_policy_paths() -> Sequence[Path]:
@@ -223,7 +237,7 @@ def _effective_user_policy_paths() -> Sequence[Path]:
     return USER_POLICY_PATHS
 
 
-def _default_policy_paths() -> list[Path]:
+def _default_policy_paths(project_root: Path | None = None) -> list[Path]:
     """Resolve the search list against the *current* working directory.
 
     Read the module attribute at call time so a monkeypatched list is honoured.
@@ -231,10 +245,10 @@ def _default_policy_paths() -> list[Path]:
     searched user entries and the ungated user entries are always the same set.
     """
     if DEFAULT_POLICY_PATHS is _FROZEN_DEFAULT_POLICY_PATHS:
-        return _resolve_against_cwd(
-            [*PROJECT_POLICY_PATHS, *_effective_user_policy_paths()]
+        return _resolve_against_project(
+            [*PROJECT_POLICY_PATHS, *_effective_user_policy_paths()], project_root
         )
-    return _resolve_against_cwd(DEFAULT_POLICY_PATHS)
+    return _resolve_against_project(DEFAULT_POLICY_PATHS, project_root)
 
 
 def _user_policy_paths() -> set[Path]:
@@ -245,7 +259,7 @@ def _user_policy_paths() -> set[Path]:
     otherwise be measured against the real `~/.claude` entries captured when this
     module was first imported.
     """
-    return set(_resolve_against_cwd(_effective_user_policy_paths()))
+    return set(_resolve_against_project(_effective_user_policy_paths()))
 
 
 def _effective_redaction_patterns(policy: GatewayPolicy) -> list[str]:
@@ -261,7 +275,9 @@ def _effective_redaction_patterns(policy: GatewayPolicy) -> list[str]:
 class PolicyManager:
     """Manages gateway policy including allow/deny lists, limits, and redaction."""
 
-    def __init__(self, policy_path: Path | None = None) -> None:
+    def __init__(
+        self, policy_path: Path | None = None, project_root: Path | None = None
+    ) -> None:
         self._policy = GatewayPolicy()
         #: An approved project-scoped policy, composed *conjunctively* with
         #: `_policy` by every predicate below. `None` means there is none -- a
@@ -272,6 +288,9 @@ class PolicyManager:
         self._user_policy_loaded = False
         self._redaction_regexes: list[re.Pattern[str]] = []
         self._explicit_policy = policy_path is not None
+        #: The project whose ``.mcp-gateway-policy.*`` is discovered: ``None``
+        #: is the served project (Consiliency/pmcp#372 round 12).
+        self._project_root = project_root
         self._scoped_advisor_active = False
 
         if policy_path:
@@ -304,7 +323,7 @@ class PolicyManager:
         user_candidate: Path | None = None
         project_candidate: Path | None = None
 
-        for candidate in _default_policy_paths():
+        for candidate in _default_policy_paths(self._project_root):
             if candidate in user_paths:
                 if user_candidate is None and candidate.exists():
                     user_candidate = candidate

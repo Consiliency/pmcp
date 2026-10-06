@@ -46,6 +46,7 @@ from pmcp.env_store import (
     load_store,
     mark_startup_loaded,
     pin_user_store_path,
+    resolve_project_root,
     serve_project_root,
     record_pmcp_introduced_keys,
 )
@@ -984,7 +985,9 @@ async def run_update(args: argparse.Namespace) -> None:
         sys.exit(2)
 
     policy_path = args.policy if hasattr(args, "policy") else None
-    policy_manager = PolicyManager(policy_path)
+    policy_manager = PolicyManager(
+        policy_path, project_root=getattr(args, "project", None)
+    )
     client_manager = ClientManager(
         max_tools_per_server=policy_manager.get_max_tools_per_server()
     )
@@ -1275,7 +1278,9 @@ async def run_status(args: argparse.Namespace) -> None:
 
     # Initialize components
     policy_path = args.policy if hasattr(args, "policy") else None
-    policy_manager = PolicyManager(policy_path)
+    policy_manager = PolicyManager(
+        policy_path, project_root=getattr(args, "project", None)
+    )
     client_manager = ClientManager(
         max_tools_per_server=policy_manager.get_max_tools_per_server()
     )
@@ -1662,7 +1667,9 @@ async def run_init(args: argparse.Namespace) -> None:
 
     from pmcp.manifest.loader import load_manifest
 
-    project_dir = args.project or Path.cwd()
+    # The project named, else the one this process serves (Consiliency/pmcp#372
+    # round 12): a project-scoped output follows the same root as every input.
+    project_dir = resolve_project_root(args.project)
     config_path = project_dir / ".mcp.json"
 
     # Check if config already exists
@@ -1675,7 +1682,7 @@ async def run_init(args: argparse.Namespace) -> None:
 
     # Load manifest to get available servers
     try:
-        manifest = load_manifest()
+        manifest = load_manifest(project_root=project_dir)
         available_servers = list(manifest.servers.keys())
     except Exception:
         manifest = None
@@ -2023,9 +2030,8 @@ def _is_pmcp_system_service_active() -> bool | None:
 
 def _load_local_mcp_json(project_root: Path | None) -> tuple[Path, dict | None]:
     """Load local .mcp.json, if present and valid JSON."""
-    from pmcp.config.loader import find_project_root
-
-    base_dir = project_root or find_project_root(Path.cwd()) or Path.cwd()
+    # The served project, or the one named (Consiliency/pmcp#372 round 12).
+    base_dir = resolve_project_root(project_root)
     config_path = base_dir / ".mcp.json"
     if not config_path.exists():
         return config_path, None
@@ -2828,7 +2834,9 @@ def _build_gateway_auth_client(args: argparse.Namespace) -> tuple[Any, Any]:
     setup_logging(args.log_level)
 
     policy_path = args.policy if hasattr(args, "policy") else None
-    policy_manager = PolicyManager(policy_path)
+    policy_manager = PolicyManager(
+        policy_path, project_root=getattr(args, "project", None)
+    )
     client_manager = ClientManager(
         max_tools_per_server=policy_manager.get_max_tools_per_server()
     )

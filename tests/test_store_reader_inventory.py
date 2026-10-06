@@ -1319,3 +1319,93 @@ def test_the_consumer_scan_sees_each_shape() -> None:
         ("pmcp.x", "start_for_nobody"),
         ("pmcp.x", "tenant_for_nobody"),
     }
+
+
+# --------------------------------------------------------------------------- #
+# One root per process (Consiliency/pmcp#372 round 12, board round 11 codex
+# F001): ``pmcp --project B`` started inside A paired A's manifest overlay --
+# found by walking up from the working directory -- with B's credentials. Every
+# project-scoped input (credentials, tenant stores, ``.mcp.json``, the manifest
+# overlay, the project policy) follows the served root or an explicit project.
+# Deriving a project from the working directory happens in ONE function, which
+# sets the served root; any other use of the working directory is listed here
+# with the reason it is not a project-scoped input.
+# --------------------------------------------------------------------------- #
+
+#: Calls that read the working directory, or walk up from one for a project.
+CWD_CALLS = frozenset({"cwd", "getcwd", "find_project_root"})
+
+#: ``(module, function)`` -> why it may read the working directory. Asserted
+#: exact.
+CWD_READERS = {
+    ("pmcp.env_store", "_discover_project_root"): (
+        "THE derivation of a project from where pmcp started: its answer is "
+        "the served root (serve_project_root)"
+    ),
+    ("pmcp.env_store", "resolve_project_root"): (
+        "an explicit RELATIVE --project is joined to the working directory, "
+        "as the operator typed it"
+    ),
+    ("pmcp.trust_store", "_checkout_roots"): (
+        "the residency guard also refuses a trust store inside the checkout "
+        "pmcp was launched from; adding roots only refuses more"
+    ),
+    ("pmcp.trust_store", "_enclosing_checkouts"): (
+        "walks up from a path it is given (the guard's roots, the path being "
+        "approved) to the checkouts enclosing it; refusal-only"
+    ),
+    ("pmcp.manifest.environment", "get_environment_info"): (
+        "reports the working directory as a fact about the environment; no "
+        "project input is read from it"
+    ),
+    ("pmcp.manifest.npm_resolver", "_has_local_prefix"): (
+        "npm itself resolves from the spawn's working directory, so the "
+        "shadow check must look where npm will"
+    ),
+}
+
+
+def cwd_readers(sources: dict[str, str]) -> set[tuple[str, str]]:
+    """``(module, function)`` of every function that reads the working directory."""
+    found: set[tuple[str, str]] = set()
+    for module, source in sources.items():
+        tree = ast.parse(source)
+        for name, fn in _qualified_functions(tree):
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                called = getattr(func, "attr", getattr(func, "id", None))
+                if called in CWD_CALLS:
+                    found.add((module, name))
+                    break
+    return found
+
+
+def test_only_the_served_root_derivation_reads_the_working_directory() -> None:
+    assert cwd_readers(_src_sources()) == set(CWD_READERS)
+
+
+def test_the_cwd_scan_sees_each_shape() -> None:
+    source = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "from pmcp.config.loader import find_project_root\n"
+        "def by_path():\n"
+        "    return Path.cwd() / '.mcp.json'\n"
+        "def by_os():\n"
+        "    return os.getcwd()\n"
+        "def by_walk():\n"
+        "    return find_project_root(Path('.'))\n"
+        "class Policy:\n"
+        "    def discover(self):\n"
+        "        return [p for p in [Path.cwd()]]\n"
+        "def fine(root):\n"
+        "    return root / '.mcp.json'\n"
+    )
+    assert cwd_readers({"pmcp.x": source}) == {
+        ("pmcp.x", "by_path"),
+        ("pmcp.x", "by_os"),
+        ("pmcp.x", "by_walk"),
+        ("pmcp.x", "Policy.discover"),
+    }

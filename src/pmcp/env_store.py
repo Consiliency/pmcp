@@ -59,7 +59,16 @@ def resolve_project_root(project: Path | None = None) -> Path:
 
 
 def _discover_project_root() -> Path:
-    """The project root found from the working directory (markers), else the cwd."""
+    """The project root found from the working directory (markers), else the cwd.
+
+    THE one place pmcp derives a project from where it was started
+    (``tests/test_store_reader_inventory.py`` forbids any other). Its answer
+    becomes the served root (:func:`serve_project_root`), and every
+    project-scoped input -- credentials, tenant stores, ``.mcp.json``, the
+    project manifest overlay, the project policy -- follows the served root or
+    an explicit project, so an endpoint and its credential always come from the
+    same project (Consiliency/pmcp#372 round 12, board round 11 codex F001).
+    """
     discovered = find_project_root(Path.cwd())
     if discovered:
         return discovered
@@ -404,6 +413,27 @@ def set_default_root(root: Path) -> None:
 def served_project_root() -> Path | None:
     """The served project root (:func:`serve_project_root`), or ``None`` before one is set."""
     return _DEFAULT_ROOT
+
+
+def project_scope_root(project: Path | None = None) -> Path | None:
+    """The root project-scoped CONFIGURATION is read from, or ``None`` for none.
+
+    ``project`` when given, else the served project root
+    (:func:`resolve_project_root`). ``None`` when that root is the operator's
+    home directory: home's ``.mcp.json`` and ``.pmcp/manifest.yaml`` are the
+    USER sources, already loaded as such, and must not be attributed to a
+    project as well (the stop ``find_project_root`` and the overlay walk always
+    had). Used by ``.mcp.json`` loading, the project manifest overlay and the
+    project policy, so each follows the same root as the credentials.
+    """
+    root = resolve_project_root(project)
+    try:
+        home = Path.home().resolve()
+        if os.path.realpath(root) == os.fspath(home):
+            return None
+    except (OSError, RuntimeError):
+        pass
+    return root
 
 
 def serve_project_root(project: Path | None) -> Path:
