@@ -72,7 +72,13 @@ to do, how to verify it, and how to roll back to 2.7.3.
   project file that changed. The project is the one pmcp serves -- `--project` when
   given, otherwise the project root found from the working directory (the root
   `.mcp.json` is loaded from) -- so `pmcp --project B` started inside project A spawns,
-  gates and checks B's servers with B's credentials; started from a subdirectory of a
+  gates and checks B's servers with B's credentials. Every project input follows that
+  same project: its `.mcp.json`, its `.pmcp/manifest.yaml` overlay (found at the
+  project root, no longer by walking up from the working directory; a directory with an
+  overlay is a project root) and its `.mcp-gateway-policy.yaml` (no longer read from the
+  working directory), so a server's endpoint and its credential always come from one
+  project. `pmcp init` without `--project` writes the served project's `.mcp.json`.
+  Started from a subdirectory of a
   project, pmcp reads the root's `.env.pmcp`, the one `pmcp secrets set --scope project`
   writes, where 2.7.3 loaded the working directory's (a tenant
   lookup checks the tenant store before the project store), where in 2.7.3 a checkout's

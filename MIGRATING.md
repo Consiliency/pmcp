@@ -484,7 +484,14 @@ project file is read again on the next lookup (your user store, which is in
 the environment, is read at startup). The project is the one pmcp serves:
 `--project` when given, otherwise the project root found from the working
 directory -- the root `.mcp.json` is loaded from. So `pmcp --project B` started
-inside project A gives B's servers B's credentials, and pmcp started from a
+inside project A gives B's servers B's credentials -- and B's `.mcp.json`,
+`.pmcp/manifest.yaml` overlay and `.mcp-gateway-policy.yaml`: every project
+input follows the same project, so an endpoint and its credential always come
+from one project. A project overlay is found at the project root, no longer by
+walking up from the working directory (a directory holding one counts as a
+project root), and the project policy is read from the project root, no longer
+from the working directory; `pmcp init` without `--project` writes the served
+project's `.mcp.json`. And pmcp started from a
 subdirectory of a project reads the root's `.env.pmcp` (the file `pmcp secrets
 set --scope project` writes) where 2.7.3 loaded the working directory's. If you
 kept a `.env.pmcp` in a subdirectory you start pmcp from, move its entries to
