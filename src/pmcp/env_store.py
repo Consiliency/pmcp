@@ -462,6 +462,73 @@ def is_pmcp_environment_name(key: str) -> bool:
     return upper in _PMCP_ENVIRONMENT_NAMES or upper.endswith("_PROXY")
 
 
+def repository_may_supply(name: str) -> bool:
+    """May a repository-controlled file supply the variable ``name``? THE one rule.
+
+    No for anything that decides what pmcp, or a program it starts, loads,
+    trusts or connects to: a variable pmcp reads from its own environment
+    (:func:`is_pmcp_environment_name`: the classified names in any case, any
+    ``*_proxy``), a code-loading variable (``validation.is_dangerous_env_var``:
+    ``LD_*``, ``DYLD_*``, ``PYTHON*``, ``NODE_OPTIONS``, ``PATH`` ...), and a
+    package-manager or runtime family (``validation.is_package_manager_env_var``:
+    ``NPM_CONFIG_*``, ``NODE_*``, ``COREPACK_*`` ...). Everything else is a
+    credential. :func:`credential_value` asks it before answering from a
+    repository source, the repository loader before keeping a binding quietly,
+    and :func:`copyable_from_repository` before a value leaves a repository
+    store for the operator's own (Consiliency/pmcp#372 round 5).
+    """
+    from pmcp.validation import is_dangerous_env_var, is_package_manager_env_var
+
+    return not (
+        is_pmcp_environment_name(name)
+        or is_dangerous_env_var(name)
+        or is_package_manager_env_var(name)
+    )
+
+
+def describe_uncopied_store_entry(variable: str, store_name: str, reason: str) -> str:
+    """Value-free: an entry of a repository store that was not copied."""
+    return f"Not copying {variable} from {store_name}: {reason}."
+
+
+def copyable_from_repository(
+    values: Mapping[str, str], store_name: str
+) -> tuple[dict[str, str], list[str]]:
+    """The entries of a repository store that may move into an operator's store.
+
+    The user store loads into pmcp's own environment at every start, from any
+    directory, so a value copied there from a project file must pass the same
+    rule a lookup does (:func:`repository_may_supply`). It must also not hold
+    ``${``: the user store is loaded with expansion, so ``X=${GITHUB_TOKEN}``
+    would turn into the operator's secret under a new name. Each refused entry
+    gets one value-free warning; its value is never copied. Returns
+    ``(copyable, refused names)``.
+    """
+    copyable: dict[str, str] = {}
+    refused: list[str] = []
+    for key, value in values.items():
+        if not repository_may_supply(key):
+            reason = (
+                "a project file supplies credentials only, and this variable "
+                "decides what pmcp or a program it starts loads, trusts or "
+                "connects to"
+            )
+        elif "${" in value:
+            reason = (
+                "its value refers to a variable, and your user store would "
+                "expand it from your environment"
+            )
+        else:
+            copyable[key] = value
+            continue
+        refused.append(key)
+        print(
+            f"pmcp: {describe_uncopied_store_entry(key, store_name, reason)}",
+            file=sys.stderr,
+        )
+    return copyable, refused
+
+
 def credential_value(
     key: str,
     *,
@@ -488,12 +555,13 @@ def credential_value(
     Precedence is decided by MEMBERSHIP, not truthiness: the first source that
     HAS the name decides, and an empty value there means "unavailable" -- an
     operator's exported ``BRAVE_API_KEY=""`` is never filled from a project file.
-    A name pmcp itself reads from its environment (:func:`is_pmcp_environment_name`,
-    any case, any ``*_proxy``) is never answered from a repository source.
+    A name a repository may not supply (:func:`repository_may_supply`: pmcp's
+    own variables in any case, any ``*_proxy``, code-loading and package-manager
+    families) is never answered from a repository source.
     """
     if environ and key in os.environ:
         return os.environ[key] or None
-    repository_may_answer = not is_pmcp_environment_name(key)
+    repository_may_answer = repository_may_supply(key)
     if operator is not None and key in operator:
         return operator[key] or None
     if repository_may_answer and repository is not None and key in repository:
@@ -504,11 +572,12 @@ def credential_value(
 
 
 def describe_ignored_store_env_var(variable: str, store_name: str) -> str:
-    """Value-free: a variable pmcp reads from its environment, set in a repository file."""
+    """Value-free: a variable a repository file may not supply (:func:`repository_may_supply`)."""
     return (
         f"Ignoring {variable} in {store_name}: a project file supplies credentials "
-        "only, and pmcp reads this variable from its own environment, so export it "
-        "in the shell that starts pmcp (or set it in ~/.config/pmcp/pmcp.env)."
+        "only, and this variable decides what pmcp or a program it starts loads, "
+        "trusts or connects to, so export it in the shell that starts pmcp (or set "
+        "it in ~/.config/pmcp/pmcp.env)."
     )
 
 
@@ -594,7 +663,7 @@ def _load_repo_credentials(text: str, store_path: Path) -> None:
     the map keeps its first value, as ``load_dotenv(override=False)`` did.
     """
     for key, value in _repository_values(text, store_path).items():
-        if is_pmcp_environment_name(key):
+        if not repository_may_supply(key):
             # Warned here; refused where it would be answered -- the one gate is
             # credential_value, whatever put the name into the map.
             _warn_store_refused(

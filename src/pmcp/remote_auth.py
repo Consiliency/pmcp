@@ -116,18 +116,23 @@ def resolve_remote_headers_for_tenant(
             headers, build_remote_header_env_lookup(project_root)
         )
 
-    from pmcp.env_store import credential_value, repository_values
+    from pmcp.env_store import credential_value, read_store, repository_values
 
     # Repository-controlled: confined to the project root (Consiliency/pmcp#367),
-    # expanded within the file only, read through the one gate.
+    # expanded within the file only, read through the one gate. The order, by
+    # presence: the environment, the user store, the tenant store, then the
+    # project store's credentials loaded at startup -- or, with
+    # include_process_env=False, the tenant store alone.
     tenant_values = repository_values(
         "tenant", project=project_root, tenant_id=tenant_id
     )
+    user_values = read_store("user") if include_process_env else None
 
     def lookup(env_var: str) -> str | None:
         return credential_value(
             env_var,
             environ=include_process_env,
+            operator=user_values,
             startup_files=include_process_env,
             repository=tenant_values,
         )

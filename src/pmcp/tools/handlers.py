@@ -59,6 +59,7 @@ from pmcp.env_store import (
     child_process_env,
     credential_value,
     load_store,
+    repository_may_supply,
     record_pmcp_introduced_keys,
     sanitized_subprocess_env,
     scope_store_name,
@@ -4614,8 +4615,16 @@ class GatewayTools:
         # declared name any credential-shaped override passed -- including
         # NPM_CONFIG__AUTH, which the pinned `npx -y` spawn would then read
         # (Consiliency/pmcp#230).
-        if not env_var_allowed(env_var, declared_storage_key) or (
-            from_discovered and not discovered_env_var_allowed(env_var)
+        #
+        # The same rule a repository file is held to (env_store.
+        # repository_may_supply) applies on top: the value lands in a store pmcp
+        # loads into its own environment, so pmcp's own variables, `*_proxy` in
+        # any case and the package-manager families are refused here too
+        # (Consiliency/pmcp#372 round 5).
+        if (
+            not env_var_allowed(env_var, declared_storage_key)
+            or (from_discovered and not discovered_env_var_allowed(env_var))
+            or not repository_may_supply(env_var)
         ):
             self._audit(
                 method="gateway.auth_connect",
@@ -4637,6 +4646,32 @@ class GatewayTools:
                     f"Env var '{env_var}' is not permitted for server "
                     f"'{server_name}'.{expected} Refusing to store it."
                 ),
+                auth_state="missing_auth",
+                env_var=env_var,
+            )
+
+        if "${" in parsed.credential:
+            # The store is loaded with python-dotenv's expansion, so a stored
+            # `${GITHUB_TOKEN}` would become the operator's secret under this
+            # server's name at the next start. Value-free refusal.
+            message = (
+                f"Refusing to store {env_var}: the value contains '${{', which "
+                "pmcp would expand from your environment when it loads the store."
+            )
+            self._audit(
+                method="gateway.auth_connect",
+                action="auth_connect",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=server_name,
+                auth_state="missing_auth",
+                auth_event="policy_denied",
+                error=message,
+            )
+            return AuthConnectOutput(
+                ok=False,
+                server=server_name,
+                message=message,
                 auth_state="missing_auth",
                 env_var=env_var,
             )

@@ -1027,3 +1027,92 @@ def test_the_credential_value_scan_sees_each_shape() -> None:
     hits = credential_value_bypasses({"pmcp.x": source})
     flagged = {h.split(":")[1] for h in hits}
     assert flagged == {"by_get", "by_index", "by_items", "by_copy", "by_map"}, hits
+
+
+# --------------------------------------------------------------------------- #
+# Nothing moves from one store into another unchecked (Consiliency/pmcp#372
+# round 5): a function that reads a store under one scope and writes a store
+# under another must pass the values through env_store.copyable_from_repository.
+# --------------------------------------------------------------------------- #
+
+STORE_READERS_BY_SCOPE = frozenset(
+    {"read_store_for_update", "read_store", "repository_values"}
+)
+STORE_WRITERS = frozenset({"write_env_file", "set_env_value"})
+
+
+def _scope_expr(call: ast.Call) -> str | None:
+    """The scope a store call names, as source text (first argument)."""
+    if call.args:
+        return ast.unparse(call.args[0])
+    return None
+
+
+def _writer_scopes(call: ast.Call) -> set[str]:
+    name = getattr(call.func, "id", getattr(call.func, "attr", ""))
+    if name == "set_env_value":
+        return {s for s in [_scope_expr(call)] if s}
+    scopes: set[str] = set()
+    for kw in call.keywords:
+        if (
+            kw.arg == "confine_to"
+            and isinstance(kw.value, ast.Call)
+            and getattr(kw.value.func, "id", getattr(kw.value.func, "attr", ""))
+            == "scope_confinement"
+        ):
+            scopes |= {s for s in [_scope_expr(kw.value)] if s}
+    return scopes or {"?"}
+
+
+def unchecked_store_copies(sources: dict[str, str]) -> list[str]:
+    found: list[str] = []
+    for module, source in sources.items():
+        for fn in _outermost_functions(ast.parse(source)):
+            calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+            names = {getattr(c.func, "id", getattr(c.func, "attr", "")) for c in calls}
+            read_scopes = {
+                s
+                for c in calls
+                if getattr(c.func, "id", getattr(c.func, "attr", ""))
+                in STORE_READERS_BY_SCOPE
+                for s in [_scope_expr(c)]
+                if s and s != "'user'"
+            }
+            write_scopes: set[str] = set()
+            for c in calls:
+                if getattr(c.func, "id", getattr(c.func, "attr", "")) in STORE_WRITERS:
+                    write_scopes |= _writer_scopes(c)
+            if not write_scopes or not read_scopes:
+                continue
+            crossing = read_scopes - write_scopes
+            if crossing and "copyable_from_repository" not in names:
+                found.append(
+                    f"{module}:{fn.name} writes a store from {sorted(crossing)} "
+                    "without copyable_from_repository"
+                )
+    return found
+
+
+def test_every_cross_store_copy_passes_the_gate() -> None:
+    assert unchecked_store_copies(_src_sources()) == []
+
+
+def test_the_copy_scan_sees_each_shape() -> None:
+    source = (
+        "def bare_sync(a, b, p):\n"
+        "    src = read_store_for_update(a, p)\n"
+        "    write_env_file(p, src, confine_to=scope_confinement(b, p))\n"
+        "def via_set(a, p):\n"
+        "    for k, v in read_store('project', project=p).items():\n"
+        "        set_env_value('user', k, v)\n"
+        "def checked(a, b, p):\n"
+        "    src, _ = copyable_from_repository(read_store_for_update(a, p), 'x')\n"
+        "    write_env_file(p, src, confine_to=scope_confinement(b, p))\n"
+        "def same_store(scope, p):\n"
+        "    values = read_store_for_update(scope, p)\n"
+        "    write_env_file(p, values, confine_to=scope_confinement(scope, p))\n"
+    )
+    flagged = {
+        line.split(" ")[0] for line in unchecked_store_copies({"pmcp.x": source})
+    }
+    assert flagged == {"pmcp.x:bare_sync", "pmcp.x:via_set"}

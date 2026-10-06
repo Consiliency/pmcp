@@ -66,13 +66,19 @@ to do, how to verify it, and how to roll back to 2.7.3.
   is expanded only from keys defined earlier in the same file: `LEAK=${GITHUB_TOKEN}`,
   which 2.7.3 filled from your environment, is ignored with `pmcp: Ignoring LEAK in
   .env.pmcp: its value refers to a variable the file does not define, …`. Your shell
-  and `~/.config/pmcp/pmcp.env` now win over a project file for every lookup, where in
-  2.7.3 a checkout's `.env` won over the user store and a remote `${VAR}` header or
-  `pmcp secrets check` preferred a project `.env.pmcp` over it (a per-project override of
-  a user-store key, such as a tenant id, no longer applies), and a variable your shell
-  exports as empty stays
+  and `~/.config/pmcp/pmcp.env` now win over a project file for every lookup (a tenant
+  lookup checks the tenant store before the project store), where in 2.7.3 a checkout's
+  `.env` won over the user store and `pmcp secrets check` preferred a project
+  `.env.pmcp` (a per-project override of a user-store key, such as a tenant id, does not
+  apply), and a variable your shell exports as empty stays
   unavailable rather than being filled from a project file. A `~/.env` (or one in an
-  ancestor of your home directory) still loads as before. *Security*
+  ancestor of your home directory) still loads as before. `pmcp secrets sync
+  --from-scope project --to-scope user` copies credentials only: pmcp's own variables,
+  proxies, code-loading and package-manager variables, and any value containing `${`,
+  are skipped with `pmcp: Not copying <NAME> from .env.pmcp: …`, where 2.7.3 copied
+  every key into the store pmcp loads into its environment at each start;
+  `gateway.auth_connect` refuses the same names and a credential containing `${`.
+  *Security*
 - **Discovered servers are default-deny.** `gateway.register_discovered_server` resolves
   and pins the package (and refuses one it cannot pin, or an `env_vars` name that is not
   credential-shaped); `provision`, `connect_server` and `restart_server` refuse it until

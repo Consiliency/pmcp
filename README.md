@@ -1594,6 +1594,15 @@ pmcp secrets sync --from-scope user --to-scope project --overwrite
 pmcp secrets sync --from-scope project --to-scope user --overwrite
 ```
 
+Copying out of a project copies credentials only. A project `.env.pmcp` is the
+repository's, and your user store loads into pmcp's environment at every start,
+so `sync` skips any name a project file may not supply -- pmcp's own variables,
+`*_proxy` in any case, `LD_*`/`DYLD_*`/`PYTHON*`/`NODE_OPTIONS`/`PATH`, the
+`NPM_CONFIG_*`/`NODE_*`/`COREPACK_*`/`YARN_*`/`PNPM_*`/`BUN_*` families -- and any
+value containing `${`, printing one `pmcp: Not copying <NAME> from .env.pmcp: ...`
+line each and listing them under `"refused"`. Set those yourself with
+`pmcp secrets set <NAME> --scope user` if you mean them.
+
 Passing the value on the command line (`pmcp secrets set API_TOKEN your-token`)
 still works but exposes it in `ps` output and shell history. `pmcp secrets check`
 prints, as JSON, the keys your configured servers require and which are present.
@@ -1814,7 +1823,9 @@ For hosted tenant auth, keep credentials in PMCP env storage or tenant-scoped
 project storage and reference only placeholders from config:
 `${TENANT_CODE_MODE_MCP_TOKEN}` and `${TENANT_CODE_MODE_TENANT_ID}`. Use
 `pmcp secrets set ... --scope project` or `gateway.auth_connect` to populate
-env-store values; the gateway does not select a per-tenant env file itself
+env-store values (a key also in your user store wins over the project's; see
+[MIGRATING.md](MIGRATING.md#a-project-file-supplies-credentials-only)); the
+gateway does not select a per-tenant env file itself
 (see [Auth And Elicitation](#auth-and-elicitation)). PMCP diagnostics report missing
 field or env-var names such as
 `TENANT_CODE_MODE_MCP_TOKEN`; they must not print token values.

@@ -237,6 +237,11 @@ _PACKAGE_MANAGER_ENV_PREFIXES = (
 )
 
 
+def is_package_manager_env_var(name: str) -> bool:
+    """Return True for a package-manager or runtime configuration variable (any case)."""
+    return name.upper().startswith(_PACKAGE_MANAGER_ENV_PREFIXES)
+
+
 def discovered_env_var_allowed(name: str) -> bool:
     """May a DISCOVERED server declare, or be given, the env var *name*?
 
@@ -253,6 +258,6 @@ def discovered_env_var_allowed(name: str) -> bool:
     """
     if not name or is_dangerous_env_var(name):
         return False
-    if name.upper().startswith(_PACKAGE_MANAGER_ENV_PREFIXES):
+    if is_package_manager_env_var(name):
         return False
     return bool(_CREDENTIAL_NAME_RE.fullmatch(name))

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pmcp.config.loader import load_configs
 from pmcp.env_store import (
+    copyable_from_repository,
     resolve_project_root,
     credential_value,
     read_store,
@@ -275,6 +276,16 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
             "error": store_refusal(target_path, exc),
         }
 
+    # A project store is the repository's; what it may hand to another store --
+    # the user store, which loads into pmcp's environment at every start -- is
+    # decided by the same rule a lookup uses (env_store.copyable_from_repository,
+    # Consiliency/pmcp#372 round 5). Refused names are reported, never copied.
+    refused: list[str] = []
+    if from_scope == "project":
+        source_values, refused = copyable_from_repository(
+            source_values, source_path.name
+        )
+
     added: list[str] = []
     updated: list[str] = []
     skipped: list[str] = []
@@ -315,6 +326,7 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
         "added": sorted(added),
         "updated": sorted(updated),
         "skipped": sorted(skipped),
+        "refused": sorted(refused),
         "target_key_count": len(target_values),
     }
 
