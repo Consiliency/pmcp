@@ -1409,3 +1409,76 @@ def test_the_cwd_scan_sees_each_shape() -> None:
         ("pmcp.x", "by_walk"),
         ("pmcp.x", "Policy.discover"),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Two questions, two values (Consiliency/pmcp#372 round 13, board round 12
+# codex F001). ``project_scope_root`` classifies config SOURCES -- its ``None``
+# means "the home directory: no project config source here". Fed to a
+# credential lookup, that ``None`` meant "the served project", so an explicitly
+# named home project got another project's credential. A value derived from a
+# classification helper never reaches a credential lookup's project parameter.
+# --------------------------------------------------------------------------- #
+
+#: Functions whose answer classifies a config source, not a credential root.
+CLASSIFIERS = frozenset({"project_scope_root", "_project_scope_root"})
+
+
+def classification_leaks(sources: dict[str, str]) -> list[str]:
+    """Every call that hands a classifier's answer to a credential lookup."""
+    gates = consumer_gates(sources)
+    found: list[str] = []
+    for module, tree, aliases in _module_trees(sources):
+        for name, fn in _qualified_functions(tree):
+            classified: set[str] = set()
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.Assign)
+                    and isinstance(node.value, ast.Call)
+                    and _called_name(node.value.func, aliases) in CLASSIFIERS
+                ):
+                    classified |= {
+                        t.id for t in node.targets if isinstance(t, ast.Name)
+                    }
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call):
+                    continue
+                called = _called_name(node.func, aliases)
+                if called is None or called not in gates:
+                    continue
+                value = _passed(node, gates[called])
+                direct = (
+                    isinstance(value, ast.Call)
+                    and _called_name(value.func, aliases) in CLASSIFIERS
+                )
+                named = isinstance(value, ast.Name) and value.id in classified
+                if direct or named:
+                    found.append(f"{module}:{name}:{node.lineno} {called}")
+    return found
+
+
+def test_no_classification_reaches_a_credential_lookup() -> None:
+    assert classification_leaks(_src_sources()) == []
+
+
+def test_the_classification_scan_sees_each_shape() -> None:
+    source = (
+        "from pmcp.env_store import credential_value, project_scope_root\n"
+        "def by_name(k, project_root):\n"
+        "    resolved = project_scope_root(project_root)\n"
+        "    return credential_value(k, root=resolved)\n"
+        "def inline(k, project_root):\n"
+        "    return credential_value(k, root=project_scope_root(project_root))\n"
+        "def through_a_wrapper(k, project_root):\n"
+        "    resolved = _project_scope_root(project_root)\n"
+        "    return lookup_for(resolved)\n"
+        "def lookup_for(root):\n"
+        "    return lambda k: credential_value(k, root=root)\n"
+        "def fine(k, project_root):\n"
+        "    resolved = project_scope_root(project_root)\n"
+        "    if resolved:\n"
+        "        pass\n"
+        "    return credential_value(k, root=project_root)\n"
+    )
+    flagged = {line.split(":")[1] for line in classification_leaks({"pmcp.x": source})}
+    assert flagged == {"by_name", "inline", "through_a_wrapper"}

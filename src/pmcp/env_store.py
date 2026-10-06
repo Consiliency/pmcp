@@ -423,8 +423,13 @@ def project_scope_root(project: Path | None = None) -> Path | None:
     home directory: home's ``.mcp.json`` and ``.pmcp/manifest.yaml`` are the
     USER sources, already loaded as such, and must not be attributed to a
     project as well (the stop ``find_project_root`` and the overlay walk always
-    had). Used by ``.mcp.json`` loading, the project manifest overlay and the
-    project policy, so each follows the same root as the credentials.
+    had). Used by ``.mcp.json`` loading and the project manifest overlay.
+
+    A CLASSIFICATION, never a credential root: its ``None`` means "no project
+    config source here", not "the served project". Credentials come from the
+    project the caller named (Consiliency/pmcp#372 round 13);
+    ``tests/test_store_reader_inventory.py`` fails if this function's answer
+    reaches a credential lookup.
     """
     root = resolve_project_root(project)
     try:

@@ -1192,8 +1192,10 @@ PMCP discovers MCP servers from:
 
 1. **Project config**: `.mcp.json` in project root (highest priority). The
    project root is `--project` when given, otherwise the nearest ancestor of
-   the working directory holding a `.mcp.json`, `.git`, `package.json` or
-   `pyproject.toml`, stopping before `$HOME`. A project `.mcp.json` is ignored
+   the working directory holding a `.mcp.json`, `.git`, `package.json`,
+   `pyproject.toml` or `.pmcp/manifest.yaml`, stopping before `$HOME`. Every
+   project input -- this file, the manifest overlay, the project policy and the
+   project's credentials -- comes from that one project root. A project `.mcp.json` is ignored
    until you run `pmcp trust approve <path>` (see
    [Security](#security)).
 2. **User config**: `~/.mcp.json` or `~/.claude/.mcp.json`
@@ -1218,8 +1220,10 @@ server name; a same-named entry is replaced whole, not deep-merged):
 
 1. **Shipped manifest** (base)
 2. **User**: `~/.pmcp/manifest.yaml`
-3. **Project**: `<project>/.pmcp/manifest.yaml` (nearest ancestor of the cwd,
-   below `$HOME`; ignored until you run `pmcp trust approve <path>`)
+3. **Project**: `<project>/.pmcp/manifest.yaml` at the served project root --
+   `--project` when given, otherwise the project root found from the working
+   directory (see the project config above); never `$HOME`'s, which is the user
+   overlay; ignored until you run `pmcp trust approve <path>`
 4. **Explicit**: `PMCP_MANIFEST_PATH` env var (wins over all; honoured only when
    exported, not when set by a `.env` file)
 

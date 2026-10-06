@@ -1198,3 +1198,94 @@ def test_secrets_check_reads_the_served_projects_manifest_overlay(
     report = asyncio.run(secrets.run_secrets_check(argparse.Namespace(project=project)))
     assert "OVERLAY_B_TOKEN" in report["missing_keys"]
     assert "OVERLAY_A_TOKEN" not in report["missing_keys"]
+
+
+# --------------------------------------------------------------------------- #
+# Board round 12, codex F001: the config loader fed its SOURCE classification
+# (project_scope_root, None for the home directory) to the credential lookup,
+# where None means "the served project" -- so GatewayServer(project_root=HOME)
+# served from A gave home's configured server A's credential. Credentials come
+# from the root the caller named; classification is a separate value.
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_r12_f001_an_explicit_home_keeps_its_own_credential(
+    tmp_path: Path,
+) -> None:
+    """codex r12 F001, verbatim in substance."""
+    import json
+    from unittest.mock import patch
+
+    from pmcp.config.loader import load_configs
+
+    home = tmp_path / "home"
+    served = tmp_path / "served"
+    home.mkdir()
+    served.mkdir()
+    (served / ".env.pmcp").write_text("BRAVE_API_KEY=served-token\n")
+    (home / ".env.pmcp").write_text("BRAVE_API_KEY=home-token\n")
+    (home / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"brave-search": {"command": "echo"}}})
+    )
+    with (
+        patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+        patch.object(env_store, "_DEFAULT_ROOT", None),
+        patch.object(env_store, "_REPO_CREDENTIALS", {}),
+        patch.object(env_store, "_PINNED_USER_STORE", None),
+    ):
+        env_store.serve_project_root(served)
+        assert env_store.credential_value("BRAVE_API_KEY", root=home) == "home-token"
+        config = next(
+            c for c in load_configs(project_root=home) if c.name == "brave-search"
+        )
+        assert config.source == "user"
+        assert (config.config.env or {}).get("BRAVE_API_KEY") == "home-token"
+
+
+def test_a_root_classification_rejects_still_supplies_its_own_credentials(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The explicit root is HOME (no project config source), the served root A.
+
+    Every consumer handed HOME answers with HOME's credential, never A's.
+    """
+    import json
+
+    from pmcp.config.loader import load_configs, resolve_startup_configs
+    from pmcp.manifest.installer import build_install_child_env
+    from pmcp.manifest.loader import load_manifest
+
+    home = roots["home"]
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    (roots["a"] / ".env.pmcp").write_text("BRAVE_API_KEY=from-a\n")
+    (home / ".env.pmcp").write_text("BRAVE_API_KEY=from-home\n")
+    (home / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"brave-search": {"command": "echo"}}})
+    )
+    _startup(roots)  # in a, which is served
+    assert env_store.project_scope_root(home) is None  # classification rejects it
+
+    server = load_manifest(project_root=home).get_server("brave-search")
+    assert server is not None
+    answers = {
+        "configured server": (
+            next(
+                c for c in load_configs(project_root=home) if c.name == "brave-search"
+            ).config.env
+            or {}
+        ).get("BRAVE_API_KEY"),
+        "startup config": next(
+            c
+            for c in resolve_startup_configs(
+                [],
+                manifest_servers={"brave-search": server},
+                enabled_auto_start={"brave-search"},
+                project_root=home,
+            ).eager_configs
+            if c.name == "brave-search"
+        ).config.env.get("BRAVE_API_KEY"),
+        "install child": build_install_child_env(server, home).get("BRAVE_API_KEY"),
+        "credential_lookup": env_store.credential_lookup(home)("BRAVE_API_KEY"),
+        "header lookup": build_remote_header_env_lookup(home)("BRAVE_API_KEY"),
+    }
+    assert answers == dict.fromkeys(answers, "from-home")

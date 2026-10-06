@@ -491,7 +491,11 @@ from one project. A project overlay is found at the project root, no longer by
 walking up from the working directory (a directory holding one counts as a
 project root), and the project policy is read from the project root, no longer
 from the working directory; `pmcp init` without `--project` writes the served
-project's `.mcp.json`. And pmcp started from a
+project's `.mcp.json`. One exception, unchanged from 2.7.3: a local server
+starts in pmcp's own working directory unless its config sets `cwd`, so with
+`--project B` started from A, B's servers start in A and see A's `./.env`,
+`.npmrc` and `node_modules`. Set `cwd` in B's server configs, or start pmcp
+from B, until that changes. And pmcp started from a
 subdirectory of a project reads the root's `.env.pmcp` (the file `pmcp secrets
 set --scope project` writes) where 2.7.3 loaded the working directory's. If you
 kept a `.env.pmcp` in a subdirectory you start pmcp from, move its entries to

@@ -1951,7 +1951,8 @@ def run_setup(args: argparse.Namespace) -> None:
 def run_config(args: argparse.Namespace) -> None:
     """Run local config administration commands."""
     command = getattr(args, "config_command", None)
-    configs = load_configs()
+    # `pmcp config` takes no --project: the served project, said explicitly.
+    configs = load_configs(project_root=getattr(args, "project", None))
     manifest = load_manifest().servers
     known_names = {config.name for config in configs} | set(manifest)
     if command == "startup-policy":

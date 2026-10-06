@@ -1210,8 +1210,15 @@ def load_configs(
     # The served project, or the caller's (Consiliency/pmcp#372 round 12):
     # never the working directory's when they differ.
     resolved_project_root = _project_scope_root(project_root)
-    # Credentials a configured entry inherits are its own project's.
-    credentials = _credential_value_for(resolved_project_root)
+    # Credentials come from the project the CALLER asked for -- ``project_root``
+    # as given, ``None`` meaning the served one -- never from the source
+    # classification above. ``_project_scope_root`` answers "is there a
+    # project config source here", and says ``None`` for the home directory
+    # (whose .mcp.json is the user source); fed to the credential lookup, that
+    # ``None`` meant "the served project", so an explicitly named home project
+    # got another project's credential (Consiliency/pmcp#372 round 13, board
+    # round 12 codex F001). Two questions, two values.
+    credentials = _credential_value_for(project_root)
     if resolved_project_root:
         project_config_path = resolved_project_root / ".mcp.json"
         project_config = _parse_project_config_or_warn(project_config_path)
