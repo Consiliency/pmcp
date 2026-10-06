@@ -2776,3 +2776,95 @@ def test_the_field_diagnostic_names_a_field_never_a_value() -> None:
     assert NAME_SENTINEL not in overlay_only and "field 'command'" in overlay_only
     assert "'github'" in config_field_diagnostic(config("github", "manifest"), "args")
     assert VALUE_SENTINEL not in config_field_diagnostic(config("x", "user"), "args")
+
+
+# --- the docs' field claims, run (Consiliency/pmcp#375 board round 1, claude F001) ---
+# README, CHANGELOG and MIGRATING.md say which overlay fields are skipped and which
+# are accepted as before. Each claim is a row here; README said a `transport`
+# "without a `url`" is accepted as before, which held only for a string.
+
+DOC_FIELD_CLAIMS: list[tuple[str, dict[str, Any], bool]] = [
+    # (case, entry fields, loads)
+    ("keywords-int", {"keywords": [1]}, False),
+    ("args-int", {"args": ["-y", 5]}, False),
+    ("args-str", {"args": "abc"}, False),
+    ("command-int", {"command": 5}, False),
+    ("transport-int", {"transport": 5}, False),
+    ("transport-bool", {"transport": True}, False),
+    ("transport-list", {"transport": ["a"]}, False),
+    ("transport-stdio", {"transport": "stdio"}, True),
+    ("transport-other-string", {"transport": "bogus"}, True),
+    ("auto_start-str", {"auto_start": "yes"}, True),
+    ("auto_start-int", {"auto_start": 5}, True),
+    ("auto_start-list", {"auto_start": [1]}, True),
+    ("status-int", {"status": 5}, True),
+    ("status-list", {"status": [1]}, True),
+    ("keywords-null", {"keywords": None}, True),
+    ("description-null", {"description": None}, True),
+]
+
+
+@pytest.mark.parametrize(
+    "case,fields,loads", DOC_FIELD_CLAIMS, ids=[c[0] for c in DOC_FIELD_CLAIMS]
+)
+def test_the_docs_field_claims_hold(
+    case: str, fields: dict[str, Any], loads: bool
+) -> None:
+    entry = {"command": "npx", "keywords": ["zzdoc"], **fields}
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump({"servers": {"zzdoc": entry}}),
+    )
+    servers = load_manifest().servers
+    assert ("zzdoc" in servers) is loads
+    assert "playwright" in servers
+    if case == "keywords-null":
+        assert servers["zzdoc"].keywords == []
+    if case == "description-null":
+        assert servers["zzdoc"].description == ""
+
+
+def test_claude_375_f001_a_non_string_transport_without_a_url_is_skipped() -> None:
+    """The seat's falsifier, with the corrected claim: `transport: 5` and no
+    `url` is skipped (main loaded it, then failed every query that matched it);
+    a string `transport` without a `url` still loads."""
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump(
+            {
+                "servers": {
+                    "zz": {"command": "npx", "keywords": ["zz"], "transport": 5},
+                    "zzs": {"command": "npx", "keywords": ["zz"], "transport": "stdio"},
+                }
+            }
+        ),
+    )
+    servers = load_manifest().servers
+    assert "zz" not in servers
+    assert "zzs" in servers
+
+
+def test_the_readme_states_the_transport_rule_as_the_code_runs_it() -> None:
+    readme = (Path(loader.__file__).resolve().parents[3] / "README.md").read_text(
+        encoding="utf-8"
+    )
+    text = " ".join(readme.split())
+    assert "(`transport` without a `url`," not in text
+    assert "a `transport` string without a `url`" in text
+    assert "A `transport` that is not a string (`5`, `true`, a list) is skipped" in text
+
+
+def test_the_cli_check_command_claim_holds() -> None:
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        yaml.safe_dump(
+            {
+                "cli_alternatives": {
+                    "zzempty": {"keywords": ["zz"], "check_command": []},
+                    "zzgit": {"keywords": ["zz"], "check_command": ["git"]},
+                }
+            }
+        ),
+    )
+    clis = load_manifest().cli_alternatives
+    assert "zzempty" not in clis and "zzgit" in clis

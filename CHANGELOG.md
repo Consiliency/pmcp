@@ -92,8 +92,9 @@ to do, how to verify it, and how to roll back to 2.7.3.
   ignored with a warning. `gateway.update_server` does not move a pinned server, and
   `pmcp update` prints `[PINNED]` for it. *Added*
 - **An overlay entry pmcp cannot use is skipped.** A manifest overlay entry with a
-  field some part of pmcp would fail on (`keywords: [1]`, an `args` or `command` that
-  is not a string, a `cli_alternatives` entry with an empty `check_command`) is skipped
+  field some part of pmcp would fail on (`keywords: [1]`, an `args` that is not a list
+  of strings, a `command` or `transport` that is not a string, a `cli_alternatives`
+  entry with an empty `check_command`) is skipped
   when the overlay is read, with a WARNING naming the field but not its value. 2.7.3
   loaded it, and then `gateway.catalog_search` failed for every query, or startup and
   `gateway.refresh` failed for every server. A CLI an overlay adds or replaces now
@@ -621,7 +622,8 @@ to do, how to verify it, and how to roll back to 2.7.3.
   removes one, within the result limit.
 
   Separately, a wrongly typed field in one overlay entry made `catalog_search` fail
-  for every query (`keywords: null`, a bad `cli_alternatives` entry) or for every
+  for every query (`keywords: null`, which now means no keywords; a bad
+  `cli_alternatives` entry) or for every
   query that matched the entry (a non-string `transport`), or stopped gateway startup
   and `gateway.refresh` for every server (an int in `args`). An overlay entry that any part of pmcp would reject is now
   skipped when the overlay is read; an entry nothing would fail on still loads as
