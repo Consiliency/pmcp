@@ -1368,19 +1368,11 @@ def _coerce_manifest_servers(
     return {server.name: server for server in manifest_servers}
 
 
-def _credential_value(key: str) -> str | None:
-    """``env_store.credential_value`` for the served root, imported late.
-
-    (env_store imports this module.) For a caller with no project of its own;
-    one that has a root uses :func:`_credential_value_for`.
-    """
-    from pmcp.env_store import credential_value
-
-    return credential_value(key)
-
-
 def _credential_value_for(root: Path | None) -> Callable[[str], str | None]:
-    """``env_store.credential_value`` for project ``root`` (``None``: the served root)."""
+    """``env_store.credential_value`` for project ``root`` (``None``: the served root).
+
+    Imported late (env_store imports this module).
+    """
     from pmcp.env_store import credential_value
 
     def lookup(key: str) -> str | None:
@@ -1450,16 +1442,21 @@ def _manifest_server_to_config(
     )
 
 
-def manifest_server_to_config(server: "ManifestServerConfig") -> ResolvedServerConfig:
+def manifest_server_to_config(
+    server: "ManifestServerConfig", project_root: Path | None = None
+) -> ResolvedServerConfig:
     """Convert a manifest ServerConfig to a ResolvedServerConfig.
 
     Args:
         server: Server configuration from manifest.yaml
+        project_root: The project whose credentials the config carries -- a
+            gateway's own ``project_root``; ``None`` is the served project root
+            (``env_store.serve_project_root``, Consiliency/pmcp#372 round 10).
 
     Returns:
         ResolvedServerConfig compatible with ClientManager
     """
-    return _manifest_server_to_config(server, _credential_value)
+    return _manifest_server_to_config(server, _credential_value_for(project_root))
 
 
 def _local_env(config: ResolvedServerConfig) -> dict[str, str] | None:

@@ -1127,13 +1127,9 @@ def test_the_copy_scan_sees_each_shape() -> None:
 # --------------------------------------------------------------------------- #
 
 #: ``(module, function)`` -> why it answers for the served root. Asserted exact.
-SERVED_ROOT_CONSUMERS = {
-    ("pmcp.config.loader", "_credential_value"): (
-        "manifest_server_to_config's lookup: a public helper that builds a "
-        "manifest server's config with no project of its own; every caller with "
-        "a root uses _credential_value_for(root)"
-    ),
-}
+#: Empty since round 10: the last entry, ``config.loader._credential_value``
+#: (``manifest_server_to_config``'s lookup), now takes the caller's project.
+SERVED_ROOT_CONSUMERS: dict[tuple[str, str], str] = {}
 
 _CONSUMER_GATES = {"credential_value": "root", "credential_lookup": "project"}
 

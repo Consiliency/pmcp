@@ -301,6 +301,23 @@ def _consumers(
             if tools._check_api_key_available(k)
         ]
 
+    def lifecycle_connect(p: Path | None) -> object:
+        # gateway.connect builds a manifest server's config through
+        # manifest_server_to_config with the gateway's own project_root
+        # (board round 10 N-2): the library case, GatewayTools(project_root=B)
+        # in a process whose served root is A, is the explicit mode below.
+        # No configured entry, so the config comes from the manifest.
+        for name in ("a", "b"):
+            (roots[name] / ".mcp.json").unlink()
+        tools = GatewayTools(
+            client_manager=MagicMock(), policy_manager=PolicyManager(), project_root=p
+        )
+        resolved, refusal, _lookup = tools._resolve_lifecycle_target(
+            "brave-search", action="connect", prior_status="disconnected"
+        )
+        assert refusal is None and resolved is not None
+        return (resolved.config.env or {}).get("BRAVE_API_KEY")
+
     def _availability(run: object) -> object:
         try:
             run()  # type: ignore[operator]
@@ -370,6 +387,7 @@ def _consumers(
         "startup config": startup_config,
         "configured server": configured_server,
         "credential check": credential_check,
+        "lifecycle connect": lifecycle_connect,
         "config_status availability": config_status_availability,
         "gateway availability": gateway_availability,
         "init": init,
@@ -387,6 +405,7 @@ B_ANSWERS: dict[str, object] = {
     "startup config": "from-b",
     "configured server": "from-b",
     "credential check": ["ONLY_B_TOKEN"],
+    "lifecycle connect": "from-b",
     "config_status availability": ["ONLY_B_TOKEN"],
     "gateway availability": ["ONLY_B_TOKEN"],
     "init": True,
@@ -480,7 +499,6 @@ GRID_COVERAGE = {
     "pmcp.manifest.installer:build_install_child_env": "install child",
     "pmcp.manifest.installer:check_api_key": "provision gate",
     "pmcp.config.loader:_credential_value_for": "startup config",
-    "pmcp.config.loader:_credential_value": "(served root; inventory-listed)",
     "pmcp.config.loader:_merge_manifest_defaults": "configured server",
     "pmcp.tools.handlers:GatewayTools._check_api_key_available": "credential check",
     "pmcp.tools.handlers:GatewayTools.config_status": "config_status availability",

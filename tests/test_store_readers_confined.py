@@ -1467,12 +1467,12 @@ def test_the_provision_gate_sees_a_project_store_credential(
 def test_a_manifest_config_carries_its_project_store_credential(
     brave_in_project_store: str,
 ) -> None:
-    from pmcp.config.loader import _manifest_server_to_config, _credential_value
+    from pmcp.config.loader import _manifest_server_to_config, _credential_value_for
     from pmcp.manifest.loader import load_manifest
 
     server = load_manifest().get_server("brave-search")
     assert server is not None
-    config = _manifest_server_to_config(server, _credential_value)
+    config = _manifest_server_to_config(server, _credential_value_for(None))
     assert config.config.env["BRAVE_API_KEY"] == brave_in_project_store  # type: ignore[union-attr]
 
 

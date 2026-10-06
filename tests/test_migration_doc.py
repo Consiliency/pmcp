@@ -1063,6 +1063,11 @@ _REVERSE_STEPS: dict[str, tuple[str, ...]] = {
         "unset `PMCP_FEEDBACK_TOKEN` and `GITHUB_TOKEN`",
         "keep `gh` off the gateway's `PATH`",
     ),
+    "A project file supplies credentials only": (
+        "2.7.3 started from that subdirectory reads only that subdirectory's `.env.pmcp`",
+        "copy the entries back into the subdirectory's `.env.pmcp`",
+        "start pmcp from the project root (`cd` to it first)",
+    ),
     "Auth responses changed": ("must match the 2.7.3 texts and `500`s again",),
     "The `tools/call` gate enforces the schemas pmcp advertises": (
         "don't send an explicit `null` for an optional argument; 2.7.3 rejects it",

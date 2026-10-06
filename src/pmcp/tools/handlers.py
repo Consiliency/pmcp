@@ -3237,7 +3237,7 @@ class GatewayTools:
                         source,
                     )
 
-            resolved = manifest_server_to_config(server_config)
+            resolved = manifest_server_to_config(server_config, self._project_root)
             missing_env_vars = self._missing_remote_header_env_vars(resolved)
             if missing_env_vars:
                 return (
@@ -4196,7 +4196,9 @@ class GatewayTools:
         # Remote manifest entries do not install packages; connect them directly.
         if server_config.url:
             try:
-                resolved_config = manifest_server_to_config(server_config)
+                resolved_config = manifest_server_to_config(
+                    server_config, self._project_root
+                )
                 missing_env_vars = self._missing_remote_header_env_vars(resolved_config)
                 if missing_env_vars:
                     env_names = ", ".join(missing_env_vars)
@@ -5830,7 +5832,9 @@ class GatewayTools:
             if not server_config:
                 raise ValueError(f"Server '{job_server_name}' not found in manifest")
 
-            resolved_config = manifest_server_to_config(server_config)
+            resolved_config = manifest_server_to_config(
+                server_config, self._project_root
+            )
 
             # Adopt the process into ClientManager
             await self._client_manager.adopt_process(
