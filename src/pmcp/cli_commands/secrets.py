@@ -10,9 +10,8 @@ from pmcp.config.loader import load_configs
 from pmcp.env_store import (
     copyable_from_repository,
     resolve_project_root,
-    credential_value,
+    credential_lookup,
     read_store,
-    repository_values,
     read_store_for_update,
     resolve_scope_path,
     scope_confinement,
@@ -341,22 +340,14 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
     # link out of the checkout lists no keys and satisfies no requirement.
     user_values = read_store("user")
     project_values = read_store("project", project=project_root)
-    # Satisfaction goes through the one gate (env_store.credential_value): the
-    # user store first, then the project store's values expanded within the
-    # file only -- by membership, and never a name pmcp reads from its own
-    # environment from the project file (Consiliency/pmcp#372 round 3).
-    project_credentials = repository_values("project", project=project_root)
+    # The diagnostic answers what the runtime will do: the same lookup a running
+    # pmcp uses (env_store.credential_lookup) -- the environment first, an
+    # exported empty value "unavailable" -- not the stores alone
+    # (Consiliency/pmcp#372 round 5; tests/test_credential_parity.py).
+    lookup = credential_lookup(project_root)
 
     def _available(key: str) -> bool:
-        return bool(
-            credential_value(
-                key,
-                environ=False,
-                startup_files=False,
-                operator=user_values,
-                repository=project_credentials,
-            )
-        )
+        return bool(lookup(key))
 
     (
         required_keys,
@@ -390,8 +381,12 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
         "required_keys": required_keys,
         "required_by_server": required_by_server,
         "auth_metadata_by_server": auth_metadata_by_server,
+        # Every name the stores hold or a server requires, that the runtime's
+        # lookup would answer -- an exported credential counts.
         "available_keys": sorted(
-            k for k in set(user_values) | set(project_values) if _available(k)
+            k
+            for k in set(user_values) | set(project_values) | set(required_keys)
+            if _available(k)
         ),
         "missing_keys": missing_keys,
     }

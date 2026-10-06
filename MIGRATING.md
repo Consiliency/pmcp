@@ -490,7 +490,10 @@ any value containing `${` or spanning lines is skipped with
 the rest still sync. If you meant one, set it yourself:
 `pmcp secrets set DATABASE_URL --scope user`. `gateway.auth_connect` accepts
 only a server's declared credential or a credential-shaped name, never one of
-those names, and refuses a credential containing `${`. Lookups that hand a
+those names, and refuses a credential containing `${`. `pmcp secrets check`
+now answers what a running pmcp would do: a variable your shell exports
+counts as available, and one it exports as empty counts as missing even when
+a store has it. Lookups that hand a
 project value only to the server the project configured -- a remote header,
 a server's declared credential -- keep the narrower rule: they refuse
 pmcp's own, proxy, code-loading and package-manager names. A `.env` that pmcp's startup walk

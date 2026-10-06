@@ -79,7 +79,9 @@ to do, how to verify it, and how to roll back to 2.7.3.
   package-manager names) and any value containing `${` or spanning lines, with `pmcp:
   Not copying <NAME> from .env.pmcp: …`, where 2.7.3 copied every key into the store
   pmcp loads into its environment at each start; `gateway.auth_connect` refuses the
-  same names and a credential containing `${`.
+  same names and a credential containing `${`. `pmcp secrets check` answers what the
+  runtime would: an exported variable counts as available, an exported empty one as
+  missing, where it used to look at the stores alone.
   *Security*
 - **Discovered servers are default-deny.** `gateway.register_discovered_server` resolves
   and pins the package (and refuses one it cannot pin, or an `env_vars` name that is not

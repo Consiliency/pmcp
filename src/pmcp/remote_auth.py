@@ -85,21 +85,12 @@ def build_remote_header_env_lookup(
     ``.env.pmcp`` linked out of the checkout contributes nothing, so a file the
     repository points at can never fill a ``${VAR}`` header (Consiliency/pmcp#367).
     """
-    from pmcp.env_store import credential_value, read_store, repository_values
+    from pmcp.env_store import credential_lookup
 
-    user_values = read_store("user")
-    project_values = repository_values("project", project=project_root)
-
-    def lookup(env_var: str) -> str | None:
-        # One gate (env_store.credential_value): the process environment, the
-        # user store, then repository values -- by membership, and never a name
-        # pmcp reads from its own environment from a repository source
-        # (Consiliency/pmcp#372 round 3).
-        return credential_value(
-            env_var, operator=user_values, repository=project_values
-        )
-
-    return lookup
+    # The one runtime lookup (env_store.credential_lookup): the process
+    # environment, the user store, then the project store -- by membership, and
+    # never a name a repository may not supply from a repository source.
+    return credential_lookup(project_root)
 
 
 def resolve_remote_headers_for_tenant(
@@ -129,6 +120,9 @@ def resolve_remote_headers_for_tenant(
     user_values = read_store("user") if include_process_env else None
 
     def lookup(env_var: str) -> str | None:
+        # Non-default arguments, deliberately: a caller that asks for tenant
+        # isolation (include_process_env=False) gets the tenant store alone --
+        # no environment, no user store, no startup project credentials.
         return credential_value(
             env_var,
             environ=include_process_env,

@@ -8,7 +8,7 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from pathlib import Path
 from typing import Literal
 
@@ -620,6 +620,26 @@ def credential_value(
     if repository_may_answer and startup_files and key in _REPO_CREDENTIALS:
         return _REPO_CREDENTIALS[key] or None
     return None
+
+
+def credential_lookup(project: Path | None = None) -> Callable[[str], str | None]:
+    """The credential lookup a running pmcp uses, for diagnostics to share.
+
+    :func:`credential_value` with the user store and the project store at
+    ``project`` read directly, so the answer is the runtime's whether or not this
+    process ran the startup load: a remote ``${VAR}`` header
+    (``remote_auth.build_remote_header_env_lookup``), ``pmcp doctor`` and ``pmcp
+    secrets check`` all call this, and ``tests/test_credential_parity.py`` checks
+    their verdicts against the runtime gates' on every combination of shell,
+    user store and project store (Consiliency/pmcp#372 round 5).
+    """
+    user_values = read_store("user")
+    project_values = repository_values("project", project=project)
+
+    def lookup(key: str) -> str | None:
+        return credential_value(key, operator=user_values, repository=project_values)
+
+    return lookup
 
 
 def describe_ignored_store_env_var(variable: str, store_name: str) -> str:
