@@ -351,3 +351,22 @@ def test_a_multi_line_value_is_skipped_and_the_rest_still_sync(
     err = capfd.readouterr().err
     assert "pmcp: Not copying MULTI_TOKEN from .env.pmcp:" in err
     assert "line one" not in err
+
+
+def test_a_credential_whose_value_would_expand_is_not_copied(
+    lay: dict[str, Path], capfd: pytest.CaptureFixture[str]
+) -> None:
+    """A credential-shaped name passes the allowlist; its ``${`` value does not."""
+    (lay["project"] / ".env.pmcp").write_text(
+        "LEAK_TOKEN='${GITHUB_TOKEN}'\nOTHER_API_KEY=plain\n"
+    )
+    out = _sync(lay["project"], "project", "user")
+    assert out["refused"] == ["LEAK_TOKEN"]
+    assert env_store.read_env_file(env_store.resolve_scope_path("user")) == {
+        "OTHER_API_KEY": "plain"
+    }
+    user_text = env_store.resolve_scope_path("user").read_text()
+    assert "${" not in user_text and "LEAK_TOKEN" not in user_text
+    assert "pmcp: Not copying LEAK_TOKEN from .env.pmcp: its value refers" in (
+        capfd.readouterr().err
+    )
