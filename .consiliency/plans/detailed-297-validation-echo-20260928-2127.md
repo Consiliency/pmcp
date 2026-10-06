@@ -1,32 +1,35 @@
 # Detailed plan: describe validation errors from their structure, never their value — everywhere pmcp turns an exception into text
 
-> **Revision 23 (2026-10-06), on main `bc0a9ce`.** Consiliency/pmcp#297, the
+> **Revision 24 (2026-10-06), on main `bc0a9ce`.** Consiliency/pmcp#297, the
 > prerequisite for piece B (`extra="forbid"`) of Consiliency/pmcp#236. The
 > change is **embedded, not described**. The 52 blocks under *Verbatim
 > bodies* are `git apply` patches against `origin/main` @ `bc0a9ce`. They are
 > byte-identical to the verified code on the branch `wip/297-code` @
-> `825c43a`. *Embedding proof* extracts them from this file and applies them
+> `86a63a6`. *Embedding proof* extracts them from this file and applies them
 > on a fresh `bc0a9ce`, then compares every file. The base stays `bc0a9ce`
 > for this rev; merging later main is for the implementation PR.
 >
-> **For the board:** review the spike's tree (`wip/297-code` @ `825c43a`,
+> **For the board:** review the spike's tree (`wip/297-code` @ `86a63a6`,
 > whose diff from `bc0a9ce` is these patches). The bundle may leave the
 > patches out.
 >
-> **What rev 23 changes:** it answers round 21 on Consiliency/pmcp#314 @
-> `221115a`. Claude, grok and codex: DISAGREE, each with the same blocking
-> class (F001). Claude also filed N1 and N2. Gemini: AGREE.
-> - Every HTTP response pmcp rejects, from every client and transport it
->   uses, is registered by class and rendered by class and status
->   number. The client list is derived and pinned, and the HTTP stacks'
->   logs are masked. A 6-shape × 14-site grid binds it end to end
->   (*Rev 23*).
-> - pmcp field names are allowed only on pmcp exception bindings. An
->   `MCPError` in a registered chain keeps only its code (the rev 12
->   residual is gone).
-> - The merge note is worded exactly.
+> **What rev 24 changes:** it answers round 22 on Consiliency/pmcp#314 @
+> `5054a76`. Claude, grok and codex: DISAGREE, with one class (a refusing
+> proxy's reason phrase). Claude also filed N1 (the links beneath a
+> registered error). Gemini: AGREE.
+> - A proxy's refusal, from every client, renders by class and status.
+>   `ProxyError` is registered; urllib's tunnel `OSError`, and a
+>   `URLError` over it, are registered by origin. So are a followed
+>   redirect's scheme (`UnsupportedProtocol`) and host (aiohttp's
+>   connection errors).
+> - Every value-free class's reason is checked against the client's
+>   source: each construction from non-literal text is reviewed, exactly.
+> - In a chain that holds a registered error, every other link prints as
+>   its class alone.
+> - A proxy grid, two redirect shapes and a client × shape layer bind
+>   these (*Rev 24*).
 
-## History (revs 1–22)
+## History (revs 1–23)
 
 Each revision answered the previous board. The full text is in the plan at
 that sha, at `.consiliency/plans/detailed-297-validation-echo-20260928-2127.md`.
@@ -56,13 +59,186 @@ The line ranges are that file's.
 | 20 | `d73d6cb` | round 18: 75–102 | 103–253 (SDK write side, log masking, exception readers, re-base on `23edd92`) |
 | 21 | `7bcb209` | round 19: 65–77 | 78–131 (every `except` binding; templates bound) |
 | 22 | `221115a` | round 20: 67–83 | 84–134 (response decoding; parser kinds; attribute allowlist); merge of `bc0a9ce`: 136–172 |
+| 23 | `5054a76` | round 21: 69–89 | 90–180 (every HTTP client's response errors; the grid; pmcp fields bound to pmcp classes) |
 
 The code for revs 1–17 is at `19dac95`, `929f693`, `026aadc`, `ee644a9`,
 `1824a09`, `9b24daa`, `dd3f707`, `2d9e736`, `8d33b49`, `6078419`,
 `46c4904`, `0a93265`, `ebcf4fc`, `06a9e01`, `67bd04d`, `403a83a` (rev 16),
 `18824c1` (rev 17), `b34717e` (rev 18), `fc88ea8` (rev 19), `f89527e` (rev
-20), `eb8796c` (rev 21) and `30dc945` (rev 22, on origin). Rev 17 before the
+20), `eb8796c` (rev 21), `30dc945` (rev 22) and `825c43a` (rev 23, on origin). Rev 17 before the
 merge of `6edf8a4` was `9e5cb57`.
+
+## Rev 24: a refusing proxy, a followed redirect, and the links beneath a registered error
+
+**Round 22.** Claude: DISAGREE. It confirmed the embedding, the round-21
+falsifiers, the response shapes, TLS, the DEBUG masking and the cost of
+the `MCPError` rule.
+- **F001 (blocking):** a proxy that refuses with `407 <reason>` has its
+  reason phrase echoed.
+  - httpx and httpx2 raise `ProxyError('407 <reason>')`, which reached a
+    remote server's connect errors and `gateway.health`'s `error`.
+  - urllib raises a bare tunnel `OSError` with the same text.
+
+  Rev 23's value-free table listed `ProxyError` with a reason that was
+  false.
+- **N1:** `safe_traceback_text` printed the exception *beneath* a
+  registered error with its own text. On 3.10 urllib's `BadStatusLine` is
+  raised while handling `int('2<S>')`.
+
+Gemini: AGREE. Grok and codex: DISAGREE, with the same class as claude's
+F001.
+- **Grok:** a CONNECT refusal's reason phrase (`403 <S>`) reached
+  `exception_text`, `describe_exception` (and so `gateway.health`) and
+  `sanitize_auth_diagnostic`, on httpx, httpx2 and urllib. Any refusal
+  status carries one, not only 407.
+- **Codex:** urllib's `URLError`, chained to the `OSError`, carries the
+  reason phrase itself. `package_identity.py`'s DEBUG line logged it
+  verbatim, and rev 23's table listed `URLError` as value-free.
+
+**The coordinator's ruling:** cover the proxy case; do not list it as a
+non-goal. The class is any error raised from a response that any HTTP
+party sent: the origin, a proxy or a redirect target. HTTP errors render
+with their status only, and the rule has no exceptions, because an
+exception is what makes it uncheckable.
+
+**The class (rev 24).** An HTTP client error whose text can carry bytes
+that some party's response chose is registered by class and rendered by
+class and a number. Rev 23 asserted each value-free class's reason by
+hand. Rev 24 checks every such reason against the client's source:
+- **`test_every_dynamic_value_free_construction_is_reviewed`** finds, by
+  AST, each construction of a value-free class from non-literal text in
+  the client's own source. Each has a reviewed reason, exact both ways.
+  - It runs over the installed httpx, httpx2, httpcore, httpcore2, h11,
+    aiohttp, `http.client` and urllib.
+  - Keys are `module:Class@path::function`, with httpcore's generated
+    `_sync` folded into `_async`.
+  - Taking rev 23's table as given, it flagged three more besides
+    `ProxyError`, each confirmed by a probe:
+    - aiohttp's `WSMessageTypeError` quotes the message's data, although
+      rev 23's reason was "a fixed type-mismatch message";
+    - httpx/httpcore `UnsupportedProtocol` quotes the scheme of a
+      followed redirect's `Location`;
+    - aiohttp's connection errors (`ClientConnectorError`,
+      `ConnectionTimeoutError`, …) name the host, port or URL that a
+      followed redirect chose.
+- **`test_the_transport_exception_map_keeps_registration`:** httpx and
+  httpx2 re-raise each httpcore error as their own class with the same
+  text (`mapped_exc(message)`). Each pair in the map must be registered
+  alike.
+- **`test_every_http_exception_class_is_classified`** now also walks each
+  exported class's subclasses, at any depth. That added aiohttp's
+  unexported `UnixClientConnectorError`.
+
+**Registered in rev 24, with their descriptions:**
+- httpx, httpx2, httpcore and httpcore2 `ProxyError`, and aiohttp's
+  `ClientHttpProxyError`:
+  - read `the proxy refused the tunnel (<class>[, status N])`;
+  - the status is the leading three digits of httpcore's
+    `"%d %s" % (status, reason)`;
+  - a SOCKS refusal has no status.
+- **urllib's refused tunnel is a bare `OSError`.** It is registered by
+  origin, never by text: the innermost frame of its traceback must be
+  the code object of `http.client.HTTPConnection._tunnel`.
+  - Its status is that frame's `code` local, if it is an `int`.
+  - It reads `the proxy refused the tunnel (OSError, status 407)`.
+  - **A `URLError` whose `reason` is that `OSError` is the same refusal
+    (round 22 codex).** Its text is its reason's, so it is registered by
+    origin too, whether or not its chain is intact. It reads
+    `the proxy refused the tunnel (URLError, status 407)`.
+    - The classification test now has a third list,
+      `_REGISTERED_BY_ORIGIN`, beside the registered and value-free ones.
+    - `URLError` moved there from the value-free table. Its non-literal
+      constructions stay in the reviewed census.
+  - The check is in the registry (`_is_validation_error`), so every sink
+    sees it: text, `safe_exc_info`, the log scrubber and tracebacks.
+- httpx, httpx2, httpcore and httpcore2 `UnsupportedProtocol` read
+  `the URL's scheme is not supported (<class>)`.
+- aiohttp's `ClientConnectionError` and every subclass read
+  `the connection failed (<class>[, errno N])`.
+  - The exception is `ServerDisconnectedError`, which keeps its
+    rejected-response wording.
+  - Cost: the host and OS text are gone from aiohttp's connection errors.
+    pmcp's aiohttp sites name their target themselves (the package,
+    registry or JWKS URL).
+- aiohttp's `WSMessageTypeError`.
+
+**N1 (rev 24).** In a chain that holds a registered error, every other
+link prints as its class alone:
+- a link beneath the registered error, such as its context or cause;
+- a link beside it in a group.
+
+Wrappers above it keep rev 18's description of what they chain.
+`test_a_link_beneath_a_registered_error_prints_its_class_alone` checks
+the chain below, above and in a group.
+
+**The bindings.**
+- **The proxy grid** (`test_no_proxy_refusal_reaches_any_output`):
+  - **Statuses × schemes:** {403, 407, 502}, each with the sentinel as
+    the reason phrase, × {https (a CONNECT tunnel), http (an
+    absolute-form request)}.
+  - **Sites:** every site whose client takes `HTTP(S)_PROXY`, derived
+    from the AST. That is every site except the aiohttp-only ones.
+    `test_no_aiohttp_site_takes_a_proxy` pins that aiohttp's `trust_env`
+    defaults to off and that pmcp passes neither `trust_env` nor `proxy`.
+  - **urllib openers:** each opener's own `ProxyHandler` reads the
+    environment once, when `build_opener` runs at import. The grid
+    therefore prepends a `ProxyHandler` to each opener's `handle_open`.
+    `test_every_urllib_opener_takes_the_environment_proxy` pins that pmcp
+    builds all three openers with `build_opener` and passes no
+    `ProxyHandler` of its own.
+  - **Oracle and non-vacuity:** the grid's oracle. Each site must reach
+    the proxy; the per-site token is in the CONNECT host or the
+    request line.
+  - The seat's falsifier (remote `http` and `sse` through a 407 proxy)
+    is two of its rows.
+- **`test_no_proxy_refusal_reaches_any_renderer`** runs each client
+  (urllib, httpx, httpx2, and aiohttp with `proxy=`) through the same
+  refusing proxy, for each scheme and status. It gives the caught error
+  to every renderer a site uses:
+  - `exception_text` and `safe_traceback_text`;
+  - `describe_exception`, bare and in a group (`gateway.health`'s shape);
+  - `sanitize_auth_diagnostic`;
+  - a log record;
+  - for urllib, a `URLError` rebuilt without its chain.
+
+  These are grok's and codex's falsifiers, on every client.
+- **The response grid** gains two shapes:
+  - `redirect-scheme`, a `Location` with the sentinel as its scheme;
+  - `redirect-host`, a `Location` to `<sentinel>.invalid`, which RFC 6761
+    guarantees never resolves.
+- **`test_no_client_error_prints_a_rejected_response`** runs each client
+  (urllib, httpx, httpx2 and aiohttp) on its own against each of the 8
+  shapes. It inspects the caught error's text, its traceback and a log
+  record carrying it as `exc_info`. The end-to-end grid sees only the
+  errors that escape, and the urllib sites catch theirs, so this is
+  where N1 is bound.
+- **The sentinel is now plain words** (`rejected…zulu`). pmcp's secret
+  redaction reads rev 23's `RESPONSESENTINELQ9…` as an opaque token, and
+  it masked a redirect-scheme leak in `last_error` on rev 23, so that row
+  passed by coincidence.
+
+**Red on rev 23's renderers** (`825c43a`'s `src` with this
+`test_parse_error_echo.py`):
+```text
+  1 test_a_link_beneath_a_registered_error_prints_its_class_alone
+  1 test_every_http_exception_class_is_classified
+  1 test_every_imported_module_is_classified
+  3 test_no_client_error_prints_a_rejected_response
+  3 test_no_proxy_refusal_reaches_any_output
+  9 test_no_proxy_refusal_reaches_any_renderer
+  2 test_no_rejected_http_response_reaches_any_output
+20 failed, 239 passed in 45.98s
+```
+
+- Every https proxy row fails on httpx, httpx2 and urllib, at each of
+  403, 407 and 502.
+- The http rows pass on rev 23 too: a forwarded refusal is an ordinary
+  response, already registered.
+- aiohttp's `ClientHttpProxyError` was already registered.
+- The import-classification failure is rev 24's own `http` import, which
+  rev 23's source lacks.
+
+**Mutants:** M162–M174 (see *Mutation evidence*).
 
 ## Rev 23: every HTTP response pmcp rejects, from every client it uses
 
@@ -588,14 +764,17 @@ read, is a sink.
   vocabulary (rev 21).
 - **§7–§8, rev 21:** every `except` binding is an exception name, whatever
   it catches. Rev 22: an attribute read is safe only by allowlist.
-- **§10, rev 22–23:** an HTTP response that any client or transport
-  pmcp uses rejects (status line, header, framing, body, MIME type,
-  reason phrase) is a registered error, rendered by class and status
-  number.
+- **§10, rev 22–24:** an HTTP error whose text can carry bytes that a
+  response chose is a registered error, rendered by class and a number.
+  This covers every client and transport pmcp uses, and a response from
+  the origin, a proxy or a redirect target: a status line, header,
+  framing, body, MIME type, reason phrase, a proxy's refusal, or a
+  redirect's scheme or host. In a chain that holds one, every other link
+  prints as its class alone (rev 24).
 
 ## Changes
 
-The patches are `git diff bc0a9ce 825c43a -- <file>`: 52 files, +12993 / −691. This is
+The patches are `git diff bc0a9ce 86a63a6 -- <file>`: 52 files, +13664 / −691. This is
 one concern applied at every sink, past the bounded-plan threshold on
 purpose. Rev 20:
 - adds `pmcp/sdk_rejections.py`, installed with the log scrubber;
@@ -614,7 +793,14 @@ Rev 23 widens the registry to `HTTP_RESPONSE_ERRORS`
 (`server.py`). Its tests are the pins and the grid in
 `test_parse_error_echo.py`, the binding rule in
 `test_exception_text_sinks.py`, and the wire-code re-pin in
-`test_downstream_frame_echo.py`. All 52 patches are one `git
+`test_downstream_frame_echo.py`. Rev 24 changes:
+- `argument_errors.py`: the proxy, scheme and connection registrations,
+  the tunnel's origin check, the phrase table and the class-only links;
+- `test_parse_error_echo.py`: the census, the map parity, the subclass
+  walk, the by-origin list, the proxy grid and its pins, the proxy ×
+  renderer layer, the redirect shapes, the client × shape layer and the
+  N1 chain;
+- `CHANGELOG.md`: two sentences. All 52 patches are one `git
 apply`: no import cycles, no migration, no config change.
 
 **Size.** The patches are most of the plan, and the prose is about 20 KB.
@@ -633,57 +819,72 @@ On a fresh `bc0a9ce` with the patches applied:
   `test_scoped_advisor_audit`, `test_gateway_tool_schemas`,
   `test_http_transport`), plus Consiliency/pmcp#371's
   `test_nullable_schema_portability` and `test_migration_doc`;
-- the round-16 to 21 falsifiers are in the suite (round 21's are rows of
-  the HTTP grid; *Rev 23*);
+- the round-16 to 22 falsifiers are in the suite (rounds 21's and 22's
+  are rows of the HTTP and proxy grids; *Rev 23*, *Rev 24*);
 - run the full suite `-m 'not live and not slow'` with the npm cache
   variables unset.
 
-## Acceptance criteria — measured on `825c43a`
+## Acceptance criteria — measured on `86a63a6`
 
-- [x] The eight modules and Consiliency/pmcp#371's two are green: `1479 passed in 407.12s (0:06:47)`.
-- [x] Red on main `bc0a9ce`, with the eight test files from `825c43a`
+- [x] The eight modules and Consiliency/pmcp#371's two are green: `1549 passed in 433.22s (0:07:13)`.
+- [x] Red on main `bc0a9ce`, with the eight test files from `86a63a6`
   (`--tb=line`; the errors are a fixture importing `pmcp.argument_errors`):
 
 ```text
  173 tests/test_argument_error_echo.py
   99 tests/test_downstream_frame_echo.py
-  10 tests/test_exception_text_sinks.py
+   9 tests/test_exception_text_sinks.py
    3 tests/test_gateway_tool_schemas.py
   24 tests/test_http_transport.py
   80 tests/test_log_record_scrubber.py
- 126 tests/test_parse_error_echo.py
+ 193 tests/test_parse_error_echo.py
    6 tests/test_scoped_advisor_audit.py
-464 failed, 622 passed, 57 errors in 157.55s (0:02:37)
+530 failed, 626 passed, 57 errors in 111.68s (0:01:51)
 ```
 
-- [x] Binding: on rev 22's renderers the HTTP grid fails on 4 of its 6 shapes (status
-line, header line, chunk size, reason phrase). The seats' falsifiers are
-rows in it: claude's at the remote http and sse sites, grok's chunk size at
-`get_npm_version`, codex's status line at `_fetch_packument`. It passes
-here. Each of M156–M160 removes one part of the rule, and each dies.
+- [x] Binding: on rev 23's renderers the response grid fails both new shapes
+(`redirect-scheme`, `redirect-host`), the proxy grid fails every https row,
+and the N1 chain and the client and renderer layers fail as listed in
+*Rev 24*. That is 20 failures; the seats' falsifiers are rows among them.
+It passes here. M162–M174 each remove one part of the rule, and each
+dies (see *Mutation evidence*).
 
 - [x] The full suite, with `npm_config_cache`, `npm_config_store_dir` and
-  `pnpm_config_store_dir` unset: `10131 passed, 6 skipped, 80 deselected in 930.69s (0:15:30)`. The green run, the full suite
+  `pnpm_config_store_dir` unset: `10201 passed, 6 skipped, 80 deselected in 1060.68s (0:17:40)`. The green run, the full suite
   and the gates ran on host `ai` (Python 3.10, `uv sync --all-extras`),
-  from a worktree of the pushed `825c43a`.
+  from a worktree of the pushed `86a63a6`.
 - [x] Gates: ruff check: `All checks passed!`; ruff format --check: `193 files already formatted`; mypy: `Success: no issues found in 57 source files`.
 
 ## Mutation evidence
 
-`mutants.py` ran on worktrees of `dddfabc`. The final `825c43a` differs
-from it in three ways:
-- the HTTP grid redirects each urllib opener on its instance; in the full
-  suite the class-level redirect missed the feedback opener, and the
-  grid's per-site token check caught it;
-- the three value-matching helpers are removed, with M93, which mutated
-  them;
-- `_response_status` reads `status`, `code` and `response.status_code`
-  one at a time, so aiohttp's deprecated `code` (a `DeprecationWarning`)
-  is read only when there is no `status`. The value it returns is
-  unchanged.
+`mutants.py` ran on host `ai`, three lanes per pass, on worktrees of
+`328c5cc`. The final `86a63a6` differs from it by:
+- the by-origin registration of a `URLError` over a refused tunnel;
+- its test rows (status 403, the proxy × renderer layer);
+- two `CHANGELOG.md` words.
 
-No other mutant touches these changes. The green run, the full suite and the gates
-below ran on `825c43a`. The procedure:
+M162–M174 ran again on `86a63a6`, in both passes, and the tables show
+those runs for them.
+
+Partway through the run, at 15:00, a startup hook (`killguard.pth`) was
+installed into every virtualenv on `ai`, by something outside this work.
+When a subprocess runs under a temporary `HOME`, the hook prints
+`killguard: NOT installed` to stderr.
+- That fails `test_an_uncaught_error_with_no_stderr_prints_nothing`
+  (empty stderr) for every mutant alike, so a "kill" there proves
+  nothing.
+- Every mutant whose run stopped on that test ran again on `86a63a6`
+  with the test deselected (`DESELECT=`, a runner option added for
+  this). That was M44, M129, M130, M132, M133, M146, M148–M150 and
+  M154–M160, and M169–M174 of the reruns.
+- The tables show those runs. M44's is from dev0, which has no hook
+  (see the note below the tables). The green run, the full suite and the
+  gates finished before 15:00.
+- An unmutated run of the eight modules on `ai` after 15:00 fails that
+  test and only that one.
+
+The green run, the full suite and the gates ran on `86a63a6`. The
+procedure:
 - each mutant's anchor must occur exactly once;
 - the eight modules run with `-x`;
 - a dirty file is refused;
@@ -691,23 +892,30 @@ below ran on `825c43a`. The procedure:
   checked with `cmp` and against HEAD's blob by sha-256;
 - `git status` after the run: `0` and `0`.
 
-The purposes of M1–M155 are in the history table's plans (M153–M155:
-`221115a`). Rev 23 retires four mutants whose anchors are gone. M73 and
-M74 were the `MCPError` `data` match. M93 was its container-string
-matching; it survived once that match was gone, and its code
-(`carries_rejected_value`, `message_text`, `_rejected_texts`) is now
-removed. M153 was the `ContentTypeError` entry, now covered by M156. Rev 23 re-anchors M66 and M155, and adds
-M156–M161:
-- M156, M157 and M158 drop aiohttp's `ClientResponseError`,
-  `http.client`'s `HTTPException` and httpcore2's `ProtocolError` from the
-  registry;
-- M159 describes a rejected HTTP response by its own text;
-- M160 leaves httpcore's and httpcore2's loggers unmasked;
-- M161 lets an `MCPError` in a registered chain keep its own message and
-  `data`.
+The purposes of M1–M161 are in the history table's plans (M156–M161:
+`5054a76`). Rev 24 re-anchors three mutants on the rewritten traceback
+and registry lines: M45 (the unqualified class name), M125 (a wrapper
+printed from its own message) and M158 (httpcore2's `ProtocolError`).
+It adds M162–M174:
+- M162 drops httpx's `ProxyError`; M163 drops httpx2's and httpcore2's
+  together, so the map parity cannot catch it;
+- M164 restores rev 23's state: `ProxyError` value-free everywhere, with
+  its old reason;
+- M165 stops recognising urllib's refused tunnel; M166 reads its status
+  from another local of the frame;
+- M167 takes a `ProxyError`'s whole text as its status;
+- M168 prints a link beneath a registered error with its text;
+- M169 drops aiohttp's `ClientConnectionError`; M170 describes a
+  connection error by its text;
+- M171 drops httpx2's and httpcore2's `UnsupportedProtocol`;
+- M172 drops aiohttp's `WSMessageTypeError`;
+- M173 runs the proxy grid's urllib handler after the direct one, so the
+  urllib sites would never reach the proxy. It shows the grid's
+  non-vacuity check works.
+- M174 stops registering a `URLError` over a refused tunnel by origin.
 
 ```text
-145 mutants applied; 143 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M152 M154–M161 G1 S5–S8
+158 mutants applied; 156 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M152 M154–M161 G1 S5–S8 M162–M174
 survived: M23 SDK parse error keeps its message
 survived: M25 malformed error message kept
 ```
@@ -715,7 +923,7 @@ survived: M25 malformed error message kept
 `NO_STATIC=1` deselects the sink guard and the helpers-only rule:
 
 ```text
-145 mutants applied; 138 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M149 M151–M152 M154–M161 G1 S5–S8
+158 mutants applied; 151 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M149 M151–M152 M154–M161 G1 S5–S8 M162–M174
 survived: M19 tasks_get response uses str(e)
 survived: M20 tasks_get audit buffer uses str(e)
 survived: M22 installer crash message uses raw exc (static guard)
@@ -727,16 +935,22 @@ survived: M150 a narrow OSError handler renders its raw text (CLI auth-token fil
 
 M23 and M25 are equivalent mutants. Their combined partners, M102 and M90,
 die in both passes. M19, M20, M22, M35 and M150 die only on the sink guard,
-by design.
+by design. These survivors are the same as in rev 23.
 
-Rev 23's mutants die in both passes:
-- M156, M157 and M158 die on `test_every_http_exception_class_is_classified`,
-  which fails as soon as a response-carrying class is left unregistered.
-- M159 and M160 die on the HTTP grid.
-- M161 and the re-anchored M66 die on the wire-code test.
+Rev 24's mutants die in both passes:
+- M162, M163, M169, M171 and M172 die on
+  `test_every_http_exception_class_is_classified`.
+- M164 dies on `test_every_dynamic_value_free_construction_is_reviewed`,
+  because `ProxyError(msg)` is an unreviewed construction.
+- M165–M167 and M170 die on the proxy and response grids.
+- M168 dies on the N1 chain test.
+- M173 dies on the proxy grid's non-vacuity check ("never reached the
+  proxy").
+- M174 dies on the renderer layer's unchained `URLError`.
 
-Both passes ran on 6 worktrees each on dev0, with
-`PYTHONDONTWRITEBYTECODE=1`.
+M44 is the only mutant whose sole killing test is the one the host hook
+breaks. On `ai`, with that test deselected, it survives. On dev0, which has
+no hook, it ran on `86a63a6` in both passes and dies there.
 
 ## Non-goals and unverified
 
@@ -752,6 +966,16 @@ Both passes ran on 6 worktrees each on dev0, with
     `""`). This is a deliberate, reviewed, shape-bounded echo (rev 19).
     The id and this are the only request content the **SDK's** rejections
     carry (round 19 N1, round 20 N2).
+  - A census reason that rests on how pmcp configures a client:
+    - no client middleware (aiohttp's digest auth quotes the server's
+      header values);
+    - no certificate fingerprint;
+    - no websocket, ftp or file URL;
+    - no urllib auth handler;
+    - no `trust_env` or `proxy=` for aiohttp.
+
+    Each is pinned or reviewed (*Rev 24*). A change to that configuration
+    reopens its review.
   - Consiliency/pmcp#315's lookup echoes, which pmcp's own handlers make
     on purpose. `Unknown resource: x://<value>` and
     `Unknown tool/prompt: <name>` carry the caller's lookup key on every
@@ -768,6 +992,13 @@ Both passes ran on 6 worktrees each on dev0, with
 - **Unverified:**
   - Piece B's `additionalProperties` paths.
   - Repr forms the static rule cannot see (`{x}`, `str(x)`, a local).
+  - The HTTP site census matches call text (`aiohttp.ClientSession`,
+    `httpx.AsyncClient`, …). An aliased import (`from aiohttp import
+    ClientSession`) would be missed; `src/pmcp` has none. That
+    `ClientSession` name today is the MCP SDK's, over stdio.
+  - The redirect-host rows rely on `.invalid` failing to resolve
+    (RFC 6761). On a resolver that queries upstream for it, they are
+    slower, not wrong.
   - Copied inputs are traced through one assignment hop only.
   - The SDK adapter swap is by name (`mcp` 2.0.x).
   - jsonschema's `FormatError` and stdlib conversion errors are not
@@ -809,7 +1040,7 @@ Both passes ran on 6 worktrees each on dev0, with
 
 ## Embedding proof
 
-From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@825c43a`. The proof was run again on the final file, with this section in it, and printed the same listing.
+From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@86a63a6`. The proof was run again on the final file, with this section in it, and printed the same listing.
 
 ```text
 $ git -C <proof worktree> rev-parse --short HEAD
@@ -822,8 +1053,8 @@ from pmcp.argument_errors import exception_text
 warning: 1 line adds whitespace errors.
 applied
 changed paths == the 52 patched files
-$ git diff --name-only bc0a9ce origin/main (14d18e4), against the patched files
-origin/main 14d18e4: 30 changed paths since bc0a9ce, 8 of them patched here
+$ git diff --name-only bc0a9ce origin/main (49f44e9), against the patched files
+origin/main 49f44e9: 44 changed paths since bc0a9ce, 15 of them patched here
 cmp: 52 of 52 files identical
 ```
 
@@ -842,7 +1073,7 @@ done
 git apply --unidiff-zero --check <scratch>/*.patch && git apply --unidiff-zero <scratch>/*.patch
 ```
 
-The patches are `git diff -U0 bc0a9ce 825c43a -- <file>`. To fit the size
+The patches are `git diff -U0 bc0a9ce 86a63a6 -- <file>`. To fit the size
 budget, each is cut to plain unified-diff form: there are no `diff --git`,
 `index` or `new file mode` lines, and no function context in the hunk
 headers. `git apply` reads them the same way; a new file is created with
@@ -899,7 +1130,7 @@ print(f"{out}: {j - i - 1} lines")
 @@ -611,0 +612,17 @@
 +- **A value pmcp rejects is no longer echoed into a response, a log line, a traceback or an audit record (Consiliency/pmcp#297).** A rejected gateway-tool argument used to come back with jsonschema's or pydantic's message, which carried the value (`'Bearer sk-…' is not of type 'object'`, `input_value=…`), in the response, the log and the scoped audit. Rejections now read `<JSON path>: <reason>`, for example `Input validation error: $.options: must be of type object or null`. The reason is a fixed phrase filled only from the tool's own schema or model, and a key the caller chose shows as `*`. A call rejected by the argument model is audited as an `audit.rejection`. **Wording change:** a client matching jsonschema phrases such as `is not of type` must match the new form.
 +
-+  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`. An exception that chains a validation or parse error, as its cause, its context or a group member, shows only its class and that error's description, never its own message; pmcp's own refusals (an invalid policy file, a trust store it cannot parse) chain nothing and still name the file and the refusal. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500. The MCP SDK's own rejections no longer quote the request, on every transport: an unknown method's name is no longer returned as `data`, an unsupported protocol version's `requested` is returned only when it is a protocol revision, an SDK message pmcp has not reviewed reads as a fixed phrase for its code, and on `/mcp` a body that is not JSON or not a JSON-RPC message is described from its structure (`Validation error: N validation errors for …: $.<path>: <reason>`). Errors from pmcp's own tools are unchanged, and so is the request id. The SDK's server-side DEBUG logs and `sse_starlette`'s no longer show request text. A failed tool call whose error carries a rejected value is never read as a URL-elicitation request or an auth challenge. An HTTP response pmcp rejects -- a malformed status or header line, bad chunk framing, a truncated or undecodable body, an unexpected content type, an error status's reason phrase -- is reported by its class and status number, never its bytes, by every HTTP client pmcp uses (registry, version and package lookups, JWKS and auth metadata, feedback, the CLI's health probes, and remote MCP servers in `gateway.health`); the HTTP client libraries' DEBUG traces are masked likewise. An `MCPError` a gateway tool raises while handling a value it rejected keeps its code, and its message becomes the structural description.
++  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`. An exception that chains a validation or parse error, as its cause, its context or a group member, shows only its class and that error's description, never its own message; pmcp's own refusals (an invalid policy file, a trust store it cannot parse) chain nothing and still name the file and the refusal. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500. The MCP SDK's own rejections no longer quote the request, on every transport: an unknown method's name is no longer returned as `data`, an unsupported protocol version's `requested` is returned only when it is a protocol revision, an SDK message pmcp has not reviewed reads as a fixed phrase for its code, and on `/mcp` a body that is not JSON or not a JSON-RPC message is described from its structure (`Validation error: N validation errors for …: $.<path>: <reason>`). Errors from pmcp's own tools are unchanged, and so is the request id. The SDK's server-side DEBUG logs and `sse_starlette`'s no longer show request text. A failed tool call whose error carries a rejected value is never read as a URL-elicitation request or an auth challenge. An HTTP response pmcp rejects -- a malformed status or header line, bad chunk framing, a truncated or undecodable body, an unexpected content type, an error status's reason phrase, a proxy's refusal of any status, a redirect to an unsupported scheme -- is reported by its class and status number, never its bytes, by every HTTP client pmcp uses (registry, version and package lookups, JWKS and auth metadata, feedback, the CLI's health probes, and remote MCP servers in `gateway.health`); the HTTP client libraries' DEBUG traces are masked likewise. aiohttp's connection errors read `the connection failed (<class>, errno N)`, without the host or URL, which a followed redirect can choose. A traceback whose chain holds such an error prints every other exception in it by its class alone. An `MCPError` a gateway tool raises while handling a value it rejected keeps its code, and its message becomes the structural description.
 +
 +  Downstream frames:
 +  - A frame that is not JSON-RPC 2.0 is dropped with a value-free DEBUG record and never settles a request. This holds on stdio, SSE and streamable HTTP.
@@ -1002,7 +1233,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/src/pmcp/argument_errors.py
-@@ -0,0 +1,1440 @@
+@@ -0,0 +1,1566 @@
 +"""Describe a rejected gateway-tool argument without the value that failed.
 +
 +A gateway tool's arguments are checked twice: by the advertised JSON Schema
@@ -1579,20 +1810,114 @@ print(f"{out}: {j - i - 1} lines")
 +        "BadContentDispositionParam",
 +        "RedirectClientError",  # a rejected `Location` from the response
 +        "WebSocketError",  # a server's close message
++        "WSMessageTypeError",  # quotes the message's data (rev 24)
++        # Every connection error (rev 24): its text names the host, port or
++        # URL it connected to, which a followed redirect's `Location` chose.
++        "ClientConnectionError",
 +    ),
 +    "aiohttp.http_exceptions": ("HttpProcessingError",),  # every parser error
-+    "httpx": ("ProtocolError", "DecodingError", "HTTPStatusError"),
-+    "httpx2": ("ProtocolError", "DecodingError", "HTTPStatusError", "SSEError"),
-+    "httpcore": ("ProtocolError",),
-+    "httpcore2": ("ProtocolError",),
++    # `ProxyError`: a proxy's refusal, `"%d %s" % (status, reason phrase)`
++    # (rev 24, round-22 claude F001). `UnsupportedProtocol`: the scheme of a
++    # followed redirect's `Location` (rev 24).
++    "httpx": (
++        "ProtocolError",
++        "DecodingError",
++        "HTTPStatusError",
++        "ProxyError",
++        "UnsupportedProtocol",
++    ),
++    "httpx2": (
++        "ProtocolError",
++        "DecodingError",
++        "HTTPStatusError",
++        "SSEError",
++        "ProxyError",
++        "UnsupportedProtocol",
++    ),
++    "httpcore": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),
++    "httpcore2": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),
 +    "h11": ("ProtocolError",),
 +    "http.client": ("HTTPException",),  # BadStatusLine, LineTooLong, ...
 +    "urllib.error": ("HTTPError",),  # the reason phrase
 +}
 +
-+#: Of those, the ones that failed to decode a body that parsed: described as
-+#: such (rev 22's wording).
-+_DECODE_ERROR_NAMES = frozenset({"DecodingError", "ContentTypeError"})
++#: How a registered HTTP error is described, by the nearest class in its MRO
++#: named here; any other is "rejected an HTTP response" (rev 23). Each phrase
++#: is the class and, at most, a number: never the error's text.
++_HTTP_PHRASES: dict[str, str] = {
++    # A body that parsed but did not decode (rev 22's wording).
++    "DecodingError": "decode",
++    "ContentTypeError": "decode",
++    # A proxy's refusal (rev 24).
++    "ProxyError": "proxy",
++    "ClientHttpProxyError": "proxy",
++    # A URL scheme the client does not speak (rev 24).
++    "UnsupportedProtocol": "scheme",
++    # aiohttp's connection errors (rev 24); a disconnect mid-response stays
++    # a rejected response.
++    "ServerDisconnectedError": "response",
++    "ClientConnectionError": "connection",
++}
++
++
++def _http_phrase(error: BaseException) -> str:
++    for klass in type(error).__mro__:
++        kind = _HTTP_PHRASES.get(klass.__name__)
++        if kind is not None:
++            return kind
++    return "response"
++
++
++def _tunnel_refusal_status(error: BaseException) -> int | None | bool:
++    """For urllib's refused tunnel -- a bare ``OSError`` that
++    ``http.client.HTTPConnection._tunnel`` raises with the proxy's status
++    line, reason phrase included (rev 24, round-22 claude F001) -- the
++    status that frame read, or ``None`` if it read none. ``False`` for
++    every other exception.
++
++    Recognised by its origin, never its text: the innermost frame of its
++    traceback is that function's code object. The status is that frame's
++    ``code`` local, and only if it is an ``int``. A ``urllib.error.URLError``
++    whose ``reason`` is that ``OSError`` -- ``do_open`` wraps it so, and the
++    URLError's text is the reason's -- is the same refusal (round 22 codex).
++    """
++    if type(error) is not OSError:
++        import urllib.error
++
++        if isinstance(error, urllib.error.URLError) and isinstance(
++            error.reason, BaseException
++        ):
++            return _tunnel_refusal_status(error.reason)
++        return False
++    tb = error.__traceback__
++    if tb is None:
++        return False
++    while tb.tb_next is not None:
++        tb = tb.tb_next
++    import http.client
++
++    tunnel = getattr(http.client.HTTPConnection, "_tunnel", None)
++    if tunnel is None or tb.tb_frame.f_code is not tunnel.__code__:
++        return False
++    try:
++        code = tb.tb_frame.f_locals.get("code")
++    except Exception:  # pragma: no cover - a frame without locals
++        return None
++    return code if type(code) is int else None
++
++
++def _proxy_status(error: BaseException) -> int | None:
++    """The status a ``ProxyError`` names: httpcore builds its message as
++    ``"%d %s" % (status, reason phrase)`` and httpx maps it with that text.
++    Only a leading three-digit number is read; nothing else of the text is
++    used. A SOCKS refusal names none."""
++    import re
++
++    text = error.args[0] if error.args else None
++    if not isinstance(text, str):
++        return None
++    match = re.match(r"([1-5][0-9][0-9]) ", text)
++    return int(match.group(1)) if match else None
 +
 +
 +@functools.cache
@@ -1647,9 +1972,10 @@ print(f"{out}: {j - i - 1} lines")
 +    global _VALUE_BEARING
 +    if not _VALUE_BEARING:
 +        _VALUE_BEARING = _value_bearing_types()
-+    return isinstance(error, _VALUE_BEARING) and not isinstance(
-+        error, _value_free_types()
-+    )
++    if isinstance(error, _VALUE_BEARING) and not isinstance(error, _value_free_types()):
++        return True
++    # A refused urllib tunnel is a bare `OSError`: by origin (rev 24).
++    return _tunnel_refusal_status(error) is not False
 +
 +
 +def _parse_text(error: BaseException) -> str:
@@ -1709,9 +2035,28 @@ print(f"{out}: {j - i - 1} lines")
 +    if isinstance(error, UnicodeDecodeError):
 +        # The codec and class only: never the undecodable bytes.
 +        return f"could not decode {error.encoding} text (UnicodeDecodeError)"
++    tunnel = _tunnel_refusal_status(error)
++    if tunnel is not False:
++        # The status alone: never the proxy's reason phrase (rev 24).
++        where = f", status {tunnel}" if tunnel is not None else ""
++        return f"the proxy refused the tunnel ({type(error).__name__}{where})"
 +    if _is_response_decode_error(error):
 +        name = type(error).__name__
-+        if name in _DECODE_ERROR_NAMES:
++        kind = _http_phrase(error)
++        if kind == "proxy":
++            status = _response_status(error)
++            if status is None:
++                status = _proxy_status(error)
++            where = f", status {status}" if status is not None else ""
++            return f"the proxy refused the tunnel ({name}{where})"
++        if kind == "scheme":
++            return f"the URL's scheme is not supported ({name})"
++        if kind == "connection":
++            # The errno, a number, and never the host, port, URL or OS text.
++            errno = getattr(error, "errno", None)
++            where = f", errno {errno}" if type(errno) is int else ""
++            return f"the connection failed ({name}{where})"
++        if kind == "decode":
 +            # Format and class only: never the MIME type or the body.
 +            return f"could not decode an HTTP response ({name})"
 +        # The class and the status number: never the status line, a header,
@@ -1806,9 +2151,10 @@ print(f"{out}: {j - i - 1} lines")
 +    """The formatted traceback. When the chain holds a validation or parse
 +    error, every exception in it is rendered as its frames (file, line,
 +    source) and ``Type: <text>``, where the text is a value-bearing error's
-+    description, a wrapper's description of what it chains (never its own
-+    message, rev 18) or else ``str()`` -- the frames never carry an
-+    exception's text -- so it stays a usable traceback (rev 6)."""
++    description or a wrapper's description of what it chains (never its own
++    message, rev 18); any other exception in that chain is its class alone
++    (rev 24) -- the frames never carry an exception's text -- so it stays a
++    usable traceback (rev 6)."""
 +    if safe_exc_info(error) is not None:
 +        return "".join(
 +            traceback.format_exception(type(error), error, error.__traceback__)
@@ -1839,12 +2185,23 @@ print(f"{out}: {j - i - 1} lines")
 +            parts.append("Traceback (most recent call last):\n")
 +            parts.extend(traceback.format_tb(current.__traceback__))
 +        # The class is printed once: a wrapper's line is its qualified name
-+        # and the description of what it chains (rev 18).
-+        linked = (
-+            None if _is_validation_error(current) else _chained_value_bearing(current)
-+        )
-+        text = exception_text(current) if linked is None else _validation_text(linked)
-+        parts.append(f"{_qualified_name(type(current))}: {text}\n")
++        # and the description of what it chains (rev 18). Every other link
++        # -- beneath a registered error, or beside one in a group -- is its
++        # class alone: a parser that raises inside its own `except` leaves
++        # the rejected bytes in that context (rev 24, round-22 claude N1:
++        # `BadStatusLine` over `int('2<S>')`).
++        if _is_validation_error(current):
++            parts.append(
++                f"{_qualified_name(type(current))}: {_validation_text(current)}\n"
++            )
++        else:
++            linked = _chained_value_bearing(current)
++            if linked is None:
++                parts.append(f"{_qualified_name(type(current))}\n")
++            else:
++                parts.append(
++                    f"{_qualified_name(type(current))}: {_validation_text(linked)}\n"
++                )
 +
 +    render(error)
 +    return "".join(parts)
@@ -13044,7 +13401,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/tests/test_parse_error_echo.py
-@@ -0,0 +1,1856 @@
+@@ -0,0 +1,2399 @@
 +"""A parse error never echoes the structured text it rejected
 +(Consiliency/pmcp#297; rev 6, reclassified by origin in rev 7).
 +
@@ -14186,6 +14543,9 @@ print(f"{out}: {j - i - 1} lines")
 +        "getpass",
 +        "hashlib",
 +        "hmac",
++        # `http.client` sends nothing for pmcp: argument_errors recognises
++        # urllib's refused tunnel by its code (rev 24); it is a transport.
++        "http",
 +        "importlib",
 +        "inspect",
 +        "ipaddress",
@@ -14242,13 +14602,21 @@ print(f"{out}: {j - i - 1} lines")
 +#: through them: derived in `test_every_client_transport_is_registered`.
 +_TRANSPORTS = {"http.client", "httpcore", "httpcore2", "h11"}
 +
-+#: Per module, every exception class it defines that is NOT registered, and
-+#: why its message cannot carry response bytes. Exact both ways with what the
-+#: module defines (`test_every_http_exception_class_is_classified`).
-+_CONNECT = "a connection, DNS, TLS or socket failure: no response was parsed"
++#: Per module, every exception class it defines -- or that subclasses one it
++#: exports, at any depth -- that is NOT registered, and why its message
++#: cannot carry response bytes. Exact both ways
++#: (`test_every_http_exception_class_is_classified`). A reason is checked
++#: against every construction of the class from non-literal text in the
++#: client's own source (`test_every_dynamic_value_free_construction_is_reviewed`,
++#: rev 24): round 22 found `ProxyError`'s reason here false.
++_CONNECT = "a connection, DNS, TLS or socket failure: the OS's text, no host"
 +_TIMEOUT = "a timeout: no response bytes in its text"
 +_BASE = "a base class: its response-carrying subclasses are registered"
 +_USE = "a misuse of the client API by the caller: pmcp's own text"
++_URL = (
++    "a URL pmcp passed; a followed redirect's is wrapped in a registered "
++    "error, beneath which a traceback prints this class alone (rev 24)"
++)
 +_VALUE_FREE_HTTP_ERRORS: dict[str, dict[str, str]] = {
 +    "httpx": {
 +        "CloseError": _CONNECT,
@@ -14256,10 +14624,9 @@ print(f"{out}: {j - i - 1} lines")
 +        "ConnectTimeout": _TIMEOUT,
 +        "CookieConflict": _USE,
 +        "HTTPError": _BASE,
-+        "InvalidURL": _USE,
++        "InvalidURL": _URL,
 +        "NetworkError": _CONNECT,
 +        "PoolTimeout": _TIMEOUT,
-+        "ProxyError": "the operator's proxy refused the tunnel",
 +        "ReadError": _CONNECT,
 +        "ReadTimeout": _TIMEOUT,
 +        "RequestError": _BASE,
@@ -14271,7 +14638,6 @@ print(f"{out}: {j - i - 1} lines")
 +        "TimeoutException": _TIMEOUT,
 +        "TooManyRedirects": "a fixed message",
 +        "TransportError": _BASE,
-+        "UnsupportedProtocol": _USE,
 +        "WriteError": _CONNECT,
 +        "WriteTimeout": _TIMEOUT,
 +    },
@@ -14281,48 +14647,97 @@ print(f"{out}: {j - i - 1} lines")
 +        "ConnectionNotAvailable": _CONNECT,
 +        "NetworkError": _CONNECT,
 +        "PoolTimeout": _TIMEOUT,
-+        "ProxyError": "the operator's proxy refused the tunnel",
 +        "ReadError": _CONNECT,
 +        "ReadTimeout": _TIMEOUT,
 +        "TimeoutException": _TIMEOUT,
-+        "UnsupportedProtocol": _USE,
 +        "WriteError": _CONNECT,
 +        "WriteTimeout": _TIMEOUT,
 +    },
 +    "h11": {},
 +    "aiohttp": {
-+        "ClientConnectionError": _CONNECT,
-+        "ClientConnectionResetError": _CONNECT,
-+        "ClientConnectorCertificateError": _CONNECT,
-+        "ClientConnectorDNSError": _CONNECT,
-+        "ClientConnectorError": _CONNECT,
-+        "ClientConnectorSSLError": _CONNECT,
 +        "ClientError": _BASE,
-+        "ClientOSError": _CONNECT,
-+        "ClientProxyConnectionError": _CONNECT,
-+        "ClientSSLError": _CONNECT,
-+        "ConnectionTimeoutError": _TIMEOUT,
 +        "EofStream": "carries no text",
-+        "InvalidURL": _USE,
-+        "InvalidUrlClientError": _USE,
-+        "NonHttpUrlClientError": _USE,
-+        "ServerConnectionError": _BASE,
-+        "ServerFingerprintMismatch": "the certificate's digests, not response bytes",
-+        "ServerTimeoutError": _TIMEOUT,
-+        "SocketTimeoutError": _TIMEOUT,
-+        "WSMessageTypeError": "a fixed type-mismatch message",
++        "InvalidURL": _URL,
++        "InvalidUrlClientError": _URL,
++        "NonHttpUrlClientError": _URL,
 +    },
 +    "aiohttp.http_exceptions": {},
 +    "http.client": {},
 +    "urllib.error": {
-+        "URLError": "its reason is a socket error or pmcp's own URL",
 +        "ContentTooShortError": "a byte count; the bytes stay in `.content`",
++    },
++}
++
++#: Classes registered by origin, not by class (rev 24): an instance is
++#: value-bearing when it comes from a refused tunnel, and only then; any
++#: other instance is value-free for the reason given. Its non-literal
++#: constructions are reviewed like a value-free class's.
++_REGISTERED_BY_ORIGIN: dict[str, dict[str, str]] = {
++    "urllib.error": {
++        "URLError": (
++            "registered when its `reason` is a refused tunnel's `OSError` "
++            "(round 22 codex: its text is that reason's); otherwise its "
++            "reason is a socket error or pmcp's own URL"
++        ),
 +    },
 +}
 +_VALUE_FREE_HTTP_ERRORS["httpx2"] = {
 +    **_VALUE_FREE_HTTP_ERRORS["httpx"],
 +}
 +_VALUE_FREE_HTTP_ERRORS["httpcore2"] = dict(_VALUE_FREE_HTTP_ERRORS["httpcore"])
++
++#: Every construction of a value-free class from text that is not a literal,
++#: in the client's own source (rev 24): `module:Class@path::function`, with
++#: httpcore's generated `_sync` folded into `_async`. Each says why that text
++#: carries no response bytes. Exact both ways
++#: (`test_every_dynamic_value_free_construction_is_reviewed`).
++_HOST_LITERAL = "an IP-literal host: `is_ip_address` matched it, digits and dots only"
++_REVIEWED_DYNAMIC_CONSTRUCTIONS: dict[str, str] = {
++    "aiohttp:ClientError@aiohttp/client_middleware_digest_auth.py::_encode": (
++        "DigestAuthMiddleware's: pmcp configures no client middleware"
++    ),
++    "aiohttp:InvalidURL@aiohttp/client.py::_request": "the proxy URL pmcp passes (none)",
++    "aiohttp:InvalidURL@aiohttp/client_reqrep.py::update_host": (
++        "a hostless URL; `_request` refuses a hostless redirect first, as "
++        "`InvalidUrlRedirectClientError` (registered)"
++    ),
++    "aiohttp:InvalidUrlClientError@aiohttp/client.py::_request": (
++        "the URL pmcp passed: a redirect raises `InvalidUrlRedirectClientError`"
++    ),
++    "aiohttp:InvalidUrlClientError@aiohttp/connector.py::_resolve_host": _HOST_LITERAL,
++    "aiohttp:NonHttpUrlClientError@aiohttp/client.py::_request": (
++        "the URL pmcp passed: a redirect raises `NonHttpUrlRedirectClientError`"
++    ),
++    "urllib.error:ContentTooShortError@urllib/request.py::retrieve": "byte counts",
++    "urllib.error:ContentTooShortError@urllib/request.py::urlretrieve": "byte counts",
++    "urllib.error:URLError@urllib/request.py::do_open": (
++        "the `OSError` it caught: a socket error, or a refused tunnel, which "
++        "registers this `URLError` by origin"
++    ),
++    "urllib.error:URLError@urllib/request.py::ftp_open": "ftp: pmcp opens none",
++    "urllib.error:URLError@urllib/request.py::get_authorization": (
++        "digest auth: pmcp's openers install no auth handler"
++    ),
++    "urllib.error:URLError@urllib/request.py::open_ftp": "ftp: pmcp opens none",
++    "urllib.error:URLError@urllib/request.py::open_local_file": "file: pmcp opens none",
++    "urllib.error:URLError@urllib/request.py::retrfile": "ftp: pmcp opens none",
++    "urllib.error:URLError@urllib/request.py::unknown_open": (
++        "the scheme of the URL pmcp passed: its openers follow no redirect"
++    ),
++}
++for _client in ("httpx", "httpx2"):
++    _REVIEWED_DYNAMIC_CONSTRUCTIONS.update(
++        {
++            f"{_client}:CookieConflict@{_client}/_models.py::get": (
++                "the cookie name pmcp asked for"
++            ),
++            f"{_client}:InvalidURL@{_client}/_urlparse.py::encode_host": _URL,
++            f"{_client}:InvalidURL@{_client}/_urlparse.py::normalize_port": _URL,
++            f"{_client}:InvalidURL@{_client}/_urlparse.py::urlparse": _URL,
++            f"{_client}:TooManyRedirects@{_client}/_client.py::"
++            "_send_handling_redirects": "a fixed message; `request=` is not rendered",
++        }
++    )
 +
 +
 +def _imported_top_modules() -> set[str]:
@@ -14412,7 +14827,7 @@ print(f"{out}: {j - i - 1} lines")
 +
 +    module = importlib.import_module(module_name)
 +    root = module_name.split(".")[0]
-+    return {
++    defined = {
 +        attr: value
 +        for attr, value in vars(module).items()
 +        if isinstance(value, type)
@@ -14420,6 +14835,19 @@ print(f"{out}: {j - i - 1} lines")
 +        and str(value.__module__).split(".")[0] == root
 +        and not attr.startswith("_")
 +    }
++    # And every subclass of those, at any depth, wherever the package
++    # defines it (rev 24: aiohttp's `UnixClientConnectorError` is not
++    # exported).
++    pending = list(defined.values())
++    while pending:
++        for sub in pending.pop().__subclasses__():
++            if (
++                str(sub.__module__).split(".")[0] == root
++                and sub not in defined.values()
++            ):
++                defined.setdefault(sub.__name__, sub)
++                pending.append(sub)
++    return defined
 +
 +
 +def test_every_http_exception_class_is_classified() -> None:
@@ -14433,16 +14861,90 @@ print(f"{out}: {j - i - 1} lines")
 +    problems = []
 +    for module_name, free in _VALUE_FREE_HTTP_ERRORS.items():
 +        defined = _defined_exceptions(module_name)
++        by_origin = _REGISTERED_BY_ORIGIN.get(module_name, {})
 +        for attr, value in sorted(defined.items()):
 +            is_registered = issubclass(value, registered)
-+            if is_registered and attr in free:
++            listed = attr in free or attr in by_origin
++            if is_registered and listed:
 +                problems.append((module_name, attr, "registered and listed"))
-+            if not is_registered and attr not in free:
++            if not is_registered and not listed:
 +                problems.append((module_name, attr, "neither registered nor listed"))
-+        for attr in free:
++        for attr in [*free, *by_origin]:
 +            if attr not in defined:
 +                problems.append((module_name, attr, "listed but not defined"))
 +    assert not problems, problems
++
++
++def _client_sources(module_name: str) -> tuple[Path, list[Path]]:
++    """The source files of a client or transport module, and their base."""
++    import importlib
++
++    if module_name == "http.client":
++        path = Path(importlib.import_module("http.client").__file__ or "")
++        return path.parents[1], [path]
++    if module_name == "urllib.error":
++        package = Path(importlib.import_module("urllib.request").__file__ or "").parent
++        return package.parent, [
++            package / n for n in ("request.py", "error.py", "response.py")
++        ]
++    package = Path(
++        importlib.import_module(module_name.split(".")[0]).__file__ or ""
++    ).parent
++    return package.parent, sorted(package.rglob("*.py"))
++
++
++def _dynamic_value_free_constructions() -> set[str]:
++    found: set[str] = set()
++    for module_name, value_free in _VALUE_FREE_HTTP_ERRORS.items():
++        free = {**value_free, **_REGISTERED_BY_ORIGIN.get(module_name, {})}
++        base, files = _client_sources(module_name)
++        for path in files:
++            tree = ast.parse(path.read_text(encoding="utf-8"))
++            rel = path.relative_to(base).as_posix().replace("/_sync/", "/_async/")
++            for node in ast.walk(tree):
++                if not isinstance(node, ast.Call):
++                    continue
++                name = ast.unparse(node.func).rsplit(".", 1)[-1]
++                values = [*node.args, *(k.value for k in node.keywords)]
++                if name in free and any(
++                    not isinstance(v, ast.Constant) for v in values
++                ):
++                    found.add(
++                        f"{module_name}:{name}@{rel}::{_owner(tree, node.lineno)}"
++                    )
++    return found
++
++
++def test_every_dynamic_value_free_construction_is_reviewed() -> None:
++    """Each construction of a value-free class from non-literal text, in each
++    client's own source, has a reviewed reason -- exactly, both ways (rev 24,
++    round-22 claude F001: `ProxyError(msg)` quoted a proxy's reason phrase
++    while its listed reason said otherwise)."""
++    found = _dynamic_value_free_constructions()
++    assert found == set(_REVIEWED_DYNAMIC_CONSTRUCTIONS), (
++        sorted(found - set(_REVIEWED_DYNAMIC_CONSTRUCTIONS)),
++        sorted(set(_REVIEWED_DYNAMIC_CONSTRUCTIONS) - found),
++    )
++
++
++@pytest.mark.parametrize("client", ["httpx", "httpx2"])
++def test_the_transport_exception_map_keeps_registration(client: str) -> None:
++    """httpx re-raises each httpcore error as its own class with the same
++    text (`mapped_exc(message)`): each pair is registered alike (rev 24)."""
++    import importlib
++
++    from pmcp.argument_errors import _value_bearing_types
++
++    registered = _value_bearing_types()
++    default = importlib.import_module(f"{client}._transports.default")
++    mapping = default._load_httpcore_exceptions()
++    assert mapping, f"{client} has no httpcore exception map"
++    mismatched = [
++        (source.__name__, target.__name__)
++        for source, target in mapping.items()
++        if issubclass(source, registered) != issubclass(target, registered)
++    ]
++    assert not mismatched, mismatched
 +
 +
 +def test_every_response_decode_site_is_inside_a_handler() -> None:
@@ -14595,7 +15097,10 @@ print(f"{out}: {j - i - 1} lines")
 +# the sentinel checked in the result, `gateway.health`'s error, every log
 +# record at DEBUG, and every exception's text and traceback.
 +
-+_GRID_S = "RESPONSESENTINEL" + "Q9" * 14
++#: Plain words, so that pmcp's secret redaction (an opaque run of letters and
++#: digits reads as a token) cannot mask a leak by coincidence (rev 24: it
++#: masked `RESPONSESENTINELQ9...` in `last_error`).
++_GRID_S = "rejectedresponsesentinelvaluefromtheserverzulu"
 +
 +
 +def _http_shapes(s: str) -> dict[str, bytes]:
@@ -14619,6 +15124,17 @@ print(f"{out}: {j - i - 1} lines")
 +            + body[-4:]
 +        ),
 +        "reason-phrase": f"HTTP/1.1 500 {s}\r\nContent-Length: 0\r\n\r\n".encode(),
++        # A redirect the client cannot follow, or follows to a host that
++        # does not resolve (`.invalid`, RFC 6761): the scheme or host is the
++        # response's (rev 24).
++        "redirect-scheme": (
++            f"HTTP/1.1 302 Found\r\nLocation: {s.lower()}://x/\r\n"
++            "Content-Length: 0\r\n\r\n"
++        ).encode(),
++        "redirect-host": (
++            f"HTTP/1.1 302 Found\r\nLocation: http://{s.lower()}.invalid/\r\n"
++            "Content-Length: 0\r\n\r\n"
++        ).encode(),
 +    }
 +
 +
@@ -14626,6 +15142,9 @@ print(f"{out}: {j - i - 1} lines")
 +#: site being driven.
 +_GRID_REQUESTS: list[bytes] = []
 +_GRID_TOKEN: list[str] = ["none"]
++#: The URL every client is sent to for the site being driven: the local
++#: server, or (proxy rows, rev 24) a host only the proxy sees.
++_GRID_URL: list[str] = ["http://127.0.0.1:9/none"]
 +
 +
 +def _serve_once_per_connection(payload: bytes) -> tuple[Any, int]:
@@ -14671,8 +15190,9 @@ print(f"{out}: {j - i - 1} lines")
 +)
 +
 +
-+def _http_call_sites() -> set[str]:
-+    sites: set[str] = set()
++def _http_call_site_clients() -> dict[str, set[str]]:
++    """Each site, and the client calls it makes."""
++    sites: dict[str, set[str]] = {}
 +    for path in sorted(_SRC.rglob("*.py")):
 +        if "baml_client" in path.parts:
 +            continue
@@ -14683,8 +15203,13 @@ print(f"{out}: {j - i - 1} lines")
 +                isinstance(node, ast.Call)
 +                and ast.unparse(node.func) in _HTTP_CALL_PATTERNS
 +            ):
-+                sites.add(f"{rel}::{_owner(tree, node.lineno)}")
++                site = f"{rel}::{_owner(tree, node.lineno)}"
++                sites.setdefault(site, set()).add(ast.unparse(node.func))
 +    return sites
++
++
++def _http_call_sites() -> set[str]:
++    return set(_http_call_site_clients())
 +
 +
 +async def _drive_version(name: str, port: int) -> Any:
@@ -14698,7 +15223,7 @@ print(f"{out}: {j - i - 1} lines")
 +    from pmcp.manifest.registry import _fetch_registry_servers_uncached
 +
 +    return await _fetch_registry_servers_uncached(
-+        f"http://127.0.0.1:{port}/{_GRID_TOKEN[0]}",
++        _GRID_URL[0],
 +        timeout=10,
 +        max_pages=1,
 +        max_response_bytes=1 << 20,
@@ -14750,7 +15275,7 @@ print(f"{out}: {j - i - 1} lines")
 +async def _drive_sse_probe(port: int) -> Any:
 +    from pmcp.cli import _probe_sse_endpoint
 +
-+    return await _probe_sse_endpoint(f"http://127.0.0.1:{port}/{_GRID_TOKEN[0]}", 10)
++    return await _probe_sse_endpoint(_GRID_URL[0], 10)
 +
 +
 +async def _drive_http_probe(port: int) -> Any:
@@ -14763,13 +15288,10 @@ print(f"{out}: {j - i - 1} lines")
 +    from pmcp.client.manager import ClientManager
 +    from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
 +
-+    path = _GRID_TOKEN[0]
 +    config = ResolvedServerConfig(
 +        name="probe",
 +        source="custom",
-+        config=RemoteMcpServerConfig(
-+            type=transport, url=f"http://127.0.0.1:{port}/{path}"
-+        ),
++        config=RemoteMcpServerConfig(type=transport, url=_GRID_URL[0]),
 +    )
 +    manager = ClientManager()
 +    errors = await asyncio.wait_for(manager.connect_server(config, retry=False), 30)
@@ -14822,7 +15344,7 @@ print(f"{out}: {j - i - 1} lines")
 +    import pmcp.cli as cli
 +
 +    def local() -> str:
-+        return f"http://127.0.0.1:{port}/{_GRID_TOKEN[0]}"
++        return _GRID_URL[0]
 +
 +    original_request = aiohttp.ClientSession._request
 +
@@ -14887,6 +15409,7 @@ print(f"{out}: {j - i - 1} lines")
 +                caplog.clear()
 +                token = f"site{len(_GRID_REQUESTS)}x{abs(hash(site)) % 10**8}"
 +                _GRID_TOKEN[0] = token
++                _GRID_URL[0] = f"http://127.0.0.1:{port}/{token}"
 +                try:
 +                    outcome = repr(asyncio.run(driver(port)))
 +                except Exception as error:  # noqa: BLE001 -- inspected
@@ -14896,11 +15419,388 @@ print(f"{out}: {j - i - 1} lines")
 +                    failures.append((site, "never connected", outcome[:300]))
 +                logs = "\n".join(_record_text(record) for record in caplog.records)
 +                for surface, text in (("result", outcome), ("log", logs)):
-+                    if any(form in text for form in _forbidden(s)):
++                    if any(form in text for form in _forbidden_any_case(s)):
 +                        failures.append((site, surface, text[:300]))
 +    finally:
 +        listener.close()
 +    assert not failures, failures
++
++
++# --- a proxy's refusal (rev 24, round-22 claude F001) -------------------------
++#
++# A proxy that refuses a request answers with a status line whose reason
++# phrase the clients quote: httpcore's `ProxyError("407 <reason>")`, urllib's
++# `OSError("Tunnel connection failed: 407 <reason>")`. Every site whose client
++# takes its proxy from the environment is driven through a refusing proxy:
++# over https (a CONNECT tunnel) and http (an absolute-form request), each
++# with a 407 and a 502 whose reason phrase is the sentinel.
++
++#: Any refusal status carries a reason phrase (round 22 grok: a 403).
++_PROXY_STATUSES = (403, 407, 502)
++
++
++def _proxied_sites() -> set[str]:
++    """The sites whose client honours `HTTP(S)_PROXY`: every one but
++    aiohttp's, whose `trust_env` is off unless set
++    (`test_no_aiohttp_site_takes_a_proxy`)."""
++    return {
++        site
++        for site, clients in _http_call_site_clients().items()
++        if clients != {"aiohttp.ClientSession"}
++    }
++
++
++def test_no_aiohttp_site_takes_a_proxy() -> None:
++    """aiohttp reads no proxy from the environment unless `trust_env=True`,
++    and pmcp passes neither that nor `proxy=` anywhere."""
++    import inspect
++
++    import aiohttp
++
++    assert (
++        inspect.signature(aiohttp.ClientSession.__init__)
++        .parameters["trust_env"]
++        .default
++        is False
++    )
++    passed = []
++    for path in sorted(_SRC.rglob("*.py")):
++        if "baml_client" in path.parts:
++            continue
++        for node in ast.walk(ast.parse(path.read_text())):
++            if isinstance(node, ast.Call):
++                for keyword in node.keywords:
++                    if keyword.arg in ("trust_env", "proxy"):
++                        passed.append(f"{path.name}:{node.lineno}")
++    assert not passed, passed
++    aiohttp_only = {
++        site
++        for site, clients in _http_call_site_clients().items()
++        if clients == {"aiohttp.ClientSession"}
++    }
++    assert aiohttp_only and not aiohttp_only & _proxied_sites()
++
++
++def _proxy_every_opener(monkeypatch: pytest.MonkeyPatch, proxy: str) -> None:
++    """What each urllib opener's own `ProxyHandler` does when `HTTP(S)_PROXY`
++    is set at import (it reads the environment once, when `build_opener`
++    runs): proxy its http and https requests. Each opener is built by
++    `build_opener` with no `ProxyHandler` of pmcp's
++    (`test_every_urllib_opener_takes_the_environment_proxy`)."""
++    import urllib.request
++
++    import pmcp.auth as auth
++    import pmcp.feedback_egress as feedback_egress
++    from pmcp.manifest import package_identity
++
++    for opener in (
++        package_identity._OPENER,
++        feedback_egress._OPENER,
++        auth._NO_REDIRECT_OPENER,
++    ):
++        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
++        handler.add_parent(opener)
++        for scheme in ("http", "https"):
++            monkeypatch.setitem(
++                opener.handle_open,
++                scheme,
++                [handler, *opener.handle_open.get(scheme, [])],
++            )
++
++
++def test_every_urllib_opener_takes_the_environment_proxy(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """pmcp builds every urllib opener with `build_opener` and passes no
++    `ProxyHandler`, so the default one takes `HTTP(S)_PROXY` from the
++    environment, as the proxy grid models."""
++    import urllib.request
++
++    built = []
++    for path in sorted(_SRC.rglob("*.py")):
++        if "baml_client" in path.parts:
++            continue
++        for node in ast.walk(ast.parse(path.read_text())):
++            if isinstance(node, ast.Call) and ast.unparse(node.func).endswith(
++                "build_opener"
++            ):
++                built.append(path.name)
++                assert "ProxyHandler" not in ast.unparse(node), path.name
++    assert sorted(built) == ["auth.py", "feedback_egress.py", "package_identity.py"]
++    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
++    assert any(
++        isinstance(handler, urllib.request.ProxyHandler)
++        for handler in urllib.request.build_opener().handlers
++    )
++
++
++@pytest.mark.parametrize("status", _PROXY_STATUSES)
++@pytest.mark.parametrize("scheme", ["https", "http"])
++def test_no_proxy_refusal_reaches_any_output(
++    scheme: str,
++    status: int,
++    tmp_path: Path,
++    caplog: pytest.LogCaptureFixture,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Every site that takes a proxy, through a proxy that refuses with the
++    sentinel as its reason phrase: the grid's oracle."""
++    import pmcp  # noqa: F401 - installs the scrubbers
++    from pmcp.argument_errors import exception_text, safe_traceback_text
++
++    s = _GRID_S
++    caplog.set_level(logging.DEBUG)
++    monkeypatch.setenv("HOME", str(tmp_path))
++    listener, port = _serve_once_per_connection(
++        f"HTTP/1.1 {status} {s}\r\nContent-Length: 0\r\n\r\n".encode()
++    )
++    proxy = f"http://127.0.0.1:{port}"
++    for name in ("NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"):
++        monkeypatch.delenv(name, raising=False)
++    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
++        monkeypatch.setenv(name, proxy)
++    _redirect_every_client(monkeypatch, port)
++    _proxy_every_opener(monkeypatch, proxy)
++    failures = []
++    try:
++        for site, drivers in sorted(_HTTP_SITE_DRIVERS.items()):
++            if site not in _proxied_sites():
++                continue
++            for driver in drivers:
++                caplog.clear()
++                token = f"proxy{len(_GRID_REQUESTS)}x{abs(hash(site)) % 10**8}"
++                _GRID_TOKEN[0] = token
++                _GRID_URL[0] = f"{scheme}://{token}.invalid/{token}"
++                try:
++                    outcome = repr(asyncio.run(driver(port)))
++                except Exception as error:  # noqa: BLE001 -- inspected
++                    outcome = exception_text(error) + safe_traceback_text(error)
++                if not any(token.encode() in request for request in _GRID_REQUESTS):
++                    failures.append((site, "never reached the proxy", outcome[:300]))
++                logs = "\n".join(_record_text(record) for record in caplog.records)
++                for surface, text in (("result", outcome), ("log", logs)):
++                    if any(form in text for form in _forbidden_any_case(s)):
++                        failures.append((site, surface, text[:300]))
++    finally:
++        listener.close()
++    assert not failures, failures
++
++
++# --- the links beneath a registered error (rev 24, round-22 claude N1) --------
++
++
++def test_a_link_beneath_a_registered_error_prints_its_class_alone() -> None:
++    """A parser that raises inside its own `except` leaves the rejected bytes
++    in the context: every link of a chain that holds a registered error is
++    described or printed as its class alone, beneath it, above it and beside
++    it in a group."""
++    import http.client
++
++    from pmcp.argument_errors import exception_text, safe_traceback_text
++
++    s = _GRID_S
++
++    def registered_over_a_value() -> BaseException:
++        try:
++            try:
++                int(s)
++            except ValueError:
++                raise http.client.BadStatusLine(s)  # noqa: B904 - the shape
++        except http.client.BadStatusLine as error:
++            return error
++
++    beneath = registered_over_a_value()
++    try:
++        raise RuntimeError(f"wrapped {s}") from beneath
++    except RuntimeError as error:
++        above = error
++    from tests.test_argument_error_echo import _exception_group
++
++    group = _exception_group()("group", [beneath, ValueError(s)])
++    for error in (beneath, above, group):
++        text = exception_text(error) + safe_traceback_text(error)
++        assert not any(form in text for form in _forbidden_any_case(s)), text
++    assert "\nValueError\n" in safe_traceback_text(beneath)
++
++
++def _client_calls() -> dict[str, Callable[[str], Any]]:
++    """Each client pmcp uses, called on its own: a GET that reads and decodes
++    the body and raises on an error status."""
++    import urllib.request
++
++    def via_urllib(url: str) -> Any:
++        with urllib.request.build_opener().open(url, timeout=10) as response:
++            return json.loads(response.read().decode("utf-8"))
++
++    def via_httpx(module_name: str) -> Callable[[str], Any]:
++        def call(url: str) -> Any:
++            import importlib
++
++            module = importlib.import_module(module_name)
++
++            async def run() -> Any:
++                async with module.AsyncClient(timeout=10) as client:
++                    response = await client.get(url)
++                    response.raise_for_status()
++                    return response.json()
++
++            return asyncio.run(run())
++
++        return call
++
++    def via_aiohttp(url: str) -> Any:
++        import aiohttp
++
++        async def run() -> Any:
++            async with aiohttp.ClientSession() as session:
++                async with session.get(url) as response:
++                    response.raise_for_status()
++                    return await response.json(content_type=None)
++
++        return asyncio.run(run())
++
++    return {
++        "urllib": via_urllib,
++        "httpx": via_httpx("httpx"),
++        "httpx2": via_httpx("httpx2"),
++        "aiohttp": via_aiohttp,
++    }
++
++
++@pytest.mark.parametrize("client", sorted(_client_calls()))
++@pytest.mark.parametrize("shape", sorted(_http_shapes("x")))
++def test_no_client_error_prints_a_rejected_response(
++    shape: str, client: str, caplog: pytest.LogCaptureFixture
++) -> None:
++    """Each client against each shape, the error caught and inspected
++    directly: its text, its traceback (every link, beneath the registered
++    error included) and a log record carrying it as `exc_info`."""
++    import pmcp  # noqa: F401 - installs the scrubbers
++    from pmcp.argument_errors import exception_text, safe_traceback_text
++
++    s = _GRID_S
++    caplog.set_level(logging.DEBUG)
++    listener, port = _serve_once_per_connection(_http_shapes(s)[shape])
++    try:
++        try:
++            result = _client_calls()[client](f"http://127.0.0.1:{port}/")
++        except Exception as error:  # noqa: BLE001 -- inspected
++            logging.getLogger("pmcp.test").error("failed", exc_info=error)
++            outcome = exception_text(error) + safe_traceback_text(error)
++        else:
++            outcome = repr(result)
++    finally:
++        listener.close()
++    logs = "\n".join(_record_text(record) for record in caplog.records)
++    for surface, text in (("error", outcome), ("log", logs)):
++        assert not any(form in text for form in _forbidden_any_case(s)), (
++            surface,
++            text[:400],
++        )
++
++
++def _proxied_client_calls(proxy: str) -> dict[str, Callable[[str], Any]]:
++    """Each client pmcp uses, through `proxy`: urllib's opener and httpx's
++    clients take it from the environment, aiohttp from `proxy=` (pmcp
++    passes none; this covers its class)."""
++    import urllib.request
++
++    def via_urllib(url: str) -> Any:
++        opener = urllib.request.build_opener(
++            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
++        )
++        with opener.open(url, timeout=10) as response:
++            return response.read()
++
++    def via_httpx(module_name: str) -> Callable[[str], Any]:
++        def call(url: str) -> Any:
++            import importlib
++
++            module = importlib.import_module(module_name)
++
++            async def run() -> Any:
++                async with module.AsyncClient(timeout=10, proxy=proxy) as client:
++                    return (await client.get(url)).raise_for_status()
++
++            return asyncio.run(run())
++
++        return call
++
++    def via_aiohttp(url: str) -> Any:
++        import aiohttp
++
++        async def run() -> Any:
++            async with aiohttp.ClientSession() as session:
++                async with session.get(url, proxy=proxy) as response:
++                    response.raise_for_status()
++                    return await response.read()
++
++        return asyncio.run(run())
++
++    return {
++        "urllib": via_urllib,
++        "httpx": via_httpx("httpx"),
++        "httpx2": via_httpx("httpx2"),
++        "aiohttp": via_aiohttp,
++    }
++
++
++@pytest.mark.parametrize("client", ["aiohttp", "httpx", "httpx2", "urllib"])
++@pytest.mark.parametrize("status", _PROXY_STATUSES)
++@pytest.mark.parametrize("scheme", ["https", "http"])
++def test_no_proxy_refusal_reaches_any_renderer(
++    scheme: str, status: int, client: str, caplog: pytest.LogCaptureFixture
++) -> None:
++    """Each client through a refusing proxy, the error caught and given to
++    every renderer a site uses: `exception_text`, `safe_traceback_text`,
++    `describe_exception` (bare and in a group, `gateway.health`'s shape),
++    `sanitize_auth_diagnostic`, and a log record carrying it (round 22
++    grok and codex)."""
++    import pmcp  # noqa: F401 - installs the scrubbers
++    from pmcp.argument_errors import exception_text, safe_traceback_text
++    from pmcp.auth import sanitize_auth_diagnostic
++    from pmcp.client.manager import describe_exception
++    from tests.test_argument_error_echo import _exception_group
++
++    s = _GRID_S
++    caplog.set_level(logging.DEBUG)
++    listener, port = _serve_once_per_connection(
++        f"HTTP/1.1 {status} {s}\r\nContent-Length: 0\r\n\r\n".encode()
++    )
++    token = f"proxied{len(_GRID_REQUESTS)}"
++    try:
++        call = _proxied_client_calls(f"http://127.0.0.1:{port}")[client]
++        with pytest.raises(Exception) as caught:
++            call(f"{scheme}://{token}.invalid/{token}")
++    finally:
++        listener.close()
++    error = caught.value
++    assert any(token.encode() in request for request in _GRID_REQUESTS)
++    logging.getLogger("pmcp.test").error("failed", exc_info=error)
++    texts = {
++        "exception_text": exception_text(error),
++        "safe_traceback_text": safe_traceback_text(error),
++        "describe_exception": describe_exception(error),
++        "describe_exception(group)": describe_exception(
++            _exception_group()("group", [error])
++        ),
++        "sanitize_auth_diagnostic": sanitize_auth_diagnostic(error, max_length=None),
++        "log": "\n".join(_record_text(record) for record in caplog.records),
++    }
++    if isinstance(getattr(error, "reason", None), OSError):
++        # A `URLError`'s text is its reason's: registered by origin, not
++        # only through the chain (round 22 codex).
++        import urllib.error
++
++        bare = urllib.error.URLError(error.reason)
++        texts["URLError, unchained"] = exception_text(bare) + safe_traceback_text(bare)
++    leaked = {
++        name: text[:300]
++        for name, text in texts.items()
++        if any(form in text for form in _forbidden_any_case(s))
++    }
++    assert not leaked, leaked
++    assert str(status) in texts["exception_text"], texts["exception_text"]
 ````
 
 ### Patch — `tests/test_pkgid_panel_fixes.py`
@@ -15294,30 +16194,42 @@ print(f"{out}: {j - i - 1} lines")
 
 ### `mutants.py`
 
-Run it as `PYTHONDONTWRITEBYTECODE=1 python mutants.py <worktree> <out-dir> [M4 ...]`; `NO_STATIC=1` deselects both sink checks. Without the bytecode setting, a same-size first mutant written in the checkout's mtime second leaves a stale `.pyc` (see *Mutation evidence*).
+Run it as `PYTHONDONTWRITEBYTECODE=1 python mutants.py <worktree> <out-dir> [M4 ...]`; `NO_STATIC=1` deselects both sink checks, and `DESELECT="<nodeid> ..."` deselects the named tests (rev 24). Without the bytecode setting, a same-size first mutant written in the checkout's mtime second leaves a stale `.pyc` (see *Mutation evidence*).
 
-To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e`, `0dc22a4`, `40e2ba4`, `acf99e9`, `d73d6cb`, `7bcb209` and `221115a`, in that order. Then apply this diff (rev 23: M73, M74, M93, M153 retired; M66, M155 re-anchored; M156–M161 added).
+To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e`, `0dc22a4`, `40e2ba4`, `acf99e9`, `d73d6cb`, `7bcb209`, `221115a` and `5054a76`, in that order. Then apply this diff (rev 24: M45, M125, M158 re-anchored; M162–M174 added; `DESELECT`).
 
 ````diff
 --- a/mutants.py
 +++ b/mutants.py
-@@ -73 +73 @@
-- ("M66 an MCPError loses its code", S, [("                replacement = MCPError(error.error.code, message, data)\n", "                replacement = MCPError(0, message, data)\n")]),
-+ ("M66 an MCPError loses its code", S, [("                replacement = MCPError(error.code, described)\n", "                replacement = MCPError(0, described)\n")]),
-@@ -80,2 +79,0 @@
-- ("M73 an MCPError's data kept though it carries the value", S, [("                if data is not None and carries_rejected_value(data, error):\n", "                if False:\n")]),
-- ("M74 an MCPError's data always dropped", S, [("                if data is not None and carries_rejected_value(data, error):\n", "                if True:\n")]),
-@@ -99 +96,0 @@
-- ("M93 strings inside a container input not matched", A, [("                elif depth and isinstance(item, str):\n                    candidates.append(item)\n", "                elif False:\n                    pass\n")]),
-@@ -157 +153,0 @@
-- ("M153 aiohttp's ContentTypeError not registered", A, [("    \"aiohttp\": (\"ContentTypeError\",),\n", "    \"aiohttp\": (),\n")]),
-@@ -159 +155,7 @@
-- ("M155 a response-decoding error described by its own text", A, [("        return f\"could not decode an HTTP response ({type(error).__name__})\"\n", "        return f\"could not decode an HTTP response: {error}\"\n")]),
-+ ("M155 a response-decoding error described by its own text", A, [("            return f\"could not decode an HTTP response ({name})\"\n", "            return f\"could not decode an HTTP response: {error}\"\n")]),
-+ ("M156 aiohttp's ClientResponseError not registered", A, [("        \"ClientResponseError\",  # parser failures, ContentTypeError, statuses\n", "")]),
-+ ("M157 http.client's HTTPException not registered", A, [("    \"http.client\": (\"HTTPException\",),  # BadStatusLine, LineTooLong, ...\n", "    \"http.client\": (),\n")]),
-+ ("M158 httpcore2's ProtocolError not registered", A, [("    \"httpcore2\": (\"ProtocolError\",),\n", "    \"httpcore2\": (),\n")]),
-+ ("M159 a rejected HTTP response described by its own text", A, [("        return f\"rejected an HTTP response ({name}{where})\"\n", "        return f\"rejected an HTTP response: {error}\"\n")]),
-+ ("M160 the HTTP client stacks' loggers not masked", "src/pmcp/sdk_rejections.py", [("    \"httpcore\",\n    \"httpcore2\",\n", "")]),
-+ ("M161 an MCPError in a registered chain keeps its own message", S, [("                replacement = MCPError(error.code, described)\n", "                replacement = MCPError(error.code, error.message, error.error.data)\n")]),
+@@ -19 +19 @@
+-X = "tests/test_exception_text_sinks.py"; E = "tests/test_argument_error_echo.py"
++X = "tests/test_exception_text_sinks.py"; E = "tests/test_argument_error_echo.py"; PE = "tests/test_parse_error_echo.py"
+@@ -64 +64 @@
+- ("M45 unqualified class name", A, [("_qualified_name(type(current))", "type(current).__name__")]),
++ ("M45 unqualified class name", A, [('                f"{_qualified_name(type(current))}: {_validation_text(current)}\\n"\n', '                f"{type(current).__name__}: {_validation_text(current)}\\n"\n')]),
+@@ -127 +127 @@
+- ("M125 the traceback renders a wrapper node from its own message", A, [("        text = exception_text(current) if linked is None else _validation_text(linked)\n", "        text = exception_text(current) if linked is None else str(current)\n")]),
++ ("M125 the traceback renders a wrapper node from its own message", A, [('                    f"{_qualified_name(type(current))}: {_validation_text(linked)}\\n"\n', '                    f"{_qualified_name(type(current))}: {current}\\n"\n')]),
+@@ -158 +158 @@
+- ("M158 httpcore2's ProtocolError not registered", A, [("    \"httpcore2\": (\"ProtocolError\",),\n", "    \"httpcore2\": (),\n")]),
++ ("M158 httpcore2's ProtocolError not registered", A, [("    \"httpcore2\": (\"ProtocolError\", \"ProxyError\", \"UnsupportedProtocol\"),\n", "    \"httpcore2\": (\"ProxyError\", \"UnsupportedProtocol\"),\n")]),
+@@ -166,0 +167,13 @@
++ ("M162 httpx's ProxyError not registered", A, [('        "HTTPStatusError",\n        "ProxyError",\n        "UnsupportedProtocol",\n    ),\n    "httpx2": (', '        "HTTPStatusError",\n        "UnsupportedProtocol",\n    ),\n    "httpx2": (')]),
++ ("M163 httpx2's and httpcore2's ProxyError not registered", A, [('        "SSEError",\n        "ProxyError",\n', '        "SSEError",\n'), ('    "httpcore2": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),\n', '    "httpcore2": ("ProtocolError", "UnsupportedProtocol"),\n')]),
++ ("M164 ProxyError back to value-free with rev 23's reason", (A, PE), [(A, '        "HTTPStatusError",\n        "ProxyError",\n        "UnsupportedProtocol",\n    ),\n    "httpx2": (', '        "HTTPStatusError",\n        "UnsupportedProtocol",\n    ),\n    "httpx2": ('), (A, '        "SSEError",\n        "ProxyError",\n', '        "SSEError",\n'), (A, '    "httpcore": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),\n    "httpcore2": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),\n', '    "httpcore": ("ProtocolError", "UnsupportedProtocol"),\n    "httpcore2": ("ProtocolError", "UnsupportedProtocol"),\n'), (PE, '        "ReadTimeout": _TIMEOUT,\n        "RequestError": _BASE,\n', '        "ReadTimeout": _TIMEOUT,\n        "ProxyError": "the operator\'s proxy refused the tunnel",\n        "RequestError": _BASE,\n'), (PE, '        "ReadTimeout": _TIMEOUT,\n        "TimeoutException": _TIMEOUT,\n        "WriteError": _CONNECT,\n', '        "ReadTimeout": _TIMEOUT,\n        "ProxyError": "the operator\'s proxy refused the tunnel",\n        "TimeoutException": _TIMEOUT,\n        "WriteError": _CONNECT,\n')]),
++ ("M165 urllib's refused tunnel not recognised", A, [("    return _tunnel_refusal_status(error) is not False\n", "    return False\n")]),
++ ("M166 the tunnel's status read from another local", A, [("    return code if type(code) is int else None\n", "    return tb.tb_frame.f_locals.get(\"message\")  # type: ignore[no-any-return]\n")]),
++ ("M167 a ProxyError's status is its whole text", A, [("    return int(match.group(1)) if match else None\n", "    return text  # type: ignore[return-value]\n")]),
++ ("M168 a link beneath a registered error printed with its text", A, [('                parts.append(f"{_qualified_name(type(current))}\\n")\n', '                parts.append(f"{_qualified_name(type(current))}: {current}\\n")\n')]),
++ ("M169 aiohttp's connection errors not registered", A, [('        # Every connection error (rev 24): its text names the host, port or\n        # URL it connected to, which a followed redirect\'s `Location` chose.\n        "ClientConnectionError",\n', '')]),
++ ("M170 a connection error described by its text", A, [('            return f"the connection failed ({name}{where})"\n', '            return f"the connection failed: {error}"\n')]),
++ ("M171 httpx2's and httpcore2's UnsupportedProtocol not registered", A, [('        "ProxyError",\n        "UnsupportedProtocol",\n    ),\n    "httpcore": (', '        "ProxyError",\n    ),\n    "httpcore": ('), ('    "httpcore2": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),\n', '    "httpcore2": ("ProtocolError", "ProxyError"),\n')]),
++ ("M172 aiohttp's WSMessageTypeError not registered", A, [('        "WSMessageTypeError",  # quotes the message\'s data (rev 24)\n', '')]),
++ ("M173 the proxy grid's urllib handler runs after the direct one", PE, [("                [handler, *opener.handle_open.get(scheme, [])],\n", "                [*opener.handle_open.get(scheme, []), handler],\n")]),
++ ("M174 a URLError over a refused tunnel not registered by origin", A, [("        if isinstance(error, urllib.error.URLError) and isinstance(\n            error.reason, BaseException\n        ):\n            return _tunnel_refusal_status(error.reason)\n", "")]),
+@@ -191,0 +205,4 @@
++    # rev 24: a host-level startup hook can make a stderr test fail for
++    # every mutant alike; DESELECT names such tests, reported with the run.
++    for nodeid in os.environ.get("DESELECT", "").split():
++        extra += ["--deselect", nodeid]
 ````
