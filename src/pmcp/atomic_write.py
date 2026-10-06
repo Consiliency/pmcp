@@ -530,24 +530,19 @@ _DIR_FD_SUPPORTED = (
 def _write_by_path(
     target: str, data: bytes, *, mode: int, prefix: str, suffix: str
 ) -> None:
-    """Write ``target`` atomically, its directory opened ONCE with the user's spelling.
+    """The confined write where ``dir_fd`` is unavailable: by name, unnormalised.
 
-    Never ``tempfile``: ``mkstemp`` runs ``abspath`` on its directory, which
-    collapses ``jump/..`` lexically (``a/jump/../x`` with ``jump -> b/inner`` is
-    ``b/x`` to the kernel, ``a/x`` to ``abspath``). The directory is opened by
-    the kernel and the temporary is created, renamed and the rename made durable
-    relative to that one descriptor (:func:`_write_in_dir`).
+    Never ``tempfile`` (``mkstemp`` runs ``abspath`` on its directory, which
+    collapses ``jump/..`` lexically); see :func:`_write_by_name`.
     """
-    parent = os.path.dirname(target) or os.curdir
-    name = os.path.basename(target)
-    if not _DIR_FD_SUPPORTED:  # pragma: no cover - Windows: pathnames, unnormalised
-        _write_by_name(parent, name, data, mode=mode, prefix=prefix, suffix=suffix)
-        return
-    dir_fd = os.open(parent, _walk_flags())
-    try:
-        _write_in_dir(dir_fd, name, data, mode=mode, prefix=prefix, suffix=suffix)
-    finally:
-        os.close(dir_fd)
+    _write_by_name(
+        os.path.dirname(target) or os.curdir,
+        os.path.basename(target),
+        data,
+        mode=mode,
+        prefix=prefix,
+        suffix=suffix,
+    )
 
 
 def _write_by_name(

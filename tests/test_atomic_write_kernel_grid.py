@@ -462,10 +462,14 @@ def _chain(base: Path, hops: int) -> Path:
     return store
 
 
+@pytest.mark.parametrize("dir_fd", [True, False], ids=["dir_fd", "no dir_fd"])
 @pytest.mark.parametrize("hops", [1, 5, 15, 18, 19, 20, 21, 25])
 def test_a_chain_with_a_linked_directory_on_each_hop_agrees_with_the_kernel(
-    hops: int, tmp_path: Path
+    hops: int, dir_fd: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(
+        writer, "_DIR_FD_SUPPORTED", dir_fd and writer._DIR_FD_SUPPORTED
+    )
     root = Path(os.path.realpath(tmp_path))
     k_store = _chain(root / "kernel", hops)
     w_store = _chain(root / "writer", hops)
@@ -693,3 +697,25 @@ def test_a_search_and_write_only_target_directory_agrees_with_the_kernel(
             os.chmod(root / side / "vault", 0o700)
     assert writer_refused == kernel_refused, (shape, oct(dir_mode), o_path)
     assert _tree(root / "writer") == _tree(root / "kernel")
+
+
+@pytest.mark.parametrize("form", list(JUMPS))
+def test_the_fallback_write_also_goes_where_the_kernel_resolves(
+    form: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-dir_fd form joins pathnames; it must still never normalise them."""
+    monkeypatch.setattr(writer, "_DIR_FD_SUPPORTED", False)
+    root = Path(os.path.realpath(tmp_path))
+    k_base, w_base = root / "kernel", root / "writer"
+    _jump_tree(k_base)
+    _jump_tree(w_base)
+    os.symlink(JUMPS[form].format(base=k_base), k_base / "store.env")
+    os.symlink(JUMPS[form].format(base=w_base), w_base / "store.env")
+    kernel_refused = _kernel_write(str(k_base / "store.env"))
+    try:
+        atomic_write(w_base / "store.env", DATA, confine_to=None)
+        writer_refused = False
+    except OSError:
+        writer_refused = True
+    assert writer_refused == kernel_refused, form
+    assert _tree(w_base) == _tree(k_base), form
