@@ -60,6 +60,13 @@ def detect_platform() -> Platform:
         return "linux"
 
 
+def _label(name: object) -> str:
+    """A CLI's name in a log line: shown only if pmcp ships it (Consiliency/pmcp#342)."""
+    from pmcp.manifest.loader import _cli_label
+
+    return _cli_label(name)
+
+
 async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
     """Check if a CLI is available and get its info."""
     # First check if command exists in PATH
@@ -87,10 +94,10 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
             return CLIInfo(name=name, path=path)
 
     except asyncio.TimeoutError:
-        logger.debug(f"Timeout checking CLI: {name}")
+        logger.debug(f"Timeout checking CLI: {_label(name)}")
         return CLIInfo(name=name, path=path)
     except Exception as e:
-        logger.debug(f"Error checking CLI {name}: {e}")
+        logger.debug(f"Error checking CLI {_label(name)}: {type(e).__name__}")
         return None
 
 
@@ -112,10 +119,10 @@ async def get_cli_help(
         return "\n".join(lines)
 
     except asyncio.TimeoutError:
-        logger.debug(f"Timeout getting help for: {name}")
+        logger.debug(f"Timeout getting help for: {_label(name)}")
         return None
     except Exception as e:
-        logger.debug(f"Error getting help for {name}: {e}")
+        logger.debug(f"Error getting help for {_label(name)}: {type(e).__name__}")
         return None
 
 
@@ -124,8 +131,17 @@ async def probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:
     detected: dict[str, CLIInfo] = {}
 
     async def check_one(name: str, config: dict) -> tuple[str, CLIInfo | None]:
-        check_cmd = config.get("check_command", [name, "--version"])
-        result = await check_cli(name, check_cmd)
+        # One unusable entry (an empty or non-string command) is "not
+        # detected", never an exception that fails every probe
+        # (Consiliency/pmcp#342).
+        try:
+            check_cmd = config.get("check_command", [name, "--version"])
+            result = await check_cli(name, check_cmd)
+        except Exception as exc:
+            logger.warning(
+                f"probe_clis: skipping an unusable check_command: {type(exc).__name__}"
+            )
+            return name, None
         return name, result
 
     # Check all CLIs in parallel
@@ -135,9 +151,11 @@ async def probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:
     for name, info in results:
         if info:
             detected[name] = info
-            logger.debug(f"Detected CLI: {name} at {info.path}")
+            logger.debug(f"Detected CLI: {_label(name)}")
 
-    logger.info(f"Detected {len(detected)} CLIs: {', '.join(detected.keys())}")
+    logger.info(
+        f"Detected {len(detected)} CLIs: {', '.join(_label(n) for n in detected)}"
+    )
     return detected
 
 

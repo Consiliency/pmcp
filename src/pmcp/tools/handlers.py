@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+from dataclasses import dataclass
 import logging
 import os
 import re
@@ -13,7 +14,7 @@ import platform
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, Literal, cast, NamedTuple
 
 import anyio
@@ -38,6 +39,7 @@ from pmcp.client.manager import (
 )
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import (
+    startup_skip_message,
     registry_allow_private_from_config,
     StartupObservationSnapshot,
     StartupSkipReason,
@@ -90,9 +92,17 @@ from pmcp.manifest.installer import (
     get_job_manager,
     InstallError,
 )
-from pmcp.manifest.loader import load_manifest, npm_env_may_redirect
+from pmcp.manifest.loader import (
+    _cli_label,
+    _server_label,
+    load_manifest,
+    manifest_candidate_fields,
+    normalized_server_name,
+    npm_env_may_redirect,
+)
 from pmcp.manifest.package_identity import PackageIdentity, resolve_package_identity
 from pmcp.manifest.matcher import (
+    CLIHintMatch,
     _keyword_match_score,
     _manifest_keyword_weights,
     rank_cli_hints,
@@ -795,6 +805,66 @@ def _summarize_arg_schema(
     return prop_type, None, ""
 
 
+_PASCAL_RE = re.compile(r"^[A-Z][a-z]{3,}$")
+
+
+def _names_an_unknown_service(query: str, server_names: Iterable[str]) -> bool:
+    """Whether a non-initial PascalCase word names no known server (issue #56).
+
+    Shared by the category pre-check and the overlay-CLI rule
+    (Consiliency/pmcp#342 rev 5), so both read the query the same way.
+    """
+    known = {
+        n.lower().replace("-", "").replace("_", "").replace(" ", "")
+        for n in server_names
+        if isinstance(n, str)
+    }
+    return any(
+        idx > 0
+        and _PASCAL_RE.match(w)
+        and w.lower().replace("-", "").replace("_", "") not in known
+        for idx, w in enumerate(query.split())
+    )
+
+
+def _log_unusable_manifest_entry(where: str, name: object, exc: BaseException) -> None:
+    """One manifest entry a consumer could not use, named safely, no values."""
+    logger.warning(
+        f"{where}: skipping an unusable manifest entry ({_server_label(name)}): "
+        f"{type(exc).__name__}"
+    )
+
+
+# The order in which `request_capability` answers (Consiliency/pmcp#342 rev 7).
+# This tuple is the only statement of it: `request_capability` asks each tier in
+# turn, through `_capability_tier_<tier>`, and returns the first answer. A CLI an
+# overlay added or replaced answers last, after every server tier and after the
+# shipped CLIs, so no return path can let it pre-empt a server. A tier added
+# later goes before `overlay_cli` and outranks it without further change.
+REQUEST_CAPABILITY_TIERS: tuple[str, ...] = (
+    "name",  # a manifest server the query names (yields to a colliding shipped CLI)
+    "shipped_cli",  # the first available shipped CLI hint (main's precedence)
+    "category",  # the base-only category tier
+    "configured",  # a .mcp.json server, by keyword
+    "registry",  # MCP Registry candidates for an unknown named service
+    "overlay_cli",  # the first available overlay CLI hint: always last
+)
+
+
+@dataclass
+class _CapabilityRequest:
+    """What every `request_capability` tier reads, computed once per request."""
+
+    parsed: CapabilityRequestInput
+    manifest: Manifest
+    merged_manifest: Manifest
+    configured_servers: dict[str, ResolvedServerConfig]
+    shipped_cli_match: CLIHintMatch | None
+    overlay_cli_match: CLIHintMatch | None
+    running_servers: list[str]
+    unknown_service: bool
+
+
 class GatewayTools:
     """Gateway tool handler implementations."""
 
@@ -1164,16 +1234,23 @@ class GatewayTools:
             if not self._policy_manager.is_server_allowed(name):
                 continue
 
-            score = _keyword_match_score(query, server.keywords, keyword_weights)
+            # One entry must never take down the search (Consiliency/pmcp#342).
+            # The loader already skips an overlay entry no consumer can use;
+            # this guard is the second line, for any manifest that bypassed it.
+            try:
+                score = _keyword_match_score(query, server.keywords, keyword_weights)
 
-            # Normalized name match (e.g. "bright data" -> "brightdata").
-            norm_name = name.lower().replace("-", "").replace("_", "")
-            for window_size in (3, 2, 1):
-                for i in range(len(query_words) - window_size + 1):
-                    window = "".join(query_words[i : i + window_size])
-                    if window == norm_name:
-                        score = max(score, 1.0)
-                        break
+                # Normalized name match (e.g. "bright data" -> "brightdata").
+                norm_name = normalized_server_name(name)
+                for window_size in (3, 2, 1):
+                    for i in range(len(query_words) - window_size + 1):
+                        window = "".join(query_words[i : i + window_size])
+                        if window == norm_name:
+                            score = max(score, 1.0)
+                            break
+            except Exception as exc:
+                _log_unusable_manifest_entry("catalog_search", name, exc)
+                continue
 
             if score >= 0.2:  # Same minimum threshold as the matcher
                 scored.append((score, name, server))
@@ -1187,16 +1264,17 @@ class GatewayTools:
         }
 
         candidates: list[CapabilityCandidate] = []
-        for score, name, server in scored[:limit]:
-            requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
-                name, manifest, configured_servers
-            )
-            candidates.append(
-                CapabilityCandidate(
+        for score, name, server in scored:
+            if len(candidates) >= limit:
+                break
+            try:
+                requires_api_key, env_var, env_instructions = (
+                    self._get_server_env_metadata(name, manifest, configured_servers)
+                )
+                candidate = CapabilityCandidate(
                     name=name,
                     candidate_type="server",
                     relevance_score=min(1.0, score),
-                    reasoning=server.description,
                     requires_api_key=requires_api_key,
                     api_key_available=self._check_any_api_key_available(
                         self._auth_env_options(name, env_var)
@@ -1205,18 +1283,16 @@ class GatewayTools:
                     env_instructions=env_instructions,
                     is_running=name in running_servers,
                     source="manifest",
-                    transport=server.transport,
-                    url=server.url,
-                    package=server.package,
-                    server_card_url=server.server_card_url,
-                    declared_scopes=server.declared_scopes,
-                    declared_capabilities=server.declared_capabilities,
                     provisionable=True,
                     provision_tool="gateway.provision",
                     request_capability_tool="gateway.request_capability",
                     auth_tool="gateway.auth_connect",
+                    **manifest_candidate_fields(server),
                 )
-            )
+            except Exception as exc:
+                _log_unusable_manifest_entry("catalog_search", name, exc)
+                continue
+            candidates.append(candidate)
         return candidates
 
     async def catalog_search(self, input_data: dict[str, Any]) -> CatalogSearchOutput:
@@ -1932,7 +2008,11 @@ class GatewayTools:
                 manifest = load_manifest()
                 manifest_servers = manifest.servers
             except Exception as e:
-                logger.warning(f"Failed to load manifest startup configs: {e}")
+                # Class only: an error's text can quote overlay input
+                # (Consiliency/pmcp#342 rev 5).
+                logger.warning(
+                    f"Failed to load manifest startup configs: {type(e).__name__}"
+                )
 
             provisioned: dict[str, str | None] = {}
             try:
@@ -1970,21 +2050,7 @@ class GatewayTools:
                 f"unknown_auto_start={counts['unknown_auto_start']}"
             )
             for skipped in resolution.skipped:
-                if skipped.reason == StartupSkipReason.MISSING_AUTH:
-                    logger.info(
-                        f"Skipping refresh entry '{skipped.name}' from {skipped.source}: "
-                        f"missing_auth; set {skipped.env_var} to enable eager startup"
-                    )
-                elif skipped.reason == StartupSkipReason.UNKNOWN_AUTO_START:
-                    logger.info(
-                        f"Skipping refresh entry '{skipped.name}' from {skipped.source}: "
-                        "unknown_auto_start; add a matching mcpServers entry or remove it from autoStart"
-                    )
-                else:
-                    logger.info(
-                        f"Skipping refresh entry '{skipped.name}' from {skipped.source}: "
-                        f"{skipped.reason.value}"
-                    )
+                logger.info(startup_skip_message("refresh", skipped))
 
             pending_requests = self._client_manager.get_pending_requests()
             pending_seen = len(pending_requests)
@@ -3364,6 +3430,9 @@ class GatewayTools:
             cli_alternatives=dict(manifest.cli_alternatives),
             servers=merged_servers,
             discovery_queue_path=manifest.discovery_queue_path,
+            base_keyword_weights=manifest.base_keyword_weights,
+            base_category_keywords=manifest.base_category_keywords,
+            overlay_cli_names=manifest.overlay_cli_names,
         )
 
     def _get_server_env_metadata(
@@ -3617,6 +3686,32 @@ class GatewayTools:
         )
         return issue_title, body
 
+    def _use_cli_resolution(self, hint: Any) -> CapabilityResolution:
+        """The `use_cli` resolution for one CLI hint (shared by both CLI tiers)."""
+        return CapabilityResolution(
+            status="use_cli",
+            message=(
+                f"Use Bash/direct CLI with '{hint.name}'. PMCP is recommending "
+                "the native command here; it is not executing the command or "
+                "provisioning an MCP server for this path."
+            ),
+            cli=CLIResolution(
+                name=hint.name,
+                path=hint.path,
+                description=hint.description,
+                available=hint.available,
+                check_command=hint.check_command,
+                help_command=hint.help_command,
+                examples=hint.examples,
+                prefer_mcp_for=hint.prefer_mcp_for,
+                reason=hint.reason,
+            ),
+            recommendation=(
+                f"Run '{hint.name}' directly via Bash/direct CLI. "
+                "Use gateway.request_capability again only if you need an MCP server."
+            ),
+        )
+
     async def request_capability(
         self, input_data: dict[str, Any]
     ) -> CapabilityResolution:
@@ -3650,31 +3745,96 @@ class GatewayTools:
         if cli_hint_matches:
             logger.debug(
                 "Matched CLI hints for future response plumbing: %s",
-                ", ".join(match.hint.name for match in cli_hint_matches[:3]),
+                ", ".join(
+                    _cli_label(match.hint.name) for match in cli_hint_matches[:3]
+                ),
             )
-        cli_hint_match = next(
-            (match for match in cli_hint_matches if match.hint.available),
+        # Shipped and overlay CLIs are separate tiers (Consiliency/pmcp#342):
+        # `REQUEST_CAPABILITY_TIERS` puts the overlay one last.
+        shipped_cli_match = next(
+            (
+                match
+                for match in cli_hint_matches
+                if match.hint.available
+                and match.hint.name not in manifest.overlay_cli_names
+            ),
             None,
         )
+        overlay_cli_match = next(
+            (
+                match
+                for match in cli_hint_matches
+                if match.hint.available
+                and match.hint.name in manifest.overlay_cli_names
+            ),
+            None,
+        )
+        request = _CapabilityRequest(
+            parsed=parsed,
+            manifest=manifest,
+            merged_manifest=merged_manifest,
+            configured_servers=configured_servers,
+            shipped_cli_match=shipped_cli_match,
+            overlay_cli_match=overlay_cli_match,
+            running_servers=[
+                s.name
+                for s in self._client_manager.get_all_server_statuses()
+                if s.status.value == "online"
+            ],
+            # Detect unknown named services (Fix C, issue #56): a PascalCase
+            # word (not the first word of the sentence) that is NOT a known
+            # server name skips the category tier and goes to the registry.
+            unknown_service=_names_an_unknown_service(
+                parsed.query, merged_manifest.servers
+            ),
+        )
+        for tier in REQUEST_CAPABILITY_TIERS:
+            answer = await getattr(self, f"_capability_tier_{tier}")(request)
+            if answer is not None:
+                return cast(CapabilityResolution, answer)
 
-        # Get running servers
-        running_servers = [
-            s.name
-            for s in self._client_manager.get_all_server_statuses()
-            if s.status.value == "online"
-        ]
+        # --- Tier 3: no match ---
+        logger.info(f"Unmatched capability request: {parsed.query}")
+        self._record_feedback_event(
+            "capability_unmatched", {"query": parsed.query, "path": "no_match"}
+        )
+        return CapabilityResolution(
+            status="not_available",
+            message=f"No matching capability found for: {parsed.query}",
+            logged_for_discovery=True,
+            search_guidance=(
+                f'Call gateway.search_registry(query="{parsed.query}") '
+                "to search the public MCP Registry for external servers. "
+                "Then call gateway.register_discovered_server and gateway.provision to install."
+            ),
+        )
 
-        # --- Tier 1: explicit server name match ---
-        # Match by normalizing server names and query word groups (strips hyphens,
-        # underscores, spaces) so "bright data" → "brightdata", "brave-search" →
-        # "bravesearch", etc. Does NOT use keywords to avoid matching generic
-        # capability words like "browser" or "search".
+    async def _capability_tier_name(
+        self, request: _CapabilityRequest
+    ) -> CapabilityResolution | None:
+        """Tier `name`: a manifest server whose normalised name is in the query.
+
+        Match by normalizing server names and query word groups (strips hyphens,
+        underscores, spaces) so "bright data" → "brightdata", "brave-search" →
+        "bravesearch", etc. Does NOT use keywords to avoid matching generic
+        capability words like "browser" or "search".
+        """
+        parsed = request.parsed
+        manifest = request.manifest
+        configured_servers = request.configured_servers
         query_lower = parsed.query.lower()
         query_words = query_lower.split()
-        norm_to_server = {
-            n.lower().replace("-", "").replace("_", "").replace(" ", ""): n
-            for n in merged_manifest.servers
-        }
+        norm_to_server: dict[str, str] = {}
+        for n in request.merged_manifest.servers:
+            # One unusable name never takes down the name tier (Consiliency/pmcp#342).
+            try:
+                # First wins: base (shipped) names come first in the merged
+                # dict, so an overlay name that normalises alike
+                # (`play_wright`) cannot take a shipped name's slot
+                # (Consiliency/pmcp#342 rev 4).
+                norm_to_server.setdefault(normalized_server_name(n), n)
+            except Exception as exc:
+                _log_unusable_manifest_entry("request_capability", n, exc)
         name_match: str | None = None
         for window_size in (3, 2, 1):
             for i in range(len(query_words) - window_size + 1):
@@ -3694,14 +3854,19 @@ class GatewayTools:
             for word in ("mcp", "server", "servers", "provision", "install", "start")
         )
         name_match_collides_with_cli = (
-            cli_hint_match is not None and cli_hint_match.hint.name == name_match
+            request.shipped_cli_match is not None
+            and request.shipped_cli_match.hint.name == name_match
         )
 
-        if (
+        if not (
             name_match
             and self._policy_manager.is_server_allowed(name_match)
             and (explicit_mcp_intent or not name_match_collides_with_cli)
         ):
+            return None
+        # An unusable entry is no name match, not a failed request
+        # (Consiliency/pmcp#342).
+        try:
             requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
                 name_match, manifest, configured_servers
             )
@@ -3717,77 +3882,57 @@ class GatewayTools:
                 api_key_available=api_key_available,
                 env_var=env_var,
                 env_instructions=env_instructions,
-                is_running=name_match in running_servers,
+                is_running=name_match in request.running_servers,
             )
-            msg = f"Matched '{name_match}' by name."
-            if requires_api_key:
-                if api_key_available:
-                    msg += f" API key ({env_var}) is already set — ready to provision."
-                else:
-                    msg += (
-                        f" Requires API key ({env_var}). "
-                        f"Set it or call gateway.auth_connect, then gateway.provision."
-                    )
+        except Exception as exc:
+            _log_unusable_manifest_entry("request_capability", name_match, exc)
+            return None
+
+        msg = f"Matched '{name_match}' by name."
+        if requires_api_key:
+            if api_key_available:
+                msg += f" API key ({env_var}) is already set — ready to provision."
             else:
-                msg += " No API key required. Call gateway.provision to install."
-            return CapabilityResolution(
-                status="candidates",
-                message=msg,
-                candidates=[candidate],
-                recommendation=f"Call gateway.provision(server_name='{name_match}')",
-            )
-
-        if cli_hint_match is not None:
-            hint = cli_hint_match.hint
-            return CapabilityResolution(
-                status="use_cli",
-                message=(
-                    f"Use Bash/direct CLI with '{hint.name}'. PMCP is recommending "
-                    "the native command here; it is not executing the command or "
-                    "provisioning an MCP server for this path."
-                ),
-                cli=CLIResolution(
-                    name=hint.name,
-                    path=hint.path,
-                    description=hint.description,
-                    available=hint.available,
-                    check_command=hint.check_command,
-                    help_command=hint.help_command,
-                    examples=hint.examples,
-                    prefer_mcp_for=hint.prefer_mcp_for,
-                    reason=hint.reason,
-                ),
-                recommendation=(
-                    f"Run '{hint.name}' directly via Bash/direct CLI. "
-                    "Use gateway.request_capability again only if you need an MCP server."
-                ),
-            )
-
-        # --- Tier 2 pre-check: detect unknown named services (Fix C, issue #56) ---
-        # If the query contains a PascalCase word (not the first word of the sentence)
-        # that is NOT a known server name, the user is likely requesting a specific
-        # external service not in the manifest. Skip category matching and fall
-        # through to not_available so search_registry guidance is surfaced.
-        _pascal_re = re.compile(r"^[A-Z][a-z]{3,}$")
-        _unknown_service = any(
-            idx > 0
-            and _pascal_re.match(w)
-            and w.lower().replace("-", "").replace("_", "") not in norm_to_server
-            for idx, w in enumerate(parsed.query.split())
+                msg += (
+                    f" Requires API key ({env_var}). "
+                    f"Set it or call gateway.auth_connect, then gateway.provision."
+                )
+        else:
+            msg += " No API key required. Call gateway.provision to install."
+        return CapabilityResolution(
+            status="candidates",
+            message=msg,
+            candidates=[candidate],
+            recommendation=f"Call gateway.provision(server_name='{name_match}')",
         )
 
-        # --- Tier 2: category keyword match ---
-        category_result = (
-            None if _unknown_service else manifest.get_servers_in_category(parsed.query)
-        )
+    async def _capability_tier_shipped_cli(
+        self, request: _CapabilityRequest
+    ) -> CapabilityResolution | None:
+        """Tier `shipped_cli`: the first available shipped CLI hint."""
+        if request.shipped_cli_match is None:
+            return None
+        return self._use_cli_resolution(request.shipped_cli_match.hint)
+
+    async def _capability_tier_category(
+        self, request: _CapabilityRequest
+    ) -> CapabilityResolution | None:
+        """Tier `category`: category keyword match, from the base statistics."""
+        if request.unknown_service:
+            return None
+        manifest = request.manifest
+        configured_servers = request.configured_servers
+        category_result = manifest.get_servers_in_category(request.parsed.query)
+        if not category_result:
+            return None
+        cat_name, cat_servers = category_result
         all_candidates: list[CapabilityCandidate] = []
-        if category_result:
-            cat_name, cat_servers = category_result
-
-            # Build enriched candidates for every server in the category
-            for scfg in cat_servers:
-                if not self._policy_manager.is_server_allowed(scfg.name):
-                    continue
+        # Build enriched candidates for every server in the category
+        for scfg in cat_servers:
+            if not self._policy_manager.is_server_allowed(scfg.name):
+                continue
+            # One category server never takes down the tier (Consiliency/pmcp#342).
+            try:
                 requires_api_key, env_var, env_instructions = (
                     self._get_server_env_metadata(
                         scfg.name, manifest, configured_servers
@@ -3796,83 +3941,86 @@ class GatewayTools:
                 api_key_available = self._check_any_api_key_available(
                     self._auth_env_options(scfg.name, env_var)
                 )
-                all_candidates.append(
-                    CapabilityCandidate(
-                        name=scfg.name,
-                        candidate_type="server",
-                        relevance_score=1.0,
-                        reasoning=scfg.description,
-                        requires_api_key=requires_api_key,
-                        api_key_available=api_key_available,
-                        env_var=env_var,
-                        env_instructions=env_instructions,
-                        is_running=scfg.name in running_servers,
-                    )
+                category_candidate = CapabilityCandidate(
+                    name=scfg.name,
+                    candidate_type="server",
+                    relevance_score=1.0,
+                    reasoning=scfg.description,
+                    requires_api_key=requires_api_key,
+                    api_key_available=api_key_available,
+                    env_var=env_var,
+                    env_instructions=env_instructions,
+                    is_running=scfg.name in request.running_servers,
                 )
+            except Exception as exc:
+                _log_unusable_manifest_entry("request_capability", scfg.name, exc)
+                continue
+            all_candidates.append(category_candidate)
 
-            if not all_candidates:
-                category_result = None
+        if not all_candidates:
+            return None
 
-        if category_result and all_candidates:
-            cat_name, _cat_servers = category_result
+        # Sort: no-key-required first, then key-available, then key-missing
+        def _sort_key(c: CapabilityCandidate) -> int:
+            if not c.requires_api_key:
+                return 0
+            if c.api_key_available:
+                return 1
+            return 2
 
-            # Sort: no-key-required first, then key-available, then key-missing
-            def _sort_key(c: CapabilityCandidate) -> int:
-                if not c.requires_api_key:
-                    return 0
-                if c.api_key_available:
-                    return 1
-                return 2
+        all_candidates.sort(key=_sort_key)
 
-            all_candidates.sort(key=_sort_key)
+        # Build a human-readable message grouping the three tiers
+        free = [c for c in all_candidates if not c.requires_api_key]
+        key_ready = [
+            c for c in all_candidates if c.requires_api_key and c.api_key_available
+        ]
+        key_missing = [
+            c for c in all_candidates if c.requires_api_key and not c.api_key_available
+        ]
 
-            # Build a human-readable message grouping the three tiers
-            free = [c for c in all_candidates if not c.requires_api_key]
-            key_ready = [
-                c for c in all_candidates if c.requires_api_key and c.api_key_available
-            ]
-            key_missing = [
-                c
-                for c in all_candidates
-                if c.requires_api_key and not c.api_key_available
-            ]
-
-            parts: list[str] = [
-                f"{len(all_candidates)} options in '{cat_name}' category. "
-                "Review and call gateway.provision(server_name='...') with your choice."
-            ]
-            if free:
-                names = ", ".join(c.name for c in free)
-                parts.append(f"No API key required: {names}.")
-            if key_ready:
-                names = ", ".join(f"{c.name} ({c.env_var} ✓)" for c in key_ready)
-                parts.append(f"API key already set — ready to provision: {names}.")
-            if key_missing:
-                names = ", ".join(f"{c.name} (needs {c.env_var})" for c in key_missing)
-                parts.append(
-                    f"Requires API key (not set): {names}. "
-                    "Provide the key or call gateway.auth_connect first."
-                )
-
-            return CapabilityResolution(
-                status="pick_from_category",
-                message=" ".join(parts),
-                candidates=all_candidates,
-                category_name=cat_name,
-                recommendation=(
-                    "Choose based on your needs and API key availability. "
-                    "Call gateway.provision(server_name='<chosen>') to install."
-                ),
+        parts: list[str] = [
+            f"{len(all_candidates)} options in '{cat_name}' category. "
+            "Review and call gateway.provision(server_name='...') with your choice."
+        ]
+        if free:
+            names = ", ".join(c.name for c in free)
+            parts.append(f"No API key required: {names}.")
+        if key_ready:
+            names = ", ".join(f"{c.name} ({c.env_var} ✓)" for c in key_ready)
+            parts.append(f"API key already set — ready to provision: {names}.")
+        if key_missing:
+            names = ", ".join(f"{c.name} (needs {c.env_var})" for c in key_missing)
+            parts.append(
+                f"Requires API key (not set): {names}. "
+                "Provide the key or call gateway.auth_connect first."
             )
 
-        query_norm = parsed.query.lower().replace("-", " ").replace("_", " ")
+        return CapabilityResolution(
+            status="pick_from_category",
+            message=" ".join(parts),
+            candidates=all_candidates,
+            category_name=cat_name,
+            recommendation=(
+                "Choose based on your needs and API key availability. "
+                "Call gateway.provision(server_name='<chosen>') to install."
+            ),
+        )
+
+    async def _capability_tier_configured(
+        self, request: _CapabilityRequest
+    ) -> CapabilityResolution | None:
+        """Tier `configured`: a `.mcp.json` server, by keyword."""
+        manifest = request.manifest
+        configured_servers = request.configured_servers
+        query_norm = request.parsed.query.lower().replace("-", " ").replace("_", " ")
         configured_query_words = set(query_norm.split())
         generic_config_keywords = {"mcp", "server", "remote", "sse", "http", "api"}
         configured_keyword_matches: list[tuple[str, ServerConfig, list[str]]] = []
         for server_name in configured_servers:
             if not self._policy_manager.is_server_allowed(server_name):
                 continue
-            server_config = merged_manifest.servers.get(server_name)
+            server_config = request.merged_manifest.servers.get(server_name)
             if not server_config:
                 continue
             matched_keywords = []
@@ -3894,76 +4042,72 @@ class GatewayTools:
                     (server_name, server_config, matched_keywords)
                 )
 
-        if configured_keyword_matches:
-            configured_keyword_matches.sort(key=lambda item: (-len(item[2]), item[0]))
-            server_name, _server_config, matched_keywords = configured_keyword_matches[
-                0
-            ]
-            requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
-                server_name, manifest, configured_servers
-            )
-            api_key_available = self._check_any_api_key_available(
-                self._auth_env_options(server_name, env_var)
-            )
-            return CapabilityResolution(
-                status="candidates",
-                message=(
-                    f"Matched configured MCP server '{server_name}' by keywords. "
-                    "Call gateway.provision to start it when needed."
-                ),
-                candidates=[
-                    CapabilityCandidate(
-                        name=server_name,
-                        candidate_type="server",
-                        relevance_score=min(1.0, len(matched_keywords) / 3),
-                        reasoning=(
-                            "Keyword match for configured server: "
-                            f"{', '.join(matched_keywords[:3])}"
-                        ),
-                        requires_api_key=requires_api_key,
-                        api_key_available=api_key_available,
-                        env_var=env_var,
-                        env_instructions=env_instructions,
-                        is_running=server_name in running_servers,
-                    )
-                ],
-                recommendation=f"Call gateway.provision(server_name='{server_name}')",
-            )
-
-        registry_candidates = (
-            await self._registry_candidates_for_query(parsed.query)
-            if _unknown_service
-            else []
+        if not configured_keyword_matches:
+            return None
+        configured_keyword_matches.sort(key=lambda item: (-len(item[2]), item[0]))
+        server_name, _server_config, matched_keywords = configured_keyword_matches[0]
+        requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
+            server_name, manifest, configured_servers
         )
-        if registry_candidates:
-            return CapabilityResolution(
-                status="candidates",
-                message=(
-                    "Found MCP Registry candidates. PMCP will not install or connect "
-                    "them until you explicitly choose and register one."
-                ),
-                candidates=registry_candidates,
-                recommendation=(
-                    "Review the registry metadata, then call "
-                    "gateway.register_discovered_server for the selected package."
-                ),
-            )
-
-        # --- Tier 3: no match ---
-        logger.info(f"Unmatched capability request: {parsed.query}")
-        self._record_feedback_event(
-            "capability_unmatched", {"query": parsed.query, "path": "no_match"}
+        api_key_available = self._check_any_api_key_available(
+            self._auth_env_options(server_name, env_var)
         )
         return CapabilityResolution(
-            status="not_available",
-            message=f"No matching capability found for: {parsed.query}",
-            logged_for_discovery=True,
-            search_guidance=(
-                f'Call gateway.search_registry(query="{parsed.query}") '
-                "to search the public MCP Registry for external servers. "
-                "Then call gateway.register_discovered_server and gateway.provision to install."
+            status="candidates",
+            message=(
+                f"Matched configured MCP server '{server_name}' by keywords. "
+                "Call gateway.provision to start it when needed."
+            ),
+            candidates=[
+                CapabilityCandidate(
+                    name=server_name,
+                    candidate_type="server",
+                    relevance_score=min(1.0, len(matched_keywords) / 3),
+                    reasoning=(
+                        "Keyword match for configured server: "
+                        f"{', '.join(matched_keywords[:3])}"
+                    ),
+                    requires_api_key=requires_api_key,
+                    api_key_available=api_key_available,
+                    env_var=env_var,
+                    env_instructions=env_instructions,
+                    is_running=server_name in request.running_servers,
+                )
+            ],
+            recommendation=f"Call gateway.provision(server_name='{server_name}')",
+        )
+
+    async def _capability_tier_registry(
+        self, request: _CapabilityRequest
+    ) -> CapabilityResolution | None:
+        """Tier `registry`: MCP Registry candidates for an unknown named service."""
+        if not request.unknown_service:
+            return None
+        registry_candidates = await self._registry_candidates_for_query(
+            request.parsed.query
+        )
+        if not registry_candidates:
+            return None
+        return CapabilityResolution(
+            status="candidates",
+            message=(
+                "Found MCP Registry candidates. PMCP will not install or connect "
+                "them until you explicitly choose and register one."
+            ),
+            candidates=registry_candidates,
+            recommendation=(
+                "Review the registry metadata, then call "
+                "gateway.register_discovered_server for the selected package."
             ),
         )
+
+    async def _capability_tier_overlay_cli(
+        self, request: _CapabilityRequest
+    ) -> CapabilityResolution | None:
+        """Tier `overlay_cli`: the first available overlay CLI hint (always last)."""
+        if request.overlay_cli_match is None:
+            return None
+        return self._use_cli_resolution(request.overlay_cli_match.hint)
 
     async def provision(self, input_data: dict[str, Any]) -> ProvisionOutput:
         """gateway.provision - Start background installation of an MCP server."""

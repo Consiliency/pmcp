@@ -788,6 +788,12 @@ def test_the_spawn_scan_sees_each_shape() -> None:
 #: Dynamic-name environment reads that are not credential lookups, and why.
 #: Asserted exact.
 NOT_A_CREDENTIAL_LOOKUP = {
+    ("pmcp.manifest.loader", "_canonical_server"): (
+        "probes that each credential lookup key can be read from the "
+        "environment at all, so an overlay entry that would raise in "
+        "credential_value is dropped at load (Consiliency/pmcp#342); the value "
+        "is discarded"
+    ),
     ("pmcp.server", "_env_int"): (
         "reads a pmcp tuning variable by the name its caller passes; the "
         "classification inventory sees each call's literal"

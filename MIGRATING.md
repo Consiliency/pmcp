@@ -36,6 +36,7 @@ log is `~/.pmcp/logs/gateway.log`.
   [task units](#task-ttl-and-poll_interval-are-seconds-in-pmcp-and-milliseconds-on-the-wire) ·
   [redaction](#redaction-removes-more) ·
   [version pins](#manifest-version-pins) ·
+  [unusable overlay entries](#an-overlay-entry-pmcp-cannot-use-is-skipped) ·
   [downstream servers](#downstream-servers-see-more-from-pmcp) ·
   [logs](#logs) ·
   [dependency floors](#dependency-floors) ·
@@ -103,13 +104,14 @@ log is `~/.pmcp/logs/gateway.log`.
 6. **Check the gateway log for the new WARNINGs**:
 
    ```bash
-   grep -E '\[WARNING\] (Ignoring |Spawning |Installing |Starting install job |Verifying installation of |Running update probe)' ~/.pmcp/logs/gateway.log | tail -n 50
+   grep -E '\[WARNING\] (Ignoring |Spawning |Installing |Starting install job |Verifying installation of |Running update probe|Skipping invalid )' ~/.pmcp/logs/gateway.log | tail -n 50
    journalctl --user -u pmcp --since today | grep -E 'Ignoring|Fatal error'
    ```
 
    The first command shows every WARNING that 3.0 adds or rewords in the log
    file: anything pmcp ignored (project files, invalid version pins, malformed
-   config) and every package-runner start, install and update probe. The
+   config, overlay entries it cannot use) and every package-runner start, install
+   and update probe. The
    "Ignoring PMCP_…" lines for `PMCP_*` variables set in a `.env` file go only
    to the gateway's stderr, not to `gateway.log`; the `journalctl` line catches
    them for a service, or watch the terminal for a gateway you started by hand.
@@ -1052,6 +1054,69 @@ entry sets an npm setting, when the gateway's environment sets any
 gateway's working directory holds a `package.json` or `node_modules`. The pin
 is still applied in those cases.
 
+### An overlay entry pmcp cannot use is skipped
+
+**Am I affected?** You are if you keep a manifest overlay
+(`~/.pmcp/manifest.yaml`, an approved project `.pmcp/manifest.yaml` or
+`$PMCP_MANIFEST_PATH`) and one of its entries has a field of the wrong type:
+`keywords: [1]`, a number in `args` or `command`, a `transport` that is not a
+string, or a `cli_alternatives` entry with an empty `check_command`. On 2.7.3
+such an entry loaded, and then `gateway.catalog_search` failed: for every query
+with `keywords: [1]` or an empty `check_command`, and for every query that
+matched the entry with a non-string `transport`. A number in `args` or
+`command` instead stopped startup and `gateway.refresh` for every server. You are also
+affected if an overlay adds or replaces a `cli_alternatives` entry that you
+expect `gateway.request_capability` to recommend.
+
+**What changed.** Such an entry is skipped when the overlay is read, with a
+WARNING that names the field but not its value, and not the entry's name
+unless pmcp ships it: `Skipping invalid server entry (…) in overlay …` or
+`Skipping invalid cli_alternative (…) in overlay …`. Every other entry and the
+shipped manifest load as before. A blank field (`description:` with nothing
+after it) means "not set" and takes its default. Discovery weighs keywords
+from the shipped manifest alone, so an overlay server that shares a keyword no
+longer hides another server. A CLI an overlay adds or replaces ranks after
+every server and after pmcp's own CLIs: `gateway.request_capability`
+recommends it only when no server matches, and `gateway.catalog_search` lists
+it after pmcp's own CLIs in `cli_hints`. The warning for a `.mcp.json` entry
+that would start pmcp itself now names the field (`command`, `args` or
+`name`), not the command line, because that entry may have inherited its
+command from an overlay.
+
+**What to do.** Fix the field the WARNING names, or delete the entry. For
+example, `keywords` and `args` are lists of strings:
+
+<!-- snippet: manifest-overlay -->
+```yaml
+# ~/.pmcp/manifest.yaml
+servers:
+  inventory-tool:
+    description: Internal inventory lookups
+    keywords: [inventory, stock levels]
+    command: npx
+    args: ["-y", "inventory-tool-mcp@1.0.0"]
+```
+
+If you relied on an overlay CLI being recommended ahead of a server, run the
+CLI directly; `gateway.catalog_search` still lists it in `cli_hints` when it
+is installed.
+
+**How to verify.** `pmcp config status` loads the manifest and its overlays
+fresh, so it reports a skipped entry directly, with no log history:
+
+```bash
+pmcp config status 2>&1 | grep -c 'Skipping invalid '   # prints 0 once every entry loads
+```
+
+Run it from the directory the gateway runs in, so it reads the same project
+overlay. The gateway's own log keeps the lines from earlier runs, so a count
+there does not drop to 0 after a fix. After restarting the gateway,
+`gateway.catalog_search` with `include_offline: true` and a keyword that only
+your entry declares returns it: for the example above,
+`{"query": "stock levels", "include_offline": true}` returns `inventory-tool`.
+Without `include_offline: true`, `catalog_search` returns no manifest
+candidates at all.
+
 ### Downstream servers see more from pmcp
 
 **Am I affected?** You are if you maintain an MCP server that pmcp connects
@@ -1351,6 +1416,7 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
 | [Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire](#task-ttl-and-poll_interval-are-seconds-in-pmcp-and-milliseconds-on-the-wire) | Reverse: 2.7.3 sends `ttl` and `poll_interval` to the server unchanged and reports the server's values back unchanged.† Which step undoes the migration depends on the server, so do **one** of these per downstream server, never both. **A spec-conforming (third-party) server** reads milliseconds, so a migrated `ttl: 300` keeps a task for 0.3 s, not five minutes:† Multiply by 1000 again (`ttl: 300000`, `poll_interval: 2500`) in the callers of that server; tasks pmcp returns from it show milliseconds again (`poll_interval: 2500.0`).† **A pmcp tenant server built to the old seconds contract that you switched to milliseconds for 3.0**: Switch it back to reading and returning seconds, and keep its callers sending seconds (`ttl: 300`), as they did on 2.7.3; tasks it returns show seconds again. Doing both keeps a five-minute task for 300000 seconds. |
 | [Redaction removes more](#redaction-removes-more) | Safe on 2.7.3: it redacts less. |
 | [Manifest version pins](#manifest-version-pins) | Reverse: 2.7.3 ignores `version:` and `server_version:` silently,† so a pinned server runs whatever npm resolves. To keep a version, put it in that server's `args` in `~/.mcp.json` (for example `"args": ["-y", "firecrawl-mcp@3.25.5"]`). |
+| [An overlay entry pmcp cannot use is skipped](#an-overlay-entry-pmcp-cannot-use-is-skipped) | Safe on 2.7.3: it loads a corrected entry the same way. An entry 3.0 skips loads again on 2.7.3, and can again make `gateway.catalog_search` fail, for every query or for every query that matches it. |
 | [Downstream servers see more from pmcp](#downstream-servers-see-more-from-pmcp) | Safe on 2.7.3: a server that handles `-32601` and `notifications/cancelled` simply doesn't receive them. |
 | [Logs](#logs) | Safe on 2.7.3: alert exclusions for the new WARNINGs match nothing. |
 | [Dependency floors](#dependency-floors) | Safe on 2.7.3: its floors for `pyjwt`, `aiohttp`, `python-dotenv` and `starlette` are lower, with no upper bound on any of the four.† (2.7.3 caps other packages: `mcp<3.0.0`, `httpx<1.0`, `httpx2<3.0.0`, `jsonschema<5.0.0` and `semver<4`; installing 2.7.3 resolves those itself.) |

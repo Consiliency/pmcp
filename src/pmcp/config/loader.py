@@ -1153,7 +1153,11 @@ def load_configs(
 
         manifest_servers = load_manifest().servers
     except Exception as e:
-        logger.debug(f"Manifest defaults unavailable during config load: {e}")
+        # Class only: an error's text can quote overlay input
+        # (Consiliency/pmcp#342 rev 5).
+        logger.debug(
+            f"Manifest defaults unavailable during config load: {type(e).__name__}"
+        )
 
     def build_resolved_config(
         name: str,
@@ -1165,9 +1169,23 @@ def load_configs(
             resolved_config: McpServerConfig = config
         else:
             normalized = normalize_server_config(config, base_path)
-            local_merged = _merge_manifest_defaults(
-                name, normalized, manifest_servers, root=resolved_project_root
-            )
+            # One manifest entry must never abort loading every other config
+            # (Consiliency/pmcp#342 rev 4). If inheriting its defaults fails,
+            # this configured entry loads without them, exactly as when the
+            # manifest is unavailable; the overlay check normally skips such an
+            # entry long before this point.
+            try:
+                local_merged = _merge_manifest_defaults(
+                    name, normalized, manifest_servers, root=resolved_project_root
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Configured server '{name}': ignoring its manifest defaults "
+                    f"({type(exc).__name__})"
+                )
+                local_merged = _merge_manifest_defaults(
+                    name, normalized, None, root=resolved_project_root
+                )
             if not local_merged:
                 return None
             resolved_config = local_merged
@@ -1354,6 +1372,37 @@ def is_legacy_manifest_auto_start_enabled(
     """Return true when legacy manifest auto-start compatibility is enabled."""
     values = env if env is not None else os.environ
     return values.get("PMCP_LEGACY_MANIFEST_AUTOSTART") == "1"
+
+
+def startup_skip_message(phase: str, skipped: StartupSkip) -> str:
+    """The log line for one skipped startup/refresh entry.
+
+    Shared by gateway startup and ``gateway.refresh``. A manifest-derived entry
+    (``manifest``, ``provisioned``) is named only if pmcp ships it, and a
+    credential variable is named only when pmcp's own entry declares it: an
+    overlay's key and ``env_var`` are free text (Consiliency/pmcp#342, D9).
+    """
+    from pmcp.manifest.loader import entry_log_name, shipped_env_var
+
+    manifest_derived = skipped.source in ("manifest", "provisioned")
+    who = entry_log_name(skipped.name, manifest_derived=manifest_derived)
+    head = f"Skipping {phase} entry {who} from {skipped.source}: "
+    if skipped.reason == StartupSkipReason.MISSING_AUTH:
+        # A configured remote entry's missing header variables come from the
+        # operator's own .mcp.json; any other variable name is shown only if
+        # pmcp's own entry declares it.
+        if skipped.source == "configured" and skipped.missing_env_vars:
+            shown: str | None = skipped.env_var
+        else:
+            shown = shipped_env_var(skipped.name, skipped.env_var)
+        target = shown or "its credential variable"
+        return f"{head}missing_auth; set {target} to enable eager startup"
+    if skipped.reason == StartupSkipReason.UNKNOWN_AUTO_START:
+        return (
+            f"{head}unknown_auto_start; add a matching mcpServers entry or "
+            "remove it from autoStart"
+        )
+    return f"{head}{skipped.reason.value}"
 
 
 def _coerce_manifest_servers(
@@ -1657,11 +1706,24 @@ def resolve_startup_configs(
         # so eager/lazy/refresh spawns would launch without the credential.
         # Resolving here keeps both this path and the connect path symmetric, so
         # the refresh diff (issue #79) still sees no spurious env change.
-        config = _manifest_server_to_config(server, _credential_value_for(project_root))
         source: Literal["manifest", "provisioned"] = (
             "provisioned" if name in provisioned else "manifest"
         )
-        add_config(config, eager=eager, source=source, manifest_server=server)
+        # One manifest entry must never abort startup or gateway.refresh for
+        # every server (Consiliency/pmcp#342). The loader already skips an
+        # overlay entry this conversion would reject; this is the second line.
+        try:
+            config = _manifest_server_to_config(
+                server, _credential_value_for(project_root)
+            )
+            add_config(config, eager=eager, source=source, manifest_server=server)
+        except Exception as exc:
+            from pmcp.manifest.loader import _server_label
+
+            logger.warning(
+                f"Startup: skipping an unusable manifest entry "
+                f"({_server_label(name)}): {type(exc).__name__}"
+            )
 
     known_names = configured_names | set(manifest_by_name)
     for name in sorted(enabled - known_names):

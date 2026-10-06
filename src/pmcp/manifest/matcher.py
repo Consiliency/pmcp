@@ -8,7 +8,15 @@ from dataclasses import dataclass
 from typing import Literal
 
 from pmcp.manifest.environment import CLIInfo
-from pmcp.manifest.loader import CLIAlternative, Manifest, ServerConfig
+from pmcp.manifest.loader import (
+    CLIAlternative,
+    Manifest,
+    ServerConfig,
+    _cli_label,
+    _server_label,
+    cli_hint_fields,
+    keyword_weights,
+)
 from pmcp.types import CLIHint
 
 logger = logging.getLogger(__name__)
@@ -88,15 +96,75 @@ def _keyword_match_score(
 
 
 def _manifest_keyword_weights(manifest: Manifest) -> dict[str, float]:
-    frequencies: dict[str, int] = {}
-    for server in manifest.servers.values():
-        for keyword in set(server.keywords):
-            keyword_norm = keyword.lower().replace("-", " ").replace("_", " ")
-            frequencies[keyword_norm] = frequencies.get(keyword_norm, 0) + 1
+    """Keyword weights for discovery scoring.
 
-    return {
-        keyword: max(1.0 / frequency, 0.5) for keyword, frequency in frequencies.items()
-    }
+    A manifest from ``load_manifest`` carries the weights of its base alone, so
+    an overlay server never lowers another server's score (Consiliency/pmcp#342).
+    A keyword only an overlay declares is absent and scores at the default 1.0.
+    A hand-built Manifest has no base and is weighted by its own servers.
+    """
+    if manifest.base_keyword_weights is not None:
+        return dict(manifest.base_keyword_weights)
+    return keyword_weights(manifest.servers.values())
+
+
+def _rank_one_cli(
+    query: str,
+    query_norm: str,
+    query_words: set[str],
+    name: str,
+    cli: CLIAlternative,
+    *,
+    is_available: bool,
+    detected_infos: Mapping[str, CLIInfo],
+    include_suppressed: bool,
+    min_score: float,
+) -> CLIHintMatch | None:
+    """Score one CLI alternative; ``None`` when it does not qualify."""
+    score = 0.0
+    score = max(score, _text_match_score(query_norm, query_words, cli.name))
+    score = max(
+        score,
+        _text_match_score(query_norm, query_words, cli.description) * 0.7,
+    )
+    score = max(score, _keyword_match_score(query, cli.keywords))
+    for example in cli.examples:
+        score = max(score, _text_match_score(query_norm, query_words, example) * 0.8)
+
+    matched_prefer_mcp_phrase = None
+    for phrase in cli.prefer_mcp_for:
+        if _text_match_score(query_norm, query_words, phrase) >= 1.0:
+            matched_prefer_mcp_phrase = phrase
+            score = max(score, 1.0)
+            break
+
+    if score < min_score:
+        return None
+
+    suppressed = matched_prefer_mcp_phrase is not None
+    if suppressed and not include_suppressed:
+        return None
+
+    path = detected_infos[name].path if name in detected_infos else None
+    reason = "Available on PATH" if is_available else "CLI is not detected"
+    if suppressed:
+        reason = (
+            "MCP server preferred for "
+            f"'{matched_prefer_mcp_phrase}' despite matching CLI '{name}'."
+        )
+
+    hint = CLIHint(
+        available=is_available,
+        path=path,
+        reason=reason,
+        **cli_hint_fields(cli),
+    )
+    return CLIHintMatch(
+        hint=hint,
+        score=score,
+        suppressed_by_prefer_mcp=suppressed,
+        matched_prefer_mcp_phrase=matched_prefer_mcp_phrase,
+    )
 
 
 def rank_cli_hints(
@@ -122,62 +190,44 @@ def rank_cli_hints(
         is_available = name in available
         if not include_unavailable and not is_available:
             continue
-
-        score = 0.0
-        score = max(score, _text_match_score(query_norm, query_words, cli.name))
-        score = max(
-            score,
-            _text_match_score(query_norm, query_words, cli.description) * 0.7,
-        )
-        score = max(score, _keyword_match_score(query, cli.keywords))
-        for example in cli.examples:
-            score = max(
-                score, _text_match_score(query_norm, query_words, example) * 0.8
+        # One CLI entry must never take down every query (Consiliency/pmcp#342);
+        # the loader already skips an overlay entry a consumer cannot use.
+        try:
+            match = _rank_one_cli(
+                query,
+                query_norm,
+                query_words,
+                name,
+                cli,
+                is_available=is_available,
+                detected_infos=detected_infos,
+                include_suppressed=include_suppressed,
+                min_score=min_score,
             )
-
-        matched_prefer_mcp_phrase = None
-        for phrase in cli.prefer_mcp_for:
-            if _text_match_score(query_norm, query_words, phrase) >= 1.0:
-                matched_prefer_mcp_phrase = phrase
-                score = max(score, 1.0)
-                break
-
-        if score < min_score:
+        except Exception as exc:
+            logger.warning(
+                f"rank_cli_hints: skipping an unusable entry ({_cli_label(name)}): "
+                f"{type(exc).__name__}"
+            )
             continue
+        if match is not None:
+            matches.append(match)
 
-        suppressed = matched_prefer_mcp_phrase is not None
-        if suppressed and not include_suppressed:
-            continue
-
-        path = detected_infos[name].path if name in detected_infos else None
-        reason = "Available on PATH" if is_available else "CLI is not detected"
-        if suppressed:
-            reason = (
-                "MCP server preferred for "
-                f"'{matched_prefer_mcp_phrase}' despite matching CLI '{name}'."
-            )
-
-        hint = CLIHint(
-            name=cli.name,
-            description=cli.description,
-            available=is_available,
-            path=path,
-            check_command=cli.check_command,
-            help_command=cli.help_command,
-            examples=cli.examples,
-            prefer_mcp_for=cli.prefer_mcp_for,
-            reason=reason,
-        )
-        matches.append(
-            CLIHintMatch(
-                hint=hint,
-                score=score,
-                suppressed_by_prefer_mcp=suppressed,
-                matched_prefer_mcp_phrase=matched_prefer_mcp_phrase,
-            )
-        )
-
-    return sorted(matches, key=lambda match: (-match.score, match.hint.name))
+    # One rule for every list of CLI hints (Consiliency/pmcp#342 rev 7): a CLI
+    # an overlay added or replaced ranks after every shipped CLI, whatever its
+    # score, so `catalog_search`'s `cli_hints` and `request_capability`'s CLI
+    # tiers read the same order. Within each origin: score, then name (main).
+    overlay_cli_names: frozenset[str] = getattr(
+        manifest, "overlay_cli_names", frozenset()
+    )
+    return sorted(
+        matches,
+        key=lambda match: (
+            match.hint.name in overlay_cli_names,
+            -match.score,
+            match.hint.name,
+        ),
+    )
 
 
 async def match_capability(
@@ -208,8 +258,17 @@ def _keyword_match(
     best_match: MatchResult | None = None
     best_score = 0.0
 
-    # Check detected CLIs first (preferred)
-    for match in rank_cli_hints(query, manifest, available_clis=detected_clis):
+    # Check detected CLIs first (preferred). An overlay CLI ranks below every
+    # server (Consiliency/pmcp#342 rev 6): it is considered only if nothing
+    # else reaches the threshold.
+    overlay_cli_names: frozenset[str] = getattr(
+        manifest, "overlay_cli_names", frozenset()
+    )
+    ranked = rank_cli_hints(query, manifest, available_clis=detected_clis)
+    overlay_ranked = [m for m in ranked if m.hint.name in overlay_cli_names]
+    for match in ranked:
+        if match.hint.name in overlay_cli_names:
+            continue
         cli = manifest.cli_alternatives[match.hint.name]
         if match.score > best_score:
             best_score = match.score
@@ -225,7 +284,14 @@ def _keyword_match(
     # Check servers
     keyword_weights = _manifest_keyword_weights(manifest)
     for name, server in manifest.servers.items():
-        score = _keyword_match_score(query, server.keywords, keyword_weights)
+        try:
+            score = _keyword_match_score(query, server.keywords, keyword_weights)
+        except Exception as exc:  # Consiliency/pmcp#342: one entry, not all
+            logger.warning(
+                f"match_capability: skipping an unusable entry "
+                f"({_server_label(name)}): {type(exc).__name__}"
+            )
+            continue
         # Slight preference for CLIs, so server needs higher score
         adjusted_score = score * 0.9
         if adjusted_score > best_score:
@@ -241,6 +307,17 @@ def _keyword_match(
 
     if best_match and best_score >= 0.2:  # Minimum threshold
         return best_match
+
+    for match in overlay_ranked:
+        if match.score >= 0.2:
+            return MatchResult(
+                matched=True,
+                entry_name=match.hint.name,
+                entry_type="cli",
+                confidence=match.score,
+                reasoning=f"Keyword match for installed CLI: {match.hint.name}",
+                cli_config=manifest.cli_alternatives[match.hint.name],
+            )
 
     return MatchResult(
         matched=False,

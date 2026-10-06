@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import re
 from pathlib import Path
+from typing import Any
 
 from pmcp.config.loader import load_configs
 from pmcp.env_store import (
@@ -39,6 +40,29 @@ def _mask(value: str) -> str:
     if not value:
         return ""
     return "*" * min(8, len(value))
+
+
+def manifest_secret_metadata(server: Any) -> tuple[dict[str, object], set[str]]:
+    """A manifest server's auth metadata and remote-header env keys.
+
+    The per-server half of ``_extract_required_keys``, shared with the overlay
+    check so an entry it would fail on is skipped at parse time
+    (Consiliency/pmcp#342 rev 4).
+    """
+    metadata: dict[str, object] = {
+        key: value
+        for key, value in {
+            "protected_resource_metadata_url": server.protected_resource_metadata_url,
+            "authorization_server_metadata_url": server.authorization_server_metadata_url,
+            "oidc_issuer_url": server.oidc_issuer_url,
+            "oidc_discovery_url": server.oidc_discovery_url,
+            "client_id_metadata_document_url": server.client_id_metadata_document_url,
+            "declared_scopes": server.declared_scopes,
+            "supports_url_elicitation": server.supports_url_elicitation,
+        }.items()
+        if value
+    }
+    return metadata, set(collect_remote_header_env_vars(server.headers))
 
 
 def _extract_required_keys(
@@ -145,29 +169,21 @@ def _extract_required_keys(
             per_server[cfg.name] = server_keys
 
     try:
-        manifest = load_manifest()
-        for server in manifest.servers.values():
-            manifest_metadata: dict[str, object] = {
-                key: value
-                for key, value in {
-                    "protected_resource_metadata_url": server.protected_resource_metadata_url,
-                    "authorization_server_metadata_url": server.authorization_server_metadata_url,
-                    "oidc_issuer_url": server.oidc_issuer_url,
-                    "oidc_discovery_url": server.oidc_discovery_url,
-                    "client_id_metadata_document_url": server.client_id_metadata_document_url,
-                    "declared_scopes": server.declared_scopes,
-                    "supports_url_elicitation": server.supports_url_elicitation,
-                }.items()
-                if value
-            }
-            if manifest_metadata:
-                auth_metadata_by_server.setdefault(server.name, manifest_metadata)
-            server_keys = set(collect_remote_header_env_vars(server.headers))
-            if server_keys:
-                per_server.setdefault(server.name, set()).update(server_keys)
-                all_keys.update(server_keys)
+        manifest_servers = list(load_manifest().servers.values())
     except Exception:
-        pass
+        manifest_servers = []
+    for server in manifest_servers:
+        # Per server: one entry must not drop every later server's metadata
+        # (Consiliency/pmcp#342 rev 4; the overlay check normally skips it first).
+        try:
+            manifest_metadata, header_keys = manifest_secret_metadata(server)
+        except Exception:
+            continue
+        if manifest_metadata:
+            auth_metadata_by_server.setdefault(server.name, manifest_metadata)
+        if header_keys:
+            per_server.setdefault(server.name, set()).update(header_keys)
+            all_keys.update(header_keys)
 
     server_required = {
         server_name: sorted(keys) for server_name, keys in per_server.items()
