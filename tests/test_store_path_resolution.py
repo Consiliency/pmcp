@@ -859,3 +859,31 @@ def test_the_pathname_fallback_still_refuses_a_planted_store(
             package_approvals.package_approvals_path()
     finally:
         os.chmod(vault, 0o700)
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="POSIX, non-root")
+@pytest.mark.parametrize("dir_mode", [0o300, 0o311, 0o700])
+@pytest.mark.parametrize("o_path", [True, False], ids=["O_PATH", "no O_PATH"])
+def test_a_project_store_under_a_search_only_project_directory(
+    o_path: bool, dir_mode: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The confined walk applies the same rule: a 0300/0311 project directory."""
+    from pmcp import atomic_write as writer
+    from pmcp.env_store import read_store_for_update, set_env_value
+
+    if o_path and not writer._O_PATH:
+        pytest.skip("no O_PATH")
+    if not o_path:
+        monkeypatch.setattr(writer, "_O_PATH", 0)
+    project = Path(os.path.realpath(tmp_path)) / "proj"
+    project.mkdir()
+    (project / ".env.pmcp").write_text("KEEP=1\n", encoding="utf-8")
+    os.chmod(project, dir_mode)
+    try:
+        set_env_value("project", "NEW", "v", project)
+        assert read_store_for_update("project", project / ".env.pmcp") == {
+            "KEEP": "1",
+            "NEW": "v",
+        }
+    finally:
+        os.chmod(project, 0o700)
