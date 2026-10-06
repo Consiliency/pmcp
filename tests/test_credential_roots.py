@@ -179,3 +179,32 @@ def test_the_credential_check_sees_either_project_file_without_a_startup_load(
     check = GatewayTools._check_api_key_available
     assert check(object(), "ONE_FILE_TOKEN") is True  # type: ignore[arg-type]
     assert "ONE_FILE_TOKEN" not in os.environ
+
+
+def test_a_file_that_changes_while_it_is_read_is_read_again(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The identity recorded is the one from before the read, if it moved.
+
+    A writer that replaces ``.env.pmcp`` between the builder's read and its
+    second look leaves an entry holding the old value. Were the entry to record
+    the file's identity after the read, it would look current and the old value
+    would be served until the next change.
+    """
+    monkeypatch.delenv("RACE_TOKEN", raising=False)
+    store = roots["a"] / ".env.pmcp"
+    store.write_text("RACE_TOKEN=old\n")
+    real = env_store._read_confined_text
+    raced: list[bool] = []
+
+    def racing(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        text = real(path, *args, **kwargs)
+        if path == store and not raced:
+            raced.append(True)
+            _touch_later(store, "RACE_TOKEN=new\n")
+        return text
+
+    monkeypatch.setattr(env_store, "_read_confined_text", racing)
+    _startup(roots)
+    assert raced
+    assert env_store.credential_value("RACE_TOKEN") == "new"

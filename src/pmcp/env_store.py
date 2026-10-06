@@ -917,11 +917,14 @@ def load_store(
 def _home_and_its_ancestors() -> set[tuple[int, int]]:
     """``(st_dev, st_ino)`` of the operator's home directory and every ancestor.
 
-    The home directory is the one the user store was pinned under
-    (:func:`pin_user_store_path`). Identity, not path strings: a repository can
-    choose path spellings, not inodes.
+    The home directory is the user store's (:func:`resolve_scope_path`): the
+    pinned one once the startup load has pinned it. Asking does not pin -- the
+    pin is the startup load's, taken before any file loads
+    (``cli.load_startup_env``), and a lookup must not take it as a side effect
+    at some later moment. Identity, not path strings: a repository can choose
+    path spellings, not inodes.
     """
-    home = pin_user_store_path().parent.parent.parent
+    home = resolve_scope_path("user").parent.parent.parent
     identities: set[tuple[int, int]] = set()
     for directory in (home, *home.parents):
         identity = _identity(directory)
