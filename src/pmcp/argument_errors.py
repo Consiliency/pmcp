@@ -574,20 +574,106 @@ HTTP_RESPONSE_ERRORS: dict[str, tuple[str, ...]] = {
         "BadContentDispositionParam",
         "RedirectClientError",  # a rejected `Location` from the response
         "WebSocketError",  # a server's close message
+        "WSMessageTypeError",  # quotes the message's data (rev 24)
+        # Every connection error (rev 24): its text names the host, port or
+        # URL it connected to, which a followed redirect's `Location` chose.
+        "ClientConnectionError",
     ),
     "aiohttp.http_exceptions": ("HttpProcessingError",),  # every parser error
-    "httpx": ("ProtocolError", "DecodingError", "HTTPStatusError"),
-    "httpx2": ("ProtocolError", "DecodingError", "HTTPStatusError", "SSEError"),
-    "httpcore": ("ProtocolError",),
-    "httpcore2": ("ProtocolError",),
+    # `ProxyError`: a proxy's refusal, `"%d %s" % (status, reason phrase)`
+    # (rev 24, round-22 claude F001). `UnsupportedProtocol`: the scheme of a
+    # followed redirect's `Location` (rev 24).
+    "httpx": (
+        "ProtocolError",
+        "DecodingError",
+        "HTTPStatusError",
+        "ProxyError",
+        "UnsupportedProtocol",
+    ),
+    "httpx2": (
+        "ProtocolError",
+        "DecodingError",
+        "HTTPStatusError",
+        "SSEError",
+        "ProxyError",
+        "UnsupportedProtocol",
+    ),
+    "httpcore": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),
+    "httpcore2": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),
     "h11": ("ProtocolError",),
     "http.client": ("HTTPException",),  # BadStatusLine, LineTooLong, ...
     "urllib.error": ("HTTPError",),  # the reason phrase
 }
 
-#: Of those, the ones that failed to decode a body that parsed: described as
-#: such (rev 22's wording).
-_DECODE_ERROR_NAMES = frozenset({"DecodingError", "ContentTypeError"})
+#: How a registered HTTP error is described, by the nearest class in its MRO
+#: named here; any other is "rejected an HTTP response" (rev 23). Each phrase
+#: is the class and, at most, a number: never the error's text.
+_HTTP_PHRASES: dict[str, str] = {
+    # A body that parsed but did not decode (rev 22's wording).
+    "DecodingError": "decode",
+    "ContentTypeError": "decode",
+    # A proxy's refusal (rev 24).
+    "ProxyError": "proxy",
+    "ClientHttpProxyError": "proxy",
+    # A URL scheme the client does not speak (rev 24).
+    "UnsupportedProtocol": "scheme",
+    # aiohttp's connection errors (rev 24); a disconnect mid-response stays
+    # a rejected response.
+    "ServerDisconnectedError": "response",
+    "ClientConnectionError": "connection",
+}
+
+
+def _http_phrase(error: BaseException) -> str:
+    for klass in type(error).__mro__:
+        kind = _HTTP_PHRASES.get(klass.__name__)
+        if kind is not None:
+            return kind
+    return "response"
+
+
+def _tunnel_refusal_status(error: BaseException) -> int | None | bool:
+    """For urllib's refused tunnel -- a bare ``OSError`` that
+    ``http.client.HTTPConnection._tunnel`` raises with the proxy's status
+    line, reason phrase included (rev 24, round-22 claude F001) -- the
+    status that frame read, or ``None`` if it read none. ``False`` for
+    every other exception.
+
+    Recognised by its origin, never its text: the innermost frame of its
+    traceback is that function's code object. The status is that frame's
+    ``code`` local, and only if it is an ``int``.
+    """
+    if type(error) is not OSError:
+        return False
+    tb = error.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    import http.client
+
+    tunnel = getattr(http.client.HTTPConnection, "_tunnel", None)
+    if tunnel is None or tb.tb_frame.f_code is not tunnel.__code__:
+        return False
+    try:
+        code = tb.tb_frame.f_locals.get("code")
+    except Exception:  # pragma: no cover - a frame without locals
+        return None
+    return code if type(code) is int else None
+
+
+def _proxy_status(error: BaseException) -> int | None:
+    """The status a ``ProxyError`` names: httpcore builds its message as
+    ``"%d %s" % (status, reason phrase)`` and httpx maps it with that text.
+    Only a leading three-digit number is read; nothing else of the text is
+    used. A SOCKS refusal names none."""
+    import re
+
+    text = error.args[0] if error.args else None
+    if not isinstance(text, str):
+        return None
+    match = re.match(r"([1-5][0-9][0-9]) ", text)
+    return int(match.group(1)) if match else None
 
 
 @functools.cache
@@ -642,9 +728,10 @@ def _is_validation_error(error: BaseException) -> bool:
     global _VALUE_BEARING
     if not _VALUE_BEARING:
         _VALUE_BEARING = _value_bearing_types()
-    return isinstance(error, _VALUE_BEARING) and not isinstance(
-        error, _value_free_types()
-    )
+    if isinstance(error, _VALUE_BEARING) and not isinstance(error, _value_free_types()):
+        return True
+    # A refused urllib tunnel is a bare `OSError`: by origin (rev 24).
+    return _tunnel_refusal_status(error) is not False
 
 
 def _parse_text(error: BaseException) -> str:
@@ -704,9 +791,28 @@ def _validation_text(error: BaseException) -> str:
     if isinstance(error, UnicodeDecodeError):
         # The codec and class only: never the undecodable bytes.
         return f"could not decode {error.encoding} text (UnicodeDecodeError)"
+    tunnel = _tunnel_refusal_status(error)
+    if tunnel is not False:
+        # The status alone: never the proxy's reason phrase (rev 24).
+        where = f", status {tunnel}" if tunnel is not None else ""
+        return f"the proxy refused the tunnel (OSError{where})"
     if _is_response_decode_error(error):
         name = type(error).__name__
-        if name in _DECODE_ERROR_NAMES:
+        kind = _http_phrase(error)
+        if kind == "proxy":
+            status = _response_status(error)
+            if status is None:
+                status = _proxy_status(error)
+            where = f", status {status}" if status is not None else ""
+            return f"the proxy refused the tunnel ({name}{where})"
+        if kind == "scheme":
+            return f"the URL's scheme is not supported ({name})"
+        if kind == "connection":
+            # The errno, a number, and never the host, port, URL or OS text.
+            errno = getattr(error, "errno", None)
+            where = f", errno {errno}" if type(errno) is int else ""
+            return f"the connection failed ({name}{where})"
+        if kind == "decode":
             # Format and class only: never the MIME type or the body.
             return f"could not decode an HTTP response ({name})"
         # The class and the status number: never the status line, a header,
@@ -801,9 +907,10 @@ def safe_traceback_text(error: BaseException) -> str:
     """The formatted traceback. When the chain holds a validation or parse
     error, every exception in it is rendered as its frames (file, line,
     source) and ``Type: <text>``, where the text is a value-bearing error's
-    description, a wrapper's description of what it chains (never its own
-    message, rev 18) or else ``str()`` -- the frames never carry an
-    exception's text -- so it stays a usable traceback (rev 6)."""
+    description or a wrapper's description of what it chains (never its own
+    message, rev 18); any other exception in that chain is its class alone
+    (rev 24) -- the frames never carry an exception's text -- so it stays a
+    usable traceback (rev 6)."""
     if safe_exc_info(error) is not None:
         return "".join(
             traceback.format_exception(type(error), error, error.__traceback__)
@@ -834,12 +941,23 @@ def safe_traceback_text(error: BaseException) -> str:
             parts.append("Traceback (most recent call last):\n")
             parts.extend(traceback.format_tb(current.__traceback__))
         # The class is printed once: a wrapper's line is its qualified name
-        # and the description of what it chains (rev 18).
-        linked = (
-            None if _is_validation_error(current) else _chained_value_bearing(current)
-        )
-        text = exception_text(current) if linked is None else _validation_text(linked)
-        parts.append(f"{_qualified_name(type(current))}: {text}\n")
+        # and the description of what it chains (rev 18). Every other link
+        # -- beneath a registered error, or beside one in a group -- is its
+        # class alone: a parser that raises inside its own `except` leaves
+        # the rejected bytes in that context (rev 24, round-22 claude N1:
+        # `BadStatusLine` over `int('2<S>')`).
+        if _is_validation_error(current):
+            parts.append(
+                f"{_qualified_name(type(current))}: {_validation_text(current)}\n"
+            )
+        else:
+            linked = _chained_value_bearing(current)
+            if linked is None:
+                parts.append(f"{_qualified_name(type(current))}\n")
+            else:
+                parts.append(
+                    f"{_qualified_name(type(current))}: {_validation_text(linked)}\n"
+                )
 
     render(error)
     return "".join(parts)

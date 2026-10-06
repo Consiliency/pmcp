@@ -1139,6 +1139,9 @@ _NOT_HTTP_CLIENTS = frozenset(
         "getpass",
         "hashlib",
         "hmac",
+        # `http.client` sends nothing for pmcp: argument_errors recognises
+        # urllib's refused tunnel by its code (rev 24); it is a transport.
+        "http",
         "importlib",
         "inspect",
         "ipaddress",
@@ -1195,13 +1198,21 @@ _NOT_HTTP_CLIENTS = frozenset(
 #: through them: derived in `test_every_client_transport_is_registered`.
 _TRANSPORTS = {"http.client", "httpcore", "httpcore2", "h11"}
 
-#: Per module, every exception class it defines that is NOT registered, and
-#: why its message cannot carry response bytes. Exact both ways with what the
-#: module defines (`test_every_http_exception_class_is_classified`).
-_CONNECT = "a connection, DNS, TLS or socket failure: no response was parsed"
+#: Per module, every exception class it defines -- or that subclasses one it
+#: exports, at any depth -- that is NOT registered, and why its message
+#: cannot carry response bytes. Exact both ways
+#: (`test_every_http_exception_class_is_classified`). A reason is checked
+#: against every construction of the class from non-literal text in the
+#: client's own source (`test_every_dynamic_value_free_construction_is_reviewed`,
+#: rev 24): round 22 found `ProxyError`'s reason here false.
+_CONNECT = "a connection, DNS, TLS or socket failure: the OS's text, no host"
 _TIMEOUT = "a timeout: no response bytes in its text"
 _BASE = "a base class: its response-carrying subclasses are registered"
 _USE = "a misuse of the client API by the caller: pmcp's own text"
+_URL = (
+    "a URL pmcp passed; a followed redirect's is wrapped in a registered "
+    "error, beneath which a traceback prints this class alone (rev 24)"
+)
 _VALUE_FREE_HTTP_ERRORS: dict[str, dict[str, str]] = {
     "httpx": {
         "CloseError": _CONNECT,
@@ -1209,10 +1220,9 @@ _VALUE_FREE_HTTP_ERRORS: dict[str, dict[str, str]] = {
         "ConnectTimeout": _TIMEOUT,
         "CookieConflict": _USE,
         "HTTPError": _BASE,
-        "InvalidURL": _USE,
+        "InvalidURL": _URL,
         "NetworkError": _CONNECT,
         "PoolTimeout": _TIMEOUT,
-        "ProxyError": "the operator's proxy refused the tunnel",
         "ReadError": _CONNECT,
         "ReadTimeout": _TIMEOUT,
         "RequestError": _BASE,
@@ -1224,7 +1234,6 @@ _VALUE_FREE_HTTP_ERRORS: dict[str, dict[str, str]] = {
         "TimeoutException": _TIMEOUT,
         "TooManyRedirects": "a fixed message",
         "TransportError": _BASE,
-        "UnsupportedProtocol": _USE,
         "WriteError": _CONNECT,
         "WriteTimeout": _TIMEOUT,
     },
@@ -1234,41 +1243,27 @@ _VALUE_FREE_HTTP_ERRORS: dict[str, dict[str, str]] = {
         "ConnectionNotAvailable": _CONNECT,
         "NetworkError": _CONNECT,
         "PoolTimeout": _TIMEOUT,
-        "ProxyError": "the operator's proxy refused the tunnel",
         "ReadError": _CONNECT,
         "ReadTimeout": _TIMEOUT,
         "TimeoutException": _TIMEOUT,
-        "UnsupportedProtocol": _USE,
         "WriteError": _CONNECT,
         "WriteTimeout": _TIMEOUT,
     },
     "h11": {},
     "aiohttp": {
-        "ClientConnectionError": _CONNECT,
-        "ClientConnectionResetError": _CONNECT,
-        "ClientConnectorCertificateError": _CONNECT,
-        "ClientConnectorDNSError": _CONNECT,
-        "ClientConnectorError": _CONNECT,
-        "ClientConnectorSSLError": _CONNECT,
         "ClientError": _BASE,
-        "ClientOSError": _CONNECT,
-        "ClientProxyConnectionError": _CONNECT,
-        "ClientSSLError": _CONNECT,
-        "ConnectionTimeoutError": _TIMEOUT,
         "EofStream": "carries no text",
-        "InvalidURL": _USE,
-        "InvalidUrlClientError": _USE,
-        "NonHttpUrlClientError": _USE,
-        "ServerConnectionError": _BASE,
-        "ServerFingerprintMismatch": "the certificate's digests, not response bytes",
-        "ServerTimeoutError": _TIMEOUT,
-        "SocketTimeoutError": _TIMEOUT,
-        "WSMessageTypeError": "a fixed type-mismatch message",
+        "InvalidURL": _URL,
+        "InvalidUrlClientError": _URL,
+        "NonHttpUrlClientError": _URL,
     },
     "aiohttp.http_exceptions": {},
     "http.client": {},
     "urllib.error": {
-        "URLError": "its reason is a socket error or pmcp's own URL",
+        "URLError": (
+            "its reason is a socket error or pmcp's own URL; a refused "
+            "tunnel's `OSError` is registered by origin (rev 24)"
+        ),
         "ContentTooShortError": "a byte count; the bytes stay in `.content`",
     },
 }
@@ -1276,6 +1271,59 @@ _VALUE_FREE_HTTP_ERRORS["httpx2"] = {
     **_VALUE_FREE_HTTP_ERRORS["httpx"],
 }
 _VALUE_FREE_HTTP_ERRORS["httpcore2"] = dict(_VALUE_FREE_HTTP_ERRORS["httpcore"])
+
+#: Every construction of a value-free class from text that is not a literal,
+#: in the client's own source (rev 24): `module:Class@path::function`, with
+#: httpcore's generated `_sync` folded into `_async`. Each says why that text
+#: carries no response bytes. Exact both ways
+#: (`test_every_dynamic_value_free_construction_is_reviewed`).
+_HOST_LITERAL = "an IP-literal host: `is_ip_address` matched it, digits and dots only"
+_REVIEWED_DYNAMIC_CONSTRUCTIONS: dict[str, str] = {
+    "aiohttp:ClientError@aiohttp/client_middleware_digest_auth.py::_encode": (
+        "DigestAuthMiddleware's: pmcp configures no client middleware"
+    ),
+    "aiohttp:InvalidURL@aiohttp/client.py::_request": "the proxy URL pmcp passes (none)",
+    "aiohttp:InvalidURL@aiohttp/client_reqrep.py::update_host": (
+        "a hostless URL; `_request` refuses a hostless redirect first, as "
+        "`InvalidUrlRedirectClientError` (registered)"
+    ),
+    "aiohttp:InvalidUrlClientError@aiohttp/client.py::_request": (
+        "the URL pmcp passed: a redirect raises `InvalidUrlRedirectClientError`"
+    ),
+    "aiohttp:InvalidUrlClientError@aiohttp/connector.py::_resolve_host": _HOST_LITERAL,
+    "aiohttp:NonHttpUrlClientError@aiohttp/client.py::_request": (
+        "the URL pmcp passed: a redirect raises `NonHttpUrlRedirectClientError`"
+    ),
+    "urllib.error:ContentTooShortError@urllib/request.py::retrieve": "byte counts",
+    "urllib.error:ContentTooShortError@urllib/request.py::urlretrieve": "byte counts",
+    "urllib.error:URLError@urllib/request.py::do_open": (
+        "the `OSError` it caught, also its context: a socket error, or a "
+        "refused tunnel, which is registered by origin"
+    ),
+    "urllib.error:URLError@urllib/request.py::ftp_open": "ftp: pmcp opens none",
+    "urllib.error:URLError@urllib/request.py::get_authorization": (
+        "digest auth: pmcp's openers install no auth handler"
+    ),
+    "urllib.error:URLError@urllib/request.py::open_ftp": "ftp: pmcp opens none",
+    "urllib.error:URLError@urllib/request.py::open_local_file": "file: pmcp opens none",
+    "urllib.error:URLError@urllib/request.py::retrfile": "ftp: pmcp opens none",
+    "urllib.error:URLError@urllib/request.py::unknown_open": (
+        "the scheme of the URL pmcp passed: its openers follow no redirect"
+    ),
+}
+for _client in ("httpx", "httpx2"):
+    _REVIEWED_DYNAMIC_CONSTRUCTIONS.update(
+        {
+            f"{_client}:CookieConflict@{_client}/_models.py::get": (
+                "the cookie name pmcp asked for"
+            ),
+            f"{_client}:InvalidURL@{_client}/_urlparse.py::encode_host": _URL,
+            f"{_client}:InvalidURL@{_client}/_urlparse.py::normalize_port": _URL,
+            f"{_client}:InvalidURL@{_client}/_urlparse.py::urlparse": _URL,
+            f"{_client}:TooManyRedirects@{_client}/_client.py::"
+            "_send_handling_redirects": "a fixed message; `request=` is not rendered",
+        }
+    )
 
 
 def _imported_top_modules() -> set[str]:
@@ -1365,7 +1413,7 @@ def _defined_exceptions(module_name: str) -> dict[str, type]:
 
     module = importlib.import_module(module_name)
     root = module_name.split(".")[0]
-    return {
+    defined = {
         attr: value
         for attr, value in vars(module).items()
         if isinstance(value, type)
@@ -1373,6 +1421,19 @@ def _defined_exceptions(module_name: str) -> dict[str, type]:
         and str(value.__module__).split(".")[0] == root
         and not attr.startswith("_")
     }
+    # And every subclass of those, at any depth, wherever the package
+    # defines it (rev 24: aiohttp's `UnixClientConnectorError` is not
+    # exported).
+    pending = list(defined.values())
+    while pending:
+        for sub in pending.pop().__subclasses__():
+            if (
+                str(sub.__module__).split(".")[0] == root
+                and sub not in defined.values()
+            ):
+                defined.setdefault(sub.__name__, sub)
+                pending.append(sub)
+    return defined
 
 
 def test_every_http_exception_class_is_classified() -> None:
@@ -1396,6 +1457,77 @@ def test_every_http_exception_class_is_classified() -> None:
             if attr not in defined:
                 problems.append((module_name, attr, "listed but not defined"))
     assert not problems, problems
+
+
+def _client_sources(module_name: str) -> tuple[Path, list[Path]]:
+    """The source files of a client or transport module, and their base."""
+    import importlib
+
+    if module_name == "http.client":
+        path = Path(importlib.import_module("http.client").__file__ or "")
+        return path.parents[1], [path]
+    if module_name == "urllib.error":
+        package = Path(importlib.import_module("urllib.request").__file__ or "").parent
+        return package.parent, [
+            package / n for n in ("request.py", "error.py", "response.py")
+        ]
+    package = Path(
+        importlib.import_module(module_name.split(".")[0]).__file__ or ""
+    ).parent
+    return package.parent, sorted(package.rglob("*.py"))
+
+
+def _dynamic_value_free_constructions() -> set[str]:
+    found: set[str] = set()
+    for module_name, free in _VALUE_FREE_HTTP_ERRORS.items():
+        base, files = _client_sources(module_name)
+        for path in files:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            rel = path.relative_to(base).as_posix().replace("/_sync/", "/_async/")
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = ast.unparse(node.func).rsplit(".", 1)[-1]
+                values = [*node.args, *(k.value for k in node.keywords)]
+                if name in free and any(
+                    not isinstance(v, ast.Constant) for v in values
+                ):
+                    found.add(
+                        f"{module_name}:{name}@{rel}::{_owner(tree, node.lineno)}"
+                    )
+    return found
+
+
+def test_every_dynamic_value_free_construction_is_reviewed() -> None:
+    """Each construction of a value-free class from non-literal text, in each
+    client's own source, has a reviewed reason -- exactly, both ways (rev 24,
+    round-22 claude F001: `ProxyError(msg)` quoted a proxy's reason phrase
+    while its listed reason said otherwise)."""
+    found = _dynamic_value_free_constructions()
+    assert found == set(_REVIEWED_DYNAMIC_CONSTRUCTIONS), (
+        sorted(found - set(_REVIEWED_DYNAMIC_CONSTRUCTIONS)),
+        sorted(set(_REVIEWED_DYNAMIC_CONSTRUCTIONS) - found),
+    )
+
+
+@pytest.mark.parametrize("client", ["httpx", "httpx2"])
+def test_the_transport_exception_map_keeps_registration(client: str) -> None:
+    """httpx re-raises each httpcore error as its own class with the same
+    text (`mapped_exc(message)`): each pair is registered alike (rev 24)."""
+    import importlib
+
+    from pmcp.argument_errors import _value_bearing_types
+
+    registered = _value_bearing_types()
+    default = importlib.import_module(f"{client}._transports.default")
+    mapping = default._load_httpcore_exceptions()
+    assert mapping, f"{client} has no httpcore exception map"
+    mismatched = [
+        (source.__name__, target.__name__)
+        for source, target in mapping.items()
+        if issubclass(source, registered) != issubclass(target, registered)
+    ]
+    assert not mismatched, mismatched
 
 
 def test_every_response_decode_site_is_inside_a_handler() -> None:
@@ -1579,6 +1711,9 @@ def _http_shapes(s: str) -> dict[str, bytes]:
 #: site being driven.
 _GRID_REQUESTS: list[bytes] = []
 _GRID_TOKEN: list[str] = ["none"]
+#: The URL every client is sent to for the site being driven: the local
+#: server, or (proxy rows, rev 24) a host only the proxy sees.
+_GRID_URL: list[str] = ["http://127.0.0.1:9/none"]
 
 
 def _serve_once_per_connection(payload: bytes) -> tuple[Any, int]:
@@ -1624,8 +1759,9 @@ _HTTP_CALL_PATTERNS = (
 )
 
 
-def _http_call_sites() -> set[str]:
-    sites: set[str] = set()
+def _http_call_site_clients() -> dict[str, set[str]]:
+    """Each site, and the client calls it makes."""
+    sites: dict[str, set[str]] = {}
     for path in sorted(_SRC.rglob("*.py")):
         if "baml_client" in path.parts:
             continue
@@ -1636,8 +1772,13 @@ def _http_call_sites() -> set[str]:
                 isinstance(node, ast.Call)
                 and ast.unparse(node.func) in _HTTP_CALL_PATTERNS
             ):
-                sites.add(f"{rel}::{_owner(tree, node.lineno)}")
+                site = f"{rel}::{_owner(tree, node.lineno)}"
+                sites.setdefault(site, set()).add(ast.unparse(node.func))
     return sites
+
+
+def _http_call_sites() -> set[str]:
+    return set(_http_call_site_clients())
 
 
 async def _drive_version(name: str, port: int) -> Any:
@@ -1651,7 +1792,7 @@ async def _drive_registry(port: int) -> Any:
     from pmcp.manifest.registry import _fetch_registry_servers_uncached
 
     return await _fetch_registry_servers_uncached(
-        f"http://127.0.0.1:{port}/{_GRID_TOKEN[0]}",
+        _GRID_URL[0],
         timeout=10,
         max_pages=1,
         max_response_bytes=1 << 20,
@@ -1703,7 +1844,7 @@ async def _drive_feedback_submit(port: int) -> Any:
 async def _drive_sse_probe(port: int) -> Any:
     from pmcp.cli import _probe_sse_endpoint
 
-    return await _probe_sse_endpoint(f"http://127.0.0.1:{port}/{_GRID_TOKEN[0]}", 10)
+    return await _probe_sse_endpoint(_GRID_URL[0], 10)
 
 
 async def _drive_http_probe(port: int) -> Any:
@@ -1716,13 +1857,10 @@ async def _drive_remote(transport: str, port: int) -> Any:
     from pmcp.client.manager import ClientManager
     from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
 
-    path = _GRID_TOKEN[0]
     config = ResolvedServerConfig(
         name="probe",
         source="custom",
-        config=RemoteMcpServerConfig(
-            type=transport, url=f"http://127.0.0.1:{port}/{path}"
-        ),
+        config=RemoteMcpServerConfig(type=transport, url=_GRID_URL[0]),
     )
     manager = ClientManager()
     errors = await asyncio.wait_for(manager.connect_server(config, retry=False), 30)
@@ -1775,7 +1913,7 @@ def _redirect_every_client(monkeypatch: pytest.MonkeyPatch, port: int) -> None:
     import pmcp.cli as cli
 
     def local() -> str:
-        return f"http://127.0.0.1:{port}/{_GRID_TOKEN[0]}"
+        return _GRID_URL[0]
 
     original_request = aiohttp.ClientSession._request
 
@@ -1840,6 +1978,7 @@ def test_no_rejected_http_response_reaches_any_output(
                 caplog.clear()
                 token = f"site{len(_GRID_REQUESTS)}x{abs(hash(site)) % 10**8}"
                 _GRID_TOKEN[0] = token
+                _GRID_URL[0] = f"http://127.0.0.1:{port}/{token}"
                 try:
                     outcome = repr(asyncio.run(driver(port)))
                 except Exception as error:  # noqa: BLE001 -- inspected
@@ -1854,3 +1993,272 @@ def test_no_rejected_http_response_reaches_any_output(
     finally:
         listener.close()
     assert not failures, failures
+
+
+# --- a proxy's refusal (rev 24, round-22 claude F001) -------------------------
+#
+# A proxy that refuses a request answers with a status line whose reason
+# phrase the clients quote: httpcore's `ProxyError("407 <reason>")`, urllib's
+# `OSError("Tunnel connection failed: 407 <reason>")`. Every site whose client
+# takes its proxy from the environment is driven through a refusing proxy:
+# over https (a CONNECT tunnel) and http (an absolute-form request), each
+# with a 407 and a 502 whose reason phrase is the sentinel.
+
+_PROXY_STATUSES = (407, 502)
+
+
+def _proxied_sites() -> set[str]:
+    """The sites whose client honours `HTTP(S)_PROXY`: every one but
+    aiohttp's, whose `trust_env` is off unless set
+    (`test_no_aiohttp_site_takes_a_proxy`)."""
+    return {
+        site
+        for site, clients in _http_call_site_clients().items()
+        if clients != {"aiohttp.ClientSession"}
+    }
+
+
+def test_no_aiohttp_site_takes_a_proxy() -> None:
+    """aiohttp reads no proxy from the environment unless `trust_env=True`,
+    and pmcp passes neither that nor `proxy=` anywhere."""
+    import inspect
+
+    import aiohttp
+
+    assert (
+        inspect.signature(aiohttp.ClientSession.__init__)
+        .parameters["trust_env"]
+        .default
+        is False
+    )
+    passed = []
+    for path in sorted(_SRC.rglob("*.py")):
+        if "baml_client" in path.parts:
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Call):
+                for keyword in node.keywords:
+                    if keyword.arg in ("trust_env", "proxy"):
+                        passed.append(f"{path.name}:{node.lineno}")
+    assert not passed, passed
+    aiohttp_only = {
+        site
+        for site, clients in _http_call_site_clients().items()
+        if clients == {"aiohttp.ClientSession"}
+    }
+    assert aiohttp_only and not aiohttp_only & _proxied_sites()
+
+
+def _proxy_every_opener(monkeypatch: pytest.MonkeyPatch, proxy: str) -> None:
+    """What each urllib opener's own `ProxyHandler` does when `HTTP(S)_PROXY`
+    is set at import (it reads the environment once, when `build_opener`
+    runs): proxy its http and https requests. Each opener is built by
+    `build_opener` with no `ProxyHandler` of pmcp's
+    (`test_every_urllib_opener_takes_the_environment_proxy`)."""
+    import urllib.request
+
+    import pmcp.auth as auth
+    import pmcp.feedback_egress as feedback_egress
+    from pmcp.manifest import package_identity
+
+    for opener in (
+        package_identity._OPENER,
+        feedback_egress._OPENER,
+        auth._NO_REDIRECT_OPENER,
+    ):
+        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        handler.add_parent(opener)
+        for scheme in ("http", "https"):
+            monkeypatch.setitem(
+                opener.handle_open,
+                scheme,
+                [handler, *opener.handle_open.get(scheme, [])],
+            )
+
+
+def test_every_urllib_opener_takes_the_environment_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pmcp builds every urllib opener with `build_opener` and passes no
+    `ProxyHandler`, so the default one takes `HTTP(S)_PROXY` from the
+    environment, as the proxy grid models."""
+    import urllib.request
+
+    built = []
+    for path in sorted(_SRC.rglob("*.py")):
+        if "baml_client" in path.parts:
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Call) and ast.unparse(node.func).endswith(
+                "build_opener"
+            ):
+                built.append(path.name)
+                assert "ProxyHandler" not in ast.unparse(node), path.name
+    assert sorted(built) == ["auth.py", "feedback_egress.py", "package_identity.py"]
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    assert any(
+        isinstance(handler, urllib.request.ProxyHandler)
+        for handler in urllib.request.build_opener().handlers
+    )
+
+
+@pytest.mark.parametrize("status", _PROXY_STATUSES)
+@pytest.mark.parametrize("scheme", ["https", "http"])
+def test_no_proxy_refusal_reaches_any_output(
+    scheme: str,
+    status: int,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every site that takes a proxy, through a proxy that refuses with the
+    sentinel as its reason phrase: the grid's oracle."""
+    import pmcp  # noqa: F401 - installs the scrubbers
+    from pmcp.argument_errors import exception_text, safe_traceback_text
+
+    s = _GRID_S
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    listener, port = _serve_once_per_connection(
+        f"HTTP/1.1 {status} {s}\r\nContent-Length: 0\r\n\r\n".encode()
+    )
+    proxy = f"http://127.0.0.1:{port}"
+    for name in ("NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        monkeypatch.setenv(name, proxy)
+    _redirect_every_client(monkeypatch, port)
+    _proxy_every_opener(monkeypatch, proxy)
+    failures = []
+    try:
+        for site, drivers in sorted(_HTTP_SITE_DRIVERS.items()):
+            if site not in _proxied_sites():
+                continue
+            for driver in drivers:
+                caplog.clear()
+                token = f"proxy{len(_GRID_REQUESTS)}x{abs(hash(site)) % 10**8}"
+                _GRID_TOKEN[0] = token
+                _GRID_URL[0] = f"{scheme}://{token}.invalid/{token}"
+                try:
+                    outcome = repr(asyncio.run(driver(port)))
+                except Exception as error:  # noqa: BLE001 -- inspected
+                    outcome = exception_text(error) + safe_traceback_text(error)
+                if not any(token.encode() in request for request in _GRID_REQUESTS):
+                    failures.append((site, "never reached the proxy", outcome[:300]))
+                logs = "\n".join(_record_text(record) for record in caplog.records)
+                for surface, text in (("result", outcome), ("log", logs)):
+                    if any(form in text for form in _forbidden(s)):
+                        failures.append((site, surface, text[:300]))
+    finally:
+        listener.close()
+    assert not failures, failures
+
+
+# --- the links beneath a registered error (rev 24, round-22 claude N1) --------
+
+
+def test_a_link_beneath_a_registered_error_prints_its_class_alone() -> None:
+    """A parser that raises inside its own `except` leaves the rejected bytes
+    in the context: every link of a chain that holds a registered error is
+    described or printed as its class alone, beneath it, above it and beside
+    it in a group."""
+    import http.client
+
+    from pmcp.argument_errors import exception_text, safe_traceback_text
+
+    s = _GRID_S
+
+    def registered_over_a_value() -> BaseException:
+        try:
+            try:
+                int(s)
+            except ValueError:
+                raise http.client.BadStatusLine(s)  # noqa: B904 - the shape
+        except http.client.BadStatusLine as error:
+            return error
+
+    beneath = registered_over_a_value()
+    try:
+        raise RuntimeError(f"wrapped {s}") from beneath
+    except RuntimeError as error:
+        above = error
+    from tests.test_argument_error_echo import _exception_group
+
+    group = _exception_group()("group", [beneath, ValueError(s)])
+    for error in (beneath, above, group):
+        text = exception_text(error) + safe_traceback_text(error)
+        assert not any(form in text for form in _forbidden(s)), text
+    assert "\nValueError\n" in safe_traceback_text(beneath)
+
+
+def _client_calls() -> dict[str, Callable[[str], Any]]:
+    """Each client pmcp uses, called on its own: a GET that reads and decodes
+    the body and raises on an error status."""
+    import urllib.request
+
+    def via_urllib(url: str) -> Any:
+        with urllib.request.build_opener().open(url, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def via_httpx(module_name: str) -> Callable[[str], Any]:
+        def call(url: str) -> Any:
+            import importlib
+
+            module = importlib.import_module(module_name)
+
+            async def run() -> Any:
+                async with module.AsyncClient(timeout=10) as client:
+                    response = await client.get(url)
+                    response.raise_for_status()
+                    return response.json()
+
+            return asyncio.run(run())
+
+        return call
+
+    def via_aiohttp(url: str) -> Any:
+        import aiohttp
+
+        async def run() -> Any:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    response.raise_for_status()
+                    return await response.json(content_type=None)
+
+        return asyncio.run(run())
+
+    return {
+        "urllib": via_urllib,
+        "httpx": via_httpx("httpx"),
+        "httpx2": via_httpx("httpx2"),
+        "aiohttp": via_aiohttp,
+    }
+
+
+@pytest.mark.parametrize("client", sorted(_client_calls()))
+@pytest.mark.parametrize("shape", sorted(_http_shapes("x")))
+def test_no_client_error_prints_a_rejected_response(
+    shape: str, client: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each client against each shape, the error caught and inspected
+    directly: its text, its traceback (every link, beneath the registered
+    error included) and a log record carrying it as `exc_info`."""
+    import pmcp  # noqa: F401 - installs the scrubbers
+    from pmcp.argument_errors import exception_text, safe_traceback_text
+
+    s = _GRID_S
+    caplog.set_level(logging.DEBUG)
+    listener, port = _serve_once_per_connection(_http_shapes(s)[shape])
+    try:
+        try:
+            result = _client_calls()[client](f"http://127.0.0.1:{port}/")
+        except Exception as error:  # noqa: BLE001 -- inspected
+            logging.getLogger("pmcp.test").error("failed", exc_info=error)
+            outcome = exception_text(error) + safe_traceback_text(error)
+        else:
+            outcome = repr(result)
+    finally:
+        listener.close()
+    logs = "\n".join(_record_text(record) for record in caplog.records)
+    for surface, text in (("error", outcome), ("log", logs)):
+        assert not any(form in text for form in _forbidden(s)), (surface, text[:400])
