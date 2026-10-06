@@ -76,7 +76,6 @@ _RENDERERS = {
     "safe_exc_info",
     "safe_traceback_text",
     "describe_exception",
-    "message_text",
     "sanitize_auth_diagnostic",
     "describe_argument_error",
     "describe_schema_error",
@@ -120,7 +119,6 @@ _RENDERER_METHODS = {"_sanitize_error"}
 #:   (`test_every_reregisters_exemption_returns_a_registered_type`).
 _EXEMPT_CALLEES: dict[str, tuple[str, str]] = {
     "_is_protocol_version_initialize_error": ("predicate", "client/manager.py"),
-    "carries_rejected_value": ("predicate", "argument_errors.py"),
     "_warn_unparseable": ("scanned", "policy/policy.py"),
     "record_rejected_arguments": ("scanned", "scoped_advisor_audit.py"),
     # parsing.py: a MarkedYAMLError's mark, for its line and column.
