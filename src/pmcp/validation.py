@@ -198,6 +198,11 @@ _CREDENTIAL_NAME_RE = re.compile(
 )
 
 
+def is_credential_shaped(name: str) -> bool:
+    """True when *name* ends in a credential token (``_TOKEN``, ``_KEY``, ``_SECRET`` ...)."""
+    return bool(_CREDENTIAL_NAME_RE.fullmatch(name))
+
+
 def is_dangerous_env_var(name: str) -> bool:
     """Return True if storing *name* could influence subprocess code loading."""
     upper = name.upper()

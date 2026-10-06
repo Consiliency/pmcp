@@ -211,3 +211,143 @@ def test_every_refused_name_is_refused_by_the_lookup_gate_too(
     assert not env_store.repository_may_supply(name)
     monkeypatch.delenv(name, raising=False)
     assert env_store.credential_value(name, repository={name: "x"}) is None
+
+
+# --------------------------------------------------------------------------- #
+# Round 6 on Consiliency/pmcp#372: the copy rule is an ALLOWLIST.
+# --------------------------------------------------------------------------- #
+
+#: Not credentials, not on any denylist: installer, TLS, git and loader
+#: configuration a repository could otherwise plant in the user store.
+NOT_CREDENTIALS = [
+    "UV_INDEX_URL",
+    "UV_CONFIG_FILE",
+    "PIP_INDEX_URL",
+    "PIP_CONFIG_FILE",
+    "PIP_TRUSTED_HOST",
+    "GIT_CONFIG_GLOBAL",
+    "JAVA_TOOL_OPTIONS",
+    "OPENSSL_CONF",
+    "GCONV_PATH",
+    "GH_HOST",
+    "PMCP_SOME_FUTURE_SETTING",
+    "DATABASE_URL",
+]
+
+
+def test_the_round6_falsifier(lay: dict[str, Path]) -> None:
+    """Board 372 r6 F001, in substance: a real credential still syncs."""
+    names = ("UV_INDEX_URL", "PIP_INDEX_URL", "UV_CONFIG_FILE", "PIP_CONFIG_FILE")
+    (lay["project"] / ".env.pmcp").write_text(
+        "BRAVE_API_KEY=dummy\n" + "".join(f"{k}=dummy\n" for k in names)
+    )
+    _sync(lay["project"], "project", "user")
+    user = env_store.read_env_file(env_store.resolve_scope_path("user"))
+    assert user.get("BRAVE_API_KEY") == "dummy"
+    assert sorted(k for k in names if k in user) == []
+
+
+@pytest.mark.parametrize("name", NOT_CREDENTIALS)
+def test_a_name_that_is_not_a_credential_is_never_copied(
+    name: str, lay: dict[str, Path], capfd: pytest.CaptureFixture[str]
+) -> None:
+    (lay["project"] / ".env.pmcp").write_text(f"{name}=value-372\nGITHUB_TOKEN=t\n")
+    out = _sync(lay["project"], "project", "user")
+    assert out["refused"] == [name]
+    user = env_store.read_env_file(env_store.resolve_scope_path("user"))
+    assert user == {"GITHUB_TOKEN": "t"}
+    err = capfd.readouterr().err
+    assert err.count(f"pmcp: Not copying {name} from .env.pmcp:") == 1
+    assert "value-372" not in err
+
+
+def test_a_manifest_declared_credential_is_copied_though_not_credential_shaped(
+    lay: dict[str, Path],
+) -> None:
+    """``POSTGRES_URL`` is the shipped postgres server's declared credential."""
+    assert "POSTGRES_URL" in env_store.declared_credential_names()
+    (lay["project"] / ".env.pmcp").write_text("POSTGRES_URL=postgres://x\n")
+    out = _sync(lay["project"], "project", "user")
+    assert out["refused"] == []
+    assert env_store.read_env_file(env_store.resolve_scope_path("user")) == {
+        "POSTGRES_URL": "postgres://x"
+    }
+
+
+def test_the_declared_arm_is_what_admits_a_non_credential_shaped_name() -> None:
+    values = {"MY_SERVICE_URL": "u", "OTHER_URL": "v", "SVC_TOKEN": "t"}
+    copied, refused = env_store.copyable_from_repository(
+        values, ".env.pmcp", declared={"MY_SERVICE_URL"}
+    )
+    assert copied == {"MY_SERVICE_URL": "u", "SVC_TOKEN": "t"}
+    assert refused == ["OTHER_URL"]
+
+
+def test_the_denylist_stays_a_second_layer_for_copies() -> None:
+    """``NODE_AUTH_TOKEN`` is credential-shaped, and still never copied."""
+    copied, refused = env_store.copyable_from_repository(
+        {"NODE_AUTH_TOKEN": "x", "PMCP_AUTH_TOKEN": "y"},
+        ".env.pmcp",
+        declared={"NODE_AUTH_TOKEN", "PMCP_AUTH_TOKEN"},
+    )
+    assert copied == {} and sorted(refused) == ["NODE_AUTH_TOKEN", "PMCP_AUTH_TOKEN"]
+
+
+@pytest.mark.parametrize("name", ["UV_INDEX_URL", "PIP_CONFIG_FILE", "GH_HOST"])
+def test_auth_connect_refuses_a_name_that_is_not_a_credential(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gateway = _gateway()
+    write_secret = MagicMock()
+    gateway._write_secret = write_secret  # type: ignore[method-assign]
+    monkeypatch.delenv(name, raising=False)
+    out = asyncio.run(
+        gateway.auth_connect(
+            {"server_name": "whatever", "credential": "x", "env_var": name}
+        )
+    )
+    assert out.ok is False
+    write_secret.assert_not_called()
+    assert name not in os.environ
+
+
+def test_pmcp_upgrade_keeps_the_operators_own_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corporate mirror the operator exported still reaches ``pmcp upgrade``."""
+    import argparse
+
+    from pmcp import cli
+
+    monkeypatch.setenv("UV_INDEX_URL", "https://mirror.corp.example/simple")
+    seen: dict[str, str] = {}
+
+    def spy(*a: object, **k: object):  # type: ignore[no-untyped-def]
+        seen.update(k.get("env") or {})  # type: ignore[arg-type]
+        raise FileNotFoundError
+
+    monkeypatch.setattr(cli.subprocess, "run", spy)
+    with pytest.raises(SystemExit):
+        asyncio.run(
+            cli.run_upgrade(
+                argparse.Namespace(log_level="warning", method="uv", dry_run=False)
+            )
+        )
+    assert seen.get("UV_INDEX_URL") == "https://mirror.corp.example/simple"
+
+
+def test_a_multi_line_value_is_skipped_and_the_rest_still_sync(
+    lay: dict[str, Path], capfd: pytest.CaptureFixture[str]
+) -> None:
+    (lay["project"] / ".env.pmcp").write_text(
+        'MULTI_TOKEN="line one\nline two"\nGITHUB_TOKEN=t\n'
+    )
+    out = _sync(lay["project"], "project", "user")
+    assert out["ok"] is True
+    assert out["refused"] == ["MULTI_TOKEN"]
+    assert env_store.read_env_file(env_store.resolve_scope_path("user")) == {
+        "GITHUB_TOKEN": "t"
+    }
+    err = capfd.readouterr().err
+    assert "pmcp: Not copying MULTI_TOKEN from .env.pmcp:" in err
+    assert "line one" not in err

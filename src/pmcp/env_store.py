@@ -8,7 +8,7 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from pathlib import Path
 from typing import Literal
 
@@ -472,10 +472,14 @@ def repository_may_supply(name: str) -> bool:
     ``LD_*``, ``DYLD_*``, ``PYTHON*``, ``NODE_OPTIONS``, ``PATH`` ...), and a
     package-manager or runtime family (``validation.is_package_manager_env_var``:
     ``NPM_CONFIG_*``, ``NODE_*``, ``COREPACK_*`` ...). Everything else is a
-    credential. :func:`credential_value` asks it before answering from a
-    repository source, the repository loader before keeping a binding quietly,
-    and :func:`copyable_from_repository` before a value leaves a repository
-    store for the operator's own (Consiliency/pmcp#372 round 5).
+    candidate credential. A DENYLIST, so it is the rule only where a value goes
+    to the server a repository configured: :func:`credential_value` asks it
+    before answering from a repository source (a remote header, a server's
+    declared credential), and the repository loader before keeping a binding
+    quietly. Anything that moves a repository value into an operator-trusted
+    place -- the user store, the environment -- uses the allowlist
+    :func:`copy_allowed`, with this as a second layer (Consiliency/pmcp#372
+    rounds 5-6).
     """
     from pmcp.validation import is_dangerous_env_var, is_package_manager_env_var
 
@@ -491,33 +495,80 @@ def describe_uncopied_store_entry(variable: str, store_name: str, reason: str) -
     return f"Not copying {variable} from {store_name}: {reason}."
 
 
+def declared_credential_names() -> frozenset[str]:
+    """Every name a manifest server declares as its credential (lookup keys).
+
+    The packaged manifest plus any approved overlay (``load_manifest``). This is
+    how a credential that is not credential-shaped by name -- ``POSTGRES_URL``,
+    ``AWS_ACCESS_KEY_ID`` -- may still be copied. A manifest that cannot be
+    loaded declares nothing: only credential-shaped names are copied then.
+    """
+    try:
+        from pmcp.manifest.loader import credential_lookup_keys, load_manifest
+
+        names: set[str] = set()
+        for server in load_manifest().servers.values():
+            names.update(credential_lookup_keys(server))
+        return frozenset(names)
+    except Exception:  # pragma: no cover - a broken manifest copies less, never more
+        return frozenset()
+
+
+def copy_allowed(name: str, declared: Collection[str]) -> bool:
+    """May a repository store's ``name`` move into an operator-trusted store? An ALLOWLIST.
+
+    Only a credential: a name that is credential-shaped by the one pattern pmcp
+    already uses (``validation.is_credential_shaped``: ``*_TOKEN``, ``*_KEY``,
+    ``*_SECRET(S)``, ``*_PASSWORD``, ``*_CREDENTIAL(S)``, ``*_PAT``, ``*_DSN``,
+    ``*_AUTH``), or one a manifest server declares as its credential
+    (:func:`declared_credential_names`). Anything else -- ``UV_INDEX_URL``,
+    ``PIP_CONFIG_FILE``, ``JAVA_TOOL_OPTIONS``, a new ``PMCP_*`` -- is refused,
+    whatever it is: the user store loads into pmcp's environment, and pmcp's own
+    spawns (``pmcp upgrade`` runs uv or pip) keep that environment. The
+    lookup-side denylist (:func:`repository_may_supply`) stays as a second
+    layer: ``NODE_AUTH_TOKEN`` is credential-shaped and still refused
+    (Consiliency/pmcp#372 round 6).
+    """
+    from pmcp.validation import is_credential_shaped
+
+    if not repository_may_supply(name):
+        return False
+    return is_credential_shaped(name) or name in declared
+
+
 def copyable_from_repository(
-    values: Mapping[str, str], store_name: str
+    values: Mapping[str, str],
+    store_name: str,
+    declared: Collection[str] | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """The entries of a repository store that may move into an operator's store.
 
     The user store loads into pmcp's own environment at every start, from any
-    directory, so a value copied there from a project file must pass the same
-    rule a lookup does (:func:`repository_may_supply`). It must also not hold
-    ``${``: the user store is loaded with expansion, so ``X=${GITHUB_TOKEN}``
-    would turn into the operator's secret under a new name. Each refused entry
-    gets one value-free warning; its value is never copied. Returns
-    ``(copyable, refused names)``.
+    directory, so a value copied there from a project file must be a credential
+    (:func:`copy_allowed`, an allowlist). It must also not hold ``${``: the user
+    store is loaded with expansion, so ``X=${GITHUB_TOKEN}`` would turn into the
+    operator's secret under a new name. Each refused entry gets one value-free
+    warning; its value is never copied. Returns ``(copyable, refused names)``.
     """
+    allowed_names = declared_credential_names() if declared is None else declared
     copyable: dict[str, str] = {}
     refused: list[str] = []
     for key, value in values.items():
-        if not repository_may_supply(key):
+        if not copy_allowed(key, allowed_names):
             reason = (
-                "a project file supplies credentials only, and this variable "
-                "decides what pmcp or a program it starts loads, trusts or "
-                "connects to"
+                "only credentials are copied out of a project file -- a "
+                "credential-shaped name or one a server declares -- and this is "
+                "not one"
             )
         elif "${" in value:
             reason = (
                 "its value refers to a variable, and your user store would "
                 "expand it from your environment"
             )
+        elif "\n" in value or "\r" in value:
+            # The store writer refuses a multi-line value for the whole file;
+            # skipping it here lets the other credentials still be copied.
+            reason = "its value spans more than one line, which a store cannot hold"
         else:
             copyable[key] = value
             continue

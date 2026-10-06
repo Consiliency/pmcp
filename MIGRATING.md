@@ -481,10 +481,19 @@ with `pmcp secrets set --scope project` in each project, say -- does not
 override it. A variable your shell exports as empty stays unavailable.
 
 `pmcp secrets sync --from-scope project --to-scope user` now copies
-credentials only: a name a project file may not supply, or a value containing
-`${`, is skipped with `pmcp: Not copying <NAME> from .env.pmcp: ...` and listed
-under `"refused"`. `gateway.auth_connect` refuses the same names, and a
-credential containing `${`. A `.env` that pmcp's startup walk
+credentials only: a credential-shaped name (`*_TOKEN`, `*_KEY`, `*_SECRET`,
+`*_PASSWORD` and the like) or one a manifest server declares as its
+credential (`POSTGRES_URL`). Any other name -- `UV_INDEX_URL`, `DATABASE_URL`,
+pmcp's own variables, proxies, code-loading and package-manager names -- and
+any value containing `${` or spanning lines is skipped with
+`pmcp: Not copying <NAME> from .env.pmcp: ...` and listed under `"refused"`;
+the rest still sync. If you meant one, set it yourself:
+`pmcp secrets set DATABASE_URL --scope user`. `gateway.auth_connect` accepts
+only a server's declared credential or a credential-shaped name, never one of
+those names, and refuses a credential containing `${`. Lookups that hand a
+project value only to the server the project configured -- a remote header,
+a server's declared credential -- keep the narrower rule: they refuse
+pmcp's own, proxy, code-loading and package-manager names. A `.env` that pmcp's startup walk
 finds in your home directory or an ancestor of it, such as `~/.env` for a
 `uv tool` install, is yours and loads as before; one anywhere else, such as
 a checkout with pmcp in its `.venv`, is a project file. A local server's `env` in `.mcp.json` is passed
@@ -1314,7 +1323,7 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
 | [`PMCP_MANIFEST_PATH`, `PMCP_CONFIG` and `PMCP_POLICY` must be exported in your shell](#pmcp_manifest_path-pmcp_config-and-pmcp_policy-must-be-exported-in-your-shell) | Safe on 2.7.3: it honours an exported variable and the `--config`/`--policy` flags. |
 | [Spawned servers no longer inherit the keys pmcp loaded from `.env`](#spawned-servers-no-longer-inherit-the-keys-pmcp-loaded-from-env) | Safe on 2.7.3: shell exports are inherited, a server's `env` block in `~/.mcp.json` is passed as written,† and `pmcp secrets set` works the same. |
 | [A symlinked project `.env.pmcp` is refused](#a-symlinked-project-envpmcp-is-refused) | Safe on 2.7.3: a regular `.env.pmcp` and your user store work the same. 2.7.3 follows a symlinked `.env.pmcp` again, for writes and at startup, wherever it points, and hangs on a fifo `.env.pmcp`, so check `ls -l .env.pmcp` in repositories you clone. |
-| [A project file supplies credentials only](#a-project-file-supplies-credentials-only) | Safe on 2.7.3: it loads a project `.env.pmcp` and `.env` into its own environment again, so settings in them apply, a checkout's `.env` wins over your user store, and `pmcp secrets check` again prefers a project `.env.pmcp`, and `pmcp secrets sync --from-scope project --to-scope user` again copies every key; credentials keep working. Re-check your user store after any such sync on 2.7.3. |
+| [A project file supplies credentials only](#a-project-file-supplies-credentials-only) | Safe on 2.7.3: it loads a project `.env.pmcp` and `.env` into its own environment again, so settings in them apply, a checkout's `.env` wins over your user store, and `pmcp secrets check` again prefers a project `.env.pmcp`, and `pmcp secrets sync --from-scope project --to-scope user` again copies every key, `UV_INDEX_URL` and the like included; credentials keep working. Re-check your user store after any such sync on 2.7.3. |
 | [Discovered servers are default-deny](#discovered-servers-are-default-deny) | Safe on 2.7.3: package approvals are ignored and discovered packages provision without one. A `packages.allowlist` must go, as for the next row. |
 | [New `packages:` policy section](#new-packages-policy-section) | Reverse: remove every `packages:` section (step 1 above), or 2.7.3 refuses to start.† |
 | [Feedback submission is off by default](#feedback-submission-is-off-by-default) | Reverse: 2.7.3 ignores `enable_feedback_submission`† and posts on `confirm_submission=true` through the first of these that works: `PMCP_FEEDBACK_TOKEN`, then `GITHUB_TOKEN` (each exported, or loaded from a `.env`, a checkout's `.env.pmcp` or `~/.config/pmcp/pmcp.env`), then a `gh` CLI on the gateway's `PATH` using its stored login.† It posts to `ViperJuice/pmcp`, the project's former name, which GitHub redirects to `Consiliency/pmcp`, unless `PMCP_FEEDBACK_REPO` names another.† To stop every channel, run `pmcp guidance --telemetry off` before you restart on 2.7.3; the call then refuses before it reads any token.† 3.0 honours the same setting. Otherwise unset `PMCP_FEEDBACK_TOKEN` and `GITHUB_TOKEN`, delete them from those files, and keep `gh` off the gateway's `PATH`.† `GH_TOKEN` alone posts nothing without `gh`.† |

@@ -73,11 +73,13 @@ to do, how to verify it, and how to roll back to 2.7.3.
   apply), and a variable your shell exports as empty stays
   unavailable rather than being filled from a project file. A `~/.env` (or one in an
   ancestor of your home directory) still loads as before. `pmcp secrets sync
-  --from-scope project --to-scope user` copies credentials only: pmcp's own variables,
-  proxies, code-loading and package-manager variables, and any value containing `${`,
-  are skipped with `pmcp: Not copying <NAME> from .env.pmcp: …`, where 2.7.3 copied
-  every key into the store pmcp loads into its environment at each start;
-  `gateway.auth_connect` refuses the same names and a credential containing `${`.
+  --from-scope project --to-scope user` copies credentials only -- a credential-shaped
+  name or one a manifest server declares (`POSTGRES_URL`) -- and skips every other
+  name (`UV_INDEX_URL`, `DATABASE_URL`, pmcp's own variables, proxies, code-loading and
+  package-manager names) and any value containing `${` or spanning lines, with `pmcp:
+  Not copying <NAME> from .env.pmcp: …`, where 2.7.3 copied every key into the store
+  pmcp loads into its environment at each start; `gateway.auth_connect` refuses the
+  same names and a credential containing `${`.
   *Security*
 - **Discovered servers are default-deny.** `gateway.register_discovered_server` resolves
   and pins the package (and refuses one it cannot pin, or an `env_vars` name that is not

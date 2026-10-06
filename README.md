@@ -1595,13 +1595,17 @@ pmcp secrets sync --from-scope project --to-scope user --overwrite
 ```
 
 Copying out of a project copies credentials only. A project `.env.pmcp` is the
-repository's, and your user store loads into pmcp's environment at every start,
-so `sync` skips any name a project file may not supply -- pmcp's own variables,
-`*_proxy` in any case, `LD_*`/`DYLD_*`/`PYTHON*`/`NODE_OPTIONS`/`PATH`, the
-`NPM_CONFIG_*`/`NODE_*`/`COREPACK_*`/`YARN_*`/`PNPM_*`/`BUN_*` families -- and any
-value containing `${`, printing one `pmcp: Not copying <NAME> from .env.pmcp: ...`
-line each and listing them under `"refused"`. Set those yourself with
-`pmcp secrets set <NAME> --scope user` if you mean them.
+repository's, and your user store loads into pmcp's environment at every start
+(and `pmcp upgrade` runs uv or pip in it), so `sync` copies a name only if it
+is credential-shaped (`*_TOKEN`, `*_KEY`, `*_SECRET(S)`, `*_PASSWORD`,
+`*_CREDENTIAL(S)`, `*_PAT`, `*_DSN`, `*_AUTH`) or a server in the manifest
+declares it as its credential (`POSTGRES_URL`, say). Everything else --
+`UV_INDEX_URL`, `PIP_CONFIG_FILE`, `DATABASE_URL`, pmcp's own variables, proxies,
+`LD_*`/`NODE_*`/`NPM_CONFIG_*` and the like, even when credential-shaped -- is
+skipped, as is any value containing `${` or spanning more than one line. Each
+skipped name prints one `pmcp: Not copying <NAME> from .env.pmcp: ...` line and
+is listed under `"refused"`; the other keys still sync. Set one yourself with
+`pmcp secrets set <NAME> --scope user` if you mean it.
 
 Passing the value on the command line (`pmcp secrets set API_TOKEN your-token`)
 still works but exposes it in `ps` output and shell history. `pmcp secrets check`
