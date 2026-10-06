@@ -1680,7 +1680,10 @@ def test_a_rejected_response_body_is_not_logged(
 # the sentinel checked in the result, `gateway.health`'s error, every log
 # record at DEBUG, and every exception's text and traceback.
 
-_GRID_S = "RESPONSESENTINEL" + "Q9" * 14
+#: Plain words, so that pmcp's secret redaction (an opaque run of letters and
+#: digits reads as a token) cannot mask a leak by coincidence (rev 24: it
+#: masked `RESPONSESENTINELQ9...` in `last_error`).
+_GRID_S = "rejectedresponsesentinelvaluefromtheserverzulu"
 
 
 def _http_shapes(s: str) -> dict[str, bytes]:
@@ -1704,6 +1707,17 @@ def _http_shapes(s: str) -> dict[str, bytes]:
             + body[-4:]
         ),
         "reason-phrase": f"HTTP/1.1 500 {s}\r\nContent-Length: 0\r\n\r\n".encode(),
+        # A redirect the client cannot follow, or follows to a host that
+        # does not resolve (`.invalid`, RFC 6761): the scheme or host is the
+        # response's (rev 24).
+        "redirect-scheme": (
+            f"HTTP/1.1 302 Found\r\nLocation: {s.lower()}://x/\r\n"
+            "Content-Length: 0\r\n\r\n"
+        ).encode(),
+        "redirect-host": (
+            f"HTTP/1.1 302 Found\r\nLocation: http://{s.lower()}.invalid/\r\n"
+            "Content-Length: 0\r\n\r\n"
+        ).encode(),
     }
 
 
@@ -1988,7 +2002,7 @@ def test_no_rejected_http_response_reaches_any_output(
                     failures.append((site, "never connected", outcome[:300]))
                 logs = "\n".join(_record_text(record) for record in caplog.records)
                 for surface, text in (("result", outcome), ("log", logs)):
-                    if any(form in text for form in _forbidden(s)):
+                    if any(form in text for form in _forbidden_any_case(s)):
                         failures.append((site, surface, text[:300]))
     finally:
         listener.close()
@@ -2147,7 +2161,7 @@ def test_no_proxy_refusal_reaches_any_output(
                     failures.append((site, "never reached the proxy", outcome[:300]))
                 logs = "\n".join(_record_text(record) for record in caplog.records)
                 for surface, text in (("result", outcome), ("log", logs)):
-                    if any(form in text for form in _forbidden(s)):
+                    if any(form in text for form in _forbidden_any_case(s)):
                         failures.append((site, surface, text[:300]))
     finally:
         listener.close()
@@ -2187,7 +2201,7 @@ def test_a_link_beneath_a_registered_error_prints_its_class_alone() -> None:
     group = _exception_group()("group", [beneath, ValueError(s)])
     for error in (beneath, above, group):
         text = exception_text(error) + safe_traceback_text(error)
-        assert not any(form in text for form in _forbidden(s)), text
+        assert not any(form in text for form in _forbidden_any_case(s)), text
     assert "\nValueError\n" in safe_traceback_text(beneath)
 
 
@@ -2261,4 +2275,7 @@ def test_no_client_error_prints_a_rejected_response(
         listener.close()
     logs = "\n".join(_record_text(record) for record in caplog.records)
     for surface, text in (("error", outcome), ("log", logs)):
-        assert not any(form in text for form in _forbidden(s)), (surface, text[:400])
+        assert not any(form in text for form in _forbidden_any_case(s)), (
+            surface,
+            text[:400],
+        )
