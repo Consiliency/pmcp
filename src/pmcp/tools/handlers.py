@@ -60,7 +60,6 @@ from pmcp.env_store import (
     record_dotenv_keys,
     child_process_env,
     credential_value,
-    served_project_root,
     load_store,
     repository_may_supply,
     record_pmcp_introduced_keys,
@@ -2759,29 +2758,17 @@ class GatewayTools:
         if credential_value(env_var, root=self._project_root):
             return True
 
-        # Load the working directory's project files, then the user store. The
-        # project load (re)builds the root's whole entry with the one builder
-        # (env_store._build_root_entry), which reads both checkout files --
-        # ``.env`` and ``.env.pmcp`` -- confined to the project
-        # (Consiliency/pmcp#367) and keeps their values in the credential map,
-        # never in the gateway's environment (Consiliency/pmcp#372 round 2).
-        # Which files a root has is the builder's to know, not this caller's.
-        # The user store follows its link. A key found early stops the loads.
-        # The project is the one this gateway serves (Consiliency/pmcp#372
-        # round 9): ``project_root``, else the served root.
-        project = self._project_root
-        if project is None:
-            project = served_project_root()
-        stores: list[tuple[Literal["project", "user"], Path | None]] = [
-            ("project", project),
-            ("user", None),
-        ]
-        for scope, store_project in stores:
-            before = set(os.environ)
-            load_store(scope, project=store_project)
-            record_dotenv_keys(set(os.environ) - before)
-            if credential_value(env_var, root=self._project_root):
-                return True
+        # The project's files need no load of their own: the lookup above
+        # builds the served (or given) project's entry with the one builder
+        # (env_store._build_root_entry), confined and outside the gateway's
+        # environment (Consiliency/pmcp#367, #372 rounds 2 and 12). What may
+        # still be missing is the user store, which follows its link and loads
+        # into the environment.
+        before = set(os.environ)
+        load_store("user")
+        record_dotenv_keys(set(os.environ) - before)
+        if credential_value(env_var, root=self._project_root):
+            return True
 
         return False
 

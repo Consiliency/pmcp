@@ -927,7 +927,18 @@ def _distinct_projects(roots: dict[str, Path], key: str) -> None:
                             "transport": "streamable-http",
                             "url": f"https://{name}.example.invalid/mcp",
                             "headers": {"Authorization": "Bearer ${" + key + "}"},
-                        }
+                        },
+                        # A local server a command-less .mcp.json entry
+                        # inherits from: its args and credential name say
+                        # which project's overlay answered.
+                        "review-local": {
+                            "description": "Project-specific local",
+                            "keywords": ["review"],
+                            "command": "echo",
+                            "args": [f"--from-{name}"],
+                            "requires_api_key": True,
+                            "env_var": f"OVERLAY_{name.upper()}_LOCAL_KEY",
+                        },
                     }
                 }
             )
@@ -936,7 +947,14 @@ def _distinct_projects(roots: dict[str, Path], key: str) -> None:
         policy.write_text(f"servers:\n  denylist:\n    - only-{name}-denies\n")
         mcp = root / ".mcp.json"
         mcp.write_text(
-            json.dumps({"mcpServers": {f"local-{name}": {"command": "true"}}})
+            json.dumps(
+                {
+                    "mcpServers": {
+                        f"local-{name}": {"command": "true"},
+                        "review-local": {"args": []},
+                    }
+                }
+            )
         )
         (root / ".env.pmcp").write_text(f"{key}=credential-{name}\n")
         for path, scope in (
@@ -976,8 +994,33 @@ def test_every_project_scoped_input_comes_from_the_served_project(
     manifest = load_manifest(project_root=project)
     assert manifest.servers["review-remote"].url == "https://b.example.invalid/mcp"
 
-    names = {c.name for c in load_configs(project_root=project)}
-    assert "local-b" in names and "local-a" not in names
+    configs = {c.name: c for c in load_configs(project_root=project)}
+    assert "local-b" in configs and "local-a" not in configs
+    # The configured entry inherits B's overlay defaults, not A's.
+    assert configs["review-local"].config.args == ["--from-b"]  # type: ignore[union-attr]
+
+    # gateway.connect resolves the manifest server from B's overlay.
+    from unittest.mock import MagicMock
+
+    from pmcp.tools.handlers import GatewayTools
+
+    tools = GatewayTools(
+        client_manager=MagicMock(),
+        policy_manager=PolicyManager(project_root=project),
+        project_root=project,
+    )
+    resolved, refusal, _lookup = tools._resolve_lifecycle_target(
+        "review-remote", action="connect", prior_status="offline"
+    )
+    assert refusal is None and resolved is not None
+    assert resolved.config.url == "https://b.example.invalid/mcp"  # type: ignore[union-attr]
+
+    # pmcp secrets check asks for the credential B's overlay declares.
+    for name in ("A", "B"):
+        monkeypatch.delenv(f"OVERLAY_{name}_LOCAL_KEY", raising=False)
+    report = asyncio.run(secrets.run_secrets_check(argparse.Namespace(project=project)))
+    assert "OVERLAY_B_LOCAL_KEY" in report["missing_keys"]
+    assert "OVERLAY_A_LOCAL_KEY" not in report["missing_keys"]
 
     policy = PolicyManager(project_root=project)
     assert not policy.is_server_allowed("only-b-denies")
