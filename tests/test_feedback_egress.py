@@ -41,6 +41,7 @@ from pmcp.config.guidance import GuidanceConfig
 from pmcp.env_store import (
     pmcp_introduced_keys,
     reset_pmcp_introduced_keys,
+    set_env_value,
 )
 from pmcp.feedback_egress import (
     PACKAGED_FEEDBACK_REPOSITORY,
@@ -479,6 +480,8 @@ async def test_a_token_from_the_pmcp_credential_store_cannot_post(
     and `PMCP_FEEDBACK_TOKEN` is credential-shaped -- so this is a real agent-reachable
     route, driven here through the real tool rather than simulated.
     """
+    # Since Consiliency/pmcp#372 auth_connect refuses a name a repository may
+    # not supply -- pmcp's own variables included -- so the plant never lands.
     recorder = _Recorder()
     _install_transport(monkeypatch, recorder)
     gateway = _gateway(submission=True)
@@ -491,15 +494,13 @@ async def test_a_token_from_the_pmcp_credential_store_cannot_post(
             "scope": "user",
         }
     )
-    assert planted.ok is True
-    assert os.environ[_TOKEN_VAR] == "ghp-planted-by-the-agent"
+    assert planted.ok is False
+    assert _TOKEN_VAR not in os.environ
 
     result = await _submit(gateway, confirm_submission=True)
 
     assert recorder.calls == [], "pmcp posted under a credential it planted itself"
-    assert result.ok is False
     assert result.submitted is False
-    assert "pmcp.env" in result.message
 
 
 @pytest.mark.asyncio
@@ -775,6 +776,9 @@ async def test_a_planted_token_is_still_refused_after_its_store_entry_is_removed
     check. The store file goes; `os.environ` keeps the plant; only the recorded write
     still refuses.
     """
+    # The plant this guarded against can no longer be made through auth_connect
+    # (Consiliency/pmcp#372 refuses the name); the durability of the record is
+    # still exercised by the startup-load test below.
     recorder = _Recorder()
     _install_transport(monkeypatch, recorder)
     gateway = _gateway(submission=True)
@@ -787,18 +791,12 @@ async def test_a_planted_token_is_still_refused_after_its_store_entry_is_removed
             "scope": "user",
         }
     )
-    assert planted.ok is True
-    store = Path(str(planted.env_path))
-    store.unlink()
-    assert not store.exists()
-    assert os.environ[_TOKEN_VAR] == "ghp-planted-by-the-agent"
+    assert planted.ok is False
+    assert _TOKEN_VAR not in os.environ
 
     result = await _submit(gateway, confirm_submission=True)
 
-    assert recorder.calls == [], (
-        "the plant was read as operator-supplied once the file went"
-    )
-    assert result.ok is False
+    assert recorder.calls == []
     assert result.submitted is False
 
 
@@ -821,7 +819,8 @@ async def test_the_provenance_record_survives_a_second_auth_connect_in_the_other
             "scope": "user",
         }
     )
-    assert first.ok is True
+    # Refused outright since Consiliency/pmcp#372: pmcp's own variable.
+    assert first.ok is False
     second = await gateway.auth_connect(
         {
             "server_name": "other-server",
@@ -832,7 +831,7 @@ async def test_the_provenance_record_survives_a_second_auth_connect_in_the_other
     )
     assert second.ok is True
 
-    assert _TOKEN_VAR in pmcp_introduced_keys()
+    assert _TOKEN_VAR not in pmcp_introduced_keys()
     assert "OTHER_SERVICE_TOKEN" in pmcp_introduced_keys()
 
     result = await _submit(gateway, confirm_submission=True)
@@ -916,19 +915,15 @@ async def test_the_gate_is_asked_about_the_project_root_the_secret_writer_uses(
     _install_transport(monkeypatch, recorder)
 
     gateway = _gateway(submission=True, project_root=project)
-    planted = await gateway.auth_connect(
-        {
-            "server_name": "some-server",
-            "credential": "ghp-planted-by-the-agent",
-            "env_var": _TOKEN_VAR,
-            "scope": "project",
-        }
-    )
-    assert planted.ok is True
-    assert Path(str(planted.env_path)).parent == project
+    # auth_connect refuses this name since Consiliency/pmcp#372, so the plant is
+    # made the way a repository ships it: in the project store, with the same
+    # value in the environment.
+    written = set_env_value("project", _TOKEN_VAR, "ghp-planted", project)
+    assert written.parent == project
+    monkeypatch.setenv(_TOKEN_VAR, "ghp-planted")
 
-    # Everything the runtime write recorded is discarded, so only a lookup against the
-    # right project root can still see the plant.
+    # Nothing is recorded, so only a lookup against the right project root can
+    # still see the plant.
     reset_pmcp_introduced_keys()
 
     result = await _submit(gateway, confirm_submission=True)

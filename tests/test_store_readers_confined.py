@@ -1833,3 +1833,36 @@ def test_a_rewrite_refuses_a_user_store_that_is_not_a_regular_file(
     assert out["ok"] is False
     assert str(out["error"]).startswith("refusing to write pmcp.env:")
     assert stat.S_ISFIFO(os.lstat(store).st_mode)
+
+
+def test_a_tenant_lookup_follows_the_documented_order(
+    lay: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Environment, user store, tenant store, then the project store -- or, with
+    include_process_env=False, the tenant store alone. The user store is read
+    directly, so this holds without a startup load too."""
+    monkeypatch.delenv("ORDER372", raising=False)
+    user = lay["home"] / ".config" / "pmcp" / "pmcp.env"
+    tenant = _tenant_store(lay)
+    tenant.parent.mkdir(parents=True)
+
+    def header(include: bool = True) -> str:
+        return resolve_remote_headers_for_tenant(
+            {"X": "${ORDER372}"},
+            server_name="r",
+            tenant_id=TENANT,
+            project_root=lay["project"],
+            include_process_env=include,
+        ).resolved_headers["X"]
+
+    _project_store(lay).write_text("ORDER372=project\n")
+    env_store.load_store("project", project=lay["project"])
+    assert header() == "project"
+    tenant.write_text("ORDER372=tenant\n")
+    assert header() == "tenant"
+    user.write_text("ORDER372=user\n")
+    assert header() == "user"
+    assert header(include=False) == "tenant"
+    monkeypatch.setenv("ORDER372", "env")
+    assert header() == "env"
+    assert header(include=False) == "tenant"
