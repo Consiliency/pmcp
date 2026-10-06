@@ -479,7 +479,14 @@ the same values through the same lookup, so the diagnostics answer what the
 gateway will do. Project files are read per project: a lookup for one
 project never uses another project's `.env` or `.env.pmcp`, and a changed
 project file is read again on the next lookup (your user store, which is in
-the environment, is read at startup). In 2.7.3 a checkout's `.env` won over the user
+the environment, is read at startup). The project is the one pmcp serves:
+`--project` when given, otherwise the project root found from the working
+directory -- the root `.mcp.json` is loaded from. So `pmcp --project B` started
+inside project A gives B's servers B's credentials, and pmcp started from a
+subdirectory of a project reads the root's `.env.pmcp` (the file `pmcp secrets
+set --scope project` writes) where 2.7.3 loaded the working directory's. If you
+kept a `.env.pmcp` in a subdirectory you start pmcp from, move its entries to
+the project root's `.env.pmcp`, or pass that subdirectory as `--project`. In 2.7.3 a checkout's `.env` won over the user
 store, and `pmcp secrets check` preferred a project `.env.pmcp`. (Remote
 `${VAR}` headers in the gateway, `pmcp status` and `pmcp doctor` already
 preferred your user store, which those load first.) So a per-project override

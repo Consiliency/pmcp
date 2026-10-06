@@ -495,7 +495,9 @@ def test_a_legitimate_tenant_store_fills_the_header(
 
 
 def _available() -> bool:
-    return GatewayTools._check_api_key_available(object(), VAR)  # type: ignore[arg-type]
+    return GatewayTools._check_api_key_available(
+        GatewayTools.__new__(GatewayTools), VAR
+    )
 
 
 @pytest.mark.parametrize("name", [".env.pmcp", ".env"])
@@ -528,15 +530,23 @@ def test_the_credential_check_refuses_a_subdirectory_link_into_the_project(
     monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """Consiliency/pmcp#366 round 9: no symlink in a repository store at all."""
+    """A subdirectory's store is not a source: the check serves the project root.
+
+    Consiliency/pmcp#366 round 9 refused this link when the check read the
+    working directory's ``.env.pmcp``. Since Consiliency/pmcp#372 round 9 the
+    check answers for the served project -- the root discovered from the
+    working directory -- so from ``pkg/`` it reads the root's own regular
+    store, and the link in ``pkg/`` is never opened at all.
+    """
     _regular(_project_store(lay), lay)
     sub = lay["project"] / "pkg"
     sub.mkdir()
     os.symlink("../.env.pmcp", sub / ".env.pmcp")
     monkeypatch.chdir(sub)
-    assert _available() is False
-    assert env_store.credential_value(VAR) is None
-    assert "pmcp: refusing to load .env.pmcp: it is a symlink" in capfd.readouterr().err
+    assert _available() is True
+    assert env_store.credential_value(VAR) == INSIDE_VALUE
+    assert VAR not in os.environ
+    assert "refusing" not in capfd.readouterr().err
 
 
 def test_the_credential_check_loads_the_user_store_through_a_dotfiles_link(
@@ -1470,7 +1480,12 @@ def test_auth_availability_and_the_credential_check_see_it(
     brave_in_project_store: str,
 ) -> None:
     assert env_store.credential_value("BRAVE_API_KEY") == brave_in_project_store
-    assert GatewayTools._check_api_key_available(object(), "BRAVE_API_KEY") is True  # type: ignore[arg-type]
+    assert (
+        GatewayTools._check_api_key_available(
+            GatewayTools.__new__(GatewayTools), "BRAVE_API_KEY"
+        )
+        is True
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1755,7 +1770,12 @@ def test_an_exported_empty_value_is_not_filled_from_a_repository_file(
     )
     with pytest.raises(MissingApiKeyError):
         asyncio.run(check_api_key(server))
-    assert GatewayTools._check_api_key_available(object(), "BRAVE_API_KEY") is False  # type: ignore[arg-type]
+    assert (
+        GatewayTools._check_api_key_available(
+            GatewayTools.__new__(GatewayTools), "BRAVE_API_KEY"
+        )
+        is False
+    )
 
 
 def test_the_user_store_decides_by_membership_over_a_project_store(

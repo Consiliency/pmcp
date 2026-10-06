@@ -1023,6 +1023,7 @@ def _merge_manifest_defaults(
     name: str,
     config: LocalMcpServerConfig,
     manifest_servers: dict[str, "ManifestServerConfig"] | None,
+    root: Path | None = None,
 ) -> LocalMcpServerConfig | None:
     """Merge a partial config with manifest defaults when possible.
 
@@ -1089,7 +1090,9 @@ def _merge_manifest_defaults(
             from pmcp.env_store import credential_value
 
             for lookup_key in credential_lookup_keys(manifest_server):
-                value = credential_value(lookup_key)
+                # The credential of the project this config is loaded for
+                # (Consiliency/pmcp#372 round 9).
+                value = credential_value(lookup_key, root=root)
                 if value:
                     if merged is config:
                         merged = config.model_copy(deep=True)
@@ -1162,7 +1165,9 @@ def load_configs(
             resolved_config: McpServerConfig = config
         else:
             normalized = normalize_server_config(config, base_path)
-            local_merged = _merge_manifest_defaults(name, normalized, manifest_servers)
+            local_merged = _merge_manifest_defaults(
+                name, normalized, manifest_servers, root=resolved_project_root
+            )
             if not local_merged:
                 return None
             resolved_config = local_merged
@@ -1364,10 +1369,24 @@ def _coerce_manifest_servers(
 
 
 def _credential_value(key: str) -> str | None:
-    """``env_store.credential_value``, imported late (env_store imports this module)."""
+    """``env_store.credential_value`` for the served root, imported late.
+
+    (env_store imports this module.) For a caller with no project of its own;
+    one that has a root uses :func:`_credential_value_for`.
+    """
     from pmcp.env_store import credential_value
 
     return credential_value(key)
+
+
+def _credential_value_for(root: Path | None) -> Callable[[str], str | None]:
+    """``env_store.credential_value`` for project ``root`` (``None``: the served root)."""
+    from pmcp.env_store import credential_value
+
+    def lookup(key: str) -> str | None:
+        return credential_value(key, root=root)
+
+    return lookup
 
 
 def _manifest_server_to_config(
@@ -1641,7 +1660,7 @@ def resolve_startup_configs(
         # so eager/lazy/refresh spawns would launch without the credential.
         # Resolving here keeps both this path and the connect path symmetric, so
         # the refresh diff (issue #79) still sees no spurious env change.
-        config = _manifest_server_to_config(server, _credential_value)
+        config = _manifest_server_to_config(server, _credential_value_for(project_root))
         source: Literal["manifest", "provisioned"] = (
             "provisioned" if name in provisioned else "manifest"
         )

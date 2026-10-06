@@ -118,7 +118,9 @@ def test_every_diagnostic_agrees_with_the_runtime(
         gate = True
     except MissingApiKeyError:
         gate = False
-    check = GatewayTools._check_api_key_available(object(), KEY)  # type: ignore[arg-type]
+    check = GatewayTools._check_api_key_available(
+        GatewayTools.__new__(GatewayTools), KEY
+    )
     child = build_install_child_env(server, root).get(KEY)
     runtime = {
         "credential_value": bool(runtime_value),

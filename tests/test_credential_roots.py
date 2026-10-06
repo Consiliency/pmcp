@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import itertools
 import os
 import time
@@ -177,7 +178,7 @@ def test_the_credential_check_sees_either_project_file_without_a_startup_load(
     monkeypatch.delenv("ONE_FILE_TOKEN", raising=False)
     (roots["a"] / file).write_text("ONE_FILE_TOKEN=x\n")
     check = GatewayTools._check_api_key_available
-    assert check(object(), "ONE_FILE_TOKEN") is True  # type: ignore[arg-type]
+    assert check(GatewayTools.__new__(GatewayTools), "ONE_FILE_TOKEN") is True
     assert "ONE_FILE_TOKEN" not in os.environ
 
 
@@ -208,3 +209,370 @@ def test_a_file_that_changes_while_it_is_read_is_read_again(
     _startup(roots)
     assert raced
     assert env_store.credential_value("RACE_TOKEN") == "new"
+
+
+# --------------------------------------------------------------------------- #
+# Board round 9 on Consiliency/pmcp#372, claude F001: only the header lookups
+# and credential_lookup answered for the project asked about; the install
+# child, the provision gate, a manifest server's injected credential, the
+# gateway credential check and auth availability answered for the directory the
+# gateway started in. A gateway serving B started from inside A spawned B's
+# servers with A's credential. Every consumer in the inventory
+# (tests/test_store_reader_inventory.py, SERVED_ROOT_CONSUMERS and the rule
+# above it) now answers for the project it serves; this grid runs each one with
+# the served root B and the working directory A.
+# --------------------------------------------------------------------------- #
+
+CONSUMER_KEYS = ("BRAVE_API_KEY", "TAVILY_API_KEY", "ONLY_A_TOKEN", "ONLY_B_TOKEN")
+
+
+class _Captured(Exception):
+    def __init__(self, kwargs: dict[str, object]) -> None:
+        self.kwargs = kwargs
+
+
+def _capture_auth_availability(monkeypatch: pytest.MonkeyPatch, module: object) -> None:
+    def capture(*_args: object, **kwargs: object) -> None:
+        raise _Captured(kwargs)
+
+    monkeypatch.setattr(module, "resolve_startup_configs", capture)
+
+
+def _consumers(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> dict[str, object]:
+    """Each consumer, as ``project -> what it answers for that project``."""
+    from unittest.mock import MagicMock
+
+    from pmcp import server as server_module
+    from pmcp.config.loader import load_configs, resolve_startup_configs
+    from pmcp.manifest.installer import (
+        MissingApiKeyError,
+        build_install_child_env,
+        check_api_key,
+    )
+    from pmcp.manifest.loader import load_manifest
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools import handlers
+    from pmcp.tools.handlers import GatewayTools
+
+    manifest = load_manifest()
+    brave = manifest.get_server("brave-search")
+    assert brave is not None and brave.env_var == "BRAVE_API_KEY"
+
+    def install_child(p: Path | None) -> object:
+        return build_install_child_env(brave, project_root=p).get("BRAVE_API_KEY")
+
+    def provision_gate(p: Path | None) -> object:
+        verdicts = []
+        for key in ("ONLY_A_TOKEN", "ONLY_B_TOKEN"):
+            server = copy.copy(brave)
+            server.env_var = key
+            server.secret_key = None
+            try:
+                asyncio.run(check_api_key(server, p))
+                verdicts.append(key)
+            except MissingApiKeyError:
+                pass
+        return verdicts
+
+    def startup_config(p: Path | None) -> object:
+        resolution = resolve_startup_configs(
+            [],
+            manifest_servers=manifest.servers,
+            enabled_auto_start={"brave-search"},
+            project_root=p,
+        )
+        configs = resolution.eager_configs + resolution.lazy_configs
+        (config,) = [c for c in configs if c.name == "brave-search"]
+        return config.config.env.get("BRAVE_API_KEY")
+
+    def configured_server(p: Path | None) -> object:
+        configs = load_configs(project_root=p)
+        (config,) = [c for c in configs if c.name == "brave-search"]
+        return config.config.env.get("BRAVE_API_KEY")
+
+    def credential_check(p: Path | None) -> object:
+        tools = GatewayTools.__new__(GatewayTools)
+        tools._project_root = p
+        return [
+            k
+            for k in ("ONLY_A_TOKEN", "ONLY_B_TOKEN")
+            if tools._check_api_key_available(k)
+        ]
+
+    def _availability(run: object) -> object:
+        try:
+            run()  # type: ignore[operator]
+        except _Captured as captured:
+            available = captured.kwargs["is_auth_available"]
+            return [k for k in ("ONLY_A_TOKEN", "ONLY_B_TOKEN") if available(k)]  # type: ignore[operator]
+        raise AssertionError("resolve_startup_configs was never reached")
+
+    def config_status_availability(p: Path | None) -> object:
+        _capture_auth_availability(monkeypatch, handlers)
+        tools = GatewayTools(
+            client_manager=MagicMock(), policy_manager=PolicyManager(), project_root=p
+        )
+        return _availability(lambda: asyncio.run(tools.config_status()))
+
+    def gateway_availability(p: Path | None) -> object:
+        _capture_auth_availability(monkeypatch, server_module)
+        gateway = server_module.GatewayServer(
+            project_root=p, cache_dir=roots["base"] / "cache"
+        )
+        return _availability(lambda: asyncio.run(gateway.initialize()))
+
+    def init(p: Path | None) -> object:
+        import contextlib
+        import io
+
+        answers = {"tavily": "y"}
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda prompt: next(
+                (v for k, v in answers.items() if f"Enable {k} " in prompt), "n"
+            ),
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asyncio.run(cli.run_init(argparse.Namespace(project=p, force=True)))
+        return "Found TAVILY_API_KEY" in out.getvalue()
+
+    def secrets_check(p: Path | None) -> object:
+        monkeypatch.setattr(
+            secrets,
+            "_extract_required_keys",
+            lambda _: (
+                ["ONLY_A_TOKEN", "ONLY_B_TOKEN"],
+                {"x": ["ONLY_A_TOKEN", "ONLY_B_TOKEN"]},
+                {},
+                {},
+            ),
+        )
+        report = asyncio.run(secrets.run_secrets_check(argparse.Namespace(project=p)))
+        return sorted(report["missing_keys"])
+
+    def header_lookup(p: Path | None) -> object:
+        return build_remote_header_env_lookup(p)("BRAVE_API_KEY")
+
+    def tenant_headers(p: Path | None) -> object:
+        return resolve_remote_headers_for_tenant(
+            {"X": "${BRAVE_API_KEY}"}, server_name="r", tenant_id="t", project_root=p
+        ).resolved_headers["X"]
+
+    def lookup(p: Path | None) -> object:
+        return env_store.credential_lookup(p)("BRAVE_API_KEY")
+
+    return {
+        "install child": install_child,
+        "provision gate": provision_gate,
+        "startup config": startup_config,
+        "configured server": configured_server,
+        "credential check": credential_check,
+        "config_status availability": config_status_availability,
+        "gateway availability": gateway_availability,
+        "init": init,
+        "secrets check": secrets_check,
+        "header lookup": header_lookup,
+        "tenant headers": tenant_headers,
+        "credential_lookup": lookup,
+    }
+
+
+#: What each consumer answers when it answers for B.
+B_ANSWERS: dict[str, object] = {
+    "install child": "from-b",
+    "provision gate": ["ONLY_B_TOKEN"],
+    "startup config": "from-b",
+    "configured server": "from-b",
+    "credential check": ["ONLY_B_TOKEN"],
+    "config_status availability": ["ONLY_B_TOKEN"],
+    "gateway availability": ["ONLY_B_TOKEN"],
+    "init": True,
+    "secrets check": ["ONLY_A_TOKEN"],
+    "header lookup": "from-b",
+    "tenant headers": "from-b",
+    "credential_lookup": "from-b",
+}
+
+#: Consumers whose project is the one their caller names, never an implicit
+#: one: the config load reads ``.mcp.json`` from ``project_root`` (else the
+#: root discovered from the working directory) and injects credentials for that
+#: same project; ``pmcp init`` configures ``--project`` (else the working
+#: directory). Production passes the served project to both (GatewayServer and
+#: the init command get ``args.project``), so only the explicit mode applies.
+EXPLICIT_ONLY = frozenset({"configured server", "init"})
+
+CONSUMER_GRID = [
+    (consumer, mode)
+    for consumer in B_ANSWERS
+    for mode in ("explicit", "served")
+    if not (mode == "served" and consumer in EXPLICIT_ONLY)
+]
+
+
+@pytest.mark.parametrize(
+    ("consumer", "mode"), CONSUMER_GRID, ids=[f"{c}-{m}" for c, m in CONSUMER_GRID]
+)
+def test_every_consumer_answers_for_the_project_it_serves(
+    consumer: str,
+    mode: str,
+    roots: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Served root B, working directory A: each consumer answers with B's credential.
+
+    ``explicit``: the consumer is handed B (``project_root=B``, as the gateway
+    hands it ``args.project``). ``served``: it is handed nothing and B is the
+    served root (``pmcp --project B``, :func:`cli.serve_project`).
+    """
+    from pmcp import trust_store
+
+    for key in CONSUMER_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    for name in ("a", "b"):
+        (roots[name] / ".env.pmcp").write_text(
+            f"BRAVE_API_KEY=from-{name}\n"
+            f"TAVILY_API_KEY=from-{name}\n"
+            f"ONLY_{name.upper()}_TOKEN=x\n"
+        )
+        mcp = roots[name] / ".mcp.json"
+        mcp.write_text(
+            '{"mcpServers": {"brave-search": {"command": "npx", '
+            '"args": ["-y", "@brave/brave-search-mcp-server"]}}}'
+        )
+        trust_store.record(mcp, mcp.read_bytes(), "project", trust_store.APPROVED)
+    run = _consumers(roots, monkeypatch)[consumer]
+    _startup(roots)  # in a
+    if mode == "served":
+        cli.serve_project(roots["b"])
+        project = None
+    else:
+        project = roots["b"]
+    assert run(project) == B_ANSWERS[consumer]  # type: ignore[operator]
+
+
+def test_the_grid_covers_every_consumer_in_the_inventory() -> None:
+    """A new consumer joins the inventory; it must join this grid too."""
+    import ast
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import test_store_reader_inventory as inventory
+
+    consumers = set()
+    for module, source in inventory._src_sources().items():
+        for name, fn in inventory._qualified_functions(ast.parse(source)):
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call):
+                    f = node.func
+                    called = getattr(f, "id", getattr(f, "attr", ""))
+                    if called in ("credential_value", "credential_lookup"):
+                        consumers.add(f"{module}:{name}")
+    assert consumers == set(GRID_COVERAGE)
+
+
+#: Every function in src/pmcp that calls credential_value or credential_lookup,
+#: and the grid row that runs it.
+GRID_COVERAGE = {
+    "pmcp.manifest.installer:build_install_child_env": "install child",
+    "pmcp.manifest.installer:check_api_key": "provision gate",
+    "pmcp.config.loader:_credential_value_for": "startup config",
+    "pmcp.config.loader:_credential_value": "(served root; inventory-listed)",
+    "pmcp.config.loader:_merge_manifest_defaults": "configured server",
+    "pmcp.tools.handlers:GatewayTools._check_api_key_available": "credential check",
+    "pmcp.tools.handlers:GatewayTools.config_status": "config_status availability",
+    "pmcp.server:GatewayServer.initialize": "gateway availability",
+    "pmcp.cli:run_init": "init",
+    "pmcp.cli_commands.secrets:run_secrets_check": "secrets check",
+    "pmcp.remote_auth:build_remote_header_env_lookup": "header lookup",
+    "pmcp.remote_auth:resolve_remote_headers_for_tenant": "tenant headers",
+    "pmcp.env_store:credential_lookup": "credential_lookup",
+}
+
+
+def test_pmcp_project_serves_that_project(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wiring: ``pmcp --project B`` run from A answers for B, through main()."""
+    import sys
+
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    (roots["a"] / ".env.pmcp").write_text("BRAVE_API_KEY=from-a\n")
+    (roots["b"] / ".env.pmcp").write_text("BRAVE_API_KEY=from-b\n")
+    seen: list[object] = []
+
+    async def report(_args: argparse.Namespace) -> None:
+        seen.append(env_store.credential_value("BRAVE_API_KEY"))
+
+    monkeypatch.setattr(cli, "async_main", report)
+    monkeypatch.setattr(cli, "find_dotenv", lambda: str(roots["base"] / "no-such.env"))
+    monkeypatch.setattr(sys, "argv", ["pmcp", "--project", str(roots["b"])])
+    cli.main()
+    assert seen == ["from-b"]
+
+
+# --------------------------------------------------------------------------- #
+# Board round 9 N-1: an entry keyed on the root's inode alone could be found by
+# a new directory that reused a deleted one's inode.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_directory_that_reuses_an_inode_gets_its_own_entry(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inode reuse, made deterministic: both directories report one inode and ctime.
+
+    The reviewer's case: a root looked up while it had no store, then deleted,
+    and a new directory elsewhere given its inode. The ctime is pinned equal
+    too, so only the path in the key tells the two apart (the ctime check has
+    its own test below).
+    """
+    monkeypatch.delenv("REUSE_TOKEN", raising=False)
+    _startup(roots)
+    old = roots["base"] / "old"
+    new = roots["base"] / "new"
+    real_identity = env_store._identity
+    shared = real_identity(roots["base"])
+    monkeypatch.setattr(
+        env_store,
+        "_identity",
+        lambda p: shared if Path(p) in (old, new) else real_identity(p),
+    )
+    real_stamp = env_store._root_stamp
+    monkeypatch.setattr(
+        env_store,
+        "_root_stamp",
+        lambda p: 1 if Path(p) in (old, new) else real_stamp(p),
+    )
+    old.mkdir()
+    assert env_store.credential_value("REUSE_TOKEN", root=old) is None
+    old.rmdir()
+    new.mkdir()
+    (new / ".env.pmcp").write_text("REUSE_TOKEN=new\n")
+    assert env_store.credential_value("REUSE_TOKEN", root=new) == "new"
+
+
+def test_a_change_to_the_root_directory_rebuilds_its_entry(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The entry records the root's ``st_ctime_ns``; a change there rebuilds."""
+    calls: list[Path] = []
+    real = env_store._build_root_entry
+
+    def counting(root: Path):  # type: ignore[no-untyped-def]
+        calls.append(root)
+        return real(root)
+
+    monkeypatch.setattr(env_store, "_build_root_entry", counting)
+    (roots["a"] / ".env.pmcp").write_text("STAMP_TOKEN=x\n")
+    _startup(roots)
+    env_store.credential_value("STAMP_TOKEN")
+    built = len(calls)
+    before = os.stat(roots["a"]).st_ctime_ns
+    while os.stat(roots["a"]).st_ctime_ns == before:
+        (roots["a"] / "unrelated").touch()
+        (roots["a"] / "unrelated").unlink()
+    assert env_store.credential_value("STAMP_TOKEN") == "x"
+    assert len(calls) == built + 1

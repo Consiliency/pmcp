@@ -1114,3 +1114,103 @@ def test_the_copy_scan_sees_each_shape() -> None:
         line.split(" ")[0] for line in unchecked_store_copies({"pmcp.x": source})
     }
     assert flagged == {"pmcp.x:bare_sync", "pmcp.x:via_set"}
+
+
+# --------------------------------------------------------------------------- #
+# Every credential consumer answers for the project it serves
+# (Consiliency/pmcp#372 round 9). A lookup with no root answers for the SERVED
+# root (env_store.serve_project_root: --project, else the discovered root), so
+# a consumer that knows a more specific root -- a gateway's project_root, an
+# install child's, a config load's -- must pass it. Each call to
+# credential_value passes ``root=``, and each call to credential_lookup passes
+# a project, or the function holding it is listed here with its reason.
+# --------------------------------------------------------------------------- #
+
+#: ``(module, function)`` -> why it answers for the served root. Asserted exact.
+SERVED_ROOT_CONSUMERS = {
+    ("pmcp.config.loader", "_credential_value"): (
+        "manifest_server_to_config's lookup: a public helper that builds a "
+        "manifest server's config with no project of its own; every caller with "
+        "a root uses _credential_value_for(root)"
+    ),
+}
+
+_CONSUMER_GATES = {"credential_value": "root", "credential_lookup": "project"}
+
+
+def _qualified_functions(
+    tree: ast.AST, prefix: str = ""
+) -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    found: list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]] = []
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            found.append((prefix + node.name, node))
+        elif isinstance(node, ast.ClassDef):
+            found.extend(_qualified_functions(node, f"{prefix}{node.name}."))
+    return found
+
+
+def root_less_consumers(sources: dict[str, str]) -> set[tuple[str, str]]:
+    """``(module, function)`` of each consumer that looks up without a root."""
+    found: set[tuple[str, str]] = set()
+    for module, source in sources.items():
+        tree = ast.parse(source)
+        aliases = {
+            alias.asname or alias.name: alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+            if alias.name in _CONSUMER_GATES
+        }
+        for name, fn in _qualified_functions(tree):
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if isinstance(func, ast.Name):
+                    called = aliases.get(func.id, func.id)
+                elif isinstance(func, ast.Attribute):
+                    called = func.attr
+                else:
+                    continue
+                gate = _CONSUMER_GATES.get(called)
+                if gate is None:
+                    continue
+                keywords = {k.arg for k in node.keywords}
+                if gate in keywords or (gate == "project" and node.args):
+                    continue
+                found.add((module, name))
+    return found
+
+
+def test_every_credential_consumer_answers_for_the_project_it_serves() -> None:
+    assert root_less_consumers(_src_sources()) == set(SERVED_ROOT_CONSUMERS)
+
+
+def test_the_consumer_scan_sees_each_shape() -> None:
+    source = (
+        "from pmcp.env_store import credential_value as cv, credential_lookup\n"
+        "from pmcp import env_store\n"
+        "def bare(k):\n"
+        "    return cv(k)\n"
+        "def by_attribute(k):\n"
+        "    return env_store.credential_value(k)\n"
+        "def lookup_for_nobody():\n"
+        "    return credential_lookup()\n"
+        "class Tools:\n"
+        "    def check(self, k):\n"
+        "        return bool(cv(k))\n"
+        "    def fine(self, k):\n"
+        "        return cv(k, root=self._project_root)\n"
+        "def fine_lookup(p):\n"
+        "    return credential_lookup(p)(k) or credential_lookup(project=p)(k)\n"
+        "def nested(k):\n"
+        "    return [x for x in map(lambda key: cv(key), [k])]\n"
+    )
+    assert root_less_consumers({"pmcp.x": source}) == {
+        ("pmcp.x", "bare"),
+        ("pmcp.x", "by_attribute"),
+        ("pmcp.x", "lookup_for_nobody"),
+        ("pmcp.x", "Tools.check"),
+        ("pmcp.x", "nested"),
+    }

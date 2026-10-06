@@ -46,7 +46,7 @@ from pmcp.env_store import (
     load_store,
     mark_startup_loaded,
     pin_user_store_path,
-    set_default_root,
+    serve_project_root,
     record_pmcp_introduced_keys,
 )
 from pmcp.validation import is_valid_package_version, parse_package_spec
@@ -1739,7 +1739,7 @@ async def run_init(args: argparse.Namespace) -> None:
                         (
                             k
                             for k in credential_lookup_keys(server)
-                            if credential_value(k)
+                            if credential_value(k, root=project_dir)
                         ),
                         None,
                     )
@@ -3137,9 +3137,12 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     """
     pin_user_store_path()
     mark_startup_loaded()
-    # An unqualified credential lookup answers for the directory this load
-    # reads (env_store: one entry per project root).
-    set_default_root(Path.cwd())
+    # An unqualified credential lookup answers for the project this process
+    # serves: here the root discovered from the working directory, the one the
+    # gateway loads `.mcp.json` from; main() moves it to `--project` once the
+    # arguments are parsed (env_store.serve_project_root, Consiliency/pmcp#372
+    # round 9).
+    served = serve_project_root(None)
     before = set(os.environ)
     found = dotenv_path if dotenv_path is not None else find_dotenv()
     if found:
@@ -3151,7 +3154,7 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     # is never recorded and never refused.
     before = set(os.environ)
     load_store("user")
-    _load_project_store_at_startup(Path.cwd() / ".env.pmcp")
+    _load_project_store_at_startup(served / ".env.pmcp")
     record_pmcp_introduced_keys(set(os.environ) - before)
 
 
@@ -3179,6 +3182,20 @@ def _load_project_store_at_startup(path: Path) -> None:
     load_store("project", path=path, verb="load")
 
 
+def serve_project(project: Path | None) -> None:
+    """Serve ``--project``: every unqualified credential lookup answers for it.
+
+    The startup load ran before the arguments were parsed and served the root
+    discovered from the working directory. A ``--project`` moves the served
+    root there and loads that root's ``.env.pmcp`` the same way, so a gateway
+    started from inside project A to serve project B spawns, gates and checks
+    B's servers with B's credentials (Consiliency/pmcp#372 round 9).
+    """
+    if project is None:
+        return
+    _load_project_store_at_startup(serve_project_root(project) / ".env.pmcp")
+
+
 def main() -> None:
     """Main entry point."""
     # Load .env from the current directory or project root, plus the PMCP
@@ -3187,6 +3204,7 @@ def main() -> None:
     load_startup_env()
 
     args = parse_args()
+    serve_project(getattr(args, "project", None))
 
     # Resolve the `secrets set` value here (not in async_main) so it is never
     # required on argv, while async_main stays a pure dispatcher over args.

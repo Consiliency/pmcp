@@ -331,27 +331,34 @@ def read_store(
 #: it says reaches ``os.environ``; only explicit credential lookups consult
 #: these values, through :func:`credential_value`.
 #:
-#: Keyed by PROJECT ROOT (the root directory's ``(st_dev, st_ino)``): a lookup
-#: for root R answers only from R's own project files -- ``R/.env`` then
-#: ``R/.env.pmcp``, first wins -- so one project's credential never fills
-#: another project's header (Consiliency/pmcp#372 round 8). Each entry is built
-#: by ONE builder (:func:`_build_root_entry`) and records each source file's
-#: identity; a lookup rebuilds the entry, with the same builder, when a file
-#: changed, so a rotated token is picked up without a restart. Test-only reset:
-#: :func:`reset_repo_credentials`.
+#: Keyed by PROJECT ROOT -- the root directory's resolved path plus its
+#: ``(st_dev, st_ino)`` (:func:`_root_key`): a lookup for root R answers only
+#: from R's own project files -- ``R/.env`` then ``R/.env.pmcp``, first wins --
+#: so one project's credential never fills another project's header
+#: (Consiliency/pmcp#372 round 8). Each entry is built by ONE builder
+#: (:func:`_build_root_entry`) and records the root directory's ``st_ctime_ns``
+#: and each source file's identity; a lookup rebuilds the entry, with the same
+#: builder, when any of them changed, so a rotated token is picked up without a
+#: restart and a new directory that reuses a deleted one's inode never inherits
+#: its entry (round 9 N-1). Test-only reset: :func:`reset_repo_credentials`.
 @dataclass
 class _RootEntry:
     root: Path
     values: dict[str, str]
     #: ``(path, identity)`` per source file; identity ``None`` when absent.
     sources: tuple[tuple[Path, object], ...]
+    #: The root directory's ``st_ctime_ns`` when the entry was built.
+    stamp: object = None
 
 
 _REPO_CREDENTIALS: dict[object, _RootEntry] = {}
 
-#: The root a lookup without an explicit project answers for: the working
-#: directory the startup load read (``cli.load_startup_env`` sets it), else the
-#: first root an entry was built for.
+#: The root a lookup without an explicit project answers for: the SERVED
+#: project root (:func:`serve_project_root` -- ``--project`` when given, else
+#: the root discovered from the working directory), else the first root an
+#: entry was built for. A consumer that knows a more specific root passes it as
+#: ``root=``; ``tests/test_store_reader_inventory.py`` lists every consumer that
+#: does not, with its reason (Consiliency/pmcp#372 round 9).
 _DEFAULT_ROOT: Path | None = None
 
 #: The project files of a root, in precedence order.
@@ -369,9 +376,29 @@ def reset_repo_credentials() -> None:
 
 
 def set_default_root(root: Path) -> None:
-    """The root an unqualified lookup answers for (the startup load's directory)."""
+    """The root an unqualified lookup answers for (see :func:`serve_project_root`)."""
     global _DEFAULT_ROOT
     _DEFAULT_ROOT = root
+
+
+def served_project_root() -> Path | None:
+    """The served project root (:func:`serve_project_root`), or ``None`` before one is set."""
+    return _DEFAULT_ROOT
+
+
+def serve_project_root(project: Path | None) -> Path:
+    """Make the project this process serves the root every unqualified lookup answers for.
+
+    ``project`` is ``--project`` (``None``: the root discovered from the working
+    directory, :func:`resolve_project_root` -- the same root the gateway loads
+    ``.mcp.json`` from). A gateway serving project B started from inside
+    project A therefore answers B's install child, provision gate, injected
+    server credential and availability checks from B's files, as it answers
+    B's headers (Consiliency/pmcp#372 round 9).
+    """
+    root = resolve_project_root(project)
+    set_default_root(root)
+    return root
 
 
 def repo_credential_names(root: Path | None = None) -> frozenset[str]:
@@ -381,8 +408,24 @@ def repo_credential_names(root: Path | None = None) -> frozenset[str]:
 
 
 def _root_key(root: Path) -> object:
+    """``(resolved path, st_dev, st_ino)`` of a root directory.
+
+    The path as well as the inode: a deleted directory's inode can be reused by
+    a new directory elsewhere, which must not find the old entry. The entry's
+    ``stamp`` (:func:`_root_stamp`) covers a directory recreated at the same
+    path.
+    """
     identity = _identity(root)
-    return identity if identity is not None else ("path", os.fspath(root))
+    where = os.path.realpath(root)
+    return (where, *identity) if identity is not None else ("path", where)
+
+
+def _root_stamp(root: Path) -> object:
+    """The root directory's ``st_ctime_ns``, or ``None`` when it cannot be looked at."""
+    try:
+        return os.stat(root).st_ctime_ns
+    except OSError:
+        return None
 
 
 def _file_identity(path: Path) -> object:
@@ -407,6 +450,7 @@ def _build_root_entry(root: Path) -> _RootEntry:
     """
     values: dict[str, str] = {}
     sources: list[tuple[Path, object]] = []
+    stamp = _root_stamp(root)
     root_identity = _identity(root)
     # In the home directory, or above it, a `.env` is the operator's own
     # (load_discovered_dotenv loads it into the environment), not a project file.
@@ -431,18 +475,24 @@ def _build_root_entry(root: Path) -> _RootEntry:
                     store_path, describe_ignored_store_env_var(key, store_path.name)
                 )
             values.setdefault(key, value)
-    return _RootEntry(root=root, values=values, sources=tuple(sources))
+    return _RootEntry(root=root, values=values, sources=tuple(sources), stamp=stamp)
 
 
 def _root_entry(root: Path | None) -> _RootEntry | None:
-    """Root ``root``'s entry (default: :data:`_DEFAULT_ROOT`), rebuilt if a file changed."""
+    """Root ``root``'s entry (default: :data:`_DEFAULT_ROOT`), rebuilt if it changed."""
     if root is None:
         root = _DEFAULT_ROOT
+    else:
+        root = resolve_project_root(root)
     if root is None:
         return None
     key = _root_key(root)
     entry = _REPO_CREDENTIALS.get(key)
-    if entry is None or any(_file_identity(p) != ident for p, ident in entry.sources):
+    if (
+        entry is None
+        or entry.stamp != _root_stamp(root)
+        or any(_file_identity(p) != ident for p, ident in entry.sources)
+    ):
         entry = _build_root_entry(root)
         _REPO_CREDENTIALS[key] = entry
     return entry
@@ -715,8 +765,8 @@ def credential_value(
     2. ``repository`` -- a TENANT store's values (``remote_auth``), the one
        layer between the user store and the project credentials;
     3. the project files of ONE root (``startup_files``): ``root``, else the
-       startup load's directory -- its ``.env``, then its ``.env.pmcp``, first
-       wins -- never another root's.
+       served project root (:func:`serve_project_root`) -- its ``.env``, then
+       its ``.env.pmcp``, first wins -- never another root's.
 
     Precedence is decided by MEMBERSHIP, not truthiness: the first source that
     HAS the name decides, and an empty value there means "unavailable" -- an
@@ -777,8 +827,8 @@ def credential_lookup(project: Path | None = None) -> Callable[[str], str | None
     """The one credential lookup: runtime and diagnostics read the same entries.
 
     The startup load first (:func:`ensure_startup_load`), then
-    :func:`credential_value` for root ``project`` (``None``: the startup load's
-    directory) -- exactly what the provision gate, the install child and the
+    :func:`credential_value` for root ``project`` (``None``: the served project
+    root) -- exactly what the provision gate, the install child and the
     gateway's credential check read for that root. Remote ``${VAR}`` headers,
     ``pmcp doctor`` and ``pmcp secrets check`` call this;
     ``tests/test_credential_parity.py`` checks their verdicts against the

@@ -58,6 +58,7 @@ from pmcp.env_store import (
     record_dotenv_keys,
     child_process_env,
     credential_value,
+    served_project_root,
     load_store,
     repository_may_supply,
     record_pmcp_introduced_keys,
@@ -796,6 +797,12 @@ def _summarize_arg_schema(
 
 class GatewayTools:
     """Gateway tool handler implementations."""
+
+    #: The project this gateway serves; ``None`` means the served project root
+    #: (``env_store.serve_project_root``). Every credential lookup here answers
+    #: for it (Consiliency/pmcp#372 round 9). A class default so that an
+    #: instance made without ``__init__`` reads the served root.
+    _project_root: Path | None = None
 
     def __init__(
         self,
@@ -2375,7 +2382,9 @@ class GatewayTools:
             disabled_auto_start=disabled,
             provisioned_server_names=provisioned,
             is_server_allowed=self._policy_manager.is_server_allowed,
-            is_auth_available=lambda env_var: bool(credential_value(env_var)),
+            is_auth_available=lambda env_var: bool(
+                credential_value(env_var, root=self._project_root)
+            ),
             legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
             project_root=self._project_root,
         )
@@ -2666,7 +2675,7 @@ class GatewayTools:
 
         # The process environment, then credentials repository files supplied
         # (env_store.credential_value) -- fast path.
-        if credential_value(env_var):
+        if credential_value(env_var, root=self._project_root):
             return True
 
         # Load the working directory's project files, then the user store. The
@@ -2677,15 +2686,20 @@ class GatewayTools:
         # never in the gateway's environment (Consiliency/pmcp#372 round 2).
         # Which files a root has is the builder's to know, not this caller's.
         # The user store follows its link. A key found early stops the loads.
+        # The project is the one this gateway serves (Consiliency/pmcp#372
+        # round 9): ``project_root``, else the served root.
+        project = self._project_root
+        if project is None:
+            project = served_project_root()
         stores: list[tuple[Literal["project", "user"], Path | None]] = [
-            ("project", Path.cwd() / ".env.pmcp"),
+            ("project", project),
             ("user", None),
         ]
-        for scope, path in stores:
+        for scope, store_project in stores:
             before = set(os.environ)
-            load_store(scope, path=path)
+            load_store(scope, project=store_project)
             record_dotenv_keys(set(os.environ) - before)
-            if credential_value(env_var):
+            if credential_value(env_var, root=self._project_root):
                 return True
 
         return False

@@ -753,8 +753,11 @@ class GatewayServer:
             enabled_auto_start=enabled_auto_start,
             disabled_auto_start=disabled_auto_start,
             is_server_allowed=self._policy_manager.is_server_allowed,
-            is_auth_available=lambda env_var: bool(credential_value(env_var)),
+            is_auth_available=lambda env_var: bool(
+                credential_value(env_var, root=self._project_root)
+            ),
             legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
+            project_root=self._project_root,
         )
         self._gateway_tools.set_startup_observations(
             build_startup_observation_snapshot(resolution)
