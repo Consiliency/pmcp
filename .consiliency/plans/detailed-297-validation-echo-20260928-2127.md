@@ -113,7 +113,8 @@ hand. Rev 24 checks every such reason against the client's source:
   - Keys are `module:Class@path::function`, with httpcore's generated
     `_sync` folded into `_async`.
   - Taking rev 23's table as given, it flagged three more besides
-    `ProxyError`, each confirmed by a probe:
+    `ProxyError`, each confirmed in the source and, apart from
+    `WSMessageTypeError`, by a probe:
     - aiohttp's `WSMessageTypeError` quotes the message's data, although
       rev 23's reason was "a fixed type-mismatch message";
     - httpx/httpcore `UnsupportedProtocol` quotes the scheme of a
@@ -152,14 +153,20 @@ hand. Rev 24 checks every such reason against the client's source:
   - The check is in the registry (`_is_validation_error`), so every sink
     sees it: text, `safe_exc_info`, the log scrubber and tracebacks.
 - httpx, httpx2, httpcore and httpcore2 `UnsupportedProtocol` read
-  `the URL's scheme is not supported (<class>)`.
+  `the URL's scheme is not supported (<class>)`. Cost: the scheme of a
+  URL pmcp was given is not shown either.
 - aiohttp's `ClientConnectionError` and every subclass read
   `the connection failed (<class>[, errno N])`.
   - The exception is `ServerDisconnectedError`, which keeps its
     rejected-response wording.
   - Cost: the host and OS text are gone from aiohttp's connection errors.
-    pmcp's aiohttp sites name their target themselves (the package,
-    registry or JWKS URL).
+    The version lookups still name the package and registry, and the
+    JWKS error its URL. The registry fetch already logged the class
+    alone.
+  - This goes past the ruling's letter. A connection failure to a host
+    that a followed redirect named is not raised *from* a response.
+    Rev 24 registers it anyway, so that the rule has no exception;
+    otherwise it would be a Non-goals line.
 - aiohttp's `WSMessageTypeError`.
 
 **N1 (rev 24).** In a chain that holds a registered error, every other
@@ -996,6 +1003,10 @@ no hook, it ran on `86a63a6` in both passes and dies there.
     `httpx.AsyncClient`, …). An aliased import (`from aiohttp import
     ClientSession`) would be missed; `src/pmcp` has none. That
     `ClientSession` name today is the MCP SDK's, over stdio.
+  - The proxy and renderer rows ran on Python 3.10. On 3.11 and 3.12 a
+    standalone probe confirmed the tunnel's origin check: the innermost
+    frame is `_tunnel`'s code object, and its `code` local is the
+    status as an `int`.
   - The redirect-host rows rely on `.invalid` failing to resolve
     (RFC 6761). On a resolver that queries upstream for it, they are
     slower, not wrong.
