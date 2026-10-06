@@ -1,15 +1,17 @@
 # Detailed plan: describe validation errors from their structure, never their value — everywhere pmcp turns an exception into text
 
-> **Revision 22 (2026-10-06), on main `f85d368`.** Consiliency/pmcp#297, the
+> **Revision 22 (2026-10-06), on main `bc0a9ce`.** Consiliency/pmcp#297, the
 > prerequisite for piece B (`extra="forbid"`) of Consiliency/pmcp#236. The
 > change is **embedded, not described**. The 52 blocks under *Verbatim
-> bodies* are `git apply` patches against `origin/main` @ `f85d368`. They are
+> bodies* are `git apply` patches against `origin/main` @ `bc0a9ce`. They are
 > byte-identical to the verified code on the branch `wip/297-code` @
-> `c8a5d80`. *Embedding proof* extracts them from this file and applies them
-> on a fresh `f85d368`, then compares every file.
+> `30dc945`, a real merge of `bc0a9ce` (Consiliency/pmcp#376: the task cap
+> and connection-bound task records) into rev 22. *Embedding proof* extracts
+> them from this file and applies them on a fresh `bc0a9ce`, then compares
+> every file.
 >
-> **For the board:** review the spike's tree (`wip/297-code` @ `c8a5d80`,
-> whose diff from `f85d368` is these patches). The bundle may leave the
+> **For the board:** review the spike's tree (`wip/297-code` @ `30dc945`,
+> whose diff from `bc0a9ce` is these patches). The bundle may leave the
 > patches out.
 >
 > **What rev 22 changes:** it answers round 20 on Consiliency/pmcp#314 @
@@ -21,6 +23,7 @@
 > - The sink guard's attribute check is an allowlist. `setattr` and `**`
 >   into a logging call are covered.
 > - The Non-goals name the `requested` echo.
+> - It merges main `bc0a9ce` (*Merge of `bc0a9ce`*).
 
 ## History (revs 1–21)
 
@@ -129,6 +132,44 @@ client, is downstream content pmcp rejected.
   `object`, `setattr` and `**`.
 
 **Mutants:** M153–M155 (see *Mutation evidence*).
+
+## Merge of `bc0a9ce` (Consiliency/pmcp#376)
+
+Consiliency/pmcp#376 bounds the tasks pmcp tracks per server, and binds
+each record to the connection it came from. `call_tool_with_task` and
+`get_task_result_with_task` now return a `TaskReply`: the reply, plus the
+record built from *this* reply on *this* connection. The handler no longer
+looks a task up by id after the await. This is a real merge, with
+conflicts in the manager (4), the handler (1) and `test_task_units.py`
+(1).
+
+**Kept from Consiliency/pmcp#376:**
+- the `TaskReply` shape;
+- the connection-bound `_record_task`, with no lookup after the await;
+- the `tasks/get` fallback's own-connection rule (`_owns`);
+- the shared `_send_task_cancel` sender.
+
+**Kept from revs 14–17, now applied in the manager:**
+- The parser is the only task recogniser (`task_answer_of`, rev 15).
+  Consiliency/pmcp#376's `_extract_task_payload` is not used.
+- A task call's reply is returned, and sized, reduced to what pmcp could
+  use (`usable_task_response`, rev 14/17). This covers both `TaskReply`s.
+- A call that is not a task gets its answer as opaque data. The effective
+  task mode (`effective_task_mode`, rev 17) is decided once, in
+  `call_tool_with_task`.
+- The `tasks/get` fallback runs only when the reply names no task at all
+  (`_names_a_task`, rev 15), and only on the request's own connection.
+- The cancel sender's unparseable answer keeps no `raw` (rev 15).
+
+**Tests.**
+- The echo tests seed records through Consiliency/pmcp#376's `_record_task(...,
+  requestor_context=None, connection=...)`.
+- Consiliency/pmcp#376's own modules all pass unchanged on the merge:
+  `test_task_tracking_cap.py`, `test_task_units.py`,
+  `test_task_numeric_bounds.py`, `test_cancel_teardown.py`,
+  `test_client_manager.py`, `test_tools.py`, `test_lazy_start.py`,
+  `test_integration.py` and `test_phase4_e2e.py`. That is 2,781 tests
+  together with the echo modules.
 
 ## Rev 21: every `except` binding is an exception name
 
@@ -429,7 +470,7 @@ read, is a sink.
 
 ## Changes
 
-The patches are `git diff f85d368 c8a5d80 -- <file>`: 52 files, +12425 / −700. This is
+The patches are `git diff bc0a9ce 30dc945 -- <file>`: 52 files, +12455 / −691. This is
 one concern applied at every sink, past the bounded-plan threshold on
 purpose. Rev 20:
 - adds `pmcp/sdk_rejections.py`, installed with the log scrubber;
@@ -455,7 +496,7 @@ alone reproduces the code.
 
 ## Verification
 
-On a fresh `f85d368` with the patches applied:
+On a fresh `bc0a9ce` with the patches applied:
 - run `uv sync --all-extras -p 3.10`, then ruff check, ruff format
   `--check` and mypy;
 - run the eight modules (`test_exception_text_sinks`,
@@ -469,10 +510,10 @@ On a fresh `f85d368` with the patches applied:
 - run the full suite `-m 'not live and not slow'` with the npm cache
   variables unset.
 
-## Acceptance criteria — measured on `c8a5d80`
+## Acceptance criteria — measured on `30dc945`
 
-- [x] The eight modules and Consiliency/pmcp#371's two are green: `1468 passed in 705.09s (0:11:45)`.
-- [x] Red on main `f85d368`, with the eight test files from `c8a5d80`
+- [x] The eight modules and Consiliency/pmcp#371's two are green: `1468 passed in 560.48s (0:09:20)`.
+- [x] Red on main `bc0a9ce`, with the eight test files from `30dc945`
   (`--tb=line`; the errors are a fixture importing `pmcp.argument_errors`):
 
 ```text
@@ -484,20 +525,20 @@ On a fresh `f85d368` with the patches applied:
   80 tests/test_log_record_scrubber.py
  118 tests/test_parse_error_echo.py
    6 tests/test_scoped_advisor_audit.py
-456 failed, 619 passed, 57 errors in 184.80s (0:03:04)
+456 failed, 619 passed, 57 errors in 158.98s (0:02:38)
 ```
 
 - [x] Binding: the round-20 falsifier, over all four lookups and two shapes, fails on
-rev 21's registry: 8 cases, plus the registry test. It passes here. M153–M155
-each remove one part of the rule, and each dies.
+rev 21's registry: 8 cases, plus the registry test. It passes here. Each of
+M153–M155 removes one part of the rule, and each dies.
 
 - [x] The full suite, with `npm_config_cache`, `npm_config_store_dir` and
-  `pnpm_config_store_dir` unset (dev0 is a team host): `9804 passed, 5 skipped, 80 deselected in 1582.43s (0:26:22)`.
-- [x] Gates: ruff check: `All checks passed!`; ruff format --check: `190 files already formatted`; mypy: `Success: no issues found in 56 source files`.
+  `pnpm_config_store_dir` unset (dev0 is a team host): `10121 passed, 5 skipped, 80 deselected in 1456.07s (0:24:16)`.
+- [x] Gates: ruff check: `All checks passed!`; ruff format --check: `193 files already formatted`; mypy: `Success: no issues found in 57 source files`.
 
 ## Mutation evidence
 
-`mutants.py` ran on worktrees of `c8a5d80`. The procedure:
+`mutants.py` ran on worktrees of `30dc945`. The procedure:
 - each mutant's anchor must occur exactly once;
 - the eight modules run with `-x`;
 - a dirty file is refused;
@@ -506,13 +547,16 @@ each remove one part of the rule, and each dies.
 - `git status` after the run: `0` and `0`.
 
 The purposes of M1–M152 are in the history table's plans (M149–M152:
-`7bcb209`). Rev 22 adds M153–M155:
+`7bcb209`). The merge of `bc0a9ce` moved the task rules from the handler
+into the manager. M94, M95, M110, M112 and M114 are re-anchored there. M113
+is retired: with the reduction in the manager, it became M94. Rev 22 adds
+M153–M155:
 - M153 drops aiohttp's `ContentTypeError` from the registry;
 - M154 drops `UnicodeDecodeError` from it;
 - M155 describes a response-decoding error by its own text.
 
 ```text
-144 mutants applied; 142 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M91 M93–M136 M138–M155 G1 S5–S8
+143 mutants applied; 141 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M91 M93–M112 M114–M136 M138–M155 G1 S5–S8
 survived: M23 SDK parse error keeps its message
 survived: M25 malformed error message kept
 ```
@@ -520,7 +564,7 @@ survived: M25 malformed error message kept
 `NO_STATIC=1` deselects the sink guard and the helpers-only rule:
 
 ```text
-144 mutants applied; 137 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M91 M93–M136 M138–M149 M151–M155 G1 S5–S8
+143 mutants applied; 136 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M91 M93–M112 M114–M136 M138–M149 M151–M155 G1 S5–S8
 survived: M19 tasks_get response uses str(e)
 survived: M20 tasks_get audit buffer uses str(e)
 survived: M22 installer crash message uses raw exc (static guard)
@@ -539,6 +583,13 @@ Rev 22's mutants die in both passes:
   cases also fail on it.
 - M154 dies on the falsifier's `undecodable-body` case.
 - M155 dies on its `content-type` case.
+
+The task mutants are re-anchored in the manager after the merge, and each
+still dies:
+- M94 on the downstream sweep;
+- M95 on the task-shape sweep;
+- M110 on the normaliser-iff-parser test;
+- M112 and M114 on the effective-mode sweep.
 
 Both passes ran on 6 worktrees each, with `PYTHONDONTWRITEBYTECODE=1`.
 
@@ -618,11 +669,11 @@ Both passes ran on 6 worktrees each, with `PYTHONDONTWRITEBYTECODE=1`.
 
 ## Embedding proof
 
-From **this file**: on a fresh worktree of `f85d368`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@c8a5d80`. The proof was run again on the final file, with this section in it, and printed the same listing.
+From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@30dc945`. The proof was run again on the final file, with this section in it, and printed the same listing.
 
 ```text
 $ git -C <proof worktree> rev-parse --short HEAD
-f85d368
+bc0a9ce
 x2.py: 28 lines
 extractor self-extract: identical
 $ git apply --unidiff-zero --check p/*.patch
@@ -631,8 +682,8 @@ from pmcp.argument_errors import exception_text
 warning: 1 line adds whitespace errors.
 applied
 changed paths == the 52 patched files
-$ git diff --name-only f85d368 origin/main (bc0a9ce), against the patched files
-origin/main bc0a9ce: 19 changed paths since f85d368, 7 of them patched here
+$ git diff --name-only bc0a9ce origin/main (14d18e4), against the patched files
+origin/main 14d18e4: 30 changed paths since bc0a9ce, 8 of them patched here
 cmp: 52 of 52 files identical
 ```
 
@@ -640,7 +691,7 @@ cmp: 52 of 52 files identical
 
 ### How to apply (and the extractor)
 
-From a fresh worktree of `origin/main` @ `f85d368`:
+From a fresh worktree of `origin/main` @ `bc0a9ce`:
 
 ```bash
 PLAN=.consiliency/plans/detailed-297-validation-echo-20260928-2127.md   # branch plan/297-validation-echo
@@ -651,7 +702,7 @@ done
 git apply --unidiff-zero --check <scratch>/*.patch && git apply --unidiff-zero <scratch>/*.patch
 ```
 
-The patches are `git diff -U0 f85d368 c8a5d80 -- <file>`. To fit the size
+The patches are `git diff -U0 bc0a9ce 30dc945 -- <file>`. To fit the size
 budget, each is cut to plain unified-diff form: there are no `diff --git`,
 `index` or `new file mode` lines, and no function context in the hunk
 headers. `git apply` reads them the same way; a new file is created with
@@ -2432,9 +2483,9 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- a/src/pmcp/client/manager.py
 +++ b/src/pmcp/client/manager.py
-@@ -14 +13,0 @@
+@@ -16 +15,0 @@
 -import traceback
-@@ -29,0 +29,7 @@
+@@ -31,0 +31,7 @@
 +from pmcp.argument_errors import (
 +    describe_value,
 +    exception_text,
@@ -2442,23 +2493,23 @@ print(f"{out}: {j - i - 1} lines")
 +    safe_traceback_text,
 +    install_log_scrubber,
 +)
-@@ -33,0 +40 @@
+@@ -35,0 +42 @@
 +from pmcp.parsing import load_json
-@@ -74,0 +82,3 @@
+@@ -77,0 +85,3 @@
 +# The SDK logs rejected frames with a traceback (Consiliency/pmcp#297); every
 +# record is scrubbed at creation (`install_log_scrubber`).
 +install_log_scrubber()
-@@ -139 +149,3 @@
+@@ -142 +152,3 @@
 -        f"{type(leaf).__name__}: {leaf}" if str(leaf) else type(leaf).__name__
 +        f"{type(leaf).__name__}: {exception_text(leaf)}"
 +        if str(leaf)
 +        else type(leaf).__name__
-@@ -264,3 +276 @@
+@@ -267,3 +279 @@
 -    traceback_text = "".join(
 -        traceback.format_exception(type(exc), exc, exc.__traceback__)
 -    )
 +    traceback_text = safe_traceback_text(exc)
-@@ -375,0 +386,10 @@
+@@ -378,0 +389,10 @@
 +#: JSON-RPC's parse-error code. The SDK's HTTP transports synthesise it for a
 +#: downstream frame their models reject, with `f"Failed to parse ...: {exc}"`
 +#: -- pydantic's text, rejected value included -- as the message
@@ -2469,7 +2520,7 @@ print(f"{out}: {j - i - 1} lines")
 +_MALFORMED_ERROR_MESSAGE = "downstream sent a malformed JSON-RPC error"
 +
 +
-@@ -377 +397,8 @@
+@@ -380 +400,8 @@
 -    """Build a `DownstreamError` from a JSON-RPC `error` member."""
 +    """Build a `DownstreamError` from a JSON-RPC `error` member.
 +
@@ -2479,7 +2530,7 @@ print(f"{out}: {j - i - 1} lines")
 +    (not an object, or a non-string `message`). Every other error keeps the
 +    downstream's own message string, returned by design.
 +    """
-@@ -379,5 +406,79 @@
+@@ -382,5 +409,61 @@
 -        return DownstreamError(str(error))
 -    return DownstreamError(
 -        str(error.get("message", "Unknown error")),
@@ -2546,7 +2597,7 @@ print(f"{out}: {j - i - 1} lines")
 +        task
 +        if isinstance(task, TaskMetadataInput)
 +        else TaskMetadataInput.model_validate(task)
-+    )
+@@ -387,0 +471,59 @@
 +    return parsed.enabled
 +
 +
@@ -2564,7 +2615,9 @@ print(f"{out}: {j - i - 1} lines")
 +    kept exactly. It decides only that poll (rev 15)."""
 +    return isinstance(result, dict) and (
 +        isinstance(result.get("task"), dict) or isinstance(result.get("taskId"), str)
-@@ -386,0 +488,41 @@
++    )
++
++
 +def task_answer_of(result: Any) -> tuple[dict[str, Any], McpTaskInfo] | None:
 +    """The task a downstream answer carries, and its parse -- or None. The
 +    one recogniser, and it is the parser (rev 15): the candidate is a task
@@ -2604,21 +2657,19 @@ print(f"{out}: {j - i - 1} lines")
 +        return server_name, int(local_id_str)
 +    except ValueError:
 +        return None
-+
-+
-@@ -899 +1041,5 @@
+@@ -902 +1044,5 @@
 -    return repr(entry)[:120]
 +        # No usable identifier: describe the entry's structure, never its
 +        # content -- the downstream's data that failed validation
 +        # (Consiliency/pmcp#297, rev 10; it was `repr(entry)[:120]`).
 +        return f"(an entry with {len(entry)} key{'' if len(entry) == 1 else 's'})"
 +    return f"(a {type(entry).__name__} entry)"
-@@ -1455 +1601,3 @@
+@@ -1495 +1641,3 @@
 -                error_msg = f"Failed to connect to {config.name}: {result}"
 +                error_msg = (
 +                    f"Failed to connect to {config.name}: {exception_text(result)}"
 +                )
-@@ -2065,9 +2213,2 @@
+@@ -2107,9 +2255,2 @@
 -    def _extract_task_payload(self, result: dict[str, Any]) -> dict[str, Any] | None:
 -        task = result.get("task")
 -        if isinstance(task, dict):
@@ -2630,30 +2681,30 @@ print(f"{out}: {j - i - 1} lines")
 -    def _task_info_from_payload(self, payload: dict[str, Any]) -> McpTaskInfo | None:
 +    @staticmethod
 +    def _task_info_from_payload(payload: dict[str, Any]) -> McpTaskInfo | None:
-@@ -2127 +2268,2 @@
+@@ -2169 +2310,2 @@
 -            # `raw` keeps the downstream's own units (Consiliency/pmcp#330).
 +            # `raw` keeps the downstream's own units (Consiliency/pmcp#330),
 +            # without the values pmcp dropped as unusable (Consiliency/pmcp#297).
-@@ -2130 +2272 @@
+@@ -2172 +2314 @@
 -            raw=payload,
 +            raw=_usable_task_raw(payload),
-@@ -2393 +2535,3 @@
+@@ -2570 +2712,3 @@
 -                logger.debug(f"Server {name} doesn't support {kind}: {result}")
 +                logger.debug(
 +                    f"Server {name} doesn't support {kind}: {exception_text(result)}"
 +                )
-@@ -2482,2 +2626,2 @@
+@@ -2659,2 +2803,2 @@
 -                    f"cursor ({raw_cursor!r}); treating as unreadable rather "
 -                    f"than as the end of the listing"
 +                    f"cursor ({describe_value(raw_cursor)}); treating as "
 +                    f"unreadable rather than as the end of the listing"
-@@ -2488,2 +2632,3 @@
+@@ -2665,2 +2809,3 @@
 -                    f"[{managed.config.name}] {kind}/list repeated cursor "
 -                    f"{raw_cursor!r}; treating as unreadable rather than looping"
 +                    f"[{managed.config.name}] {kind}/list repeated a cursor "
 +                    f"({describe_value(raw_cursor)}); treating as unreadable "
 +                    f"rather than looping"
-@@ -3383,6 +3528,10 @@
+@@ -3560,6 +3705,10 @@
 -            message = json.loads(text)
 -        except json.JSONDecodeError:
 -            # Non-JSON output already counted as a heartbeat by the caller.
@@ -2670,7 +2721,7 @@ print(f"{out}: {j - i - 1} lines")
 +            # on stderr, which is logged as before. The record is fixed text
 +            # plus the parser's value-free description.
 +            logger.debug(f"[{name}] non-protocol stdout line: {exception_text(error)}")
-@@ -3426,13 +3575,20 @@
+@@ -3603,13 +3752,20 @@
 -        Each guard below exists because a later access depends on it, and each
 -        drops the frame with a value-free debug log, as a non-JSON line is
 -        dropped:
@@ -2704,7 +2755,7 @@ print(f"{out}: {j - i - 1} lines")
 +        `set_exception` still raise `InvalidStateError` on a future that is
 +        already settled (a caller cancelled it, and the response raced its
 +        `finally` pop), which is checked below.
-@@ -3440,5 +3596,3 @@
+@@ -3617,5 +3773,3 @@
 -        if not isinstance(frame, dict):
 -            logger.debug(
 -                f"[{name}] dropped invalid frame: not a JSON object "
@@ -2713,7 +2764,7 @@ print(f"{out}: {j - i - 1} lines")
 +        problem = jsonrpc_envelope_problem(frame)
 +        if problem is not None:
 +            logger.debug(f"[{name}] dropped invalid frame: {problem}")
-@@ -3447,7 +3600,0 @@
+@@ -3624,7 +3777,0 @@
 -        if msg_id is not None and (
 -            isinstance(msg_id, bool) or not isinstance(msg_id, (str, int))
 -        ):
@@ -2721,11 +2772,11 @@ print(f"{out}: {j - i - 1} lines")
 -                f"[{name}] dropped invalid frame: id of type {type(msg_id).__name__}"
 -            )
 -            return
-@@ -3462 +3609,2 @@
+@@ -3639 +3786,2 @@
 -                # Notification: no id, nothing to resolve.
 +                # Notification: no id (or `id: null`, which main and the MCP
 +                # SDK read as a notification; rev 15), nothing to resolve.
-@@ -3467,9 +3614,0 @@
+@@ -3644,9 +3791,0 @@
 -        elif "method" in frame:
 -            # A `method` that is present but not a string is not a valid
 -            # JSON-RPC request -- and it is not a response either, so it must
@@ -2735,19 +2786,19 @@ print(f"{out}: {j - i - 1} lines")
 -                f"[{name}] dropped invalid frame: non-string method "
 -                f"({type(method).__name__})"
 -            )
-@@ -4507,4 +4646,2 @@
+@@ -4700,4 +4839,2 @@
 -        task_requested = task is not None
 -        if support == "required":
 -            task_requested = True
 -        if task_requested and support == "forbidden":
 +        asked = task is not None or support == "required"
 +        if asked and support == "forbidden":
-@@ -4512 +4649 @@
+@@ -4705 +4842 @@
 -        if task_requested and not self._server_supports_tasks(managed):
 +        if asked and not self._server_supports_tasks(managed):
-@@ -4521,0 +4659 @@
+@@ -4714,0 +4852 @@
 +        task_requested = effective_task_mode(tool_info, task)
-@@ -4528,5 +4666,2 @@
+@@ -4721,5 +4859,2 @@
 -            if not parsed_task.enabled and support != "required":
 -                task_requested = False
 -            else:
@@ -2755,50 +2806,72 @@ print(f"{out}: {j - i - 1} lines")
 -                requestor_context = parsed_task.requestor_context
 +            params["task"] = self._task_wire_metadata(parsed_task)
 +            requestor_context = parsed_task.requestor_context
-@@ -4543,10 +4678,9 @@
+@@ -4737,11 +4872,12 @@
 -            task_payload = self._extract_task_payload(result)
 -            if task_payload is not None:
 -                task_info = self._task_info_from_payload(task_payload)
 -                if task_info is not None:
--                    self._record_task(
+-                    built = self._record_task(
 -                        tool_info.server_name,
 -                        task_info,
 -                        tool_id=tool_id,
 -                        requestor_context=requestor_context,
+-                        connection=managed,
 -                    )
 +            found = task_answer_of(result)
 +            if found is not None:
-+                self._record_task(
++                built = self._record_task(
 +                    tool_info.server_name,
 +                    found[1],
 +                    tool_id=tool_id,
 +                    requestor_context=requestor_context,
++                    connection=managed,
 +                )
-+            return usable_task_response(result)
-@@ -4618,3 +4752,2 @@
++            # A task call returns, and is sized from, the answer reduced to
++            # what pmcp could use (Consiliency/pmcp#297 rev 14/17).
++            result = usable_task_response(result)
+@@ -4943,3 +5079,2 @@
 -        payload = self._extract_task_payload(result) or result
 -        task_info = self._task_info_from_payload(payload)
 -        if task_info is None:
 +        found = task_answer_of(result)
 +        if found is None:
-@@ -4622 +4755 @@
--        return self._record_task(server_name, task_info)
-+        return self._record_task(server_name, found[1])
-@@ -4643,6 +4776,4 @@
+@@ -4949 +5084 @@
+-            task_info,
++            found[1],
+@@ -4989,11 +5124,13 @@
 -        task_payload = self._extract_task_payload(result)
 -        if task_payload is not None:
 -            task_info = self._task_info_from_payload(task_payload)
 -            if task_info is not None:
--                self._record_task(server_name, task_info)
--        else:
+-                built = self._record_task(
+-                    server_name,
+-                    task_info,
+-                    requestor_context=None,  # a reply supplies no context
+-                    connection=managed,
+-                )
+-        elif self._owns(server_name, managed):
++        # The parser is the only task recogniser (Consiliency/pmcp#297 rev
++        # 15): a reply carries a task only if it parses. The `tasks/get`
++        # fallback keeps main's condition exactly -- the reply names no task
++        # at all -- and Consiliency/pmcp#338's connection rule.
 +        found = task_answer_of(result)
 +        if found is not None:
-+            self._record_task(server_name, found[1])
-+        elif not _names_a_task(result):
-@@ -4655 +4786 @@
--        return result
-+        return usable_task_response(result)
-@@ -4679,3 +4810,8 @@
++            built = self._record_task(
++                server_name,
++                found[1],
++                requestor_context=None,  # a reply supplies no context
++                connection=managed,
++            )
++        elif not _names_a_task(result) and self._owns(server_name, managed):
+@@ -5011 +5148,2 @@
+-        # task's record.
++        # task's record. The reply is returned reduced to what pmcp could use
++        # (Consiliency/pmcp#297).
+@@ -5014 +5152 @@
+-        return TaskReply(result, built)
++        return TaskReply(usable_task_response(result), built)
+@@ -5059,3 +5197,8 @@
 -        payload = self._extract_task_payload(result) or result
 -        task_info = self._task_info_from_payload(payload)
 -        if task_info is None:
@@ -2810,13 +2883,13 @@ print(f"{out}: {j - i - 1} lines")
 +            # read: `raw` stays empty rather than holding the whole answer
 +            # (rev 15, round-14 claude F001: an unparseable task's `ttl` went
 +            # back out through `gateway.tasks_cancel`).
-@@ -4686 +4821,0 @@
+@@ -5066 +5208,0 @@
 -                raw=result,
-@@ -4982 +5117,2 @@
+@@ -5367 +5509,2 @@
 -                f"Invalid request_id format: {request_id}",
 +                "Invalid request_id format: expected server_name::local_id "
 +                f"({describe_value(request_id)})",
-@@ -4986,6 +5122,9 @@
+@@ -5371,6 +5514,9 @@
 -
 -        server_name, local_id_str = request_id.rsplit("::", 1)
 -        try:
@@ -4518,141 +4591,113 @@ print(f"{out}: {j - i - 1} lines")
 +++ b/src/pmcp/tools/handlers.py
 @@ -22,0 +23 @@
 +from pmcp.argument_errors import describe_value, exception_text, safe_exc_info
-@@ -38,0 +40,4 @@
+@@ -38,0 +40 @@
 +    parse_request_id,
-+    effective_task_mode,
-+    task_answer_of,
-+    usable_task_response,
-@@ -72,0 +78 @@
+@@ -72,0 +75 @@
 +    discovered_env_var_refusal_reason,
-@@ -207,0 +214 @@
+@@ -207,0 +211 @@
 +from pmcp.parsing import load_json, load_json_file
-@@ -1023 +1030 @@
+@@ -1023 +1027 @@
 -                data = json.load(f)
 +                data = load_json_file(f, source="provisioned registry")
-@@ -1026 +1033 @@
+@@ -1026 +1030 @@
 -            logger.warning(f"Could not load provisioned registry: {e}")
 +            logger.warning(f"Could not load provisioned registry: {exception_text(e)}")
-@@ -1037 +1044 @@
+@@ -1037 +1041 @@
 -            logger.warning(f"Could not save provisioned registry: {e}")
 +            logger.warning(f"Could not save provisioned registry: {exception_text(e)}")
-@@ -1632,0 +1640 @@
-+        task_requested = effective_task_mode(tool_info, parsed.task)
-@@ -1664,9 +1671,0 @@
--            # The task this reply carries, recognised by the manager's own
--            # extractor and parser -- wrapped `{task}` or at the top level --
--            # and only when this call ran as a task, as the manager decides
--            # (Consiliency/pmcp#330, board round 3 F001). The record is the
--            # one the manager made from it, in seconds.
--            task_support = (tool_info.execution or {}).get("taskSupport")
--            task_requested = task_support == "required" or (
--                parsed.task is not None and parsed.task.enabled
--            )
-@@ -1674,11 +1673,11 @@
--            if task_requested and isinstance(result, dict):
--                task_payload = ClientManager._extract_task_payload(
--                    self._client_manager, result
--                )
--                found = (
--                    ClientManager._task_info_from_payload(
--                        self._client_manager, task_payload
--                    )
--                    if task_payload is not None
--                    else None
--                )
-+            # Rev 17 (round-15 codex F001, claude F003; and Consiliency/pmcp#330
-+            # round 3 F001, the same gate): task handling follows the call's
-+            # effective task mode, derived once before the call. A call that is
-+            # not a task returns its answer as opaque data, sized as returned:
-+            # no recognition, no registry lookup, no replacement. A task call
-+            # returns, and is sized from, the answer reduced to what pmcp
-+            # could use (`usable_task_response`, idempotent). The record is the
-+            # one the manager made from it, in seconds.
-+            if task_requested:
-+                result = usable_task_response(result)
-+                found = task_answer_of(result)
-@@ -1687 +1686 @@
--                        tool_info.server_name, found.task_id
-+                        tool_info.server_name, found[1].task_id
-@@ -1771 +1770,4 @@
+@@ -1670,5 +1674,7 @@
+-            # task (Consiliency/pmcp#338, rev 6) -- the manager applies
+-            # Consiliency/pmcp#330's rule (wrapped `{task}` or top level; a
+-            # task was requested) and records it in seconds. Never a lookup
+-            # by key after the await: a reconnect may have put another
+-            # connection's same-id task there.
++            # task (Consiliency/pmcp#338, rev 6). Never a lookup by key after
++            # the await: a reconnect may have put another connection's same-id
++            # task there. The manager decides the call's effective task mode
++            # (`effective_task_mode`, Consiliency/pmcp#297 rev 17): a call
++            # that is not a task gets its answer back as opaque data; a task
++            # call gets it reduced to what pmcp could use
++            # (`usable_task_response`), and it is sized in that form.
+@@ -1762 +1768,4 @@
 -            auth_challenge = self._auth_challenge_from_message(str(e))
 +            # `exception_text`: a ConnectionError built from a rejected value
 +            # is read as its description, never parsed for a challenge
 +            # (rev 21, round-19 codex F001).
 +            auth_challenge = self._auth_challenge_from_message(exception_text(e))
-@@ -1854 +1856 @@
+@@ -1845 +1854 @@
 -            auth_challenge = self._auth_challenge_from_message(str(e))
 +            auth_challenge = self._auth_challenge_from_message(exception_text(e))
-@@ -1932 +1934,3 @@
+@@ -1923 +1932,3 @@
 -                logger.warning(f"Failed to load manifest startup configs: {e}")
 +                logger.warning(
 +                    f"Failed to load manifest startup configs: {exception_text(e)}"
 +                )
-@@ -1938 +1942,3 @@
+@@ -1929 +1940,3 @@
 -                logger.warning(f"Failed to restore provisioned servers: {e}")
 +                logger.warning(
 +                    f"Failed to restore provisioned servers: {exception_text(e)}"
 +                )
-@@ -2184 +2190 @@
+@@ -2188 +2201 @@
 -                error=str(e),
 +                error=exception_text(e),
-@@ -2192 +2198 @@
+@@ -2196 +2209 @@
 -                errors=[str(e)],
 +                errors=[exception_text(e)],
-@@ -4301 +4307,3 @@
+@@ -4305 +4318,3 @@
 -                logger.error(f"Failed to connect remote server {server_name}: {e}")
 +                logger.error(
 +                    f"Failed to connect remote server {server_name}: {exception_text(e)}"
 +                )
-@@ -4383 +4391,3 @@
+@@ -4387 +4402,3 @@
 -            logger.error(f"Failed to start provisioning {server_name}: {e}")
 +            logger.error(
 +                f"Failed to start provisioning {server_name}: {exception_text(e)}"
 +            )
-@@ -4471 +4481 @@
+@@ -4475 +4492 @@
 -                        error=str(e),
 +                        error=exception_text(e),
-@@ -4476 +4486 @@
+@@ -4480 +4497 @@
 -                        message=str(e),
 +                        message=exception_text(e),
-@@ -4612 +4622,4 @@
+@@ -4616 +4633,4 @@
 -                error=f"Env var '{env_var}' is not permitted for this server.",
 +                error=(
 +                    f"Env var ({describe_value(env_var)}) is not permitted for "
 +                    "this server."
 +                ),
-@@ -4621,2 +4634,2 @@
+@@ -4625,2 +4645,2 @@
 -                    f"Env var '{env_var}' is not permitted for server "
 -                    f"'{server_name}'.{expected} Refusing to store it."
 +                    f"Env var ({describe_value(env_var)}) is not permitted for "
 +                    f"server '{server_name}'.{expected} Refusing to store it."
-@@ -4625 +4638,2 @@
+@@ -4629 +4649,2 @@
 -                env_var=env_var,
 +                # Not echoed: the caller's rejected value (rev 12).
 +                env_var=None,
-@@ -4639 +4653 @@
+@@ -4643 +4664 @@
 -                error=str(exc),
 +                error=exception_text(exc),
-@@ -4644 +4658 @@
+@@ -4648 +4669 @@
 -                message=str(exc),
 +                message=exception_text(exc),
-@@ -4646 +4660,2 @@
+@@ -4650 +4671,2 @@
 -                env_var=env_var,
 +                # Not echoed: the caller's rejected value (rev 12).
 +                env_var=None,
-@@ -4848 +4863 @@
+@@ -4852 +4874 @@
 -            logger.warning("Feedback submission raised: %s", exc)
 +            logger.warning("Feedback submission raised: %s", exception_text(exc))
-@@ -5122 +5137 @@
+@@ -5126 +5148 @@
 -                message=f"Failed to run update probe: {e}",
 +                message=f"Failed to run update probe: {exception_text(e)}",
-@@ -5352 +5367 @@
+@@ -5356 +5378 @@
 -                                f"'{server_name}': {e}"
 +                                f"'{server_name}': {exception_text(e)}"
-@@ -5476 +5491 @@
+@@ -5480 +5502 @@
 -                    f"unsafe package identifier {package!r}."
 +                    f"unsafe package identifier ({describe_value(package)})."
-@@ -5491 +5506,8 @@
+@@ -5495 +5517,8 @@
 -            names = ", ".join(operator_safe(name) for name in disallowed)
 +            reasons: dict[str, int] = {}
 +            for name in disallowed:
@@ -4662,59 +4707,59 @@ print(f"{out}: {j - i - 1} lines")
 +            names = "; ".join(
 +                f"{count} {reason}" for reason, count in sorted(reasons.items())
 +            )
-@@ -5521 +5543,5 @@
+@@ -5525 +5554,5 @@
 -            logger.warning("Package identity lookup raised for %r: %s", package, exc)
 +            logger.warning(
 +                "Package identity lookup raised for %r: %s",
 +                package,
 +                exception_text(exc),
 +            )
-@@ -5637,0 +5664,5 @@
+@@ -5641,0 +5675,5 @@
 +        # Outside the `try`: its arm logs a traceback and renders `str(e)`,
 +        # and a `ValidationError`'s text carries the rejected value. Raised,
 +        # it is described without it (Consiliency/pmcp#297).
 +        parsed = ProvisionStatusInput.model_validate(input_data)
 +        job_id = parsed.job_id
-@@ -5639,3 +5669,0 @@
+@@ -5643,3 +5680,0 @@
 -            parsed = ProvisionStatusInput.model_validate(input_data)
 -            job_id = parsed.job_id
 -
-@@ -5709 +5737,4 @@
+@@ -5713 +5748,4 @@
 -            logger.error(f"provision_status handler failed: {e}", exc_info=True)
 +            logger.error(
 +                f"provision_status handler failed: {exception_text(e)}",
 +                exc_info=safe_exc_info(e),
 +            )
-@@ -5712 +5743 @@
+@@ -5716 +5754 @@
 -                job_id=input_data.get("job_id", "unknown"),
 +                job_id=job_id,
-@@ -5803 +5834,4 @@
+@@ -5807 +5845,4 @@
 -            logger.error(f"Handoff failed for {job_server_name}: {e}", exc_info=True)
 +            logger.error(
 +                f"Handoff failed for {job_server_name}: {exception_text(e)}",
 +                exc_info=safe_exc_info(e),
 +            )
-@@ -5805 +5839 @@
+@@ -5809 +5850 @@
 -            job.error = f"Handoff failed: {e}"
 +            job.error = f"Handoff failed: {exception_text(e)}"
-@@ -5849 +5883 @@
+@@ -5853 +5894 @@
 -            logger.error(f"Failed to refresh after install: {e}")
 +            logger.error(f"Failed to refresh after install: {exception_text(e)}")
-@@ -6078 +6112 @@
+@@ -6079 +6120 @@
 -                error=str(e),
 +                error=exception_text(e),
-@@ -6122 +6156 @@
+@@ -6123 +6164 @@
 -                error=str(e),
 +                error=exception_text(e),
-@@ -6158 +6192,3 @@
+@@ -6160 +6201,3 @@
 -                        decoded = json.loads(result_payload)
 +                        decoded = load_json(
 +                            result_payload, source="tool result payload"
 +                        )
-@@ -6196 +6232 @@
+@@ -6198 +6241 @@
 -                error=str(e),
 +                error=exception_text(e),
-@@ -6300,3 +6336,7 @@
+@@ -6302,3 +6345,7 @@
 -        server_name = (
 -            parsed.request_id.rsplit("::", 1)[0] if "::" in parsed.request_id else None
 -        )
@@ -4725,7 +4770,7 @@ print(f"{out}: {j - i - 1} lines")
 +        # misses names it, as every lookup miss does (Consiliency/pmcp#315).
 +        parsed_id = parse_request_id(parsed.request_id)
 +        server_name = parsed_id[0] if parsed_id is not None else None
-@@ -6313 +6353 @@
+@@ -6315 +6362 @@
 -            request_id=parsed.request_id,
 +            request_id=parsed.request_id if parsed_id is not None else None,
 ````
@@ -4954,20 +4999,20 @@ print(f"{out}: {j - i - 1} lines")
 +            # Through the parse helper (Consiliency/pmcp#297): its failure
 +            # is value-free; the value itself is dropped, as main drops it.
 +            return parse_timestamp(candidate, source="task timestamp").timestamp()
-@@ -1116 +1126 @@
+@@ -1121 +1131 @@
 -            raise ValueError("correlation IDs may contain only alphanumerics and ._:-")
 +            raise argument_error(CORRELATION_ID_CHARSET)
-@@ -1129,3 +1139 @@
+@@ -1134,3 +1144 @@
 -            raise ValueError(
 -                "scoped advisor correlation fields must be supplied together"
 -            )
 +            raise argument_error(SCOPED_CORRELATION_INCOMPLETE)
-@@ -1322 +1330,3 @@
+@@ -1327 +1335,3 @@
 -    request_id: str
 +    #: The id cancelled, or null when it was rejected for its format
 +    #: (Consiliency/pmcp#297): a rejected value is not copied back.
 +    request_id: str | None
-@@ -1392,4 +1402,3 @@
+@@ -1397,4 +1407,3 @@
 -                raise ValueError(
 -                    f"package pattern {entry!r} names a version; package "
 -                    "patterns match the package name only"
@@ -4975,7 +5020,7 @@ print(f"{out}: {j - i - 1} lines")
 +                # Fixed text: the entry is the operator's own value, and the
 +                # error's path names it (Consiliency/pmcp#297 rev 20).
 +                raise argument_error(PACKAGE_PATTERN_VERSIONED)
-@@ -1624,5 +1633 @@
+@@ -1629,5 +1638 @@
 -            raise ValueError(
 -                "package must be a valid npm/pypi identifier "
 -                "(no leading dash, whitespace, path separators, or shell "
@@ -5010,7 +5055,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/tests/test_argument_error_echo.py
-@@ -0,0 +1,2632 @@
+@@ -0,0 +1,2654 @@
 +"""A rejected gateway-tool argument never echoes its value (Consiliency/pmcp#297).
 +
 +The oracle is a generated sweep, not hand-picked cases. Its axes come from the
@@ -6766,7 +6811,10 @@ print(f"{out}: {j - i - 1} lines")
 +                    if method == "tasks/cancel":
 +                        # Cancel asks downstream only for a live, known task.
 +                        server._client_manager._record_task(
-+                            _DOWNSTREAM, McpTaskInfo(task_id="t", status="working")
++                            _DOWNSTREAM,
++                            McpTaskInfo(task_id="t", status="working"),
++                            requestor_context=None,
++                            connection=server._client_manager._clients.get(_DOWNSTREAM),
 +                        )
 +                    mark = tap.start()
 +                    result = await _call(server, name, arguments)
@@ -7342,7 +7390,10 @@ print(f"{out}: {j - i - 1} lines")
 +                    server._client_manager._tasks.clear()
 +                    if method == "tasks/cancel":
 +                        server._client_manager._record_task(
-+                            _DOWNSTREAM, McpTaskInfo(task_id="t", status="working")
++                            _DOWNSTREAM,
++                            McpTaskInfo(task_id="t", status="working"),
++                            requestor_context=None,
++                            connection=server._client_manager._clients.get(_DOWNSTREAM),
 +                        )
 +                    mark = tap.start()
 +                    result = await _call(server, name, arguments)
@@ -7472,7 +7523,12 @@ print(f"{out}: {j - i - 1} lines")
 +        if nested or info is not None:  # otherwise main's rule polls tasks/get
 +            assert await manager.get_task_result(_DOWNSTREAM, "t") == expected, name
 +        manager._tasks.clear()
-+        manager._record_task(_DOWNSTREAM, McpTaskInfo(task_id="t", status="working"))
++        manager._record_task(
++            _DOWNSTREAM,
++            McpTaskInfo(task_id="t", status="working"),
++            requestor_context=None,
++            connection=manager._clients.get(_DOWNSTREAM),
++        )
 +        _, record, _ = await manager.cancel_task(_DOWNSTREAM, "t")
 +        assert record is not None
 +        assert record.raw == (info.raw if info is not None else {}), name
@@ -7496,7 +7552,12 @@ print(f"{out}: {j - i - 1} lines")
 +    else:
 +        args = {"server_name": _DOWNSTREAM, "task_id": "t"}
 +        task = McpTaskInfo(task_id="t", status="working")
-+        server._client_manager._record_task(_DOWNSTREAM, task)
++        server._client_manager._record_task(
++            _DOWNSTREAM,
++            task,
++            requestor_context=None,
++            connection=server._client_manager._clients.get(_DOWNSTREAM),
++        )
 +    result = await _call(server, tool, args)
 +    if tool == "gateway.tasks_cancel":
 +        record = server._client_manager.get_task_record(_DOWNSTREAM, "t")
@@ -7563,7 +7624,13 @@ print(f"{out}: {j - i - 1} lines")
 +    manager._send_request = send  # type: ignore[method-assign]
 +    if recorded:
 +        task = McpTaskInfo(task_id="t", status="working")
-+        manager._record_task(_DOWNSTREAM, task, tool_id="o")
++        manager._record_task(
++            _DOWNSTREAM,
++            task,
++            tool_id="o",
++            requestor_context=None,
++            connection=manager._clients.get(_DOWNSTREAM),
++        )
 +    args: dict[str, Any] = {"tool_id": f"{_DOWNSTREAM}::run", **_correlations()}
 +    if requested:
 +        args["task"] = {"enabled": True}
@@ -7668,7 +7735,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/tests/test_downstream_frame_echo.py
-@@ -0,0 +1,1799 @@
+@@ -0,0 +1,1802 @@
 +"""A downstream's malformed JSON-RPC reply never echoes into pmcp's output
 +(Consiliency/pmcp#297, rev 3).
 +
@@ -8086,7 +8153,10 @@ print(f"{out}: {j - i - 1} lines")
 +            from pmcp.types import McpTaskInfo
 +
 +            server._client_manager._record_task(
-+                "frames", McpTaskInfo(task_id="t", status="working")
++                "frames",
++                McpTaskInfo(task_id="t", status="working"),
++                requestor_context=None,
++                connection=server._client_manager._clients.get("frames"),
 +            )
 +        name = {
 +            "tasks/list": "gateway.tasks_list",
@@ -14487,28 +14557,28 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- a/tests/test_task_units.py
 +++ b/tests/test_task_units.py
-@@ -370,2 +370,4 @@
+@@ -390,2 +390,4 @@
 -    downstream reply into a task (calls `_task_info_from_payload`) has a row in
 -    `REPLY_PATHS`, and so does each one with a no-task fallback branch."""
 +    downstream reply into a task (calls `_task_info_from_payload`, or
 +    `task_answer_of`, the recogniser that is that parser -- Consiliency/pmcp#297)
 +    has a row in `REPLY_PATHS`, and so does each one with a no-task fallback
 +    branch."""
-@@ -372,0 +375 @@
+@@ -392,0 +395 @@
 +    readers = {"_task_info_from_payload", "task_answer_of"}
-@@ -377,2 +380,3 @@
+@@ -397,2 +400,3 @@
 -        and name != "_task_info_from_payload"
 -        and any(_called(n) == "_task_info_from_payload" for n in ast.walk(func))
 +        # the recogniser's own module helpers are not operations
 +        and name not in readers | {"usable_task_response"}
 +        and any(_called(n) in readers for n in ast.walk(func))
-@@ -959,2 +963,3 @@
+@@ -998,2 +1002,3 @@
 -        "raw=payload; ttl=task_duration_from_wire('ttl', payload.get('ttl'))",
 -        "THE inbound converter",
 +        "raw=_usable_task_raw(payload); "
 +        "ttl=task_duration_from_wire('ttl', payload.get('ttl'))",
 +        "THE inbound converter; `raw` without the values dropped (#297)",
-@@ -967,2 +972,3 @@
+@@ -1008,2 +1013,3 @@
 -        "raw=result",
 -        "no duration: task_id, status, updated_at; `raw` is verbatim by design",
 +        "",
@@ -14521,7 +14591,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- a/tests/test_tools.py
 +++ b/tests/test_tools.py
-@@ -3942 +3942,3 @@
+@@ -3943 +3943,3 @@
 -        assert result.env_var == "BAD-NAME"
 +        # rev 12 (Consiliency/pmcp#297): a rejected name is not echoed back.
 +        assert result.env_var is None
@@ -14551,7 +14621,21 @@ To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutant
 ````diff
 --- a/mutants.py
 +++ b/mutants.py
-@@ -157,0 +158,3 @@
+@@ -100,2 +100,2 @@
+- ("M94 call_tool returns the task answer as sent", C, [("            return usable_task_response(result)\n\n        return result\n", "            return result\n\n        return result\n")]),
+- ("M95 tasks/result returns the task answer as sent", C, [("        return usable_task_response(result)\n\n    async def cancel_task(", "        return result\n\n    async def cancel_task(")]),
++ ("M94 call_tool returns the task answer as sent", C, [("            result = usable_task_response(result)\n\n        return TaskReply(result, built)\n", "            pass\n\n        return TaskReply(result, built)\n")]),
++ ("M95 tasks/result returns the task answer as sent", C, [("        return TaskReply(usable_task_response(result), built)\n", "        return TaskReply(result, built)\n")]),
+@@ -116 +116 @@
+- ("M110 tasks/result polls whenever the parser finds no task", C, [("        elif not _names_a_task(result):\n", "        else:\n")]),
++ ("M110 tasks/result polls whenever the parser finds no task", C, [("        elif not _names_a_task(result) and self._owns(server_name, managed):\n", "        elif self._owns(server_name, managed):\n")]),
+@@ -118,3 +118,2 @@
+- ("M112 invoke looks every answer up as a task (ungated lookup)", H, [("            if task_requested:\n                result = usable_task_response(result)\n                found = task_answer_of(result)\n                if found is not None:\n                    task_info = self._client_manager.get_task_record(\n                        tool_info.server_name, found[1].task_id\n                    )\n", "            if task_requested:\n                result = usable_task_response(result)\n            found = task_answer_of(result)\n            if found is not None:\n                task_info = self._client_manager.get_task_record(\n                    tool_info.server_name, found[1].task_id\n                )\n")]),
+- ("M113 a task answer sized from the uncleaned answer", (C, H), [(C, "            return usable_task_response(result)\n\n        return result\n", "            return result\n\n        return result\n"), (H, "                result = usable_task_response(result)\n", "                pass\n")]),
+- ("M114 the invoke gate reads only the task argument", H, [("        task_requested = effective_task_mode(tool_info, parsed.task)\n", "        task_requested = parsed.task is not None\n")]),
++ ("M112 every answer read as a task (ungated recognition)", C, [("        if task_requested and isinstance(result, dict):\n            found = task_answer_of(result)\n", "        if isinstance(result, dict):\n            found = task_answer_of(result)\n")]),
++ ("M114 the task-mode gate reads only the task argument", C, [("        task_requested = effective_task_mode(tool_info, task)\n", "        task_requested = task is not None\n")]),
+@@ -157,0 +157,3 @@
 + ("M153 aiohttp's ContentTypeError not registered", A, [("    \"aiohttp\": (\"ContentTypeError\",),\n", "    \"aiohttp\": (),\n")]),
 + ("M154 UnicodeDecodeError not registered", A, [("    types: list[type[BaseException]] = [UnicodeDecodeError]\n", "    types: list[type[BaseException]] = []\n")]),
 + ("M155 a response-decoding error described by its own text", A, [("        return f\"could not decode an HTTP response ({type(error).__name__})\"\n", "        return f\"could not decode an HTTP response: {error}\"\n")]),
