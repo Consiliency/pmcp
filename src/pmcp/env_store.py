@@ -482,8 +482,6 @@ def _root_entry(root: Path | None) -> _RootEntry | None:
     """Root ``root``'s entry (default: :data:`_DEFAULT_ROOT`), rebuilt if it changed."""
     if root is None:
         root = _DEFAULT_ROOT
-    else:
-        root = resolve_project_root(root)
     if root is None:
         return None
     key = _root_key(root)

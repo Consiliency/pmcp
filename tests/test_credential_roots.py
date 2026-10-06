@@ -434,8 +434,9 @@ def test_every_consumer_answers_for_the_project_it_serves(
     for name in ("a", "b"):
         (roots[name] / ".env.pmcp").write_text(
             f"BRAVE_API_KEY=from-{name}\n"
-            f"TAVILY_API_KEY=from-{name}\n"
             f"ONLY_{name.upper()}_TOKEN=x\n"
+            # Only B has it, so `pmcp init` finding it means it read B.
+            + ("TAVILY_API_KEY=from-b\n" if name == "b" else "")
         )
         mcp = roots[name] / ".mcp.json"
         mcp.write_text(

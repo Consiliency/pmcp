@@ -79,7 +79,9 @@ def planted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # Every load a running gateway does: startup (the discovered .env inside
     # the project, the user store, the cwd store) and the credential check.
     cli.load_startup_env(dotenv_path=str(project / ".env"))
-    GatewayTools._check_api_key_available(object(), "UNSET_372")  # type: ignore[arg-type]
+    GatewayTools._check_api_key_available(
+        GatewayTools.__new__(GatewayTools), "UNSET_372"
+    )
     return project
 
 

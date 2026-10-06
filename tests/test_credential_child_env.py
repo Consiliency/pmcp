@@ -55,7 +55,10 @@ class TestRealSymbolsRealArity:
 
     def test_merge_manifest_defaults_arity(self) -> None:
         sig = inspect.signature(_merge_manifest_defaults)
-        assert list(sig.parameters) == ["name", "config", "manifest_servers"]
+        assert list(sig.parameters) == ["name", "config", "manifest_servers", "root"]
+        # The project the config is loaded for (Consiliency/pmcp#372 round 9);
+        # load_configs passes it, None is the served root.
+        assert sig.parameters["root"].default is None
 
 
 def _relaxed_server(**overrides: object) -> ServerConfig:
