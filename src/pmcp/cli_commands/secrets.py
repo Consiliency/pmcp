@@ -344,7 +344,9 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
     # pmcp uses (env_store.credential_lookup) -- the environment first, an
     # exported empty value "unavailable" -- not the stores alone
     # (Consiliency/pmcp#372 round 5; tests/test_credential_parity.py).
-    lookup = credential_lookup(project_root)
+    # The root the runtime answers for: the --project given, else the startup
+    # load's directory -- not a re-derived project root.
+    lookup = credential_lookup(getattr(args, "project", None))
 
     def _available(key: str) -> bool:
         return bool(lookup(key))

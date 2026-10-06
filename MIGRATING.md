@@ -475,8 +475,11 @@ that pmcp's startup walk found before `.env.pmcp`; a tenant lookup checks the
 tenant store before the project files, and with `include_process_env` off
 reads the tenant store alone. Every reader -- the gateway, the provision
 check, a server's credential, `pmcp secrets check`, `pmcp doctor` -- reads
-the same values, loaded once at startup, so the diagnostics answer what the
-gateway will do. In 2.7.3 a checkout's `.env` won over the user
+the same values through the same lookup, so the diagnostics answer what the
+gateway will do. Project files are read per project: a lookup for one
+project never uses another project's `.env` or `.env.pmcp`, and a changed
+project file is read again on the next lookup (your user store, which is in
+the environment, is read at startup). In 2.7.3 a checkout's `.env` won over the user
 store, and `pmcp secrets check` preferred a project `.env.pmcp`. (Remote
 `${VAR}` headers in the gateway, `pmcp status` and `pmcp doctor` already
 preferred your user store, which those load first.) So a per-project override

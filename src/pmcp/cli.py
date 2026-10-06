@@ -46,6 +46,7 @@ from pmcp.env_store import (
     load_store,
     mark_startup_loaded,
     pin_user_store_path,
+    set_default_root,
     record_pmcp_introduced_keys,
 )
 from pmcp.validation import is_valid_package_version, parse_package_spec
@@ -3136,6 +3137,9 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     """
     pin_user_store_path()
     mark_startup_loaded()
+    # An unqualified credential lookup answers for the directory this load
+    # reads (env_store: one entry per project root).
+    set_default_root(Path.cwd())
     before = set(os.environ)
     found = dotenv_path if dotenv_path is not None else find_dotenv()
     if found:

@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import sys
+from dataclasses import dataclass
 from collections.abc import Callable, Collection, Iterable, Mapping
 from pathlib import Path
 from typing import Literal
@@ -322,28 +323,129 @@ def read_store(
 # (Consiliency/pmcp#372 round 2).
 # --------------------------------------------------------------------------- #
 
-#: Credentials loaded from repository-controlled files -- a checkout's
-#: ``.env.pmcp`` and ``.env``, the ``.env`` the startup walk finds inside a
-#: project -- kept OUT of ``os.environ``. Filtering what such a file may put into
-#: the process environment was a denylist, and a denylist fails open: a proxy
-#: variable in another case, ``SSLKEYLOGFILE``, ``LD_PRELOAD`` for a child.
-#: Instead nothing it says reaches ``os.environ``, so pmcp's own code, the
-#: libraries it runs (httpx, ssl, the MCP SDK) and every child it spawns never
-#: see a repository-chosen variable at all. Only explicit credential lookups
-#: consult this map, through :func:`credential_value`. First loaded wins, as
-#: ``load_dotenv(override=False)`` did. Test-only reset:
+
+#: Credentials loaded from repository-controlled files, kept OUT of
+#: ``os.environ``. Filtering what such a file may put into the process
+#: environment was a denylist, and a denylist fails open: a proxy variable in
+#: another case, ``SSLKEYLOGFILE``, ``LD_PRELOAD`` for a child. Instead nothing
+#: it says reaches ``os.environ``; only explicit credential lookups consult
+#: these values, through :func:`credential_value`.
+#:
+#: Keyed by PROJECT ROOT (the root directory's ``(st_dev, st_ino)``): a lookup
+#: for root R answers only from R's own project files -- ``R/.env`` then
+#: ``R/.env.pmcp``, first wins -- so one project's credential never fills
+#: another project's header (Consiliency/pmcp#372 round 8). Each entry is built
+#: by ONE builder (:func:`_build_root_entry`) and records each source file's
+#: identity; a lookup rebuilds the entry, with the same builder, when a file
+#: changed, so a rotated token is picked up without a restart. Test-only reset:
 #: :func:`reset_repo_credentials`.
-_REPO_CREDENTIALS: dict[str, str] = {}
+@dataclass
+class _RootEntry:
+    root: Path
+    values: dict[str, str]
+    #: ``(path, identity)`` per source file; identity ``None`` when absent.
+    sources: tuple[tuple[Path, object], ...]
+
+
+_REPO_CREDENTIALS: dict[object, _RootEntry] = {}
+
+#: The root a lookup without an explicit project answers for: the working
+#: directory the startup load read (``cli.load_startup_env`` sets it), else the
+#: first root an entry was built for.
+_DEFAULT_ROOT: Path | None = None
+
+#: The project files of a root, in precedence order.
+_ROOT_FILES = (".env", ".env.pmcp")
+
+#: An identity that never equals a real one: the file changed while it was read.
+_CHANGED = object()
 
 
 def reset_repo_credentials() -> None:
-    """Forget every repository-file credential. **Test-only seam.**"""
+    """Forget every repository-file credential and the default root. **Test-only seam.**"""
+    global _DEFAULT_ROOT
     _REPO_CREDENTIALS.clear()
+    _DEFAULT_ROOT = None
 
 
-def repo_credential_names() -> frozenset[str]:
-    """The names (never the values) of the credentials repository files supplied."""
-    return frozenset(_REPO_CREDENTIALS)
+def set_default_root(root: Path) -> None:
+    """The root an unqualified lookup answers for (the startup load's directory)."""
+    global _DEFAULT_ROOT
+    _DEFAULT_ROOT = root
+
+
+def repo_credential_names(root: Path | None = None) -> frozenset[str]:
+    """The names (never the values) of the credentials root ``root``'s files supply."""
+    entry = _root_entry(root)
+    return frozenset(entry.values) if entry is not None else frozenset()
+
+
+def _root_key(root: Path) -> object:
+    identity = _identity(root)
+    return identity if identity is not None else ("path", os.fspath(root))
+
+
+def _file_identity(path: Path) -> object:
+    """``(st_dev, st_ino, st_mtime_ns, st_size)``, or ``None`` when absent/unreadable."""
+    try:
+        if is_absent(path):
+            return None
+        status = os.lstat(path)
+    except OSError:
+        return None
+    return (status.st_dev, status.st_ino, status.st_mtime_ns, status.st_size)
+
+
+def _build_root_entry(root: Path) -> _RootEntry:
+    """THE builder of a root's repository credentials.
+
+    ``root/.env`` then ``root/.env.pmcp``, each read confined to ``root``
+    (:func:`_read_confined_text`; a refused file contributes nothing, with one
+    warning), expanded within its own file (:func:`_repository_values`), first
+    loaded wins. The identity is taken before and after each read; a file that
+    changed in between is recorded as changed, so the next lookup rebuilds.
+    """
+    values: dict[str, str] = {}
+    sources: list[tuple[Path, object]] = []
+    root_identity = _identity(root)
+    # In the home directory, or above it, a `.env` is the operator's own
+    # (load_discovered_dotenv loads it into the environment), not a project file.
+    operators = root_identity is not None and root_identity in _home_and_its_ancestors()
+    for name in _ROOT_FILES:
+        if operators and name == ".env":
+            continue
+        store_path = root / name
+        before = _file_identity(store_path)
+        text = _read_confined_text(
+            store_path, (root, "project"), strict=False, verb="load"
+        )
+        after = _file_identity(store_path)
+        sources.append((store_path, after if after == before else _CHANGED))
+        if text is None:
+            continue
+        for key, value in _repository_values(text, store_path).items():
+            if not repository_may_supply(key):
+                # Warned here; refused where it would be answered -- the one gate
+                # is credential_value, whatever put the name into the entry.
+                _warn_store_refused(
+                    store_path, describe_ignored_store_env_var(key, store_path.name)
+                )
+            values.setdefault(key, value)
+    return _RootEntry(root=root, values=values, sources=tuple(sources))
+
+
+def _root_entry(root: Path | None) -> _RootEntry | None:
+    """Root ``root``'s entry (default: :data:`_DEFAULT_ROOT`), rebuilt if a file changed."""
+    if root is None:
+        root = _DEFAULT_ROOT
+    if root is None:
+        return None
+    key = _root_key(root)
+    entry = _REPO_CREDENTIALS.get(key)
+    if entry is None or any(_file_identity(p) != ident for p, ident in entry.sources):
+        entry = _build_root_entry(root)
+        _REPO_CREDENTIALS[key] = entry
+    return entry
 
 
 #: Variables pmcp -- or a library it runs -- reads from its own environment to
@@ -597,6 +699,7 @@ def credential_value(
     environ: bool = True,
     repository: Mapping[str, str] | None = None,
     startup_files: bool = True,
+    root: Path | None = None,
 ) -> str | None:
     """The credential named ``key``: THE one gate every credential read goes through.
 
@@ -611,8 +714,9 @@ def credential_value(
        which the startup load puts there with ``override=False``;
     2. ``repository`` -- a TENANT store's values (``remote_auth``), the one
        layer between the user store and the project credentials;
-    3. the ONE map of repository credentials (``startup_files``): the
-       discovered checkout ``.env``, then ``.env.pmcp``, first loaded wins.
+    3. the project files of ONE root (``startup_files``): ``root``, else the
+       startup load's directory -- its ``.env``, then its ``.env.pmcp``, first
+       wins -- never another root's.
 
     Precedence is decided by MEMBERSHIP, not truthiness: the first source that
     HAS the name decides, and an empty value there means "unavailable" -- an
@@ -626,8 +730,10 @@ def credential_value(
     repository_may_answer = repository_may_supply(key)
     if repository_may_answer and repository is not None and key in repository:
         return repository[key] or None
-    if repository_may_answer and startup_files and key in _REPO_CREDENTIALS:
-        return _REPO_CREDENTIALS[key] or None
+    if repository_may_answer and startup_files:
+        entry = _root_entry(root)
+        if entry is not None and key in entry.values:
+            return entry.values[key] or None
     return None
 
 
@@ -668,23 +774,23 @@ def ensure_startup_load() -> None:
 
 
 def credential_lookup(project: Path | None = None) -> Callable[[str], str | None]:
-    """The one credential lookup: runtime and diagnostics read the same map.
+    """The one credential lookup: runtime and diagnostics read the same entries.
 
-    The startup load first (:func:`ensure_startup_load`), then -- for a project
-    root that is not the one startup loaded -- that project's ``.env.pmcp``
-    merged into the SAME map by the SAME loader (:func:`load_store`; a key the
-    map already has keeps its value). The answer is then
-    :func:`credential_value` with its defaults -- exactly what the provision
-    gate, the install child and the gateway's credential check read. Remote
-    ``${VAR}`` headers, ``pmcp doctor`` and ``pmcp secrets check`` call this;
+    The startup load first (:func:`ensure_startup_load`), then
+    :func:`credential_value` for root ``project`` (``None``: the startup load's
+    directory) -- exactly what the provision gate, the install child and the
+    gateway's credential check read for that root. Remote ``${VAR}`` headers,
+    ``pmcp doctor`` and ``pmcp secrets check`` call this;
     ``tests/test_credential_parity.py`` checks their verdicts against the
-    runtime's for every combination of shell, user store, checkout ``.env`` and
-    ``.env.pmcp`` (Consiliency/pmcp#372 rounds 5-7).
+    runtime's (Consiliency/pmcp#372 rounds 5-8).
     """
     ensure_startup_load()
-    if project is not None:
-        load_store("project", project=project, verb="read")
-    return credential_value
+    root = None if project is None else resolve_project_root(project)
+
+    def lookup(key: str) -> str | None:
+        return credential_value(key, root=root)
+
+    return lookup
 
 
 def describe_ignored_store_env_var(variable: str, store_name: str) -> str:
@@ -772,22 +878,6 @@ def repository_values(
     return _repository_values(text, store_path)
 
 
-def _load_repo_credentials(text: str, store_path: Path) -> None:
-    """Add a repository file's credentials to :data:`_REPO_CREDENTIALS`.
-
-    Expanded within the file only (:func:`_repository_values`); a key already in
-    the map keeps its first value, as ``load_dotenv(override=False)`` did.
-    """
-    for key, value in _repository_values(text, store_path).items():
-        if not repository_may_supply(key):
-            # Warned here; refused where it would be answered -- the one gate is
-            # credential_value, whatever put the name into the map.
-            _warn_store_refused(
-                store_path, describe_ignored_store_env_var(key, store_path.name)
-            )
-        _REPO_CREDENTIALS.setdefault(key, value)
-
-
 def load_store(
     scope: StoreScope,
     *,
@@ -816,9 +906,12 @@ def load_store(
         if text is not None:
             load_dotenv(stream=io.StringIO(text), override=False)
         return
-    text = _read_confined_text(store_path, confinement, strict=False, verb=verb)
-    if text is not None:
-        _load_repo_credentials(text, store_path)
+    # A repository file is one of its root's project files: (re)build that
+    # root's entry with THE builder (_build_root_entry).
+    root = confinement[0]
+    if _DEFAULT_ROOT is None:
+        set_default_root(root)
+    _REPO_CREDENTIALS[_root_key(root)] = _build_root_entry(root)
 
 
 def _home_and_its_ancestors() -> set[tuple[int, int]]:

@@ -107,7 +107,12 @@ def resolve_remote_headers_for_tenant(
             headers, build_remote_header_env_lookup(project_root)
         )
 
-    from pmcp.env_store import credential_lookup, credential_value, repository_values
+    from pmcp.env_store import (
+        credential_lookup,
+        credential_value,
+        repository_values,
+        resolve_project_root,
+    )
 
     # Repository-controlled: confined to the project root (Consiliency/pmcp#367),
     # expanded within the file only, read through the one gate. The order, by
@@ -117,10 +122,11 @@ def resolve_remote_headers_for_tenant(
     tenant_values = repository_values(
         "tenant", project=project_root, tenant_id=tenant_id
     )
+    root = None if project_root is None else resolve_project_root(project_root)
     if include_process_env:
-        # The one map every reader uses (env_store.credential_lookup): the
+        # The one lookup every reader uses (env_store.credential_lookup): the
         # environment -- the user store is in it after the startup load -- and
-        # the project credentials, with the tenant store between the two.
+        # this root's project files, with the tenant store between the two.
         credential_lookup(project_root)
 
     def lookup(env_var: str) -> str | None:
@@ -132,6 +138,7 @@ def resolve_remote_headers_for_tenant(
             environ=include_process_env,
             startup_files=include_process_env,
             repository=tenant_values,
+            root=root,
         )
 
     return resolve_remote_headers(headers, lookup)

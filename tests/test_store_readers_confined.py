@@ -286,7 +286,7 @@ def test_a_remote_connection_never_sends_an_outside_store_value(
     assert isinstance(exc, MissingRemoteHeaderAuthError), repr(exc)
     assert _Capture.seen == [], "a request reached the server"
     err = capfd.readouterr().err
-    assert (READ_NOT_REGULAR if shape == "fifo" else READ_REFUSAL) in err
+    assert (LOAD_NOT_REGULAR if shape == "fifo" else LOAD_REFUSAL) in err
     _no_outside_value(err, exc)
     assert str(lay["base"]) not in err
 

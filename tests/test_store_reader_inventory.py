@@ -66,7 +66,7 @@ ENTRY_POINT_INTERNALS = frozenset(
         ("pmcp.env_store", "read_store"),
         ("pmcp.env_store", "load_store"),
         ("pmcp.env_store", "load_discovered_dotenv"),
-        ("pmcp.env_store", "_load_repo_credentials"),
+        ("pmcp.env_store", "_build_root_entry"),
         ("pmcp.env_store", "_repository_values"),
         ("pmcp.env_store", "read_store_for_update"),
         ("pmcp.env_store", "_read_confined_text"),
@@ -917,10 +917,9 @@ STORE_VALUE_PRODUCERS = frozenset({"read_store", "repository_values"})
 VALUE_READS = frozenset({"get", "items", "values", "pop", "setdefault", "copy"})
 #: env_store functions that may touch the map itself, and why. Asserted exact.
 MAP_TOUCHERS = {
-    "credential_value": "THE gate",
-    "_load_repo_credentials": "writes it",
+    "_root_entry": "reads a root's entry for THE gate (credential_value)",
+    "load_store": "stores a root's entry built by _build_root_entry",
     "reset_repo_credentials": "test-only clear",
-    "repo_credential_names": "names only",
 }
 
 

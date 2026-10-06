@@ -209,3 +209,61 @@ def test_a_diagnostic_without_a_startup_load_builds_the_same_map(
     report = asyncio.run(secrets.run_secrets_check(argparse.Namespace(project=root)))
     assert report["missing_keys"] == [KEY]
     assert env_store.credential_value(KEY) is None
+
+
+SECOND_ROOT_GRID = list(itertools.product(SHELL, USER, PROJECT))
+
+
+@pytest.mark.parametrize(
+    ("shell", "user", "project_b"),
+    SECOND_ROOT_GRID,
+    ids=["-".join(c) for c in SECOND_ROOT_GRID],
+)
+def test_parity_for_a_second_root(
+    shell: str,
+    user: str,
+    project_b: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Started in A, asked about B: every reader answers from B's files only
+    (A always defines the key, and must never fill B's answer)."""
+    base = Path(os.path.realpath(tmp_path))
+    home = base / "home"
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    a = base / "a"
+    (a / ".git").mkdir(parents=True)
+    b = base / "b"
+    (b / ".git").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(a)
+    monkeypatch.delenv(KEY, raising=False)
+    (a / ".env.pmcp").write_text(f"{KEY}=from-a\n")
+    if shell != "absent":
+        monkeypatch.setenv(KEY, VALUES["shell"] if shell == "set" else "")
+    if user != "absent":
+        (home / ".config" / "pmcp" / "pmcp.env").write_text(
+            f"{KEY}={VALUES['user'] if user == 'set' else ''}\n"
+        )
+    if project_b != "absent":
+        (b / ".env.pmcp").write_text(
+            f"{KEY}={VALUES['project'] if project_b == 'set' else ''}\n"
+        )
+    monkeypatch.setattr(
+        secrets,
+        "_extract_required_keys",
+        lambda _: ([KEY], {"brave-search": [KEY]}, {}, {}),
+    )
+    cli.load_startup_env(dotenv_path=str(base / "no-such.env"))
+    winner = _winner(shell, user, "absent", project_b)
+
+    runtime_b = env_store.credential_value(KEY, root=b)
+    report = asyncio.run(secrets.run_secrets_check(argparse.Namespace(project=b)))
+    answers = {
+        "runtime for B": runtime_b,
+        "credential_lookup(B)": env_store.credential_lookup(b)(KEY),
+        "header lookup(B)": build_remote_header_env_lookup(b)(KEY),
+    }
+    assert set(answers.values()) == {winner}, answers
+    assert (KEY in report["available_keys"]) == (winner is not None)  # type: ignore[operator]
+    assert "from-a" not in answers.values()
