@@ -1755,19 +1755,23 @@ def test_an_exported_empty_value_is_not_filled_from_a_repository_file(
     assert GatewayTools._check_api_key_available(object(), "BRAVE_API_KEY") is False  # type: ignore[arg-type]
 
 
-def test_a_project_store_entry_decides_by_membership_over_the_user_store(
+def test_the_user_store_decides_by_membership_over_a_project_store(
     lay: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The project store overrides the user store's file for a header, as it
-    always has -- and an empty project entry is "unavailable", not a fall-through."""
+    """One documented order for every lookup, headers included: environment,
+    user store, then project -- and an empty user entry is "unavailable",
+    never a fall-through to the project file."""
     from pmcp.remote_auth import build_remote_header_env_lookup
 
     monkeypatch.delenv("MEMBER372", raising=False)
-    (lay["home"] / ".config" / "pmcp" / "pmcp.env").write_text("MEMBER372=user\n")
-    _project_store(lay).write_text("MEMBER372=\n")
+    user = lay["home"] / ".config" / "pmcp" / "pmcp.env"
+    _project_store(lay).write_text("MEMBER372=project\n")
+    user.write_text("MEMBER372=\n")
     assert build_remote_header_env_lookup(lay["project"])("MEMBER372") is None
-    _project_store(lay).write_text("OTHER372=x\n")
+    user.write_text("MEMBER372=user\n")
     assert build_remote_header_env_lookup(lay["project"])("MEMBER372") == "user"
+    user.write_text("OTHER372=x\n")
+    assert build_remote_header_env_lookup(lay["project"])("MEMBER372") == "project"
 
 
 def test_the_feedback_gate_denies_a_dangling_project_store_link(

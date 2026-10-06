@@ -480,10 +480,9 @@ def credential_value(
 
     1. the process environment (``environ``) -- the shell, the user store
        loaded at startup;
-    2. ``repository`` -- a project or tenant store's values, read by the caller
-       through :func:`repository_values` (a project store overrides the user
-       store's file, as it always has for remote headers and ``secrets check``);
-    3. ``operator`` -- the user store's values, read by the caller;
+    2. ``operator`` -- the user store's values, read by the caller;
+    3. ``repository`` -- a project or tenant store's values, read by the caller
+       through :func:`repository_values`;
     4. the credentials repository files supplied at startup (``startup_files``).
 
     Precedence is decided by MEMBERSHIP, not truthiness: the first source that
@@ -495,10 +494,10 @@ def credential_value(
     if environ and key in os.environ:
         return os.environ[key] or None
     repository_may_answer = not is_pmcp_environment_name(key)
-    if repository_may_answer and repository is not None and key in repository:
-        return repository[key] or None
     if operator is not None and key in operator:
         return operator[key] or None
+    if repository_may_answer and repository is not None and key in repository:
+        return repository[key] or None
     if repository_may_answer and startup_files and key in _REPO_CREDENTIALS:
         return _REPO_CREDENTIALS[key] or None
     return None

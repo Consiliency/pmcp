@@ -246,8 +246,10 @@ def test_tenant_code_mode_env_lookup_precedence(
 
     lookup = build_remote_header_env_lookup(project)
 
+    # One documented order (Consiliency/pmcp#367): the process environment,
+    # then the user store, then the project store.
     assert lookup("TENANT_CODE_MODE_MCP_TOKEN") == "process-secret"
-    assert lookup("TENANT_CODE_MODE_TENANT_ID") == "project-tenant"
+    assert lookup("TENANT_CODE_MODE_TENANT_ID") == "user-tenant"
 
 
 def test_remote_headers_for_tenant_reads_only_tenant_scope(tmp_path: Path) -> None:
