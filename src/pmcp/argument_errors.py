@@ -641,9 +641,17 @@ def _tunnel_refusal_status(error: BaseException) -> int | None | bool:
 
     Recognised by its origin, never its text: the innermost frame of its
     traceback is that function's code object. The status is that frame's
-    ``code`` local, and only if it is an ``int``.
+    ``code`` local, and only if it is an ``int``. A ``urllib.error.URLError``
+    whose ``reason`` is that ``OSError`` -- ``do_open`` wraps it so, and the
+    URLError's text is the reason's -- is the same refusal (round 22 codex).
     """
     if type(error) is not OSError:
+        import urllib.error
+
+        if isinstance(error, urllib.error.URLError) and isinstance(
+            error.reason, BaseException
+        ):
+            return _tunnel_refusal_status(error.reason)
         return False
     tb = error.__traceback__
     if tb is None:
@@ -795,7 +803,7 @@ def _validation_text(error: BaseException) -> str:
     if tunnel is not False:
         # The status alone: never the proxy's reason phrase (rev 24).
         where = f", status {tunnel}" if tunnel is not None else ""
-        return f"the proxy refused the tunnel (OSError{where})"
+        return f"the proxy refused the tunnel ({type(error).__name__}{where})"
     if _is_response_decode_error(error):
         name = type(error).__name__
         kind = _http_phrase(error)

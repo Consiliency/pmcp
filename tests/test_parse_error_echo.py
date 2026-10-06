@@ -1260,11 +1260,21 @@ _VALUE_FREE_HTTP_ERRORS: dict[str, dict[str, str]] = {
     "aiohttp.http_exceptions": {},
     "http.client": {},
     "urllib.error": {
-        "URLError": (
-            "its reason is a socket error or pmcp's own URL; a refused "
-            "tunnel's `OSError` is registered by origin (rev 24)"
-        ),
         "ContentTooShortError": "a byte count; the bytes stay in `.content`",
+    },
+}
+
+#: Classes registered by origin, not by class (rev 24): an instance is
+#: value-bearing when it comes from a refused tunnel, and only then; any
+#: other instance is value-free for the reason given. Its non-literal
+#: constructions are reviewed like a value-free class's.
+_REGISTERED_BY_ORIGIN: dict[str, dict[str, str]] = {
+    "urllib.error": {
+        "URLError": (
+            "registered when its `reason` is a refused tunnel's `OSError` "
+            "(round 22 codex: its text is that reason's); otherwise its "
+            "reason is a socket error or pmcp's own URL"
+        ),
     },
 }
 _VALUE_FREE_HTTP_ERRORS["httpx2"] = {
@@ -1297,8 +1307,8 @@ _REVIEWED_DYNAMIC_CONSTRUCTIONS: dict[str, str] = {
     "urllib.error:ContentTooShortError@urllib/request.py::retrieve": "byte counts",
     "urllib.error:ContentTooShortError@urllib/request.py::urlretrieve": "byte counts",
     "urllib.error:URLError@urllib/request.py::do_open": (
-        "the `OSError` it caught, also its context: a socket error, or a "
-        "refused tunnel, which is registered by origin"
+        "the `OSError` it caught: a socket error, or a refused tunnel, which "
+        "registers this `URLError` by origin"
     ),
     "urllib.error:URLError@urllib/request.py::ftp_open": "ftp: pmcp opens none",
     "urllib.error:URLError@urllib/request.py::get_authorization": (
@@ -1447,13 +1457,15 @@ def test_every_http_exception_class_is_classified() -> None:
     problems = []
     for module_name, free in _VALUE_FREE_HTTP_ERRORS.items():
         defined = _defined_exceptions(module_name)
+        by_origin = _REGISTERED_BY_ORIGIN.get(module_name, {})
         for attr, value in sorted(defined.items()):
             is_registered = issubclass(value, registered)
-            if is_registered and attr in free:
+            listed = attr in free or attr in by_origin
+            if is_registered and listed:
                 problems.append((module_name, attr, "registered and listed"))
-            if not is_registered and attr not in free:
+            if not is_registered and not listed:
                 problems.append((module_name, attr, "neither registered nor listed"))
-        for attr in free:
+        for attr in [*free, *by_origin]:
             if attr not in defined:
                 problems.append((module_name, attr, "listed but not defined"))
     assert not problems, problems
@@ -1479,7 +1491,8 @@ def _client_sources(module_name: str) -> tuple[Path, list[Path]]:
 
 def _dynamic_value_free_constructions() -> set[str]:
     found: set[str] = set()
-    for module_name, free in _VALUE_FREE_HTTP_ERRORS.items():
+    for module_name, value_free in _VALUE_FREE_HTTP_ERRORS.items():
+        free = {**value_free, **_REGISTERED_BY_ORIGIN.get(module_name, {})}
         base, files = _client_sources(module_name)
         for path in files:
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -2018,7 +2031,8 @@ def test_no_rejected_http_response_reaches_any_output(
 # over https (a CONNECT tunnel) and http (an absolute-form request), each
 # with a 407 and a 502 whose reason phrase is the sentinel.
 
-_PROXY_STATUSES = (407, 502)
+#: Any refusal status carries a reason phrase (round 22 grok: a 403).
+_PROXY_STATUSES = (403, 407, 502)
 
 
 def _proxied_sites() -> set[str]:
@@ -2279,3 +2293,107 @@ def test_no_client_error_prints_a_rejected_response(
             surface,
             text[:400],
         )
+
+
+def _proxied_client_calls(proxy: str) -> dict[str, Callable[[str], Any]]:
+    """Each client pmcp uses, through `proxy`: urllib's opener and httpx's
+    clients take it from the environment, aiohttp from `proxy=` (pmcp
+    passes none; this covers its class)."""
+    import urllib.request
+
+    def via_urllib(url: str) -> Any:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        )
+        with opener.open(url, timeout=10) as response:
+            return response.read()
+
+    def via_httpx(module_name: str) -> Callable[[str], Any]:
+        def call(url: str) -> Any:
+            import importlib
+
+            module = importlib.import_module(module_name)
+
+            async def run() -> Any:
+                async with module.AsyncClient(timeout=10, proxy=proxy) as client:
+                    return (await client.get(url)).raise_for_status()
+
+            return asyncio.run(run())
+
+        return call
+
+    def via_aiohttp(url: str) -> Any:
+        import aiohttp
+
+        async def run() -> Any:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, proxy=proxy) as response:
+                    response.raise_for_status()
+                    return await response.read()
+
+        return asyncio.run(run())
+
+    return {
+        "urllib": via_urllib,
+        "httpx": via_httpx("httpx"),
+        "httpx2": via_httpx("httpx2"),
+        "aiohttp": via_aiohttp,
+    }
+
+
+@pytest.mark.parametrize("client", ["aiohttp", "httpx", "httpx2", "urllib"])
+@pytest.mark.parametrize("status", _PROXY_STATUSES)
+@pytest.mark.parametrize("scheme", ["https", "http"])
+def test_no_proxy_refusal_reaches_any_renderer(
+    scheme: str, status: int, client: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each client through a refusing proxy, the error caught and given to
+    every renderer a site uses: `exception_text`, `safe_traceback_text`,
+    `describe_exception` (bare and in a group, `gateway.health`'s shape),
+    `sanitize_auth_diagnostic`, and a log record carrying it (round 22
+    grok and codex)."""
+    import pmcp  # noqa: F401 - installs the scrubbers
+    from pmcp.argument_errors import exception_text, safe_traceback_text
+    from pmcp.auth import sanitize_auth_diagnostic
+    from pmcp.client.manager import describe_exception
+    from tests.test_argument_error_echo import _exception_group
+
+    s = _GRID_S
+    caplog.set_level(logging.DEBUG)
+    listener, port = _serve_once_per_connection(
+        f"HTTP/1.1 {status} {s}\r\nContent-Length: 0\r\n\r\n".encode()
+    )
+    token = f"proxied{len(_GRID_REQUESTS)}"
+    try:
+        call = _proxied_client_calls(f"http://127.0.0.1:{port}")[client]
+        with pytest.raises(Exception) as caught:
+            call(f"{scheme}://{token}.invalid/{token}")
+    finally:
+        listener.close()
+    error = caught.value
+    assert any(token.encode() in request for request in _GRID_REQUESTS)
+    logging.getLogger("pmcp.test").error("failed", exc_info=error)
+    texts = {
+        "exception_text": exception_text(error),
+        "safe_traceback_text": safe_traceback_text(error),
+        "describe_exception": describe_exception(error),
+        "describe_exception(group)": describe_exception(
+            _exception_group()("group", [error])
+        ),
+        "sanitize_auth_diagnostic": sanitize_auth_diagnostic(error, max_length=None),
+        "log": "\n".join(_record_text(record) for record in caplog.records),
+    }
+    if isinstance(getattr(error, "reason", None), OSError):
+        # A `URLError`'s text is its reason's: registered by origin, not
+        # only through the chain (round 22 codex).
+        import urllib.error
+
+        bare = urllib.error.URLError(error.reason)
+        texts["URLError, unchained"] = exception_text(bare) + safe_traceback_text(bare)
+    leaked = {
+        name: text[:300]
+        for name, text in texts.items()
+        if any(form in text for form in _forbidden_any_case(s))
+    }
+    assert not leaked, leaked
+    assert str(status) in texts["exception_text"], texts["exception_text"]
