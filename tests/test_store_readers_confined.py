@@ -57,16 +57,10 @@ INSIDE_VALUE = "inside-ok-367"
 USER_VALUE = "dotfiles-ok-367"
 TENANT = "acme"
 
-READ_REFUSAL = (
-    "pmcp: refusing to read .env.pmcp: it is a symlink that leaves the project"
-)
+READ_REFUSAL = "pmcp: refusing to read .env.pmcp: it is a symlink"
 READ_NOT_REGULAR = "pmcp: refusing to read .env.pmcp: it is not a regular file"
-LOAD_REFUSAL = (
-    "pmcp: refusing to load .env.pmcp: it is a symlink that leaves the project"
-)
-TENANT_REFUSAL = (
-    "pmcp: refusing to read pmcp.env: it is a symlink that leaves the project"
-)
+LOAD_REFUSAL = "pmcp: refusing to load .env.pmcp: it is a symlink"
+TENANT_REFUSAL = "pmcp: refusing to read pmcp.env: it is a symlink"
 
 
 # --------------------------------------------------------------------------- #
@@ -105,9 +99,16 @@ def _fifo(store: Path, lay: dict[str, Path]) -> None:
     os.mkfifo(store)
 
 
+def _link_inside_late(store: Path, lay: dict[str, Path]) -> None:
+    _link_inside(store, lay)
+
+
+#: Since Consiliency/pmcp#366 round 9 a repository store is never read through
+#: a symlink of any kind -- one into the project included.
 REFUSED: dict[str, Callable[[Path, dict[str, Path]], None]] = {
     "link-out": _link_out,
     "absolute-link-out": _abs_link_out,
+    "link-inside": _link_inside_late,
     "fifo": _fifo,
 }
 
@@ -128,7 +129,6 @@ def _link_inside(store: Path, lay: dict[str, Path]) -> None:
 
 LEGIT: dict[str, Callable[[Path, dict[str, Path]], None]] = {
     "regular": _regular,
-    "link-inside": _link_inside,
 }
 
 
@@ -503,11 +503,7 @@ def test_the_credential_check_never_loads_an_outside_store(
     assert _available() is False
     assert VAR not in os.environ
     err = capfd.readouterr().err
-    reason = (
-        "it is not a regular file"
-        if shape == "fifo"
-        else ("it is a symlink that leaves the project")
-    )
+    reason = "it is not a regular file" if shape == "fifo" else ("it is a symlink")
     assert f"pmcp: refusing to load {name}: {reason}" in err
     _no_outside_value(err, dict(os.environ))
 
@@ -523,17 +519,20 @@ def test_the_credential_check_loads_a_legitimate_store(
     assert VAR not in os.environ
 
 
-def test_the_credential_check_loads_a_subdirectory_link_into_the_project(
-    lay: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+def test_the_credential_check_refuses_a_subdirectory_link_into_the_project(
+    lay: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
+    """Consiliency/pmcp#366 round 9: no symlink in a repository store at all."""
     _regular(_project_store(lay), lay)
     sub = lay["project"] / "pkg"
     sub.mkdir()
     os.symlink("../.env.pmcp", sub / ".env.pmcp")
     monkeypatch.chdir(sub)
-    assert _available() is True
-    assert env_store.credential_value(VAR) == INSIDE_VALUE
-    assert VAR not in os.environ
+    assert _available() is False
+    assert env_store.credential_value(VAR) is None
+    assert "pmcp: refusing to load .env.pmcp: it is a symlink" in capfd.readouterr().err
 
 
 def test_the_credential_check_loads_the_user_store_through_a_dotfiles_link(
@@ -585,13 +584,10 @@ def test_the_feedback_gate_still_reads_a_legitimate_store(
     assert decision.reason != "gate_error"
 
 
-def test_the_feedback_gate_sees_a_token_planted_through_an_inside_link(
+def test_the_feedback_gate_sees_a_token_planted_in_a_regular_store(
     lay: dict[str, Path],
 ) -> None:
-    real = lay["project"] / "conf" / "pmcp.env"
-    real.parent.mkdir()
-    real.write_text(f"PMCP_FEEDBACK_TOKEN={_TOKEN}\n", encoding="utf-8")
-    os.symlink("conf/pmcp.env", _project_store(lay))
+    _project_store(lay).write_text(f"PMCP_FEEDBACK_TOKEN={_TOKEN}\n", encoding="utf-8")
     decision = _decide(lay["project"])
     assert decision.submit_allowed is False
     assert decision.reason == "untrusted_token"
@@ -704,7 +700,7 @@ def test_a_refused_store_warns_once_per_process(
 
 def test_a_strict_read_raises_the_refusal(lay: dict[str, Path]) -> None:
     _link_out(_project_store(lay), lay)
-    with pytest.raises(PermissionError, match="leaves the project"):
+    with pytest.raises(PermissionError, match="it is a symlink"):
         env_store.read_store("project", project=lay["project"], strict=True)
 
 
@@ -811,10 +807,7 @@ def test_pmcp_installed_in_the_checkout_never_sends_an_outside_env_value(
     out, proc = _header_probe(lay, site)
     assert out["env"] is None
     assert out["header"] == {"Authorization": f"Bearer ${{{VAR}}}"}
-    assert (
-        "pmcp: refusing to load .env: it is a symlink that leaves the project"
-        in proc.stderr
-    )
+    assert "pmcp: refusing to load .env: it is a symlink" in proc.stderr
     _no_outside_value(proc.stdout, proc.stderr)
 
 
