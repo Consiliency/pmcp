@@ -2197,7 +2197,6 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         "re-raise",
     ),
     ("client/manager.py", "ClientManager._send_request", "reraises"): (1, "re-raise"),
-    ("env_store.py", "write_env_file", "reraises"): (1, "sync temp-file cleanup"),
     ("manifest/installer.py", "JobManager._handle_task_exception", "absorbs"): (
         1,
         "sync done-callback reading a finished task's result; no await",
@@ -2210,16 +2209,10 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "re-raise",
     ),
-    ("manifest/registry.py", "save_registry_cache", "reraises"): (
-        1,
-        "sync temp-file cleanup",
-    ),
-    ("package_approvals.py", "_write_store", "reraises"): (1, "sync temp-file cleanup"),
     ("tools/handlers.py", "GatewayTools._run_update_probe_command", "reraises"): (
         1,
         "SIGKILLs the probe synchronously, then re-raises",
     ),
-    ("trust_store.py", "_write_store", "reraises"): (1, "sync temp-file cleanup"),
 }
 
 # Handlers allowed to await: task roots whose own cancellation ends them.

@@ -10,7 +10,11 @@ from pmcp.config.loader import load_configs
 from pmcp.env_store import (
     read_env_file,
     resolve_project_root,
+    read_store_for_update,
     resolve_scope_path,
+    scope_confinement,
+    scope_store_name,
+    store_refusal,
     set_env_value,
     validate_env_var_name,
     write_env_file,
@@ -177,13 +181,26 @@ def _extract_required_keys(
 async def run_secrets_set(args: argparse.Namespace) -> dict[str, object]:
     """Set one secret in user or project PMCP env file."""
     project = getattr(args, "project", None)
-    path = resolve_scope_path(args.scope, project)
-    values = read_env_file(path)
-
-    existing_value = values.get(args.key)
-    changed = existing_value != args.value
-
-    path = set_env_value(args.scope, args.key, args.value, project)
+    path = Path(scope_store_name(args.scope))
+    # The read sits inside the same boundary as the write, and for the project
+    # store it goes through the write's confined walk: a link the write would
+    # refuse is refused before anything is read (read_store_for_update).
+    # ValueError too: a store that is not UTF-8, a value with a newline, an
+    # invalid key -- reported, never raised (store_refusal).
+    try:
+        # Resolving the project root can itself be refused (`missing/../x`).
+        path = resolve_scope_path(args.scope, project)
+        values = read_store_for_update(args.scope, path)
+        existing_value = values.get(args.key)
+        changed = existing_value != args.value
+        path = set_env_value(args.scope, args.key, args.value, project)
+    except (OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "command": "secrets.set",
+            "scope": args.scope,
+            "error": store_refusal(path, exc),
+        }
 
     return {
         "ok": True,
@@ -211,15 +228,50 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
             "to_scope": to_scope,
         }
 
-    source_path = resolve_scope_path(from_scope, project)
-    target_path = resolve_scope_path(to_scope, project)
+    source_path = Path(scope_store_name(from_scope))
+    target_path = Path(scope_store_name(to_scope))
+    try:
+        source_path = resolve_scope_path(from_scope, project)
+        target_path = resolve_scope_path(to_scope, project)
+    except (OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "command": "secrets.sync",
+            "from_scope": from_scope,
+            "to_scope": to_scope,
+            "error": store_refusal(
+                target_path if from_scope == "user" else source_path, exc
+            ),
+        }
 
-    source_values = read_env_file(source_path)
-    target_values = read_env_file(target_path)
-    for key in source_values:
-        validate_env_var_name(key)
-    for key in target_values:
-        validate_env_var_name(key)
+    # Both reads go through the confined walk for a project store and sit
+    # inside the reported-refusal boundary, so a leaving or non-regular store is
+    # refused before it is read, never raised.
+    # The SOURCE is only read, so its refusal says "read" (verb="read").
+    try:
+        source_values = read_store_for_update(from_scope, source_path, verb="read")
+        for key in source_values:
+            validate_env_var_name(key)
+    except (OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "command": "secrets.sync",
+            "from_scope": from_scope,
+            "to_scope": to_scope,
+            "error": store_refusal(source_path, exc, verb="read"),
+        }
+    try:
+        target_values = read_store_for_update(to_scope, target_path)
+        for key in target_values:
+            validate_env_var_name(key)
+    except (OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "command": "secrets.sync",
+            "from_scope": from_scope,
+            "to_scope": to_scope,
+            "error": store_refusal(target_path, exc),
+        }
 
     added: list[str] = []
     updated: list[str] = []
@@ -235,7 +287,20 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
         else:
             skipped.append(key)
 
-    write_env_file(target_path, target_values)
+    try:
+        write_env_file(
+            target_path,
+            target_values,
+            confine_to=scope_confinement(to_scope, target_path),
+        )
+    except (OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "command": "secrets.sync",
+            "from_scope": from_scope,
+            "to_scope": to_scope,
+            "error": store_refusal(target_path, exc),
+        }
 
     return {
         "ok": True,

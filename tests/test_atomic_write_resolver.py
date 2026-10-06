@@ -1,0 +1,407 @@
+"""Board falsifiers from rounds 2-6 of Consiliency/pmcp#366, against the round-8 rules.
+
+The generated confined grid that lived here followed links INSIDE a project; the
+owner's round-8 ruling refuses every project-store symlink instead, and
+``test_atomic_write_kernel_grid`` now generates both rules' grids from one
+grammar. What stays here: the falsifiers that still apply (the fallback swap,
+grok's Windows and ``escape/..`` shapes, grok's unreadable-target refusal, the
+lstat-to-open swap), and the unconfined kernel-oracle grid for ``..`` after a
+missing, regular, looping or real hop. Codex's round-2 F001 (an absolute
+``hop/../x`` link INSIDE the project must be written through) is retired: under
+the ruling that link is refused, and a test pins that it changes nothing.
+"""
+
+from __future__ import annotations
+
+import ntpath
+import os
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from pmcp import atomic_write as atomic_write_module
+from pmcp.atomic_write import ConfinedWriteError, atomic_write
+
+DATA = b"K=generated\n"
+
+
+# --------------------------------------------------------------------------- #
+# The round-2 board falsifiers, as written.
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_f002_fallback_cannot_write_through_a_swapped_directory(
+    tmp_path: Path,
+) -> None:
+    writer = atomic_write_module
+    project = tmp_path / "project"
+    sub = project / "sub"
+    sub.mkdir(parents=True)
+    (sub / "pmcp.env").write_bytes(b"OLD=1\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "pmcp.env"
+    victim.write_bytes(b"OUTSIDE=untouched\n")
+    link = project / ".env.pmcp"
+    link.symlink_to("sub/pmcp.env")
+    resolve = writer.resolve_confined_target
+
+    def resolve_then_swap(path: Path, confine_to: Path, label: str) -> Path:
+        target = resolve(path, confine_to, label)
+        sub.rename(project / "sub-old")
+        sub.symlink_to("../outside", target_is_directory=True)
+        return target
+
+    with (
+        patch.object(writer, "_DIR_FD_SUPPORTED", False),
+        patch.object(writer, "resolve_confined_target", resolve_then_swap),
+    ):
+        try:
+            writer.atomic_write(link, b"USER_SECRET=private\n", confine_to=project)
+        except OSError:
+            pass
+
+    assert victim.read_bytes() == b"OUTSIDE=untouched\n"
+
+
+_ORIGINAL = "ORIGINAL\n"
+
+
+def test_grok_f001_a_project_symlink_that_leaves_is_refused_before_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failures: list[str] = []
+    tmp_path = Path(os.path.realpath(tmp_path))
+
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    victim = outside / "victim"
+    victim.write_text(_ORIGINAL, encoding="utf-8")
+    (project / "escape").symlink_to(outside)
+    absolute = str(project / "escape" / ".." / "planted")
+    (project / ".env.pmcp").symlink_to(absolute)
+    try:
+        atomic_write(project / ".env.pmcp", b"K=secret\n", confine_to=project)
+    except ConfinedWriteError:
+        pass
+    else:
+        failures.append(
+            f"absolute link {absolute} was written to the lexically collapsed path"
+        )
+    if (project / "planted").exists():
+        failures.append("secret written to planted inside the project")
+    if (tmp_path / "planted").exists():
+        failures.append("secret written outside the project via escape/..")
+    if victim.read_text(encoding="utf-8") != _ORIGINAL:
+        failures.append("outside victim was modified")
+    if not os.path.islink(project / ".env.pmcp"):
+        failures.append("the leaving symlink was replaced")
+
+    root = "C:\\work\\project"
+    store = root + "\\.env.pmcp"
+    link_text = "../.bashrc"
+    escaped = ntpath.normpath(ntpath.join(root, link_text))
+    assert not (escaped == root or escaped.startswith(root.rstrip("\\") + "\\")), (
+        escaped
+    )
+
+    def islink(path: object) -> bool:
+        return ntpath.normpath(str(path)) == ntpath.normpath(store)
+
+    def isdir(path: object) -> bool:
+        # Win32 stat() resolves ".." and accepts "/"; C:\work exists.
+        return ntpath.normpath(str(path)) in {"C:\\", "C:\\work", "C:\\work\\project"}
+
+    def readlink(path: object) -> str:
+        if ntpath.normpath(str(path)) == ntpath.normpath(store):
+            return link_text
+        raise OSError(path)
+
+    written: list[str] = []
+
+    def record_write(
+        target: Path, data: bytes, *, mode: int, prefix: str, suffix: str
+    ) -> None:
+        written.append(str(target))
+
+    monkeypatch.setattr(os, "sep", "\\")
+    monkeypatch.setattr(os, "path", ntpath)
+    monkeypatch.setattr(os, "readlink", readlink)
+    monkeypatch.setattr(ntpath, "islink", islink)
+    monkeypatch.setattr(ntpath, "isdir", isdir)
+    monkeypatch.setattr(atomic_write_module, "_DIR_FD_SUPPORTED", False)
+    monkeypatch.setattr(atomic_write_module, "_write_by_path", record_write)
+
+    try:
+        atomic_write(Path(store), b"K=secret\n", confine_to=Path(root))
+    except ConfinedWriteError:
+        pass
+    else:
+        norm = ntpath.normpath(written[0]) if written else escaped
+        failures.append(
+            f"windows target {link_text!r} normalizes to {norm}, outside {root}"
+        )
+    if written:
+        norm = ntpath.normpath(written[0])
+        if not (norm == root or norm.startswith(root.rstrip("\\") + "\\")):
+            failures.append(f"windows write path {norm} leaves {root}")
+
+    monkeypatch.undo()
+    assert failures == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd walk is POSIX-only")
+def test_a_directory_swapped_between_lstat_and_open_is_not_followed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window inside the walk: `lstat` saw a directory, `open` meets a link.
+
+    The directory open is O_NOFOLLOW, so the swapped-in link fails it instead
+    of carrying the walk -- and the write -- outside the project.
+    """
+    base = Path(os.path.realpath(tmp_path))
+    project = base / "project"
+    (project / "sub").mkdir(parents=True)
+    outside = base / "outside"
+    outside.mkdir()
+    real_stat = os.stat
+    swapped: list[bool] = []
+
+    def stat_then_swap(name: object, *args: object, **kwargs: object) -> object:
+        result = real_stat(name, *args, **kwargs)  # type: ignore[arg-type]
+        if name == "sub" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped.append(True)
+            os.rename(project / "sub", project / "sub-old")
+            os.symlink(outside, project / "sub")
+        return result
+
+    monkeypatch.setattr(os, "stat", stat_then_swap)
+    with pytest.raises(OSError):
+        atomic_write(project / "sub" / "x.env", DATA, confine_to=project)
+    monkeypatch.undo()
+
+    assert swapped, "the seam never fired"
+    assert list(outside.iterdir()) == []
+
+
+def test_grok_round3_f001_unreadable_project_store_is_reported_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 board falsifier (grok F001), as written."""
+    import argparse
+    import asyncio
+
+    from pmcp.cli_commands.secrets import run_secrets_set, run_secrets_sync
+
+    # Round 8 (owner's ruling): every project-store symlink is refused, with
+    # one message; the falsifier's original constant named "leaves the project".
+    refusal = "refusing to write .env.pmcp: it is a symlink"
+    if os.geteuid() == 0:
+        pytest.skip("root ignores mode 000")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    victim = tmp_path / "outside" / "secret"
+    victim.parent.mkdir()
+    victim.write_text("ORIGINAL\n", encoding="utf-8")
+    os.chmod(victim, 0)
+    os.symlink(victim, project / ".env.pmcp")
+
+    async def _set() -> dict[str, object]:
+        return await run_secrets_set(
+            argparse.Namespace(scope="project", key="K", value="v", project=project)
+        )
+
+    async def _sync() -> dict[str, object]:
+        return await run_secrets_sync(
+            argparse.Namespace(
+                from_scope="user",
+                to_scope="project",
+                project=project,
+                overwrite=False,
+            )
+        )
+
+    try:
+        for out in (asyncio.run(_set()), asyncio.run(_sync())):
+            assert out["ok"] is False
+            message = str(out["error"])
+            assert message == refusal
+            assert str(tmp_path) not in message
+            assert "secret" not in message
+            assert "ORIGINAL" not in message
+    finally:
+        os.chmod(victim, 0o600)
+
+    assert victim.read_text(encoding="utf-8") == "ORIGINAL\n"
+    assert os.path.islink(project / ".env.pmcp")
+
+
+# --------------------------------------------------------------------------- #
+# Round 6 codex F001: the UNCONFINED (operator-owned) path resolves in kernel
+# order too. Non-strict realpath collapsed `hop/../existing.env` onto
+# `existing.env` when `hop` was missing, a regular file or a loop -- shapes the
+# kernel refuses -- and overwrote an unrelated file. Oracle: the kernel itself.
+# Each case is built twice; the kernel opens one copy for writing
+# (O_WRONLY|O_CREAT|O_TRUNC through the link), the writer writes the other, and
+# the two trees must end byte-identical, with the same refuse/accept outcome.
+# --------------------------------------------------------------------------- #
+
+HOP_KINDS = ["missing", "regular file", "loop", "real directory", "link to a directory"]
+
+
+def _hop_texts(store_dir: Path) -> dict[str, str]:
+    return {
+        "hop/..": "hop/../existing.env",
+        "hop/sub/../..": "hop/sub/../../existing.env",
+        "../pmcp/hop/..": "../pmcp/hop/../existing.env",
+        "absolute hop/..": str(store_dir / "hop") + "/../existing.env",
+    }
+
+
+def _build_unconfined(base: Path, hop: str, text_id: str) -> Path:
+    store_dir = base / "cfg" / "pmcp"
+    store_dir.mkdir(parents=True)
+    (base / "other" / "child" / "sub").mkdir(parents=True)
+    (store_dir / "existing.env").write_bytes(b"UNRELATED=1\n")
+    hop_path = store_dir / "hop"
+    if hop == "regular file":
+        hop_path.write_bytes(b"")
+    elif hop == "loop":
+        os.symlink("hop2", hop_path)
+        os.symlink("hop", store_dir / "hop2")
+    elif hop == "real directory":
+        (hop_path / "sub").mkdir(parents=True)
+    elif hop == "link to a directory":
+        os.symlink("../../other/child", hop_path)
+    link = store_dir / "pmcp.env"
+    os.symlink(_hop_texts(store_dir)[text_id], link)
+    return link
+
+
+def _tree(base: Path) -> dict[str, bytes]:
+    out: dict[str, bytes] = {}
+    for dirpath, _dirs, files in os.walk(base, followlinks=False):
+        for f in files:
+            p = Path(dirpath, f)
+            if not p.is_symlink() and not f.startswith(".pmcp-"):
+                out[str(p.relative_to(base))] = p.read_bytes()
+    return out
+
+
+@pytest.mark.parametrize("text_id", list(_hop_texts(Path("/x"))))
+@pytest.mark.parametrize("hop", HOP_KINDS)
+def test_an_unconfined_write_lands_where_the_kernel_opens_or_is_refused(
+    hop: str, text_id: str, tmp_path: Path
+) -> None:
+    base = Path(os.path.realpath(tmp_path))
+    kernel_link = _build_unconfined(base / "kernel", hop, text_id)
+    writer_link = _build_unconfined(base / "writer", hop, text_id)
+    if text_id == "absolute hop/..":
+        # Absolute text names its own tree; rebuild the writer's link to match.
+        os.unlink(writer_link)
+        os.symlink(_hop_texts(writer_link.parent)[text_id], writer_link)
+
+    try:
+        fd = os.open(kernel_link, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    except OSError:
+        kernel_refused = True
+    else:
+        os.write(fd, DATA)
+        os.close(fd)
+        kernel_refused = False
+
+    try:
+        atomic_write(writer_link, DATA, confine_to=None)
+    except OSError:
+        writer_refused = True
+    else:
+        writer_refused = False
+
+    assert writer_refused == kernel_refused, (hop, text_id)
+    assert _tree(base / "writer") == _tree(base / "kernel"), (hop, text_id)
+    assert os.path.islink(writer_link)
+
+
+def test_the_unconfined_grid_has_both_outcomes() -> None:
+    """Positive control: the kernel refuses the missing/file/loop hops, not the dirs."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(os.path.realpath(d))
+        outcomes = {}
+        for hop in HOP_KINDS:
+            link = _build_unconfined(base / hop.replace(" ", "-"), hop, "hop/..")
+            try:
+                os.close(os.open(link, os.O_WRONLY | os.O_CREAT, 0o600))
+                outcomes[hop] = "opened"
+            except OSError:
+                outcomes[hop] = "refused"
+    assert outcomes == {
+        "missing": "refused",
+        "regular file": "refused",
+        "loop": "refused",
+        "real directory": "opened",
+        "link to a directory": "opened",
+    }
+
+
+def test_codex_r6_f001_unresolvable_user_store_link_does_not_overwrite(
+    tmp_path: Path,
+) -> None:
+    """Round-6 codex falsifier shape: the user store links through a missing hop."""
+    store_dir = Path(os.path.realpath(tmp_path)) / "pmcp"
+    store_dir.mkdir()
+    existing = store_dir / "existing.env"
+    existing.write_bytes(b"UNRELATED=1\n")
+    link = store_dir / "pmcp.env"
+    os.symlink("hop/../existing.env", link)
+    with pytest.raises(OSError):
+        atomic_write(link, b"K=v\n", confine_to=None)
+    assert existing.read_bytes() == b"UNRELATED=1\n"
+    assert os.readlink(link) == "hop/../existing.env"
+
+
+def test_an_unconfined_absolute_link_climbing_past_the_root_stays_at_the_root(
+    tmp_path: Path,
+) -> None:
+    """`/..` is `/` in the kernel: extra `..` at the anchor are absorbed, not refused."""
+    store_dir = Path(os.path.realpath(tmp_path)) / "pmcp"
+    store_dir.mkdir()
+    real = store_dir / "real.env"
+    real.write_bytes(b"OLD=1\n")
+    link = store_dir / "pmcp.env"
+    os.symlink("/../../.." + str(real), link)
+    with open(link, "rb") as handle:  # the kernel's own reading of the text
+        assert handle.read() == b"OLD=1\n"
+
+    # The returned path is the user's own spelling, never normalised; the
+    # system says it is the same file.
+    assert os.path.samefile(atomic_write(link, DATA, confine_to=None), real)
+    assert real.read_bytes() == DATA
+
+
+def test_codex_r2_f001_shape_is_now_refused_and_changes_nothing(tmp_path: Path) -> None:
+    """Retired falsifier's shape: an absolute `hop/../pmcp.env` link inside a project."""
+    tmp_path = Path(os.path.realpath(tmp_path))
+    project = tmp_path / "project"
+    (project / "storage" / "child").mkdir(parents=True)
+    (project / "hop").symlink_to("storage/child", target_is_directory=True)
+    target = project / "storage" / "pmcp.env"
+    target.write_bytes(b"OLD=1\n")
+    unrelated = project / "pmcp.env"
+    unrelated.write_bytes(b"UNRELATED=1\n")
+    link = project / ".env.pmcp"
+    link.symlink_to(str(project / "hop") + "/../pmcp.env")
+
+    with pytest.raises(ConfinedWriteError, match="it is a symlink"):
+        atomic_write(link, b"OLD=1\nNEW=2\n", confine_to=project)
+
+    assert unrelated.read_bytes() == b"UNRELATED=1\n"
+    assert target.read_bytes() == b"OLD=1\n"
+    assert link.is_symlink()

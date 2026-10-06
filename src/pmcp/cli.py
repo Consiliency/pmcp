@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.metadata
+import io
 import json
 import logging
 import os
@@ -13,13 +14,13 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 from pmcp import package_approvals, trust_store
+from pmcp.atomic_write import atomic_write, is_absent, read_confined
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
 from pmcp.cli_commands.install import (
@@ -41,6 +42,7 @@ from pmcp.env_store import (
     env_key_is_operator_supplied,
     record_dotenv_keys,
     record_pmcp_introduced_keys,
+    store_refusal,
 )
 from pmcp.validation import is_valid_package_version, parse_package_spec
 from pmcp.manifest.loader import load_manifest
@@ -1867,15 +1869,21 @@ def _merge_setup_config(existing: dict, generated: dict) -> dict:
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
-    """Atomically write JSON data to path."""
+    """Atomically write JSON data to path, at 0600, through a symlinked config.
+
+    A client config kept in a dotfiles repository and symlinked into place is
+    written to its target, the link left intact (``pmcp.atomic_write``). This is
+    not the startup-policy editor's ``.mcp.json`` write, which refuses a link
+    (``symlinked_config``) because it records trust against the file's identity;
+    ``pmcp setup`` records no trust.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", dir=path.parent, delete=False, encoding="utf-8"
-    ) as tmp_file:
-        json.dump(data, tmp_file, indent=2)
-        tmp_file.write("\n")
-        tmp_path = Path(tmp_file.name)
-    tmp_path.replace(path)
+    text = json.dumps(data, indent=2) + "\n"
+    # confine_to=None: the target is ~/.mcp.json or ~/.config/opencode/opencode.json,
+    # fixed under the operator's home; no checkout chooses it.
+    atomic_write(
+        path, text.encode("utf-8"), confine_to=None, mode=0o600, prefix=".pmcp-setup-"
+    )
 
 
 def run_setup(args: argparse.Namespace) -> None:
@@ -1894,7 +1902,9 @@ def run_setup(args: argparse.Namespace) -> None:
 
     target_path = _get_setup_target_path(args.client)
     existing: dict = {}
-    if target_path.exists():
+    # Only ENOENT/ENOTDIR is "no config yet"; a config the system refuses to
+    # look up (ELOOP, EACCES) must not be read as empty and then replaced.
+    if not is_absent(target_path):
         try:
             parsed = json.loads(target_path.read_text())
             if isinstance(parsed, dict):
@@ -3104,8 +3114,48 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     # is never recorded and never refused.
     before = set(os.environ)
     load_dotenv(Path.home() / ".config" / "pmcp" / "pmcp.env", override=False)
-    load_dotenv(Path.cwd() / ".env.pmcp", override=False)
+    _load_project_store_at_startup(Path.cwd() / ".env.pmcp")
     record_pmcp_introduced_keys(set(os.environ) - before)
+
+
+def _load_project_store_at_startup(path: Path) -> None:
+    """Load ``<cwd>/.env.pmcp`` through the confined reader, or skip it with a warning.
+
+    The project store is repository-controlled: a clone can ship it as a symlink
+    out of the project, as a fifo, or as a socket. This load runs in ``main()``
+    BEFORE any subcommand -- including ``pmcp secrets set``/``sync`` and
+    ``pmcp auth connect``, which rewrite or report on that store -- so it must
+    not follow a link those commands would refuse, nor block on a fifo. It reads
+    through :func:`pmcp.atomic_write.read_confined` (the write's own walk): a
+    symlinked store of any kind, a non-regular file, an unreadable or non-UTF-8
+    store are each skipped with one value-free line on stderr, and the command
+    goes on. A regular store loads exactly as ``load_dotenv(path,
+    override=False)`` did (same parser, interpolation and precedence, from the
+    same bytes).
+
+    Other readers of a project ``.env.pmcp`` -- remote-header auth, the tenant store, the gateway's credential-availability
+    check, env stripping, the feedback gate's planted-key check and ``pmcp secrets
+    check``, inventoried in tests/test_env_store_reader_inventory.py -- still follow
+    its link (Consiliency/pmcp#367, stays open); they no longer block on a fifo
+    (``env_store.read_env_text``).
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return  # no project store: nothing to load
+    except OSError as exc:
+        print(f"pmcp: {store_refusal(path, exc, verb='load')}", file=sys.stderr)
+        return
+    # Confined to the store's own directory: a project `.env.pmcp` that is a
+    # symlink of any kind is refused, so no other directory is ever walked.
+    try:
+        data = read_confined(path, path.parent, verb="load")
+        text = data.decode("utf-8") if data is not None else None
+    except (OSError, ValueError) as exc:
+        print(f"pmcp: {store_refusal(path, exc, verb='load')}", file=sys.stderr)
+        return
+    if text is not None:
+        load_dotenv(stream=io.StringIO(text), override=False)
 
 
 def main() -> None:

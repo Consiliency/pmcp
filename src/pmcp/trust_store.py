@@ -33,15 +33,24 @@ absolute path: re-approving replaces, it does not append a history.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
-import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from pmcp.atomic_write import (
+    atomic_write,
+    falls_back_to_pathname,
+    is_absent,
+    make_store_dirs,
+    open_directory,
+    resolve_write_target,
+)
 
 APPROVED = "approved"
 DENIED = "denied"
@@ -236,14 +245,146 @@ def trust_store_path() -> Path:
     planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
     path = (Path.home() / ".config" / "pmcp" / "trust.json").resolve()
-    for checkout in _checkout_roots():
-        if path.is_relative_to(checkout):
-            raise TrustStoreError(
-                f"Trust store {path} resolves inside the checkout at {checkout}. "
-                "A checkout-resident store lets a repository approve its own "
-                "content; move it under a home directory outside the repository."
-            )
+    refuse_checkout_resident(path, "Trust store")
     return path
+
+
+def refuse_checkout_resident(
+    path: Path | str, label: str, *, dir_fd: int | None = None
+) -> None:
+    """Raise ``TrustStoreError`` if ``path``'s directory lies inside a judged checkout.
+
+    By FILE IDENTITY, never path strings (``//x`` and ``/x`` are one directory
+    but compare unequal), and FAIL CLOSED: if residency cannot be established
+    for any reason, the store is refused. ``dir_fd``, when given, is an open
+    descriptor of the store's directory (the writer's own chain follower hands
+    one over), judged instead of ``path``'s. See :func:`_resident_checkout`.
+    """
+    name = os.path.basename(os.fspath(path))
+    try:
+        checkout = _resident_checkout(path, _checkout_roots(), dir_fd=dir_fd)
+    except OSError as exc:
+        raise TrustStoreError(
+            f"{label} {name}: cannot establish that it lies outside every "
+            f"checkout being judged ({os.strerror(exc.errno) if exc.errno else exc}); "
+            "refusing it."
+        ) from exc
+    if checkout is not None:
+        raise TrustStoreError(
+            f"{label} {name} resolves inside the checkout at {checkout}. "
+            "A checkout-resident store lets a repository approve its own "
+            "content; move it under a home directory outside the repository."
+        )
+
+
+#: More ancestors than any real path has; past it, residency is unknown.
+_MAX_ANCESTORS = 4096
+
+
+def _resident_checkout(
+    path: Path | str, checkouts: tuple[Path, ...], *, dir_fd: int | None = None
+) -> Path | None:
+    """The checkout whose root is an ancestor of ``path``'s directory, or ``None``.
+
+    Walked by DESCRIPTORS where the platform has them, never by growing a path
+    string (``a/../..`` past ``PATH_MAX`` fails with ``ENAMETOOLONG``, which an
+    earlier walk read as "outside"): from the store's directory, ``..`` relative
+    to each directory reached, comparing ``(st_dev, st_ino)`` with every
+    checkout root's, until a directory is its own parent. Without ``dir_fd`` /
+    ``O_DIRECTORY`` (Windows) the store's directory is resolved strictly and its
+    ``parents`` are compared by the same identity (Windows fills ``st_dev`` /
+    ``st_ino`` from the volume serial and file index). A checkout root that does
+    not exist (a served project not created yet) is skipped. A store directory
+    not created yet is judged by the nearest existing directory above it, found
+    by stepping only across plain names. Any other error raises: residency is
+    then unknown, and the caller refuses.
+    """
+    roots = []
+    for checkout in checkouts:
+        if is_absent(checkout):
+            continue  # nothing can live inside a root that does not exist
+        st = os.stat(checkout)
+        roots.append(((st.st_dev, st.st_ino), checkout))
+    if not roots:
+        return None
+
+    def match(st: os.stat_result) -> Path | None:
+        for ident, checkout in roots:
+            if (st.st_dev, st.st_ino) == ident:
+                return checkout
+        return None
+
+    by_fd = hasattr(os, "O_DIRECTORY") and bool(os.supports_dir_fd)
+    if by_fd:
+        try:
+            return _resident_by_descriptor(path, match, dir_fd)
+        except OSError as exc:
+            # Without O_PATH a directory the user may search but not list
+            # (0311) refuses the descriptor walk the kernel's lookup would
+            # pass: judge by pathname identity instead (the shared rule).
+            if not falls_back_to_pathname(exc):
+                raise
+            if dir_fd is not None:
+                path = resolve_write_target(path)  # the store's real directory
+    return _resident_by_pathname(path, match)
+
+
+def _existing_directory(path: Path | str) -> str:
+    """The store's directory, or the nearest existing one above it across plain
+    names only (a store directory not created yet)."""
+    current = os.path.dirname(os.fspath(path)) or os.curdir
+    while True:
+        try:
+            os.stat(current)
+            return current
+        except FileNotFoundError:
+            name = os.path.basename(current)
+            parent = os.path.dirname(current)
+            if name in ("", os.curdir, os.pardir) or parent == current:
+                raise
+            current = parent
+
+
+def _resident_by_pathname(
+    path: Path | str, match: Callable[[os.stat_result], Path | None]
+) -> Path | None:
+    """Strictly resolve the store's directory; compare it and each parent by
+    ``(st_dev, st_ino)`` -- needs only search permission, and is the form used
+    where descriptors are unavailable (Windows fills these from the file index)."""
+    real = Path(os.path.realpath(_existing_directory(path), strict=True))
+    for ancestor in (real, *real.parents):
+        found = match(os.stat(ancestor))
+        if found is not None:
+            return found
+    return None
+
+
+def _resident_by_descriptor(
+    path: Path | str,
+    match: Callable[[os.stat_result], Path | None],
+    dir_fd: int | None,
+) -> Path | None:
+    """Walk up with ``..`` relative to each directory reached, by descriptor."""
+    fd = (
+        os.dup(dir_fd)
+        if dir_fd is not None
+        else open_directory(_existing_directory(path))
+    )
+    try:
+        for _ in range(_MAX_ANCESTORS):
+            here = os.fstat(fd)
+            found = match(here)
+            if found is not None:
+                return found
+            up = open_directory(os.pardir, dir_fd=fd)
+            above = os.fstat(up)
+            os.close(fd)
+            fd = up
+            if (above.st_dev, above.st_ino) == (here.st_dev, here.st_ino):
+                return None  # the filesystem root, checked on the previous turn
+        raise OSError(errno.ELOOP, "Too many ancestors to establish residency")
+    finally:
+        os.close(fd)
 
 
 def _decode(entry: Any) -> TrustRecord:
@@ -286,7 +427,7 @@ def _read_store(path: Path) -> list[TrustRecord]:
     An absent store is empty, not an error -- a user who has approved nothing is
     the normal starting state.
     """
-    if not path.exists():
+    if is_absent(path):  # only ENOENT/ENOTDIR; ELOOP, EACCES ... are raised
         return []
 
     try:
@@ -331,46 +472,22 @@ def _write_store(path: Path, records: list[TrustRecord]) -> None:
     parent = path.parent
     _ensure_store_dir(parent)
 
-    # Write a sibling temp file and rename it into place. `os.replace` is
-    # atomic, so a reader never observes a half-written store and an
+    # Write a temp file beside the store and rename it into place. `os.replace`
+    # is atomic, so a reader never observes a half-written store and an
     # interrupted write leaves the previous one intact rather than truncated.
-    fd, tmp_name = tempfile.mkstemp(dir=parent, prefix=".trust-", suffix=".tmp")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as store_file:
-            json.dump(payload, store_file, indent=2)
-            store_file.write("\n")
-            store_file.flush()
-            os.fsync(store_file.fileno())
-        os.replace(tmp_name, path)
-        # fsync the DIRECTORY too, not just the file. `os.replace` is atomic
-        # against readers, but the rename itself is only durable once the
-        # directory entry is synced -- so a crash right after a revoke can leave
-        # the pre-revoke store on disk and resurrect the approval the operator
-        # just withdrew. That is the same invariant the lock protects against a
-        # race, reached through power loss instead.
-        # Best effort, and deliberately so. Directory fsync is unsupported on
-        # some platforms and filesystems (macOS returns EINVAL, NFS and some
-        # overlay mounts ENOTSUP), and `os.open` on a directory fails outright
-        # on Windows. The replace has ALREADY succeeded by this point, so
-        # raising here would report a failed `record`/`revoke` for a write that
-        # landed -- telling an operator their revoke did not take when it did is
-        # worse than losing a durability guarantee the platform cannot give.
-        try:
-            dir_fd = os.open(parent, os.O_RDONLY)
-        except OSError:
-            pass
-        else:
-            try:
-                os.fsync(dir_fd)
-            except OSError:
-                pass
-            finally:
-                os.close(dir_fd)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    # The DIRECTORY is fsync-ed too (best effort): the rename is only durable
+    # once the directory entry is synced, so a crash right after a revoke must
+    # not leave the pre-revoke store on disk and resurrect the approval the
+    # operator just withdrew -- the invariant the lock protects against a race,
+    # reached through power loss instead. `path` is already fully resolved by
+    # `trust_store_path()`, so the helper's symlink-following is the identity
+    # here and the residency check above judged the file actually written.
+    text = json.dumps(payload, indent=2) + "\n"
+    # confine_to=None: the operator's own ~/.config/pmcp, already resolved and
+    # refused if checkout-resident (C-15).
+    atomic_write(
+        path, text.encode("utf-8"), confine_to=None, mode=0o600, prefix=".trust-"
+    )
 
 
 def _ensure_store_dir(parent: Path) -> None:
@@ -384,32 +501,14 @@ def _ensure_store_dir(parent: Path) -> None:
     helper, one decision. As before, never tighten a directory the user already
     had (mirrors ``env_store.write_env_file``).
     """
-    if parent.exists():
-        return
-    # Create every missing component RESTRICTIVE AT CREATION, one at a time.
-    # `mkdir(parents=True, mode=0o700)` is not enough on two counts, both
-    # measured: the intermediates are created with the default mode because
-    # pathlib deliberately ignores `mode` for parents (mimicking `mkdir -p`), so
-    # a freshly created `~/.config` lands 0o775 under umask 002; and creating
-    # loosely and tightening afterwards leaves a window in which another account
-    # in the user's group can insert a forged `trust.json` that a later
-    # `record()` will read and carry forward. `mkdir`'s mode is applied by the
-    # kernel at creation and umask can only remove bits, never add them.
-    missing: list[Path] = []
-    probe = parent
-    while not probe.exists():
-        missing.append(probe)
-        if probe.parent == probe:
-            break
-        probe = probe.parent
-    for component in reversed(missing):
-        component.mkdir(mode=0o700, exist_ok=True)
-        try:
-            # Only for a pathological umask that stripped owner bits from the
-            # mode above; it can never loosen a directory beyond 0o700.
-            os.chmod(component, 0o700)
-        except OSError:
-            pass
+    # Walked as the kernel would; only the plain tail of directories that do
+    # not exist yet is created, each at 0o700 (restrictive AT CREATION),
+    # relative to the last directory the walk reached. Never treated as absent
+    # and created when the path cannot be resolved for another reason.
+    for created in make_store_dirs(parent):
+        with contextlib.suppress(OSError):
+            # Only for a umask that stripped owner bits; never loosens.
+            os.chmod(created, 0o700)
 
 
 @contextlib.contextmanager
@@ -505,7 +604,7 @@ def assert_store_outside_path_checkout(path: Path) -> None:
     store = trust_store_path()
     approved = Path(path).resolve()
     for checkout in _enclosing_checkouts(approved.parent):
-        if store.is_relative_to(checkout):
+        if _resident_checkout(store, (checkout,)) is not None:
             raise TrustStoreError(
                 f"Trust store {store} resolves inside the checkout at {checkout} "
                 f"that contains {approved}. A checkout-resident store lets a "

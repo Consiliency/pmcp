@@ -6,6 +6,7 @@ import functools
 import logging
 import os
 import re
+import io
 import json
 import asyncio
 import time
@@ -57,9 +58,12 @@ from pmcp.config.loader import (
 from pmcp.errors import ErrorCode, GatewayException, make_error
 from pmcp.env_store import (
     record_dotenv_keys,
+    read_env_text,
     record_pmcp_introduced_keys,
     sanitized_subprocess_env,
+    scope_store_name,
     set_env_value,
+    store_refusal,
 )
 from pmcp.feedback_egress import (
     FeedbackProgress,
@@ -2669,9 +2673,13 @@ class GatewayTools:
             Path.cwd() / ".env.pmcp",
             Path.home() / ".config" / "pmcp" / "pmcp.env",
         ]:
-            if env_path.exists():
+            # read_env_text: a fifo (or any non-regular file) a repository ships
+            # at one of these paths reads as absent instead of freezing the
+            # gateway; same parser, interpolation and precedence as before.
+            text = read_env_text(env_path)
+            if text is not None:
                 before = set(os.environ)
-                load_dotenv(env_path)
+                load_dotenv(stream=io.StringIO(text))
                 record_dotenv_keys(set(os.environ) - before)
                 if os.environ.get(env_var):
                     return True
@@ -4631,7 +4639,21 @@ class GatewayTools:
 
         try:
             path = self._write_secret(parsed.scope, env_var, parsed.credential)
-        except ValueError as exc:
+        except (ValueError, OSError) as exc:
+            # OSError: the store write failed or was refused -- a project
+            # `.env.pmcp` that is a symlink leaving the project (pmcp.atomic_write),
+            # a directory at the path, a loop, no permission. Reported as a
+            # value-free refusal naming only the store's file, never raised.
+            # A store that is not UTF-8 (a UnicodeDecodeError, a ValueError)
+            # is reported without its bytes; other ValueErrors are input
+            # validation messages and stay as they were.
+            message = (
+                # Named from the scope alone: re-resolving the path here could
+                # raise the very error being reported.
+                store_refusal(Path(scope_store_name(parsed.scope)), exc)
+                if isinstance(exc, (OSError, UnicodeDecodeError))
+                else str(exc)
+            )
             self._audit(
                 method="gateway.auth_connect",
                 action="auth_connect",
@@ -4640,12 +4662,12 @@ class GatewayTools:
                 server_name=server_name,
                 auth_state="missing_auth",
                 auth_event="missing_credential",
-                error=str(exc),
+                error=message,
             )
             return AuthConnectOutput(
                 ok=False,
                 server=server_name,
-                message=str(exc),
+                message=message,
                 auth_state="missing_auth",
                 env_var=env_var,
             )
