@@ -222,7 +222,10 @@ def test_every_refused_name_is_refused_by_the_lookup_gate_too(
 NOT_CREDENTIALS = [
     "UV_INDEX_URL",
     "UV_CONFIG_FILE",
+    "UV_DEFAULT_INDEX",
+    "UV_EXTRA_INDEX_URL",
     "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
     "PIP_CONFIG_FILE",
     "PIP_TRUSTED_HOST",
     "GIT_CONFIG_GLOBAL",
@@ -370,3 +373,73 @@ def test_a_credential_whose_value_would_expand_is_not_copied(
     assert "pmcp: Not copying LEAK_TOKEN from .env.pmcp: its value refers" in (
         capfd.readouterr().err
     )
+
+
+#: The names board round 6 (grok and codex) showed reaching ``pmcp upgrade``.
+UPGRADE_STEERING = [
+    "PIP_INDEX_URL",
+    "UV_INDEX_URL",
+    "UV_DEFAULT_INDEX",
+    "PIP_TRUSTED_HOST",
+    "OPENSSL_CONF",
+]
+
+
+def test_a_synced_project_cannot_steer_the_next_upgrade(lay: dict[str, Path]) -> None:
+    """sync -> a fresh pmcp process -> the environment ``pmcp upgrade`` hands uv/pip.
+
+    The project's installer settings are refused by the sync, so a later
+    ``pmcp upgrade`` -- in a new process, from another directory -- never sees
+    them, while a credential the sync did copy is still there.
+    """
+    import subprocess
+
+    (lay["project"] / ".env.pmcp").write_text(
+        "BRAVE_API_KEY=legit\n"
+        + "".join(
+            f"{k}=https://evil.invalid/{i}\n" for i, k in enumerate(UPGRADE_STEERING)
+        )
+    )
+    out = _sync(lay["project"], "project", "user")
+    assert sorted(out["refused"]) == sorted(UPGRADE_STEERING)  # type: ignore[arg-type]
+
+    elsewhere = lay["home"] / "elsewhere"
+    elsewhere.mkdir()
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k.upper() not in {n.upper() for n in UPGRADE_STEERING} | {"BRAVE_API_KEY"}
+        and not k.startswith("PMCP")
+    }
+    env["HOME"] = str(lay["home"])
+    probe = (
+        "import argparse, asyncio, json, sys\n"
+        "from pmcp import cli\n"
+        "cli.load_startup_env(dotenv_path='/nonexistent')\n"
+        "seen = {}\n"
+        "def spy(*a, **k):\n"
+        "    seen.update(k.get('env') or {})\n"
+        "    raise FileNotFoundError\n"
+        "cli.subprocess.run = spy\n"
+        "try:\n"
+        "    asyncio.run(cli.run_upgrade(argparse.Namespace(\n"
+        "        log_level='warning', method='pip', dry_run=False)))\n"
+        "except SystemExit:\n"
+        "    pass\n"
+        "keys = sys.argv[1:]\n"
+        "print(json.dumps({k: seen.get(k) for k in keys}))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe, *UPGRADE_STEERING, "BRAVE_API_KEY"],
+        cwd=elsewhere,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr[-600:]
+    import json
+
+    seen = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert seen == {**dict.fromkeys(UPGRADE_STEERING), "BRAVE_API_KEY": "legit"}
+    assert "evil.invalid" not in proc.stdout + proc.stderr
