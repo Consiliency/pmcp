@@ -144,7 +144,11 @@ def _store_identity(path: Path) -> tuple[int, int, int] | None:
 
 
 def _warn_store_refused(path: Path, message: str) -> None:
-    key = (os.path.realpath(path), message, _store_identity(path))
+    try:
+        where = os.path.realpath(path)
+    except OSError:  # e.g. a working directory that no longer exists
+        where = os.fspath(path)
+    key = (where, message, _store_identity(path))
     if key in _WARNED_REFUSALS:
         return
     _WARNED_REFUSALS.add(key)

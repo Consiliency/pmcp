@@ -1650,6 +1650,9 @@ def test_a_repository_file_cannot_launder_an_operator_secret(
         tenant_id=TENANT,
         project_root=lay["project"],
     )
+    # An unexpandable binding is absent, not an emptied or partial value.
+    if "${NOT_IN_FILE:-x}" not in template and ":-${" not in template:
+        assert "LEAK" not in env_store.repo_credential_names()
     for secret in operator_secrets.values():
         assert secret not in str(env_store.credential_value("LEAK"))
         assert secret not in str(lookup("LEAK"))
@@ -1774,3 +1777,33 @@ def test_the_feedback_gate_denies_a_dangling_project_store_link(
     decision = _decide(lay["project"])
     assert decision.submit_allowed is False
     assert decision.reason == "gate_error"
+
+
+def test_the_user_store_path_is_pinned_even_when_no_env_is_discovered(
+    lay: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import cli
+
+    monkeypatch.setattr(cli, "find_dotenv", lambda: "")
+    cli.load_startup_env()
+    pinned = env_store.resolve_scope_path("user")
+    assert pinned == lay["home"] / ".config" / "pmcp" / "pmcp.env"
+    monkeypatch.setenv("HOME", str(lay["project"] / "fakehome"))
+    assert env_store.resolve_scope_path("user") == pinned
+
+
+def test_a_project_root_that_cannot_be_found_warns_or_raises(
+    lay: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Locating the project store can itself fail -- here the working directory
+    was removed. A lenient reader warns once and reads empty; a strict one raises."""
+    gone = lay["base"] / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+    assert env_store.read_store("project") == {}
+    assert "pmcp: refusing to read .env.pmcp:" in capfd.readouterr().err
+    with pytest.raises(OSError):
+        env_store.read_store("project", strict=True)
