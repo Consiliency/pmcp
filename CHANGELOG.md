@@ -80,7 +80,13 @@ to do, how to verify it, and how to roll back to 2.7.3.
   `.env.pmcp` (a per-project override of a user-store key, such as a tenant id, does not
   apply), and a variable your shell exports as empty stays
   unavailable rather than being filled from a project file. A `~/.env` (or one in an
-  ancestor of your home directory) still loads as before. `pmcp secrets sync
+  ancestor of your home directory) still loads as before. A server pmcp spawns
+  keeps every variable you exported: a project `.env.pmcp` that lists a name, such as
+  `NO_PROXY` or `SSL_CERT_FILE`, no longer removes your value of it from the child's
+  environment, as 2.7.3 did. Only the names in your user store and the credentials pmcp
+  itself put into its environment (`auth_connect`, a `~/.env`) are withheld from other
+  servers. A tenant or project store located without `--project` is the served
+  project's. `pmcp secrets sync
   --from-scope project --to-scope user` copies credentials only -- a credential-shaped
   name or one a manifest server declares (`POSTGRES_URL`) -- and skips every other
   name (`UV_INDEX_URL`, `DATABASE_URL`, anything named `PMCP_*`, proxies, code-loading and

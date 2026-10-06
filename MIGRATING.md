@@ -488,7 +488,11 @@ inside project A gives B's servers B's credentials, and pmcp started from a
 subdirectory of a project reads the root's `.env.pmcp` (the file `pmcp secrets
 set --scope project` writes) where 2.7.3 loaded the working directory's. If you
 kept a `.env.pmcp` in a subdirectory you start pmcp from, move its entries to
-the project root's `.env.pmcp`, or pass that subdirectory as `--project`. In 2.7.3 a checkout's `.env` won over the user
+the project root's `.env.pmcp`, or pass that subdirectory as `--project`. A
+server pmcp spawns keeps every variable you exported: a project `.env.pmcp`
+that lists a name such as `NO_PROXY` no longer removes your value of it from
+the server's environment; only your user store's names, and credentials pmcp
+itself put into its environment, are withheld from other servers. In 2.7.3 a checkout's `.env` won over the user
 store, and `pmcp secrets check` preferred a project `.env.pmcp`. (Remote
 `${VAR}` headers in the gateway, `pmcp status` and `pmcp doctor` already
 preferred your user store, which those load first.) So a per-project override

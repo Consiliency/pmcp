@@ -637,8 +637,14 @@ def test_managed_secret_keys_reads_a_legitimate_store(
 ) -> None:
     LEGIT[shape](_project_store(lay), lay)
     assert env_store.managed_secret_keys(lay["project"]) == {VAR}
-    monkeypatch.setenv(VAR, "managed-and-loaded")
-    assert VAR not in env_store.sanitized_subprocess_env(None, lay["project"])
+    # A name the project store lists strips nothing from a child: the value in
+    # the environment is the operator's (a repository's never enters it), so it
+    # survives (Consiliency/pmcp#372 round 11, board round 10 grok F001).
+    monkeypatch.setenv(VAR, "the-operators-own")
+    assert (
+        env_store.sanitized_subprocess_env(None, lay["project"])[VAR]
+        == "the-operators-own"
+    )
 
 
 def test_managed_secret_keys_follows_the_user_store_dotfiles_link(

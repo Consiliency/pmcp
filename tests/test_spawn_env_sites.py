@@ -245,3 +245,115 @@ def test_no_spawn_passes_a_repository_chosen_variable(
     assert leaked == set(), f"{site} passed {sorted(leaked)} to its child"
     # Not vacuous: the child gets a real environment.
     assert env.get("PATH") or env.get("HOME"), site
+
+
+# --------------------------------------------------------------------------- #
+# Board round 10 on Consiliency/pmcp#372, grok F001: a repository store that
+# merely NAMED a variable deleted the operator's own exported value from every
+# server pmcp spawned -- the spawn strip removed every name a project store
+# listed. Its value was correctly ignored; naming it was enough. The strip is
+# by provenance now (env_store.sanitized_subprocess_env), so every operator
+# value survives into every spawn site's environment, whatever the checkout's
+# files list.
+# --------------------------------------------------------------------------- #
+
+OPERATOR = "the-operators-own-372"
+#: Names a checkout could list to strip the operator's own settings.
+AMBIENT = [
+    *STEERING,
+    "NO_PROXY",
+    "no_proxy",
+    "HTTPS_PROXY",
+    "SSL_CERT_FILE",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "GITHUB_TOKEN",
+    "OPERATOR_372_API_KEY",
+]
+
+
+@pytest.fixture
+def listed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The operator exported every name; the checkout's files list each one."""
+    home = tmp_path / "home"
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    body = "".join(f"{k}={PLANTED}\n" for k in AMBIENT)
+    (project / ".env.pmcp").write_text(body)
+    (project / ".env").write_text(body)
+    for key in AMBIENT:
+        monkeypatch.setenv(key, OPERATOR)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(project)
+    cli.load_startup_env(dotenv_path=str(project / ".env"))
+    GatewayTools._check_api_key_available(
+        GatewayTools.__new__(GatewayTools), "UNSET_372"
+    )
+    return project
+
+
+@pytest.mark.parametrize("site", SITES, ids=[f"{m}:{f}" for m, f in SITES])
+def test_no_repository_file_removes_an_operator_value_from_a_spawn(
+    site: tuple[str, str],
+    listed: Path,
+    captured: list[Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = DRIVERS[site]
+    with pytest.raises(_Stop):
+        asyncio.run(driver(monkeypatch))
+    assert captured, f"{site} was not reached"
+    env = captured[0]
+    assert env != "NO-ENV-KWARG", f"{site} spawned without env="
+    expected = set(AMBIENT)
+    if site == ("pmcp.manifest.refresher", "refresh_server"):
+        # This site's base is mcp's minimal default environment
+        # (get_default_environment, an allowlist the SDK owns), not pmcp's own:
+        # only what that allowlist passes is expected, and no repository file
+        # takes anything from it.
+        from mcp.client.stdio import get_default_environment
+
+        expected &= set(get_default_environment())
+    lost = {k for k in expected if env.get(k) != OPERATOR}
+    assert lost == set(), (
+        f"{site} lost the operator's own {sorted(lost)}: a repository file "
+        "listing a name removed the operator's value"
+    )
+    assert PLANTED not in env.values(), site
+
+
+def test_grok_r10_f001_a_checkout_cannot_strip_operator_ambient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """grok r10 F001, verbatim in substance."""
+    from pmcp.env_store import sanitized_subprocess_env
+
+    home = tmp_path / "home"
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    project = tmp_path / "checkout"
+    (project / ".git").mkdir(parents=True)
+    (project / ".env.pmcp").write_text(
+        "NO_PROXY=dropped-by-checkout\n"
+        "SSL_CERT_FILE=/checkout/ca.pem\n"
+        "NODE_OPTIONS=--checkout\n"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,.internal")
+    monkeypatch.setenv("HTTPS_PROXY", "http://operator-proxy:8080")
+    monkeypatch.setenv("SSL_CERT_FILE", "/operator/ca.pem")
+    monkeypatch.setenv("NODE_OPTIONS", "--disallow-code-generation-from-strings")
+    monkeypatch.setenv("PATH", "/operator/bin")
+
+    cli.load_startup_env(dotenv_path=str(project / "no-such.env"))
+    child = sanitized_subprocess_env(project=project)
+
+    assert child.get("HTTPS_PROXY") == "http://operator-proxy:8080"
+    assert child.get("NO_PROXY") == "localhost,127.0.0.1,.internal"
+    assert child.get("SSL_CERT_FILE") == "/operator/ca.pem"
+    assert child.get("NODE_OPTIONS") == "--disallow-code-generation-from-strings"
+    assert child.get("PATH") == "/operator/bin"
+    assert "dropped-by-checkout" not in child.values()
+    assert "/checkout/ca.pem" not in child.values()
+    assert "--checkout" not in child.values()

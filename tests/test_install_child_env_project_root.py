@@ -144,7 +144,13 @@ def scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Pat
     assert written == gateway_root / ".env.pmcp"
     assert written.exists()
 
+    # The value reaches the gateway's environment the way it does in
+    # production: ``auth_connect`` sets it and records that pmcp put it there
+    # (handlers.py, ``record_pmcp_introduced_keys``). A repository file's value
+    # never enters the environment (Consiliency/pmcp#372 round 2), so this is
+    # the only route by which a project-scoped credential is there to strip.
     monkeypatch.setenv(_SECRET_KEY, _SECRET_VALUE)
+    env_store.record_pmcp_introduced_keys([_SECRET_KEY])
     monkeypatch.setenv(_CONTROL_KEY, _CONTROL_VALUE)
     return gateway_root, elsewhere
 
@@ -293,35 +299,30 @@ async def test_a_project_scoped_credential_is_stripped_when_the_cwd_is_the_proje
     )
 
 
-def test_the_helper_falls_back_to_the_working_directory_walk_when_given_no_root(
+def test_the_strip_is_by_provenance_whatever_the_root_or_working_directory(
     scenario: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """What the optional default MEANS, so the structural rule has a behavioural
-    partner.
+    """Since Consiliency/pmcp#372 round 11 the strip no longer reads a project store.
 
-    ``project_root`` is optional (a required parameter would have rewritten 55 call
-    sites across three merged phases' evidence files), and an omitted argument
-    therefore acquires the old cwd-walk behaviour — which is the defect itself.
-    That is exactly why omitting it is forbidden at every production call site
-    by ``test_no_production_call_site_omits_the_project_root``. This test states
-    the cost of the default plainly rather than leaving it implied.
+    It removes what pmcp put into its own environment (the credential
+    ``auth_connect`` set, recorded at the write), whichever root is given and
+    wherever pmcp runs -- so the cwd walk that was this lane's defect no longer
+    decides anything. And a name a project store merely LISTS strips nothing: the
+    operator's own exported value of that name survives (board round 10 grok
+    F001).
     """
     gateway_root, elsewhere = scenario
     config = _no_credential_config()
+    for cwd in (gateway_root, elsewhere):
+        monkeypatch.chdir(cwd)
+        assert _SECRET_KEY not in build_install_child_env(config)
+        assert _SECRET_KEY not in build_install_child_env(config, gateway_root)
 
-    # No root given, cwd IS the project root: the walk happens to find the store.
-    monkeypatch.chdir(gateway_root)
-    assert _SECRET_KEY not in build_install_child_env(config)
-
-    # No root given, cwd elsewhere: the walk misses the store and the credential
-    # survives into the child env. This is the defect, in one line, and it is
-    # what an omitted argument still buys a caller.
-    monkeypatch.chdir(elsewhere)
-    assert build_install_child_env(config).get(_SECRET_KEY) == _SECRET_VALUE
-
-    # Root given explicitly: the working directory stops mattering.
-    assert _SECRET_KEY not in build_install_child_env(config, gateway_root)
+    env_store.set_env_value("project", "NO_PROXY", "from-the-checkout", gateway_root)
+    monkeypatch.setenv("NO_PROXY", "operator.internal")
+    child = build_install_child_env(config, gateway_root)
+    assert child.get("NO_PROXY") == "operator.internal"
 
 
 def _calls_missing_a_project_argument() -> list[str]:

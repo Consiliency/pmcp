@@ -34,7 +34,16 @@ def validate_env_var_name(name: str) -> str:
 
 
 def resolve_project_root(project: Path | None = None) -> Path:
-    """Resolve project root for project-scope secrets."""
+    """Resolve project root for project-scope secrets.
+
+    ``project`` when given. Without one, the project this process SERVES
+    (:func:`serve_project_root`: ``--project``, else the root discovered from
+    the working directory at startup) -- so a project or tenant store located
+    with no explicit project is the served project's, never the working
+    directory's when they differ (Consiliency/pmcp#372 round 11, board round 10
+    codex F001). Before anything is served: discovered from the working
+    directory, as always.
+    """
     if project:
         # Never realpath, strict or not (strict collapses `file/..` on 3.12,
         # non-strict `missing/..`): the root is kept as the operator spelled it,
@@ -44,6 +53,13 @@ def resolve_project_root(project: Path | None = None) -> Path:
         # or no permission is refused there, never treated as absent.
         return project if project.is_absolute() else Path.cwd() / project
 
+    if _DEFAULT_ROOT is not None:
+        return _DEFAULT_ROOT
+    return _discover_project_root()
+
+
+def _discover_project_root() -> Path:
+    """The project root found from the working directory (markers), else the cwd."""
     discovered = find_project_root(Path.cwd())
     if discovered:
         return discovered
@@ -400,7 +416,7 @@ def serve_project_root(project: Path | None) -> Path:
     server credential and availability checks from B's files, as it answers
     B's headers (Consiliency/pmcp#372 round 9).
     """
-    root = resolve_project_root(project)
+    root = resolve_project_root(project) if project else _discover_project_root()
     set_default_root(root)
     return root
 
@@ -1497,6 +1513,15 @@ def describe_ignored_trust_env_var(variable: str, path: str) -> str:
     )
 
 
+def operator_managed_secret_keys() -> frozenset[str]:
+    """The names in the operator's own user store: what a spawn strips by name.
+
+    Only the user store. A repository's ``.env.pmcp`` names nothing pmcp strips
+    from a child's environment (:func:`sanitized_subprocess_env`).
+    """
+    return frozenset(read_store("user"))
+
+
 def managed_secret_keys(project: Path | None = None) -> set[str]:
     """Env-var keys of credentials PMCP manages in its user/project secret stores.
 
@@ -1569,11 +1594,27 @@ def sanitized_subprocess_env(
 
     Note: secrets the operator exported into their shell are still inherited --
     deliberately, and out of scope here.
+
+    No repository file decides what is stripped (Consiliency/pmcp#372 round
+    11, board round 10 grok F001). The strip used to include every NAME the
+    project's ``.env.pmcp`` listed, so a checkout that merely named
+    ``NO_PROXY`` or ``SSL_CERT_FILE`` deleted the operator's own exported value
+    from every server pmcp spawned. A repository store's values never enter
+    the environment (:func:`load_store`), so it has nothing to strip. What is
+    stripped: the names in the operator's own user store, the PMCP-managed
+    secrets of Consiliency/pmcp#230 (:func:`operator_managed_secret_keys`), and,
+    by provenance, the keys pmcp itself put into this environment -- a
+    credential ``auth_connect`` set, whichever store it wrote
+    (:func:`pmcp_introduced_keys`), and what a ``~/.env`` the startup walk
+    loaded introduced (:func:`dotenv_sourced_keys`). ``project`` no longer
+    changes the result; it is kept for callers.
     """
+    del project  # see above: a project store contributes nothing to strip
     env = child_process_env()
-    for key in managed_secret_keys(project):
-        env.pop(key, None)
-    for key in dotenv_sourced_keys():
+    strip = (
+        operator_managed_secret_keys() | pmcp_introduced_keys() | dotenv_sourced_keys()
+    )
+    for key in strip:
         env.pop(key, None)
     if own_env:
         env.update(own_env)

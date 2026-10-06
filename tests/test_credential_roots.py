@@ -411,7 +411,7 @@ B_ANSWERS: dict[str, object] = {
     "init": True,
     "secrets check": ["ONLY_A_TOKEN"],
     "header lookup": "from-b",
-    "tenant headers": "from-b",
+    "tenant headers": "tenant-from-b",
     "credential_lookup": "from-b",
 }
 
@@ -457,6 +457,11 @@ def test_every_consumer_answers_for_the_project_it_serves(
             # Only B has it, so `pmcp init` finding it means it read B.
             + ("TAVILY_API_KEY=from-b\n" if name == "b" else "")
         )
+        # A non-empty tenant store under BOTH roots (board round 10 codex F001:
+        # with B served, the tenant lookup read A's tenant store).
+        tenant = roots[name] / ".pmcp" / "tenants" / "t" / "pmcp.env"
+        tenant.parent.mkdir(parents=True)
+        tenant.write_text(f"BRAVE_API_KEY=tenant-from-{name}\n")
         mcp = roots[name] / ".mcp.json"
         mcp.write_text(
             '{"mcpServers": {"brave-search": {"command": "npx", '
@@ -800,3 +805,93 @@ def test_grok_f001_the_served_project_never_gets_the_launch_credential(
         )
     )
     assert "missing_env=ONLY_A_TOKEN" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# Board round 10, codex F001: the tenant lookup read the tenant store of the
+# working directory's project (repository_values(project=None) discovered the
+# cwd), so with B served, A's tenant credential answered for B. A project or
+# tenant store located with no explicit project is now the SERVED project's
+# (env_store.resolve_project_root). The lifecycle half is round 10's N-2.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("consumer", ["tenant", "lifecycle"])
+def test_codex_r10_f001_a_consumer_keeps_its_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, consumer: str
+) -> None:
+    """codex r10 F001, verbatim in substance."""
+    from types import SimpleNamespace
+
+    from pmcp.manifest.loader import ServerConfig
+    from pmcp.tools import handlers
+
+    key = "REVIEW_PROJECT_TOKEN"
+    home = tmp_path / "home"
+    home.mkdir()
+    a, b = tmp_path / "a", tmp_path / "b"
+    for root in (a, b):
+        (root / ".git").mkdir(parents=True)
+        (root / ".env.pmcp").write_text(f"{key}=from-{root.name}\n")
+        tenant = root / ".pmcp" / "tenants" / "acme" / "pmcp.env"
+        tenant.parent.mkdir(parents=True)
+        tenant.write_text(f"{key}=from-{root.name}\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(a)
+    cli.load_startup_env(dotenv_path=home / "absent.env")
+
+    if consumer == "tenant":
+        cli.serve_project(b)
+        result = resolve_remote_headers_for_tenant(
+            {"Authorization": "${" + key + "}"},
+            server_name="review-server",
+            tenant_id="acme",
+        )
+        actual = result.resolved_headers["Authorization"]
+    else:
+        server = ServerConfig(
+            name="review-server",
+            description="root-isolation probe",
+            keywords=[],
+            install={},
+            command="unused",
+            args=[],
+            requires_api_key=True,
+            env_var=key,
+        )
+        monkeypatch.setattr(
+            handlers,
+            "load_manifest",
+            lambda: SimpleNamespace(get_server=lambda name: server),
+        )
+        monkeypatch.setattr(
+            handlers,
+            "evaluate_provision",
+            lambda *args, **kwargs: SimpleNamespace(allowed=True),
+        )
+        gateway = handlers.GatewayTools.__new__(handlers.GatewayTools)
+        gateway._project_root = b
+        gateway._policy_manager = SimpleNamespace(is_server_allowed=lambda name: True)
+        gateway._load_all_configured_servers = lambda: {}
+        assert gateway._check_api_key_available(key)
+        config, failure, source = gateway._resolve_lifecycle_target(
+            server.name, action="connect", prior_status="offline"
+        )
+        assert failure is None and source == "manifest"
+        actual = config.config.env[key]
+
+    assert actual == "from-b", f"{consumer} used another project's credential"
+
+
+def test_an_unspecified_project_is_the_served_one(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every store located without a project: the served project's."""
+    _startup(roots)  # in a
+    assert env_store.resolve_project_root(None) == roots["a"]
+    cli.serve_project(roots["b"])
+    assert env_store.resolve_project_root(None) == roots["b"]
+    assert env_store.resolve_scope_path("project") == roots["b"] / ".env.pmcp"
+    # An explicit project is still that project.
+    assert env_store.resolve_project_root(roots["a"]) == roots["a"]

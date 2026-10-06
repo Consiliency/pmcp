@@ -5332,8 +5332,11 @@ class TestUpdateServerVersionRepair:
         probed" defect.
         """
         self._make_manifest_with_playwright(monkeypatch)
+        # The user store's names are what a spawn strips by name
+        # (env_store.operator_managed_secret_keys, Consiliency/pmcp#372 round 11).
         monkeypatch.setattr(
-            "pmcp.env_store.managed_secret_keys", lambda project=None: {"SECRET_TOKEN"}
+            "pmcp.env_store.operator_managed_secret_keys",
+            lambda: frozenset({"SECRET_TOKEN"}),
         )
         monkeypatch.setenv("SECRET_TOKEN", "value")
 

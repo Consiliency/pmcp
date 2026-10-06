@@ -1145,6 +1145,9 @@ SERVED_ROOT_CONSUMERS: dict[tuple[str, str], str] = {}
 _BASE_GATES: dict[str, tuple[str, int | None]] = {
     "credential_value": ("root", None),
     "credential_lookup": ("project", 0),
+    # A tenant or project store's values for credential_value(repository=...):
+    # the store of the project the caller serves (board round 10 codex F001).
+    "repository_values": ("project", None),
 }
 
 
@@ -1297,6 +1300,11 @@ def test_the_consumer_scan_sees_each_shape() -> None:
         "    return jobs.start(s)\n"
         "def start_for_one(jobs, s, p):\n"
         "    return jobs.start(s, p)\n"
+        # The tenant/project store reader: the caller's project, named.
+        "def tenant_for_nobody(t):\n"
+        "    return repository_values('tenant', tenant_id=t)\n"
+        "def tenant_for_one(t, p):\n"
+        "    return repository_values('tenant', project=p, tenant_id=t)\n"
     )
     sources = {"pmcp.x": source}
     assert consumer_gates(sources)["doctor"] == ("project_root", 1)
@@ -1309,4 +1317,5 @@ def test_the_consumer_scan_sees_each_shape() -> None:
         ("pmcp.x", "nested"),
         ("pmcp.x", "doctor_for_nobody"),
         ("pmcp.x", "start_for_nobody"),
+        ("pmcp.x", "tenant_for_nobody"),
     }

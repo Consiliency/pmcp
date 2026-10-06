@@ -287,7 +287,9 @@ def test_the_lenient_lookup_keeps_its_existing_caller_behaviour(
     assert env["PATH"] == "/usr/bin", "non-secret ambient vars survive"
 
     called = _called_names_in("sanitized_subprocess_env")
-    assert "managed_secret_keys" in called
+    # The user store's names only since Consiliency/pmcp#372 round 11: a
+    # repository's store names nothing a spawn strips.
+    assert "operator_managed_secret_keys" in called
     assert "managed_secret_keys_strict" not in called, (
         "the strict lookup belongs to the gate; routing the sanitiser through "
         "it would turn an unreadable project store into a failed server spawn"
@@ -324,15 +326,17 @@ def test_the_submission_outcome_field_defaults_to_none() -> None:
         SubmitFeedbackOutput(**required, submission_outcome="submitted")
 
 
-def test_the_new_registry_does_not_widen_the_dotenv_strip(
+def test_a_key_pmcp_put_into_its_environment_is_stripped_from_children(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The two registries are separate, and only one of them strips.
+    """The strip is by provenance (Consiliency/pmcp#372 round 11).
 
-    `dotenv_sourced_keys` has a merged consumer -- `sanitized_subprocess_env`
-    removes its keys from every spawned child (#229) -- so recording into the
-    new registry must not remove anything from a child's environment. The new
-    registry is read only by this phase's gate.
+    ``auth_connect`` sets the credential in pmcp's environment and records it
+    here; that record is what removes it from every other server's child
+    environment, now that a project store's NAMES strip nothing (board round 10
+    grok F001). Before, this registry deliberately stripped nothing and the
+    project store's names did the work -- including the operator's own exports
+    of any name a checkout listed.
     """
     home = tmp_path / "home"
     _write_user_store(home, "")
@@ -342,9 +346,7 @@ def test_the_new_registry_does_not_widen_the_dotenv_strip(
     record_pmcp_introduced_keys({PLANTED})
 
     assert PLANTED not in dotenv_sourced_keys()
-    assert sanitized_subprocess_env(project=tmp_path / "project")[PLANTED] == (
-        "planted-through-auth-connect"
-    )
+    assert PLANTED not in sanitized_subprocess_env(project=tmp_path / "project")
 
 
 def test_the_test_only_reset_seam_clears_the_registry() -> None:
