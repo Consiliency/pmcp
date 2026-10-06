@@ -160,3 +160,22 @@ def test_an_unchanged_store_is_not_rebuilt(
     for _ in range(5):
         assert env_store.credential_value("STEADY_TOKEN") == "x"
     assert len(calls) == built
+
+
+@pytest.mark.parametrize("file", [".env", ".env.pmcp"])
+def test_the_credential_check_sees_either_project_file_without_a_startup_load(
+    file: str, roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check's one project load builds the root's whole entry.
+
+    The handler names no project file list of its own: the builder reads both
+    checkout files, so a key in only ``.env`` is found as one in only
+    ``.env.pmcp`` is, with no startup load to have filled the map first.
+    """
+    from pmcp.tools.handlers import GatewayTools
+
+    monkeypatch.delenv("ONE_FILE_TOKEN", raising=False)
+    (roots["a"] / file).write_text("ONE_FILE_TOKEN=x\n")
+    check = GatewayTools._check_api_key_available
+    assert check(object(), "ONE_FILE_TOKEN") is True  # type: ignore[arg-type]
+    assert "ONE_FILE_TOKEN" not in os.environ

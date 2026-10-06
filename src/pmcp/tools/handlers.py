@@ -2669,16 +2669,15 @@ class GatewayTools:
         if credential_value(env_var):
             return True
 
-        # Check all env stores in priority order: project-local .env, then pmcp
-        # files. The two checkout files are repository-controlled and read
-        # confined to the project (Consiliency/pmcp#367): a link out of the
-        # checkout, or a fifo, reads as absent with one warning; the user store
-        # follows its link. The checkout files' values go to the credential map,
-        # never into the gateway's environment (env_store.load_store,
-        # Consiliency/pmcp#372 round 2). One store at a time: a key found early
-        # stops the loads.
+        # Load the working directory's project files, then the user store. The
+        # project load (re)builds the root's whole entry with the one builder
+        # (env_store._build_root_entry), which reads both checkout files --
+        # ``.env`` and ``.env.pmcp`` -- confined to the project
+        # (Consiliency/pmcp#367) and keeps their values in the credential map,
+        # never in the gateway's environment (Consiliency/pmcp#372 round 2).
+        # Which files a root has is the builder's to know, not this caller's.
+        # The user store follows its link. A key found early stops the loads.
         stores: list[tuple[Literal["project", "user"], Path | None]] = [
-            ("project", Path.cwd() / ".env"),
             ("project", Path.cwd() / ".env.pmcp"),
             ("user", None),
         ]
