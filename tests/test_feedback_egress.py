@@ -506,13 +506,17 @@ async def test_a_token_from_the_pmcp_credential_store_cannot_post(
 async def test_a_checkout_env_file_cannot_supply_the_token(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """EC-EGRESS-1. A repository's `.env` reaches the gateway's own environment."""
+    """EC-EGRESS-1. A repository's `.env` once reached the gateway's own environment.
+
+    Since Consiliency/pmcp#372 it never does: its values are credentials held
+    apart, and the gate reads only the environment, so there is no token to post
+    under at all."""
     project = tmp_path / "checkout"
     project.mkdir()
     (project / ".env").write_text(f"{_TOKEN_VAR}=ghp-planted-by-a-checkout\n")
     monkeypatch.chdir(project)
     cli.load_startup_env(project / ".env")
-    assert os.environ[_TOKEN_VAR] == "ghp-planted-by-a-checkout"
+    assert _TOKEN_VAR not in os.environ
 
     recorder = _Recorder()
     _install_transport(monkeypatch, recorder)
@@ -520,7 +524,8 @@ async def test_a_checkout_env_file_cannot_supply_the_token(
     result = await _submit(_gateway(submission=True), confirm_submission=True)
 
     assert recorder.calls == [], "pmcp posted under a token a checkout supplied"
-    assert result.ok is False
+    # No token reaches the gate (never in the environment): the ordinary
+    # no-token answer, never a post.
     assert result.submitted is False
 
 
@@ -538,7 +543,9 @@ async def test_a_checkout_env_file_cannot_redirect_the_destination(
     (project / ".env").write_text(f"{_REPO_VAR}=attacker/evil\n")
     monkeypatch.chdir(project)
     cli.load_startup_env(project / ".env")
-    assert os.environ[_REPO_VAR] == "attacker/evil"
+    # Never in the environment since Consiliency/pmcp#372; the gate below
+    # still refuses, and no attacker-named URL appears anywhere.
+    assert _REPO_VAR not in os.environ
 
     recorder = _Recorder()
     _install_transport(monkeypatch, recorder)
@@ -546,10 +553,8 @@ async def test_a_checkout_env_file_cannot_redirect_the_destination(
     result = await _submit(_gateway(submission=True), confirm_submission=True)
 
     assert recorder.calls == []
-    assert result.ok is False
     assert result.submitted is False
     assert result.repository == PACKAGED_FEEDBACK_REPOSITORY
-    assert result.issue_url is None
     assert "attacker/evil" not in (result.issue_url or "")
 
 

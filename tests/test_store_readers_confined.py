@@ -1764,3 +1764,13 @@ def test_a_project_store_entry_decides_by_membership_over_the_user_store(
     assert build_remote_header_env_lookup(lay["project"])("MEMBER372") is None
     _project_store(lay).write_text("OTHER372=x\n")
     assert build_remote_header_env_lookup(lay["project"])("MEMBER372") == "user"
+
+
+def test_the_feedback_gate_denies_a_dangling_project_store_link(
+    lay: dict[str, Path],
+) -> None:
+    """A symlinked project store is refused whatever it points at (or doesn't)."""
+    os.symlink("absent-target", _project_store(lay))
+    decision = _decide(lay["project"])
+    assert decision.submit_allowed is False
+    assert decision.reason == "gate_error"
