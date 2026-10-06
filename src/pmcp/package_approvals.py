@@ -40,10 +40,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 
+from pmcp import atomic_write as _atomic_write_module
 from pmcp.atomic_write import (
     atomic_write,
     is_absent,
     make_store_dirs,
+    open_final_directory,
     resolve_write_target,
 )
 from pmcp.trust_store import (
@@ -108,12 +110,27 @@ def package_approvals_path() -> Path:
     """
     path = trust_store_path().parent / PACKAGE_APPROVALS_FILENAME
     try:
-        target = resolve_write_target(path)
+        if is_absent(path.parent):
+            # A fresh install: no store, no link to follow. Judge where it will
+            # be created (the residency walk steps up across plain names).
+            fd, target = None, os.fspath(path)
+        elif _atomic_write_module._DIR_FD_SUPPORTED:
+            # The directory the writer will actually write in, reached hop by
+            # hop (no pathname grows), judged by identity from its descriptor.
+            fd, _name = open_final_directory(path)
+        else:
+            fd, target = None, resolve_write_target(path)
     except OSError as exc:
         raise TrustStoreError(
             f"Cannot resolve {path.name}: {os.strerror(exc.errno) if exc.errno else exc}"
         ) from exc
-    refuse_checkout_resident(target, "Package approvals")
+    try:
+        refuse_checkout_resident(
+            target if fd is None else path, "Package approvals", dir_fd=fd
+        )
+    finally:
+        if fd is not None:
+            os.close(fd)
     return path
 
 

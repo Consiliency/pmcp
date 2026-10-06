@@ -612,3 +612,84 @@ def test_secrets_set_on_a_user_store_the_kernel_refuses_keeps_every_key(
     )
     assert out["ok"] is False
     assert (base / "real-config" / "target.env").read_bytes() == b"KEEP=original\n"
+
+
+# --------------------------------------------------------------------------- #
+# Round 10 (codex F002): a chain of long RELATIVE link texts whose joined
+# length passes PATH_MAX still resolves for the kernel, so it must for the
+# writer: the descriptor walk never builds a pathname longer than one link.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("repeats", [10, 300, 450, 800])
+def test_a_long_relative_chain_agrees_with_the_kernel(
+    repeats: int, tmp_path: Path
+) -> None:
+    root = Path(os.path.realpath(tmp_path))
+    for side in ("kernel", "writer"):
+        base = root / side
+        (base / "d").mkdir(parents=True)
+        (base / "target.env").write_bytes(b"KEEP=original\n")
+        os.symlink("d/../" * repeats + "target.env", base / "hop")
+        os.symlink("d/../" * repeats + "hop", base / "store.env")
+    kernel_refused = _kernel_write(str(root / "kernel" / "store.env"))
+    try:
+        atomic_write(root / "writer" / "store.env", DATA, confine_to=None)
+        writer_refused = False
+    except OSError:
+        writer_refused = True
+    assert writer_refused == kernel_refused, repeats
+    assert _tree(root / "writer") == _tree(root / "kernel"), repeats
+
+
+def test_the_long_chain_grid_passes_path_max_when_joined() -> None:
+    """Positive control: the longest case's joined text is past PATH_MAX."""
+    joined = len(("d/../" * 800 + "hop")) + len(("d/../" * 800 + "target.env"))
+    assert joined > os.pathconf("/", "PC_PATH_MAX")
+
+
+# --------------------------------------------------------------------------- #
+# Round 10 (claude N-1): without O_PATH, a write-and-search-only (0300/0311)
+# target directory is written, as the kernel allows.
+# --------------------------------------------------------------------------- #
+
+
+@needs_non_root
+@pytest.mark.parametrize("dir_mode", [0o300, 0o311, 0o700])
+@pytest.mark.parametrize("o_path", [True, False], ids=["O_PATH", "no O_PATH"])
+@pytest.mark.parametrize("shape", ["plain store", "linked store"])
+def test_a_search_and_write_only_target_directory_agrees_with_the_kernel(
+    shape: str,
+    o_path: bool,
+    dir_mode: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if o_path and not writer._O_PATH:
+        pytest.skip("no O_PATH")
+    if not o_path:
+        monkeypatch.setattr(writer, "_O_PATH", 0)
+    root = Path(os.path.realpath(tmp_path))
+    stores = {}
+    for side in ("kernel", "writer"):
+        base = root / side
+        (base / "vault").mkdir(parents=True)
+        (base / "vault" / "pmcp.env").write_bytes(b"KEEP=original\n")
+        store = base / "vault" / "pmcp.env"
+        if shape == "linked store":
+            os.symlink("vault/pmcp.env", base / "link.env")
+            store = base / "link.env"
+        stores[side] = store
+        os.chmod(base / "vault", dir_mode)
+    try:
+        kernel_refused = _kernel_write(str(stores["kernel"]))
+        try:
+            atomic_write(stores["writer"], DATA, confine_to=None)
+            writer_refused = False
+        except OSError:
+            writer_refused = True
+    finally:
+        for side in ("kernel", "writer"):
+            os.chmod(root / side / "vault", 0o700)
+    assert writer_refused == kernel_refused, (shape, oct(dir_mode), o_path)
+    assert _tree(root / "writer") == _tree(root / "kernel")

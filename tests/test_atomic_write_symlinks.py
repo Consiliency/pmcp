@@ -297,7 +297,9 @@ def test_a_dangling_symlink_into_a_missing_directory_is_refused(
     target = dotfiles / "missing-dir" / "file"
     link = _link(site.path(_home()), target)
 
-    with pytest.raises(FileNotFoundError):
+    # package_approvals.json: its residency check opens the final directory
+    # first, and reports the missing one as a TrustStoreError.
+    with pytest.raises((FileNotFoundError, TrustStoreError)):
         site.write(link)
 
     assert os.path.islink(link) and os.readlink(link) == str(target)

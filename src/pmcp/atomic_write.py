@@ -10,14 +10,20 @@ a write that fails partway leaves the old file byte-intact (Consiliency/pmcp#248
 The module does NOT reimplement the kernel's path resolution. Two rules, each
 small enough to leave every hard case to the kernel:
 
-**Operator-owned files (``confine_to=None``): follow the final link chain by
-pathname.** Users keep ``~/.config/pmcp/pmcp.env`` and friends in a dotfiles
+**Operator-owned files (``confine_to=None``): follow the final link chain, hop
+by hop.** Users keep ``~/.config/pmcp/pmcp.env`` and friends in a dotfiles
 repository and symlink them into place; replacing the link would stop the
 dotfiles copy from receiving updates (the #248 regression against 2.7.3). So
 only the final component's chain is followed: ``lstat`` it; if it is a link,
-``readlink`` and join the text to the link's directory with plain
-``os.path.join`` -- no ``normpath``, no ``realpath`` of any strictness -- and
-loop, up to 40 hops (``ELOOP``). Every syscall gets the user's own spelling, so
+``readlink`` it relative to the descriptor of the directory holding it and open
+the directory part of its text, spelled exactly as the link spells it, relative
+to that descriptor -- no ``normpath``, no ``realpath`` of any strictness, and no
+pathname longer than one link's own text, so a chain the kernel resolves is
+never refused for ``ENAMETOOLONG``; up to 40 hops (``ELOOP``). Where ``dir_fd``
+is unavailable, or opening a directory for the walk needs read permission the
+kernel's lookup does not (no ``O_PATH``), the texts are joined into one
+pathname instead, with ``PATH_MAX`` as that fallback's residual. Every syscall
+gets the user's own spelling, so
 the kernel applies its own rules to ``missing/..``, ``file/..``, ``//``,
 mode-000 and search-only directories, and to a target that ends in a
 separator. Before any of that the whole path is ``stat``-ed once, so the
@@ -146,6 +152,63 @@ def resolve_write_target(path: Path | str) -> str:
             raise IsADirectoryError(errno.EISDIR, "Is a directory", current)
         return current
     raise OSError(errno.ELOOP, "Too many levels of symbolic links", os.fspath(path))
+
+
+def open_final_directory(path: Path | str) -> tuple[int, str]:
+    """``(directory descriptor, name)`` of the file an unconfined write replaces.
+
+    The kernel decides first (``os.stat`` of the whole path, as in
+    :func:`resolve_write_target`). Then the final link chain is followed HOP BY
+    HOP through descriptors: the directory holding the current link is held open,
+    the link is read relative to it, and the directory part of its text -- spelled
+    exactly as the link spells it -- is opened relative to that descriptor (an
+    absolute one from ``/``). No pathname ever grows past one link's own text, so
+    a chain the kernel resolves is never refused for ``ENAMETOOLONG``
+    (Consiliency/pmcp#366 round 10). The caller owns the descriptor.
+    """
+    spelled = os.fspath(path)
+    try:
+        os.stat(spelled)
+    except FileNotFoundError:
+        pass  # absent target: the chain below names the file to create
+    fd = os.open(os.path.dirname(spelled) or os.curdir, _walk_flags())
+    name = os.path.basename(spelled)
+    handed_over = False
+    try:
+        for _hop in range(_MAX_LINK_HOPS + 1):
+            if name == "":
+                raise IsADirectoryError(errno.EISDIR, "Is a directory", spelled)
+            try:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                break
+            if stat.S_ISLNK(st.st_mode):
+                text = os.readlink(name, dir_fd=fd)
+                head, name = os.path.dirname(text), os.path.basename(text)
+                if head:
+                    following = os.open(head, _walk_flags(), dir_fd=fd)
+                    os.close(fd)
+                    fd = following
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                raise IsADirectoryError(errno.EISDIR, "Is a directory", spelled)
+            break
+        else:
+            raise OSError(errno.ELOOP, "Too many levels of symbolic links", spelled)
+        handed_over = True
+        return fd, name
+    finally:
+        if not handed_over:
+            os.close(fd)
+
+
+def _where(fd: int, name: str, fallback: Path | str) -> str:
+    """A display path for what was written: the descriptor's real path where the
+    platform can name it, else the path as given. Never used for a syscall."""
+    try:
+        return os.path.join(os.readlink(f"/proc/self/fd/{fd}"), name)
+    except OSError:
+        return os.fspath(fallback)
 
 
 def is_absent(path: Path | str) -> bool:
@@ -357,8 +420,34 @@ def atomic_write(
     directory ``fsync``-ed best effort. Returns the path actually written.
     """
     if confine_to is None:
+        if _DIR_FD_SUPPORTED:
+            try:
+                fd, name = open_final_directory(path)
+            except PermissionError:
+                # Without O_PATH, opening a directory needs READ permission the
+                # kernel's own lookup does not (a 0300/0311 directory): write by
+                # pathname instead, which needs only search, as the kernel does.
+                if _O_PATH:
+                    raise
+            else:
+                try:
+                    _write_in_dir(
+                        fd, name, data, mode=mode, prefix=prefix, suffix=suffix
+                    )
+                    return Path(_where(fd, name, path))
+                finally:
+                    os.close(fd)
+        # No dir_fd: the pathname join, whose residual is PATH_MAX on a chain of
+        # long relative link texts (the descriptor walk above has none).
         target = resolve_write_target(path)
-        _write_by_path(target, data, mode=mode, prefix=prefix, suffix=suffix)
+        _write_by_name(
+            os.path.dirname(target) or os.curdir,
+            os.path.basename(target),
+            data,
+            mode=mode,
+            prefix=prefix,
+            suffix=suffix,
+        )
         return Path(target)
     walk = _walk_confined(path, confine_to, confine_label)
     try:
@@ -432,6 +521,7 @@ _DIR_FD_SUPPORTED = (
     and os.unlink in os.supports_dir_fd
     and os.stat in os.supports_dir_fd
     and os.stat in os.supports_follow_symlinks
+    and os.readlink in os.supports_dir_fd
     and hasattr(os, "O_DIRECTORY")
     and hasattr(os, "O_NOFOLLOW")
 )
@@ -462,7 +552,7 @@ def _write_by_path(
 
 def _write_by_name(
     parent: str, name: str, data: bytes, *, mode: int, prefix: str, suffix: str
-) -> None:  # pragma: no cover - exercised only where dir_fd is unavailable
+) -> None:
     """The no-``dir_fd`` form of :func:`_write_in_dir`: plain joins, never normalised."""
     tmp = os.path.join(parent, f"{prefix}{secrets.token_hex(8)}{suffix}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
@@ -470,6 +560,8 @@ def _write_by_name(
     committed = False
     try:
         with os.fdopen(fd, "wb") as handle:
+            if hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), mode)
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())

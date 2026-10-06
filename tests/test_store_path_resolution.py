@@ -552,3 +552,113 @@ def test_residency_that_cannot_be_established_is_a_refusal(
     monkeypatch.setattr(os, "open", failing_open)
     with pytest.raises(TrustStoreError, match="cannot establish"):
         trust_store.refuse_checkout_resident(store, "Trust store")
+
+
+# --------------------------------------------------------------------------- #
+# Round 10: the residency walk without dir_fd/O_DIRECTORY (Windows), and a
+# served project root that does not exist yet.
+# --------------------------------------------------------------------------- #
+
+
+def _windows_os():  # type: ignore[no-untyped-def]
+    from types import SimpleNamespace
+
+    windows = SimpleNamespace(
+        **{n: getattr(os, n) for n in dir(os) if n not in {"O_DIRECTORY", "O_PATH"}}
+    )
+    windows.name = "nt"
+    windows.supports_dir_fd = set()
+    return windows
+
+
+def _planted_store(base: Path) -> tuple[Path, Path, bytes]:
+    import hashlib
+    import json
+
+    checkout = base / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    config = checkout / ".mcp.json"
+    content = b"{}"
+    config.write_bytes(content)
+    planted = checkout / "trust.json"
+    planted.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "records": [
+                    {
+                        "absolute_path": str(config),
+                        "content_sha256": hashlib.sha256(content).hexdigest(),
+                        "scope": "user",
+                        "decision": "approved",
+                        "recorded_at": "2026-10-05T00:00:00+00:00",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return checkout, planted, content
+
+
+def test_the_windows_residency_fallback_refuses_a_planted_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import trust_store
+
+    base = Path(os.path.realpath(tmp_path))
+    checkout, planted, content = _planted_store(base)
+    home = base / "home"
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    os.symlink(planted, home / ".config" / "pmcp" / "trust.json")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (checkout,))
+    monkeypatch.setattr(trust_store, "os", _windows_os())
+    assert not trust_store.is_approved(checkout / ".mcp.json", content)
+
+
+def test_the_windows_residency_fallback_refuses_on_any_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import trust_store
+    from pmcp.trust_store import TrustStoreError
+
+    base = Path(os.path.realpath(tmp_path))
+    (base / "checkout").mkdir()
+    store = base / "home" / "trust.json"
+    store.parent.mkdir()
+    windows = _windows_os()
+    real_stat = os.stat
+
+    def failing_stat(p: object, *a: object, **kw: object) -> os.stat_result:
+        if Path(os.fspath(p)) == base:  # an ancestor the walk must compare
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_stat(p, *a, **kw)  # type: ignore[arg-type]
+
+    windows.stat = failing_stat
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (base / "checkout",))
+    monkeypatch.setattr(trust_store, "os", windows)
+    with pytest.raises(TrustStoreError, match="cannot establish"):
+        trust_store.refuse_checkout_resident(store, "Trust store")
+
+
+@pytest.mark.parametrize("walk", ["descriptors", "windows fallback"])
+def test_a_served_root_that_does_not_exist_yet_refuses_nothing(
+    walk: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 10 N-2: a missing root holds no store; the user's own stays usable."""
+    from pmcp import trust_store
+
+    base = Path(os.path.realpath(tmp_path))
+    home = base / "home"
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(
+        trust_store, "_checkout_roots", lambda: (base / "not-created-yet",)
+    )
+    if walk == "windows fallback":
+        monkeypatch.setattr(trust_store, "os", _windows_os())
+    approved = base / "x.json"
+    approved.write_bytes(b"{}")
+    trust_store.record(approved, b"{}", trust_store.PROJECT_SCOPE, trust_store.APPROVED)
+    assert trust_store.is_approved(approved, b"{}")

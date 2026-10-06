@@ -242,16 +242,20 @@ def trust_store_path() -> Path:
     return path
 
 
-def refuse_checkout_resident(path: Path | str, label: str) -> None:
+def refuse_checkout_resident(
+    path: Path | str, label: str, *, dir_fd: int | None = None
+) -> None:
     """Raise ``TrustStoreError`` if ``path``'s directory lies inside a judged checkout.
 
     By FILE IDENTITY, never path strings (``//x`` and ``/x`` are one directory
     but compare unequal), and FAIL CLOSED: if residency cannot be established
-    for any reason, the store is refused. See :func:`_resident_checkout`.
+    for any reason, the store is refused. ``dir_fd``, when given, is an open
+    descriptor of the store's directory (the writer's own chain follower hands
+    one over), judged instead of ``path``'s. See :func:`_resident_checkout`.
     """
     name = os.path.basename(os.fspath(path))
     try:
-        checkout = _resident_checkout(path, _checkout_roots())
+        checkout = _resident_checkout(path, _checkout_roots(), dir_fd=dir_fd)
     except OSError as exc:
         raise TrustStoreError(
             f"{label} {name}: cannot establish that it lies outside every "
@@ -270,40 +274,70 @@ def refuse_checkout_resident(path: Path | str, label: str) -> None:
 _MAX_ANCESTORS = 4096
 
 
-def _resident_checkout(path: Path | str, checkouts: tuple[Path, ...]) -> Path | None:
+def _resident_checkout(
+    path: Path | str, checkouts: tuple[Path, ...], *, dir_fd: int | None = None
+) -> Path | None:
     """The checkout whose root is an ancestor of ``path``'s directory, or ``None``.
 
-    Walked by DESCRIPTORS, never by growing a path string (`a/../..` past
-    ``PATH_MAX`` fails with ``ENAMETOOLONG``, which an earlier walk read as
-    "outside"): open the store's directory, then ``..`` relative to each
-    directory reached, comparing ``(st_dev, st_ino)`` with every checkout
-    root's, until a directory is its own parent (``/``). A store directory not
-    created yet is judged by the nearest existing directory above it, found by
-    stepping only across plain names. Any other error raises: residency is then
-    unknown, and the caller refuses.
+    Walked by DESCRIPTORS where the platform has them, never by growing a path
+    string (``a/../..`` past ``PATH_MAX`` fails with ``ENAMETOOLONG``, which an
+    earlier walk read as "outside"): from the store's directory, ``..`` relative
+    to each directory reached, comparing ``(st_dev, st_ino)`` with every
+    checkout root's, until a directory is its own parent. Without ``dir_fd`` /
+    ``O_DIRECTORY`` (Windows) the store's directory is resolved strictly and its
+    ``parents`` are compared by the same identity (Windows fills ``st_dev`` /
+    ``st_ino`` from the volume serial and file index). A checkout root that does
+    not exist (a served project not created yet) is skipped. A store directory
+    not created yet is judged by the nearest existing directory above it, found
+    by stepping only across plain names. Any other error raises: residency is
+    then unknown, and the caller refuses.
     """
     roots = []
     for checkout in checkouts:
+        if is_absent(checkout):
+            continue  # nothing can live inside a root that does not exist
         st = os.stat(checkout)
         roots.append(((st.st_dev, st.st_ino), checkout))
+    if not roots:
+        return None
+
+    def match(st: os.stat_result) -> Path | None:
+        for ident, checkout in roots:
+            if (st.st_dev, st.st_ino) == ident:
+                return checkout
+        return None
+
+    by_fd = hasattr(os, "O_DIRECTORY") and bool(os.supports_dir_fd)
+    if dir_fd is not None and by_fd:
+        fd = os.dup(dir_fd)
+    else:
+        current = os.path.dirname(os.fspath(path)) or os.curdir
+        while True:
+            try:
+                os.stat(current)
+                break
+            except FileNotFoundError:
+                name = os.path.basename(current)
+                parent = os.path.dirname(current)
+                if name in ("", os.curdir, os.pardir) or parent == current:
+                    raise
+                current = parent
+        if not by_fd:
+            real = Path(os.path.realpath(current, strict=True))
+            for ancestor in (real, *real.parents):
+                found = match(os.stat(ancestor))
+                if found is not None:
+                    return found
+            return None
+        flags = (getattr(os, "O_PATH", 0) or os.O_RDONLY) | os.O_DIRECTORY
+        fd = os.open(current, flags)
     flags = (getattr(os, "O_PATH", 0) or os.O_RDONLY) | os.O_DIRECTORY
-    current = os.path.dirname(os.fspath(path)) or os.curdir
-    while True:
-        try:
-            fd = os.open(current, flags)
-            break
-        except FileNotFoundError:
-            name = os.path.basename(current)
-            parent = os.path.dirname(current)
-            if name in ("", os.curdir, os.pardir) or parent == current:
-                raise
-            current = parent
     try:
         for _ in range(_MAX_ANCESTORS):
             here = os.fstat(fd)
-            for ident, checkout in roots:
-                if (here.st_dev, here.st_ino) == ident:
-                    return checkout
+            found = match(here)
+            if found is not None:
+                return found
             up = os.open(os.pardir, flags, dir_fd=fd)
             above = os.fstat(up)
             os.close(fd)
