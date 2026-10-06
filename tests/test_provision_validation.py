@@ -254,7 +254,7 @@ class TestProvisionStatusHandoff:
         monkeypatch.setattr(
             handlers_module,
             "load_manifest",
-            lambda: SimpleNamespace(
+            lambda **_k: SimpleNamespace(
                 get_server=lambda _n: SimpleNamespace(env_var=None)
             ),
         )

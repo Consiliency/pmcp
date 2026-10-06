@@ -215,7 +215,7 @@ def _gateway(
         discovery_queue_path=".mcp-gateway/discovery_queue.json",
     )
     jobs = _RecordingJobManager()
-    monkeypatch.setattr(handlers_module, "load_manifest", lambda: manifest)
+    monkeypatch.setattr(handlers_module, "load_manifest", lambda **_k: manifest)
     monkeypatch.setattr(handlers_module, "load_configs", lambda **_: [])
     monkeypatch.setattr(handlers_module, "get_job_manager", lambda: jobs)
     gateway = GatewayTools(

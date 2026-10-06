@@ -180,7 +180,7 @@ class TestProvisionRoutingAllServers:
         fake_jm = MagicMock()
         fake_jm.start_install = AsyncMock(return_value="fake-job-id")
 
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: _manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: _manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.setattr("pmcp.tools.handlers.get_job_manager", lambda: fake_jm)
 
@@ -201,7 +201,7 @@ class TestProvisionRoutingAllServers:
         fake_jm = MagicMock()
         fake_jm.start_install = AsyncMock(return_value="fake-job-id")
 
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: _manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: _manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.setattr("pmcp.tools.handlers.get_job_manager", lambda: fake_jm)
         monkeypatch.setattr(tools, "_save_provisioned_registry", lambda: None)
@@ -219,7 +219,7 @@ class TestProvisionRoutingAllServers:
         """API-key servers with no key set should return auth_required=True."""
         tools = _make_gateway_tools()
 
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: _manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: _manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
         # Force all env-var checks to miss

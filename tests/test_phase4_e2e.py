@@ -78,7 +78,7 @@ async def test_clisoak_request_capability_one_call_returns_direct_cli_guidance(
         discovery_queue_path=".mcp-gateway/discovery_queue.json",
     )
 
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
     monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
     gateway = GatewayTools(
@@ -156,7 +156,7 @@ async def test_clisoak_catalog_search_one_call_returns_direct_cli_hint(
     )
     manager._servers["github"] = github_status
 
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
 
     gateway = GatewayTools(
         client_manager=manager,
@@ -408,7 +408,7 @@ async def test_auth_soak_local_api_key_provision_connect_retry_smoke(
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.chdir(project)
     monkeypatch.delenv("SOAK_TEST_KEY", raising=False)
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
     monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
     monkeypatch.setattr("pmcp.tools.handlers.get_job_manager", lambda: FakeJobManager())
     monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)

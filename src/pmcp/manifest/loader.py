@@ -1645,7 +1645,7 @@ def _find_project_manifest(project_root: Path | None = None) -> Path | None:
         if root is None:
             return None
         current = root.resolve()
-    except OSError:
+    except (OSError, RuntimeError):  # RuntimeError: a link loop, before 3.13
         return None
     candidate = current / ".pmcp" / "manifest.yaml"
     if candidate.exists():

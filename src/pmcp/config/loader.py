@@ -260,9 +260,13 @@ def find_project_root(start_dir: Path) -> Path | None:
         # Check for .mcp.json
         if (current / ".mcp.json").exists():
             return current
-        # Check for common project markers
+        # Check for common project markers -- and a project overlay, which
+        # makes its directory a pmcp project whatever else it holds
+        # (Consiliency/pmcp#372 round 12: the overlay is found at the project
+        # root every other project input follows, so its directory is one).
         if (
-            (current / ".git").exists()
+            (current / ".pmcp" / "manifest.yaml").exists()
+            or (current / ".git").exists()
             or (current / "package.json").exists()
             or (current / "pyproject.toml").exists()
         ):
@@ -1152,7 +1156,13 @@ def load_configs(
     try:
         from pmcp.manifest.loader import load_manifest
 
-        manifest_servers = load_manifest(project_root=project_root).servers
+        # The project overlay of this load's project (Consiliency/pmcp#372
+        # round 12); with none, the served project's.
+        manifest_servers = (
+            load_manifest()
+            if project_root is None
+            else load_manifest(project_root=project_root)
+        ).servers
     except Exception as e:
         # Class only: an error's text can quote overlay input
         # (Consiliency/pmcp#342 rev 5).

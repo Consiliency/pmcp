@@ -282,8 +282,8 @@ def test_the_bytes_hashed_are_the_bytes_parsed(
     path = _user_overlay(_pin("3.25.5"))
     real = loader._gather_overlay_sources
 
-    def gather_then_rewrite(notices: list[str]) -> Any:
-        sources = real(notices)
+    def gather_then_rewrite(notices: list[str], project_root: Any = None) -> Any:
+        sources = real(notices, project_root)
         path.write_text(_pin("9.9.9"))
         return sources
 

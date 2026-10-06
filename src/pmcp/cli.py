@@ -114,6 +114,21 @@ def setup_logging(
             pass
 
 
+def _manifest_for(project_root: Path | None) -> Any:
+    """``load_manifest`` for ``project_root``; ``None`` is the served project.
+
+    The project overlay follows the same root as the credentials
+    (Consiliency/pmcp#372 round 12). With no project the call stays
+    ``load_manifest()``, which reads the served project's overlay. Imported at
+    call time, as ``run_init`` always did, so a patched loader is the one used.
+    """
+    from pmcp.manifest.loader import load_manifest as _load_manifest
+
+    if project_root is None:
+        return _load_manifest()
+    return _load_manifest(project_root=project_root)
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     examples = """Examples:
@@ -1665,8 +1680,6 @@ async def run_init(args: argparse.Namespace) -> None:
     """Initialize PMCP configuration."""
     import json
 
-    from pmcp.manifest.loader import load_manifest
-
     # The project named, else the one this process serves (Consiliency/pmcp#372
     # round 12): a project-scoped output follows the same root as every input.
     project_dir = resolve_project_root(args.project)
@@ -1682,7 +1695,7 @@ async def run_init(args: argparse.Namespace) -> None:
 
     # Load manifest to get available servers
     try:
-        manifest = load_manifest(project_root=project_dir)
+        manifest = _manifest_for(project_dir)
         available_servers = list(manifest.servers.keys())
     except Exception:
         manifest = None

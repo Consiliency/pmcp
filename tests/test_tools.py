@@ -615,7 +615,7 @@ def patch_refresh_config_sources(
         discovery_queue_path=".mcp-gateway/discovery_queue.json",
     )
     monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
     monkeypatch.setattr(
         "pmcp.tools.handlers.load_enabled_auto_start",
         lambda **_: set(),
@@ -677,7 +677,7 @@ class TestRefreshCompatibility:
         )
 
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_enabled_auto_start",
             lambda **_: set(),
@@ -740,7 +740,7 @@ class TestRefreshCompatibility:
         )
 
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_enabled_auto_start",
             lambda **_: {"configured"},
@@ -787,7 +787,7 @@ class TestRefreshCompatibility:
 
         monkeypatch.setenv("PMCP_LEGACY_MANIFEST_AUTOSTART", "1")
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_enabled_auto_start",
             lambda **_: set(),
@@ -832,7 +832,7 @@ class TestRefreshCompatibility:
         )
 
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_enabled_auto_start",
             lambda **_: set(),
@@ -929,7 +929,7 @@ class TestRefreshCompatibility:
             policy_manager=PolicyManager(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_enabled_auto_start", lambda **_: set()
         )
@@ -1857,7 +1857,7 @@ class TestCatalogSearch:
         )
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_manifest",
-            lambda: Manifest(
+            lambda **_k: Manifest(
                 version="1.0",
                 cli_alternatives={},
                 servers={},
@@ -1928,7 +1928,7 @@ class TestServerLifecycleTools:
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
         policy_manager.is_server_allowed = lambda name: name != "denied"  # type: ignore[method-assign]
         return gateway_tools
@@ -2051,7 +2051,7 @@ class TestServerLifecycleTools:
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
         fake_jm = types.SimpleNamespace(start_install=pytest.fail)
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.setattr("pmcp.tools.handlers.get_job_manager", lambda: fake_jm)
 
@@ -2649,7 +2649,7 @@ class TestHealth:
         monkeypatch.delenv("SOAK_TEST_KEY", raising=False)
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_manifest",
-            lambda: Manifest(
+            lambda **_k: Manifest(
                 version="1.0",
                 cli_alternatives={},
                 servers={
@@ -2973,7 +2973,7 @@ class TestHealth:
             }
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_enabled_auto_start",
             lambda **_: set(),
@@ -3595,7 +3595,7 @@ class TestCapabilityAndProvision:
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
 
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -3640,7 +3640,7 @@ class TestCapabilityAndProvision:
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
 
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
@@ -3696,7 +3696,7 @@ class TestCapabilityAndProvision:
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
 
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.delenv("API_TOKEN", raising=False)
         monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
@@ -3752,7 +3752,7 @@ class TestCapabilityAndProvision:
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
 
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.delenv("API_TOKEN", raising=False)
         monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
@@ -3802,7 +3802,7 @@ class TestCapabilityAndProvision:
         async def start_install(*args: object, **kwargs: object) -> str:
             return "job-auth-soak"
 
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.setattr(
             "pmcp.tools.handlers.get_job_manager",
@@ -4233,7 +4233,7 @@ class TestCapabilityAndProvision:
             },
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
         result = await gateway_tools.provision({"server_name": "remote-auth"})
@@ -4310,7 +4310,7 @@ class TestCapabilityAndProvision:
             servers={},
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
         # A discovered server only provisions pinned to an approved identity
@@ -4382,7 +4382,7 @@ class TestCapabilityAndProvision:
             },
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         probe_calls: dict[str, object] = {}
 
         def _fake_probe(command, env=None):
@@ -4459,7 +4459,7 @@ class TestCapabilityAndProvision:
             },
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
 
         async def fake_get_package_version(
             command, args, env=None, cwd=None, timeout=5.0
@@ -4759,7 +4759,7 @@ class TestSearchRegistryAndRegister:
         fake_npm_registry["@modelcontextprotocol/server-github"] = "2025.4.8"
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_manifest",
-            lambda: Manifest(
+            lambda **_k: Manifest(
                 version="1.0",
                 cli_alternatives={},
                 servers={},
@@ -4814,7 +4814,7 @@ class TestSearchRegistryAndRegister:
         )
         fake_jm = types.SimpleNamespace(start_install=pytest.fail)
 
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.setattr("pmcp.tools.handlers.get_job_manager", lambda: fake_jm)
         monkeypatch.setattr(gateway_tools, "_save_provisioned_registry", lambda: None)
@@ -4990,7 +4990,7 @@ class TestUpdateServerVersionRepair:
             },
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         # _resolve_lifecycle_config (used by the real gateway.restart_server
         # call update_server now makes) checks configured .mcp.json entries
         # before the manifest -- return none, so "playwright" resolves via
@@ -5452,7 +5452,7 @@ class TestUpdateServerVersionRepair:
                 servers={},
                 discovery_queue_path=".mcp-gateway/discovery_queue.json",
             )
-            monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: empty)
+            monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: empty)
             return (True, "ok")
 
         monkeypatch.setattr(
@@ -6865,7 +6865,7 @@ class TestUpdateServerAmbientEnvironment:
             },
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         # Keep the strip hermetic: unpatched, sanitized_subprocess_env reads the
         # operator's real ~/.config/pmcp store inside the guard. Empty also makes

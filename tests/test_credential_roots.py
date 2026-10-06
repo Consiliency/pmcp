@@ -863,7 +863,7 @@ def test_codex_r10_f001_a_consumer_keeps_its_project(
         monkeypatch.setattr(
             handlers,
             "load_manifest",
-            lambda: SimpleNamespace(get_server=lambda name: server),
+            lambda **_k: SimpleNamespace(get_server=lambda name: server),
         )
         monkeypatch.setattr(
             handlers,
@@ -1111,3 +1111,47 @@ def test_the_gateway_and_the_cli_read_the_served_project(
         asyncio.run(cli.run_init(argparse.Namespace(project=project, force=True)))
     assert (roots["b"] / ".mcp.json").exists()
     assert "local-a" in (roots["a"] / ".mcp.json").read_text()
+
+
+@pytest.mark.parametrize("mode", ["served", "explicit"])
+def test_secrets_check_reads_the_served_projects_manifest_overlay(
+    mode: str, roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``pmcp secrets check`` asks for the header keys of B's overlay, not A's."""
+    import json
+
+    from pmcp import trust_store
+
+    monkeypatch.delenv("PMCP_MANIFEST_PATH", raising=False)
+    for name in ("a", "b"):
+        overlay = roots[name] / ".pmcp" / "manifest.yaml"
+        overlay.parent.mkdir(exist_ok=True)
+        var = f"OVERLAY_{name.upper()}_TOKEN"
+        monkeypatch.delenv(var, raising=False)
+        overlay.write_text(
+            json.dumps(
+                {
+                    "servers": {
+                        "review-remote": {
+                            "description": "Project-specific remote",
+                            "keywords": ["review"],
+                            "transport": "streamable-http",
+                            "url": f"https://{name}.example.invalid/mcp",
+                            "headers": {"Authorization": "Bearer ${" + var + "}"},
+                        }
+                    }
+                }
+            )
+        )
+        trust_store.record(
+            overlay, overlay.read_bytes(), "project", trust_store.APPROVED
+        )
+    _startup(roots)  # in a
+    if mode == "served":
+        cli.serve_project(roots["b"])
+        project = None
+    else:
+        project = roots["b"]
+    report = asyncio.run(secrets.run_secrets_check(argparse.Namespace(project=project)))
+    assert "OVERLAY_B_TOKEN" in report["missing_keys"]
+    assert "OVERLAY_A_TOKEN" not in report["missing_keys"]

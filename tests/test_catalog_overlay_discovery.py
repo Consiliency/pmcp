@@ -844,7 +844,7 @@ def test_guard_refresh_survives_an_unusable_server(
 ) -> None:
     tools = _refresh_tools(monkeypatch)
     manifest = _with({"bad": _bad_server(command=5)})
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
     assert asyncio.run(tools.refresh({"reason": "test"})).ok is True
 
 
@@ -946,7 +946,7 @@ def test_the_marked_entries_load_when_no_consumer_is_stricter() -> None:
 
 
 def _request(monkeypatch: pytest.MonkeyPatch, manifest: Manifest, query: str) -> Any:
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
     return asyncio.run(_gateway().request_capability({"query": query}))
 
 
@@ -1459,7 +1459,7 @@ def test_guard_configured_default_inheritance_contains_one_entry(
     """The second line: a manifest that bypassed the overlay check."""
     bad = _bad_server(name="remote-bad", args=5, url="https://example.invalid/mcp")
     manifest = _with({"remote-bad": bad})
-    monkeypatch.setattr("pmcp.manifest.loader.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.manifest.loader.load_manifest", lambda **_k: manifest)
     config = _write(
         tmp_path / "cfg.json",
         json.dumps(
@@ -1488,7 +1488,9 @@ def test_guard_secrets_contains_one_entry(monkeypatch: pytest.MonkeyPatch) -> No
         oidc_issuer_url="https://issuer.invalid",
     )
     manifest = _with({"aaa-bad": bad, "zz-good-remote": good})
-    monkeypatch.setattr("pmcp.cli_commands.secrets.load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        "pmcp.cli_commands.secrets.load_manifest", lambda **_k: manifest
+    )
     _, _, auth_metadata, _ = _extract_required_keys(Path.cwd())
     assert "zz-good-remote" in auth_metadata
 

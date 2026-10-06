@@ -557,7 +557,7 @@ def _gateway(
     configured: list[ResolvedServerConfig] | None = None,
 ) -> GatewayTools:
     _no_host_npm_config(monkeypatch)
-    monkeypatch.setattr(handlers_module, "load_manifest", lambda: manifest)
+    monkeypatch.setattr(handlers_module, "load_manifest", lambda **_k: manifest)
     monkeypatch.setattr(handlers_module, "load_configs", lambda **_: configured or [])
     policy_path = tmp_path / "gateway-policy.yaml"
     policy_path.write_text("servers: {}\n")

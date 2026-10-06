@@ -384,10 +384,10 @@ _REPO_CREDENTIALS: dict[object, _RootEntry] = {}
 
 #: The root a lookup without an explicit project answers for: the SERVED
 #: project root (:func:`serve_project_root` -- ``--project`` when given, else
-#: the root discovered from the working directory), else the first root an
-#: entry was built for. A consumer that knows a more specific root passes it as
-#: ``root=``; ``tests/test_store_reader_inventory.py`` lists every consumer that
-#: does not, with its reason (Consiliency/pmcp#372 round 9).
+#: the root discovered from the working directory); ``None`` until a startup
+#: load or ``--project`` serves one, and lookups then use the discovered root
+#: (:func:`resolve_project_root`). A consumer that knows a more specific root
+#: passes it as ``root=`` (Consiliency/pmcp#372 rounds 9 and 12).
 _DEFAULT_ROOT: Path | None = None
 
 #: The project files of a root, in precedence order.
@@ -540,11 +540,17 @@ def _build_root_entry(root: Path) -> _RootEntry:
 
 
 def _root_entry(root: Path | None) -> _RootEntry | None:
-    """Root ``root``'s entry (default: :data:`_DEFAULT_ROOT`), rebuilt if it changed."""
+    """Root ``root``'s entry (default: the served project), rebuilt if it changed.
+
+    No root means the served project root (:func:`resolve_project_root`):
+    ``--project``, else the root discovered from the working directory -- the
+    same root every other project-scoped input follows. A load never makes
+    its own root the default as a side effect (Consiliency/pmcp#372 round 12:
+    that made the project of whichever store happened to load first the
+    process's project).
+    """
     if root is None:
-        root = _DEFAULT_ROOT
-    if root is None:
-        return None
+        root = resolve_project_root(None)
     key = _root_key(root)
     entry = _REPO_CREDENTIALS.get(key)
     if (
@@ -1018,8 +1024,6 @@ def load_store(
     # A repository file is one of its root's project files: (re)build that
     # root's entry with THE builder (_build_root_entry).
     root = confinement[0]
-    if _DEFAULT_ROOT is None:
-        set_default_root(root)
     _REPO_CREDENTIALS[_root_key(root)] = _build_root_entry(root)
 
 

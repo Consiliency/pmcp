@@ -101,6 +101,18 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
         return default
 
 
+def _manifest_for(project_root: Path | None) -> Any:
+    """``load_manifest`` for ``project_root``; ``None`` is the served project.
+
+    The project overlay follows the same root as the credentials
+    (Consiliency/pmcp#372 round 12). With no project the call stays
+    ``load_manifest()``, which reads the served project's overlay.
+    """
+    if project_root is None:
+        return load_manifest()
+    return load_manifest(project_root=project_root)
+
+
 class GatewayServer:
     """MCP Gateway Server."""
 
@@ -733,7 +745,7 @@ class GatewayServer:
         manifest = None
         manifest_servers = {}
         try:
-            manifest = load_manifest(project_root=self._project_root)
+            manifest = _manifest_for(self._project_root)
             manifest_servers = manifest.servers
         except Exception as e:
             # Class only: an error's text can quote overlay input (Consiliency/pmcp#342).

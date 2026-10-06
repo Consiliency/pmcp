@@ -65,6 +65,18 @@ def manifest_secret_metadata(server: Any) -> tuple[dict[str, object], set[str]]:
     return metadata, set(collect_remote_header_env_vars(server.headers))
 
 
+def _manifest_for(project_root: Path | None) -> Any:
+    """``load_manifest`` for ``project_root``; ``None`` is the served project.
+
+    The project overlay follows the same root as the credentials
+    (Consiliency/pmcp#372 round 12). With no project the call stays
+    ``load_manifest()``, which reads the served project's overlay.
+    """
+    if project_root is None:
+        return load_manifest()
+    return load_manifest(project_root=project_root)
+
+
 def _extract_required_keys(
     project_root: Path,
 ) -> tuple[
@@ -80,7 +92,7 @@ def _extract_required_keys(
     configs = load_configs(project_root=project_root)
 
     try:
-        manifest_by_name = load_manifest(project_root=project_root).servers
+        manifest_by_name = _manifest_for(project_root).servers
     except Exception:
         manifest_by_name = {}
 
@@ -169,9 +181,7 @@ def _extract_required_keys(
             per_server[cfg.name] = server_keys
 
     try:
-        manifest_servers = list(
-            load_manifest(project_root=project_root).servers.values()
-        )
+        manifest_servers = list(_manifest_for(project_root).servers.values())
     except Exception:
         manifest_servers = []
     for server in manifest_servers:

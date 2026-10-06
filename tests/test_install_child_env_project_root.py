@@ -181,7 +181,9 @@ def recorded_spawn(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
 
 def _use_shipped_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: _SHIPPED_MANIFEST)
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_manifest", lambda **_k: _SHIPPED_MANIFEST
+    )
     monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
 
