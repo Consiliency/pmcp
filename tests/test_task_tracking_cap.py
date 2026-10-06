@@ -4509,10 +4509,17 @@ class _Overlap:
       connection, whoever else owes it -- the residual stated since rev 3
       (README, SECURITY). Main also leaves it running; its
       `cancel_active_tasks` reports it as an error, where rev 5 skips it.
+    - `unsent_at_removal`: Consiliency/pmcp#324's residual. A forced
+      disconnect whose own teardown is interrupted still disconnects, without
+      the cancels it had not sent. The tasks of that server not yet sent a
+      `tasks/cancel` are recorded at the moment of removal (by wrapping
+      `_forget_disconnected`); only those, and only if that disconnect then
+      ended interrupted, are exempt.
     An aborted teardown is not exempt (rev 13, round-12 F001): each task it
     owed was answered, is still tracked, was lost to the cap only after its
-    release (nothing owed it then), or is the residual above. The model learns
-    when a release happens from `unwatch` (the moment, not the state)."""
+    release (nothing owed it then), or is one of the residuals above. The
+    model learns when a release happens from `unwatch` (the moment, not the
+    state)."""
 
     def __init__(self) -> None:
         self.manager, _ = _manager("alpha", "beta")
@@ -4568,6 +4575,23 @@ class _Overlap:
             return out
 
         registry.unwatch = releasing  # type: ignore[method-assign]
+        # Consiliency/pmcp#324: record, at the moment a forced disconnect
+        # removes its server, which of that server's tasks had not been sent a
+        # `tasks/cancel` yet. Only those, and only if that disconnect then
+        # ended interrupted, are exempt at the end (round-1 N2 on #376).
+        self.unsent_at_removal: list[
+            tuple[asyncio.Task[Any] | None, set[tuple[str, str]]]
+        ] = []
+        forget = m._forget_disconnected
+
+        def forgetting(name: str, config: Any) -> Any:
+            unsent = {k for k in self.active | self.custody if k[0] == name} - set(
+                self.sent
+            )
+            self.unsent_at_removal.append((asyncio.current_task(), unsent))
+            return forget(name, config)
+
+        m._forget_disconnected = forgetting  # type: ignore[method-assign]
         self.record("alpha", "a1", {"tenant": "a1"})
         self.record("beta", "b1", {"tenant": "b1"})
 
@@ -4754,16 +4778,18 @@ async def _run_overlap(order: tuple[str, ...]) -> None:
     # `cancel_task` loop stops there too. A task of that server pmcp had not
     # cancelled by then keeps running remotely, whichever teardown owed it.
     cut_short = {
-        server
-        for task, server in h.forced_server.items()
-        if task.cancelled() or task.exception() is not None
+        key
+        for task, unsent in h.unsent_at_removal
+        if task in h.forced_server
+        and (task.cancelled() or task.exception() is not None)
+        for key in unsent
     }
     for task, owed in h.owes:
         aborted = task.cancelled() or task.exception() is not None
         for key in owed:
             if key in h.removed and key in h.late:
                 continue  # the stated residual (see `_Overlap`)
-            if key in h.removed and key[0] in cut_short:
+            if key in h.removed and key in cut_short:
                 continue  # pmcp#324's interrupted forced disconnect (above)
             if not aborted:
                 assert key in h.sent, (key, owed, h.sent)

@@ -1746,7 +1746,9 @@ class ClientManager:
         # at either await still gets the synchronous teardown, then the cancel.
         # The tasks are cancelled through the one teardown helper
         # (Consiliency/pmcp#338): it owes every active task tracked now, an
-        # eviction meanwhile included, and returns what it did not cancel.
+        # eviction meanwhile included. It returns how many it cancelled or
+        # found finished, which this caller does not use; a task it did not
+        # cancel goes back to the registry when its custody is released.
         try:
             if active_tasks:
                 await self._cancel_tracked_for_teardown([name])

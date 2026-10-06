@@ -7,6 +7,12 @@ the await. A client-manager double that already defines `call_tool`,
 `get_task_result` and `get_task_record` mixes this in to answer the new
 calls. Its "record built from this reply" is its own record of the task the
 reply names, which is what a double's registry holds.
+
+Limits: `call_tool_with_task` recognises only the wrapped `{"task": {...}}`
+form, not a task at the top level of the reply, and ignores the "a task was
+requested" rule (Consiliency/pmcp#330): it reports any wrapped task its
+registry holds. A handler test that needs either rule must drive the real
+`ClientManager` (as `tests/test_task_units.py` does), not this double.
 """
 
 from __future__ import annotations
