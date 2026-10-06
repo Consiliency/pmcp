@@ -4513,8 +4513,13 @@ class _Overlap:
       disconnect whose own teardown is interrupted still disconnects, without
       the cancels it had not sent. The tasks of that server not yet sent a
       `tasks/cancel` are recorded at the moment of removal (by wrapping
-      `_forget_disconnected`); only those, and only if that disconnect then
-      ended interrupted, are exempt.
+      `_forget_disconnected`), with the owing teardowns still running then.
+      Only those tasks, only for those teardowns, and only if that disconnect
+      then ended interrupted, are exempt -- and for a teardown that had ended
+      earlier, only if, when it released its custody, a running teardown
+      owed the same unsent task (`handed`: the obligation passed on, R3) and
+      that one is excused. A teardown that ended without sending a task's
+      cancel and handed it to nobody is never excused.
     An aborted teardown is not exempt (rev 13, round-12 F001): each task it
     owed was answered, is still tracked, was lost to the cap only after its
     release (nothing owed it then), or is one of the residuals above. The
@@ -4542,6 +4547,9 @@ class _Overlap:
         self.answered: set[tuple[str, str]] = set()
         self.removed: set[tuple[str, str]] = set()
         self.released: set[asyncio.Task[Any]] = set()
+        self.handed: dict[
+            tuple[asyncio.Task[Any], tuple[str, str]], set[asyncio.Task[Any]]
+        ] = {}
         self.ids = 0
         self.floods = 0
         self.bounds = _LiveBounds(
@@ -4568,6 +4576,14 @@ class _Overlap:
             task = asyncio.current_task()
             if task is not None:
                 self.released.add(task)
+                # what this teardown still owed, unsent, that a running one
+                # owes too: the obligation passes to it (R3), not dropped
+                mine = next((o for t, o in self.owes if t is task), set())
+                for t, keys in self.owes:
+                    if t is task or t.done() or t in self.released:
+                        continue
+                    for key in (mine & keys) - set(self.sent):
+                        self.handed.setdefault((task, key), set()).add(t)
             owed = self.owed_now()
             for key in list(self.custody):
                 if key not in owed:
@@ -4577,10 +4593,16 @@ class _Overlap:
         registry.unwatch = releasing  # type: ignore[method-assign]
         # Consiliency/pmcp#324: record, at the moment a forced disconnect
         # removes its server, which of that server's tasks had not been sent a
-        # `tasks/cancel` yet. Only those, and only if that disconnect then
-        # ended interrupted, are exempt at the end (round-1 N2 on #376).
+        # `tasks/cancel` yet, and which owing teardowns were still running.
+        # Only those tasks, for those teardowns, and only if that disconnect
+        # then ended interrupted, are exempt at the end (round-1 N2 and
+        # round-2 N1 on Consiliency/pmcp#376).
         self.unsent_at_removal: list[
-            tuple[asyncio.Task[Any] | None, set[tuple[str, str]]]
+            tuple[
+                asyncio.Task[Any] | None,
+                set[tuple[str, str]],
+                set[asyncio.Task[Any]],
+            ]
         ] = []
         forget = m._forget_disconnected
 
@@ -4588,7 +4610,8 @@ class _Overlap:
             unsent = {k for k in self.active | self.custody if k[0] == name} - set(
                 self.sent
             )
-            self.unsent_at_removal.append((asyncio.current_task(), unsent))
+            running = {task for task, _owed in self.owes if not task.done()}
+            self.unsent_at_removal.append((asyncio.current_task(), unsent, running))
             return forget(name, config)
 
         m._forget_disconnected = forgetting  # type: ignore[method-assign]
@@ -4778,18 +4801,31 @@ async def _run_overlap(order: tuple[str, ...]) -> None:
     # `cancel_task` loop stops there too. A task of that server pmcp had not
     # cancelled by then keeps running remotely, whichever teardown owed it.
     cut_short = {
-        key
-        for task, unsent in h.unsent_at_removal
+        (owner, key)
+        for task, unsent, running in h.unsent_at_removal
         if task in h.forced_server
         and (task.cancelled() or task.exception() is not None)
         for key in unsent
+        for owner in running
     }
+    # an earlier teardown that ended while a running one owed the same unsent
+    # task handed the obligation on: excused exactly when that one is
+    while True:
+        more = {
+            (owner, key)
+            for (owner, key), heirs in h.handed.items()
+            if (owner, key) not in cut_short
+            and any((heir, key) in cut_short for heir in heirs)
+        }
+        if not more:
+            break
+        cut_short |= more
     for task, owed in h.owes:
         aborted = task.cancelled() or task.exception() is not None
         for key in owed:
             if key in h.removed and key in h.late:
                 continue  # the stated residual (see `_Overlap`)
-            if key in h.removed and key in cut_short:
+            if key in h.removed and (task, key) in cut_short:
                 continue  # pmcp#324's interrupted forced disconnect (above)
             if not aborted:
                 assert key in h.sent, (key, owed, h.sent)

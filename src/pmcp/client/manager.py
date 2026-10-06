@@ -1747,8 +1747,10 @@ class ClientManager:
         # The tasks are cancelled through the one teardown helper
         # (Consiliency/pmcp#338): it owes every active task tracked now, an
         # eviction meanwhile included. It returns how many it cancelled or
-        # found finished, which this caller does not use; a task it did not
-        # cancel goes back to the registry when its custody is released.
+        # found finished, which this caller does not use. When its custody is
+        # released, a task it did not cancel goes back to the registry only if
+        # it is unfinished, on its server's current connection, and owed by no
+        # other running teardown (R4).
         try:
             if active_tasks:
                 await self._cancel_tracked_for_teardown([name])
