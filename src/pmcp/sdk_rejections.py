@@ -133,6 +133,20 @@ _PROTOCOL_REVISION = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 #: Logger-name prefixes whose records are scrubbed by :func:`scrub_sdk_record`.
 SDK_LOGGERS = ("mcp.server", "mcp.shared", "sse_starlette")
+#: The HTTP client stacks' loggers (rev 23, round-21 claude F001): their
+#: traces quote response bytes (`receive_response_headers.failed
+#: exception=RemoteProtocolError(... b'<status line>')`, httpx's
+#: `HTTP Request: ... "HTTP/1.1 500 <reason>"`). Masked like the SDK's, and a
+#: pre-formatted message keeps only its first word, the trace event's name.
+HTTP_CLIENT_LOGGERS = (
+    "httpx",
+    "httpx2",
+    "httpcore",
+    "httpcore2",
+    "h11",
+    "aiohttp",
+    "urllib3",
+)
 _TEXT = "<text>"
 _PLACEHOLDER = "<...>"
 
@@ -453,16 +467,22 @@ def _masked_argument(value: Any) -> Any:
     return value
 
 
-def is_sdk_logger(name: Any) -> bool:
+def _under(name: Any, prefixes: tuple[str, ...]) -> bool:
     return isinstance(name, str) and any(
-        name == prefix or name.startswith(prefix + ".") for prefix in SDK_LOGGERS
+        name == prefix or name.startswith(prefix + ".") for prefix in prefixes
     )
 
 
+def is_sdk_logger(name: Any) -> bool:
+    return _under(name, SDK_LOGGERS) or _under(name, HTTP_CLIENT_LOGGERS)
+
+
 def scrub_sdk_record(record: logging.LogRecord) -> None:
-    """For a record of an SDK server-side logger or ``sse_starlette``: mask
-    every text ``%``-argument, and every placeholder of a message the SDK
-    pre-formatted with an f-string. In place; never raises."""
+    """For a record of an SDK server-side logger, ``sse_starlette`` or an
+    HTTP client stack: mask every text ``%``-argument, and every placeholder
+    of a message the SDK pre-formatted with an f-string (an HTTP client's
+    pre-formatted message keeps only its first word). In place; never
+    raises."""
     if not is_sdk_logger(record.name):
         return
     try:
@@ -472,6 +492,11 @@ def scrub_sdk_record(record: logging.LogRecord) -> None:
         elif isinstance(args, dict):
             record.args = {key: _masked_argument(item) for key, item in args.items()}
         if not args and isinstance(record.msg, str):
+            if _under(record.name, HTTP_CLIENT_LOGGERS):
+                head, _, rest = record.msg.partition(" ")
+                if rest:
+                    record.msg = f"{head} {_PLACEHOLDER}"
+                return
             for pattern, masked in _log_patterns():
                 if pattern.fullmatch(record.msg):
                     record.msg = masked

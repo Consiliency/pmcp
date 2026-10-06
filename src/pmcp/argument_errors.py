@@ -557,30 +557,47 @@ def _value_bearing_types() -> tuple[type[BaseException], ...]:
     )
 
 
-#: The HTTP client libraries pmcp imports, and the exceptions each raises
-#: when it cannot decode a response body (rev 22, round-20 codex F001): a
-#: response that will not decode is downstream content pmcp rejected, and
-#: the error's text quotes it -- aiohttp's ``ContentTypeError`` names the
-#: rejected MIME type, ``UnicodeDecodeError`` holds the undecodable bytes.
-#: ``.json()`` on any of them raises ``json.JSONDecodeError``, already a
-#: parse error. ``tests/test_parse_error_echo.py`` derives the libraries from
-#: pmcp's imports and checks this table covers each.
-RESPONSE_DECODE_ERRORS: dict[str, tuple[str, ...]] = {
-    "aiohttp": ("ContentTypeError",),
-    "httpx": ("DecodingError",),
-    "httpx2": ("DecodingError",),
-    "urllib.request": (),
+#: Every HTTP client module pmcp uses -- the clients it imports and their
+#: transports -- and the base classes of the exceptions whose message can
+#: carry bytes of a response pmcp rejected: a status line, a header, chunk
+#: framing, a body, a MIME type, a reason phrase (rev 22 round-20 codex F001;
+#: rev 23 round-21 claude/grok/codex F001). Registered by class, so every
+#: subclass is covered. `tests/test_parse_error_echo.py` derives the modules
+#: from pmcp's imports and the clients' requirements, and pins every
+#: exception class each defines as registered here or value-free, exactly.
+HTTP_RESPONSE_ERRORS: dict[str, tuple[str, ...]] = {
+    "aiohttp": (
+        "ClientResponseError",  # parser failures, ContentTypeError, statuses
+        "ClientPayloadError",  # chunk framing and body transfer errors
+        "ServerDisconnectedError",  # may carry the partial response message
+        "BadContentDispositionHeader",
+        "BadContentDispositionParam",
+        "RedirectClientError",  # a rejected `Location` from the response
+        "WebSocketError",  # a server's close message
+    ),
+    "aiohttp.http_exceptions": ("HttpProcessingError",),  # every parser error
+    "httpx": ("ProtocolError", "DecodingError", "HTTPStatusError"),
+    "httpx2": ("ProtocolError", "DecodingError", "HTTPStatusError", "SSEError"),
+    "httpcore": ("ProtocolError",),
+    "httpcore2": ("ProtocolError",),
+    "h11": ("ProtocolError",),
+    "http.client": ("HTTPException",),  # BadStatusLine, LineTooLong, ...
+    "urllib.error": ("HTTPError",),  # the reason phrase
 }
+
+#: Of those, the ones that failed to decode a body that parsed: described as
+#: such (rev 22's wording).
+_DECODE_ERROR_NAMES = frozenset({"DecodingError", "ContentTypeError"})
 
 
 @functools.cache
 def _response_decode_types() -> tuple[type[BaseException], ...]:
-    """The registered response-decoding exception types, plus
+    """The registered HTTP response exception types, plus
     ``UnicodeDecodeError`` (``.text()``/``.decode()`` of a body)."""
     import importlib
 
     types: list[type[BaseException]] = [UnicodeDecodeError]
-    for module_name, names in RESPONSE_DECODE_ERRORS.items():
+    for module_name, names in HTTP_RESPONSE_ERRORS.items():
         try:
             module = importlib.import_module(module_name)
         except ImportError:  # pragma: no cover - an optional client
@@ -591,6 +608,18 @@ def _response_decode_types() -> tuple[type[BaseException], ...]:
 
 def _is_response_decode_error(error: BaseException) -> bool:
     return isinstance(error, _response_decode_types()) and not _is_parse_error(error)
+
+
+def _response_status(error: BaseException) -> int | None:
+    """The HTTP status a response error records, as an int, if any."""
+    for value in (
+        getattr(error, "status", None),
+        getattr(error, "code", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+    ):
+        if type(value) is int:
+            return value
+    return None
 
 
 _VALUE_BEARING: tuple[type[BaseException], ...] = ()
@@ -674,8 +703,15 @@ def _validation_text(error: BaseException) -> str:
         # The codec and class only: never the undecodable bytes.
         return f"could not decode {error.encoding} text (UnicodeDecodeError)"
     if _is_response_decode_error(error):
-        # Format and class only: never the MIME type or the body.
-        return f"could not decode an HTTP response ({type(error).__name__})"
+        name = type(error).__name__
+        if name in _DECODE_ERROR_NAMES:
+            # Format and class only: never the MIME type or the body.
+            return f"could not decode an HTTP response ({name})"
+        # The class and the status number: never the status line, a header,
+        # the framing, the body or the reason phrase (rev 23).
+        status = _response_status(error)
+        where = f", status {status}" if status is not None else ""
+        return f"rejected an HTTP response ({name}{where})"
     if isinstance(error, ValidationError):
         count = error.error_count()
         plural = "" if count == 1 else "s"

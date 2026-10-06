@@ -42,9 +42,7 @@ from pmcp.argument_errors import (
     describe_model_error,
     describe_schema_error,
     exception_text,
-    carries_rejected_value,
     install_log_scrubber,
-    message_text,
     safe_exc_info,
 )
 from pmcp.client.manager import ClientManager
@@ -128,9 +126,8 @@ def _described_errors(handler: Any) -> Any:
     wrapper such as `ValueError(f"... {e}") from e` sends the value. When
     the chain holds a validation or parse error, the replacement keeps that
     mapping's code and changes only the text:
-    - an `MCPError` keeps its code, with its message (or, if the message
-      embeds the validation text, the structural description) and no
-      `data`;
+    - an `MCPError` keeps its code, with the structural description as its
+      message and no `data` (rev 23);
     - a bare `ValidationError` keeps `-32602`, now with the structural
       description;
     - anything else is a `ValueError` of its description (the SDK's
@@ -162,18 +159,13 @@ def _described_errors(handler: Any) -> Any:
                 raise
             described = exception_text(error)
             if isinstance(error, MCPError):
-                # Keep the code; keep message and `data` unless they carry
-                # what was rejected (rev 12: `data` used to be dropped
-                # whenever the chain held a validation error).
-                message = error.error.message
-                if carries_rejected_value(message, error):
-                    message = message_text(message, error)
-                    if carries_rejected_value(message, error):
-                        message = "the request failed on data that did not validate"
-                data = error.error.data
-                if data is not None and carries_rejected_value(data, error):
-                    data = None
-                replacement = MCPError(error.error.code, message, data)
+                # Keep the code. The message and `data` are the wrapper's own,
+                # and an exception that chains a value-bearing error is never
+                # rendered from them (rev 18's rule, applied to `MCPError` in
+                # rev 23, round-21 claude N1): rev 12 kept them unless they
+                # matched what was rejected, which a short or reformatted copy
+                # passed.
+                replacement = MCPError(error.code, described)
             elif isinstance(error, ValidationError):
                 replacement = MCPError(INVALID_PARAMS, described)
             else:

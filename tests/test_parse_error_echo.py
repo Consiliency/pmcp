@@ -29,6 +29,8 @@ Two halves:
 from __future__ import annotations
 
 import ast
+import asyncio
+import functools
 import json
 import logging
 import os
@@ -1105,7 +1107,175 @@ def test_a_versioned_package_pattern_is_refused_without_its_value(
 # names the rejected MIME type, and the version lookups logged it through
 # `exception_text` unchanged, because the type was not registered.
 
-_HTTP_CLIENT_MARKERS = ("ClientResponse", "Response")
+#: Every top-level module pmcp imports, split into the HTTP clients and the
+#: rest (rev 23). Derived from the AST and pinned exactly: a new import fails
+#: `test_every_imported_module_is_classified` until it is classified. A client
+#: is a module whose calls send an HTTP request and parse the response.
+_HTTP_CLIENT_IMPORTS: dict[str, str] = {
+    "aiohttp": "registry, version and JWKS fetches",
+    "httpx": "the CLI's health probes",
+    "httpx2": "remote MCP servers (pmcp's own AsyncClient)",
+    "urllib": "urllib.request openers: auth metadata, npm packuments, feedback",
+    "mcp": "the SDK's remote clients, over httpx2",
+}
+_NOT_HTTP_CLIENTS = frozenset(
+    {
+        # The standard library, apart from `urllib`.
+        "__future__",
+        "argparse",
+        "ast",
+        "asyncio",
+        "bisect",
+        "collections",
+        "contextlib",
+        "copy",
+        "dataclasses",
+        "datetime",
+        "enum",
+        "errno",
+        "fcntl",
+        "fnmatch",
+        "functools",
+        "getpass",
+        "hashlib",
+        "hmac",
+        "importlib",
+        "inspect",
+        "ipaddress",
+        "itertools",
+        "json",
+        "logging",
+        "math",
+        "msvcrt",
+        "os",
+        "pathlib",
+        "pickle",
+        "pkgutil",
+        "platform",
+        "queue",
+        "random",
+        "re",
+        "resource",
+        "shlex",
+        "shutil",
+        "signal",
+        "site",
+        "socket",
+        "stat",
+        "string",
+        "subprocess",
+        "sys",
+        "tempfile",
+        "threading",
+        "time",
+        "tomllib",
+        "traceback",
+        "types",
+        "typing",
+        "uuid",
+        # Third-party, none of which pmcp uses to send a request: async
+        # primitives, parsers and models, the server side, metrics.
+        "anyio",
+        "dotenv",
+        "jsonschema",
+        "jwt",
+        "mcp_types",
+        "packaging",
+        "prometheus_client",
+        "pydantic",
+        "pydantic_core",
+        "semver",
+        "starlette",
+        "uvicorn",
+        "yaml",
+    }
+)
+
+#: The transports and parsers under those clients, whose exceptions surface
+#: through them: derived in `test_every_client_transport_is_registered`.
+_TRANSPORTS = {"http.client", "httpcore", "httpcore2", "h11"}
+
+#: Per module, every exception class it defines that is NOT registered, and
+#: why its message cannot carry response bytes. Exact both ways with what the
+#: module defines (`test_every_http_exception_class_is_classified`).
+_CONNECT = "a connection, DNS, TLS or socket failure: no response was parsed"
+_TIMEOUT = "a timeout: no response bytes in its text"
+_BASE = "a base class: its response-carrying subclasses are registered"
+_USE = "a misuse of the client API by the caller: pmcp's own text"
+_VALUE_FREE_HTTP_ERRORS: dict[str, dict[str, str]] = {
+    "httpx": {
+        "CloseError": _CONNECT,
+        "ConnectError": _CONNECT,
+        "ConnectTimeout": _TIMEOUT,
+        "CookieConflict": _USE,
+        "HTTPError": _BASE,
+        "InvalidURL": _USE,
+        "NetworkError": _CONNECT,
+        "PoolTimeout": _TIMEOUT,
+        "ProxyError": "the operator's proxy refused the tunnel",
+        "ReadError": _CONNECT,
+        "ReadTimeout": _TIMEOUT,
+        "RequestError": _BASE,
+        "RequestNotRead": _USE,
+        "ResponseNotRead": _USE,
+        "StreamClosed": _USE,
+        "StreamConsumed": _USE,
+        "StreamError": _BASE,
+        "TimeoutException": _TIMEOUT,
+        "TooManyRedirects": "a fixed message",
+        "TransportError": _BASE,
+        "UnsupportedProtocol": _USE,
+        "WriteError": _CONNECT,
+        "WriteTimeout": _TIMEOUT,
+    },
+    "httpcore": {
+        "ConnectError": _CONNECT,
+        "ConnectTimeout": _TIMEOUT,
+        "ConnectionNotAvailable": _CONNECT,
+        "NetworkError": _CONNECT,
+        "PoolTimeout": _TIMEOUT,
+        "ProxyError": "the operator's proxy refused the tunnel",
+        "ReadError": _CONNECT,
+        "ReadTimeout": _TIMEOUT,
+        "TimeoutException": _TIMEOUT,
+        "UnsupportedProtocol": _USE,
+        "WriteError": _CONNECT,
+        "WriteTimeout": _TIMEOUT,
+    },
+    "h11": {},
+    "aiohttp": {
+        "ClientConnectionError": _CONNECT,
+        "ClientConnectionResetError": _CONNECT,
+        "ClientConnectorCertificateError": _CONNECT,
+        "ClientConnectorDNSError": _CONNECT,
+        "ClientConnectorError": _CONNECT,
+        "ClientConnectorSSLError": _CONNECT,
+        "ClientError": _BASE,
+        "ClientOSError": _CONNECT,
+        "ClientProxyConnectionError": _CONNECT,
+        "ClientSSLError": _CONNECT,
+        "ConnectionTimeoutError": _TIMEOUT,
+        "EofStream": "carries no text",
+        "InvalidURL": _USE,
+        "InvalidUrlClientError": _USE,
+        "NonHttpUrlClientError": _USE,
+        "ServerConnectionError": _BASE,
+        "ServerFingerprintMismatch": "the certificate's digests, not response bytes",
+        "ServerTimeoutError": _TIMEOUT,
+        "SocketTimeoutError": _TIMEOUT,
+        "WSMessageTypeError": "a fixed type-mismatch message",
+    },
+    "aiohttp.http_exceptions": {},
+    "http.client": {},
+    "urllib.error": {
+        "URLError": "its reason is a socket error or pmcp's own URL",
+        "ContentTooShortError": "a byte count; the bytes stay in `.content`",
+    },
+}
+_VALUE_FREE_HTTP_ERRORS["httpx2"] = {
+    **_VALUE_FREE_HTTP_ERRORS["httpx"],
+}
+_VALUE_FREE_HTTP_ERRORS["httpcore2"] = dict(_VALUE_FREE_HTTP_ERRORS["httpcore"])
 
 
 def _imported_top_modules() -> set[str]:
@@ -1115,58 +1285,117 @@ def _imported_top_modules() -> set[str]:
             continue
         for node in ast.walk(ast.parse(path.read_text())):
             if isinstance(node, ast.Import):
-                names |= {alias.name for alias in node.names}
+                names |= {alias.name.split(".")[0] for alias in node.names}
             elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-                names.add(node.module)
-    return names
+                names.add(node.module.split(".")[0])
+    return {name for name in names if name != "pmcp"}
 
 
-def _http_client_libraries() -> set[str]:
-    """Every module pmcp imports that hands back a response object with a
-    `json` method: an HTTP client."""
-    import importlib
+def test_every_imported_module_is_classified() -> None:
+    """Every module pmcp imports is an HTTP client or is not, exactly."""
+    imported = _imported_top_modules()
+    classified = set(_HTTP_CLIENT_IMPORTS) | _NOT_HTTP_CLIENTS
+    assert imported == classified, (
+        sorted(imported - classified),
+        sorted(classified - imported),
+    )
+
+
+def _distribution_requirements(name: str) -> set[str]:
+    """The installed distributions `name` requires (markers evaluated)."""
+    import importlib.metadata
+    import re as _re
+
+    from packaging.requirements import Requirement
 
     found: set[str] = set()
-    for name in _imported_top_modules():
-        if name.startswith("pmcp"):
+    for line in importlib.metadata.requires(name) or []:
+        requirement = Requirement(line)
+        if requirement.marker is not None and not requirement.marker.evaluate(
+            {"extra": ""}
+        ):
             continue
-        try:
-            module = importlib.import_module(name)
-        except Exception:  # noqa: BLE001 -- a platform-only module
-            continue
-        for marker in _HTTP_CLIENT_MARKERS:
-            response = getattr(module, marker, None)
-            if isinstance(response, type) and hasattr(response, "json"):
-                found.add(name)
+        found.add(_re.sub(r"[-_.]+", "_", requirement.name).lower())
     return found
 
 
-def test_every_http_client_pmcp_imports_has_its_decode_errors_registered() -> None:
+def test_every_client_transport_is_registered() -> None:
+    """The transports under each client -- the installed requirements, at
+    any depth, that define a `*ProtocolError` -- and `http.client` under
+    `urllib.request` are all in the registry."""
     import importlib
 
-    from pmcp.argument_errors import RESPONSE_DECODE_ERRORS, _value_bearing_types
+    from pmcp.argument_errors import HTTP_RESPONSE_ERRORS
 
-    clients = _http_client_libraries()
-    assert {"aiohttp", "httpx", "httpx2"} <= clients, clients
-    missing = clients - set(RESPONSE_DECODE_ERRORS)
-    assert not missing, missing
-    registered = _value_bearing_types()
-    for name in clients:
-        module = importlib.import_module(name)
-        for error in RESPONSE_DECODE_ERRORS[name]:
-            assert issubclass(getattr(module, error), registered), (name, error)
-        # Every `*DecodingError` / `ContentTypeError` the library exports.
-        exported = [
-            value
-            for attr, value in vars(module).items()
-            if isinstance(value, type)
+    pending = [name for name in _HTTP_CLIENT_IMPORTS if name != "urllib"]
+    seen: set[str] = set()
+    transports: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        if name not in _HTTP_CLIENT_IMPORTS and any(
+            isinstance(value, type)
             and issubclass(value, BaseException)
-            and ("Decod" in attr or "ContentType" in attr)
-        ]
-        assert all(issubclass(value, registered) for value in exported), (
-            name,
-            exported,
-        )
+            and "ProtocolError" in attr
+            for attr, value in vars(module).items()
+        ):
+            transports.add(name)
+        try:
+            pending.extend(_distribution_requirements(name))
+        except Exception:  # noqa: BLE001 -- a module with no distribution
+            continue
+    import urllib.request
+
+    assert urllib.request.http.client is importlib.import_module("http.client")
+    transports.add("http.client")
+    assert transports == _TRANSPORTS, transports
+    assert _TRANSPORTS <= set(HTTP_RESPONSE_ERRORS), set(HTTP_RESPONSE_ERRORS)
+    for client in ("aiohttp", "httpx", "httpx2"):
+        assert client in HTTP_RESPONSE_ERRORS, client
+
+
+def _defined_exceptions(module_name: str) -> dict[str, type]:
+    import importlib
+
+    module = importlib.import_module(module_name)
+    root = module_name.split(".")[0]
+    return {
+        attr: value
+        for attr, value in vars(module).items()
+        if isinstance(value, type)
+        and issubclass(value, BaseException)
+        and str(value.__module__).split(".")[0] == root
+        and not attr.startswith("_")
+    }
+
+
+def test_every_http_exception_class_is_classified() -> None:
+    """In every HTTP client and transport module, each exception class is
+    registered (a subclass of a registered base) or listed as value-free with
+    its reason -- exactly, both ways."""
+    from pmcp.argument_errors import HTTP_RESPONSE_ERRORS, _value_bearing_types
+
+    registered = _value_bearing_types()
+    assert set(HTTP_RESPONSE_ERRORS) == set(_VALUE_FREE_HTTP_ERRORS)
+    problems = []
+    for module_name, free in _VALUE_FREE_HTTP_ERRORS.items():
+        defined = _defined_exceptions(module_name)
+        for attr, value in sorted(defined.items()):
+            is_registered = issubclass(value, registered)
+            if is_registered and attr in free:
+                problems.append((module_name, attr, "registered and listed"))
+            if not is_registered and attr not in free:
+                problems.append((module_name, attr, "neither registered nor listed"))
+        for attr in free:
+            if attr not in defined:
+                problems.append((module_name, attr, "listed but not defined"))
+    assert not problems, problems
 
 
 def test_every_response_decode_site_is_inside_a_handler() -> None:
@@ -1307,3 +1536,315 @@ def test_a_rejected_response_body_is_not_logged(
     assert any(
         "could not decode" in record.getMessage() for record in caplog.records
     ), logged
+
+
+# --- rev 23: every HTTP client response pmcp rejects, at every call site ----
+#
+# Round 21 (claude, grok, codex F001): each client's protocol parser quotes
+# the response bytes it rejects -- `illegal status line: bytearray(b'...')`,
+# `Invalid character in chunk size: b'...'`, `BadStatusLine: HTTP/1.1 ...`.
+# The grid is every malformed-response shape x every call site pmcp has
+# (pinned from the AST), each driven end to end against a local server, with
+# the sentinel checked in the result, `gateway.health`'s error, every log
+# record at DEBUG, and every exception's text and traceback.
+
+_GRID_S = "RESPONSESENTINEL" + "Q9" * 14
+
+
+def _http_shapes(s: str) -> dict[str, bytes]:
+    body = ('{"' + s + '": 1}').encode()
+    return {
+        "status-line": f"HTTP/1.1 2{s} OK\r\nContent-Length: 2\r\n\r\n{{}}".encode(),
+        "header-line": f"HTTP/1.1 200 OK\r\n{s}\r\nContent-Length: 2\r\n\r\n{{}}".encode(),
+        "chunk-size": (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+            b"Content-Type: application/json\r\n\r\n" + s.encode() + b"\r\n0\r\n\r\n"
+        ),
+        "truncated-body": (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: 4096\r\n\r\n" + body[:-3]
+        ),
+        "undecodable-body": (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+            + f"Content-Length: {len(body) + 2}\r\n\r\n".encode()
+            + body[:-4]
+            + b"\xff\xfe"
+            + body[-4:]
+        ),
+        "reason-phrase": f"HTTP/1.1 500 {s}\r\nContent-Length: 0\r\n\r\n".encode(),
+    }
+
+
+#: The request lines the grid's server received, and the path token of the
+#: site being driven.
+_GRID_REQUESTS: list[bytes] = []
+_GRID_TOKEN: list[str] = ["none"]
+
+
+def _serve_once_per_connection(payload: bytes) -> tuple[Any, int]:
+    import socket
+    import threading
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(64)
+
+    def loop() -> None:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            try:
+                conn.settimeout(5)
+                try:
+                    _GRID_REQUESTS.append(conn.recv(65536))
+                except OSError:
+                    pass
+                conn.sendall(payload)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    threading.Thread(target=loop, daemon=True).start()
+    return listener, listener.getsockname()[1]
+
+
+#: Every function in `src/pmcp` that sends an HTTP request -- found by the
+#: client calls in it -- and the grid's driver for it.
+_HTTP_CALL_PATTERNS = (
+    "aiohttp.ClientSession",
+    "httpx.AsyncClient",
+    "httpx2.AsyncClient",
+    "sse_client",
+    "streamable_http_client",
+    "urlopen",
+    "_OPENER.open",
+)
+
+
+def _http_call_sites() -> set[str]:
+    sites: set[str] = set()
+    for path in sorted(_SRC.rglob("*.py")):
+        if "baml_client" in path.parts:
+            continue
+        rel = path.relative_to(_SRC).as_posix()
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and ast.unparse(node.func) in _HTTP_CALL_PATTERNS
+            ):
+                sites.add(f"{rel}::{_owner(tree, node.lineno)}")
+    return sites
+
+
+async def _drive_version(name: str, port: int) -> Any:
+    from pmcp.manifest import version_checker
+
+    version_checker._version_cache.clear()
+    return await getattr(version_checker, name)("probe-name")
+
+
+async def _drive_registry(port: int) -> Any:
+    from pmcp.manifest.registry import _fetch_registry_servers_uncached
+
+    return await _fetch_registry_servers_uncached(
+        f"http://127.0.0.1:{port}/{_GRID_TOKEN[0]}",
+        timeout=10,
+        max_pages=1,
+        max_response_bytes=1 << 20,
+    )
+
+
+async def _drive_jwks(port: int) -> Any:
+    from pmcp.auth import AsyncJWKS
+
+    return await AsyncJWKS("https://1.1.1.1/jwks.json")._fetch()
+
+
+async def _drive_metadata(port: int) -> Any:
+    from pmcp.auth import fetch_json_metadata
+
+    return fetch_json_metadata("https://1.1.1.1/.well-known/oauth")
+
+
+async def _drive_packument(port: int) -> Any:
+    from pmcp.manifest.package_identity import _fetch_packument
+
+    return _fetch_packument("probe-name")
+
+
+async def _drive_feedback_probe(port: int) -> Any:
+    import time
+
+    from pmcp.feedback_egress import _probe_repository_visibility
+
+    return _probe_repository_visibility("o/r", "token", time.monotonic() + 600)
+
+
+async def _drive_feedback_submit(port: int) -> Any:
+    import time
+
+    from pmcp.feedback_egress import FeedbackProgress, submit_feedback_issue
+
+    return submit_feedback_issue(
+        repository="o/r",
+        token="token",
+        title="a title",
+        body="a body",
+        labels=[],
+        deadline=time.monotonic() + 600,
+        progress=FeedbackProgress(),
+    )
+
+
+async def _drive_sse_probe(port: int) -> Any:
+    from pmcp.cli import _probe_sse_endpoint
+
+    return await _probe_sse_endpoint(f"http://127.0.0.1:{port}/{_GRID_TOKEN[0]}", 10)
+
+
+async def _drive_http_probe(port: int) -> Any:
+    from pmcp.cli import _probe_http_health
+
+    return await _probe_http_health(10)
+
+
+async def _drive_remote(transport: str, port: int) -> Any:
+    from pmcp.client.manager import ClientManager
+    from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
+
+    path = _GRID_TOKEN[0]
+    config = ResolvedServerConfig(
+        name="probe",
+        source="custom",
+        config=RemoteMcpServerConfig(
+            type=transport, url=f"http://127.0.0.1:{port}/{path}"
+        ),
+    )
+    manager = ClientManager()
+    errors = await asyncio.wait_for(manager.connect_server(config, retry=False), 30)
+    # `gateway.health` reports each server's `last_error`.
+    return errors, [status.last_error for status in manager.get_all_server_statuses()]
+
+
+_HTTP_SITE_DRIVERS: dict[str, list[Any]] = {
+    "manifest/version_checker.py::get_npm_version": [
+        functools.partial(_drive_version, "get_npm_version")
+    ],
+    "manifest/version_checker.py::get_pypi_version": [
+        functools.partial(_drive_version, "get_pypi_version")
+    ],
+    "manifest/version_checker.py::get_cargo_version": [
+        functools.partial(_drive_version, "get_cargo_version")
+    ],
+    "manifest/version_checker.py::get_docker_version": [
+        functools.partial(_drive_version, "get_docker_version")
+    ],
+    "manifest/registry.py::_fetch_registry_servers_uncached": [_drive_registry],
+    "auth.py::_fetch": [_drive_jwks],
+    "auth.py::fetch_json_metadata": [_drive_metadata],
+    "manifest/package_identity.py::_fetch_packument": [_drive_packument],
+    "feedback_egress.py::_probe_repository_visibility": [_drive_feedback_probe],
+    "feedback_egress.py::submit_feedback_issue": [_drive_feedback_submit],
+    "cli.py::_probe_sse_endpoint": [_drive_sse_probe],
+    "cli.py::_probe_http_health": [_drive_http_probe],
+    "client/manager.py::_connect_streamable_http": [
+        functools.partial(_drive_remote, "http")
+    ],
+    "client/manager.py::_connect_sse": [functools.partial(_drive_remote, "sse")],
+}
+
+
+def test_every_http_call_site_has_a_grid_driver() -> None:
+    """The grid's sites are exactly the functions that send a request."""
+    assert _http_call_sites() == set(_HTTP_SITE_DRIVERS), sorted(
+        _http_call_sites() ^ set(_HTTP_SITE_DRIVERS)
+    )
+
+
+def _redirect_every_client(monkeypatch: pytest.MonkeyPatch, port: int) -> None:
+    """Send every request any client makes to the local server, unchanged in
+    every other way: the client's own parser reads the response."""
+    import urllib.request
+
+    import aiohttp
+
+    import pmcp.cli as cli
+
+    def local() -> str:
+        return f"http://127.0.0.1:{port}/{_GRID_TOKEN[0]}"
+
+    original_request = aiohttp.ClientSession._request
+
+    def aiohttp_request(self: Any, method: str, str_or_url: Any, **kwargs: Any) -> Any:
+        return original_request(self, method, local(), **kwargs)
+
+    monkeypatch.setattr(aiohttp.ClientSession, "_request", aiohttp_request)
+    original_open = urllib.request.OpenerDirector.open
+
+    def urllib_open(self: Any, fullurl: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(fullurl, urllib.request.Request):
+            fullurl.full_url = local()
+        else:
+            fullurl = local()
+        return original_open(self, fullurl, *args, **kwargs)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", urllib_open)
+    monkeypatch.setattr(cli, "_get_gateway_health_url", local)
+    # conftest's `_no_live_npm_registry` replaces the packument opener's
+    # `open` on the instance; here every request goes to the local server,
+    # so the class's (redirected) method is used again.
+    from pmcp.manifest import package_identity
+
+    monkeypatch.delattr(package_identity._OPENER, "open")
+    # `pmcp.auth.urlopen` is the opener's `open` bound at import: rebind it to
+    # the (redirected) class method.
+    import pmcp.auth as auth
+
+    monkeypatch.setattr(
+        auth, "urlopen", lambda *a, **k: auth._NO_REDIRECT_OPENER.open(*a, **k)
+    )
+
+
+@pytest.mark.parametrize("shape", sorted(_http_shapes("x")))
+def test_no_rejected_http_response_reaches_any_output(
+    shape: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every malformed-response shape x every HTTP call site, end to end:
+    no form of the sentinel in the result, `gateway.health`'s error, any log
+    record at DEBUG, or any escaping exception's text or traceback."""
+    import pmcp  # noqa: F401 - installs the scrubbers
+    from pmcp.argument_errors import exception_text, safe_traceback_text
+
+    s = _GRID_S
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    listener, port = _serve_once_per_connection(_http_shapes(s)[shape])
+    _redirect_every_client(monkeypatch, port)
+    failures = []
+    try:
+        for site, drivers in sorted(_HTTP_SITE_DRIVERS.items()):
+            for driver in drivers:
+                caplog.clear()
+                token = f"site{len(_GRID_REQUESTS)}x{abs(hash(site)) % 10**8}"
+                _GRID_TOKEN[0] = token
+                try:
+                    outcome = repr(asyncio.run(driver(port)))
+                except Exception as error:  # noqa: BLE001 -- inspected
+                    outcome = exception_text(error) + safe_traceback_text(error)
+                if not any(token.encode() in request for request in _GRID_REQUESTS):
+                    # No vacuous pass: the site's client read the response.
+                    failures.append((site, "never connected", outcome[:300]))
+                logs = "\n".join(_record_text(record) for record in caplog.records)
+                for surface, text in (("result", outcome), ("log", logs)):
+                    if any(form in text for form in _forbidden(s)):
+                        failures.append((site, surface, text[:300]))
+    finally:
+        listener.close()
+    assert not failures, failures

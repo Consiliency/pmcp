@@ -1121,12 +1121,14 @@ async def test_a_wrapped_handler_keeps_the_wire_code(family: str) -> None:
 
     cases = {
         "bare": (INVALID_PARAMS, "validation error"),
-        "mcp_inside_except": (-32002, "Resource not found"),
+        # Rev 23 (round-21 claude N1): an MCPError that chains a validation
+        # error keeps its code; its own message and `data` are never kept.
+        "mcp_inside_except": (-32002, "validation error"),
         "mcp_from_error": (-32602, "validation error"),
         "wrapped": (0, "validation error"),
-        "mcp_data_kept": (-32002, "Resource not found"),
-        "mcp_data_carries": (-32602, "bad input"),
-        "mcp_partial_message": (-32602, ""),
+        "mcp_data_kept": (-32002, "validation error"),
+        "mcp_data_carries": (-32602, "validation error"),
+        "mcp_partial_message": (-32602, "validation error"),
     }
     for name, handler in (
         ("bare", bare),
@@ -1142,11 +1144,10 @@ async def test_a_wrapped_handler_keeps_the_wire_code(family: str) -> None:
         assert code == expected_code, (name, code, message)
         assert expected_text in message, (name, message)
         assert not any(f in f"{message}{data!r}" for f in forbidden), (name, message)
-        if name == "mcp_data_kept":
-            # rev 12: `data` that carries nothing rejected is kept.
-            assert data == {"uri": "x://r"}, data
-        if name == "mcp_data_carries":
-            assert data is None, data
+        if name.startswith("mcp_"):
+            # Rev 23: no `data` survives a chain that holds a validation
+            # error (rev 12 kept `data` that matched nothing rejected).
+            assert data is None, (name, data)
     assert await wire(unrelated) == (0, "plain failure", None)
 
 

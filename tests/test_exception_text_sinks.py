@@ -172,41 +172,64 @@ _VALUE_FREE_ATTRIBUTES = frozenset(
 )
 
 
-def _pmcp_exception_fields() -> frozenset[str]:
-    """Attribute names pmcp's own exception classes set on `self`. Their
-    values are pmcp-built, so their construction is checked by this guard
-    where it happens."""
-    root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
+def _class_fields(cls: type) -> frozenset[str]:
+    """Attribute names `cls` and its pmcp bases set on `self` (rev 23)."""
+    import inspect
+
     names: set[str] = set()
-    for path in sorted(root.rglob("*.py")):
-        if "baml_client" in path.parts:
+    for klass in cls.__mro__:
+        if not str(getattr(klass, "__module__", "")).startswith("pmcp"):
             continue
-        for node in ast.walk(ast.parse(path.read_text())):
-            if not isinstance(node, ast.ClassDef):
-                continue
-            bases = " ".join(ast.unparse(base) for base in node.bases)
-            if not any(word in bases for word in ("Error", "Exception")):
-                continue
-            for inner in ast.walk(node):
-                if (
-                    isinstance(inner, ast.Attribute)
-                    and isinstance(inner.ctx, ast.Store)
-                    and isinstance(inner.value, ast.Name)
-                    and inner.value.id == "self"
-                ):
-                    names.add(inner.attr)
+        try:
+            tree = ast.parse(inspect.getsource(klass).lstrip())
+        except (OSError, TypeError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, ast.Store)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"
+            ):
+                names.add(node.attr)
     return frozenset(names)
 
 
-_SAFE_ATTRIBUTE_CACHE: list[frozenset[str]] = []
-
-
-def _safe_exception_attributes() -> frozenset[str]:
-    if not _SAFE_ATTRIBUTE_CACHE:
-        _SAFE_ATTRIBUTE_CACHE.append(
-            (_VALUE_FREE_ATTRIBUTES | _pmcp_exception_fields()) - _TEXT_ATTRIBUTES
+def _handler_fields(
+    handler: ast.ExceptHandler, namespace: dict[str, Any]
+) -> frozenset[str]:
+    """The pmcp fields an `except` binding may read: those of the classes it
+    catches, only when every one of them is a pmcp exception class (rev 23,
+    round-21 claude N1: `e.data` on the SDK's `MCPError` is not pmcp's)."""
+    if handler.type is None:
+        return frozenset()
+    try:
+        value = eval(  # noqa: S307 -- pmcp's own except clause, its namespace
+            ast.unparse(handler.type), {**vars(builtins), **namespace}
         )
-    return _SAFE_ATTRIBUTE_CACHE[0]
+    except Exception:
+        return frozenset()
+    classes = value if isinstance(value, tuple) else (value,)
+    if not classes or not all(
+        isinstance(cls, type) and str(cls.__module__).startswith("pmcp")
+        for cls in classes
+    ):
+        return frozenset()
+    fields = [_class_fields(cls) for cls in classes]
+    return frozenset.intersection(*fields) - _TEXT_ATTRIBUTES
+
+
+def _binding_handler(
+    use: ast.Name, parents: dict[ast.AST, ast.AST]
+) -> ast.ExceptHandler | None:
+    node: ast.AST = use
+    while node in parents:
+        node = parents[node]
+        if isinstance(node, ast.ExceptHandler) and node.name == use.id:
+            return node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+    return None
 
 
 #: Attributes that carry an exception's text or the rejected value.
@@ -812,7 +835,11 @@ def exception_sinks(
                 # straight to a renderer or an exempt callee.
                 grand = parents.get(parent)
                 method = isinstance(grand, ast.Call) and grand.func is parent
-                if parent.attr in _safe_exception_attributes() and not method:
+                handler = _binding_handler(use, parents)
+                allowed = _VALUE_FREE_ATTRIBUTES - _TEXT_ATTRIBUTES
+                if handler is not None:
+                    allowed = allowed | _handler_fields(handler, namespace)
+                if parent.attr in allowed and not method:
                     continue
                 if (
                     isinstance(grand, ast.Call)
@@ -922,6 +949,10 @@ _FLAGGED = {
     # registered error too.
     "narrow_handler_text": "try:\n    f()\nexcept KeyError as e:\n    log(f'{e}')\n",
     "narrow_handler_str": "try:\n    f()\nexcept ConnectionError as e:\n    parse(str(e))\n",
+    # rev 23 (round-21 claude N1): a pmcp field name on an exception that is
+    # not a pmcp class.
+    "mcp_error_data": "from mcp.shared.exceptions import MCPError\ntry:\n    f()\nexcept MCPError as e:\n    log(str(e.data))\n",
+    "any_exception_error_field": "try:\n    f()\nexcept Exception as e:\n    log(e.error.message)\n",
     # rev 22 (round-20 claude N1): the attribute check is an allowlist, a
     # `setattr` hands off unless the exception is its target, and `**` into
     # a logging call can carry `exc_info`.
