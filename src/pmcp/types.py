@@ -765,6 +765,11 @@ class McpTaskRecord(McpTaskInfo):
     #: eviction key. pmcp's own sequence, so neither a downstream's clock nor
     #: pmcp's wall clock can reorder it (Consiliency/pmcp#298, R3-N4).
     _recorded_order: int = PrivateAttr(default=0)
+    #: The `ManagedClient.connection_id` of the connection this record came
+    #: from (not public). A task request derived from the record is sent only
+    #: on that same connection (Consiliency/pmcp#338, rev 5). None for a
+    #: record no connection made (tests that seed the registry directly).
+    _connection_id: int | None = PrivateAttr(default=None)
 
 
 class TaskMetadataInput(GatewayArguments):

@@ -38,9 +38,6 @@ from pmcp.client.manager import (
     _spawned_group_pgid,
     _terminate_process_tree,
     parse_request_id,
-    effective_task_mode,
-    task_answer_of,
-    usable_task_response,
 )
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import (
@@ -1637,19 +1634,22 @@ class GatewayTools:
             )
 
         # Call the tool
-        task_requested = effective_task_mode(tool_info, parsed.task)
         _call_start = time.monotonic()
         timeout_ms = 30000
         if parsed.options:
             timeout_ms = parsed.options.timeout_ms
         try:
+            # The reply, and the task record pmcp built from *this* reply on
+            # *this* connection (Consiliency/pmcp#338, rev 6). Never a lookup
+            # by (server, task_id) after the await: a reconnect may have put
+            # another connection's same-id task there.
             if parsed.task is None:
                 if trace_context is None:
-                    result = await self._client_manager.call_tool(
+                    reply = await self._client_manager.call_tool_with_task(
                         parsed.tool_id, parsed.arguments, timeout_ms
                     )
                 else:
-                    result = await self._client_manager.call_tool(
+                    reply = await self._client_manager.call_tool_with_task(
                         parsed.tool_id,
                         parsed.arguments,
                         timeout_ms,
@@ -1657,11 +1657,11 @@ class GatewayTools:
                     )
             else:
                 if trace_context is None:
-                    result = await self._client_manager.call_tool(
+                    reply = await self._client_manager.call_tool_with_task(
                         parsed.tool_id, parsed.arguments, timeout_ms, task=parsed.task
                     )
                 else:
-                    result = await self._client_manager.call_tool(
+                    reply = await self._client_manager.call_tool_with_task(
                         parsed.tool_id,
                         parsed.arguments,
                         timeout_ms,
@@ -1669,28 +1669,26 @@ class GatewayTools:
                         trace_context=trace_context,
                     )
 
-            task_info = None
-            # Rev 17 (round-15 codex F001, claude F003; and Consiliency/pmcp#330
-            # round 3 F001, the same gate): task handling follows the call's
-            # effective task mode, derived once before the call. A call that is
-            # not a task returns its answer as opaque data, sized as returned:
-            # no recognition, no registry lookup, no replacement. A task call
-            # returns, and is sized from, the answer reduced to what pmcp
-            # could use (`usable_task_response`, idempotent). The record is the
-            # one the manager made from it, in seconds.
-            if task_requested:
-                result = usable_task_response(result)
-                found = task_answer_of(result)
-                if found is not None:
-                    task_info = self._client_manager.get_task_record(
-                        tool_info.server_name, found[1].task_id
-                    )
+            # The task this reply carries: the record the manager built from
+            # this reply, on this connection, and only when this call ran as a
+            # task (Consiliency/pmcp#338, rev 6). Never a lookup by key after
+            # the await: a reconnect may have put another connection's same-id
+            # task there. The manager decides the call's effective task mode
+            # (`effective_task_mode`, Consiliency/pmcp#297 rev 17): a call
+            # that is not a task gets its answer back as opaque data; a task
+            # call gets it reduced to what pmcp could use
+            # (`usable_task_response`), and it is sized in that form.
+            result = reply.result
+            task_info = reply.task
 
             # Process output (truncate, redact)
             max_bytes = None
             if parsed.options and parsed.options.max_output_chars:
                 max_bytes = parsed.options.max_output_chars * 4  # Rough bytes estimate
 
+            # Redacted by default when this call produced a task record: a task
+            # was requested and the reply carries one. That is main's rule; the
+            # record is now this reply's, stored or not (rev 6).
             redact = (
                 parsed.options.redact_secrets
                 if parsed.options
@@ -2132,10 +2130,23 @@ class GatewayTools:
                 )
             ]
 
+            disconnect_errors: list[str] = []
             for name in to_disconnect:
                 # Pending/active work was already gated (and force-cancelled)
-                # above, so force the per-server disconnect here.
-                await self._client_manager.disconnect_server(name, force=True)
+                # above, so force the per-server disconnect here. A failure is
+                # reported, not dropped: the server is still connected, though
+                # it may be removed from config or denied by policy
+                # (Consiliency/pmcp#338).
+                (
+                    disconnected,
+                    _cancelled,
+                    error,
+                ) = await self._client_manager.disconnect_server(name, force=True)
+                if not disconnected:
+                    disconnect_errors.append(
+                        f"Server '{name}' could not be disconnected: "
+                        f"{error or 'unknown error'}"
+                    )
 
             self._client_manager.register_lazy_configs(resolution.lazy_configs)
             # Reconcile the lazy set to the resolved keep-set: drop on-demand
@@ -2145,9 +2156,9 @@ class GatewayTools:
             # ensure_connected().
             self._client_manager.prune_lazy_configs(set(keep_by_name))
 
-            errors: list[str] = []
+            errors: list[str] = list(disconnect_errors)
             if to_connect:
-                errors = await self._client_manager.connect_all(to_connect)
+                errors += await self._client_manager.connect_all(to_connect)
             pending_remaining = len(self._client_manager.get_pending_requests())
 
             revision_id, _ = self._client_manager.get_registry_meta()
@@ -6083,12 +6094,9 @@ class GatewayTools:
                         continue
                     if not self._policy_manager.is_server_allowed(task_server):
                         continue
-                    record = self._client_manager.get_task_record(
-                        task_server,
-                        task["task_id"],
-                    )
-                    task_info = record if record is not None else McpTaskInfo(**task)
-                    tasks.append(self._sanitize_task_for_output(task_info))
+                    # The listed entry is the record list_tasks built from this
+                    # reply. Never re-read by key after the await (rev 6).
+                    tasks.append(self._sanitize_task_for_output(McpTaskInfo(**task)))
             output = TasksListOutput(
                 ok=True,
                 tasks=tasks,
@@ -6175,14 +6183,15 @@ class GatewayTools:
             )
             return TasksResultOutput(ok=False, errors=[message])
         try:
-            result = await self._client_manager.get_task_result(
+            # The reply, and the record built from it (rev 6): never a
+            # lookup by key after the await.
+            reply = await self._client_manager.get_task_result_with_task(
                 parsed.server_name,
                 parsed.task_id,
                 requestor_context=parsed.requestor_context,
             )
-            task = self._client_manager.get_task_record(
-                parsed.server_name, parsed.task_id
-            )
+            result = reply.result
+            task = reply.task
             result_payload = (
                 result.get("result", result) if isinstance(result, dict) else result
             )

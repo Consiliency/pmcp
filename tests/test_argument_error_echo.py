@@ -1753,7 +1753,10 @@ async def test_no_downstream_value_reaches_a_response_log_or_audit(
                     if method == "tasks/cancel":
                         # Cancel asks downstream only for a live, known task.
                         server._client_manager._record_task(
-                            _DOWNSTREAM, McpTaskInfo(task_id="t", status="working")
+                            _DOWNSTREAM,
+                            McpTaskInfo(task_id="t", status="working"),
+                            requestor_context=None,
+                            connection=server._client_manager._clients.get(_DOWNSTREAM),
                         )
                     mark = tap.start()
                     result = await _call(server, name, arguments)
@@ -2329,7 +2332,10 @@ async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
                     server._client_manager._tasks.clear()
                     if method == "tasks/cancel":
                         server._client_manager._record_task(
-                            _DOWNSTREAM, McpTaskInfo(task_id="t", status="working")
+                            _DOWNSTREAM,
+                            McpTaskInfo(task_id="t", status="working"),
+                            requestor_context=None,
+                            connection=server._client_manager._clients.get(_DOWNSTREAM),
                         )
                     mark = tap.start()
                     result = await _call(server, name, arguments)
@@ -2459,7 +2465,12 @@ async def test_the_normaliser_acts_iff_the_parser_accepts_on_every_task_op(
         if nested or info is not None:  # otherwise main's rule polls tasks/get
             assert await manager.get_task_result(_DOWNSTREAM, "t") == expected, name
         manager._tasks.clear()
-        manager._record_task(_DOWNSTREAM, McpTaskInfo(task_id="t", status="working"))
+        manager._record_task(
+            _DOWNSTREAM,
+            McpTaskInfo(task_id="t", status="working"),
+            requestor_context=None,
+            connection=manager._clients.get(_DOWNSTREAM),
+        )
         _, record, _ = await manager.cancel_task(_DOWNSTREAM, "t")
         assert record is not None
         assert record.raw == (info.raw if info is not None else {}), name
@@ -2483,7 +2494,12 @@ async def _answer_text(root: Path, tool: str, reply: Any) -> str:
     else:
         args = {"server_name": _DOWNSTREAM, "task_id": "t"}
         task = McpTaskInfo(task_id="t", status="working")
-        server._client_manager._record_task(_DOWNSTREAM, task)
+        server._client_manager._record_task(
+            _DOWNSTREAM,
+            task,
+            requestor_context=None,
+            connection=server._client_manager._clients.get(_DOWNSTREAM),
+        )
     result = await _call(server, tool, args)
     if tool == "gateway.tasks_cancel":
         record = server._client_manager.get_task_record(_DOWNSTREAM, "t")
@@ -2550,7 +2566,13 @@ async def _invoke_as(
     manager._send_request = send  # type: ignore[method-assign]
     if recorded:
         task = McpTaskInfo(task_id="t", status="working")
-        manager._record_task(_DOWNSTREAM, task, tool_id="o")
+        manager._record_task(
+            _DOWNSTREAM,
+            task,
+            tool_id="o",
+            requestor_context=None,
+            connection=manager._clients.get(_DOWNSTREAM),
+        )
     args: dict[str, Any] = {"tool_id": f"{_DOWNSTREAM}::run", **_correlations()}
     if requested:
         args["task"] = {"enabled": True}

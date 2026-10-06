@@ -415,7 +415,10 @@ async def _request(server: Any, method: str) -> str:
             from pmcp.types import McpTaskInfo
 
             server._client_manager._record_task(
-                "frames", McpTaskInfo(task_id="t", status="working")
+                "frames",
+                McpTaskInfo(task_id="t", status="working"),
+                requestor_context=None,
+                connection=server._client_manager._clients.get("frames"),
             )
         name = {
             "tasks/list": "gateway.tasks_list",

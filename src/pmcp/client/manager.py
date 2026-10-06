@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, ExitStack, contextmanager
+import functools
+import itertools
 import json
 import logging
 import os
@@ -17,7 +19,7 @@ from collections import deque
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, Iterator, TypeVar
+from typing import NamedTuple, Any, Iterator, TypeVar
 
 import httpx2
 import mcp.types as mcp_types
@@ -42,6 +44,7 @@ from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
     resolve_remote_headers_for_tenant,
 )
+from pmcp.client.task_registry import TaskCustody, TaskRegistry, task_is_terminal
 from pmcp.subscriptions import CatalogEventSink
 from pmcp.validation import normalized_executable_name
 from pmcp.types import (
@@ -1430,6 +1433,42 @@ class PendingRequest:
     method: str = ""
 
 
+#: Source of `ManagedClient.connection_id`: unique for the process lifetime,
+#: unlike `id()`, which a later object can reuse.
+_CONNECTION_IDS = itertools.count(1)
+
+
+def _pins_task(method: Any) -> Any:
+    """Pin `(server_name, task_id)` -- a method's first two arguments -- for
+    the whole call (Consiliency/pmcp#338, rev 9): the record the request reads
+    at its start cannot be evicted before its reply lands."""
+
+    @functools.wraps(method)
+    async def pinned(
+        self: Any, server_name: str, task_id: str, *a: Any, **k: Any
+    ) -> Any:
+        with self._pinned([(server_name, task_id)]):
+            return await method(self, server_name, task_id, *a, **k)
+
+    return pinned
+
+
+class TaskReply(NamedTuple):
+    """A downstream reply, and the task record pmcp built from *this* reply
+    (Consiliency/pmcp#338, rev 6).
+
+    `task` is built from the reply alone, on the connection the request went
+    out on, whether or not it was stored (a reply from a replaced connection
+    is not). A caller uses it instead of looking the task up by
+    `(server, task_id)` after the await: by then the registry may hold another
+    connection's task under the same id. None when the reply carries no task
+    pmcp records (no task requested, no task payload, or a reply about a
+    different task than the one asked for)."""
+
+    result: Any
+    task: McpTaskRecord | None
+
+
 @dataclass
 class ManagedClient:
     """A managed connection to a downstream MCP server."""
@@ -1488,6 +1527,11 @@ class ManagedClient:
     # afterwards: a leader that exits at once can be reaped before
     # `create_subprocess_exec` even returns.
     group_pgid: int | None = None
+    # Which connection this is. A reconnect under the same name makes a new
+    # ManagedClient with a new id, so a task record (or a teardown snapshot)
+    # from the old connection can be told apart from the replacement
+    # (Consiliency/pmcp#338, rev 5).
+    connection_id: int = field(default_factory=lambda: next(_CONNECTION_IDS))
 
 
 class ClientManager:
@@ -1540,14 +1584,10 @@ class ClientManager:
         # by server so a reconcile of A never swallows a genuine publish for B.
         self._catalog_suppressed: dict[str, int] = {}
         self._request_counters: dict[str, int] = {}
-        self._tasks: dict[tuple[str, str], McpTaskRecord] = {}
-        # Cap on retained terminal (completed/failed/cancelled) task records.
-        # Active records are never evicted; only terminal ones are pruned oldest
-        # first once this many accumulate, so the registry can't grow unbounded
-        # between full teardowns.
-        self._max_terminal_tasks = 100
-        # Increments on every `_record_task`: the terminal-eviction order.
-        self._record_order = 0
+        # Every tracked downstream task. Read-only mapping: `_record_task` is
+        # the one writer (`TaskRegistry.put`), and `put` applies the per-server
+        # and total caps (Consiliency/pmcp#338).
+        self._tasks = TaskRegistry()
 
     async def connect_all(
         self, configs: list[ResolvedServerConfig], retry: bool = True
@@ -1852,14 +1892,16 @@ class ClientManager:
         # forced disconnect sends `tasks/cancel` for each active MCP task and
         # waits for the reply, and then waits for the lock. A caller cancelled
         # at either await still gets the synchronous teardown, then the cancel.
+        # The tasks are cancelled through the one teardown helper
+        # (Consiliency/pmcp#338): it owes every active task tracked now, an
+        # eviction meanwhile included. It returns how many it cancelled or
+        # found finished, which this caller does not use. When its custody is
+        # released, a task it did not cancel goes back to the registry only if
+        # it is unfinished, on its server's current connection, and owed by no
+        # other running teardown (R4).
         try:
             if active_tasks:
-                for task in active_tasks:
-                    ok, _task, message = await self.cancel_task(
-                        name, task.task_id, force=True
-                    )
-                    if not ok:
-                        return (False, cancelled, message)
+                await self._cancel_tracked_for_teardown([name])
             await self._lifecycle_lock.acquire()
         except asyncio.CancelledError:
             before_lock = self._clients.get(name)
@@ -2119,8 +2161,10 @@ class ClientManager:
         """Remove catalog entries owned by one server.
 
         `drop_tasks=False` keeps the server's tracked `McpTaskRecord`s. Dropping
-        them is right for a disconnect, where the downstream's tasks died with
-        the connection, and wrong for a `list_changed` reconcile, where the
+        them is right for a disconnect, where pmcp can no longer reach those
+        tasks (a stdio server's die with its process; a remote server's keep
+        running, which is why a forced disconnect cancels them first), and
+        wrong for a `list_changed` reconcile, where the
         server is still up and its in-flight tasks are still running -- evicting
         them there would silently break `gateway.tasks_list`/`tasks_result`.
 
@@ -2150,9 +2194,7 @@ class ClientManager:
                     self._prompts.pop(prompt_id, None)
                     prompts_removed = True
         if drop_tasks:
-            for key in list(self._tasks):
-                if key[0] == name:
-                    self._tasks.pop(key, None)
+            self._tasks.drop_server(name)
         suppressed = self._catalog_publishing_suppressed(name)
         if tools_removed and not suppressed:
             self._catalog_events.note_tools_changed()
@@ -2278,9 +2320,54 @@ class ClientManager:
         task_info: McpTaskInfo,
         *,
         tool_id: str | None = None,
-        requestor_context: dict[str, Any] | None = None,
+        requestor_context: dict[str, Any] | None,
+        connection: ManagedClient | None,
     ) -> McpTaskRecord:
-        existing = self._tasks.get((server_name, task_info.task_id))
+        """Build and store one record: the only way a record is made.
+
+        `requestor_context` is required, with no default (Consiliency/pmcp#338,
+        rev 5). Each caller passes the context it holds for this task, or an
+        explicit `None` it can justify; the structural tests list every call
+        and its value. The merge below keeps an existing record's context when
+        the caller passes none, but after an eviction there is no existing
+        record, so a caller that held a context and dropped it here would lose
+        it -- the class four panel rounds found one site at a time.
+
+        Precedence (rev 9): the context a caller supplies with this request
+        (`gateway.invoke`'s `task.requestor_context`) wins, as on main; else
+        the existing same-connection record's is kept. A reply supplies none,
+        so it never overrides. Rev 8's captured `fallback_context` is gone: a
+        request that captured a context pins its record (`_pinned`), so the
+        record is still there when the reply lands, and the existing record's
+        context -- the newest pmcp holds -- is what the merge keeps.
+
+        `connection` is required too (rev 5): the `ManagedClient` the task's
+        information came from. The record is bound to it, and a task request
+        derived from the record is sent only on that connection
+        (`_task_client(..., bound_to=record)`). If that connection is no
+        longer the server's -- it was replaced or removed while the request
+        was in flight -- the record is built and returned but *not stored*: a
+        reply from the old connection must not become state of the new one.
+        `None` (an unbound record) is for tests that seed the registry; every
+        call in `src/pmcp` passes the connection it used (structurally
+        pinned).
+        """
+        # Ownership first (rev 7): a reply from a connection that is no longer
+        # the server's is built from the reply alone -- never merged with what
+        # the registry holds now, which may be a replacement connection's
+        # same-id task -- and is not stored.
+        owned = connection is None or self._owns(server_name, connection)
+        key = (server_name, task_info.task_id)
+        # Evicted while a forced teardown owed it: its custody still holds it,
+        # and pmcp merges with what it holds (rev 11).
+        existing = (self._tasks.get(key) or self._tasks.held(key)) if owned else None
+        if (
+            existing is not None
+            and connection is not None
+            and existing._connection_id is not None
+            and existing._connection_id != connection.connection_id
+        ):
+            existing = None  # another connection's record: never merged
         now = time.time()
         # created_at: the first usable value pmcp saw (Consiliency/pmcp#298).
         created_at = (
@@ -2315,49 +2402,57 @@ class ClientManager:
             requestor_context=requestor_context
             or (existing.requestor_context if existing else None),
         )
-        self._record_order += 1
-        record._recorded_order = self._record_order
-        self._tasks[(server_name, task_info.task_id)] = record
-        self._evict_terminal_tasks()
+        if not owned:
+            return record  # the old connection's reply: not stored
+        if connection is not None:
+            record._connection_id = connection.connection_id
+        # The one way in: `put` applies the per-server and total caps
+        # (Consiliency/pmcp#338). It never evicts the record it just stored.
+        self._tasks.put(record)
         return record
 
-    def _evict_terminal_tasks(self) -> None:
-        """Prune oldest terminal task records past the retention cap.
-
-        Only completed/failed/cancelled records are candidates; active tasks are
-        left untouched. Eviction targets the records pmcp recorded least
-        recently (``_recorded_order``), so recently-seen tasks remain queryable.
-        """
-        terminal = [
-            (key, record)
-            for key, record in self._tasks.items()
-            if self._terminal_task(record)
-        ]
-        excess = len(terminal) - self._max_terminal_tasks
-        if excess <= 0:
-            return
-        # Least recently recorded by pmcp first. The downstream's own
-        # timestamps play no part: a far-future `lastUpdatedAt` cannot keep one
-        # server's records past another's, and an honest server whose clock
-        # runs behind cannot lose its records early (Consiliency/pmcp#298).
-        terminal.sort(key=lambda item: item[1]._recorded_order)
-        for key, _record in terminal[:excess]:
-            self._tasks.pop(key, None)
-
     def _terminal_task(self, task: McpTaskRecord) -> bool:
-        return task.status in {"completed", "failed", "cancelled"}
+        return task_is_terminal(task)
 
     def get_task_record(self, server_name: str, task_id: str) -> McpTaskRecord | None:
+        """The registry's record for one task. In `src/pmcp` it is read only
+        by a request that has pinned the key (rev 12, structurally pinned),
+        and pinning puts a record the cap had moved into a running teardown's
+        custody back in the registry first (`_pinned`): so every request sees
+        a task pmcp tracks, custody included, with its context."""
         return self._tasks.get((server_name, task_id))
 
     def get_tracked_tasks(self, server_name: str | None = None) -> list[McpTaskRecord]:
-        return sorted(
-            [
-                task
-                for (server, _), task in self._tasks.items()
-                if server_name is None or server == server_name
-            ],
-            key=lambda task: (task.server_name, task.task_id),
+        """Every task pmcp tracks, for one server or all: the one source every
+        reader of task state goes through (rev 12, round-11 F001).
+
+        That is the registry's records, plus the records a running forced
+        teardown owes that the cap moved into its custody
+        (`TaskRegistry.owed_records`): such a task is still running
+        downstream and still owed a `tasks/cancel`, so a second teardown must
+        owe it too, a non-forced disconnect must refuse on it, and a refresh
+        must count it. An owed record counts only while it belongs to its
+        server's current connection: one from a removed or replaced
+        connection is not this server's state any more (rev 5)."""
+        tracked = [
+            task
+            for (server, _), task in self._tasks.items()
+            if server_name is None or server == server_name
+        ]
+        tracked.extend(
+            task
+            for task in self._tasks.owed_records(server_name)
+            if self._on_current_connection(task)
+        )
+        return sorted(tracked, key=lambda task: (task.server_name, task.task_id))
+
+    def _on_current_connection(self, task: McpTaskRecord) -> bool:
+        """Whether `task` belongs to its server's current connection (an
+        unbound record, as tests seed, belongs to whichever is current)."""
+        managed = self._clients.get(task.server_name)
+        return managed is not None and task._connection_id in (
+            None,
+            managed.connection_id,
         )
 
     def get_active_tasks(self, server_name: str | None = None) -> list[McpTaskRecord]:
@@ -2370,17 +2465,99 @@ class ClientManager:
     async def cancel_active_tasks(
         self, server_name: str | None = None
     ) -> tuple[int, list[str]]:
+        servers = (
+            [server_name]
+            if server_name is not None
+            else sorted({task.server_name for task in self.get_active_tasks()})
+        )
+        cancelled = await self._cancel_tracked_for_teardown(servers)
+        return cancelled, []
+
+    async def _cancel_tracked_for_teardown(self, server_names: list[str]) -> int:
+        """Force-cancel every active task of each server in `server_names`.
+
+        The only place a teardown cancels tasks (Consiliency/pmcp#338).
+
+        What it owes is fixed when it is requested (rev 11): its first
+        statement, before any await, reads every active task of every named
+        server -- through `get_active_tasks`, so including what other running
+        teardowns owe and the cap moved into their custodies (rev 12,
+        round-11 F001): it cancels those now too, never leaves them to an
+        owner that may find the connection gone. Nothing that happens while it waits -- a cancel on another
+        server, a listing that floods this one -- can remove an entry from
+        that obligation (round 10: rev 10 read each server's snapshot only
+        when its turn came, so an eviction meanwhile silently dropped a task
+        and left it running).
+
+        The teardown does not pin what it owes (rev 11). It holds it in a
+        `TaskCustody`: the registry still evicts an owed record past the caps,
+        and hands it to the custody, so it is still cancelled, with the newest
+        context pmcp held for it. Since nothing a teardown owes counts against
+        the caps, overlapping teardowns cannot stack retention (round 9), and
+        no lock is needed to serialise them (rev 10's per-server lock is gone,
+        and with it round-10 N1, an unpruned lock per server, and N2, a forced
+        disconnect waiting behind a forced refresh's other servers). The one
+        record it pins is the entry whose `tasks/cancel` is in flight, as
+        `cancel_task` does: one request, one pin (rev 9).
+
+        An owed record the cap evicted before its turn is still cancelled:
+        its pin puts it back in the registry. While the custody is
+        registered, `_record_task` merges any record of that key with what
+        the custody holds, so a reply or a listing's re-track keeps the
+        context pmcp held for it.
+
+        Per entry, in snapshot order:
+        - the connection the snapshot came from cannot take a task request now
+          -- a concurrent disconnect removed it, a reconnect has the server
+          listed but not yet connected or replaced it, or it does not
+          advertise tasks: skipped, not counted, not an error (rev 5);
+        - the entry is pinned for its own request; a record the cap had moved
+          into a custody is put back in the registry by the pin (rev 12);
+        - finished meanwhile: counted, nothing sent;
+        - otherwise: `tasks/cancel` sent through `_send_task_cancel`, with the
+          record's context -- the newest pmcp holds: `_record_task` merges
+          with a custody's record whenever the registry no longer holds the
+          key.
+
+        Returns how many were cancelled or found finished. A downstream error
+        propagates, as it always has: a teardown that fails or is cancelled
+        ends its obligation with it, and its caller sees the failure.
+        """
+        snapshot = [
+            task
+            for server_name in sorted(set(server_names))
+            for task in self.get_active_tasks(server_name)
+        ]
         cancelled = 0
-        errors: list[str] = []
-        for task in list(self.get_active_tasks(server_name)):
-            ok, _record, message = await self.cancel_task(
-                task.server_name, task.task_id, force=True
-            )
-            if ok:
-                cancelled += 1
-            else:
-                errors.append(message)
-        return cancelled, errors
+        with self._custody(snapshot):
+            for snapped in snapshot:
+                server_name, task_id = snapped.server_name, snapped.task_id
+                if self._task_client_unavailable(server_name, bound_to=snapped):
+                    continue
+                # this entry's own tasks/cancel is a request in flight like
+                # any other: its key is pinned until the reply lands, and the
+                # pin puts the record back in the registry if the cap had
+                # moved it into a custody (rev 12)
+                with self._pinned([(server_name, task_id)]):
+                    current = self.get_task_record(server_name, task_id)
+                    if current is None:
+                        # Unreachable: the connection is the snapshot's, so
+                        # the record is in the registry or a custody, and the
+                        # pin has put it in the registry. An explicit skip,
+                        # not an `assert` (round-9 N1).
+                        continue
+                    if self._terminal_task(current):
+                        cancelled += 1
+                        continue
+                    await self._send_task_cancel(
+                        server_name,
+                        task_id,
+                        force=True,
+                        requestor_context=current.requestor_context,
+                        bound_to=snapped,
+                    )
+                    cancelled += 1
+        return cancelled
 
     def _index_tools(
         self,
@@ -4624,7 +4801,23 @@ class ClientManager:
         task: TaskMetadataInput | dict[str, Any] | None = None,
         trace_context: TraceContextInfo | dict[str, Any] | None = None,
     ) -> Any:
-        """Call a tool on a downstream server."""
+        """Call a tool on a downstream server; the reply only."""
+        reply = await self.call_tool_with_task(
+            tool_id, args, timeout_ms, task=task, trace_context=trace_context
+        )
+        return reply.result
+
+    async def call_tool_with_task(
+        self,
+        tool_id: str,
+        args: dict[str, Any],
+        timeout_ms: int = 30000,
+        *,
+        task: TaskMetadataInput | dict[str, Any] | None = None,
+        trace_context: TraceContextInfo | dict[str, Any] | None = None,
+    ) -> TaskReply:
+        """Call a tool on a downstream server: the reply, and the task record
+        built from it when a task was requested (rev 6)."""
         tool_info = self._tools.get(tool_id)
         if not tool_info:
             raise ValueError(f"Unknown tool: {tool_id}")
@@ -4674,32 +4867,136 @@ class ClientManager:
             tool_id=tool_id,
             timeout_ms=timeout_ms,
         )
+        built: McpTaskRecord | None = None
         if task_requested and isinstance(result, dict):
             found = task_answer_of(result)
             if found is not None:
-                self._record_task(
+                built = self._record_task(
                     tool_info.server_name,
                     found[1],
                     tool_id=tool_id,
                     requestor_context=requestor_context,
+                    connection=managed,
                 )
-            return usable_task_response(result)
+            # A task call returns, and is sized from, the answer reduced to
+            # what pmcp could use (Consiliency/pmcp#297 rev 14/17).
+            result = usable_task_response(result)
 
-        return result
+        return TaskReply(result, built)
 
-    def _task_client(self, server_name: str) -> ManagedClient:
+    @contextmanager
+    def _pinned(self, keys: list[tuple[str, str]]) -> Iterator[None]:
+        """Pin `keys` in the registry for the duration of a request, and
+        release them however it ends -- reply, exception, cancellation or
+        timeout (rev 9). The only place pins are taken or released, and the
+        only place a custody's record is restored to the registry (rev 12)."""
+        with ExitStack() as release:
+            for key in keys:
+                self._tasks.pin(key)
+                # registered per key: every release runs even if one raises
+                # (round-9 N3), and a pin taken is released if a later one fails
+                release.callback(self._tasks.unpin, key)
+                # Rev 12 (round-11 codex F001): a key the cap moved into a
+                # running teardown's custody comes back into the registry,
+                # where this pin keeps it until the request ends -- however
+                # that teardown ends. Only a record of the server's current
+                # connection: another connection's is not this server's state.
+                if key not in self._tasks:
+                    held = self._tasks.held(key)
+                    if held is not None and self._on_current_connection(held):
+                        self._tasks.restore(held)
+            yield
+
+    @contextmanager
+    def _custody(self, records: list[McpTaskRecord]) -> Iterator[TaskCustody]:
+        """Register what a forced teardown owes for its whole run, and release
+        it however the teardown ends (rev 11). The only place `watch` and
+        `unwatch` are called.
+
+        Releasing does not itself discard a task that was not cancelled (rev
+        13, round-12 F001). An abort is not a discharge: a teardown can end before its
+        last `tasks/cancel` -- its caller cancelled, a downstream error, or a
+        forced disconnect of *another* server cancelling its in-flight
+        request. Each owed record the custody still holds that pmcp no longer
+        tracks otherwise (not in the registry, not owed by another running
+        teardown), that is unfinished, and that is on its server's current
+        connection, goes back into the registry: tracked and retriable again,
+        so a later forced teardown cancels it and a disconnect without
+        `force` refuses on it. Back in the registry it is an ordinary record,
+        under the caps like any other: returned oldest-owed first, each ranks
+        as the newest, so when the returned records and the server's own
+        exceed its cap, the cap evicts in its usual order (finished first,
+        then unfinished, each oldest first) whatever nothing pins: the
+        server's older tasks before the returned ones, and the oldest
+        returned ones if they still exceed it (round-13 N1). That
+        priority is intended: a task pmcp owed a cancel outranks newer tasks
+        it never owed (round-13 N2)."""
+        custody = self._tasks.watch(records)
+        try:
+            yield custody
+        finally:
+            self._tasks.unwatch(custody)
+            leftovers = sorted(
+                (
+                    record
+                    for key, record in custody.items()
+                    if key not in self._tasks
+                    and self._tasks.held(key) is None
+                    and not self._terminal_task(record)
+                    and self._on_current_connection(record)
+                ),
+                key=lambda record: record._recorded_order,
+            )
+            for record in leftovers:
+                self._tasks.restore(record)
+
+    def _owns(self, server_name: str, connection: ManagedClient) -> bool:
+        """Whether `connection` is still `server_name`'s connection. An identity
+        check against a connection a request captured, never a resolution by
+        name: the one way a request may look at `_clients` after its first
+        await (rev 7, structurally pinned)."""
+        return self._clients.get(server_name) is connection
+
+    def _task_client_unavailable(
+        self, server_name: str, *, bound_to: McpTaskRecord | None
+    ) -> str | None:
+        """Why no task request can be sent to `server_name` right now, or None
+        when one can. `_task_client` raises it; a forced teardown skips.
+
+        `bound_to` is the stored record the request is derived from, or None
+        for a request that uses no stored task state (rev 5). A record from a
+        previous connection of the server is refused: its task id and context
+        belong to that connection, and the replacement may be another URL or
+        tenant, where the same id can name an unrelated task."""
         managed = self._clients.get(server_name)
         if (
             not managed
             or (not managed.is_remote and managed.process is None)
             or (managed.is_remote and managed.write_stream is None)
         ):
-            raise RuntimeError(f"Server {server_name} is not connected")
+            return f"Server {server_name} is not connected"
         if not self._server_supports_tasks(managed):
-            raise RuntimeError(
-                f"Server {server_name} does not advertise MCP task support"
+            return f"Server {server_name} does not advertise MCP task support"
+        if (
+            bound_to is not None
+            and bound_to._connection_id is not None
+            and bound_to._connection_id != managed.connection_id
+        ):
+            return (
+                f"Server {server_name} was reconnected; this task belongs to "
+                "its previous connection"
             )
-        return managed
+        return None
+
+    def _task_client(
+        self, server_name: str, *, bound_to: McpTaskRecord | None
+    ) -> ManagedClient:
+        """The connection to send a task request on: the one funnel every
+        `tasks/*` send goes through (rev 5, structurally pinned)."""
+        reason = self._task_client_unavailable(server_name, bound_to=bound_to)
+        if reason is not None:
+            raise RuntimeError(reason)
+        return self._clients[server_name]
 
     async def list_tasks(
         self,
@@ -4713,7 +5010,9 @@ class ClientManager:
         all_tasks: list[dict[str, Any]] = []
         next_cursor: str | None = None
         for name in servers:
-            managed = self._task_client(name)
+            # bound to nothing: a listing is the caller's query, built from no
+            # stored task state
+            managed = self._task_client(name, bound_to=None)
             params = self._task_request_params(
                 cursor=cursor,
                 requestor_context=requestor_context,
@@ -4725,11 +5024,21 @@ class ClientManager:
                 task_info = self._task_info_from_payload(payload)
                 if task_info is None:
                     continue
-                record = self._record_task(name, task_info)
+                # None: a listing does not say which context a task belongs
+                # to (the caller's listing context scopes the query, not the
+                # task). A task pmcp tracks keeps its own via the merge; one it
+                # had evicted had already lost it (the stated residual).
+                record = self._record_task(
+                    name,
+                    task_info,
+                    requestor_context=None,
+                    connection=managed,
+                )
                 all_tasks.append(record.model_dump())
             next_cursor = result.get("nextCursor") or result.get("next_cursor")
         return {"tasks": all_tasks, "nextCursor": next_cursor}
 
+    @_pins_task
     async def get_task(
         self,
         server_name: str,
@@ -4738,21 +5047,44 @@ class ClientManager:
         requestor_context: dict[str, Any] | None = None,
     ) -> McpTaskInfo:
         """Proxy downstream tasks/get and update the transient task registry."""
-        managed = self._task_client(server_name)
         record = self.get_task_record(server_name, task_id)
+        # The one resolution of this request's connection (rev 7).
+        managed = self._task_client(server_name, bound_to=record)
+        return await self._fetch_task(
+            server_name,
+            task_id,
+            sent_context=requestor_context
+            or (record.requestor_context if record is not None else None),
+            connection=managed,
+        )
+
+    async def _fetch_task(
+        self,
+        server_name: str,
+        task_id: str,
+        *,
+        sent_context: dict[str, Any] | None,
+        connection: ManagedClient,
+    ) -> McpTaskRecord:
+        """Send `tasks/get` with `sent_context` on `connection`, the connection
+        the calling request resolved once at its entry (rev 7), and record the
+        reply. It resolves nothing by server name; the caller has pinned the
+        task's record (rev 9)."""
+        managed = connection
         result = await self._send_request(
             managed,
             "tasks/get",
-            self._task_request_params(
-                task_id=task_id,
-                requestor_context=requestor_context
-                or (record.requestor_context if record is not None else None),
-            ),
+            self._task_request_params(task_id=task_id, requestor_context=sent_context),
         )
         found = task_answer_of(result)
         if found is None:
             raise KeyError(f"Task not found: {server_name}::{task_id}")
-        return self._record_task(server_name, found[1])
+        return self._record_task(
+            server_name,
+            found[1],
+            requestor_context=None,  # a reply supplies no context
+            connection=managed,
+        )
 
     async def get_task_result(
         self,
@@ -4761,30 +5093,65 @@ class ClientManager:
         *,
         requestor_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Proxy downstream tasks/result and update task metadata when returned."""
-        managed = self._task_client(server_name)
+        """Proxy downstream tasks/result; the reply only."""
+        reply = await self.get_task_result_with_task(
+            server_name, task_id, requestor_context=requestor_context
+        )
+        result: dict[str, Any] = reply.result
+        return result
+
+    @_pins_task
+    async def get_task_result_with_task(
+        self,
+        server_name: str,
+        task_id: str,
+        *,
+        requestor_context: dict[str, Any] | None = None,
+    ) -> TaskReply:
+        """Proxy downstream tasks/result: the reply, and the record of
+        `task_id` built from it, or from the `tasks/get` fallback (rev 6)."""
         record = self.get_task_record(server_name, task_id)
+        managed = self._task_client(server_name, bound_to=record)
+        context = requestor_context or (
+            record.requestor_context if record is not None else None
+        )
         result = await self._send_request(
             managed,
             "tasks/result",
-            self._task_request_params(
-                task_id=task_id,
-                requestor_context=requestor_context
-                or (record.requestor_context if record is not None else None),
-            ),
+            self._task_request_params(task_id=task_id, requestor_context=context),
         )
+        built: McpTaskRecord | None = None
+        # The parser is the only task recogniser (Consiliency/pmcp#297 rev
+        # 15): a reply carries a task only if it parses. The `tasks/get`
+        # fallback keeps main's condition exactly -- the reply names no task
+        # at all -- and Consiliency/pmcp#338's connection rule.
         found = task_answer_of(result)
         if found is not None:
-            self._record_task(server_name, found[1])
-        elif not _names_a_task(result):
-            await self.get_task(
+            built = self._record_task(
+                server_name,
+                found[1],
+                requestor_context=None,  # a reply supplies no context
+                connection=managed,
+            )
+        elif not _names_a_task(result) and self._owns(server_name, managed):
+            # The fallback continues this request on the connection it started
+            # on, never one resolved again by name (rev 7). If that connection
+            # was replaced during `tasks/result`, there is nothing to continue
+            # on: the result is returned without a task record.
+            built = await self._fetch_task(
                 server_name,
                 task_id,
-                requestor_context=requestor_context
-                or (record.requestor_context if record is not None else None),
+                sent_context=context,
+                connection=managed,
             )
-        return usable_task_response(result)
+        # A reply about a different task is recorded, but it is not this
+        # task's record. The reply is returned reduced to what pmcp could use
+        # (Consiliency/pmcp#297).
+        if built is not None and built.task_id != task_id:
+            built = None
+        return TaskReply(usable_task_response(result), built)
 
+    @_pins_task
     async def cancel_task(
         self,
         server_name: str,
@@ -4799,11 +5166,31 @@ class ClientManager:
             return (True, record, f"Task is already terminal: {record.status}")
         if record is None:
             return (False, None, f"Task not found: {server_name}::{task_id}")
-
-        managed = self._task_client(server_name)
-        params = self._task_request_params(
-            task_id=task_id,
+        cancelled = await self._send_task_cancel(
+            server_name,
+            task_id,
+            force=force,
             requestor_context=requestor_context or record.requestor_context,
+            bound_to=record,
+        )
+        return (True, cancelled, "Task cancelled")
+
+    async def _send_task_cancel(
+        self,
+        server_name: str,
+        task_id: str,
+        *,
+        force: bool,
+        requestor_context: dict[str, Any] | None,
+        bound_to: McpTaskRecord,
+    ) -> McpTaskRecord:
+        """Send `tasks/cancel` with `requestor_context` and record the reply:
+        the one sender, for `cancel_task` and the forced teardowns
+        (Consiliency/pmcp#338). Sent only on the connection `bound_to` came
+        from (rev 5); the caller has pinned the task's key (rev 9)."""
+        managed = self._task_client(server_name, bound_to=bound_to)
+        params = self._task_request_params(
+            task_id=task_id, requestor_context=requestor_context
         )
         params["force"] = force
         result = await self._send_request(managed, "tasks/cancel", params)
@@ -4820,7 +5207,12 @@ class ClientManager:
                 status="cancelled",
                 updated_at=time.time(),
             )
-        return (True, self._record_task(server_name, task_info), "Task cancelled")
+        return self._record_task(
+            server_name,
+            task_info,
+            requestor_context=None,  # a reply supplies no context
+            connection=managed,
+        )
 
     async def read_resource(self, resource_id: str, timeout_ms: int = 30000) -> Any:
         """Read a resource from a downstream server."""
