@@ -40,7 +40,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 
-from pmcp.atomic_write import atomic_write, make_store_dirs, resolve_write_target
+from pmcp.atomic_write import (
+    atomic_write,
+    is_absent,
+    make_store_dirs,
+    resolve_write_target,
+)
 from pmcp.trust_store import (
     TrustStoreError,
     refuse_checkout_resident,
@@ -184,7 +189,7 @@ def _read_store_and_stale(
     path: Path,
 ) -> tuple[list[PackageApproval], list[tuple[str, str]]]:
     """``_read_store``, plus the ``(name, version)`` of each stale record left out."""
-    if not path.exists():
+    if is_absent(path):  # only ENOENT/ENOTDIR; ELOOP, EACCES ... are raised
         return [], []
     try:
         raw = path.read_text(encoding="utf-8")

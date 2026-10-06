@@ -66,7 +66,6 @@ import errno
 import os
 import secrets
 import stat
-import tempfile
 from pathlib import Path, PurePath
 
 #: Same bound the kernel applies to one path resolution (Linux MAXSYMLINKS).
@@ -147,6 +146,24 @@ def resolve_write_target(path: Path | str) -> str:
             raise IsADirectoryError(errno.EISDIR, "Is a directory", current)
         return current
     raise OSError(errno.ELOOP, "Too many levels of symbolic links", os.fspath(path))
+
+
+def is_absent(path: Path | str) -> bool:
+    """True only when the kernel says ``path`` does not exist (``ENOENT``/``ENOTDIR``).
+
+    Every "is the store there?" decision uses this, never ``Path.exists()`` or
+    ``os.path.exists``: those answer ``False`` for EVERY failed lookup, so a
+    store the kernel refuses (``ELOOP`` after too many links in one lookup,
+    ``EACCES``) read as empty and the next write dropped its keys
+    (Consiliency/pmcp#366 round 9). Any other failure is raised.
+    """
+    try:
+        os.stat(path)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return True
+        raise
+    return False
 
 
 def make_store_dirs(directory: Path | str, mode: int = 0o700) -> list[str]:
@@ -372,7 +389,7 @@ def read_confined(
     ``ConfinedWriteError`` -- nothing is read. ``verb`` names what the caller
     was doing ("write", "read", "load") in the refusal.
     """
-    if not os.path.lexists(confine_to):
+    if is_absent(confine_to):
         return None
     walk = _walk_confined(path, confine_to, label, verb)
     try:
@@ -423,52 +440,54 @@ _DIR_FD_SUPPORTED = (
 def _write_by_path(
     target: str, data: bytes, *, mode: int, prefix: str, suffix: str
 ) -> None:
-    # Strings, never Path: the user's spelling reaches the kernel unnormalised.
+    """Write ``target`` atomically, its directory opened ONCE with the user's spelling.
+
+    Never ``tempfile``: ``mkstemp`` runs ``abspath`` on its directory, which
+    collapses ``jump/..`` lexically (``a/jump/../x`` with ``jump -> b/inner`` is
+    ``b/x`` to the kernel, ``a/x`` to ``abspath``). The directory is opened by
+    the kernel and the temporary is created, renamed and the rename made durable
+    relative to that one descriptor (:func:`_write_in_dir`).
+    """
     parent = os.path.dirname(target) or os.curdir
-    fd, tmp_name = tempfile.mkstemp(dir=parent, prefix=prefix, suffix=suffix)
+    name = os.path.basename(target)
+    if not _DIR_FD_SUPPORTED:  # pragma: no cover - Windows: pathnames, unnormalised
+        _write_by_name(parent, name, data, mode=mode, prefix=prefix, suffix=suffix)
+        return
+    dir_fd = os.open(parent, _walk_flags())
+    try:
+        _write_in_dir(dir_fd, name, data, mode=mode, prefix=prefix, suffix=suffix)
+    finally:
+        os.close(dir_fd)
+
+
+def _write_by_name(
+    parent: str, name: str, data: bytes, *, mode: int, prefix: str, suffix: str
+) -> None:  # pragma: no cover - exercised only where dir_fd is unavailable
+    """The no-``dir_fd`` form of :func:`_write_in_dir`: plain joins, never normalised."""
+    tmp = os.path.join(parent, f"{prefix}{secrets.token_hex(8)}{suffix}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(tmp, flags | getattr(os, "O_NOFOLLOW", 0), mode)
     committed = False
     try:
         with os.fdopen(fd, "wb") as handle:
-            if hasattr(os, "fchmod"):
-                os.fchmod(handle.fileno(), mode)
-            else:  # pragma: no cover - Windows has no fchmod
-                os.chmod(tmp_name, mode)
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
             written = os.fstat(handle.fileno())
-        # Best-effort narrowing, not a guarantee: the temporary is renamed by
-        # NAME, so check that the entry is still the file just written (not a
-        # link or another file swapped in) before renaming it. A concurrent
-        # same-user writer can still swap it between this check and the rename
-        # -- POSIX has no rename-by-descriptor -- which is out of scope (module
-        # docstring); even then nothing is written outside. The destination
-        # needs no check: rename replaces a link there as an entry.
-        current = os.lstat(tmp_name)
+        current = os.lstat(tmp)
         if stat.S_ISLNK(current.st_mode) or not _same_file(current, written):
             raise ConfinedWriteError(
-                f"refusing to write {os.path.basename(target)}: its temporary file changed "
+                f"refusing to write {name}: its temporary file changed "
                 "before it could be committed"
             )
-        os.replace(tmp_name, target)
+        os.replace(tmp, os.path.join(parent, name))
         committed = True
     finally:
         if not committed:
             try:
-                os.unlink(tmp_name)
+                os.unlink(tmp)
             except OSError:
                 pass
-
-    try:
-        dir_fd = os.open(parent, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
-    finally:
-        os.close(dir_fd)
 
 
 def _write_in_dir(

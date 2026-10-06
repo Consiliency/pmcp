@@ -20,7 +20,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 from pmcp import package_approvals, trust_store
-from pmcp.atomic_write import atomic_write, read_confined
+from pmcp.atomic_write import atomic_write, is_absent, read_confined
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
 from pmcp.cli_commands.install import (
@@ -1902,7 +1902,9 @@ def run_setup(args: argparse.Namespace) -> None:
 
     target_path = _get_setup_target_path(args.client)
     existing: dict = {}
-    if target_path.exists():
+    # Only ENOENT/ENOTDIR is "no config yet"; a config the system refuses to
+    # look up (ELOOP, EACCES) must not be read as empty and then replaced.
+    if not is_absent(target_path):
         try:
             parsed = json.loads(target_path.read_text())
             if isinstance(parsed, dict):
@@ -3137,7 +3139,12 @@ def _load_project_store_at_startup(path: Path) -> None:
     its link (Consiliency/pmcp#367, stays open); they no longer block on a fifo
     (``env_store.read_env_text``).
     """
-    if not os.path.lexists(path):
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return  # no project store: nothing to load
+    except OSError as exc:
+        print(f"pmcp: {store_refusal(path, exc, verb='load')}", file=sys.stderr)
         return
     # Confined to the store's own directory: a project `.env.pmcp` that is a
     # symlink of any kind is refused, so no other directory is ever walked.

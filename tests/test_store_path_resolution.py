@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import errno
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -434,3 +435,120 @@ def test_a_package_approvals_link_into_the_checkout_is_refused_however_spelled(
     monkeypatch.chdir(checkout)
     with pytest.raises(TrustStoreError, match="inside the checkout"):
         package_approvals.package_approvals_path()
+
+
+# --------------------------------------------------------------------------- #
+# Round 9 (codex F002): "is the store there?" is the kernel's ENOENT/ENOTDIR,
+# never a boolean that answers False for EVERY failed lookup (ELOOP, EACCES).
+# --------------------------------------------------------------------------- #
+
+BOOLEAN_EXISTENCE = {
+    "exists",
+    "lexists",
+    "is_file",
+    "isfile",
+    "is_symlink",
+    "islink",
+    "is_dir",
+    "isdir",
+}
+EXISTENCE_MODULES = (
+    "env_store.py",
+    "atomic_write.py",
+    "trust_store.py",
+    "package_approvals.py",
+)
+#: Config writers that live in larger modules: checked function by function.
+EXISTENCE_FUNCTIONS = {
+    ("cli.py", "run_setup"),
+    ("cli.py", "_atomic_write_json"),
+    ("cli.py", "_load_project_store_at_startup"),
+    ("cli.py", "load_startup_env"),
+    ("cli_commands/secrets.py", "run_secrets_set"),
+    ("cli_commands/secrets.py", "run_secrets_sync"),
+}
+
+
+def _boolean_existence(tree: ast.AST) -> list[str]:
+    return [
+        f"{n.func.attr} at line {n.lineno}"
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr in BOOLEAN_EXISTENCE
+    ]
+
+
+def test_store_absence_is_never_decided_by_a_boolean_existence_check() -> None:
+    offenders: dict[str, list[str]] = {}
+    for rel in EXISTENCE_MODULES:
+        tree = ast.parse((SRC / rel).read_text(encoding="utf-8"))
+        if bad := _boolean_existence(tree):
+            offenders[rel] = bad
+    functions = _functions()
+    for key in sorted(EXISTENCE_FUNCTIONS):
+        assert key in functions, key
+        if bad := _boolean_existence(functions[key]):
+            offenders[f"{key[0]}:{key[1]}"] = bad
+    assert offenders == {}, (
+        "a store's absence is decided by a boolean that is False for every "
+        f"failed lookup; use atomic_write.is_absent: {offenders}"
+    )
+
+
+def test_the_existence_scan_sees_each_form() -> None:
+    tree = ast.parse(
+        "p.exists()\nos.path.lexists(p)\np.is_file()\nos.path.isfile(p)\n"
+        "p.is_symlink()\nos.path.islink(p)\np.is_dir()\nos.path.isdir(p)\n"
+    )
+    assert len(_boolean_existence(tree)) == 8
+
+
+def test_a_deep_checkout_cannot_host_package_approvals_either(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex round-9 F001's shape, for the store that shares the residency walk."""
+    from pmcp import package_approvals, trust_store
+    from pmcp.trust_store import TrustStoreError
+
+    base = Path(os.path.realpath(tmp_path))
+    checkout = base / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    directory = checkout
+    while len(os.fsencode(directory)) < 3800:
+        directory = directory / ("d" * 19)
+        directory.mkdir()
+    planted = directory / "approvals.json"
+    planted.write_text('{"version": 1, "records": []}\n', encoding="utf-8")
+    home = base / "home"
+    store = home / ".config" / "pmcp" / "package_approvals.json"
+    store.parent.mkdir(parents=True)
+    os.symlink(planted, store)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (checkout,))
+    with pytest.raises(TrustStoreError, match="inside the checkout"):
+        package_approvals.package_approvals_path()
+
+
+def test_residency_that_cannot_be_established_is_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: an error during the walk refuses the store."""
+    from pmcp import trust_store
+    from pmcp.trust_store import TrustStoreError
+
+    base = Path(os.path.realpath(tmp_path))
+    (base / "checkout").mkdir()
+    store = base / "home" / "trust.json"
+    store.parent.mkdir()
+    real_open = os.open
+
+    def failing_open(p: object, flags: int, *a: object, **kw: object) -> int:
+        if p == os.pardir:
+            raise OSError(errno.ENAMETOOLONG, "File name too long")
+        return real_open(p, flags, *a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (base / "checkout",))
+    monkeypatch.setattr(os, "open", failing_open)
+    with pytest.raises(TrustStoreError, match="cannot establish"):
+        trust_store.refuse_checkout_resident(store, "Trust store")

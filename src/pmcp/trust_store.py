@@ -33,6 +33,7 @@ absolute path: re-approving replaces, it does not append a history.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -42,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pmcp.atomic_write import atomic_write, make_store_dirs
+from pmcp.atomic_write import atomic_write, is_absent, make_store_dirs
 
 APPROVED = "approved"
 DENIED = "denied"
@@ -245,48 +246,73 @@ def refuse_checkout_resident(path: Path | str, label: str) -> None:
     """Raise ``TrustStoreError`` if ``path``'s directory lies inside a judged checkout.
 
     By FILE IDENTITY, never path strings (``//x`` and ``/x`` are one directory
-    but compare unequal): walk up from the directory holding ``path`` with
-    ``..``, as the kernel does, comparing each directory's ``(st_dev, st_ino)``
-    with every checkout root's. Shared by every approval store.
+    but compare unequal), and FAIL CLOSED: if residency cannot be established
+    for any reason, the store is refused. See :func:`_resident_checkout`.
     """
     name = os.path.basename(os.fspath(path))
-    for checkout in _checkout_roots():
-        if _resides_in(path, checkout):
-            raise TrustStoreError(
-                f"{label} {name} resolves inside the checkout at {checkout}. "
-                "A checkout-resident store lets a repository approve its own "
-                "content; move it under a home directory outside the repository."
-            )
-
-
-def _resides_in(path: Path | str, checkout: Path) -> bool:
     try:
-        root = os.stat(checkout)
-    except OSError:
-        return False
+        checkout = _resident_checkout(path, _checkout_roots())
+    except OSError as exc:
+        raise TrustStoreError(
+            f"{label} {name}: cannot establish that it lies outside every "
+            f"checkout being judged ({os.strerror(exc.errno) if exc.errno else exc}); "
+            "refusing it."
+        ) from exc
+    if checkout is not None:
+        raise TrustStoreError(
+            f"{label} {name} resolves inside the checkout at {checkout}. "
+            "A checkout-resident store lets a repository approve its own "
+            "content; move it under a home directory outside the repository."
+        )
+
+
+#: More ancestors than any real path has; past it, residency is unknown.
+_MAX_ANCESTORS = 4096
+
+
+def _resident_checkout(path: Path | str, checkouts: tuple[Path, ...]) -> Path | None:
+    """The checkout whose root is an ancestor of ``path``'s directory, or ``None``.
+
+    Walked by DESCRIPTORS, never by growing a path string (`a/../..` past
+    ``PATH_MAX`` fails with ``ENAMETOOLONG``, which an earlier walk read as
+    "outside"): open the store's directory, then ``..`` relative to each
+    directory reached, comparing ``(st_dev, st_ino)`` with every checkout
+    root's, until a directory is its own parent (``/``). A store directory not
+    created yet is judged by the nearest existing directory above it, found by
+    stepping only across plain names. Any other error raises: residency is then
+    unknown, and the caller refuses.
+    """
+    roots = []
+    for checkout in checkouts:
+        st = os.stat(checkout)
+        roots.append(((st.st_dev, st.st_ino), checkout))
+    flags = (getattr(os, "O_PATH", 0) or os.O_RDONLY) | os.O_DIRECTORY
     current = os.path.dirname(os.fspath(path)) or os.curdir
     while True:
         try:
-            here = os.stat(current)
+            fd = os.open(current, flags)
+            break
         except FileNotFoundError:
-            # A directory not created yet: judge the one that will hold it.
+            name = os.path.basename(current)
             parent = os.path.dirname(current)
-            if parent == current:
-                return False
+            if name in ("", os.curdir, os.pardir) or parent == current:
+                raise
             current = parent
-            continue
-        except OSError:
-            return False
-        if (here.st_dev, here.st_ino) == (root.st_dev, root.st_ino):
-            return True
-        above = os.path.join(current, os.pardir)
-        try:
-            up = os.stat(above)
-        except OSError:
-            return False
-        if (up.st_dev, up.st_ino) == (here.st_dev, here.st_ino):
-            return False  # the filesystem root
-        current = above
+    try:
+        for _ in range(_MAX_ANCESTORS):
+            here = os.fstat(fd)
+            for ident, checkout in roots:
+                if (here.st_dev, here.st_ino) == ident:
+                    return checkout
+            up = os.open(os.pardir, flags, dir_fd=fd)
+            above = os.fstat(up)
+            os.close(fd)
+            fd = up
+            if (above.st_dev, above.st_ino) == (here.st_dev, here.st_ino):
+                return None  # the filesystem root, checked on the previous turn
+        raise OSError(errno.ELOOP, "Too many ancestors to establish residency")
+    finally:
+        os.close(fd)
 
 
 def _decode(entry: Any) -> TrustRecord:
@@ -329,7 +355,7 @@ def _read_store(path: Path) -> list[TrustRecord]:
     An absent store is empty, not an error -- a user who has approved nothing is
     the normal starting state.
     """
-    if not path.exists():
+    if is_absent(path):  # only ENOENT/ENOTDIR; ELOOP, EACCES ... are raised
         return []
 
     try:
@@ -506,7 +532,7 @@ def assert_store_outside_path_checkout(path: Path) -> None:
     store = trust_store_path()
     approved = Path(path).resolve()
     for checkout in _enclosing_checkouts(approved.parent):
-        if _resides_in(store, checkout):
+        if _resident_checkout(store, (checkout,)) is not None:
             raise TrustStoreError(
                 f"Trust store {store} resolves inside the checkout at {checkout} "
                 f"that contains {approved}. A checkout-resident store lets a "

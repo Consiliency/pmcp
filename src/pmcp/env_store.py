@@ -78,9 +78,16 @@ def read_env_text(path: Path) -> str | None:
     It follows a symlink (Consiliency/pmcp#367, stays open); the confined
     readers in :mod:`pmcp.atomic_write` are the ones that do not.
     """
-    if not path.exists():
-        return None
-    if not stat.S_ISREG(os.stat(path).st_mode):
+    # The kernel decides absence: only ENOENT/ENOTDIR is "no store"; ELOOP
+    # (too many links in one lookup), EACCES and the rest are raised, never
+    # read as an empty store that the next write would then replace.
+    try:
+        entry = os.stat(path)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None
+        raise
+    if not stat.S_ISREG(entry.st_mode):
         return None
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     with os.fdopen(fd, "rb") as handle:

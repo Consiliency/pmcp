@@ -488,3 +488,127 @@ def test_the_chain_grid_crosses_the_kernel_limit() -> None:
         for hops in (5, 25):
             outcomes.add(_kernel_write(str(_chain(Path(d) / str(hops), hops))))
     assert outcomes == {True, False}
+
+
+# --------------------------------------------------------------------------- #
+# Round 9 (codex F003): the temporary's directory is the KERNEL's. `mkstemp`
+# ran `abspath` on it, so `a/jump/../x` (jump -> b/inner) put the temporary in
+# `a/` instead of `b/`. Generated over relative/absolute spellings and depths.
+# --------------------------------------------------------------------------- #
+
+
+def _jump_tree(base: Path) -> None:
+    (base / "a").mkdir(parents=True)
+    (base / "b" / "inner" / "deeper").mkdir(parents=True)
+    (base / "b" / "nested").mkdir()
+    (base / "a" / "nested").mkdir()  # the WRONG directory a lexical collapse picks
+    (base / "b" / "nested" / "t.env").write_bytes(b"KEEP=b\n")
+    (base / "a" / "nested" / "t.env").write_bytes(b"KEEP=a\n")
+    os.symlink(base / "b" / "inner", base / "a" / "jump")
+    os.symlink(base / "b" / "inner" / "deeper", base / "a" / "jump2")
+
+
+JUMPS = {
+    "relative jump/..": "a/jump/../nested/t.env",
+    "absolute jump/..": "{base}/a/jump/../nested/t.env",
+    "jump2/../..": "a/jump2/../../nested/t.env",
+    "missing file after jump/..": "a/jump/../nested/new.env",
+}
+
+
+@pytest.mark.parametrize("form", list(JUMPS))
+def test_the_temporary_goes_where_the_kernel_resolves_the_directory(
+    form: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = Path(os.path.realpath(tmp_path))
+    k_base, w_base = root / "kernel", root / "writer"
+    _jump_tree(k_base)
+    _jump_tree(w_base)
+    os.symlink(JUMPS[form].format(base=k_base), k_base / "store.env")
+    os.symlink(JUMPS[form].format(base=w_base), w_base / "store.env")
+    kernel_refused = _kernel_write(str(k_base / "store.env"))
+
+    placed: list[os.stat_result] = []
+    real_in_dir = writer._write_in_dir
+
+    def spy(dir_fd: int, *args: object, **kwargs: object) -> None:
+        placed.append(os.fstat(dir_fd))
+        real_in_dir(dir_fd, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(writer, "_write_in_dir", spy)
+    try:
+        atomic_write(w_base / "store.env", DATA, confine_to=None)
+        writer_refused = False
+    except OSError:
+        writer_refused = True
+    monkeypatch.undo()
+
+    assert writer_refused == kernel_refused, form
+    assert _tree(w_base) == _tree(k_base), form
+    if not writer_refused and writer._DIR_FD_SUPPORTED:
+        kernel_dir = os.stat(os.path.dirname(os.path.realpath(w_base / "store.env")))
+        assert placed and (placed[0].st_dev, placed[0].st_ino) == (
+            kernel_dir.st_dev,
+            kernel_dir.st_ino,
+        ), "the temporary was not created in the kernel's target directory"
+
+
+# --------------------------------------------------------------------------- #
+# Round 9 (codex F002): a store the kernel refuses to look up is an ERROR on
+# every read path, never "absent" (which the next write would replace).
+# --------------------------------------------------------------------------- #
+
+
+def _eloop_store(base: Path) -> Path:
+    directory = base / "real-config"
+    directory.mkdir(parents=True)
+    alias = base / "config"
+    alias.symlink_to(directory, target_is_directory=True)
+    (directory / "target.env").write_bytes(b"KEEP=original\n")
+    names = ["pmcp.env"] + [f"hop{i}" for i in range(1, 40)]
+    for name, destination in zip(names, names[1:] + ["target.env"]):
+        (directory / name).symlink_to(destination)
+    store = alias / "pmcp.env"
+    with pytest.raises(OSError) as info:
+        store.read_bytes()
+    assert info.value.errno == errno.ELOOP
+    return store
+
+
+def test_every_store_reader_raises_on_a_store_the_kernel_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.env_store import read_env_file, read_store_for_update
+
+    store = _eloop_store(Path(os.path.realpath(tmp_path)))
+    with pytest.raises(OSError):
+        read_env_file(store)
+    with pytest.raises(OSError):
+        read_store_for_update("user", store)
+    assert writer.is_absent(store.parent / "nope.env") is True
+    with pytest.raises(OSError):
+        writer.is_absent(store)
+
+
+def test_secrets_set_on_a_user_store_the_kernel_refuses_keeps_every_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import argparse
+    import asyncio
+
+    from pmcp.cli_commands.secrets import run_secrets_set
+
+    base = Path(os.path.realpath(tmp_path))
+    store = _eloop_store(base)
+    home = base / "home"
+    (home / ".config").mkdir(parents=True)
+    (home / ".config" / "pmcp").mkdir()
+    os.symlink(store, home / ".config" / "pmcp" / "pmcp.env")
+    monkeypatch.setenv("HOME", str(home))
+    out = asyncio.run(
+        run_secrets_set(
+            argparse.Namespace(scope="user", key="NEW", value="v", project=None)
+        )
+    )
+    assert out["ok"] is False
+    assert (base / "real-config" / "target.env").read_bytes() == b"KEEP=original\n"
