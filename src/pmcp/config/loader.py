@@ -1023,7 +1023,7 @@ def _merge_manifest_defaults(
     name: str,
     config: LocalMcpServerConfig,
     manifest_servers: dict[str, "ManifestServerConfig"] | None,
-    root: Path | None = None,
+    env_lookup: Callable[[str], str | None],
 ) -> LocalMcpServerConfig | None:
     """Merge a partial config with manifest defaults when possible.
 
@@ -1087,12 +1087,11 @@ def _merge_manifest_defaults(
             existing and re.fullmatch(_LOCAL_ENV_PLACEHOLDER_RE, existing)
         )
         if not existing or is_placeholder:
-            from pmcp.env_store import credential_value
-
             for lookup_key in credential_lookup_keys(manifest_server):
-                # The credential of the project this config is loaded for
-                # (Consiliency/pmcp#372 round 9).
-                value = credential_value(lookup_key, root=root)
+                # ``env_lookup``: the credential lookup of the project this
+                # config is loaded for (Consiliency/pmcp#372 round 9), as
+                # _manifest_server_to_config takes one.
+                value = env_lookup(lookup_key)
                 if value:
                     if merged is config:
                         merged = config.model_copy(deep=True)
@@ -1176,7 +1175,7 @@ def load_configs(
             # entry long before this point.
             try:
                 local_merged = _merge_manifest_defaults(
-                    name, normalized, manifest_servers, root=resolved_project_root
+                    name, normalized, manifest_servers, credentials
                 )
             except Exception as exc:
                 logger.warning(
@@ -1184,7 +1183,7 @@ def load_configs(
                     f"({type(exc).__name__})"
                 )
                 local_merged = _merge_manifest_defaults(
-                    name, normalized, None, root=resolved_project_root
+                    name, normalized, None, credentials
                 )
             if not local_merged:
                 return None
@@ -1197,6 +1196,8 @@ def load_configs(
 
     # 1. Load project config (highest priority)
     resolved_project_root = project_root or find_project_root(Path.cwd())
+    # Credentials a configured entry inherits are its own project's.
+    credentials = _credential_value_for(resolved_project_root)
     if resolved_project_root:
         project_config_path = resolved_project_root / ".mcp.json"
         project_config = _parse_project_config_or_warn(project_config_path)

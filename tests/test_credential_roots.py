@@ -499,7 +499,6 @@ GRID_COVERAGE = {
     "pmcp.manifest.installer:build_install_child_env": "install child",
     "pmcp.manifest.installer:check_api_key": "provision gate",
     "pmcp.config.loader:_credential_value_for": "startup config",
-    "pmcp.config.loader:_merge_manifest_defaults": "configured server",
     "pmcp.tools.handlers:GatewayTools._check_api_key_available": "credential check",
     "pmcp.tools.handlers:GatewayTools.config_status": "config_status availability",
     "pmcp.server:GatewayServer.initialize": "gateway availability",
@@ -595,3 +594,209 @@ def test_a_change_to_the_root_directory_rebuilds_its_entry(
         (roots["a"] / "unrelated").unlink()
     assert env_store.credential_value("STAMP_TOKEN") == "x"
     assert len(calls) == built + 1
+
+
+# --------------------------------------------------------------------------- #
+# Board round 9, external seats (reviewed 078084c). Their falsifiers, kept as
+# regression tests. codex F002 is new: a cached entry was validated against
+# the PATHS recorded when it was built, so a renamed root was answered from the
+# file moved back to its old path. A cached entry now records file NAMES and is
+# checked against the files under the root it is asked about.
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_f002_a_renamed_root_does_not_read_the_old_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex r9 F002, verbatim in substance."""
+    home, original, renamed = [
+        tmp_path / name for name in ("home", "original", "renamed")
+    ]
+    home.mkdir()
+    original.mkdir()
+    key = "F002_API_KEY"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(env_store, "_PINNED_USER_STORE", None)
+    monkeypatch.setattr(env_store, "_REPO_CREDENTIALS", {})
+    monkeypatch.setattr(env_store, "_DEFAULT_ROOT", None)
+    (original / ".env.pmcp").write_text(f"{key}=original-secret\n")
+    assert env_store.credential_value(key, root=original) == "original-secret"
+    original.rename(renamed)
+    original.mkdir()
+    (renamed / ".env.pmcp").rename(original / ".env.pmcp")
+    assert env_store.read_store("project", project=renamed) == {}
+    assert env_store.credential_value(key, root=renamed) is None
+    assert build_remote_header_env_lookup(renamed)(key) is None
+    # The file is original's now, and original answers with it.
+    assert env_store.credential_value(key, root=original) == "original-secret"
+
+
+@pytest.mark.parametrize("keep_in_renamed", [False, True], ids=["moved", "both"])
+def test_codex_f002_a_hard_linked_store_answers_only_where_it_is(
+    keep_in_renamed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The F002 sequence with the store hard-linked back, not moved.
+
+    One inode, so an identity check alone cannot tell the two names apart:
+    ``moved`` unlinks the renamed root's name afterwards, ``both`` keeps it.
+    Each root answers exactly when a store is under it.
+    """
+    home, original, renamed = [
+        tmp_path / name for name in ("home", "original", "renamed")
+    ]
+    home.mkdir()
+    original.mkdir()
+    key = "F002_LINK_KEY"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv(key, raising=False)
+    (original / ".env.pmcp").write_text(f"{key}=original-secret\n")
+    assert env_store.credential_value(key, root=original) == "original-secret"
+    original.rename(renamed)
+    original.mkdir()
+    os.link(renamed / ".env.pmcp", original / ".env.pmcp")
+    if not keep_in_renamed:
+        (renamed / ".env.pmcp").unlink()
+    expected = "original-secret" if keep_in_renamed else None
+    assert env_store.credential_value(key, root=renamed) == expected
+    assert env_store.credential_value(key, root=original) == "original-secret"
+
+
+def test_a_file_replaced_with_its_old_inode_and_mtime_is_reread(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """grok r9: a replacement that reuses the inode and restores the old
+    modification time and size still has a new change time.
+
+    Made deterministic by rewriting the file in place (same inode) and
+    restoring its modification time; the size is kept equal.
+    """
+    monkeypatch.delenv("CTIME_TOKEN", raising=False)
+    store = roots["a"] / ".env.pmcp"
+    store.write_text("CTIME_TOKEN=old-1\n")
+    _startup(roots)
+    assert env_store.credential_value("CTIME_TOKEN") == "old-1"
+    before = os.lstat(store)
+    while os.lstat(store).st_ctime_ns == before.st_ctime_ns:
+        with open(store, "r+") as handle:  # same inode
+            handle.write("CTIME_TOKEN=new-2\n")
+        os.utime(store, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = os.lstat(store)
+    assert (after.st_ino, after.st_mtime_ns, after.st_size) == (
+        before.st_ino,
+        before.st_mtime_ns,
+        before.st_size,
+    )
+    assert env_store.credential_value("CTIME_TOKEN") == "new-2"
+
+
+def test_codex_f001_the_install_child_uses_the_requested_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex r9 F001, verbatim in substance."""
+    from pmcp.manifest.installer import build_install_child_env
+    from pmcp.manifest.loader import ServerConfig
+
+    home, a, b = [tmp_path / name for name in ("home", "a", "b")]
+    for directory in (home, a, b):
+        directory.mkdir()
+    key = "F001_API_KEY"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(env_store, "_PINNED_USER_STORE", None)
+    monkeypatch.setattr(env_store, "_REPO_CREDENTIALS", {})
+    monkeypatch.setattr(env_store, "_DEFAULT_ROOT", a)
+    (a / ".env.pmcp").write_text(f"{key}=from-a\n")
+    (b / ".env.pmcp").write_text(f"{key}=from-b\n")
+    env_store.load_store("project", project=a)
+    server = ServerConfig(
+        name="probe",
+        description="probe",
+        keywords=[],
+        install={},
+        command="unused",
+        args=[],
+        requires_api_key=True,
+        env_var=key,
+    )
+    assert env_store.credential_value(key, root=b) == "from-b"
+    with_b_key = build_install_child_env(server, b).get(key)
+    (b / ".env.pmcp").unlink()
+    assert env_store.credential_value(key, root=b) is None
+    without_b_key = build_install_child_env(server, b).get(key)
+    assert (with_b_key, without_b_key) == ("from-b", None)
+
+
+def test_gemini_f001_startup_configs_for_another_project(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """gemini r9 F001, verbatim in substance."""
+    from pmcp.config.loader import resolve_startup_configs
+    from pmcp.manifest.loader import load_manifest
+
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    (roots["a"] / ".env.pmcp").write_text("BRAVE_API_KEY=from-a\n")
+    (roots["b"] / ".env.pmcp").write_text("BRAVE_API_KEY=from-b\n")
+    _startup(roots)
+    server = load_manifest().get_server("brave-search")
+    assert server is not None
+    resolution = resolve_startup_configs(
+        [],
+        manifest_servers={"brave-search": server},
+        enabled_auto_start=["brave-search"],
+        project_root=roots["b"],
+    )
+    [config] = resolution.eager_configs
+    assert config.config.env.get("BRAVE_API_KEY") == "from-b"
+
+
+def test_grok_f001_the_served_project_never_gets_the_launch_credential(
+    roots: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """grok r9 F001, verbatim in substance -- including ``pmcp doctor --project``."""
+    from pmcp.config.loader import resolve_startup_configs
+    from pmcp.manifest.installer import build_install_child_env
+    from pmcp.manifest.loader import load_manifest
+
+    launch, served = roots["a"], roots["b"]
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    monkeypatch.delenv("ONLY_A_TOKEN", raising=False)
+    (launch / ".env.pmcp").write_text("BRAVE_API_KEY=from-a\nONLY_A_TOKEN=only-a\n")
+    (served / ".env.pmcp").write_text("BRAVE_API_KEY=from-b\n")
+    (served / ".mcp.json").write_text(
+        '{"mcpServers":{"remote-b":{"type":"http",'
+        '"url":"https://example.invalid/mcp",'
+        '"headers":{"Authorization":"Bearer ${ONLY_A_TOKEN}"}}}}\n'
+    )
+    _startup(roots)
+
+    server = load_manifest().get_server("brave-search")
+    assert server is not None and server.env_var == "BRAVE_API_KEY"
+    assert build_install_child_env(server, served).get("BRAVE_API_KEY") == "from-b"
+    resolution = resolve_startup_configs(
+        [],
+        manifest_servers={"brave-search": server},
+        enabled_auto_start={"brave-search"},
+        is_auth_available=lambda env_var: bool(env_store.credential_value(env_var)),
+        project_root=served,
+    )
+    spawned = next(
+        config for config in resolution.eager_configs if config.name == "brave-search"
+    )
+    assert spawned.config.env is not None
+    assert spawned.config.env.get("BRAVE_API_KEY") == "from-b"
+
+    async def _health_down(_timeout: float) -> tuple[bool, str, int | None]:
+        return False, "down", None
+
+    monkeypatch.setattr(cli, "_probe_http_health", _health_down)
+    monkeypatch.setattr(cli, "_is_pmcp_system_service_active", lambda: False)
+    capsys.readouterr()
+    asyncio.run(
+        cli.run_doctor(
+            argparse.Namespace(project=served, log_level="error", timeout=0.1)
+        )
+    )
+    assert "missing_env=ONLY_A_TOKEN" in capsys.readouterr().out

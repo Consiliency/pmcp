@@ -18,7 +18,7 @@ from typing import Any, cast
 import pytest
 import yaml
 
-from pmcp.config.loader import _merge_manifest_defaults
+from pmcp.config.loader import _credential_value_for, _merge_manifest_defaults
 from pmcp.manifest.loader import (
     Manifest,
     ServerConfig,
@@ -419,7 +419,10 @@ def test_a_config_entry_without_a_command_inherits_the_pin() -> None:
     manifest_servers = load_manifest().servers
 
     merged = _merge_manifest_defaults(
-        "firecrawl", LocalMcpServerConfig(command="", args=[]), manifest_servers
+        "firecrawl",
+        LocalMcpServerConfig(command="", args=[]),
+        manifest_servers,
+        _credential_value_for(None),
     )
 
     assert merged is not None
@@ -435,6 +438,7 @@ def test_explicit_config_args_win_over_the_manifest_pin() -> None:
         "firecrawl",
         LocalMcpServerConfig(command="npx", args=["-y", "firecrawl-mcp@3.20.0"]),
         manifest_servers,
+        _credential_value_for(None),
     )
 
     assert merged is not None

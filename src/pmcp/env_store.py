@@ -345,8 +345,12 @@ def read_store(
 class _RootEntry:
     root: Path
     values: dict[str, str]
-    #: ``(path, identity)`` per source file; identity ``None`` when absent.
-    sources: tuple[tuple[Path, object], ...]
+    #: ``(file name, identity)`` per source file; identity ``None`` when absent.
+    #: A NAME, not a path: a cached entry is checked against the files under
+    #: the root it is ASKED about, never against a path recorded earlier
+    #: (board round 9, codex F002: a renamed root was answered from the file
+    #: moved back to its old path).
+    sources: tuple[tuple[str, object], ...]
     #: The root directory's ``st_ctime_ns`` when the entry was built.
     stamp: object = None
 
@@ -429,14 +433,25 @@ def _root_stamp(root: Path) -> object:
 
 
 def _file_identity(path: Path) -> object:
-    """``(st_dev, st_ino, st_mtime_ns, st_size)``, or ``None`` when absent/unreadable."""
+    """``(st_dev, st_ino, st_mtime_ns, st_ctime_ns, st_size)``, or ``None`` when absent/unreadable.
+
+    ``st_ctime_ns`` as well as the modification time: a file replaced by one
+    that reuses its inode, with the old modification time restored, still has
+    a new change time, which no one can set (board round 9, grok).
+    """
     try:
         if is_absent(path):
             return None
         status = os.lstat(path)
     except OSError:
         return None
-    return (status.st_dev, status.st_ino, status.st_mtime_ns, status.st_size)
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+        status.st_size,
+    )
 
 
 def _build_root_entry(root: Path) -> _RootEntry:
@@ -449,7 +464,7 @@ def _build_root_entry(root: Path) -> _RootEntry:
     changed in between is recorded as changed, so the next lookup rebuilds.
     """
     values: dict[str, str] = {}
-    sources: list[tuple[Path, object]] = []
+    sources: list[tuple[str, object]] = []
     stamp = _root_stamp(root)
     root_identity = _identity(root)
     # In the home directory, or above it, a `.env` is the operator's own
@@ -464,7 +479,7 @@ def _build_root_entry(root: Path) -> _RootEntry:
             store_path, (root, "project"), strict=False, verb="load"
         )
         after = _file_identity(store_path)
-        sources.append((store_path, after if after == before else _CHANGED))
+        sources.append((name, after if after == before else _CHANGED))
         if text is None:
             continue
         for key, value in _repository_values(text, store_path).items():
@@ -489,7 +504,7 @@ def _root_entry(root: Path | None) -> _RootEntry | None:
     if (
         entry is None
         or entry.stamp != _root_stamp(root)
-        or any(_file_identity(p) != ident for p, ident in entry.sources)
+        or any(_file_identity(root / name) != ident for name, ident in entry.sources)
     ):
         entry = _build_root_entry(root)
         _REPO_CREDENTIALS[key] = entry

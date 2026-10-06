@@ -21,7 +21,11 @@ from pathlib import Path
 
 import pytest
 
-from pmcp.config.loader import _manifest_server_to_config, _merge_manifest_defaults
+from pmcp.config.loader import (
+    _credential_value_for,
+    _manifest_server_to_config,
+    _merge_manifest_defaults,
+)
 from pmcp.env_store import sanitized_subprocess_env
 from pmcp.manifest.installer import build_install_child_env
 from pmcp.manifest.loader import ServerConfig, credential_requirement
@@ -55,10 +59,15 @@ class TestRealSymbolsRealArity:
 
     def test_merge_manifest_defaults_arity(self) -> None:
         sig = inspect.signature(_merge_manifest_defaults)
-        assert list(sig.parameters) == ["name", "config", "manifest_servers", "root"]
-        # The project the config is loaded for (Consiliency/pmcp#372 round 9);
-        # load_configs passes it, None is the served root.
-        assert sig.parameters["root"].default is None
+        assert list(sig.parameters) == [
+            "name",
+            "config",
+            "manifest_servers",
+            "env_lookup",
+        ]
+        # The credential lookup of the project the config is loaded for
+        # (Consiliency/pmcp#372 round 9), required: no implicit project.
+        assert sig.parameters["env_lookup"].default is inspect.Parameter.empty
 
 
 def _relaxed_server(**overrides: object) -> ServerConfig:
@@ -126,7 +135,9 @@ class TestChildEnvConsistencyAcrossPaths:
         server = _relaxed_server()
         config = LocalMcpServerConfig(command="npx", args=["-y", "firecrawl-mcp"])
 
-        merged = _merge_manifest_defaults("firecrawl", config, {"firecrawl": server})
+        merged = _merge_manifest_defaults(
+            "firecrawl", config, {"firecrawl": server}, _credential_value_for(None)
+        )
 
         assert merged is not None
         assert merged.env is not None
@@ -146,7 +157,9 @@ class TestChildEnvConsistencyAcrossPaths:
             env={"FIRECRAWL_API_URL": ""},
         )
 
-        merged = _merge_manifest_defaults("firecrawl", config, {"firecrawl": server})
+        merged = _merge_manifest_defaults(
+            "firecrawl", config, {"firecrawl": server}, _credential_value_for(None)
+        )
 
         assert merged is not None
         assert merged.env == {"FIRECRAWL_API_URL": ""}
@@ -164,7 +177,9 @@ class TestChildEnvConsistencyAcrossPaths:
             env={"FIRECRAWL_API_URL": "${FIRECRAWL_API_URL}"},
         )
 
-        merged = _merge_manifest_defaults("firecrawl", config, {"firecrawl": server})
+        merged = _merge_manifest_defaults(
+            "firecrawl", config, {"firecrawl": server}, _credential_value_for(None)
+        )
 
         assert merged is not None
         assert merged.env == {"FIRECRAWL_API_URL": "${FIRECRAWL_API_URL}"}

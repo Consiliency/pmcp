@@ -2849,7 +2849,11 @@ def test_codex_r6_f002_falsifier_an_inherited_argument_reaches_no_log(
 ) -> None:
     """Round 6, codex F002, verbatim in substance: a partial `.mcp.json` entry
     inherits `command: pmcp` and an argument only the overlay holds."""
-    from pmcp.config.loader import _merge_manifest_defaults, parse_config_bytes
+    from pmcp.config.loader import (
+        _credential_value_for,
+        _merge_manifest_defaults,
+        parse_config_bytes,
+    )
     from pmcp.types import ResolvedServerConfig
 
     secret = "sk-review-overlay-only-61d"
@@ -2864,7 +2868,9 @@ def test_codex_r6_f002_falsifier_an_inherited_argument_reaches_no_log(
     assert configured is not None
     partial = configured.mcpServers["puppeteer"]
     assert secret not in repr(partial)
-    inherited = _merge_manifest_defaults("puppeteer", partial, servers)  # type: ignore[arg-type]
+    inherited = _merge_manifest_defaults(
+        "puppeteer", partial, servers, _credential_value_for(None)
+    )  # type: ignore[arg-type]
     assert inherited is not None and secret in inherited.args
     resolved = ResolvedServerConfig(name="puppeteer", source="user", config=inherited)
     with caplog.at_level(logging.DEBUG):

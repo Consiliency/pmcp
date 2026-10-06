@@ -1062,6 +1062,7 @@ def _canonical_server(server: ServerConfig) -> ServerConfig:
         canonical.name,
         LocalMcpServerConfig(command="", args=[]),
         {canonical.name: canonical},
+        lambda _key: None,
     )
     if inherited is not None:
         # warnings=False: pydantic's serializer warning quotes the value.

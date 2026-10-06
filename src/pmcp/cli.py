@@ -2216,7 +2216,9 @@ async def run_doctor(args: argparse.Namespace) -> None:
             )
         )
 
-    remote_checks = collect_remote_header_diagnostics(config_data)
+    remote_checks = collect_remote_header_diagnostics(
+        config_data, args.project if hasattr(args, "project") else None
+    )
     if remote_checks:
         checks.extend(remote_checks)
     else:

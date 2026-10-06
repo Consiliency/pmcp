@@ -1128,8 +1128,11 @@ def test_the_copy_scan_sees_each_shape() -> None:
 # root (env_store.serve_project_root: --project, else the discovered root), so
 # a consumer that knows a more specific root -- a gateway's project_root, an
 # install child's, a config load's -- must pass it. Each call to
-# credential_value passes ``root=``, and each call to credential_lookup passes
-# a project, or the function holding it is listed here with its reason.
+# credential_value passes ``root=``, each call to credential_lookup passes a
+# project, and -- since round 10 -- each call to a function that FORWARDS its
+# own project parameter to one of them (derived to a fixed point:
+# consumer_gates) passes that parameter too, or the function holding the call
+# is listed here with its reason.
 # --------------------------------------------------------------------------- #
 
 #: ``(module, function)`` -> why it answers for the served root. Asserted exact.
@@ -1137,7 +1140,12 @@ def test_the_copy_scan_sees_each_shape() -> None:
 #: (``manifest_server_to_config``'s lookup), now takes the caller's project.
 SERVED_ROOT_CONSUMERS: dict[tuple[str, str], str] = {}
 
-_CONSUMER_GATES = {"credential_value": "root", "credential_lookup": "project"}
+#: The two lookups and the parameter that names the project:
+#: ``name -> (parameter, positional index or None for keyword-only)``.
+_BASE_GATES: dict[str, tuple[str, int | None]] = {
+    "credential_value": ("root", None),
+    "credential_lookup": ("project", 0),
+}
 
 
 def _qualified_functions(
@@ -1152,9 +1160,34 @@ def _qualified_functions(
     return found
 
 
-def root_less_consumers(sources: dict[str, str]) -> set[tuple[str, str]]:
-    """``(module, function)`` of each consumer that looks up without a root."""
-    found: set[tuple[str, str]] = set()
+def _parameters(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, int | None]:
+    positional = [a.arg for a in fn.args.posonlyargs + fn.args.args]
+    found: dict[str, int | None] = {name: i for i, name in enumerate(positional)}
+    found.update({a.arg: None for a in fn.args.kwonlyargs})
+    return found
+
+
+def _called_name(func: ast.AST, aliases: dict[str, str]) -> str | None:
+    if isinstance(func, ast.Name):
+        return aliases.get(func.id, func.id)
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _passed(call: ast.Call, gate: tuple[str, int | None]) -> ast.AST | None:
+    """The expression a call passes for the gated parameter, if any."""
+    name, index = gate
+    for keyword in call.keywords:
+        if keyword.arg == name:
+            return keyword.value
+    if index is not None and len(call.args) > index:
+        return call.args[index]
+    return None
+
+
+def _module_trees(sources: dict[str, str]) -> list[tuple[str, ast.AST, dict[str, str]]]:
+    trees = []
     for module, source in sources.items():
         tree = ast.parse(source)
         aliases = {
@@ -1162,26 +1195,65 @@ def root_less_consumers(sources: dict[str, str]) -> set[tuple[str, str]]:
             for node in ast.walk(tree)
             if isinstance(node, ast.ImportFrom)
             for alias in node.names
-            if alias.name in _CONSUMER_GATES
         }
+        trees.append((module, tree, aliases))
+    return trees
+
+
+def consumer_gates(sources: dict[str, str]) -> dict[str, tuple[str, int | None]]:
+    """The lookups, plus every function that FORWARDS its own project to one.
+
+    Derived, to a fixed point: a function that passes one of its own
+    parameters as a gated function's project is itself gated on that
+    parameter (``build_remote_header_env_lookup(project_root)``,
+    ``collect_remote_header_diagnostics(config, project_root)``,
+    ``manifest_server_to_config(server, project_root)``, ...). A caller that
+    omits it answers for the served root without saying so -- the shape of
+    ``pmcp doctor --project B`` judging B's headers against A (board round 9,
+    grok F001).
+    """
+    gates = dict(_BASE_GATES)
+    trees = _module_trees(sources)
+    changed = True
+    while changed:
+        changed = False
+        for _module, tree, aliases in trees:
+            for qualified, fn in _qualified_functions(tree):
+                name = qualified.rsplit(".", 1)[-1]
+                if name in gates:
+                    continue
+                params = _parameters(fn)
+                for node in ast.walk(fn):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    called = _called_name(node.func, aliases)
+                    if called not in gates or called == name:
+                        continue
+                    value = _passed(node, gates[called])
+                    if isinstance(value, ast.Name) and value.id in params:
+                        index = params[value.id]
+                        if index is not None and qualified != name:
+                            index -= 1  # a method's own self
+                        gates[name] = (value.id, index)
+                        changed = True
+                        break
+    return gates
+
+
+def root_less_consumers(sources: dict[str, str]) -> set[tuple[str, str]]:
+    """``(module, function)`` of each call site that names no project."""
+    gates = consumer_gates(sources)
+    found: set[tuple[str, str]] = set()
+    for module, tree, aliases in _module_trees(sources):
         for name, fn in _qualified_functions(tree):
             for node in ast.walk(fn):
                 if not isinstance(node, ast.Call):
                     continue
-                func = node.func
-                if isinstance(func, ast.Name):
-                    called = aliases.get(func.id, func.id)
-                elif isinstance(func, ast.Attribute):
-                    called = func.attr
-                else:
+                called = _called_name(node.func, aliases)
+                if called is None or called not in gates:
                     continue
-                gate = _CONSUMER_GATES.get(called)
-                if gate is None:
-                    continue
-                keywords = {k.arg for k in node.keywords}
-                if gate in keywords or (gate == "project" and node.args):
-                    continue
-                found.add((module, name))
+                if _passed(node, gates[called]) is None:
+                    found.add((module, name))
     return found
 
 
@@ -1208,11 +1280,33 @@ def test_the_consumer_scan_sees_each_shape() -> None:
         "    return credential_lookup(p)(k) or credential_lookup(project=p)(k)\n"
         "def nested(k):\n"
         "    return [x for x in map(lambda key: cv(key), [k])]\n"
+        # A wrapper that forwards its own project is gated on it, and so is a
+        # wrapper of that wrapper; a caller that omits it is flagged.
+        "def headers_for(config, project_root=None):\n"
+        "    return credential_lookup(project_root)\n"
+        "def doctor(config, project_root=None):\n"
+        "    return headers_for(config, project_root)\n"
+        "def doctor_for_nobody(config):\n"
+        "    return doctor(config)\n"
+        "def doctor_by_keyword(config, p):\n"
+        "    return doctor(config, project_root=p)\n"
+        "class Jobs:\n"
+        "    def start(self, server, project_root=None):\n"
+        "        return headers_for(server, project_root)\n"
+        "def start_for_nobody(jobs, s):\n"
+        "    return jobs.start(s)\n"
+        "def start_for_one(jobs, s, p):\n"
+        "    return jobs.start(s, p)\n"
     )
-    assert root_less_consumers({"pmcp.x": source}) == {
+    sources = {"pmcp.x": source}
+    assert consumer_gates(sources)["doctor"] == ("project_root", 1)
+    assert consumer_gates(sources)["start"] == ("project_root", 1)
+    assert root_less_consumers(sources) == {
         ("pmcp.x", "bare"),
         ("pmcp.x", "by_attribute"),
         ("pmcp.x", "lookup_for_nobody"),
         ("pmcp.x", "Tools.check"),
         ("pmcp.x", "nested"),
+        ("pmcp.x", "doctor_for_nobody"),
+        ("pmcp.x", "start_for_nobody"),
     }
