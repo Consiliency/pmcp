@@ -123,7 +123,8 @@ _EXEMPT_CALLEES: dict[str, tuple[str, str]] = {
     "carries_rejected_value": ("predicate", "argument_errors.py"),
     "_warn_unparseable": ("scanned", "policy/policy.py"),
     "record_rejected_arguments": ("scanned", "scoped_advisor_audit.py"),
-    "_yaml_position": ("scanned", "parsing.py"),
+    # parsing.py: a MarkedYAMLError's mark, for its line and column.
+    "_yaml_position": ("fields", "parsing.py"),
     "_iter_leaf_exceptions": ("passthrough", "client/manager.py"),
     "parse_url_elicitation_error": ("guarded", "auth.py"),
     "pyjwt_text": ("guarded", "auth.py"),
@@ -147,8 +148,67 @@ _NON_RENDERING_CALLEES = set(_EXEMPT_CALLEES)
 _NON_RENDERING_FUNCTIONS = {
     name
     for name, (kind, _home) in _EXEMPT_CALLEES.items()
-    if kind in ("predicate", "passthrough", "reregisters")
+    if kind in ("predicate", "passthrough", "reregisters", "fields")
 }
+_LOGGING_METHODS = {"debug", "info", "warning", "error", "exception", "critical", "log"}
+
+#: Value-free attributes of library exceptions (rev 22): numbers and
+#: positions, never text. Every other attribute read is a sink unless it is
+#: a pmcp exception's own field (:func:`_pmcp_exception_fields`).
+_VALUE_FREE_ATTRIBUTES = frozenset(
+    {
+        "errno",
+        "code",
+        "status",
+        "status_code",
+        "returncode",
+        "lineno",
+        "colno",
+        "pos",
+        "__class__",
+        # pydantic's `ValidationError.title`: the model or type name.
+        "title",
+    }
+)
+
+
+def _pmcp_exception_fields() -> frozenset[str]:
+    """Attribute names pmcp's own exception classes set on `self`. Their
+    values are pmcp-built, so their construction is checked by this guard
+    where it happens."""
+    root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
+    names: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        if "baml_client" in path.parts:
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            bases = " ".join(ast.unparse(base) for base in node.bases)
+            if not any(word in bases for word in ("Error", "Exception")):
+                continue
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Attribute)
+                    and isinstance(inner.ctx, ast.Store)
+                    and isinstance(inner.value, ast.Name)
+                    and inner.value.id == "self"
+                ):
+                    names.add(inner.attr)
+    return frozenset(names)
+
+
+_SAFE_ATTRIBUTE_CACHE: list[frozenset[str]] = []
+
+
+def _safe_exception_attributes() -> frozenset[str]:
+    if not _SAFE_ATTRIBUTE_CACHE:
+        _SAFE_ATTRIBUTE_CACHE.append(
+            (_VALUE_FREE_ATTRIBUTES | _pmcp_exception_fields()) - _TEXT_ATTRIBUTES
+        )
+    return _SAFE_ATTRIBUTE_CACHE[0]
+
+
 #: Attributes that carry an exception's text or the rejected value.
 _TEXT_ATTRIBUTES = {
     "args",
@@ -708,7 +768,13 @@ def exception_sinks(
             if isinstance(parent, ast.keyword):
                 parent = parents.get(parent)
             if isinstance(parent, ast.Call) and use is not parent.func:
-                if _is_renderer_call(parent, imported, label):
+                # `setattr` hands nothing off only when the exception is its
+                # target (rev 22, round-20 claude N1).
+                if _callee(parent) == "setattr" and not (
+                    parent.args and parent.args[0] is use
+                ):
+                    pass
+                elif _is_renderer_call(parent, imported, label):
                     continue
             elif isinstance(parent, (ast.Raise, ast.Compare, ast.BoolOp, ast.UnaryOp)):
                 continue
@@ -740,12 +806,20 @@ def exception_sinks(
                 n is use for n in ast.walk(parent.iter)
             ):
                 continue
-            elif (
-                isinstance(parent, ast.Attribute)
-                and parent.attr not in _TEXT_ATTRIBUTES
-            ):
+            elif isinstance(parent, ast.Attribute):
+                # An allowlist (rev 22, round-20 claude N1): an attribute is
+                # safe only if it is a known value-free field, or is handed
+                # straight to a renderer or an exempt callee.
                 grand = parents.get(parent)
-                if not (isinstance(grand, ast.Call) and grand.func is parent):
+                method = isinstance(grand, ast.Call) and grand.func is parent
+                if parent.attr in _safe_exception_attributes() and not method:
+                    continue
+                if (
+                    isinstance(grand, ast.Call)
+                    and not method
+                    and _is_renderer_call(grand, imported, label)
+                    and _callee(grand) not in ("setattr", "set_exception")
+                ):
                     continue
             found.append(f"{label}:{use.lineno}: {type(parent).__name__} uses {use.id}")
     for node in ast.walk(tree):
@@ -802,9 +876,18 @@ def exception_sinks(
                 found.append(
                     f"{label}:{call.lineno}: exc_info= not through safe_exc_info"
                 )
-            if keyword.arg is None and any(
-                isinstance(k, ast.Constant) and k.value == "exc_info"
-                for k in ast.walk(keyword.value)
+            if keyword.arg is None and (
+                any(
+                    isinstance(k, ast.Constant) and k.value == "exc_info"
+                    for k in ast.walk(keyword.value)
+                )
+                # A `**name` into a logging call can carry `exc_info` from
+                # anywhere (rev 22, round-20 claude N1): only a dict display
+                # with no `exc_info` key is safe.
+                or (
+                    callee in _LOGGING_METHODS
+                    and not isinstance(keyword.value, ast.Dict)
+                )
             ):
                 found.append(f"{label}:{call.lineno}: exc_info passed through **")
     return list(dict.fromkeys(found))
@@ -839,6 +922,13 @@ _FLAGGED = {
     # registered error too.
     "narrow_handler_text": "try:\n    f()\nexcept KeyError as e:\n    log(f'{e}')\n",
     "narrow_handler_str": "try:\n    f()\nexcept ConnectionError as e:\n    parse(str(e))\n",
+    # rev 22 (round-20 claude N1): the attribute check is an allowlist, a
+    # `setattr` hands off unless the exception is its target, and `**` into
+    # a logging call can carry `exc_info`.
+    "strerror_attribute": "try:\n    f()\nexcept OSError as e:\n    log(e.strerror + str(e.filename))\n",
+    "unicode_object_attribute": "try:\n    f()\nexcept UnicodeDecodeError as e:\n    log(e.object)\n",
+    "setattr_value": "try:\n    f()\nexcept Exception as e:\n    setattr(obj, 'err', e)\n",
+    "logging_double_star": "KW = {'exc_info': True}\nlogger.warning('x', **KW)\n",
     "alias_used_after_except": "last=None\nfor i in r:\n    try:\n        f()\n    except Exception as e:\n        last = e\nlog(f'{last}')\n",
     "attr_store_then_render": "try:\n    f()\nexcept Exception as e:\n    self.last_error = e\nlog(f'{self.last_error}')\n",
     "subscript_store": "try:\n    f()\nexcept Exception as e:\n    errs[name] = e\nlog(str(errs[name]))\n",
@@ -1609,11 +1699,17 @@ async def test_gateway_invoke_reads_no_elicitation_from_a_rejected_value(
 
 #: The attributes a ``fields`` exemption may read: an HTTP status and the
 #: response's header map (`urllib.error.HTTPError`).
-_FIELD_ATTRIBUTES = {"code", "headers", "status"}
+_FIELD_ATTRIBUTES = {"code", "headers", "status", "problem_mark", "context_mark"}
 
 
 def test_every_fields_exemption_reads_only_its_fields() -> None:
+    """A `fields` callee reads its exception only through `isinstance` or an
+    attribute in `_FIELD_ATTRIBUTES`, and returns no text: its returns are
+    numbers, `None`, or pmcp-built results (rev 21/22)."""
     assert _kinds("fields")
+    # `_yaml_position` returns a mark's line and column only.
+    position = _definition("_yaml_position", "parsing.py")
+    assert ast.unparse(position.returns) == "tuple[int | None, int | None]"
     for name, home in _kinds("fields"):
         function = _definition(name, home)
         parameter = function.args.args[0].arg

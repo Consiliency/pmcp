@@ -37,6 +37,7 @@ unless the error is, or embeds the text of, a validation error, and
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import sys
@@ -552,7 +553,44 @@ def _value_bearing_types() -> tuple[type[BaseException], ...]:
         jsonschema.ValidationError,
         jsonschema.SchemaError,
         *_parse_error_types(),
+        *_response_decode_types(),
     )
+
+
+#: The HTTP client libraries pmcp imports, and the exceptions each raises
+#: when it cannot decode a response body (rev 22, round-20 codex F001): a
+#: response that will not decode is downstream content pmcp rejected, and
+#: the error's text quotes it -- aiohttp's ``ContentTypeError`` names the
+#: rejected MIME type, ``UnicodeDecodeError`` holds the undecodable bytes.
+#: ``.json()`` on any of them raises ``json.JSONDecodeError``, already a
+#: parse error. ``tests/test_parse_error_echo.py`` derives the libraries from
+#: pmcp's imports and checks this table covers each.
+RESPONSE_DECODE_ERRORS: dict[str, tuple[str, ...]] = {
+    "aiohttp": ("ContentTypeError",),
+    "httpx": ("DecodingError",),
+    "httpx2": ("DecodingError",),
+    "urllib.request": (),
+}
+
+
+@functools.cache
+def _response_decode_types() -> tuple[type[BaseException], ...]:
+    """The registered response-decoding exception types, plus
+    ``UnicodeDecodeError`` (``.text()``/``.decode()`` of a body)."""
+    import importlib
+
+    types: list[type[BaseException]] = [UnicodeDecodeError]
+    for module_name, names in RESPONSE_DECODE_ERRORS.items():
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:  # pragma: no cover - an optional client
+            continue
+        types.extend(getattr(module, name) for name in names)
+    return tuple(types)
+
+
+def _is_response_decode_error(error: BaseException) -> bool:
+    return isinstance(error, _response_decode_types()) and not _is_parse_error(error)
 
 
 _VALUE_BEARING: tuple[type[BaseException], ...] = ()
@@ -632,6 +670,12 @@ def _validation_text(error: BaseException) -> str:
     A parse error is described by :func:`_parse_text` (rev 6)."""
     if _is_parse_error(error):
         return _parse_text(error)
+    if isinstance(error, UnicodeDecodeError):
+        # The codec and class only: never the undecodable bytes.
+        return f"could not decode {error.encoding} text (UnicodeDecodeError)"
+    if _is_response_decode_error(error):
+        # Format and class only: never the MIME type or the body.
+        return f"could not decode an HTTP response ({type(error).__name__})"
     if isinstance(error, ValidationError):
         count = error.error_count()
         plural = "" if count == 1 else "s"

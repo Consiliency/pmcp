@@ -90,24 +90,27 @@ _PARSER_NAMES = frozenset(
     }
 )
 
-#: Named exemptions, ``file::function`` -> reason. Each must still exist.
-_EXEMPT: dict[str, str] = {
-    # python-dotenv never raises on bad input; it logs "python-dotenv could
-    # not parse statement starting at line N" -- the line number only
-    # (measured on python-dotenv 1.x).
-    "env_store.py::read_env_file": "dotenv_values",
-    "cli.py::load_startup_env": "load_dotenv",
-    "tools/handlers.py::_check_api_key_available": "load_dotenv",
-    # A response object's `.json()`: JSON has no constructors, so its
-    # failures are JSONDecodeError (fixed vocabulary; the `doc` attribute is
-    # rendered by exception_text as `could not parse JSON ...`),
-    # RecursionError, or aiohttp's ContentTypeError (the server's MIME type).
-    # Every one is caught and rendered via exception_text or swallowed.
-    "manifest/version_checker.py::get_npm_version": ".json() (aiohttp)",
-    "manifest/version_checker.py::get_pypi_version": ".json() (aiohttp)",
-    "manifest/version_checker.py::get_cargo_version": ".json() (aiohttp)",
-    "manifest/version_checker.py::get_docker_version": ".json() (aiohttp)",
-    "cli.py::_probe_http_health": ".json() (httpx), error swallowed",
+#: Parser sites outside the helpers, ``file::function`` -> (kind, detail).
+#: No site is exempt by name alone (rev 22, round-20 codex F001); each kind's
+#: reason is enforced by a test below:
+#: - ``dotenv``: python-dotenv never raises on bad input and logs the line
+#:   number only (`test_dotenv_never_raises_and_logs_no_value`);
+#: - ``response-decode``: a response object's ``.json()``/``.text()``. Every
+#:   exception its client library raises decoding a body is registered as
+#:   value-bearing (`test_every_http_client_pmcp_imports_has_its_decode_errors_registered`),
+#:   and the call sits in a ``try`` whose handler catches it
+#:   (`test_every_response_decode_site_is_inside_a_handler`); the sink guard
+#:   checks that handler renders through the registry. End to end:
+#:   `test_a_rejected_response_body_is_not_logged`.
+_EXEMPT: dict[str, tuple[str, str]] = {
+    "env_store.py::read_env_file": ("dotenv", "dotenv_values"),
+    "cli.py::load_startup_env": ("dotenv", "load_dotenv"),
+    "tools/handlers.py::_check_api_key_available": ("dotenv", "load_dotenv"),
+    "manifest/version_checker.py::get_npm_version": ("response-decode", "aiohttp"),
+    "manifest/version_checker.py::get_pypi_version": ("response-decode", "aiohttp"),
+    "manifest/version_checker.py::get_cargo_version": ("response-decode", "aiohttp"),
+    "manifest/version_checker.py::get_docker_version": ("response-decode", "aiohttp"),
+    "cli.py::_probe_http_health": ("response-decode", "httpx"),
 }
 
 _DOTENV = frozenset({"dotenv_values", "load_dotenv"})
@@ -187,9 +190,10 @@ def _parser_references(source: str) -> list[tuple[int, str]]:
                 found.append((node.lineno, f".{node.value.attr}.{node.attr}"))
         elif isinstance(node, ast.Call):
             func = node.func
-            if isinstance(func, ast.Attribute) and func.attr == "json":
-                # With or without arguments (``resp.json(content_type=None)``).
-                found.append((node.lineno, ".json()"))
+            if isinstance(func, ast.Attribute) and func.attr in ("json", "text"):
+                # With or without arguments (``resp.json(content_type=None)``);
+                # ``.text()`` decodes a body too (rev 22).
+                found.append((node.lineno, f".{func.attr}()"))
             elif isinstance(func, ast.Name) and (
                 func.id in _DOTENV or bound.get(func.id, "").startswith("dotenv.")
             ):
@@ -1093,3 +1097,213 @@ def test_a_versioned_package_pattern_is_refused_without_its_value(
         "package patterns match the package name only"
     ), text
     assert not any(form in text for form in _forbidden(s)), text
+
+
+# --- rev 22: response decoding is a parse of downstream content -------------
+#
+# Round-20 codex F001: aiohttp's `ContentTypeError` (raised by `resp.json()`)
+# names the rejected MIME type, and the version lookups logged it through
+# `exception_text` unchanged, because the type was not registered.
+
+_HTTP_CLIENT_MARKERS = ("ClientResponse", "Response")
+
+
+def _imported_top_modules() -> set[str]:
+    names: set[str] = set()
+    for path in sorted(_SRC.rglob("*.py")):
+        if "baml_client" in path.parts:
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                names |= {alias.name for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                names.add(node.module)
+    return names
+
+
+def _http_client_libraries() -> set[str]:
+    """Every module pmcp imports that hands back a response object with a
+    `json` method: an HTTP client."""
+    import importlib
+
+    found: set[str] = set()
+    for name in _imported_top_modules():
+        if name.startswith("pmcp"):
+            continue
+        try:
+            module = importlib.import_module(name)
+        except Exception:  # noqa: BLE001 -- a platform-only module
+            continue
+        for marker in _HTTP_CLIENT_MARKERS:
+            response = getattr(module, marker, None)
+            if isinstance(response, type) and hasattr(response, "json"):
+                found.add(name)
+    return found
+
+
+def test_every_http_client_pmcp_imports_has_its_decode_errors_registered() -> None:
+    import importlib
+
+    from pmcp.argument_errors import RESPONSE_DECODE_ERRORS, _value_bearing_types
+
+    clients = _http_client_libraries()
+    assert {"aiohttp", "httpx", "httpx2"} <= clients, clients
+    missing = clients - set(RESPONSE_DECODE_ERRORS)
+    assert not missing, missing
+    registered = _value_bearing_types()
+    for name in clients:
+        module = importlib.import_module(name)
+        for error in RESPONSE_DECODE_ERRORS[name]:
+            assert issubclass(getattr(module, error), registered), (name, error)
+        # Every `*DecodingError` / `ContentTypeError` the library exports.
+        exported = [
+            value
+            for attr, value in vars(module).items()
+            if isinstance(value, type)
+            and issubclass(value, BaseException)
+            and ("Decod" in attr or "ContentType" in attr)
+        ]
+        assert all(issubclass(value, registered) for value in exported), (
+            name,
+            exported,
+        )
+
+
+def test_every_response_decode_site_is_inside_a_handler() -> None:
+    """Each `response-decode` site's `.json()`/`.text()` call sits in a `try`
+    whose handler catches it (`Exception`, or a base of the decode errors)."""
+    sites = _parse_sites()
+    for site, (kind, _library) in _EXEMPT.items():
+        if kind != "response-decode":
+            continue
+        rel, function = site.split("::")
+        tree = ast.parse((_SRC / rel).read_text())
+        parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        lines = {int(item.split(":")[0]) for item in sites[site]}
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("json", "text")
+            and node.lineno in lines
+        ]
+        assert calls, site
+        for call in calls:
+            node: ast.AST = call
+            caught = False
+            while node in parents:
+                parent = parents[node]
+                if isinstance(parent, ast.Try) and node in parent.body:
+                    caught = any(
+                        h.type is not None
+                        and ast.unparse(h.type) in ("Exception", "BaseException")
+                        for h in parent.handlers
+                    )
+                    if caught:
+                        break
+                node = parent
+            assert caught, (site, call.lineno)
+
+
+def test_dotenv_never_raises_and_logs_no_value(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The `dotenv` kind's reason, measured: malformed input does not raise,
+    and what python-dotenv logs carries no part of it."""
+    from dotenv import dotenv_values
+
+    caplog.set_level(logging.DEBUG)
+    s = _FAMILIES["hex"][0]
+    path = tmp_path / ".env"
+    path.write_text(f"GOOD=1\n{s} = = '\nexport {s}\n'{s}\n")
+    values = dotenv_values(path)
+    assert "GOOD" in values
+    logged = "\n".join(_record_text(record) for record in caplog.records)
+    assert not any(form in logged for form in _forbidden(s)), logged
+
+
+def _aiohttp_response(content_type: str, body: bytes) -> Any:
+    import asyncio
+    from types import SimpleNamespace
+
+    import aiohttp
+    from multidict import CIMultiDict, CIMultiDictProxy
+    from yarl import URL
+
+    url = URL("https://registry.example/probe")
+    response = aiohttp.ClientResponse(
+        "GET",
+        url,
+        writer=None,
+        continue100=None,
+        timer=None,  # type: ignore[arg-type]
+        request_info=aiohttp.RequestInfo(
+            url, "GET", CIMultiDictProxy(CIMultiDict()), url
+        ),
+        traces=[],
+        loop=asyncio.get_running_loop(),
+        session=None,  # type: ignore[arg-type]
+        stream_writer=SimpleNamespace(output_size=0),  # type: ignore[arg-type]
+    )
+    response.status = 200
+    response._headers = CIMultiDictProxy(CIMultiDict({"Content-Type": content_type}))
+    response._body = body
+    return response
+
+
+@pytest.mark.parametrize(
+    "lookup",
+    ["get_npm_version", "get_pypi_version", "get_cargo_version", "get_docker_version"],
+)
+@pytest.mark.parametrize("shape", ["content-type", "undecodable-body"])
+def test_a_rejected_response_body_is_not_logged(
+    lookup: str,
+    shape: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-20 codex F001's falsifier, over all four lookups: a response
+    whose MIME type aiohttp rejects (`ContentTypeError`), or whose body will
+    not decode (`UnicodeDecodeError`), is logged by its class only. The
+    response is aiohttp's own, with no socket opened."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    import aiohttp
+
+    from pmcp.manifest import version_checker
+
+    sentinel = "x-rejected-private-value-9137"
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(version_checker, "_version_cache", {})
+
+    async def exercise() -> None:
+        if shape == "content-type":
+            response = _aiohttp_response(f"text/{sentinel}", b"{}")
+            with pytest.raises(aiohttp.ContentTypeError) as rejected:
+                await response.json()
+        else:
+            response = _aiohttp_response(
+                "application/json; charset=utf-8",
+                b'{"' + sentinel.encode() + b'\xff\xfe": 1}',
+            )
+            with pytest.raises(UnicodeDecodeError) as rejected:
+                await response.json()
+        assert sentinel in repr(rejected.value) or sentinel.encode() in getattr(
+            rejected.value, "object", b""
+        )
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        session.get.return_value.__aenter__.return_value = response
+        monkeypatch.setattr(
+            version_checker.aiohttp, "ClientSession", lambda *a, **k: session
+        )
+        assert await getattr(version_checker, lookup)("probe-name") is None
+
+    asyncio.run(exercise())
+    logged = "\n".join(_record_text(record) for record in caplog.records)
+    assert sentinel not in logged, logged
+    assert any(
+        "could not decode" in record.getMessage() for record in caplog.records
+    ), logged
