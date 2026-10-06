@@ -1475,9 +1475,14 @@ def test_a_rejected_response_body_is_not_logged(
     asyncio.run(exercise())
     logged = "\n".join(_record_text(record) for record in caplog.records)
     assert sentinel not in logged, logged
-    assert any(
-        "could not decode" in record.getMessage() for record in caplog.records
-    ), logged
+    # By class only: rev 25's one phrase for an HTTP client's error, and the
+    # codec's for an undecodable body.
+    described = (
+        "an HTTP request failed (ContentTypeError"
+        if shape == "content-type"
+        else "could not decode utf-8 text (UnicodeDecodeError)"
+    )
+    assert any(described in record.getMessage() for record in caplog.records), logged
 
 
 # --- rev 23: every HTTP client response pmcp rejects, at every call site ----
