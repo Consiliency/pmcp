@@ -168,22 +168,23 @@ def test_startup_door_does_not_apply_the_injected_overlay(
 def test_startup_door_logs_operator_safe_refusal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
+    """Since Consiliency/pmcp#372 a checkout's ``.env.pmcp`` never reaches the
+    environment at all, so the variable is refused where it is loaded, with a
+    value-free line naming it, and the use site never sees it."""
     checkout = _checkout(tmp_path, monkeypatch)
     (checkout / ".hidden").mkdir()
     (checkout / ".hidden" / "m.yaml").write_text(INJECTED_MANIFEST)
     (checkout / ".env.pmcp").write_text("PMCP_MANIFEST_PATH=.hidden/m.yaml\n")
 
     cli.load_startup_env(dotenv_path=str(checkout / "no-such.env"))
-    with caplog.at_level(logging.WARNING):
-        load_manifest()
 
-    msgs = _warnings(caplog)
-    hit = [m for m in msgs if "PMCP_MANIFEST_PATH" in m]
-    assert hit, f"expected a refusal naming the variable; got {msgs}"
-    assert ".hidden/m.yaml" in hit[0]
-    assert "project file" in hit[0]
+    assert "PMCP_MANIFEST_PATH" not in os.environ
+    err = capfd.readouterr().err
+    assert "pmcp: Ignoring PMCP_MANIFEST_PATH in .env.pmcp:" in err
+    assert ".hidden/m.yaml" not in err
+    assert load_manifest().get_server("repo-added-server") is None
 
 
 # --------------------------------------------------------------------------- #
@@ -201,7 +202,9 @@ def test_runtime_door_does_not_apply_the_injected_overlay(
     tools = GatewayTools.__new__(GatewayTools)
     # An unset key forces the .env load; the boolean answer is irrelevant here.
     tools._check_api_key_available("SOME_UNSET_API_KEY")
-    assert os.environ.get("PMCP_MANIFEST_PATH") == str(checkout / "m.yaml")
+    # A checkout's .env never reaches the gateway's environment
+    # (Consiliency/pmcp#372): the redirect is not even there to be gated.
+    assert os.environ.get("PMCP_MANIFEST_PATH") is None
 
     manifest = load_manifest()
     assert manifest.get_server("repo-added-server") is None, (
@@ -236,7 +239,7 @@ def test_s11_checkout_config_is_not_a_config_source(
 def test_s11_checkout_policy_is_not_adopted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
     checkout = _checkout(tmp_path, monkeypatch)
     (checkout / "policy.yaml").write_text("version: 1\n")
@@ -245,14 +248,12 @@ def test_s11_checkout_policy_is_not_adopted(
     cli.load_startup_env(dotenv_path=str(checkout / "no-such.env"))
 
     args = argparse.Namespace(config=None, policy=None)
-    with caplog.at_level(logging.WARNING):
-        cli.resolve_env_config_and_policy(args)
+    cli.resolve_env_config_and_policy(args)
 
     assert args.policy is None, (
         "a checkout-sourced PMCP_POLICY must not become the explicit policy (S-11)"
     )
-    msgs = _warnings(caplog)
-    assert any("PMCP_POLICY" in m for m in msgs), msgs
+    assert "pmcp: Ignoring PMCP_POLICY in .env.pmcp:" in capfd.readouterr().err
 
 
 # --------------------------------------------------------------------------- #

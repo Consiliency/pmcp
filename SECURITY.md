@@ -166,7 +166,11 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   process environment in non-tenant mode. Tenant remote-header mode reads
   tenant-scoped files derived from the resolved project root and must not read
   another tenant's file, but PMCP still does not provide cross-user identity or
-  authorization isolation by itself.
+  authorization isolation by itself. Project-scope and tenant files are read
+  only through a walk confined to the project root, so a link that leaves the
+  project contributes nothing. Values from such a file never enter pmcp's
+  environment or a child's: only credential lookups see them, and never for a
+  variable pmcp itself reads (Consiliency/pmcp#367).
 - **Tenant code-mode hosting keeps execution outside PMCP**: the host contract
   in `specs/tenant-code-mode-host-contract.md` treats PMCP as the broker and
   the companion tenant server as the sandbox execution authority. The contract

@@ -1,0 +1,846 @@
+"""The authoritative inventory of credential-store readers, derived from the AST.
+
+Consiliency/pmcp#367: every ``src/pmcp`` reader of a credential store goes
+through ONE entry point -- ``env_store.read_store``, and
+``env_store.load_store`` for a load into the process environment --
+which picks a confined or a followed read from the store's scope. No call site
+may choose its own read mode. This is the one inventory: the documented-list
+inventory Consiliency/pmcp#366 added (``tests/test_env_store_reader_inventory.py``,
+which pinned the readers that still followed a link) is folded in here, now that
+that list is empty.
+
+The inventory is not a hand-written list of readers. It walks every module under
+``src/pmcp`` and records, per function (methods by ``Class.name``, nested
+functions and lambdas folded into the function that holds them):
+
+* **low-level reads** -- a call to ``read_env_file``, ``read_env_text``,
+  ``_read_env_file_strict`` or ``read_confined``, or to ``load_dotenv`` /
+  ``dotenv_values`` with a PATH (positional, ``dotenv_path=``, or none at all,
+  which discovers one) rather than ``stream=``;
+* **dotenv parses** -- any ``load_dotenv`` / ``dotenv_values`` call, path or
+  stream;
+* **raw opens of a store** -- ``open`` / ``os.open`` / ``.open`` / ``.read_text``
+  / ``.read_bytes`` in a function that names a store file (``.env.pmcp``,
+  ``pmcp.env``, ``.env`` or ``tenants``).
+
+and fails when any of them sits outside the entry point -- a stream parse
+included: only the entry point hands text to ``load_dotenv``, because only it
+drops the variables a repository file may not set. Import aliases
+(``from dotenv import load_dotenv as ld``) and attribute calls
+(``dotenv.load_dotenv``, ``env_store.read_env_file``) resolve to the same name.
+
+There are NO exemptions, and ``test_there_are_no_exemptions`` keeps it so. The
+last one -- ``cli.load_startup_env``'s ``load_dotenv(dotenv_path)``, a ``.env``
+discovered by walking up from where pmcp is INSTALLED -- was removed on review
+(Consiliency/pmcp#372 round 1): an install in a ``.venv`` inside a checkout walks
+up into that checkout, so the file it reaches is the repository's. It is now
+loaded through ``load_store`` like every other repository-controlled
+file.
+
+Two more rules from the same review round live here because they guard the same
+reads:
+
+* **Absence is only ENOENT.** One rule in one place:
+  ``atomic_write.is_absent``, and Consiliency/pmcp#366's AST ban on yes/no
+  existence checks in the store modules (``tests/test_store_path_resolution.py``).
+* **Every environment variable ``src/pmcp`` reads is classified** in
+  ``env_store`` as path-and-trust (a repository file may not set it), gated by
+  provenance at its use, or operational. The set is derived from the AST, so a
+  new variable fails here until someone decides which it is.
+"""
+
+from __future__ import annotations
+
+import ast
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+SRC = Path(__file__).resolve().parents[1] / "src" / "pmcp"
+
+#: The entry point and the helpers it is built from. Reads below these are the
+#: implementation of the one rule; anywhere else they are a bypass.
+ENTRY_POINT = frozenset({"read_store", "load_store"})
+ENTRY_POINT_INTERNALS = frozenset(
+    {
+        ("pmcp.env_store", "read_store"),
+        ("pmcp.env_store", "load_store"),
+        ("pmcp.env_store", "load_discovered_dotenv"),
+        ("pmcp.env_store", "_load_repo_credentials"),
+        ("pmcp.env_store", "_read_confined_text"),
+        ("pmcp.env_store", "_read_user_text"),
+        ("pmcp.env_store", "read_env_file"),
+        ("pmcp.env_store", "read_env_text"),
+        ("pmcp.env_store", "_read_env_file_strict"),
+    }
+)
+
+LOW_LEVEL_READERS = frozenset(
+    {"read_env_file", "read_env_text", "_read_env_file_strict", "read_confined"}
+)
+DOTENV_PARSERS = frozenset({"load_dotenv", "dotenv_values"})
+#: Readers whose bare reference (not a call) is itself a bypass: a call
+#: through ``r = read_env_file`` or ``map(load_dotenv, ...)`` escapes the scan.
+ESCAPABLE = frozenset(
+    {"read_env_file", "read_env_text", "_read_env_file_strict", "read_confined"}
+    | {"load_dotenv", "dotenv_values"}
+)
+RAW_OPENS = frozenset({"open", "read_text", "read_bytes"})
+STORE_NAMES = (".env.pmcp", "pmcp.env", ".env", "tenants")
+
+#: (module, function, sink) -> a measured reason. Empty, and asserted empty.
+EXEMPT: dict[tuple[str, str, str], str] = {}
+
+
+@dataclass
+class FunctionFacts:
+    low_level: set[str] = field(default_factory=set)
+    #: Each path-based parse as written, ``load_dotenv(dotenv_path)``, so an
+    #: exemption names one exact call, not every call of that function.
+    path_parses: list[str] = field(default_factory=list)
+    stream_parses: set[str] = field(default_factory=set)
+    raw_opens: set[str] = field(default_factory=set)
+    entry_calls: set[str] = field(default_factory=set)
+    names_a_store: bool = False
+    #: A reader referenced WITHOUT being called -- assigned, passed, rebound --
+    #: so a later call through the new name would escape the scan.
+    escapes: list[str] = field(default_factory=list)
+
+
+def _module_name(path: Path) -> str:
+    rel = path.relative_to(SRC.parent).with_suffix("")
+    parts = list(rel.parts)
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+class _Walker(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.aliases: dict[str, str] = {}
+        self.stack: list[str] = []
+        self.facts: dict[str, FunctionFacts] = defaultdict(FunctionFacts)
+        self.depth = 0
+        self.callees: set[int] = set()
+
+    # -- scope ------------------------------------------------------------- #
+    def _current(self) -> FunctionFacts:
+        return self.facts[".".join(self.stack) if self.stack else "<module>"]
+
+    def _enter(self, node: ast.AST, name: str) -> None:
+        self.stack.append(name)
+        self.generic_visit(node)
+        self.stack.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._enter(node, node.name)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        # Nested functions are folded into the outermost function that holds
+        # them, so a reader cannot hide its read in an inner helper.
+        self.depth += 1
+        try:
+            if self.depth > 1:
+                self.generic_visit(node)
+            else:
+                self._enter(node, node.name)
+        finally:
+            self.depth -= 1
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+    # -- imports ----------------------------------------------------------- #
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for alias in node.names:
+            self.aliases[alias.asname or alias.name] = alias.name
+        self.generic_visit(node)
+
+    # -- facts ------------------------------------------------------------- #
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, str) and any(
+            name in node.value for name in STORE_NAMES
+        ):
+            # Docstrings mention stores freely; only code that builds a path
+            # matters, and a docstring is an Expr statement handled below.
+            self._current().names_a_store = True
+
+    def visit_Expr(self, node: ast.Expr) -> None:
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            return  # a docstring or bare string: not a path
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        name = self.aliases.get(node.id, node.id)
+        if name in ESCAPABLE and id(node) not in self.callees:
+            self._current().escapes.append(f"{name} referenced at line {node.lineno}")
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in ESCAPABLE and id(node) not in self.callees:
+            self._current().escapes.append(
+                f"{node.attr} referenced at line {node.lineno}"
+            )
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.callees.add(id(node.func))
+        func = node.func
+        if isinstance(func, ast.Name):
+            name = self.aliases.get(func.id, func.id)
+        elif isinstance(func, ast.Attribute):
+            name = func.attr
+        else:
+            name = ""
+        facts = self._current()
+        if name in LOW_LEVEL_READERS:
+            facts.low_level.add(name)
+        if name in DOTENV_PARSERS:
+            by_stream = any(kw.arg == "stream" for kw in node.keywords)
+            by_path = bool(node.args) or any(
+                kw.arg == "dotenv_path" for kw in node.keywords
+            )
+            if by_path or not by_stream:
+                spelled = ", ".join(
+                    [ast.unparse(arg) for arg in node.args]
+                    + [ast.unparse(kw) for kw in node.keywords]
+                )
+                facts.path_parses.append(f"{name}({spelled})")
+            else:
+                facts.stream_parses.add(name)
+        if name in RAW_OPENS:
+            facts.raw_opens.add(name)
+        if name in ENTRY_POINT:
+            facts.entry_calls.add(name)
+        self.generic_visit(node)
+
+
+def inventory(sources: dict[str, str]) -> dict[tuple[str, str], FunctionFacts]:
+    """``{(module, function): facts}`` for every function with a store fact."""
+    result: dict[tuple[str, str], FunctionFacts] = {}
+    for module, source in sources.items():
+        walker = _Walker()
+        walker.visit(ast.parse(source))
+        for function, facts in walker.facts.items():
+            # Methods: the class is part of the stack; keep "Class.method".
+            result[(module, function)] = facts
+    return result
+
+
+def bypasses(inv: dict[tuple[str, str], FunctionFacts]) -> list[str]:
+    found: list[str] = []
+    used_exemptions: set[tuple[str, str, str]] = set()
+    for (module, function), facts in sorted(inv.items()):
+        if (module, function) in ENTRY_POINT_INTERNALS:
+            continue
+        sinks = sorted(facts.low_level) + facts.path_parses
+        if facts.names_a_store:
+            sinks += sorted(facts.raw_opens)
+        for sink in sinks:
+            key = (module, function, sink)
+            if key in EXEMPT and key not in used_exemptions:
+                used_exemptions.add(key)  # one call only: a second is a bypass
+                continue
+            shown = sink if "(" in sink else f"{sink}()"
+            found.append(f"{module}:{function} reads a store with {shown}")
+        for escape in facts.escapes:
+            found.append(f"{module}:{function} lets a reader escape: {escape}")
+        if facts.stream_parses:
+            found.append(f"{module}:{function} parses dotenv text outside load_store")
+    for key in sorted(set(EXEMPT) - used_exemptions):
+        found.append(f"exemption {key} no longer matches anything: drop it")
+    return found
+
+
+def _src_sources() -> dict[str, str]:
+    return {
+        _module_name(path): path.read_text(encoding="utf-8")
+        for path in sorted(SRC.rglob("*.py"))
+    }
+
+
+# --------------------------------------------------------------------------- #
+# The tests.
+# --------------------------------------------------------------------------- #
+
+
+def test_no_function_in_src_reads_a_store_around_the_entry_point() -> None:
+    assert bypasses(inventory(_src_sources())) == []
+
+
+def test_the_inventory_sees_the_readers_it_governs() -> None:
+    """Not vacuous: the walk finds the entry point's callers and its internals.
+
+    Every function that calls the entry point is a store reader the rule now
+    governs. The walk must see at least the modules the issue named --
+    remote-header auth, the CLI, doctor, secrets, the gateway handlers and the
+    env store itself -- or it is not looking at the tree.
+    """
+    inv = inventory(_src_sources())
+    callers = {key for key, facts in inv.items() if facts.entry_calls}
+    modules = {module for module, _ in callers}
+    assert {
+        "pmcp.remote_auth",
+        "pmcp.cli",
+        "pmcp.cli_commands.doctor",
+        "pmcp.cli_commands.secrets",
+        "pmcp.tools.handlers",
+        "pmcp.env_store",
+    } <= modules, sorted(callers)
+    internals_with_reads = {
+        key
+        for key in ENTRY_POINT_INTERNALS
+        if inv.get(key) and inv[key].low_level | inv[key].stream_parses
+    }
+    assert internals_with_reads, "the walk found no read inside the entry point"
+
+
+def test_the_entry_point_internals_all_exist() -> None:
+    """A renamed internal must not leave a stale allowance behind."""
+    inv = inventory(_src_sources())
+    missing = sorted(key for key in ENTRY_POINT_INTERNALS if key not in inv)
+    assert missing == []
+
+
+def test_the_walker_flags_every_bypass_shape() -> None:
+    """The walker itself, against a synthetic module holding each bypass."""
+    source = """
+import os
+from dotenv import load_dotenv as ld, dotenv_values
+from pmcp import env_store
+from pmcp.env_store import read_env_file as ref, load_store
+
+def follows_project(root):
+    return ref(root / ".env.pmcp")
+
+def attribute_call(root):
+    return env_store.read_env_text(root / ".env.pmcp")
+
+def aliased_path_load():
+    ld("x")
+
+def discovered_load():
+    ld()
+
+def opens_tenant(root):
+    return open(root / ".pmcp" / "tenants" / "t" / "pmcp.env").read()
+
+def reads_text(root):
+    return (root / ".env.pmcp").read_text()
+
+def stream_without_entry(text):
+    return dotenv_values(stream=text)
+
+def hidden_in_a_nested_helper(root):
+    def inner():
+        return env_store.read_confined(root / ".env.pmcp", root)
+    return inner()
+
+class Gateway:
+    def check(self):
+        return [lambda: env_store._read_env_file_strict(".env.pmcp")]
+
+def stream_of_entry_text(root):
+    ld(stream="X=1")
+
+def fine(root):
+    load_store("project", path=root / ".env.pmcp")
+"""
+    found = bypasses(inventory({"pmcp.synthetic": source}))
+    flagged = {
+        line.split(" ")[0] for line in found if line.startswith("pmcp.synthetic")
+    }
+    assert flagged == {
+        "pmcp.synthetic:follows_project",
+        "pmcp.synthetic:attribute_call",
+        "pmcp.synthetic:aliased_path_load",
+        "pmcp.synthetic:discovered_load",
+        "pmcp.synthetic:opens_tenant",
+        "pmcp.synthetic:reads_text",
+        "pmcp.synthetic:stream_without_entry",
+        "pmcp.synthetic:hidden_in_a_nested_helper",
+        "pmcp.synthetic:Gateway.check",
+        "pmcp.synthetic:stream_of_entry_text",
+    }, found
+
+
+def test_there_are_no_exemptions() -> None:
+    """Every read in src goes through the entry point: nothing is exempt."""
+    inv = inventory(_src_sources())
+    matched = sorted(
+        (module, function, sink)
+        for (module, function), facts in inv.items()
+        for sink in [*facts.low_level, *facts.path_parses]
+        if (module, function) not in ENTRY_POINT_INTERNALS
+    )
+    assert EXEMPT == {}
+    assert matched == []
+
+
+def test_the_startup_env_load_is_flagged_if_it_loads_by_path_again() -> None:
+    """The F001 shape: discovery handed straight to ``load_dotenv(path)``."""
+    source = """
+from dotenv import find_dotenv, load_dotenv
+
+def load_startup_env(dotenv_path=None):
+    load_dotenv(dotenv_path)
+    load_dotenv(find_dotenv())
+"""
+    assert bypasses(inventory({"pmcp.cli": source})) == [
+        "pmcp.cli:load_startup_env reads a store with load_dotenv(dotenv_path)",
+        "pmcp.cli:load_startup_env reads a store with load_dotenv(find_dotenv())",
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Every environment variable src/pmcp reads is classified (grok F001).
+# --------------------------------------------------------------------------- #
+
+#: Calls that read the environment implicitly, and the variables each consults.
+IMPLICIT_ENV_READS = {
+    "home": {"HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"},
+    "expanduser": {"HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"},
+    "gettempdir": {"TMPDIR", "TEMP", "TMP"},
+    "mkstemp": {"TMPDIR", "TEMP", "TMP"},
+    "mkdtemp": {"TMPDIR", "TEMP", "TMP"},
+    "NamedTemporaryFile": {"TMPDIR", "TEMP", "TMP"},
+    "TemporaryDirectory": {"TMPDIR", "TEMP", "TMP"},
+    "which": {"PATH", "PATHEXT"},
+}
+
+
+def _is_environ(node: ast.AST) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr == "environ") or (
+        isinstance(node, ast.Name) and node.id == "environ"
+    )
+
+
+def _env_reading_helpers(sources: dict[str, str]) -> set[str]:
+    """Functions that read the environment by the name a PARAMETER holds."""
+    helpers: set[str] = set()
+    for source in sources.values():
+        for fn in ast.walk(ast.parse(source)):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            params = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
+            for node in ast.walk(fn):
+                arg = None
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    if (
+                        node.func.attr in ("get", "pop")
+                        and _is_environ(node.func.value)
+                    ) or node.func.attr == "getenv":
+                        arg = node.args[0] if node.args else None
+                elif isinstance(node, ast.Subscript) and _is_environ(node.value):
+                    arg = node.slice
+                if isinstance(arg, ast.Name) and arg.id in params:
+                    helpers.add(fn.name)
+    return helpers
+
+
+def env_reads(sources: dict[str, str]) -> dict[str, set[str]]:
+    """``{variable: {"module:function", ...}}`` for every literal environment read.
+
+    ``os.environ.get/pop/setdefault(K)``, ``os.environ[K]``, ``K in os.environ``,
+    ``os.getenv(K)`` and ``environ.get(K)`` on a mapping named ``environ`` (the
+    feedback gate's parameter), with ``K`` a string literal or a module-level
+    string constant; plus the variables an implicit reader consults.
+    """
+    reads: dict[str, set[str]] = defaultdict(set)
+    helpers = _env_reading_helpers(sources)
+    for module, source in sources.items():
+        tree = ast.parse(source)
+        consts: dict[str, str] = {}
+        for stmt in tree.body:
+            targets = (
+                stmt.targets
+                if isinstance(stmt, ast.Assign)
+                else [stmt.target]
+                if isinstance(stmt, ast.AnnAssign)
+                else []
+            )
+            value = getattr(stmt, "value", None)
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        consts[target.id] = value.value
+
+        def key(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            if isinstance(node, ast.Name):
+                return consts.get(node.id)
+            return None
+
+        def visit(node: ast.AST, where: str) -> None:
+            for child in ast.iter_child_nodes(node):
+                inner = where
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    inner = f"{module}:{child.name}"
+                name: str | None = None
+                if isinstance(child, ast.Call):
+                    func = child.func
+                    attr = (
+                        func.attr
+                        if isinstance(func, ast.Attribute)
+                        else (func.id if isinstance(func, ast.Name) else "")
+                    )
+                    if (
+                        isinstance(func, ast.Attribute)
+                        and attr in ("get", "pop", "setdefault")
+                        and _is_environ(func.value)
+                        and child.args
+                    ):
+                        name = key(child.args[0])
+                    elif attr == "getenv" and child.args:
+                        name = key(child.args[0])
+                    elif attr in helpers and child.args:
+                        # A helper that reads the environment by its argument
+                        # (server._env_int): the literal at the call site.
+                        name = key(child.args[0])
+                    for implied in IMPLICIT_ENV_READS.get(attr, ()):
+                        reads[implied].add(inner)
+                elif isinstance(child, ast.Subscript) and _is_environ(child.value):
+                    name = key(child.slice)
+                elif (
+                    isinstance(child, ast.Compare)
+                    and len(child.ops) == 1
+                    and isinstance(child.ops[0], (ast.In, ast.NotIn))
+                    and _is_environ(child.comparators[0])
+                ):
+                    name = key(child.left)
+                if name is not None and name.isupper():
+                    reads[name].add(inner)
+                visit(child, inner)
+
+        visit(tree, f"{module}:<module>")
+    return reads
+
+
+def test_every_environment_variable_pmcp_reads_is_classified() -> None:
+    from pmcp import env_store
+
+    classes = (
+        env_store.PATH_AND_TRUST_ENV_VARS,
+        env_store.PROVENANCE_GATED_ENV_VARS,
+        env_store.OPERATIONAL_ENV_VARS,
+    )
+    for a in range(len(classes)):
+        for b in range(a + 1, len(classes)):
+            assert not classes[a] & classes[b]
+    classified = set().union(*classes)
+    reads = env_reads(_src_sources())
+    unclassified = {k: sorted(v) for k, v in reads.items() if k not in classified}
+    assert unclassified == {}, (
+        "classify each in env_store: PATH_AND_TRUST_ENV_VARS if it decides a path, "
+        "a root, who may connect or whom to trust; PROVENANCE_GATED_ENV_VARS if "
+        "its use is gated by env_key_is_operator_supplied; else OPERATIONAL"
+    )
+    # Every implicit reader's variables are path-and-trust.
+    for implied in IMPLICIT_ENV_READS.values():
+        assert implied <= env_store.PATH_AND_TRUST_ENV_VARS
+
+
+def test_every_provenance_gated_variable_is_gated_where_it_is_read() -> None:
+    """A gated variable is only read in a function that asks its provenance."""
+    from pmcp import env_store
+
+    sources = _src_sources()
+    reads = env_reads(sources)
+    gate_calls: set[str] = set()
+    for module, source in sources.items():
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names = {
+                    n.func.id
+                    if isinstance(n.func, ast.Name)
+                    else getattr(n.func, "attr", "")
+                    for n in ast.walk(node)
+                    if isinstance(n, ast.Call)
+                }
+                if names & {"env_key_is_operator_supplied", "untrusted"}:
+                    gate_calls.add(f"{module}:{node.name}")
+    for variable in env_store.PROVENANCE_GATED_ENV_VARS:
+        assert reads.get(variable), f"{variable} is never read: drop it"
+        assert reads[variable] <= gate_calls, (variable, reads[variable] - gate_calls)
+
+
+def test_the_env_scan_sees_each_read_shape() -> None:
+    source = (
+        "import os, shutil, tempfile\n"
+        "from pathlib import Path\n"
+        "K = 'PMCP_CONST'\n"
+        "def f(environ):\n"
+        "    os.environ.get('PMCP_A'); os.environ['PMCP_B']; 'PMCP_C' in os.environ\n"
+        "    os.getenv('PMCP_D'); environ.get(K); Path.home(); shutil.which('x')\n"
+        "    tempfile.gettempdir()\n"
+        "def _env_n(name):\n"
+        "    return os.environ.get(name)\n"
+        "def g():\n"
+        "    _env_n('PMCP_E')\n"
+    )
+    assert set(env_reads({"pmcp.x": source})) == {
+        "PMCP_A",
+        "PMCP_B",
+        "PMCP_C",
+        "PMCP_D",
+        "PMCP_E",
+        "PMCP_CONST",
+        "HOME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "PATH",
+        "PATHEXT",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Every spawn's environment comes from a builder (Consiliency/pmcp#372 round 2).
+# --------------------------------------------------------------------------- #
+
+#: Calls that start a process. ``StdioServerParameters`` is the MCP SDK's
+#: description of one (it spawns from it, with ``env=`` or its own default).
+SPAWN_CALLS = frozenset(
+    {
+        "run",
+        "Popen",
+        "call",
+        "check_call",
+        "check_output",
+        "create_subprocess_exec",
+        "create_subprocess_shell",
+        "system",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+        "execl",
+        "execle",
+        "execlp",
+        "execlpe",
+        "spawnv",
+        "spawnve",
+        "spawnvp",
+        "spawnvpe",
+        "posix_spawn",
+        "posix_spawnp",
+        "run_process",
+        "open_process",
+        "StdioServerParameters",
+    }
+)
+#: The env builders. ``build_install_child_env`` and ``sanitized_subprocess_env``
+#: both build on ``env_store.child_process_env``.
+ENV_BUILDERS = frozenset(
+    {"child_process_env", "sanitized_subprocess_env", "build_install_child_env"}
+)
+
+
+def _is_spawn(call: ast.Call) -> bool:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id == "StdioServerParameters"
+    if not isinstance(func, ast.Attribute) or func.attr not in SPAWN_CALLS:
+        return False
+    owner = func.value.id if isinstance(func.value, ast.Name) else ""
+    if func.attr in ("run", "call", "check_call", "check_output"):
+        return owner == "subprocess"  # not asyncio.run / anyio.run
+    if func.attr == "system" or func.attr.startswith(("exec", "spawn")):
+        return owner == "os"
+    return True
+
+
+def _builder_call(node: ast.AST | None) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+    return name in ENV_BUILDERS
+
+
+def spawn_sites(sources: dict[str, str]) -> list[tuple[str, str, bool]]:
+    """``(module, function, env_from_a_builder)`` for every spawn in ``sources``.
+
+    ``env=`` must be a call to a builder, or a name the same function assigned
+    from one. A spawn without ``env=`` inherits the process environment
+    unexamined, and the SDK's ``StdioServerParameters`` without ``env=`` uses
+    its own default -- both fail.
+    """
+    sites: list[tuple[str, str, bool]] = []
+    for module, source in sources.items():
+        tree = ast.parse(source)
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            built: set[str] = set()
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Assign) and _builder_call(node.value):
+                    built |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call) and _is_spawn(node):
+                    env = next((k.value for k in node.keywords if k.arg == "env"), None)
+                    ok = _builder_call(env) or (
+                        isinstance(env, ast.Name) and env.id in built
+                    )
+                    sites.append((module, fn.name, ok))
+    return sites
+
+
+def test_every_spawn_takes_its_environment_from_a_builder() -> None:
+    sites = spawn_sites(_src_sources())
+    assert len(sites) >= 10, sites  # not vacuous: the tree has at least this many
+    assert [s for s in sites if not s[2]] == []
+
+
+def test_the_spawn_scan_sees_each_shape() -> None:
+    source = (
+        "import asyncio, os, subprocess\n"
+        "from mcp import StdioServerParameters\n"
+        "def bare():\n"
+        "    subprocess.run(['x'])\n"
+        "async def inherits():\n"
+        "    await asyncio.create_subprocess_exec('x', env=os.environ)\n"
+        "def sdk_default():\n"
+        "    StdioServerParameters(command='x', args=[])\n"
+        "def system():\n"
+        "    os.system('x')\n"
+        "def fine():\n"
+        "    subprocess.Popen(['x'], env=child_process_env())\n"
+        "def fine_by_name():\n"
+        "    env = sanitized_subprocess_env(None)\n"
+        "    subprocess.run(['x'], env=env)\n"
+    )
+    assert spawn_sites({"pmcp.x": source}) == [
+        ("pmcp.x", "bare", False),
+        ("pmcp.x", "inherits", False),
+        ("pmcp.x", "sdk_default", False),
+        ("pmcp.x", "system", False),
+        ("pmcp.x", "fine", True),
+        ("pmcp.x", "fine_by_name", True),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Every credential lookup goes through env_store.credential_value.
+# --------------------------------------------------------------------------- #
+
+#: Dynamic-name environment reads that are not credential lookups, and why.
+#: Asserted exact.
+NOT_A_CREDENTIAL_LOOKUP = {
+    ("pmcp.server", "_env_int"): (
+        "reads a pmcp tuning variable by the name its caller passes; the "
+        "classification inventory sees each call's literal"
+    ),
+    ("pmcp.tools.handlers", "_refresh_config_unchanged"): (
+        "compares a config's env overrides with the environment a spawn inherits"
+    ),
+}
+
+
+def _is_called(scope: ast.AST, attr: ast.Attribute) -> bool:
+    return any(isinstance(n, ast.Call) and n.func is attr for n in ast.walk(scope))
+
+
+def dynamic_environ_reads(sources: dict[str, str]) -> set[tuple[str, str]]:
+    """``(module, outermost function)`` reading ``os.environ``/``getenv`` by a non-literal name."""
+    found: set[tuple[str, str]] = set()
+    for module, source in sources.items():
+        if module == "pmcp.env_store":
+            continue
+        tree = ast.parse(source)
+        for fn in tree.body:
+            targets = (
+                [fn]
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else [
+                    m
+                    for m in getattr(fn, "body", [])
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                ]
+            )
+            for target in targets:
+                for node in ast.walk(target):
+                    key = None
+                    if isinstance(node, ast.Call) and isinstance(
+                        node.func, ast.Attribute
+                    ):
+                        if node.func.attr == "get" and _is_environ(node.func.value):
+                            key = node.args[0] if node.args else None
+                        elif node.func.attr == "getenv":
+                            key = node.args[0] if node.args else None
+                    elif (
+                        isinstance(node, ast.Subscript)
+                        and isinstance(node.ctx, ast.Load)
+                        and _is_environ(node.value)
+                    ):
+                        key = node.slice
+                    if (
+                        isinstance(node, ast.Attribute)
+                        and node.attr in ("get", "getenv")
+                        and (_is_environ(node.value) or node.attr == "getenv")
+                        and not _is_called(target, node)
+                    ):
+                        # `os.environ.get` handed on as a lookup function.
+                        found.add((module, target.name))
+                    if key is not None and not isinstance(key, ast.Constant):
+                        if isinstance(key, ast.Name) and key.id.isupper():
+                            continue  # a module constant: a literal name
+                        found.add((module, target.name))
+    return found
+
+
+def test_every_credential_lookup_goes_through_credential_value() -> None:
+    """A credential a project file supplies is in the map, not ``os.environ``:
+    a lookup that read ``os.environ`` by name would silently miss it."""
+    assert dynamic_environ_reads(_src_sources()) == set(NOT_A_CREDENTIAL_LOOKUP)
+
+
+def test_the_credential_lookup_scan_sees_each_shape() -> None:
+    source = (
+        "import os\n"
+        "K = 'PMCP_K'\n"
+        "def by_get(k):\n"
+        "    return os.environ.get(k)\n"
+        "def by_index(k):\n"
+        "    return os.environ[k]\n"
+        "def by_getenv(k):\n"
+        "    return os.getenv(k)\n"
+        "def handed_on(f):\n"
+        "    return f(os.environ.get)\n"
+        "def literal():\n"
+        "    return os.environ.get('PMCP_X'), os.environ[K]\n"
+        "def write(k, v):\n"
+        "    os.environ[k] = v\n"
+    )
+    assert dynamic_environ_reads({"pmcp.x": source}) == {
+        ("pmcp.x", "by_get"),
+        ("pmcp.x", "by_index"),
+        ("pmcp.x", "by_getenv"),
+        ("pmcp.x", "handed_on"),
+    }
+
+
+def test_the_walker_flags_a_reader_that_escapes_by_reference() -> None:
+    """Folded in from Consiliency/pmcp#366's inventory (its round 7 N-1)."""
+    source = """
+from dotenv import dotenv_values as _dv
+import dotenv
+import functools
+from pmcp import env_store
+
+def sneaky(root):
+    a = _dv(root / ".env.pmcp")
+    b = dotenv.load_dotenv(root / ".env.pmcp")
+    c = env_store.read_env_file(root)
+    r = _dv
+    map(_dv, [root])
+    functools.partial(dotenv.dotenv_values)(root)
+    return a, b, c, r
+"""
+    found = bypasses(inventory({"pmcp.sneaky": source}))
+    escapes = [line for line in found if "escape" in line]
+    reads = [line for line in found if "reads a store" in line]
+    assert len(escapes) == 3, found
+    assert len(reads) == 3, found

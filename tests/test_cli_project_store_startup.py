@@ -40,7 +40,12 @@ _PROBE_MAIN = (
     "import json, os, sys\n"
     "import pmcp.cli as cli\n"
     "async def _report(args):\n"
-    f"    print(json.dumps({{'probe': os.environ.get({PROBE!r})}}))\n"
+    # Since Consiliency/pmcp#372 a project store's values are credentials,
+    # held apart from the process environment: what startup loaded is what a
+    # credential lookup answers, and the environment never has it.
+    "    from pmcp.env_store import credential_value\n"
+    f"    assert {PROBE!r} not in os.environ\n"
+    f"    print(json.dumps({{'probe': credential_value({PROBE!r})}}))\n"
     "cli.async_main = _report\n"
     "sys.argv = ['pmcp', 'secrets', 'set', '--scope', 'project', 'K', 'v']\n"
     "cli.main()\n"
@@ -368,8 +373,10 @@ def test_a_link_outside_any_project_is_skipped_the_same_way(
 
 
 # --------------------------------------------------------------------------- #
-# Round 5 N-B: the readers that still follow a link (Consiliency/pmcp#367) no
-# longer block on a fifo.
+# Round 5 N-B: the other readers never block on a fifo. Since
+# Consiliency/pmcp#367 they read the project store through the confined walk
+# too (env_store.read_store; tests/test_store_readers_confined.py), so the fifo
+# is refused there as it is at startup.
 # --------------------------------------------------------------------------- #
 
 

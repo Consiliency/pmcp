@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 REMOTE_HEADER_ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-TENANT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 @dataclass(frozen=True)
@@ -81,14 +79,21 @@ def resolve_remote_headers(
 def build_remote_header_env_lookup(
     project_root: Path | None = None,
 ) -> Callable[[str], str | None]:
-    """Build a lookup over process env plus PMCP user/project env stores."""
-    from pmcp.env_store import read_env_file, resolve_scope_path
+    """Build a lookup over process env plus PMCP user/project env stores.
 
-    user_values = read_env_file(resolve_scope_path("user"))
-    project_values = read_env_file(resolve_scope_path("project", project_root))
+    The project store is read confined to the project (``read_store``): a
+    ``.env.pmcp`` linked out of the checkout contributes nothing, so a file the
+    repository points at can never fill a ``${VAR}`` header (Consiliency/pmcp#367).
+    """
+    from pmcp.env_store import credential_value, read_store
+
+    user_values = read_store("user")
+    project_values = read_store("project", project=project_root)
 
     def lookup(env_var: str) -> str | None:
-        value = os.environ.get(env_var)
+        # The process environment, then credentials repository files supplied
+        # at startup (env_store.credential_value), then the stores themselves.
+        value = credential_value(env_var)
         if value:
             return value
         value = project_values.get(env_var)
@@ -100,22 +105,6 @@ def build_remote_header_env_lookup(
         return None
 
     return lookup
-
-
-def _tenant_env_path(project_root: Path | None, tenant_id: str) -> Path:
-    if not TENANT_ID_PATTERN.fullmatch(tenant_id):
-        raise ValueError(
-            "Tenant id may only contain letters, numbers, dot, underscore, or dash."
-        )
-    from pmcp.env_store import resolve_project_root
-
-    return (
-        resolve_project_root(project_root)
-        / ".pmcp"
-        / "tenants"
-        / tenant_id
-        / "pmcp.env"
-    )
 
 
 def resolve_remote_headers_for_tenant(
@@ -132,13 +121,14 @@ def resolve_remote_headers_for_tenant(
             headers, build_remote_header_env_lookup(project_root)
         )
 
-    from pmcp.env_store import read_env_file
+    from pmcp.env_store import credential_value, read_store
 
-    tenant_values = read_env_file(_tenant_env_path(project_root, tenant_id))
+    # Repository-controlled: confined to the project root (Consiliency/pmcp#367).
+    tenant_values = read_store("tenant", project=project_root, tenant_id=tenant_id)
 
     def lookup(env_var: str) -> str | None:
         if include_process_env:
-            value = os.environ.get(env_var)
+            value = credential_value(env_var)
             if value:
                 return value
         return tenant_values.get(env_var) or None

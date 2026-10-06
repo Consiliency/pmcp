@@ -1929,7 +1929,7 @@ class TestServerLifecycleTools:
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
         monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
-        monkeypatch.setattr("pmcp.tools.handlers.load_dotenv", lambda *a, **kw: False)
+        monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
         policy_manager.is_server_allowed = lambda name: name != "denied"  # type: ignore[method-assign]
         return gateway_tools
 
@@ -3600,7 +3600,7 @@ class TestCapabilityAndProvision:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         # Prevent _check_api_key_available from loading env vars out of pmcp files on disk
-        monkeypatch.setattr("pmcp.tools.handlers.load_dotenv", lambda *a, **kw: False)
+        monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
 
         result = await gateway_tools.provision({"server_name": "browser-use"})
 
@@ -3811,7 +3811,7 @@ class TestCapabilityAndProvision:
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.chdir(project)
         monkeypatch.delenv("PMCP_TEST_KEY", raising=False)
-        monkeypatch.setattr("pmcp.tools.handlers.load_dotenv", lambda *a, **kw: False)
+        monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
         gateway_tools = GatewayTools(
             client_manager=MockClientManager(),  # type: ignore
             policy_manager=PolicyManager(),

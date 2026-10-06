@@ -411,7 +411,7 @@ async def test_auth_soak_local_api_key_provision_connect_retry_smoke(
     monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
     monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
     monkeypatch.setattr("pmcp.tools.handlers.get_job_manager", lambda: FakeJobManager())
-    monkeypatch.setattr("pmcp.tools.handlers.load_dotenv", lambda *a, **kw: False)
+    monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
     gateway = GatewayTools(
         client_manager=ClientManager(),
         policy_manager=PolicyManager(),

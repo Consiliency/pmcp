@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from urllib.parse import urlparse
 
 from pmcp.auth import (
@@ -16,13 +15,9 @@ from pmcp.remote_auth import build_remote_header_env_lookup, resolve_remote_head
 
 def _read_user_pmcp_env() -> dict[str, str]:
     """Read user-scope PMCP env context from ~/.config/pmcp/pmcp.env."""
-    path = Path.home() / ".config" / "pmcp" / "pmcp.env"
-    if not path.exists():
-        return {}
+    from pmcp.env_store import read_store
 
-    from pmcp.env_store import read_env_file
-
-    return read_env_file(path)
+    return read_store("user")
 
 
 def collect_remote_header_diagnostics(

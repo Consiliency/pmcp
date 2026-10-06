@@ -53,6 +53,7 @@ from pmcp.config.guidance import (
     set_feedback_submission_enabled,
 )
 from pmcp.env_store import (
+    credential_value,
     dotenv_sourced_keys,
     pmcp_introduced_keys,
     reset_pmcp_introduced_keys,
@@ -313,7 +314,8 @@ def test_startup_store_loads_are_recorded_as_pmcp_introduced(
 
     Three properties, each a separate way to get this wrong:
 
-    * **Both** stores record, not just the user one.
+    * The user store records. (The project store did too, until
+      Consiliency/pmcp#372 kept repository files out of the environment.)
     * The record is by *provenance*, not by name: `EXPORTED_KEY` is in the user
       store **and** in the operator's shell, and `override=False` means the file
       did not introduce it -- so it is in neither registry and its shell value
@@ -343,7 +345,12 @@ def test_startup_store_loads_are_recorded_as_pmcp_introduced(
     sourced = dotenv_sourced_keys()
 
     assert STORE_KEY in introduced, "the user store's delta was not recorded"
-    assert PROJECT_KEY in introduced, "the project store's delta was not recorded"
+    # The project store never reaches the environment (Consiliency/pmcp#372):
+    # its value is in the credential map, so there is no delta to record and
+    # no variable a gate could mistake for the operator's.
+    assert PROJECT_KEY not in introduced
+    assert PROJECT_KEY not in os.environ
+    assert credential_value(PROJECT_KEY) == "planted-in-the-project"
 
     assert EXPORTED_KEY not in introduced
     assert EXPORTED_KEY not in sourced
@@ -356,6 +363,5 @@ def test_startup_store_loads_are_recorded_as_pmcp_introduced(
     assert DOTENV_KEY in sourced
     assert DOTENV_KEY not in introduced
 
-    # The loads themselves are unchanged: the gateway still sees the values.
+    # The user store's load is unchanged: the gateway still sees its values.
     assert os.environ[STORE_KEY] == "planted-by-a-previous-process"
-    assert os.environ[PROJECT_KEY] == "planted-in-the-project"

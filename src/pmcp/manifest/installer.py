@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import shlex
 import time
 import uuid
@@ -12,7 +11,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from pmcp.env_store import resolve_scope_path, sanitized_subprocess_env
+from pmcp.env_store import (
+    credential_value,
+    resolve_scope_path,
+    sanitized_subprocess_env,
+)
 from pmcp.manifest.environment import Platform
 from pmcp.manifest.loader import (
     ServerConfig,
@@ -623,7 +626,7 @@ def build_install_child_env(
     env_var = server_config.env_var
     if env_var:
         for key in credential_lookup_keys(server_config):
-            value = os.environ.get(key)
+            value = credential_value(key)
             if value:
                 own_env[env_var] = value
                 break
@@ -650,7 +653,7 @@ async def check_api_key(server_config: ServerConfig) -> None:
     # a namespaced secret_key satisfies the provision gate. Checking only the raw
     # runtime env_var would wrongly raise for namespaced-only credentials.
     lookup_keys = credential_lookup_keys(server_config) or [env_var]
-    if not any(os.environ.get(key) for key in lookup_keys):
+    if not any(credential_value(key) for key in lookup_keys):
         env_path = resolve_scope_path("project")
         raise MissingApiKeyError(
             env_var=env_var,

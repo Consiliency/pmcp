@@ -261,9 +261,24 @@ class TestMain:
         from pmcp.cli import main
 
         (tmp_path / ".env.pmcp").write_text("R4_MAIN_PROBE=1\n", encoding="utf-8")
+        # The user store, too, is read through the one store reader and loaded
+        # as a stream only when present (Consiliency/pmcp#367).
+        home = tmp_path / "home"
+        (home / ".config" / "pmcp").mkdir(parents=True)
+        (home / ".config" / "pmcp" / "pmcp.env").write_text(
+            "R4_MAIN_USER_PROBE=1\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HOME", str(home))
         monkeypatch.chdir(tmp_path)
+        # The discovered `.env` is read through the store reader as well, and
+        # only when one is found (Consiliency/pmcp#367 board round 1, F001).
+        (tmp_path / ".env").write_text("R4_MAIN_ENV_PROBE=1\n", encoding="utf-8")
+        monkeypatch.setattr("pmcp.cli.find_dotenv", lambda: str(tmp_path / ".env"))
 
-        with patch("pmcp.cli.load_dotenv") as mock_dotenv:
+        with (
+            patch("pmcp.cli.load_store") as mock_load,
+            patch("pmcp.cli.load_discovered_dotenv") as mock_discovered,
+        ):
             with patch("pmcp.cli.parse_args") as mock_parse:
                 mock_parse.return_value = argparse.Namespace(
                     command=None,
@@ -280,17 +295,23 @@ class TestMain:
 
                     main()
 
-            # main() loads .env, then two pmcp env stores — 3 calls total; the
-            # project store arrives as a stream read through the confined walk.
-            assert mock_dotenv.call_count == 3
-            assert "stream" in mock_dotenv.call_args_list[2].kwargs
-            assert mock_dotenv.call_args_list[2].kwargs["override"] is False
+            # main() loads the discovered .env, then the two pmcp env stores,
+            # each through the one store loader with its scope: the checkout
+            # files as "project" (confined), the user store as "user"; the
+            # discovered .env is classified by where it is.
+            mock_discovered.assert_called_once_with(tmp_path / ".env")
+            assert [
+                (c.args, c.kwargs.get("path")) for c in mock_load.call_args_list
+            ] == [
+                (("user",), None),
+                (("project",), tmp_path / ".env.pmcp"),
+            ]
 
     def test_main_handles_keyboard_interrupt(self) -> None:
         """Test that main handles KeyboardInterrupt gracefully."""
         from pmcp.cli import main
 
-        with patch("pmcp.cli.load_dotenv"):
+        with patch("pmcp.cli.load_store"), patch("pmcp.cli.load_discovered_dotenv"):
             with patch("pmcp.cli.parse_args") as mock_parse:
                 mock_parse.return_value = argparse.Namespace(
                     command=None,
@@ -312,7 +333,7 @@ class TestMain:
         """Test that main exits with code 1 on error."""
         from pmcp.cli import main
 
-        with patch("pmcp.cli.load_dotenv"):
+        with patch("pmcp.cli.load_store"), patch("pmcp.cli.load_discovered_dotenv"):
             with patch("pmcp.cli.parse_args") as mock_parse:
                 mock_parse.return_value = argparse.Namespace(
                     command=None,
@@ -1463,7 +1484,7 @@ class TestRunDoctor:
 
         with patch.dict("os.environ", {}, clear=True):
             with patch("pmcp.cli.Path.home", return_value=tmp_path):
-                with patch("pmcp.cli_commands.doctor.Path.home", return_value=tmp_path):
+                with patch("pmcp.env_store.Path.home", return_value=tmp_path):
                     with patch(
                         "pmcp.cli._is_pmcp_system_service_active",
                         return_value=False,
@@ -1519,7 +1540,7 @@ class TestRunDoctor:
 
         with patch.dict("os.environ", {}, clear=True):
             with patch("pmcp.cli.Path.home", return_value=tmp_path):
-                with patch("pmcp.cli_commands.doctor.Path.home", return_value=tmp_path):
+                with patch("pmcp.env_store.Path.home", return_value=tmp_path):
                     with patch(
                         "pmcp.cli._is_pmcp_system_service_active",
                         return_value=False,

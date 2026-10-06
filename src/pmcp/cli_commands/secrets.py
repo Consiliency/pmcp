@@ -8,8 +8,8 @@ from pathlib import Path
 
 from pmcp.config.loader import load_configs
 from pmcp.env_store import (
-    read_env_file,
     resolve_project_root,
+    read_store,
     read_store_for_update,
     resolve_scope_path,
     scope_confinement,
@@ -323,8 +323,10 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
     user_path = resolve_scope_path("user")
     project_path = resolve_scope_path("project", project_root)
 
-    user_values = read_env_file(user_path)
-    project_values = read_env_file(project_path)
+    # The project store is confined to the project (Consiliency/pmcp#367): a
+    # link out of the checkout lists no keys and satisfies no requirement.
+    user_values = read_store("user")
+    project_values = read_store("project", project=project_root)
 
     effective = dict(user_values)
     effective.update(project_values)

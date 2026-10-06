@@ -37,7 +37,11 @@ from pathlib import Path
 import pytest
 
 from pmcp import cli
-from pmcp.env_store import dotenv_sourced_keys, sanitized_subprocess_env
+from pmcp.env_store import (
+    credential_value,
+    dotenv_sourced_keys,
+    sanitized_subprocess_env,
+)
 from pmcp.tools.handlers import GatewayTools
 
 PREFIX = "PMCP_TEST_229_"
@@ -247,7 +251,10 @@ def test_the_availability_check_still_interpolates(
     (project / ".env").write_text(f"{BASE}=abc\n{DERIVED}=${{{BASE}}}/x\n")
 
     assert _gateway_tools()._check_api_key_available(DERIVED) is True
-    assert os.environ[DERIVED] == "abc/x"
+    # A checkout's .env supplies credentials only: the value is in the
+    # credential map, never the gateway's environment (Consiliency/pmcp#372).
+    assert credential_value(DERIVED) == "abc/x"
+    assert DERIVED not in os.environ
     assert DERIVED not in sanitized_subprocess_env()
 
 
@@ -263,7 +270,8 @@ def test_an_empty_value_shadows_a_later_file(
     (project / ".env.pmcp").write_text(f"{QUERIED}=real\n")
 
     assert _gateway_tools()._check_api_key_available(QUERIED) is False
-    assert os.environ[QUERIED] == ""
+    assert credential_value(QUERIED) is None
+    assert QUERIED not in os.environ
 
 
 def test_the_availability_check_short_circuits_on_no_env_var() -> None:

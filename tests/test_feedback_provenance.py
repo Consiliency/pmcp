@@ -166,14 +166,16 @@ def _raise_on_project_store(
     on the uid the suite runs as -- root reads a mode-000 file. The real-file
     comparison is `test_an_unreadable_project_store_file_separates_the_lookups`.
     """
-    real_read = env_store.read_env_file
+    # The project store is read through the confined walk (Consiliency/pmcp#367),
+    # so the failure is injected at `read_confined`, the one call that reads it.
+    real_read = env_store.read_confined
 
-    def _read(path: Path) -> dict[str, str]:
-        if path == project_store:
+    def _read(path: Path, *args: object, **kwargs: object) -> bytes | None:
+        if path.resolve() == project_store.resolve():
             raise PermissionError(13, "Permission denied", str(path))
-        return real_read(path)
+        return real_read(path, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(env_store, "read_env_file", _read)
+    monkeypatch.setattr(env_store, "read_confined", _read)
 
 
 def test_a_key_pmcp_wrote_at_runtime_is_recorded(
@@ -251,14 +253,16 @@ def test_the_strict_lookup_raises_where_the_lenient_one_swallows(
     with pytest.raises(OSError):
         managed_secret_keys_strict(project)
 
-    # The user half is already unguarded in both, so fail-closed is reachable
-    # there today; only the project half failed open.
-    def _read_nothing(path: Path) -> dict[str, str]:
+    # The user half: the lenient lookup warns and reads it as empty (startup
+    # and every spawn must not crash on an unreadable user store); the strict
+    # one still raises, so the gate fails closed (Consiliency/pmcp#367).
+    def _read_nothing(path: Path) -> str | None:
         raise PermissionError(13, "Permission denied", str(path))
 
-    monkeypatch.setattr(env_store, "read_env_file", _read_nothing)
+    monkeypatch.setattr(env_store, "read_env_text", _read_nothing)
+    assert OTHER not in managed_secret_keys(project)
     with pytest.raises(OSError):
-        managed_secret_keys(project)
+        managed_secret_keys_strict(project)
 
 
 def test_the_lenient_lookup_keeps_its_existing_caller_behaviour(

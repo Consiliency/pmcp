@@ -6,7 +6,6 @@ import functools
 import logging
 import os
 import re
-import io
 import json
 import asyncio
 import time
@@ -18,7 +17,6 @@ from collections.abc import Callable, Mapping
 from typing import Any, Literal, cast, NamedTuple
 
 import anyio
-from dotenv import load_dotenv
 from mcp.types import Tool
 from pydantic import BaseModel
 from pmcp import __version__ as PMCP_VERSION
@@ -58,7 +56,9 @@ from pmcp.config.loader import (
 from pmcp.errors import ErrorCode, GatewayException, make_error
 from pmcp.env_store import (
     record_dotenv_keys,
-    read_env_text,
+    child_process_env,
+    credential_value,
+    load_store,
     record_pmcp_introduced_keys,
     sanitized_subprocess_env,
     scope_store_name,
@@ -2374,7 +2374,7 @@ class GatewayTools:
             disabled_auto_start=disabled,
             provisioned_server_names=provisioned,
             is_server_allowed=self._policy_manager.is_server_allowed,
-            is_auth_available=lambda env_var: bool(os.environ.get(env_var)),
+            is_auth_available=lambda env_var: bool(credential_value(env_var)),
             legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
             project_root=self._project_root,
         )
@@ -2663,26 +2663,30 @@ class GatewayTools:
         if not env_var:
             return False
 
-        # Check live environment first (fast path)
-        if os.environ.get(env_var):
+        # The process environment, then credentials repository files supplied
+        # (env_store.credential_value) -- fast path.
+        if credential_value(env_var):
             return True
 
-        # Check all env stores in priority order: project-local .env, then pmcp files
-        for env_path in [
-            Path.cwd() / ".env",
-            Path.cwd() / ".env.pmcp",
-            Path.home() / ".config" / "pmcp" / "pmcp.env",
-        ]:
-            # read_env_text: a fifo (or any non-regular file) a repository ships
-            # at one of these paths reads as absent instead of freezing the
-            # gateway; same parser, interpolation and precedence as before.
-            text = read_env_text(env_path)
-            if text is not None:
-                before = set(os.environ)
-                load_dotenv(stream=io.StringIO(text))
-                record_dotenv_keys(set(os.environ) - before)
-                if os.environ.get(env_var):
-                    return True
+        # Check all env stores in priority order: project-local .env, then pmcp
+        # files. The two checkout files are repository-controlled and read
+        # confined to the project (Consiliency/pmcp#367): a link out of the
+        # checkout, or a fifo, reads as absent with one warning; the user store
+        # follows its link. The checkout files' values go to the credential map,
+        # never into the gateway's environment (env_store.load_store,
+        # Consiliency/pmcp#372 round 2). One store at a time: a key found early
+        # stops the loads.
+        stores: list[tuple[Literal["project", "user"], Path | None]] = [
+            ("project", Path.cwd() / ".env"),
+            ("project", Path.cwd() / ".env.pmcp"),
+            ("user", None),
+        ]
+        for scope, path in stores:
+            before = set(os.environ)
+            load_store(scope, path=path)
+            record_dotenv_keys(set(os.environ) - before)
+            if credential_value(env_var):
+                return True
 
         return False
 
@@ -3435,7 +3439,7 @@ class GatewayTools:
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=env,
+            env=child_process_env(base=env),
             start_new_session=True,
         )
         # The spawn contract: `start_new_session=True` makes the probe a group

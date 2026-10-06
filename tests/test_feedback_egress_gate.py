@@ -385,7 +385,8 @@ def test_a_project_store_lookup_failure_is_not_read_as_absent(
 ) -> None:
     """EC-EGRESS-2: a failed store read denies; the lenient lookup would have allowed.
 
-    The failure is injected at ``read_env_file`` rather than produced with an
+    The failure is injected at ``read_confined`` (the project store's one read)
+    rather than produced with an
     unreadable file on disk, because a chmod-000 file proves nothing when the suite
     runs as root. (Corrected after measurement: ``dotenv_values`` does NOT swallow an
     unreadable path -- it raises ``PermissionError`` -- so that shape was already
@@ -394,14 +395,16 @@ def test_a_project_store_lookup_failure_is_not_read_as_absent(
     the two lookups differ about.
     """
     project_store = env_store.resolve_scope_path("project", project_root)
-    real_read = env_store.read_env_file
+    # The project store is read through the confined walk (Consiliency/pmcp#367),
+    # so the failure is injected at `read_confined`, the one call that reads it.
+    real_read = env_store.read_confined
 
-    def _read(path: Path) -> dict[str, str]:
-        if path == project_store:
+    def _read(path: Path, *args: object, **kwargs: object) -> bytes | None:
+        if path.resolve() == project_store.resolve():
             raise OSError("project store is unreadable")
-        return real_read(path)
+        return real_read(path, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(env_store, "read_env_file", _read)
+    monkeypatch.setattr(env_store, "read_confined", _read)
 
     # The lenient lookup answers "not planted" for a lookup that failed ...
     assert env_store.managed_secret_keys(project_root) == set()

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import yaml
 
+from pmcp.env_store import child_process_env
 from pmcp.manifest.loader import (
     credential_lookup_keys,
     load_manifest,
@@ -285,7 +286,7 @@ async def refresh_server(
         Generated descriptions or None if failed
     """
     from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
+    from mcp.client.stdio import get_default_environment, stdio_client
 
     server_name = server_config.name
 
@@ -343,9 +344,14 @@ async def refresh_server(
 
     try:
         # Create server parameters
+        # The SDK's own default environment (HOME, PATH, USER and the like,
+        # from pmcp's environment), as before -- passed explicitly through the
+        # one spawn builder (env_store.child_process_env) so the spawn
+        # inventory can see where it comes from.
         server_params = StdioServerParameters(
             command=server_config.command,
             args=server_config.args,
+            env=child_process_env(base=get_default_environment()),
         )
 
         # Connect and fetch tools

@@ -37,6 +37,7 @@ from mcp.types import (
     Tool,
 )
 
+from pmcp.env_store import credential_value
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
 from pmcp.config.loader import (
@@ -752,7 +753,7 @@ class GatewayServer:
             enabled_auto_start=enabled_auto_start,
             disabled_auto_start=disabled_auto_start,
             is_server_allowed=self._policy_manager.is_server_allowed,
-            is_auth_available=lambda env_var: bool(os.environ.get(env_var)),
+            is_auth_available=lambda env_var: bool(credential_value(env_var)),
             legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
         )
         self._gateway_tools.set_startup_observations(

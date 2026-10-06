@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.metadata
-import io
 import json
 import logging
 import os
@@ -18,9 +17,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv
 from pmcp import package_approvals, trust_store
-from pmcp.atomic_write import atomic_write, is_absent, read_confined
+from pmcp.atomic_write import atomic_write, is_absent
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
 from pmcp.cli_commands.install import (
@@ -38,11 +37,15 @@ from pmcp.config.loader import (
     set_startup_policy,
 )
 from pmcp.env_store import (
+    child_process_env,
+    credential_value,
     describe_ignored_trust_env_var,
     env_key_is_operator_supplied,
     record_dotenv_keys,
+    load_discovered_dotenv,
+    load_store,
+    pin_user_store_path,
     record_pmcp_introduced_keys,
-    store_refusal,
 )
 from pmcp.validation import is_valid_package_version, parse_package_spec
 from pmcp.manifest.loader import load_manifest
@@ -1734,7 +1737,7 @@ async def run_init(args: argparse.Namespace) -> None:
                         (
                             k
                             for k in credential_lookup_keys(server)
-                            if os.environ.get(k)
+                            if credential_value(k)
                         ),
                         None,
                     )
@@ -2008,6 +2011,7 @@ def _is_pmcp_system_service_active() -> bool | None:
             capture_output=True,
             text=True,
             check=False,
+            env=child_process_env(),
         )
     except OSError:
         return None
@@ -2255,17 +2259,26 @@ def _restart_local_pmcp_service() -> None:
             ["systemctl", "--user", "is-active", "pmcp.service"],
             capture_output=True,
             text=True,
+            env=child_process_env(),
         )
         if probe.returncode != 0:
             print("No active pmcp systemd user service found — skipping restart.")
             return
         print("Restarting pmcp systemd user service...")
-        subprocess.run(["systemctl", "--user", "restart", "pmcp.service"], check=False)
+        subprocess.run(
+            ["systemctl", "--user", "restart", "pmcp.service"],
+            check=False,
+            env=child_process_env(),
+        )
         return
     if sys.platform == "darwin" and shutil.which("launchctl"):
         label = f"gui/{os.getuid()}/com.user.pmcp"
         print(f"Kickstarting launchd {label}...")
-        subprocess.run(["launchctl", "kickstart", "-k", label], check=False)
+        subprocess.run(
+            ["launchctl", "kickstart", "-k", label],
+            check=False,
+            env=child_process_env(),
+        )
         return
     print("No supported service manager detected — skipping restart.")
 
@@ -2309,7 +2322,7 @@ async def run_upgrade(args: argparse.Namespace) -> None:
 
     print(f"Upgrading pmcp via {method}: {' '.join(cmd)}")
     try:
-        result = subprocess.run(cmd, check=False)
+        result = subprocess.run(cmd, check=False, env=child_process_env())
     except FileNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -3096,24 +3109,42 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     spawned child -- so recording the stores there would change what downstream
     servers inherit, which is behaviour outside this change.
 
-    ``dotenv_path`` is a test seam, and ``None`` -- the production call -- is
-    identical to the bare ``load_dotenv()`` this replaced: ``find_dotenv``
-    resolves the path by walking up from THIS module's directory either way. It
-    exists because that frame-based discovery cannot be pointed at a ``tmp_path``
-    (``monkeypatch.chdir`` has no effect on it), and the end-to-end proof of
-    #229 has to run this production function rather than call ``load_dotenv``
-    itself. ``tests/test_env_leak_229.py`` asserts ``main()`` still passes
-    nothing.
+    ``dotenv_path`` is a test seam, and ``None`` -- the production call --
+    discovers the file as the bare ``load_dotenv()`` this replaced did:
+    ``find_dotenv`` walks up from THIS module's directory. It exists because that
+    frame-based discovery cannot be pointed at a ``tmp_path`` (``monkeypatch.chdir``
+    has no effect on it), and the end-to-end proof of #229 has to run this
+    production function rather than call ``load_dotenv`` itself.
+    ``tests/test_env_leak_229.py`` asserts ``main()`` still passes nothing.
+
+    The discovered file is classified by WHERE it is
+    (``env_store.load_discovered_dotenv``, Consiliency/pmcp#367). The walk starts
+    where pmcp is installed, and that can be inside a checkout -- a ``.venv``
+    that ``uv run`` or ``pip install -e`` created there -- so the ``.env`` it
+    reaches can be the repository's: then it is read confined, and its values go
+    to the credential map, never into the process environment. Outside every
+    project -- ``~/.env`` for a ``uv tool`` or ``pip --user`` install, which
+    MIGRATING.md documents as loaded -- it is the operator's own and loads as
+    before.
+
+    The user store's path is pinned FIRST (``env_store.pin_user_store_path``),
+    before any other file is loaded, so nothing loaded later can move it. No
+    repository-controlled file reaches ``os.environ`` (``env_store.load_store``),
+    so none can set ``HOME``, a proxy, ``LD_PRELOAD`` or any other variable pmcp,
+    its libraries or its children read (Consiliency/pmcp#372 rounds 1-2).
     """
+    pin_user_store_path()
     before = set(os.environ)
-    load_dotenv(dotenv_path)
+    found = dotenv_path if dotenv_path is not None else find_dotenv()
+    if found:
+        load_discovered_dotenv(Path(os.path.abspath(found)))
     record_dotenv_keys(set(os.environ) - before)
     # Load PMCP credential stores written by auth_connect (don't override already-set
     # vars) and record what they introduced. ``override=False`` is what makes the
     # delta correct: a variable the operator exported is already in ``before``, so it
     # is never recorded and never refused.
     before = set(os.environ)
-    load_dotenv(Path.home() / ".config" / "pmcp" / "pmcp.env", override=False)
+    load_store("user")
     _load_project_store_at_startup(Path.cwd() / ".env.pmcp")
     record_pmcp_introduced_keys(set(os.environ) - before)
 
@@ -3133,29 +3164,13 @@ def _load_project_store_at_startup(path: Path) -> None:
     override=False)`` did (same parser, interpolation and precedence, from the
     same bytes).
 
-    Other readers of a project ``.env.pmcp`` -- remote-header auth, the tenant store, the gateway's credential-availability
-    check, env stripping, the feedback gate's planted-key check and ``pmcp secrets
-    check``, inventoried in tests/test_env_store_reader_inventory.py -- still follow
-    its link (Consiliency/pmcp#367, stays open); they no longer block on a fifo
-    (``env_store.read_env_text``).
+    Every other reader of a repository-controlled store reads it the same way
+    (``env_store.read_store``, Consiliency/pmcp#367).
     """
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return  # no project store: nothing to load
-    except OSError as exc:
-        print(f"pmcp: {store_refusal(path, exc, verb='load')}", file=sys.stderr)
-        return
-    # Confined to the store's own directory: a project `.env.pmcp` that is a
-    # symlink of any kind is refused, so no other directory is ever walked.
-    try:
-        data = read_confined(path, path.parent, verb="load")
-        text = data.decode("utf-8") if data is not None else None
-    except (OSError, ValueError) as exc:
-        print(f"pmcp: {store_refusal(path, exc, verb='load')}", file=sys.stderr)
-        return
-    if text is not None:
-        load_dotenv(stream=io.StringIO(text), override=False)
+    # Confined to the store's own directory (env_store.cwd_store_confinement):
+    # a project `.env.pmcp` that is a symlink of any kind is refused. A refusal
+    # is one `pmcp: refusing to load .env.pmcp: ...` line on stderr.
+    load_store("project", path=path, verb="load")
 
 
 def main() -> None:

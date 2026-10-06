@@ -1086,8 +1086,10 @@ def _merge_manifest_defaults(
             existing and re.fullmatch(_LOCAL_ENV_PLACEHOLDER_RE, existing)
         )
         if not existing or is_placeholder:
+            from pmcp.env_store import credential_value
+
             for lookup_key in credential_lookup_keys(manifest_server):
-                value = os.environ.get(lookup_key)
+                value = credential_value(lookup_key)
                 if value:
                     if merged is config:
                         merged = config.model_copy(deep=True)
@@ -1361,6 +1363,13 @@ def _coerce_manifest_servers(
     return {server.name: server for server in manifest_servers}
 
 
+def _credential_value(key: str) -> str | None:
+    """``env_store.credential_value``, imported late (env_store imports this module)."""
+    from pmcp.env_store import credential_value
+
+    return credential_value(key)
+
+
 def _manifest_server_to_config(
     server: "ManifestServerConfig",
     env_lookup: Callable[[str], str | None],
@@ -1431,7 +1440,7 @@ def manifest_server_to_config(server: "ManifestServerConfig") -> ResolvedServerC
     Returns:
         ResolvedServerConfig compatible with ClientManager
     """
-    return _manifest_server_to_config(server, os.environ.get)
+    return _manifest_server_to_config(server, _credential_value)
 
 
 def _local_env(config: ResolvedServerConfig) -> dict[str, str] | None:
@@ -1503,6 +1512,11 @@ def resolve_startup_configs(
 
     configured_names: set[str] = set()
     classified_names: set[str] = set()
+    # A new load cycle: a store that is still refused is reported again
+    # (Consiliency/pmcp#367), once, however many lookups follow.
+    from pmcp.env_store import begin_store_read_cycle
+
+    begin_store_read_cycle()
     remote_header_env_lookup = build_remote_header_env_lookup(project_root)
 
     def add_config(
@@ -1627,7 +1641,7 @@ def resolve_startup_configs(
         # so eager/lazy/refresh spawns would launch without the credential.
         # Resolving here keeps both this path and the connect path symmetric, so
         # the refresh diff (issue #79) still sees no spurious env change.
-        config = _manifest_server_to_config(server, os.environ.get)
+        config = _manifest_server_to_config(server, _credential_value)
         source: Literal["manifest", "provisioned"] = (
             "provisioned" if name in provisioned else "manifest"
         )

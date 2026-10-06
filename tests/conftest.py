@@ -57,7 +57,13 @@ from pmcp import trust_store
 from pmcp.manifest import npm_resolver, package_identity, registry, version_checker
 from pmcp.manifest import loader as manifest_loader
 from pmcp.transport import http as transport_http
-from pmcp.env_store import reset_dotenv_keys, reset_pmcp_introduced_keys
+from pmcp.env_store import (
+    reset_dotenv_keys,
+    reset_pmcp_introduced_keys,
+    reset_repo_credentials,
+    reset_store_warnings,
+    reset_user_store_pin,
+)
 from pmcp.policy.policy import PolicyManager
 from tests.task_reply_double import TaskReplyDouble
 from pmcp.types import (
@@ -321,8 +327,14 @@ def _reset_dotenv_provenance() -> Iterator[None]:
     have nothing to do with #229.
     """
     reset_dotenv_keys()
+    reset_store_warnings()
+    reset_user_store_pin()
+    reset_repo_credentials()
     yield
     reset_dotenv_keys()
+    reset_store_warnings()
+    reset_user_store_pin()
+    reset_repo_credentials()
 
 
 @pytest.fixture(autouse=True)
