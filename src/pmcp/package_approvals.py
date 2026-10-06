@@ -126,7 +126,12 @@ def _decode(entry: Any) -> PackageApproval:
         decision = entry["decision"]
         recorded_at = entry["recorded_at"]
     except KeyError as exc:
-        raise PackageApprovalError(f"Package approval entry is missing {exc}") from exc
+        missing: str | None = exception_text(exc)
+    else:
+        missing = None
+    if missing is not None:
+        # Raised after the handler, chaining nothing (rev 19/21).
+        raise PackageApprovalError(f"Package approval entry is missing {missing}")
 
     # Raised outside the handler, chaining nothing, so the description shows
     # (Consiliency/pmcp#297 rev 19).
@@ -176,9 +181,13 @@ def _read_store_and_stale(
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
+        unreadable: str | None = exception_text(exc)
+    else:
+        unreadable = None
+    if unreadable is not None:
         raise PackageApprovalError(
-            f"Cannot read package approvals {path}: {exc}"
-        ) from exc
+            f"Cannot read package approvals {path}: {unreadable}"
+        )
     failure: str | None = None
     try:
         data = load_json(raw, source="package approvals")

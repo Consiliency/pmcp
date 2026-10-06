@@ -61,21 +61,57 @@ _MESSAGE_ARGUMENTS: dict[str, tuple[str, int | None]] = {
 }
 
 #: f-string message templates (their source, as ``ast.unparse`` prints it)
-#: whose placeholders are SDK constants or pmcp's own schema (an
-#: ``x-mcp-header`` token and the argument path that declares it), never a
-#: value from the request. A message matching one is kept.
-REVIEWED_MESSAGE_TEMPLATES: dict[str, str] = {
-    "f'{duplicated} header appears more than once'": "one of the SDK's fixed routing-header names",
-    "f'params._meta must be an object carrying the required {PROTOCOL_VERSION_META_KEY!r} and {CLIENT_CAPABILITIES_META_KEY!r} envelope keys'": "SDK constants",
-    "f\"params._meta is missing the required envelope key(s): {', '.join(missing)}\"": "`missing` holds SDK constants",
-    'f"{MCP_PROTOCOL_VERSION_HEADER} header does not match the request envelope\'s protocol version"': "SDK constant",
-    'f"{MCP_METHOD_HEADER} header does not match the request body\'s method"': "SDK constant",
-    'f"{MCP_NAME_HEADER} header does not match the request body\'s {name_key!r} parameter"': "`name_key` from the SDK's NAME_BEARING_METHODS",
-    "f'{header_name} header appears more than once'": "the tool's own x-mcp-header token",
-    'f"{header_name} header is present but the request body\'s {argument!r} argument is absent"': "schema token and schema path",
-    'f"{header_name} header does not match the request body\'s {argument!r} argument"': "schema token and schema path",
-    'f"{header_name} header is missing but the request body\'s {argument!r} argument is present"': "schema token and schema path",
-    "f'{header_name} header carries a malformed base64 sentinel value'": "schema token",
+#: that pmcp keeps, each bound to the one code its site raises and, per
+#: placeholder, to the vocabulary it may take (rev 21, round-19 claude N2: a
+#: template no longer matches across sites, and a placeholder never matches
+#: arbitrary text):
+#: - ``constant``: the placeholder's own expression, evaluated in the SDK
+#:   module (an SDK constant);
+#: - ``routing_header``: the SDK's fixed routing-header names;
+#: - ``meta_keys``: a ``", "``-join of the two envelope keys, in order;
+#: - ``name_key``: a parameter name from the SDK's ``NAME_BEARING_METHODS``;
+#: - ``param_header`` / ``param_argument``: an ``x-mcp-header`` token, and
+#:   the argument path declaring it, from pmcp's own gateway tool schemas
+#:   (pmcp declares none today, so those templates match nothing).
+REVIEWED_MESSAGE_TEMPLATES: dict[str, tuple[int, tuple[str, ...]]] = {
+    "f'{duplicated} header appears more than once'": (-32020, ("routing_header",)),
+    "f'params._meta must be an object carrying the required {PROTOCOL_VERSION_META_KEY!r} and {CLIENT_CAPABILITIES_META_KEY!r} envelope keys'": (
+        -32602,
+        ("constant", "constant"),
+    ),
+    "f\"params._meta is missing the required envelope key(s): {', '.join(missing)}\"": (
+        -32602,
+        ("meta_keys",),
+    ),
+    'f"{MCP_PROTOCOL_VERSION_HEADER} header does not match the request envelope\'s protocol version"': (
+        -32020,
+        ("constant",),
+    ),
+    'f"{MCP_METHOD_HEADER} header does not match the request body\'s method"': (
+        -32020,
+        ("constant",),
+    ),
+    'f"{MCP_NAME_HEADER} header does not match the request body\'s {name_key!r} parameter"': (
+        -32020,
+        ("constant", "name_key"),
+    ),
+    "f'{header_name} header appears more than once'": (-32020, ("param_header",)),
+    'f"{header_name} header is present but the request body\'s {argument!r} argument is absent"': (
+        -32020,
+        ("param_header", "param_argument"),
+    ),
+    'f"{header_name} header does not match the request body\'s {argument!r} argument"': (
+        -32020,
+        ("param_header", "param_argument"),
+    ),
+    'f"{header_name} header is missing but the request body\'s {argument!r} argument is present"': (
+        -32020,
+        ("param_header", "param_argument"),
+    ),
+    "f'{header_name} header carries a malformed base64 sentinel value'": (
+        -32020,
+        ("param_header",),
+    ),
 }
 
 #: The phrase for a code when the SDK's message is not one pmcp has reviewed.
@@ -131,6 +167,7 @@ def message_arguments(tree: ast.AST) -> list[ast.expr]:
 
 
 def _template_pattern(node: ast.JoinedStr) -> re.Pattern[str]:
+    """A template with every placeholder matching anything (for logs)."""
     parts: list[str] = []
     for value in node.values:
         if isinstance(value, ast.Constant) and isinstance(value.value, str):
@@ -140,33 +177,118 @@ def _template_pattern(node: ast.JoinedStr) -> re.Pattern[str]:
     return re.compile("".join(parts), re.DOTALL)
 
 
+def _converted(value: Any, conversion: int) -> str:
+    if conversion == ord("r"):
+        return repr(value)
+    if conversion == ord("a"):
+        return ascii(value)
+    return str(value)
+
+
 @functools.cache
-def _message_registry() -> tuple[frozenset[str], tuple[re.Pattern[str], ...]]:
-    """The SDK's literal wire messages, and the patterns of its reviewed
-    templates, read from the installed package's source once."""
+def _pmcp_header_positions() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The ``x-mcp-header`` tokens pmcp's own gateway tools declare, as
+    header names, and the argument paths that declare them."""
+    from mcp.shared.inbound import MCP_PARAM_HEADER_PREFIX, _annotated_positions
+
+    from pmcp.tools.handlers import get_gateway_tool_definitions
+
+    headers: set[str] = set()
+    arguments: set[str] = set()
+    for tool in get_gateway_tool_definitions():
+        for path, token, _schema in _annotated_positions(tool.input_schema):
+            headers.add(f"{MCP_PARAM_HEADER_PREFIX}{token}")
+            arguments.add(".".join(path))
+    return tuple(sorted(headers)), tuple(sorted(arguments))
+
+
+def _vocabulary(kind: str, node: ast.FormattedValue, module: Any) -> list[str]:
+    """The texts placeholder ``node`` (of vocabulary ``kind``) may render."""
+    import mcp.shared.inbound as inbound
+
+    conversion = node.conversion
+    if kind == "constant":
+        value = eval(ast.unparse(node.value), vars(module))  # noqa: S307 -- SDK source
+        return [_converted(value, conversion)]
+    if kind == "routing_header":
+        return [_converted(name, conversion) for name in inbound._ROUTING_HEADER_NAMES]
+    if kind == "meta_keys":
+        keys = [inbound.PROTOCOL_VERSION_META_KEY, inbound.CLIENT_CAPABILITIES_META_KEY]
+        return [keys[0], keys[1], ", ".join(keys)]
+    if kind == "name_key":
+        return [
+            _converted(name, conversion)
+            for name in sorted(set(inbound.NAME_BEARING_METHODS.values()))
+        ]
+    headers, arguments = _pmcp_header_positions()
+    if kind == "param_header":
+        return [_converted(name, conversion) for name in headers]
+    if kind == "param_argument":
+        return [_converted(name, conversion) for name in arguments]
+    raise ValueError(kind)
+
+
+def _bound_pattern(
+    node: ast.JoinedStr, kinds: tuple[str, ...], module: Any
+) -> re.Pattern[str]:
+    """``node`` with each placeholder matching only its vocabulary."""
+    parts: list[str] = []
+    placeholders = iter(kinds)
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            parts.append(re.escape(value.value))
+        elif isinstance(value, ast.FormattedValue):
+            words = _vocabulary(next(placeholders), value, module)
+            parts.append(
+                "(?:" + "|".join(re.escape(w) for w in words) + ")" if words else "(?!)"
+            )
+    return re.compile("".join(parts))
+
+
+@functools.cache
+def _message_registry() -> tuple[
+    frozenset[str], tuple[tuple[int, re.Pattern[str]], ...]
+]:
+    """The SDK's literal wire messages, and each reviewed template's (code,
+    bound pattern), read from the installed package's source once."""
+    import importlib
+
     literals: set[str] = set()
-    patterns: list[re.Pattern[str]] = []
-    for path in sorted(_mcp_root().rglob("*.py")):
+    patterns: list[tuple[int, re.Pattern[str]]] = []
+    root = _mcp_root()
+    for path in sorted(root.rglob("*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue
+        module = None
         for argument in message_arguments(tree):
             if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
                 literals.add(argument.value)
-            elif (
-                isinstance(argument, ast.JoinedStr)
-                and ast.unparse(argument) in REVIEWED_MESSAGE_TEMPLATES
-            ):
-                patterns.append(_template_pattern(argument))
+            elif isinstance(argument, ast.JoinedStr):
+                reviewed = REVIEWED_MESSAGE_TEMPLATES.get(ast.unparse(argument))
+                if reviewed is None:
+                    continue
+                if module is None:
+                    name = (
+                        path.relative_to(root.parent)
+                        .with_suffix("")
+                        .as_posix()
+                        .replace("/", ".")
+                    )
+                    module = importlib.import_module(name)
+                code, kinds = reviewed
+                patterns.append((code, _bound_pattern(argument, kinds, module)))
     return frozenset(literals), tuple(patterns)
 
 
-def _reviewed_message(message: Any) -> bool:
+def _reviewed_message(message: Any, code: Any = None) -> bool:
     if not isinstance(message, str):
         return False
     literals, patterns = _message_registry()
-    return message in literals or any(p.fullmatch(message) for p in patterns)
+    return message in literals or any(
+        bound == code and pattern.fullmatch(message) for bound, pattern in patterns
+    )
 
 
 def _reviewed_data(code: Any, data: Any) -> Any:
@@ -207,7 +329,7 @@ def value_free_error_data(error: Any) -> Any:
     raw_message = getattr(error, "message", None)
     message: str = (
         raw_message
-        if isinstance(raw_message, str) and _reviewed_message(raw_message)
+        if isinstance(raw_message, str) and _reviewed_message(raw_message, code)
         else _CODE_PHRASES.get(code, _DEFAULT_PHRASE)
     )
     data = _reviewed_data(code, getattr(error, "data", None))

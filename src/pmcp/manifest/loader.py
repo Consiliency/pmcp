@@ -1407,7 +1407,9 @@ def _gather_overlay_sources(notices: list[str]) -> list[_OverlaySource]:
             content = overlay_path.read_bytes()
         except OSError as exc:
             sources.append(
-                _OverlaySource(label, overlay_path, None, "unreadable", error=str(exc))
+                _OverlaySource(
+                    label, overlay_path, None, "unreadable", error=exception_text(exc)
+                )
             )
             continue
         sources.append(_OverlaySource(label, overlay_path, content, "read"))

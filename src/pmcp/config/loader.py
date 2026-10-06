@@ -779,7 +779,12 @@ def _pin_and_read_policy_target(
                 "invalid_source",
                 f"symlinked_config: refusing to edit a symlinked .mcp.json at {path}",
             )
-        return path.resolve(), None, "invalid_source", f"unreadable_config: {exc}"
+        return (
+            path.resolve(),
+            None,
+            "invalid_source",
+            f"unreadable_config: {exception_text(exc)}",
+        )
     try:
         # Capture the true identity of the opened file BEFORE anything else can
         # move it, then read its bytes from the descriptor itself.
@@ -790,7 +795,7 @@ def _pin_and_read_policy_target(
                 path.resolve(),
                 None,
                 "unpinnable_config",
-                f"cannot stat the opened descriptor: {exc}",
+                f"cannot stat the opened descriptor: {exception_text(exc)}",
             )
         chunks: list[bytes] = []
         while True:
@@ -813,7 +818,7 @@ def _pin_and_read_policy_target(
                 path.resolve(),
                 None,
                 "unpinnable_config",
-                f"the target path no longer resolves to a live file: {exc}",
+                f"the target path no longer resolves to a live file: {exception_text(exc)}",
             )
         if (candidate_stat.st_dev, candidate_stat.st_ino) != (
             fd_stat.st_dev,
@@ -981,7 +986,7 @@ def set_startup_policy(
                         code="approval_not_carried_forward",
                         message=(
                             "Startup policy was written, but the prior trust "
-                            f"approval could not be carried forward: {exc}"
+                            f"approval could not be carried forward: {exception_text(exc)}"
                         ),
                         source=target.source,
                         path=str(pinned_key),

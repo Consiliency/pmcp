@@ -1586,3 +1586,39 @@ def test_a_pmcp_handler_error_reaches_the_caller_as_pmcp_wrote_it(
     assert replies[3]["error"] == {"code": -32601, "message": "Method not found"}, (
         replies[3]
     )
+
+
+def test_a_reviewed_template_is_bound_to_its_code_and_vocabulary() -> None:
+    """Round-19 claude N2: a template keeps a message only under the code its
+    site raises, and each placeholder only as one of its reviewed words (an
+    SDK constant, a routing-header name, an envelope key, pmcp's own
+    `x-mcp-header` token). Anything else falls back to the code's phrase."""
+    from mcp_types import ErrorData
+
+    from pmcp.sdk_rejections import value_free_error_data
+
+    def kept(code: int, message: str) -> str:
+        return value_free_error_data(ErrorData(code=code, message=message)).message
+
+    assert (
+        kept(-32020, "mcp-method header appears more than once")
+        == "mcp-method header appears more than once"
+    )
+    assert kept(-32020, "SECRETzz header appears more than once") == "Header mismatch"
+    assert kept(-32602, "mcp-method header appears more than once") == "Invalid params"
+    key = "io.modelcontextprotocol/clientCapabilities"
+    assert kept(
+        -32602, f"params._meta is missing the required envelope key(s): {key}"
+    ) == (f"params._meta is missing the required envelope key(s): {key}")
+    assert (
+        kept(-32602, "params._meta is missing the required envelope key(s): SECRETzz")
+        == "Invalid params"
+    )
+    # pmcp declares no x-mcp-header token, so these templates match nothing.
+    assert (
+        kept(
+            -32020,
+            "Mcp-Param-SECRETzz header carries a malformed base64 sentinel value",
+        )
+        == "Header mismatch"
+    )

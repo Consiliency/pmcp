@@ -263,7 +263,12 @@ def _decode(entry: Any) -> TrustRecord:
         decision = entry["decision"]
         recorded_at = entry["recorded_at"]
     except KeyError as exc:
-        raise TrustStoreError(f"Trust store entry is missing {exc}") from exc
+        missing: str | None = exception_text(exc)
+    else:
+        missing = None
+    if missing is not None:
+        # Raised after the handler, chaining nothing (rev 19/21).
+        raise TrustStoreError(f"Trust store entry is missing {missing}")
 
     if decision not in DECISIONS:
         raise TrustStoreError(f"Unknown trust decision: {decision!r}")
@@ -299,7 +304,11 @@ def _read_store(path: Path) -> list[TrustRecord]:
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise TrustStoreError(f"Cannot read trust store {path}: {exc}") from exc
+        unreadable: str | None = exception_text(exc)
+    else:
+        unreadable = None
+    if unreadable is not None:
+        raise TrustStoreError(f"Cannot read trust store {path}: {unreadable}")
 
     failure: str | None = None
     try:

@@ -234,7 +234,7 @@ class JobManager:
 
         except FileNotFoundError as e:
             job.status = "failed"
-            job.error = f"Command not found: {e}"
+            job.error = f"Command not found: {exception_text(e)}"
             logger.error(f"Install job {job_id} failed: {job.error}")
 
         except Exception as e:
@@ -736,7 +736,11 @@ async def install_server(
             f"Installation of {server_config.name} timed out after {timeout}s"
         )
     except FileNotFoundError as e:
-        raise InstallError(f"Command not found for {server_config.name}: {e}")
+        not_found: str | None = exception_text(e)
+    else:
+        not_found = None
+    if not_found is not None:
+        raise InstallError(f"Command not found for {server_config.name}: {not_found}")
 
 
 async def verify_installation(

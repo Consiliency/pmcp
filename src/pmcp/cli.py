@@ -2303,7 +2303,7 @@ async def run_upgrade(args: argparse.Namespace) -> None:
     try:
         result = subprocess.run(cmd, check=False)
     except FileNotFoundError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {exception_text(exc)}", file=sys.stderr)
         sys.exit(1)
     if result.returncode != 0:
         print(
@@ -2409,7 +2409,10 @@ async def run_server(args: argparse.Namespace) -> None:
         try:
             args.auth_token = Path(auth_token_file).read_text().strip()
         except OSError as e:
-            print(f"error: Cannot read --auth-token-file: {e}", file=sys.stderr)
+            print(
+                f"error: Cannot read --auth-token-file: {exception_text(e)}",
+                file=sys.stderr,
+            )
             sys.exit(1)
     elif not args.auth_token and os.environ.get("PMCP_AUTH_TOKEN"):
         args.auth_token = os.environ["PMCP_AUTH_TOKEN"]
@@ -2683,7 +2686,7 @@ def _run_trust_approve(args: argparse.Namespace) -> None:
     try:
         content = path.read_bytes()
     except OSError as exc:
-        _trust_fail(f"cannot read {path}: {exc}")
+        _trust_fail(f"cannot read {path}: {exception_text(exc)}")
         return
 
     # #252: refuse a store resident in the checkout enclosing `path`, so approve

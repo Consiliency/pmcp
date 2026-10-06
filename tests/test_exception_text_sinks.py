@@ -110,6 +110,10 @@ _RENDERER_METHODS = {"_sanitize_error"}
 #: - ``passthrough``: defined in pmcp, yields or returns only exception
 #:   objects (plain names) and reads no text from them
 #:   (`test_every_passthrough_exemption_reads_no_text`);
+#: - ``fields``: defined in pmcp, and reads its exception parameter only
+#:   through ``isinstance``/``type`` or an attribute in
+#:   :data:`_FIELD_ATTRIBUTES` -- a status, a header map -- never its text
+#:   (`test_every_fields_exemption_reads_only_its_fields`);
 #: - ``reregisters``: defined in pmcp, annotated to return a registered
 #:   value-bearing type (or a list or iterator of one), so its output is
 #:   rendered by the registry like the input
@@ -122,6 +126,12 @@ _EXEMPT_CALLEES: dict[str, tuple[str, str]] = {
     "_yaml_position": ("scanned", "parsing.py"),
     "_iter_leaf_exceptions": ("passthrough", "client/manager.py"),
     "parse_url_elicitation_error": ("guarded", "auth.py"),
+    "pyjwt_text": ("guarded", "auth.py"),
+    "_handshake_error": ("scanned", "client/manager.py"),
+    # feedback_egress.py: classify a transport failure by its type, status
+    # and headers only.
+    "_classify_http_error": ("fields", "feedback_egress.py"),
+    "_classify_transport_error": ("fields", "feedback_egress.py"),
     # tools/schema.py (Consiliency/pmcp#371): rebuild a registered error from
     # one; the result is itself registered, so every renderer treats it.
     "_rerooted": ("reregisters", "tools/schema.py"),
@@ -448,8 +458,11 @@ def _exception_regions(body: list[ast.stmt], namespace: dict[str, Any]) -> _Regi
 
     for node in nodes:
         if isinstance(node, ast.ExceptHandler) and node.name:
-            if _catches_validation(node.type, namespace):
-                _widen(regions, node.name, _ids(node.body))
+            # Every binding, whatever it catches (rev 21, round-19 codex
+            # F001): a narrow type -- `ConnectionError`, `OSError` -- can
+            # still chain a registered error through `__cause__` or
+            # `__context__`, and its own text can be built from it.
+            _widen(regions, node.name, _ids(node.body))
         elif isinstance(node, (ast.If, ast.While)):
             for name in _isinstance_names(node.test, namespace, positive=True):
                 _widen(regions, name, _ids(node.body))
@@ -822,6 +835,10 @@ def test_no_exception_reaches_text_except_through_the_renderer() -> None:
 #: needs Python 3.11, this suite runs 3.10), plus the `_connect_with_retry`
 #: regression it found surviving every test. Each must be flagged.
 _FLAGGED = {
+    # rev 21 (round-19 codex F001): a narrow handler's binding can chain a
+    # registered error too.
+    "narrow_handler_text": "try:\n    f()\nexcept KeyError as e:\n    log(f'{e}')\n",
+    "narrow_handler_str": "try:\n    f()\nexcept ConnectionError as e:\n    parse(str(e))\n",
     "alias_used_after_except": "last=None\nfor i in r:\n    try:\n        f()\n    except Exception as e:\n        last = e\nlog(f'{last}')\n",
     "attr_store_then_render": "try:\n    f()\nexcept Exception as e:\n    self.last_error = e\nlog(f'{self.last_error}')\n",
     "subscript_store": "try:\n    f()\nexcept Exception as e:\n    errs[name] = e\nlog(str(errs[name]))\n",
@@ -904,7 +921,6 @@ def test_the_scanner_passes_the_renderers() -> None:
         "    log(f'{exception_text(e)}', exc_info=safe_exc_info(e))\n"
         "    if e.code == 1 or isinstance(e, KeyError):\n        raise\n"
         "    raise X() from e\n"
-        "try:\n    f()\nexcept KeyError as e:\n    log(f'{e}')\n"
         "def g(fut):\n    exc = fut.exception()\n    if exc is not None:\n"
         "        log(exception_text(exc))\n        raise exc\n"
     )
@@ -1589,3 +1605,110 @@ async def test_gateway_invoke_reads_no_elicitation_from_a_rejected_value(
     assert not result.url_elicitations, result.url_elicitations
     assert result.auth_state != "elicitation_required"
     assert sentinel not in result.model_dump_json(), result.model_dump_json()
+
+
+#: The attributes a ``fields`` exemption may read: an HTTP status and the
+#: response's header map (`urllib.error.HTTPError`).
+_FIELD_ATTRIBUTES = {"code", "headers", "status"}
+
+
+def test_every_fields_exemption_reads_only_its_fields() -> None:
+    assert _kinds("fields")
+    for name, home in _kinds("fields"):
+        function = _definition(name, home)
+        parameter = function.args.args[0].arg
+        parents = {c: n for n in ast.walk(function) for c in ast.iter_child_nodes(n)}
+        for node in ast.walk(function):
+            if not (isinstance(node, ast.Name) and node.id == parameter):
+                continue
+            parent = parents.get(node)
+            if isinstance(parent, ast.Attribute):
+                assert parent.attr in _FIELD_ATTRIBUTES, (name, parent.attr)
+            elif isinstance(parent, ast.Call):
+                callee = _callee(parent)
+                assert callee in ("isinstance", "type", "getattr"), (name, callee)
+                if callee == "getattr":
+                    assert isinstance(parent.args[1], ast.Constant), name
+                    assert parent.args[1].value in _FIELD_ATTRIBUTES, name
+            else:
+                raise AssertionError((name, type(parent).__name__))
+
+
+@pytest.mark.asyncio
+async def test_invoke_does_not_parse_a_rejected_connection_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-19 codex F001's falsifier, as filed: a `ConnectionError` built
+    from a rejected `WWW-Authenticate` string, chained to the validation
+    error, gives `gateway.invoke` no auth challenge and none of the value."""
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+    from pmcp.types import RiskHint, ToolInfo
+    from tests.test_tools import MockClientManager
+
+    sentinel = "REJECTED_SCOPE_SENTINEL_9137"
+    rejected_value = f'WWW-Authenticate: Bearer scope="{sentinel}"'
+    tool = ToolInfo(
+        tool_id="remote-auth::login",
+        server_name="remote-auth",
+        tool_name="login",
+        description="Login",
+        short_description="Login",
+        input_schema={},
+        tags=[],
+        risk_hint=RiskHint.LOW,
+    )
+    manager = MockClientManager([tool])
+
+    async def fail(*_args: Any, **_kwargs: Any) -> Any:
+        try:
+            jsonschema.validate(rejected_value, {"type": "integer"})
+        except jsonschema.ValidationError as rejected:
+            raise ConnectionError(rejected.message) from rejected
+
+    manager.call_tool = fail  # type: ignore[method-assign]
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(GatewayTools, "_load_provisioned_registry", lambda self: {})
+    tools = GatewayTools(client_manager=manager, policy_manager=PolicyManager(policy))  # type: ignore[arg-type]
+    result = await tools.invoke({"tool_id": "remote-auth::login", "arguments": {}})
+    assert not result.ok
+    assert sentinel not in result.model_dump_json(), result.model_dump_json()
+    assert result.auth_challenge is None
+
+
+@pytest.mark.asyncio
+async def test_invoke_still_reads_a_genuine_connection_challenge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same path with an unchained `ConnectionError` -- a downstream's own
+    401 -- still yields its challenge: `exception_text` is `str()` there."""
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+    from pmcp.types import RiskHint, ToolInfo
+    from tests.test_tools import MockClientManager
+
+    tool = ToolInfo(
+        tool_id="remote-auth::login",
+        server_name="remote-auth",
+        tool_name="login",
+        description="Login",
+        short_description="Login",
+        input_schema={},
+        tags=[],
+        risk_hint=RiskHint.LOW,
+    )
+    manager = MockClientManager([tool])
+
+    async def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise ConnectionError(
+            '401 Unauthorized WWW-Authenticate: Bearer scope="repo read:org"'
+        )
+
+    manager.call_tool = fail  # type: ignore[method-assign]
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(GatewayTools, "_load_provisioned_registry", lambda self: {})
+    tools = GatewayTools(client_manager=manager, policy_manager=PolicyManager(policy))  # type: ignore[arg-type]
+    result = await tools.invoke({"tool_id": "remote-auth::login", "arguments": {}})
+    assert result.auth_challenge is not None, result.model_dump_json()

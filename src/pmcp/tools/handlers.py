@@ -1767,7 +1767,10 @@ class GatewayTools:
             )
 
         except ConnectionError as e:
-            auth_challenge = self._auth_challenge_from_message(str(e))
+            # `exception_text`: a ConnectionError built from a rejected value
+            # is read as its description, never parsed for a challenge
+            # (rev 21, round-19 codex F001).
+            auth_challenge = self._auth_challenge_from_message(exception_text(e))
             auth_state = "none"
             if auth_challenge:
                 auth_state = (

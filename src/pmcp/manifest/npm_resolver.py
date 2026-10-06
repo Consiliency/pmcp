@@ -177,7 +177,7 @@ def _has_local_prefix(cwd: str | None) -> str | None:
     try:
         start = Path(cwd).resolve() if cwd else Path.cwd()
     except OSError as exc:  # pragma: no cover - unreadable cwd
-        return f"cannot resolve the effective cwd: {exc}"
+        return f"cannot resolve the effective cwd: {exception_text(exc)}"
     for directory in (start, *start.parents):
         if (directory / "package.json").exists() or (
             directory / "node_modules"
@@ -356,7 +356,7 @@ class NpmResolver:
         except FileNotFoundError as exc:
             # node is not installed. This is the ONE spawn failure that learns
             # nothing about npm, so it is the one that falls back to the tables.
-            return _unavailable(f"node is not installed: {exc}")
+            return _unavailable(f"node is not installed: {exception_text(exc)}")
         except OSError as exc:
             # node IS on PATH but could not be executed: permission denied, a
             # resource limit, ETXTBSY, a bad interpreter. None of these is
@@ -365,7 +365,9 @@ class NpmResolver:
             # resolved `npx --registry https://private.invalid probe` to
             # `probe` (board review on the diff).
             self._spawn_failure_is_durable = False
-            return _refused(f"node is present but could not be spawned: {exc}")
+            return _refused(
+                f"node is present but could not be spawned: {exception_text(exc)}"
+            )
         self.spawn_count += 1
         self._generation += 1
         self._proc = proc

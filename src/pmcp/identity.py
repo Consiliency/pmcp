@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
+from pmcp.argument_errors import exception_text
 from pmcp.types import LocalMcpServerConfig
 
 if TYPE_CHECKING:
@@ -204,7 +205,9 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
         _LOCK_FILE.touch(exist_ok=True)
         fd = open(_LOCK_FILE, "r+")
     except OSError as e:
-        logger.warning(f"Could not open singleton lock file {_LOCK_FILE}: {e}")
+        logger.warning(
+            f"Could not open singleton lock file {_LOCK_FILE}: {exception_text(e)}"
+        )
         return False
 
     try:
@@ -219,7 +222,8 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
         except Exception:
             pass
         logger.warning(
-            f"Another gateway instance is running ({pid_info} lock: {_LOCK_FILE}): {e}"
+            f"Another gateway instance is running ({pid_info} lock: {_LOCK_FILE}): "
+            f"{exception_text(e)}"
         )
         fd.close()
         return False
@@ -228,7 +232,7 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
         # without msvcrt). Don't crash startup — proceed without single-instance
         # protection rather than re-introducing the #84 import-crash class.
         logger.warning(
-            f"Singleton lock primitive unavailable ({e}); proceeding without "
+            f"Singleton lock primitive unavailable ({exception_text(e)}); proceeding without "
             "single-instance protection."
         )
         fd.close()

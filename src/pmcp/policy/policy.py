@@ -477,7 +477,9 @@ class PolicyManager:
             try:
                 self._redaction_regexes.append(re.compile(pattern, re.IGNORECASE))
             except re.error as e:
-                logger.warning(f"Invalid redaction pattern '{pattern}': {e}")
+                logger.warning(
+                    f"Invalid redaction pattern '{pattern}': {exception_text(e)}"
+                )
 
     def _matches_any(self, value: str, patterns: list[str]) -> bool:
         """Check if value matches any glob pattern.
