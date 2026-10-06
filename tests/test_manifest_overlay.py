@@ -396,10 +396,13 @@ server_env:
         manifest = load_manifest()
 
     assert "no-such-server" not in manifest.servers
+    # The warning is owed, but an overlay's own key is never shown: it may be
+    # anything an operator pasted (Consiliency/pmcp#342, D9).
     assert any(
-        "no-such-server" in r.message and "server_env" in r.message
+        "server_env" in r.message and "(name not shown)" in r.message
         for r in caplog.records
     )
+    assert not any("no-such-server" in r.message for r in caplog.records)
 
 
 @pytest.mark.parametrize(

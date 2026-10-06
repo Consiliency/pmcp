@@ -48,7 +48,9 @@ SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "pmcp"
 # (Consiliency/pmcp#114 board review finding 1, remote variant).
 ALLOWLISTED_ATTRIBUTE_READS: set[tuple[str, str]] = {
     ("tools/handlers.py", "_sort_key"),
-    ("tools/handlers.py", "request_capability"),
+    # The category tier's candidate grouping, moved out of request_capability
+    # into its own tier method (Consiliency/pmcp#342 rev 7).
+    ("tools/handlers.py", "_capability_tier_category"),
     ("tools/handlers.py", "_configured_duplicate_missing_credential"),
     ("tools/handlers.py", "_get_server_env_metadata"),
 }

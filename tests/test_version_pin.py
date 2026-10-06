@@ -380,7 +380,14 @@ servers:
 def test_a_pin_on_a_malformed_entry_costs_only_that_entry(
     shape: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """HEAD loads every entry of this overlay; the pin must not change that."""
+    """A non-string argv costs only its own entry.
+
+    A non-string `args` or `command` loaded on main and then aborted startup and
+    `gateway.refresh` for every server (`LocalMcpServerConfig` rejects it); it
+    is now skipped at parse time (Consiliency/pmcp#342). A non-string install
+    argv breaks only that server's own provisioning, so it still loads, as on
+    main. Either way the pin must cost nothing else.
+    """
     shipped_count = len(load_manifest().servers)
     _user_overlay(
         f"""
@@ -396,8 +403,12 @@ servers:
     with caplog.at_level(logging.WARNING):
         manifest = load_manifest()  # must not raise
 
-    assert len(manifest.servers) == shipped_count + 1
-    assert manifest.servers["malformed"].version is None
+    startup_would_fail = "install:" not in shape
+    assert len(manifest.servers) == shipped_count + (0 if startup_would_fail else 1)
+    if startup_would_fail:
+        assert "malformed" not in manifest.servers
+    else:
+        assert manifest.servers["malformed"].version is None
     assert manifest.servers["firecrawl"].args == ["-y", "firecrawl-mcp"]
     assert any("an overlay server (name not shown)" in m for m in _warnings(caplog))
     assert not any("malformed" in m for m in _warnings(caplog))
@@ -705,15 +716,18 @@ async def test_no_refused_pin_or_credential_reaches_a_log_or_update_output(
         "c-slot",
         "c-install",
         "c-uvx",
-        "c-bad",
         remote,
     )
     assert all(manifest.servers[n].version is None for n in refused)
+    # A non-string argv is skipped whole at parse time (Consiliency/pmcp#342).
+    assert "c-bad" not in manifest.servers
     assert manifest.servers["c-ok"].version == "1.0.0"
+    # c-bad is skipped whole now (one "Skipping invalid server entry" line)
+    # rather than loaded with a refused pin (Consiliency/pmcp#342).
     assert (
-        len([m for m in loader_lines if "Ignoring" in m or "does not define" in m])
-        >= 10
+        len([m for m in loader_lines if "Ignoring" in m or "does not define" in m]) >= 9
     )
+    assert any("Skipping invalid server entry" in m for m in loader_lines)
     assert value not in caplog.text
     assert all(
         value not in r.model_dump_json() and value not in line for r, line in outputs

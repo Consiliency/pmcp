@@ -50,6 +50,21 @@ def is_self_reference(config: ResolvedServerConfig) -> bool:
     Returns:
         True if this config would spawn another gateway instance
     """
+    field_name = _self_reference_field(config)
+    if field_name is not None:
+        logger.debug(
+            f"Self-reference detected: {config_field_diagnostic(config, field_name)}"
+        )
+    return field_name is not None
+
+
+def _self_reference_field(config: ResolvedServerConfig) -> str | None:
+    """The config field that makes *config* spawn this gateway, or ``None``.
+
+    Returns a field NAME (``command``, ``args`` or ``name``), never its value:
+    a ``.mcp.json`` entry can inherit ``command`` and ``args`` from a manifest
+    overlay, and an overlay's values are never logged (Consiliency/pmcp#342 D9).
+    """
     # Handle both nested config (ResolvedServerConfig) and flat config (mock/test)
     if hasattr(config, "config") and config.config is not None:
         nested_config = config.config
@@ -67,8 +82,7 @@ def is_self_reference(config: ResolvedServerConfig) -> bool:
     # Direct gateway command (e.g., command: pmcp)
     command_base = Path(command).name
     if command_base in GATEWAY_COMMANDS:
-        logger.debug(f"Self-reference detected: direct command '{command}'")
-        return True
+        return "command"
 
     # Check if command is a package manager invoking the gateway
     if command_base in PACKAGE_MANAGERS:
@@ -76,19 +90,33 @@ def is_self_reference(config: ResolvedServerConfig) -> bool:
         for arg in args_lower:
             # Handle: uvx pmcp, pipx run pmcp, python -m pmcp
             if arg in GATEWAY_COMMANDS:
-                logger.debug(f"Self-reference detected: {command} invoking '{arg}'")
-                return True
+                return "args"
             # Handle paths like /path/to/pmcp
             if Path(arg).name in GATEWAY_COMMANDS:
-                logger.debug(f"Self-reference detected: {command} with path '{arg}'")
-                return True
+                return "args"
 
     # Check config name as fallback (legacy behavior)
     if config.name.lower() in GATEWAY_COMMANDS or config.name.lower() == "mcp-gateway":
-        logger.debug(f"Self-reference detected: config name '{config.name}'")
-        return True
+        return "name"
 
-    return False
+    return None
+
+
+def config_field_diagnostic(config: ResolvedServerConfig, field_name: str) -> str:
+    """How a diagnostic names one field of a configured server: never its value.
+
+    The one renderer for a config field on the load, discovery, startup and
+    refresh paths (Consiliency/pmcp#342 rev 7, D9). The server is named by
+    ``entry_log_name`` (a manifest-derived entry only if pmcp ships its name)
+    and the field by its name, because any field of a ``.mcp.json`` entry may
+    have been inherited from a manifest overlay.
+    """
+    from pmcp.manifest.loader import entry_log_name
+
+    who = entry_log_name(
+        config.name, manifest_derived=getattr(config, "source", None) == "manifest"
+    )
+    return f"server {who} (field '{field_name}')"
 
 
 def filter_self_references(
@@ -105,23 +133,12 @@ def filter_self_references(
     """
     filtered = []
     for config in configs:
-        if is_self_reference(config):
-            # Get command info for logging
-            if hasattr(config, "config") and config.config is not None:
-                nested_config = config.config
-                if isinstance(nested_config, LocalMcpServerConfig):
-                    cmd = nested_config.command
-                    args = nested_config.args
-                else:
-                    cmd = "<remote>"
-                    args = []
-            else:
-                cmd = getattr(config, "command", "")
-                args = getattr(config, "args", [])
+        field_name = _self_reference_field(config)
+        if field_name is not None:
             if not suppress_warnings:
                 logger.warning(
-                    f"Excluding server '{config.name}' to prevent recursive spawning "
-                    f"(command: {cmd} {' '.join(args)})"
+                    f"Excluding {config_field_diagnostic(config, field_name)} "
+                    "to prevent recursive spawning: it invokes the gateway"
                 )
         else:
             filtered.append(config)
