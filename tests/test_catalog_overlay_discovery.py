@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import dataclasses
 import re
 import sys
@@ -1248,9 +1249,11 @@ def test_no_overlay_name_or_value_reaches_any_log_on_these_paths(
 # --- revision 4: every scoring statistic is base-only (round 3, grok F001) -----
 
 
-def _ask(query: str, available: tuple[str, ...] = ()) -> tuple[str, list[str]]:
+def _ask(
+    query: str, available: tuple[str, ...] = (), tools: GatewayTools | None = None
+) -> tuple[str, list[str]]:
     result = asyncio.run(
-        _gateway().request_capability(
+        (tools or _gateway()).request_capability(
             {"query": query, "available_clis": list(available)}
         )
     )
@@ -1271,7 +1274,8 @@ def test_a_replaced_category_server_does_not_empty_another_category() -> None:
     assert _ask("markdown") == before
 
 
-def _category_vocabulary() -> list[str]:
+@functools.lru_cache(maxsize=1)
+def _category_vocabulary_cached() -> tuple[str, ...]:
     shipped = load_manifest(_SHIPPED_MANIFEST_PATH)
     words: set[str] = set()
     for names in loader._CATEGORY_MAP.values():
@@ -1279,10 +1283,17 @@ def _category_vocabulary() -> list[str]:
             if name in shipped.servers:
                 words.update(shipped.servers[name].keywords)
     words.update(loader._CATEGORY_MAP)
-    return sorted(words)
+    return tuple(sorted(words))
 
 
-def _overlays() -> dict[str, dict[str, Any]]:
+def _category_vocabulary() -> list[str]:
+    """Every category word: each mapped shipped server's keywords and every
+    category name (built once; a fresh list each call)."""
+    return list(_category_vocabulary_cached())
+
+
+@functools.lru_cache(maxsize=1)
+def _overlays_cached() -> dict[str, dict[str, Any]]:
     """Generated overlays: additive, replacing a shipped name, replacing a
     `_CATEGORY_MAP` name -- each declaring keywords from OTHER categories."""
     import random
@@ -1323,6 +1334,13 @@ def _overlays() -> dict[str, dict[str, Any]]:
     }
 
 
+def _overlays() -> dict[str, dict[str, Any]]:
+    """The generated overlays (seeded, so built once; a deep copy each call)."""
+    import copy
+
+    return copy.deepcopy(_overlays_cached())
+
+
 _NO_OVERLAY_SNAPSHOTS: dict[tuple[str, ...], dict[str, Any]] = {}
 
 
@@ -1358,7 +1376,7 @@ def test_no_overlay_removes_a_non_overlay_server_from_any_discovery_entry_point(
             }
             km = _keyword_match(q, manifest, set())
             out[q] = (
-                _ask(q, available),
+                _ask(q, available, tools),
                 catalog,
                 km.entry_name if km.matched else None,
             )
