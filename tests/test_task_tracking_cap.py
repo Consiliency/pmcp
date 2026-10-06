@@ -4515,11 +4515,11 @@ class _Overlap:
       `tasks/cancel` are recorded at the moment of removal (by wrapping
       `_forget_disconnected`), with the owing teardowns still running then.
       Only those tasks, only for those teardowns, and only if that disconnect
-      then ended interrupted, are exempt -- and for a teardown that had ended
-      earlier, only if, when it released its custody, a running teardown
-      owed the same unsent task (`handed`: the obligation passed on, R3) and
-      that one is excused. A teardown that ended without sending a task's
-      cancel and handed it to nobody is never excused.
+      then ended interrupted, are exempt -- and for an aborted teardown that
+      had ended earlier, only if, when it released its custody, a running
+      teardown owed the same unsent task (`handed`: the obligation passed
+      on, R3) and that one is excused. A teardown that completed without
+      sending a task's cancel is never excused, whoever else owed it.
     An aborted teardown is not exempt (rev 13, round-12 F001): each task it
     owed was answered, is still tracked, was lost to the cap only after its
     release (nothing owed it then), or is one of the residuals above. The
@@ -4808,13 +4808,16 @@ async def _run_overlap(order: tuple[str, ...]) -> None:
         for key in unsent
         for owner in running
     }
-    # an earlier teardown that ended while a running one owed the same unsent
-    # task handed the obligation on: excused exactly when that one is
+    # an aborted teardown that ended while a running one owed the same unsent
+    # task handed the obligation on: excused exactly when that one is (a
+    # teardown that completed without sending it is never excused; round-3
+    # note on Consiliency/pmcp#376)
     while True:
         more = {
             (owner, key)
             for (owner, key), heirs in h.handed.items()
             if (owner, key) not in cut_short
+            and (owner.cancelled() or owner.exception() is not None)
             and any((heir, key) in cut_short for heir in heirs)
         }
         if not more:
@@ -5282,3 +5285,18 @@ async def test_a_chain_of_forced_refreshes_owes_its_history_and_cancels_it_all()
     assert await previous == (59, [])
     assert manager.get_active_tasks("tasks") == [] and registry.watching == 0
     assert peak <= 11
+
+
+@pytest.mark.parametrize("order", ["FTSDAG", "TFSDAG", "FTDSAG", "TFDSAG"])
+@pytest.mark.asyncio
+async def test_a_refresh_that_skips_a_server_is_caught_in_the_pinned_orderings(
+    order: str,
+) -> None:
+    """Review rounds 2 and 3 on Consiliency/pmcp#376: the `abort+get`
+    orderings in which a forced refresh completes, a forced disconnect of
+    beta is then aborted, and the harness's Consiliency/pmcp#324 exemption
+    applies. A refresh that cancelled only its first server (mutant M119)
+    must still fail each of them: the exemption excuses an unsent task only
+    for a teardown running at the removal, or an aborted one that handed it
+    on, never one that completed without sending it."""
+    await _run_overlap(tuple(order))
