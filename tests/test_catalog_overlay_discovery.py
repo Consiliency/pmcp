@@ -3307,6 +3307,8 @@ def test_attribution_passes_do_not_silence_another_context() -> None:
     """The silence is scoped to the attribution pass's own context."""
     import contextvars
 
+    from pmcp.manifest.attribution import attribution_pass, quiet_during_attribution
+
     seen: list[str] = []
 
     class _Keep(logging.Handler):
@@ -3314,17 +3316,55 @@ def test_attribution_passes_do_not_silence_another_context() -> None:
             seen.append(record.getMessage())
 
     handler = _Keep(level=logging.WARNING)
-    log = logging.getLogger("pmcp.manifest.loader")
-    log.addHandler(handler)
+    base = logging.getLogger("pmcp.manifest.loader")
+    base.addHandler(handler)
+    log = quiet_during_attribution("pmcp.manifest.loader")
     try:
-        loader._quiet_pmcp_loggers()
-        token = loader._ATTRIBUTION_PROBE.set(True)
-        try:
-            contextvars.Context().run(log.warning, "outside the probe")
-            log.warning("inside the probe")
-        finally:
-            loader._ATTRIBUTION_PROBE.reset(token)
-        log.warning("after the probe")
+        with attribution_pass():
+            contextvars.Context().run(log.warning, "outside the pass")
+            log.warning("inside the pass")
+        log.warning("after the pass")
     finally:
-        log.removeHandler(handler)
-    assert seen == ["outside the probe", "after the probe"]
+        base.removeHandler(handler)
+    assert seen == ["outside the pass", "after the pass"]
+
+
+def test_no_logger_emits_during_an_attribution_pass(tmp_path: Path) -> None:
+    """Derived, not listed: across every row of the generated table and the
+    round-3 falsifier entries, no record from ANY logger is emitted while an
+    attribution pass runs. A module the check reaches that logs through a
+    plain logger fails here."""
+    from pmcp.manifest.attribution import ATTRIBUTION_PROBE
+    from tests.overlay_field_table import SHAPES, observe, _fields
+
+    during: list[tuple[str, str]] = []
+
+    class _Watch(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if ATTRIBUTION_PROBE.get():
+                during.append((record.name, record.getMessage()[:80]))
+
+    handler = _Watch(level=logging.DEBUG)
+    root = logging.getLogger()
+    saved = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    try:
+        server_fields, cli_fields = _fields()
+        for field_name in server_fields:
+            for _shape, value in SHAPES:
+                for base in ("local", "url"):
+                    observe("server", field_name, value, base, tmp_path)
+        for field_name in cli_fields:
+            for _shape, value in SHAPES:
+                observe("cli", field_name, value, "cli", tmp_path)
+        for extra in (
+            "version: latest\n    url: 5",
+            "env_var: ZZ_KEY\n    api_key_optional_when: [ZZ_KEY]\n    url: 5",
+            "extra_env: 5\n    keywords: [1]",
+        ):
+            observe("server", "description", '"d"\n    ' + extra, "local", tmp_path)
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(saved)
+    assert during == []
