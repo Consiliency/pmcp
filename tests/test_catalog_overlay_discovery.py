@@ -2690,7 +2690,9 @@ DIAGNOSTIC_SITES_OUTSIDE_D9 = {
     ("manifest/version_checker.py", "get_pypi_version"): _NOT_A_FIELD,
     ("manifest/version_checker.py", "get_cargo_version"): _NOT_A_FIELD,
     ("manifest/version_checker.py", "get_docker_version"): _NOT_A_FIELD,
-    ("client/manager.py", "call_tool"): _NOT_A_FIELD,
+    # Consiliency/pmcp#376 (merged from main) moved `call_tool`'s
+    # connection-status line here.
+    ("client/manager.py", "call_tool_with_task"): _NOT_A_FIELD,
     ("client/manager.py", "read_resource"): _NOT_A_FIELD,
     ("client/manager.py", "get_prompt"): _NOT_A_FIELD,
     ("client/manager.py", "_remote_headers"): _LIFECYCLE,
