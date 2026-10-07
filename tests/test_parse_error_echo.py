@@ -3119,6 +3119,9 @@ def test_a_masked_record_keeps_no_valued_argument(logger_name: str) -> None:
 
         __str__ = __repr__
 
+    # An enum that is not pmcp's or the SDK's: its member's value is text.
+    Foreign = enum.Enum("Foreign", {"MEMBER": s})
+
     records: list[logging.LogRecord] = []
 
     class Capture(logging.Handler):
@@ -3152,9 +3155,9 @@ def test_a_masked_record_keeps_no_valued_argument(logger_name: str) -> None:
             [s],
             {s},
             Carrier(),
-            extra={"carried": s},
+            extra={"carried": s, "foreign": Foreign.MEMBER},
         )
-        logger.debug("%(m)s", {"m": {"k": [s]}})
+        logger.debug("%(m)s %(e)s", {"m": {"k": [s]}, "e": Foreign.MEMBER})
         logger.debug(
             "kept %d %s %s %s", 7, True, None, list(sdk_enum)[0] if sdk_enum else None
         )
