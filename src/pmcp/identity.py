@@ -207,7 +207,11 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
         return False
 
     if lock_dir is None:
-        lock_dir = Path.home() / ".pmcp"
+        # Home-scoped (Consiliency/pmcp#372 round 22): refused while a
+        # checkout controls the home directory.
+        from pmcp.home_identity import home_path
+
+        lock_dir = home_path(".pmcp")
     elif isinstance(lock_dir, str):
         lock_dir = Path(lock_dir)
 

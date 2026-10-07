@@ -28,6 +28,7 @@ from pmcp.types import (
     StartupPolicyPreview,
     StartupPolicySource,
 )
+from pmcp.home_identity import optional_operator_home, spelled_home
 from pmcp.project_consent import ConsentDecision, log_refusal, read_and_gate
 from pmcp.remote_auth import build_remote_header_env_lookup, resolve_remote_headers
 
@@ -71,17 +72,22 @@ def _env_pmcp_config_path() -> str | None:
 # default_user_config_paths() instead, which resolves Path.home() at call time
 # (mirrors manifest/loader.py's overlay path handling).
 DEFAULT_USER_CONFIG_PATHS = [
-    Path.home() / ".mcp.json",
-    Path.home() / ".claude" / ".mcp.json",
+    spelled_home() / ".mcp.json",
+    spelled_home() / ".claude" / ".mcp.json",
 ]
 
 
 def default_user_config_paths() -> list[Path]:
-    """User-level config paths, resolved from Path.home() at call time."""
-    return [
-        Path.home() / ".mcp.json",
-        Path.home() / ".claude" / ".mcp.json",
-    ]
+    """User-level config paths, resolved at call time.
+
+    None while the home directory is not the operator's (a checkout controls
+    it): those files would be the repository's, read as the operator's, ungated
+    (Consiliency/pmcp#372 round 22). pmcp then runs without user config.
+    """
+    home = optional_operator_home()
+    if home is None:
+        return []
+    return [home / ".mcp.json", home / ".claude" / ".mcp.json"]
 
 
 class StartupSkipReason(str, Enum):
@@ -246,7 +252,7 @@ def _coerce_server_entry(config: object) -> dict[str, Any] | None:
 
 def find_project_root(start_dir: Path) -> Path | None:
     """Find project root by looking for .mcp.json or common project markers."""
-    from pmcp.home_identity import is_home
+    from pmcp.home_identity import home_is_operators, is_home
 
     current = start_dir.resolve()
     temp_root = Path(tempfile.gettempdir()).resolve()
@@ -256,7 +262,10 @@ def find_project_root(start_dir: Path) -> Path | None:
             return None
         # $HOME is already covered by the user config source; treating it as a
         # project root would double-attribute ~/.mcp.json (project + user).
-        if is_home(current):  # by identity, not spelling (#372 round 19)
+        # Home is never a project -- while it is the operator's. A home a
+        # checkout controls is not, and must not end discovery early
+        # (Consiliency/pmcp#372 round 22).
+        if is_home(current) and home_is_operators():
             return None
         # Check for .mcp.json
         if (current / ".mcp.json").exists():

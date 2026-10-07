@@ -44,8 +44,11 @@ from pathlib import Path
 from typing import Any
 
 from pmcp.home_identity import (
+    HomeInsideCheckoutError,
+    checkout_controlling_home,
     enclosing_checkouts,
     has_checkout_marker,
+    home_path,
     is_operator_owned,
 )
 from pmcp.atomic_write import (
@@ -307,7 +310,18 @@ def trust_store_path(*, also: tuple[Path, ...] = ()) -> Path:
     Symlinks are resolved *before* the comparison, which is the only reason a
     planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
-    path = (Path.home() / ".config" / "pmcp" / "trust.json").resolve()
+    # Home-scoped (Consiliency/pmcp#372 round 22): refused while a checkout
+    # controls the home directory.
+    try:
+        path = home_path(".config", "pmcp", "trust.json").resolve()
+    except HomeInsideCheckoutError as exc:
+        checkout = checkout_controlling_home()
+        where = f"the checkout at {checkout}" if checkout is not None else "a checkout"
+        raise TrustStoreError(
+            f"Trust store trust.json resolves inside {where}: the home directory "
+            "lies inside it. A store inside a project's checkout lets it approve "
+            "its own content; move the home directory outside the repository."
+        ) from exc
     refuse_checkout_resident(path, "Trust store", also=also)
     return path
 

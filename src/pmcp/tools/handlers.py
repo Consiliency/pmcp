@@ -56,6 +56,7 @@ from pmcp.config.loader import (
     summarize_startup_resolution,
 )
 from pmcp.errors import ErrorCode, GatewayException, make_error
+from pmcp.home_identity import home_path
 from pmcp.env_store import (
     bind_project_root,
     record_dotenv_keys,
@@ -1114,11 +1115,16 @@ class GatewayTools:
 
     @property
     def _provisioned_registry_path(self) -> Path:
-        return Path.home() / ".config" / "pmcp" / "provisioned.json"
+        # Home-scoped: only while HOME is the operator's (Consiliency/pmcp#372
+        # round 22); otherwise reading it fails like an unreadable file.
+        return home_path(".config", "pmcp", "provisioned.json")
 
     def _load_provisioned_registry(self) -> dict[str, str | None]:
         """Load the persisted provisioned-server registry from disk."""
-        path = self._provisioned_registry_path
+        try:
+            path = self._provisioned_registry_path
+        except OSError:
+            return {}  # a home a checkout controls: no registry (round 22)
         if not path.exists():
             return {}
         try:

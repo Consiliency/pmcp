@@ -2659,3 +2659,190 @@ def test_a_launch_from_home_config_inside_a_checkout_still_refuses(
         assert accepted is None and not decision.allowed
     finally:
         trust_store.set_active_project_root(None)
+
+
+# --------------------------------------------------------------------------- #
+# Board round 21, grok F001: with a repository-shipped `home -> .` and
+# HOME=<checkout>/home, the checkout's .mcp.json, .pmcp/manifest.yaml and
+# .claude/gateway-policy.yaml were read as the operator's user config, user
+# manifest overlay and base policy. Every home-scoped file now goes through
+# one gate (pmcp.home_identity) that answers only while HOME is the operator's.
+# --------------------------------------------------------------------------- #
+
+
+def _repository_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A checkout shipping `home -> .`, with HOME pointed at it; cwd home/app."""
+    from pmcp import home_identity
+
+    checkout = tmp_path.resolve() / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    (checkout / "app").mkdir()
+    home = checkout / "home"
+    home.symlink_to(".", target_is_directory=True)
+    (checkout / ".mcp.json").write_text(
+        '{"mcpServers":{"planted-user":{"command":"echo","args":["pwned"]}}}'
+    )
+    (checkout / ".pmcp").mkdir()
+    (checkout / ".pmcp" / "manifest.yaml").write_text(
+        "servers:\n  planted-manifest:\n    description: planted\n"
+        "    keywords: [plantedwidget]\n    command: echo\n"
+        '    args: ["manifest"]\n'
+    )
+    (checkout / ".claude").mkdir()
+    (checkout / ".claude" / "gateway-policy.yaml").write_text(
+        'servers:\n  denylist: ["from-repo-policy"]\n'
+    )
+    (checkout / ".claude" / "gateway-guidance.yaml").write_text("level: off\n")
+    (checkout / ".config" / "pmcp").mkdir(parents=True)
+    (checkout / ".config" / "pmcp" / "pmcp.env").write_text("PLANTED_372=1\n")
+    (checkout / ".config" / "pmcp" / "provisioned.json").write_text(
+        '{"planted-provisioned": null}'
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PLANTED_372", raising=False)
+    monkeypatch.chdir(home / "app")
+    home_identity.reset_home_warning()
+    return checkout
+
+
+def test_grok_r21_f001_a_repository_home_supplies_no_operator_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """grok r21 F001, verbatim in substance."""
+    from pmcp.config.loader import load_configs
+    from pmcp.manifest.loader import load_manifest
+    from pmcp.policy.policy import PolicyManager
+
+    _repository_home(tmp_path, monkeypatch)
+    user_servers = [cfg.name for cfg in load_configs() if cfg.source == "user"]
+    manifest = load_manifest()
+    policy = PolicyManager()
+    assert {
+        "user_config": user_servers,
+        "user_manifest": "planted-manifest" in manifest.servers,
+        "repo_policy_denies": policy.is_server_allowed("from-repo-policy") is False,
+    } == {"user_config": [], "user_manifest": False, "repo_policy_denies": False}
+
+
+def test_every_home_scoped_file_is_refused_under_a_repository_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """User config, overlay, policy, guidance, user store, trust and approval
+    stores, provisioned registry, registry cache, lock and setup target."""
+    from unittest.mock import MagicMock
+
+    from pmcp import home_identity, identity, trust_store
+    from pmcp.config.guidance import load_guidance_config
+    from pmcp.config.loader import default_user_config_paths
+    from pmcp.manifest.registry import default_registry_cache_path
+    from pmcp.package_approvals import package_approvals_path
+    from pmcp.policy.policy import PolicyManager, default_user_policy_paths
+    from pmcp.tools.handlers import GatewayTools
+
+    _repository_home(tmp_path, monkeypatch)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    assert default_user_config_paths() == []
+    assert default_user_policy_paths() == []
+    assert load_guidance_config().level != "off"
+    env_store.load_store("user")
+    assert "PLANTED_372" not in os.environ
+    with pytest.raises(trust_store.TrustStoreError):
+        trust_store.trust_store_path()
+    with pytest.raises(trust_store.TrustStoreError):
+        package_approvals_path()
+    tools = GatewayTools(client_manager=MagicMock(), policy_manager=PolicyManager())
+    assert tools._load_provisioned_registry() == {}
+    for refused in (
+        default_registry_cache_path,
+        lambda: identity.acquire_singleton_lock(None),
+        lambda: cli._get_setup_target_path("claude"),
+    ):
+        with pytest.raises(home_identity.HomeInsideCheckoutError):
+            refused()
+    err = capsys.readouterr().err
+    assert "the home directory lies inside a checkout" in err
+    assert "pwned" not in err and "PLANTED_372" not in err
+
+
+@pytest.mark.parametrize("home_kind", ["clean", "dotfiles"])
+def test_an_operators_home_still_supplies_every_home_scoped_file(
+    home_kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same files under a clean home, or a home kept in its own repository."""
+    from unittest.mock import MagicMock
+
+    from pmcp.config.loader import load_configs
+    from pmcp.manifest.loader import load_manifest
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+
+    home = Path(os.environ["HOME"]).resolve()
+    if home_kind == "dotfiles":
+        (home / ".git").mkdir(exist_ok=True)
+    (home / ".mcp.json").write_text(
+        '{"mcpServers":{"operator-user":{"command":"echo"}}}'
+    )
+    (home / ".pmcp").mkdir(exist_ok=True)
+    (home / ".pmcp" / "manifest.yaml").write_text(
+        "servers:\n  operator-manifest:\n    description: mine\n"
+        "    keywords: [minewidget]\n    command: echo\n"
+    )
+    (home / ".claude").mkdir(exist_ok=True)
+    (home / ".claude" / "gateway-policy.yaml").write_text(
+        'servers:\n  denylist: ["operator-denies"]\n'
+    )
+    (home / ".config" / "pmcp").mkdir(parents=True, exist_ok=True)
+    (home / ".config" / "pmcp" / "pmcp.env").write_text("OPERATOR_372=1\n")
+    (home / ".config" / "pmcp" / "provisioned.json").write_text(
+        '{"operator-provisioned": null}'
+    )
+    monkeypatch.delenv("OPERATOR_372", raising=False)
+    work = tmp_path.resolve() / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    try:
+        assert "operator-user" in {c.name for c in load_configs() if c.source == "user"}
+        assert "operator-manifest" in load_manifest().servers
+        assert PolicyManager().is_server_allowed("operator-denies") is False
+        env_store.load_store("user")
+        assert os.environ.get("OPERATOR_372") == "1"
+        tools = GatewayTools(client_manager=MagicMock(), policy_manager=PolicyManager())
+        assert "operator-provisioned" in tools._load_provisioned_registry()
+    finally:
+        os.environ.pop("OPERATOR_372", None)
+
+
+def test_a_home_a_checkout_controls_does_not_end_project_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Discovery from under such a home reaches the checkout, gated as a project."""
+    from pmcp.config.loader import find_project_root
+
+    checkout = tmp_path.resolve() / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    home = checkout / "home"
+    (home / "sub").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    assert find_project_root(home / "sub") == checkout
+    assert env_store.project_scope_root(home) == home
+
+
+def test_an_env_reached_through_a_checkout_link_is_the_repositorys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identity says "an ancestor of home"; the path as written runs through a
+    checkout, so the file is the repository's and stays out of the environment."""
+    base = tmp_path.resolve()
+    home = base / "home"
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    repo = base / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "link").symlink_to(base, target_is_directory=True)
+    (base / ".env").write_text("THROUGH_LINK_372=leaked\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("THROUGH_LINK_372", raising=False)
+    monkeypatch.chdir(home)
+    cli.load_startup_env(dotenv_path=str(repo / "link" / ".env"))
+    assert "THROUGH_LINK_372" not in os.environ

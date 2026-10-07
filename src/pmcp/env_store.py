@@ -85,11 +85,21 @@ def _discover_project_root() -> Path:
 _PINNED_USER_STORE: Path | None = None
 
 
-def pin_user_store_path() -> Path:
-    """Resolve ``~/.config/pmcp/pmcp.env`` now and keep that answer for the process."""
+def pin_user_store_path() -> Path | None:
+    """Resolve ``~/.config/pmcp/pmcp.env`` now and keep that answer for the process.
+
+    ``None`` -- nothing pinned -- while a checkout controls the home directory
+    (Consiliency/pmcp#372 round 22): every later user-store access then fails
+    like an unreadable store, and pmcp runs without it.
+    """
     global _PINNED_USER_STORE
     if _PINNED_USER_STORE is None:
-        _PINNED_USER_STORE = Path.home() / ".config" / "pmcp" / "pmcp.env"
+        from pmcp.home_identity import HomeInsideCheckoutError, home_path
+
+        try:
+            _PINNED_USER_STORE = home_path(".config", "pmcp", "pmcp.env")
+        except HomeInsideCheckoutError:
+            return None
     return _PINNED_USER_STORE
 
 
@@ -104,7 +114,12 @@ def resolve_scope_path(scope: str, project: Path | None = None) -> Path:
     if scope == "user":
         if _PINNED_USER_STORE is not None:
             return _PINNED_USER_STORE
-        return Path.home() / ".config" / "pmcp" / "pmcp.env"
+        from pmcp.home_identity import home_path
+
+        # Home-scoped (Consiliency/pmcp#372 round 22): raises -- a
+        # PermissionError, so a lenient reader treats it as an unreadable
+        # store -- while a checkout controls the home directory.
+        return home_path(".config", "pmcp", "pmcp.env")
     if scope == "project":
         return resolve_project_root(project) / ".env.pmcp"
     raise ValueError(f"Unsupported secret scope: {scope}")
@@ -446,11 +461,13 @@ def project_scope_root(project: Path | None = None) -> Path | None:
     ``tests/test_store_reader_inventory.py`` fails if this function's answer
     reaches a credential lookup.
     """
-    from pmcp.home_identity import is_home
+    from pmcp.home_identity import home_is_operators, is_home
 
     root = resolve_project_root(project)
-    # By identity, not spelling (Consiliency/pmcp#372 round 19).
-    if is_home(root):
+    # By identity, not spelling (Consiliency/pmcp#372 round 19) -- and only
+    # while home is the operator's: a home a checkout controls is a project
+    # like any other, its .mcp.json gated (round 22).
+    if is_home(root) and home_is_operators():
         return None
     return root
 
@@ -1066,8 +1083,7 @@ def load_store(
         text = _read_user_text(store_path, verb=verb)
         if text is None:
             return  # refused, with its own warning
-        home = resolve_scope_path("user").parent.parent.parent
-        if not _operator_owned_directory(home):
+        if not _operator_owned_directory(store_path.parent.parent.parent):
             # The verb spelled out: a migration guide may quote this line, and
             # its checker matches quotes against literal text.
             if verb == "load":
@@ -1140,13 +1156,13 @@ def _operator_owned_directory(directory: Path) -> bool:
     ``home_identity.is_operator_owned`` without the default-store directories,
     for the home directory pinned by the startup load.
     """
-    from pmcp.home_identity import is_operator_owned
+    from pmcp.home_identity import HomeInsideCheckoutError, is_operator_owned
 
-    return is_operator_owned(
-        directory,
-        store_directories=False,
-        home=resolve_scope_path("user").parent.parent.parent,
-    )
+    try:
+        home = resolve_scope_path("user").parent.parent.parent
+    except HomeInsideCheckoutError:
+        return False  # a home a checkout controls owns nothing for the operator
+    return is_operator_owned(directory, store_directories=False, home=home)
 
 
 def load_discovered_dotenv(path: Path) -> None:

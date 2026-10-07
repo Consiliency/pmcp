@@ -173,7 +173,12 @@ def default_user_policy_paths() -> list[Path]:
     process -- take effect; the frozen attribute below cannot
     (Consiliency/pmcp#262).
     """
-    return [Path.home() / tail for tail in _USER_POLICY_TAILS]
+    # Only while the home directory is the operator's (Consiliency/pmcp#372
+    # round 22): a home a checkout controls supplies no base policy.
+    from pmcp.home_identity import optional_operator_home
+
+    home = optional_operator_home()
+    return [] if home is None else [home / tail for tail in _USER_POLICY_TAILS]
 
 
 class _FrozenDefault(tuple[Path, ...]):

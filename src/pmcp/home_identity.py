@@ -21,8 +21,10 @@ all import it without a cycle.
 
 from __future__ import annotations
 
+import errno as _errno
 import os
 import stat
+import sys as _sys
 from pathlib import Path
 
 Identity = tuple[int, int]
@@ -179,6 +181,23 @@ def inside_a_checkout(path: os.PathLike[str] | str) -> bool:
     return False
 
 
+def controlling_checkout(path: os.PathLike[str] | str) -> Path | None:
+    """The nearest checkout enclosing ``path`` along its unresolved spelling."""
+    for prefix in reversed(_lexical_prefixes(path)):
+        try:
+            found = next(enclosing_checkouts(prefix), None)
+        except OSError:
+            continue
+        if found is not None:
+            return found
+    return None
+
+
+def checkout_controlling_home() -> Path | None:
+    """The checkout that controls HOME, for a refusal message (``None``: none found)."""
+    return controlling_checkout(Path.home())
+
+
 def is_operator_owned(
     directory: os.PathLike[str] | str,
     *,
@@ -202,3 +221,93 @@ def is_operator_owned(
     if identity not in areas:
         return False
     return not inside_a_checkout(directory)
+
+
+# --------------------------------------------------------------------------- #
+# THE gate for every home-scoped read and write (Consiliency/pmcp#372 round 22,
+# board round 21 grok F001): with a repository-shipped `home -> .` and
+# HOME=<checkout>/home, the user config (~/.mcp.json), the user manifest
+# overlay and the base policy were read from the checkout, ungated, as the
+# operator's. Every file pmcp treats as the operator's because it sits under
+# HOME is located through these functions, which answer only while HOME is
+# operator-owned (is_operator_owned); otherwise pmcp runs without the file.
+# ``tests/test_store_reader_inventory.py`` forbids deriving HOME anywhere else.
+# --------------------------------------------------------------------------- #
+
+_HOME_REFUSAL = "the home directory lies inside a checkout"
+_WARNED_HOME = False
+
+
+class HomeInsideCheckoutError(PermissionError):
+    """HOME is not operator-owned: a checkout controls it."""
+
+
+def _refuse_home() -> HomeInsideCheckoutError:
+    return HomeInsideCheckoutError(_errno.EPERM, _HOME_REFUSAL)
+
+
+def _warn_home_once() -> None:
+    global _WARNED_HOME
+    if not _WARNED_HOME:
+        _WARNED_HOME = True
+        print(
+            "pmcp: Ignoring the operator's files under the home directory: "
+            f"{_HOME_REFUSAL}",
+            file=_sys.stderr,
+        )
+
+
+def reset_home_warning() -> None:
+    """Forget that the refusal was reported. **Test-only seam.**"""
+    global _WARNED_HOME
+    _WARNED_HOME = False
+
+
+def operator_home() -> Path:
+    """HOME, only while it is the operator's; otherwise raise.
+
+    For writers and for stores whose readers already treat an ``OSError`` as an
+    unreadable store (the error is a ``PermissionError``).
+    """
+    home = Path.home()
+    if _identity(home) is None:
+        # Cannot even look at it: the access that follows fails with its own,
+        # accurate error (an unsearchable home is reported as such).
+        return home
+    if not is_operator_owned(home, store_directories=False):
+        _warn_home_once()
+        raise _refuse_home()
+    return home
+
+
+def optional_operator_home() -> Path | None:
+    """HOME, only while it is the operator's; otherwise ``None`` (one warning).
+
+    For optional user files: pmcp then runs without them, failing closed.
+    """
+    try:
+        return operator_home()
+    except HomeInsideCheckoutError:
+        return None
+
+
+def home_path(*parts: str) -> Path:
+    """``operator_home() / parts`` -- raises while HOME is not the operator's."""
+    return operator_home().joinpath(*parts)
+
+
+def optional_home_path(*parts: str) -> Path | None:
+    """``optional_operator_home() / parts``, or ``None``."""
+    home = optional_operator_home()
+    return None if home is None else home.joinpath(*parts)
+
+
+def home_is_operators() -> bool:
+    """Is HOME the operator's (no checkout controls it)? No warning."""
+    return is_operator_owned(Path.home(), store_directories=False)
+
+
+def spelled_home() -> Path:
+    """HOME as spelled, UNCHECKED: only for frozen import-time constants that
+    the documented test seams compare by identity and never read at runtime."""
+    return Path.home()

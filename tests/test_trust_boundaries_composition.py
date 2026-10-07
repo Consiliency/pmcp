@@ -79,6 +79,7 @@ from typing import Any, cast
 
 import pytest
 
+from tests._shipped_approvals import ship_approval, ship_package_approval
 from pmcp import package_approvals, trust_store
 from pmcp.config.loader import load_configs
 from pmcp.env_store import reset_pmcp_introduced_keys
@@ -619,10 +620,11 @@ def _ship_an_approval_inside(
     """
     home = checkout / "home"
     home.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("HOME", str(home))
     monkeypatch.chdir(outside)
-    trust_store.record(target, target.read_bytes(), "project", trust_store.APPROVED)
-    store = trust_store.trust_store_path()
+    # Shipped bytes (round 22: pmcp no longer writes a store a checkout
+    # controls), then HOME inside the checkout.
+    store = ship_approval(target, home).resolve()
+    monkeypatch.setenv("HOME", str(home))
     assert store.is_relative_to(checkout.resolve())
     return store
 
@@ -751,7 +753,9 @@ async def test_an_approval_in_a_checkout_resident_store_grants_nothing(
     # ... and a package approval, in the store beside it, for the same package
     # the overlay runs. `approve_package` resolves its path through
     # `trust_store_path`, so it is written from outside the checkout too.
-    approve_package(_npm_identity(ADDED_PACKAGE, ADDED_VERSION))
+    ship_package_approval(
+        _npm_identity(ADDED_PACKAGE, ADDED_VERSION), checkout / "home"
+    )
     assert (checkout / "home" / ".config" / "pmcp" / "package_approvals.json").exists()
 
     monkeypatch.chdir(checkout)

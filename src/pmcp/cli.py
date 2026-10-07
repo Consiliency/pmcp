@@ -1891,7 +1891,11 @@ def _setup_profile_options(args: argparse.Namespace) -> tuple[str, bool, bool]:
 
 def _get_setup_target_path(client: str) -> Path:
     """Get the destination config path for a supported client."""
-    home = Path.home()
+    # Home-scoped (Consiliency/pmcp#372 round 22): refused while a checkout
+    # controls the home directory.
+    from pmcp.home_identity import home_path
+
+    home = home_path()
     if client == "claude":
         return home / ".mcp.json"
     return home / ".config" / "opencode" / "opencode.json"
@@ -2188,8 +2192,10 @@ async def run_doctor(args: argparse.Namespace) -> None:
 
     checks: list[tuple[str, str, str]] = []
 
-    lock_path = Path.home() / ".pmcp" / "gateway.lock"
-    if lock_path.exists():
+    from pmcp.home_identity import optional_home_path
+
+    lock_path = optional_home_path(".pmcp", "gateway.lock")
+    if lock_path is not None and lock_path.exists():
         checks.append(
             (
                 "lock",

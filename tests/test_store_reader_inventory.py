@@ -1893,3 +1893,82 @@ def test_the_residency_discovery_scan_sees_each_shape() -> None:
         for line in discovery_in_residency({"pmcp.trust_store": source})
     }
     assert flagged == {"walk", "classify"}
+
+
+# --------------------------------------------------------------------------- #
+# One gate for every home-scoped read (Consiliency/pmcp#372 round 22, board
+# round 21 grok F001): with a repository-shipped `home -> .`, the user config,
+# the user manifest overlay and the base policy were read from the checkout as
+# the operator's. Every HOME-derived path goes through pmcp.home_identity's
+# gate (home_path, optional_home_path, operator_home, optional_operator_home),
+# which answers only while HOME is operator-owned. Nothing else derives HOME;
+# spelled_home is allowed only for module-level documentation constants.
+# --------------------------------------------------------------------------- #
+
+
+def home_derivations(sources: dict[str, str]) -> list[str]:
+    found: list[str] = []
+    for module, source in sources.items():
+        if module == "pmcp.home_identity":
+            continue
+        tree = ast.parse(source)
+        in_function: set[int] = set()
+        for _name, fn in _qualified_functions(tree):
+            in_function |= {id(n) for n in ast.walk(fn)}
+        for node in ast.walk(tree):
+            where = f"{module}:{getattr(node, 'lineno', '?')}"
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr == "home":
+                    found.append(f"{where} .home()")
+                elif (
+                    node.func.attr == "expanduser"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and str(node.args[0].value).startswith("~")
+                ):
+                    found.append(f"{where} expanduser('~')")
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", getattr(node.func, "attr", None))
+                == "spelled_home"
+                and id(node) in in_function
+            ):
+                found.append(f"{where} spelled_home() at runtime")
+            if (
+                isinstance(node, (ast.Subscript, ast.Call))
+                and "HOME"
+                in {
+                    c.value
+                    for c in ast.walk(node)
+                    if isinstance(c, ast.Constant) and isinstance(c.value, str)
+                }
+                and "environ" in ast.unparse(node)
+                and not ast.unparse(node).startswith(("_NEVER_LOADED",))
+            ):
+                found.append(f"{where} HOME read from the environment")
+    return found
+
+
+def test_home_is_derived_only_by_the_gate() -> None:
+    assert home_derivations(_src_sources()) == []
+
+
+def test_the_home_derivation_scan_sees_each_shape() -> None:
+    source = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "CONST = spelled_home() / '.x'\n"
+        "def a():\n"
+        "    return Path.home() / '.mcp.json'\n"
+        "def b():\n"
+        "    return os.path.expanduser('~/.claude')\n"
+        "def c():\n"
+        "    return os.environ.get('HOME')\n"
+        "def d():\n"
+        "    return spelled_home() / '.y'\n"
+        "def fine():\n"
+        "    return home_path('.config')\n"
+    )
+    found = home_derivations({"pmcp.x": source})
+    lines = sorted(int(line.split(":")[1].split(" ")[0]) for line in found)
+    assert lines == [5, 7, 9, 11]

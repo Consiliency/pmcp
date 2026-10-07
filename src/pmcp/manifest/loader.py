@@ -17,6 +17,8 @@ from typing import Any, Literal, cast
 
 import yaml
 
+from pmcp.home_identity import optional_home_path, spelled_home
+
 from pmcp.manifest.attribution import attribution_pass, quiet_during_attribution
 from pmcp.project_consent import log_refusal, read_and_gate
 from pmcp.validation import (
@@ -237,7 +239,7 @@ ServerTransport = Literal["local", "remote", "sse", "http", "streamable-http"]
 # DEFAULT_USER_CONFIG_PATHS). The user path is recomputed from Path.home() at
 # call time in _overlay_manifest_paths() so HOME monkeypatching works in tests;
 # this constant documents the default location.
-DEFAULT_USER_MANIFEST_PATHS = [Path.home() / ".pmcp" / "manifest.yaml"]
+DEFAULT_USER_MANIFEST_PATHS = [spelled_home() / ".pmcp" / "manifest.yaml"]
 
 
 @dataclass
@@ -1673,8 +1675,10 @@ def _overlay_manifest_paths(
     """
     paths: list[tuple[str, Path]] = []
 
-    user_path = Path.home() / ".pmcp" / "manifest.yaml"
-    if user_path.exists():
+    # Only while the home directory is the operator's (Consiliency/pmcp#372
+    # round 22): a home a checkout controls supplies no user overlay.
+    user_path = optional_home_path(".pmcp", "manifest.yaml")
+    if user_path is not None and user_path.exists():
         paths.append(("user", user_path))
 
     project_path = _find_project_manifest(project_root)
