@@ -461,13 +461,14 @@ def project_scope_root(project: Path | None = None) -> Path | None:
     ``tests/test_store_reader_inventory.py`` fails if this function's answer
     reaches a credential lookup.
     """
-    from pmcp.home_identity import home_is_operators, is_home
+    from pmcp.home_identity import is_home
 
     root = resolve_project_root(project)
     # By identity, not spelling (Consiliency/pmcp#372 round 19) -- and only
     # while home is the operator's: a home a checkout controls is a project
-    # like any other, its .mcp.json gated (round 22).
-    if is_home(root) and home_is_operators():
+    # like any other, its .mcp.json gated (round 22); is_home answers only for
+    # the operator's home (round 23).
+    if is_home(root):
         return None
     return root
 
@@ -1156,13 +1157,9 @@ def _operator_owned_directory(directory: Path) -> bool:
     ``home_identity.is_operator_owned`` without the default-store directories,
     for the home directory pinned by the startup load.
     """
-    from pmcp.home_identity import HomeInsideCheckoutError, is_operator_owned
+    from pmcp.home_identity import is_operator_owned
 
-    try:
-        home = resolve_scope_path("user").parent.parent.parent
-    except HomeInsideCheckoutError:
-        return False  # a home a checkout controls owns nothing for the operator
-    return is_operator_owned(directory, store_directories=False, home=home)
+    return is_operator_owned(directory, store_directories=False)
 
 
 def load_discovered_dotenv(path: Path) -> None:

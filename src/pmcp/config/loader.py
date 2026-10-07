@@ -252,7 +252,7 @@ def _coerce_server_entry(config: object) -> dict[str, Any] | None:
 
 def find_project_root(start_dir: Path) -> Path | None:
     """Find project root by looking for .mcp.json or common project markers."""
-    from pmcp.home_identity import home_is_operators, is_home
+    from pmcp.home_identity import is_home
 
     current = start_dir.resolve()
     temp_root = Path(tempfile.gettempdir()).resolve()
@@ -264,8 +264,9 @@ def find_project_root(start_dir: Path) -> Path | None:
         # project root would double-attribute ~/.mcp.json (project + user).
         # Home is never a project -- while it is the operator's. A home a
         # checkout controls is not, and must not end discovery early
-        # (Consiliency/pmcp#372 round 22).
-        if is_home(current) and home_is_operators():
+        # (Consiliency/pmcp#372 round 22): is_home answers only for the
+        # operator's home (round 23).
+        if is_home(current):
             return None
         # Check for .mcp.json
         if (current / ".mcp.json").exists():

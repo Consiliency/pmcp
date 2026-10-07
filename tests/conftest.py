@@ -190,8 +190,13 @@ def isolate_trust_store(
     # test's own first judgement captures the directory the test launched in
     # (Consiliency/pmcp#372 round 18).
     trust_store.reset_launch_directory()
+    # The home refusal is reported once per process; each test sees its own.
+    from pmcp.home_identity import reset_home_warning
+
+    reset_home_warning()
     yield fake_home
     trust_store.reset_launch_directory()
+    reset_home_warning()
 
 
 @pytest.fixture(autouse=True)

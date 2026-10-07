@@ -2887,11 +2887,14 @@ def test_claude_r22_n1_a_home_spelled_through_missing_dotdot_grants_nothing(
     monkeypatch.chdir(base / "outside")
     trust_store.reset_launch_directory()
     assert trust_store.is_approved(config, content, project_root=config.parent) is False
-    with pytest.raises(trust_store.TrustStoreError, match="cannot be examined"):
+    # Round 23's rule: resolving HOME traverses `repo`, a checkout.
+    with pytest.raises(trust_store.TrustStoreError, match="the home directory lies"):
         trust_store.trust_store_path()
     with pytest.raises(trust_store.TrustStoreError):
         package_approvals_path()
-    assert "the home directory cannot be examined" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "the home directory lies inside a checkout" in err
+    assert "planted" not in err
 
 
 def test_an_unexaminable_home_refuses_trust_but_plain_reads_report_their_own_error(
@@ -2951,3 +2954,312 @@ def test_an_unexaminable_home_owns_no_ancestor_env(
     monkeypatch.chdir(plain / "home")
     cli.load_startup_env(dotenv_path=str(plain / ".env"))
     assert "SPELLED_HOME_372" not in os.environ
+
+
+# --------------------------------------------------------------------------- #
+# Board round 22 (grok F001, codex F001-F003, gemini F001) -> round 23 ruling:
+# ONE rule replaces every home special case. HOME is operator-owned iff no
+# directory TRAVERSED while resolving HOME (kernel order, links spliced as
+# written, `..` applied after earlier links) -- other than HOME's own final
+# directory -- carries a checkout marker. The grid generates HOME shapes and
+# checks each verdict, and what follows from it, end to end.
+# --------------------------------------------------------------------------- #
+
+
+def _shape(base: Path, name: str) -> str:
+    """Build HOME shape ``name`` under ``base``; return the HOME spelling."""
+    repo = base / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "child").mkdir()
+    real = base / "real"
+    real.mkdir()
+    if name == "plain":
+        return str(real)
+    if name == "dotfiles-at-home":
+        (real / ".git").mkdir()
+        (real / ".mcp.json").write_text('{"mcpServers": {}}')
+        return str(real)
+    if name in (
+        "operator-link",
+        "operator-link-marked-target",
+        "operator-link-relative",
+    ):
+        if name == "operator-link-marked-target":
+            (real / ".git").mkdir()
+            (real / ".mcp.json").write_text('{"mcpServers": {}}')
+        target = "real" if name == "operator-link-relative" else str(real)
+        (base / "alias").symlink_to(target, target_is_directory=True)
+        return str(base / "alias")
+    if name == "operator-link-to-a-checkout":
+        (base / "alias").symlink_to(repo, target_is_directory=True)
+        return str(base / "alias")
+    if name == "repo-link-to-dot":
+        (repo / "home").symlink_to(".", target_is_directory=True)
+        return str(repo / "home")
+    if name == "repo-link-to-child":
+        (repo / "home").symlink_to("child", target_is_directory=True)
+        return str(repo / "home")
+    if name == "repo-link-to-sibling":
+        (repo / "home").symlink_to("../real", target_is_directory=True)
+        return str(repo / "home")
+    if name == "repo-dotdot-before-link":
+        (repo / "home").symlink_to(real, target_is_directory=True)
+        return f"{repo}/child/../home"
+    if name == "plain-dotdot-before-link":
+        (real / "sub").mkdir()
+        (base / "alias").symlink_to(real, target_is_directory=True)
+        return f"{real}/sub/../../alias"
+    if name == "link-into-repo-then-dotdot":
+        (base / "alias").symlink_to(repo / "child", target_is_directory=True)
+        return f"{base}/alias/.."
+    if name == "repo-link-then-dotdot":
+        (repo / "home").symlink_to("child", target_is_directory=True)
+        return f"{repo}/home/.."
+    if name == "operator-link-then-dotdot":
+        (real / "user").mkdir()
+        (base / "alias").symlink_to(real / "user", target_is_directory=True)
+        return f"{base}/alias/.."
+    if name == "missing-inside-a-checkout":
+        return str(repo / "not-created")
+    if name == "missing-deep-inside-a-checkout":
+        return str(repo / "a" / "b")
+    if name == "missing-through-dotdot-inside-a-checkout":
+        return f"{repo}/missing/../home"
+    if name == "missing-outside":
+        return str(base / "not-created")
+    if name == "checkout-one-level-up":
+        (repo / "home").mkdir()
+        return str(repo / "home")
+    if name == "checkout-two-levels-up":
+        (repo / "a" / "home").mkdir(parents=True)
+        return str(repo / "a" / "home")
+    if name == "operator-parent-link":  # /home -> /var/home (Silverblue)
+        (base / "var" / "home" / "user").mkdir(parents=True)
+        (base / "home").symlink_to("var/home", target_is_directory=True)
+        return str(base / "home" / "user")
+    if name == "operator-parent-link-marked-home":
+        (base / "var" / "home" / "user").mkdir(parents=True)
+        (base / "var" / "home" / "user" / ".mcp.json").write_text("{}")
+        (base / "home").symlink_to(base / "var" / "home", target_is_directory=True)
+        return str(base / "home" / "user")
+    if name == "parent-link-into-a-checkout":
+        (repo / "homes" / "user").mkdir(parents=True)
+        (base / "home").symlink_to(repo / "homes", target_is_directory=True)
+        return str(base / "home" / "user")
+    raise AssertionError(name)
+
+
+#: shape -> (operator-owned?, examinable?)
+HOME_SHAPES = {
+    "plain": (True, True),
+    "dotfiles-at-home": (True, True),
+    "operator-link": (True, True),
+    "operator-link-marked-target": (True, True),
+    "operator-link-relative": (True, True),
+    "operator-link-to-a-checkout": (True, True),
+    "repo-link-to-dot": (False, False),
+    "repo-link-to-child": (False, False),
+    "repo-link-to-sibling": (False, False),
+    "repo-dotdot-before-link": (False, False),
+    "plain-dotdot-before-link": (True, True),
+    "link-into-repo-then-dotdot": (False, False),
+    "repo-link-then-dotdot": (False, False),
+    "operator-link-then-dotdot": (True, True),
+    "missing-inside-a-checkout": (False, False),
+    "missing-deep-inside-a-checkout": (False, False),
+    "missing-through-dotdot-inside-a-checkout": (False, False),
+    "missing-outside": (True, False),
+    "checkout-one-level-up": (False, False),
+    "checkout-two-levels-up": (False, False),
+    "operator-parent-link": (True, True),
+    "operator-parent-link-marked-home": (True, True),
+    "parent-link-into-a-checkout": (False, False),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(HOME_SHAPES))
+def test_every_home_shape_follows_the_one_rule(
+    shape: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity, trust_store
+
+    base = tmp_path.resolve()
+    assert all(not home_identity.has_checkout_marker(d) for d in base.parents)
+    spelled = _shape(base, shape)
+    monkeypatch.setenv("HOME", spelled)
+    monkeypatch.setattr(env_store, "_PINNED_USER_STORE", None)
+    monkeypatch.delenv("GRID_TOKEN_372", raising=False)
+    home_identity.reset_home_warning()
+    trust_store.reset_launch_directory()
+    owned, examinable = HOME_SHAPES[shape]
+
+    assert home_identity.home_is_operators() is owned
+    assert (home_identity.optional_operator_home() == Path(spelled)) is owned
+    assert (home_identity.examinable_home() is not None) is examinable
+    # The rule, restated from the walk itself: final directory excluded.
+    walk = home_identity.traverse(spelled)
+    assert (walk.marked() is None) is owned
+    assert (walk.final is None) is shape.startswith("missing")
+
+    before = {p for p in base.rglob("*")}
+    if examinable:
+        assert trust_store.trust_store_path() is not None
+        env_store.set_env_value("user", "GRID_TOKEN_372", "inert")
+        assert env_store.read_store("user") == {"GRID_TOKEN_372": "inert"}
+    else:
+        with pytest.raises(trust_store.TrustStoreError):
+            trust_store.trust_store_path()
+        if not owned:
+            with pytest.raises(home_identity.HomeInsideCheckoutError):
+                env_store.set_env_value("user", "GRID_TOKEN_372", "inert")
+            assert env_store.read_store("user") == {}
+            assert not [p for p in base.rglob("pmcp.env")]
+            assert {p for p in base.rglob("*")} == before
+
+
+def test_the_home_grid_covers_every_shape_the_ruling_names() -> None:
+    named = {
+        "plain",
+        "dotfiles-at-home",
+        "operator-link",
+        "operator-link-marked-target",
+        "repo-link-to-dot",
+        "repo-link-to-child",
+        "repo-link-to-sibling",
+        "repo-dotdot-before-link",
+        "link-into-repo-then-dotdot",
+        "missing-inside-a-checkout",
+        "missing-outside",
+        "checkout-one-level-up",
+        "checkout-two-levels-up",
+        "operator-parent-link",
+    }
+    assert named <= set(HOME_SHAPES)
+    assert {v for v in HOME_SHAPES.values()} == {
+        (True, True),
+        (False, False),
+        (True, False),
+    }
+
+
+# The seats' falsifiers, as filed (their ancestor-marker patches kept).
+
+
+def _no_markers_above(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from pmcp import home_identity
+
+    marker = home_identity.has_checkout_marker
+    ancestors = set(tmp_path.resolve().parents)
+    monkeypatch.setattr(
+        home_identity,
+        "has_checkout_marker",
+        lambda path: False if Path(path) in ancestors else marker(path),
+    )
+
+
+def test_grok_r22_f001_unstatable_home_inside_a_checkout_is_not_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.atomic_write import atomic_write, make_store_dirs
+    from pmcp.home_identity import (
+        HomeInsideCheckoutError,
+        home_is_operators,
+        home_path,
+        reset_home_warning,
+    )
+
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    home = checkout / "home"
+    monkeypatch.setenv("HOME", str(home))
+    reset_home_warning()
+    assert home_is_operators() is False
+    try:
+        target = home_path(".config", "pmcp", "pmcp.env")
+    except HomeInsideCheckoutError:
+        return
+    make_store_dirs(target.parent)
+    atomic_write(target, b"SECRET_TOKEN=leak\n", confine_to=None, mode=0o600)
+    raise AssertionError(f"user store written inside the checkout at {target}")
+
+
+def test_codex_r22_f001_repository_home_parent_link_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity
+
+    _no_markers_above(tmp_path, monkeypatch)
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    (checkout / "child").mkdir()
+    link = checkout / "home"
+    link.symlink_to("child", target_is_directory=True)
+    (checkout / ".mcp.json").write_text('{"mcpServers": {}}')
+    monkeypatch.setenv("HOME", str(link))
+    assert home_identity.optional_operator_home() is None
+    monkeypatch.setenv("HOME", str(link / ".."))
+    assert Path.home().resolve() == checkout.resolve()
+    assert home_identity.optional_home_path(".mcp.json") is None
+
+
+def test_codex_r22_f002_operator_home_symlink_still_works_with_user_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity
+
+    _no_markers_above(tmp_path, monkeypatch)
+    home = tmp_path / "operator-home"
+    home.mkdir()
+    alias = tmp_path / "operator-home-link"
+    alias.symlink_to(home, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(alias))
+    assert home_identity.optional_operator_home() == alias
+    (home / ".mcp.json").write_text('{"mcpServers": {}}')
+    assert home_identity.optional_home_path(".mcp.json") == alias / ".mcp.json"
+
+
+def test_codex_r22_f003_missing_home_inside_checkout_cannot_receive_user_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity
+
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    home = checkout / "not-created"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(env_store, "_PINNED_USER_STORE", None)
+    assert not home.exists()
+    try:
+        env_store.set_env_value("user", "F003_TOKEN", "inert")
+    except home_identity.HomeInsideCheckoutError:
+        pass
+    assert not (home / ".config" / "pmcp" / "pmcp.env").exists()
+
+
+def test_gemini_r22_f001_operator_symlink_home_with_user_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.home_identity import home_is_operators, operator_home
+
+    real_home = tmp_path / "real_home"
+    real_home.mkdir()
+    (real_home / ".mcp.json").write_text("{}", encoding="utf-8")
+    symlink_home = tmp_path / "symlink_home"
+    symlink_home.symlink_to(real_home)
+    monkeypatch.setenv("HOME", str(symlink_home))
+    assert home_is_operators() is True
+    assert operator_home() == symlink_home
+
+
+def test_the_operators_home_ends_project_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The counterpart of a controlled home: the operator's own `~/.mcp.json`
+    is user config, never a project root found from below it."""
+    from pmcp.config.loader import find_project_root
+
+    home = tmp_path.resolve() / "home"
+    (home / "work").mkdir(parents=True)
+    (home / ".mcp.json").write_text('{"mcpServers": {}}')
+    monkeypatch.setenv("HOME", str(home))
+    assert find_project_root(home / "work") is None

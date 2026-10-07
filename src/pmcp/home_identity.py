@@ -1,22 +1,30 @@
-"""Is a directory the operator's home -- decided by file identity, never spelling.
+"""Is the home directory the operator's -- ONE rule, by kernel-order traversal.
 
-``HOME`` can be spelled through a symlink, and a directory can link to it, so a
-path comparison can both miss the real home and mistake a link for it
-(Consiliency/pmcp#372 round 19, board round 18 codex F001: a launch directory
-holding a link to an externally spelled home was taken for an ancestor of home,
-dropped from the residency guard, and a ``trust.json`` planted in it approved
-the served project). Every home comparison in the trust, residency and store
-code asks this module, which compares ``(st_dev, st_ino)`` only:
+**HOME is operator-owned if and only if no directory TRAVERSED while resolving
+HOME -- other than HOME's own final directory -- carries a checkout marker**
+(Consiliency/pmcp#372 round 23, board round 22: the patch-per-round rules did
+not converge).
 
-* the home directory and its PHYSICAL ancestors -- walked from
-  ``os.path.realpath(home)``, never from the spelling ``HOME`` holds;
-* and, for the residency guard, the directories on the default store's own
-  physical path -- home's ``.config`` and ``.config/pmcp`` -- each only while it
-  is a real directory, not a link: a store linked elsewhere is judged by where
-  it resolves, so a link into a checkout is still refused.
+"Traversed" is the kernel's own walk (the rule of Consiliency/pmcp#366's chain
+follower): HOME as written, component by component from ``/``; a symlink's
+target spliced in as written and walked from the right directory; ``..``
+applied after earlier links resolved; never ``abspath``/``normpath``/
+``realpath`` first. Every directory in which a name is looked up -- including
+those inside link targets -- counts; the final directory does not, so a
+dotfiles repository (or a ``~/.mcp.json``) at HOME is fine however HOME is
+reached. Components that do not exist end the walk: a checkout among the
+directories already traversed refuses HOME; otherwise the access reports its
+own error, and trust and approval decisions fail closed
+(:func:`trust_home_path`).
 
-No dependencies on the rest of pmcp, so the store, trust and config modules can
-all import it without a cycle.
+Settled by the rule: a repository ``home -> .`` or ``HOME=<checkout>/home/..``
+traverses the checkout (refused); a real directory inside a checkout (refused);
+an operator link such as ``/home -> /var/home`` (allowed); HOME itself a
+dotfiles repository (allowed); a missing HOME inside a checkout (refused).
+
+Every home-scoped file is located through this module's gate
+(``tests/test_store_reader_inventory.py`` forbids deriving HOME elsewhere). No
+dependencies on the rest of pmcp, so any module may import it.
 """
 
 from __future__ import annotations
@@ -25,100 +33,11 @@ import errno as _errno
 import os
 import stat
 import sys as _sys
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 Identity = tuple[int, int]
-
-
-def _identity(path: os.PathLike[str] | str, *, follow: bool = True) -> Identity | None:
-    try:
-        status = os.stat(path) if follow else os.lstat(path)
-    except OSError:
-        return None
-    return (status.st_dev, status.st_ino)
-
-
-def physical_home(home: Path | None = None) -> Path:
-    """The home directory as the kernel resolves it (``home``: default ``Path.home()``)."""
-    return Path(os.path.realpath(home if home is not None else Path.home()))
-
-
-def examinable_home(home: Path | None = None) -> Path | None:
-    """The physical home, or ``None`` when HOME cannot be examined.
-
-    Examinable means the kernel resolves HOME as spelled (``os.stat``) to the
-    same directory ``realpath`` names. ``realpath`` collapses ``missing/..``
-    lexically; the kernel does not -- for HOME spelled ``repo/missing/../home``
-    the two disagree, and nothing derived from that spelling may grant trust
-    (Consiliency/pmcp#372 round 23, board round 22 claude N-1).
-    """
-    spelled = home if home is not None else Path.home()
-    seen = _identity(spelled)
-    real = Path(os.path.realpath(spelled))
-    if seen is None or seen != _identity(real):
-        return None
-    return real
-
-
-def home_and_ancestor_identities(home: Path | None = None) -> set[Identity]:
-    """``(st_dev, st_ino)`` of the home directory and each of its PHYSICAL ancestors.
-
-    Empty while HOME cannot be examined (:func:`examinable_home`): nothing is
-    the operator's then, so no residency or ownership exemption applies.
-    """
-    real = examinable_home(home)
-    if real is None:
-        return set()
-    found: set[Identity] = set()
-    for directory in (real, *real.parents):
-        identity = _identity(directory)
-        if identity is not None:
-            found.add(identity)
-    return found
-
-
-def default_store_directory_identities(home: Path | None = None) -> set[Identity]:
-    """Home's ``.config`` and ``.config/pmcp``, each only while a REAL directory.
-
-    Judged with ``lstat``: a link at either name contributes nothing (nor does
-    anything below it), so a store linked into another directory is judged by
-    where it lands.
-    """
-    real = examinable_home(home)
-    if real is None:
-        return set()  # cannot examine HOME: no exemption (round 23)
-    found: set[Identity] = set()
-    current = real
-    for name in (".config", "pmcp"):
-        current = current / name
-        try:
-            status = os.lstat(current)
-        except OSError:
-            break
-        if not stat.S_ISDIR(status.st_mode):  # a link, or not a directory
-            break
-        found.add((status.st_dev, status.st_ino))
-    return found
-
-
-def is_home(directory: os.PathLike[str] | str, home: Path | None = None) -> bool:
-    """Is ``directory`` the home directory itself (by identity)?
-
-    Never while HOME cannot be examined (:func:`examinable_home`).
-    """
-    real = examinable_home(home)
-    identity = _identity(directory)
-    return real is not None and identity is not None and identity == _identity(real)
-
-
-# --------------------------------------------------------------------------- #
-# Operator ownership (Consiliency/pmcp#372 round 21, boards round 20 grok and
-# codex F001). Being home, an ancestor of home or the default store's directory
-# is not enough: a checkout can make a path LOOK like the operator's -- a
-# repository-shipped `home -> .` with HOME=<checkout>/home resolves home to the
-# checkout itself; a checkout that encloses home owns home's ancestors. A path
-# is the operator's only when no checkout controls it.
-# --------------------------------------------------------------------------- #
 
 #: What makes a directory a checkout: the markers project discovery uses
 #: (``config.loader.find_project_root``).
@@ -129,6 +48,17 @@ CHECKOUT_MARKERS = (
     "pyproject.toml",
     os.path.join(".pmcp", "manifest.yaml"),
 )
+
+#: More links than any real path has (the kernel's own limit is 40).
+_MAX_LINKS = 40
+
+
+def _identity(path: os.PathLike[str] | str) -> Identity | None:
+    try:
+        status = os.stat(path)
+    except OSError:
+        return None
+    return (status.st_dev, status.st_ino)
 
 
 def has_checkout_marker(directory: os.PathLike[str] | str) -> bool:
@@ -141,126 +71,169 @@ def has_checkout_marker(directory: os.PathLike[str] | str) -> bool:
     return False
 
 
-def _lexical_prefixes(path: os.PathLike[str] | str) -> list[Path]:
-    """``/``, ``/a``, ``/a/b``, ... of ``path`` AS WRITTEN (absolute, not resolved)."""
-    absolute = Path(os.path.abspath(path))
-    return [*reversed(absolute.parents), absolute]
+@dataclass
+class Traversal:
+    """The kernel-order walk of one path."""
+
+    #: Every directory a name was looked up in, physical, in walk order.
+    traversed: list[Path] = field(default_factory=list)
+    #: The physical final directory (or file); ``None`` if the walk stopped.
+    final: Path | None = None
+    #: The last physical directory reached (the final one, or where it stopped).
+    reached: Path = Path("/")
+    #: A component did not exist (``ENOENT``/``ENOTDIR``).
+    missing: bool = False
+    #: The walk could not continue for another reason (``EACCES``, ``ELOOP``).
+    unexaminable: bool = False
+
+    def marked(self) -> Path | None:
+        """The first traversed directory that is a checkout, or ``None``."""
+        return next((d for d in self.traversed if has_checkout_marker(d)), None)
 
 
-def _marked_at_or_above(resolved: Path) -> bool:
-    """Is any directory from ``resolved`` up to ``/`` a checkout (no exceptions)?"""
-    current = resolved
-    while True:
-        if has_checkout_marker(current):
-            return True
-        if current.parent == current:
-            return False
-        current = current.parent
+def traverse(path: os.PathLike[str] | str) -> Traversal:
+    """Walk ``path`` as the kernel resolves it, recording every directory used."""
+    spelled = os.fspath(path)
+    walk = Traversal()
+    current = Path("/") if os.path.isabs(spelled) else Path(os.getcwd())
+    remaining = deque(spelled.split("/"))
+    links = 0
+    while remaining:
+        name = remaining.popleft()
+        if name in ("", "."):
+            continue
+        walk.traversed.append(current)
+        if name == "..":
+            current = current.parent
+            continue
+        candidate = current / name
+        try:
+            status = os.lstat(candidate)
+        except (FileNotFoundError, NotADirectoryError):
+            walk.missing = True
+            walk.reached = current
+            return walk
+        except OSError:
+            walk.unexaminable = True
+            walk.reached = current
+            return walk
+        if stat.S_ISLNK(status.st_mode):
+            links += 1
+            if links > _MAX_LINKS:
+                walk.unexaminable = True
+                walk.reached = current
+                return walk
+            target = os.readlink(candidate)
+            if os.path.isabs(target):
+                current = Path("/")
+            remaining.extendleft(reversed(target.split("/")))
+            continue
+        if remaining and not stat.S_ISDIR(status.st_mode):
+            walk.missing = True  # a file where a directory is needed: ENOTDIR
+            walk.reached = current
+            return walk
+        current = candidate
+    walk.final = current
+    walk.reached = current
+    return walk
 
 
-def home_is_clean(home: Path | None = None) -> bool:
-    """Does HOME, as written, reach home without a link that resolves into a checkout?
+def _home_walk() -> Traversal:
+    return traverse(Path.home())
 
-    The condition for treating a repository AT home (a dotfiles repository) as
-    the operator's rather than as a checkout: a repository-shipped
-    ``<checkout>/home -> .`` makes home resolve to the checkout itself.
+
+def home_is_operators() -> bool:
+    """THE rule: no directory traversed to reach HOME (but HOME's own) is a checkout."""
+    return _home_walk().marked() is None
+
+
+def examinable_home() -> Path | None:
+    """HOME's physical final directory while HOME is the operator's and resolves.
+
+    ``None`` when a component is missing, the walk cannot proceed, or a
+    traversed directory is a checkout: nothing derived from such a HOME is the
+    operator's, and trust decisions refuse it.
     """
-    spelled = home if home is not None else Path.home()
-    for prefix in _lexical_prefixes(spelled):
-        if os.path.islink(prefix) and _marked_at_or_above(
-            Path(os.path.realpath(prefix))
-        ):
-            return False
-    return True
+    walk = _home_walk()
+    if walk.final is None or walk.marked() is not None:
+        return None
+    return walk.final
+
+
+def checkout_controlling_home() -> Path | None:
+    """The checkout HOME's resolution traverses, for a refusal message."""
+    return _home_walk().marked()
+
+
+def is_home(directory: os.PathLike[str] | str) -> bool:
+    """Is ``directory`` the operator's home itself (by identity)?"""
+    home = examinable_home()
+    identity = _identity(directory)
+    return home is not None and identity is not None and identity == _identity(home)
+
+
+def _operator_area_identities(store_directories: bool) -> set[Identity]:
+    """Home, its physical ancestors and (``store_directories``) home's real
+    ``.config`` / ``.config/pmcp`` -- empty unless HOME is the operator's."""
+    home = examinable_home()
+    if home is None:
+        return set()
+    found = {i for d in (home, *home.parents) if (i := _identity(d)) is not None}
+    if store_directories:
+        current = home
+        for name in (".config", "pmcp"):
+            current = current / name
+            try:
+                status = os.lstat(current)  # a link here is not the store's own
+            except OSError:
+                break
+            if not stat.S_ISDIR(status.st_mode) or has_checkout_marker(current):
+                break
+            found.add((status.st_dev, status.st_ino))
+    return found
+
+
+def is_operator_owned(
+    directory: os.PathLike[str] | str, *, store_directories: bool = True
+) -> bool:
+    """Is ``directory`` the operator's own?
+
+    By identity one of the operator's areas (:func:`_operator_area_identities`,
+    which needs HOME to be the operator's) -- AND reached, as written, through
+    no checkout (the same traversal rule applied to ``directory`` itself).
+    """
+    identity = _identity(directory)
+    if identity is None or identity not in _operator_area_identities(store_directories):
+        return False
+    return traverse(directory).marked() is None
 
 
 def enclosing_checkouts(start: os.PathLike[str] | str):  # type: ignore[no-untyped-def]
-    """Every checkout from ``start`` (resolved) up to ``/``, nearest first.
+    """Every checkout from ``start``'s physical directory up to ``/``, nearest first.
 
-    The residency walk -- not project discovery, which stops at home. The home
-    directory itself is skipped only while HOME is clean (:func:`home_is_clean`):
-    a dotfiles repository at home is the operator's; a checkout home merely
-    resolves to is not.
+    The residency walk -- not project discovery, which stops at home. The
+    operator's home directory itself (by identity) is never yielded: a dotfiles
+    repository there is the operator's.
     """
-    try:
-        current = Path(os.path.realpath(start))
-    except (OSError, ValueError):
-        return
-    skip_home = home_is_clean()
+    walk = traverse(start)
+    home = examinable_home()
+    home_identity = _identity(home) if home is not None else None
+    current = walk.final if walk.final is not None else walk.reached
     while True:
-        if has_checkout_marker(current) and not (skip_home and is_home(current)):
+        if has_checkout_marker(current) and not (
+            home_identity is not None and _identity(current) == home_identity
+        ):
             yield current
         if current.parent == current:
             return
         current = current.parent
 
 
-def inside_a_checkout(path: os.PathLike[str] | str) -> bool:
-    """Does a checkout enclose ``path`` along its UNRESOLVED spelling?
-
-    Each component as written, from ``/``: if the directory it names -- or the
-    target a link there resolves to -- lies inside a checkout, so does the path.
-    """
-    for prefix in _lexical_prefixes(path):
-        try:
-            if any(True for _ in enclosing_checkouts(prefix)):
-                return True
-        except OSError:
-            return True  # cannot establish: not the operator's
-    return False
-
-
-def controlling_checkout(path: os.PathLike[str] | str) -> Path | None:
-    """The nearest checkout enclosing ``path`` along its unresolved spelling."""
-    for prefix in reversed(_lexical_prefixes(path)):
-        try:
-            found = next(enclosing_checkouts(prefix), None)
-        except OSError:
-            continue
-        if found is not None:
-            return found
-    return None
-
-
-def checkout_controlling_home() -> Path | None:
-    """The checkout that controls HOME, for a refusal message (``None``: none found)."""
-    return controlling_checkout(Path.home())
-
-
-def is_operator_owned(
-    directory: os.PathLike[str] | str,
-    *,
-    store_directories: bool = True,
-    home: Path | None = None,
-) -> bool:
-    """THE predicate: is ``directory`` the operator's own?
-
-    Both must hold: (1) by identity it is home, a physical ancestor of home, or
-    (``store_directories``) home's real ``.config`` / ``.config/pmcp``; and (2)
-    no checkout encloses it along its unresolved spelling
-    (:func:`inside_a_checkout`). Used for the residency exemption, the startup
-    ``.env`` rule and the user store.
-    """
-    identity = _identity(directory)
-    if identity is None:
-        return False
-    areas = home_and_ancestor_identities(home)
-    if store_directories:
-        areas |= default_store_directory_identities(home)
-    if identity not in areas:
-        return False
-    return not inside_a_checkout(directory)
-
-
 # --------------------------------------------------------------------------- #
 # THE gate for every home-scoped read and write (Consiliency/pmcp#372 round 22,
-# board round 21 grok F001): with a repository-shipped `home -> .` and
-# HOME=<checkout>/home, the user config (~/.mcp.json), the user manifest
-# overlay and the base policy were read from the checkout, ungated, as the
-# operator's. Every file pmcp treats as the operator's because it sits under
-# HOME is located through these functions, which answer only while HOME is
-# operator-owned (is_operator_owned); otherwise pmcp runs without the file.
-# ``tests/test_store_reader_inventory.py`` forbids deriving HOME anywhere else.
+# board round 21 grok F001). Every file pmcp treats as the operator's because it
+# sits under HOME is located through these functions, which answer only while
+# HOME is the operator's; otherwise pmcp runs without the file.
 # --------------------------------------------------------------------------- #
 
 _HOME_REFUSAL = "the home directory lies inside a checkout"
@@ -271,10 +244,6 @@ _WARNED_HOME = False
 
 class HomeInsideCheckoutError(PermissionError):
     """HOME is not operator-owned: a checkout controls it."""
-
-
-def _refuse_home() -> HomeInsideCheckoutError:
-    return HomeInsideCheckoutError(_errno.EPERM, _HOME_REFUSAL)
 
 
 def _warn_home_once() -> None:
@@ -295,42 +264,19 @@ def reset_home_warning() -> None:
 
 
 def operator_home() -> Path:
-    """HOME, only while it is the operator's; otherwise raise.
+    """HOME, only while it is the operator's; otherwise raise (a PermissionError).
 
-    For writers and for stores whose readers already treat an ``OSError`` as an
-    unreadable store (the error is a ``PermissionError``).
+    A HOME that is missing or cannot be walked, and is not inside a checkout,
+    goes through: the access that follows reports its own error.
     """
-    home = Path.home()
-    if _identity(home) is None:
-        # Cannot even look at it: the access that follows fails with its own,
-        # accurate error (an unsearchable home is reported as such).
-        return home
-    if not is_operator_owned(home, store_directories=False):
+    if not home_is_operators():
         _warn_home_once()
-        raise _refuse_home()
-    return home
-
-
-def trust_home_path(*parts: str) -> Path:
-    """``home_path`` for TRUST and APPROVAL stores: fails closed.
-
-    Plain reads (the user store, user config) may go through a home that cannot
-    be examined and report the access's own error. A trust or approval decision
-    may not: a HOME the kernel cannot resolve as spelled -- or resolves to a
-    different directory than its lexical spelling -- is refused, with one
-    value-free line (Consiliency/pmcp#372 round 23).
-    """
-    if examinable_home() is None:
-        print(f"pmcp: Refusing the trust stores: {HOME_UNEXAMINABLE}", file=_sys.stderr)
-        raise HomeInsideCheckoutError(_errno.EPERM, HOME_UNEXAMINABLE)
-    return home_path(*parts)
+        raise HomeInsideCheckoutError(_errno.EPERM, _HOME_REFUSAL)
+    return Path.home()
 
 
 def optional_operator_home() -> Path | None:
-    """HOME, only while it is the operator's; otherwise ``None`` (one warning).
-
-    For optional user files: pmcp then runs without them, failing closed.
-    """
+    """HOME, only while it is the operator's; otherwise ``None`` (one warning)."""
     try:
         return operator_home()
     except HomeInsideCheckoutError:
@@ -348,9 +294,17 @@ def optional_home_path(*parts: str) -> Path | None:
     return None if home is None else home.joinpath(*parts)
 
 
-def home_is_operators() -> bool:
-    """Is HOME the operator's (no checkout controls it)? No warning."""
-    return is_operator_owned(Path.home(), store_directories=False)
+def trust_home_path(*parts: str) -> Path:
+    """``home_path`` for TRUST and APPROVAL stores: fails closed.
+
+    Refused, with one value-free line, while HOME cannot be examined -- missing,
+    or not walkable -- as well as while a checkout controls it.
+    """
+    path = home_path(*parts)
+    if examinable_home() is None:
+        print(f"pmcp: Refusing the trust stores: {HOME_UNEXAMINABLE}", file=_sys.stderr)
+        raise HomeInsideCheckoutError(_errno.EPERM, HOME_UNEXAMINABLE)
+    return path
 
 
 def spelled_home() -> Path:

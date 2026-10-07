@@ -305,8 +305,10 @@ authentication or "missing variable" error, even though the key is in `.env`.
 
 **What changed.** A `~/.env` (in your home directory or an ancestor of it, when no
 checkout encloses that directory -- a checkout above your home owns its `.env`; and if
-your home directory itself lies inside a checkout, or is reached through a link a
-repository ships, pmcp uses none of your home-scoped files and says so once) still
+resolving your home directory passes through a checkout -- it lies inside one, or a
+link on the way leads through one, or a missing home would be created inside one --
+pmcp uses none of your home-scoped files and says so once; a dotfiles repository AT
+your home directory, and a home reached through your own links, are fine) still
 loads into pmcp's own environment, and pmcp now strips every key it loaded that
 way from the environment of the servers it spawns. Any other `.env` -- a
 project's, or a checkout's that the install walk reaches -- never enters pmcp's
