@@ -1,25 +1,26 @@
 # Detailed plan: describe validation errors from their structure, never their value — everywhere pmcp turns an exception into text
 
-> **Revision 28 (2026-10-07), on main `bc0a9ce`.** Consiliency/pmcp#297, the
+> **Revision 29 (2026-10-07), on main `bc0a9ce`.** Consiliency/pmcp#297, the
 > prerequisite for piece B (`extra="forbid"`) of Consiliency/pmcp#236. The
 > change is **embedded, not described**. The 52 blocks under *Verbatim
 > bodies* are `git apply` patches against `origin/main` @ `bc0a9ce`. They are
 > byte-identical to the verified code on the branch `wip/297-code` @
-> `bf648d5`. *Embedding proof* extracts them from this file and applies them
+> `6edb9f6`. *Embedding proof* extracts them from this file and applies them
 > on a fresh `bc0a9ce`, then compares every file. The base stays `bc0a9ce`
 > for this rev; merging later main is for the implementation PR.
 >
-> **For the board:** review the spike's tree (`wip/297-code` @ `bf648d5`,
+> **For the board:** review the spike's tree (`wip/297-code` @ `6edb9f6`,
 > whose diff from `bc0a9ce` is these patches). The bundle may leave the
 > patches out.
 >
-> **What rev 28 changes:** it answers round 26 on Consiliency/pmcp#314 @
-> `7900699`. Grok and gemini: AGREE. Claude: PARTIALLY AGREE, with nothing
-> blocking. Codex errored. Claude's N1 is fixed: a validation error's
-> `title` is printed only when it is the name of a model pmcp, `mcp_types`
-> or the SDK defines, and any other title reads `<model>` (*Rev 28*).
+> **What rev 29 changes:** it answers round 27 on Consiliency/pmcp#314 @
+> `761ccb0`. Claude and gemini: AGREE. Grok timed out. Codex: DISAGREE,
+> with one finding: the HTTP transport logged the raw `Accept` header.
+> Request metadata is now caller content like the body. pmcp's transport
+> logs its structure only, and an AST check and a header grid bind that
+> (*Rev 29*).
 
-## History (revs 1–27)
+## History (revs 1–28)
 
 Each revision answered the previous board. The full text is in the plan at
 that sha, at `.consiliency/plans/detailed-297-validation-echo-20260928-2127.md`.
@@ -50,6 +51,7 @@ The line ranges are that file's.
 | 21 | `7bcb209` | round 19: 65–77 | 78–131 (every `except` binding; templates bound) |
 | 22 | `221115a` | round 20: 67–83 | 84–134 (response decoding; parser kinds; attribute allowlist); merge of `bc0a9ce`: 136–172 |
 | 23 | `5054a76` | round 21: 69–89 | 90–180 (every HTTP client's response errors; the grid; pmcp fields bound to pmcp classes) |
+| 28 | `761ccb0` | round 26: 67–80 | 81–121 (a validation error's title, only for a declared model) |
 | 27 | `7900699` | round 25: 70–94 | 95–178 (one traceback walk gives origin and site; fail closed) |
 | 26 | `62ab87e` | round 24: 70–93 | 94–210 (the SDK's client side; any exception an HTTP client raises, by origin) |
 | 25 | `ef7ad60` | round 23: 70–87 | 88–179 (every HTTP client exception registered; one phrase; TLS-mismatch rows) |
@@ -59,8 +61,109 @@ The code for revs 1–17 is at `19dac95`, `929f693`, `026aadc`, `ee644a9`,
 `1824a09`, `9b24daa`, `dd3f707`, `2d9e736`, `8d33b49`, `6078419`,
 `46c4904`, `0a93265`, `ebcf4fc`, `06a9e01`, `67bd04d`, `403a83a` (rev 16),
 `18824c1` (rev 17), `b34717e` (rev 18), `fc88ea8` (rev 19), `f89527e` (rev
-20), `eb8796c` (rev 21), `30dc945` (rev 22), `825c43a` (rev 23), `86a63a6` (rev 24), `89a47c1` (rev 25), `5a93b9c` (rev 26) and `e8e7ef6` (rev 27, on origin). Rev 17 before the
+20), `eb8796c` (rev 21), `30dc945` (rev 22), `825c43a` (rev 23), `86a63a6` (rev 24), `89a47c1` (rev 25), `5a93b9c` (rev 26), `e8e7ef6` (rev 27) and `bf648d5` (rev 28, on origin). Rev 17 before the
 merge of `6edf8a4` was `9e5cb57`.
+
+## Rev 29: request headers are caller content
+
+**Round 27.**
+- Claude: AGREE, with no findings. It re-swept all 24 earlier falsifier
+  files.
+- Gemini: AGREE.
+- Grok timed out.
+- Codex: DISAGREE, with one blocking finding.
+
+**Codex F001.** `handle_mcp`'s DEBUG entry log carried the raw `Accept`
+header, before any transport validation. So `Accept: text/<S>` reached a
+`pmcp.transport.http` record as a plain-string argument, which
+`scrub_record` leaves alone. The grids had varied request bodies only, and
+always sent acceptable headers.
+
+Looking for the class turned up two more values in pmcp's own logs:
+- the entry log's first 8 characters of the caller's `Mcp-Session-Id`;
+- the rate-limit log's client address. Behind a trusting proxy, that
+  address is the caller's `X-Forwarded-For`.
+
+**The ruling: fix the class.** Every caller-supplied piece of request
+metadata is caller content, the same as the body.
+
+**Rev 29.**
+- **The entry log is structural.** It carries:
+  - the HTTP method, from a fixed set, else `other`;
+  - `session=present|absent`;
+  - how `Accept` classifies: `json+sse`, `json`, `sse`, `absent` or
+    `other`;
+  - the header names. A name outside a fixed set of known names reads
+    `other`, because a header's name is the caller's choice too.
+
+  It no longer logs the path, the session id's prefix or the `Accept`
+  text.
+- **The session id is not logged at all**, only whether one was sent. The
+  caller sends it, so its value is the caller's whether or not the SDK
+  issued it.
+- **The rate-limit log** says `429 rate limited`, without the address.
+- Every other place pmcp reads request metadata only decides from it:
+  - the Origin and Host checks;
+  - the bearer token;
+  - the content-length cap;
+  - the trace-context and header-presence scope entries, which are passed
+    on and never logged.
+
+  The HTTP transport is the only pmcp module that reads request metadata.
+  The SDK's own responses and logs about headers are rev 20's and rev 26's.
+
+**The bindings.**
+- **`test_no_request_metadata_reaches_a_log_or_a_response`** is an AST
+  check over `src/pmcp`.
+  - **Flagged values:**
+    - a request's `headers`, `query_params`, `path_params`, `url`,
+      `client`, `method` or `cookies`;
+    - a `scope[...]` read of a metadata key;
+    - a name bound to either, through one assignment.
+  - **Where:** in a logging call, or in a response construction
+    (`Response`, `JSONResponse`, `_reject`, `_auth_response`, …).
+  - **Not flagged:** the test of a conditional (`"present" if … else …`),
+    and the arguments of the reviewed classifiers (`_method_class`,
+    `_accept_class`, `_header_names`).
+  - The reviewed-sink allowlist is empty.
+  - `test_the_request_metadata_check_sees_each_shape` is its self-test.
+- **`test_no_request_header_reaches_any_output`** is the header grid.
+  - **Headers:** every header the transport or the SDK reads (`Accept`,
+    `Content-Type`, `Mcp-Session-Id`, `Mcp-Protocol-Version`,
+    `Last-Event-ID`, `Origin`, `Host`, `Authorization`), plus one
+    arbitrary extra header, and one header whose *name* carries the
+    sentinel. Each carries the sentinel.
+  - **Configurations:** no auth, shared-secret, allowed origins, and rate
+    limited.
+  - **Requests:** an `initialize` POST, a session POST, a GET and a
+    DELETE.
+  - **Checked:** every log record at DEBUG (tracebacks included), and
+    every response body and header.
+  - **Windows:** 8-character windows as well as `_forbidden`'s 12, which
+    is what makes the session-id prefix visible.
+  - **Non-vacuity:** the transport must log each request.
+- **`test_a_rejected_accept_header_is_not_logged`** is codex's falsifier
+  as filed: a 406, and `accept=other` in the entry log.
+
+**Red on rev 28's code:**
+On rev 28's code (`bf648d5`'s `src` with this `test_parse_error_echo.py` and `test_http_transport.py`):
+
+```text
+  1 test_http_transport.py::test_a_rejected_accept_header_is_not_logged
+  8 test_http_transport.py::test_no_request_header_reaches_any_output
+  1 test_http_transport.py::test_no_request_metadata_reaches_a_log_or_a_response
+10 failed, 430 passed, 40 warnings in 86.14s (0:01:26)
+```
+
+- The grid fails for `Accept`, codex's case, and for `Mcp-Session-Id`
+  (the 8-character prefix), under all four configurations.
+- The AST check flags the entry log and the rate-limit log.
+- The other headers' rows pass on rev 28: nothing else logged or returned
+  a header value. The header-name row passes there too, because rev 28
+  logged no header names; M195 binds it here.
+
+**Mutants:** M193–M196 restore the Accept text, the session prefix, an
+unknown header's name, and the client address.
 
 ## Rev 28: a validation error's title, only when it is a declared model
 
@@ -1233,7 +1336,7 @@ read, is a sink.
 
 ## Changes
 
-The patches are `git diff bc0a9ce bf648d5 -- <file>`: 52 files, +15485 / −691. This is
+The patches are `git diff bc0a9ce 6edb9f6 -- <file>`: 52 files, +15855 / −700. This is
 one concern applied at every sink, past the bounded-plan threshold on
 purpose. Rev 20:
 - adds `pmcp/sdk_rejections.py`, installed with the log scrubber;
@@ -1293,6 +1396,13 @@ Rev 28 changes:
   expectations;
 - `CHANGELOG.md`: the `<Model>` sentence.
 
+Rev 29 changes:
+- `transport/http.py`: the structural entry and rate-limit logs, and
+  their classifiers;
+- `test_http_transport.py`: the AST check, the header grid, and codex's
+  falsifier;
+- `CHANGELOG.md`: one sentence.
+
 All 52 patches are one `git apply`: no import cycles, no
 migration, no config change.
 
@@ -1324,10 +1434,10 @@ On a fresh `bc0a9ce` with the patches applied:
 - run the full suite `-m 'not live and not slow'` with the npm cache
   variables unset.
 
-## Acceptance criteria — measured on `bf648d5`
+## Acceptance criteria — measured on `6edb9f6`
 
-- [x] The eight modules and Consiliency/pmcp#371's two are green: `1609 passed in 456.74s (0:07:36)`.
-- [x] Red on main `bc0a9ce`, with the eight test files from `bf648d5`
+- [x] The eight modules and Consiliency/pmcp#371's two are green: `1660 passed, 40 warnings in 451.09s (0:07:31)`.
+- [x] Red on main `bc0a9ce`, with the eight test files from `6edb9f6`
   (`--tb=line`; the errors are a fixture importing `pmcp.argument_errors`):
 
 ```text
@@ -1335,27 +1445,28 @@ On a fresh `bc0a9ce` with the patches applied:
   99 tests/test_downstream_frame_echo.py
    9 tests/test_exception_text_sinks.py
    3 tests/test_gateway_tool_schemas.py
-  28 tests/test_http_transport.py
+  38 tests/test_http_transport.py
   80 tests/test_log_record_scrubber.py
  249 tests/test_parse_error_echo.py
    6 tests/test_scoped_advisor_audit.py
-590 failed, 626 passed, 57 errors in 141.86s (0:02:21)
+600 failed, 667 passed, 40 warnings, 57 errors in 141.12s (0:02:21)
 ```
 
-- [x] Binding: on rev 27's code, the title rows fail on the leak, and the re-pinned
-expectations and the census fail (*Rev 28*). It passes here. M191 and M192
-each remove part of the rule (see *Mutation evidence*).
+- [x] Binding: on rev 28's code, the header grid fails for `Accept` and `Mcp-Session-Id`,
+codex's falsifier fails, and the AST check flags both logs (*Rev 29*). It
+passes here. M193–M196 each remove part of the rule (see *Mutation
+evidence*).
 
 - [x] The full suite, with `npm_config_cache`, `npm_config_store_dir` and
-  `pnpm_config_store_dir` unset: `10261 passed, 6 skipped, 80 deselected in 1108.08s (0:18:28)`. The green run, the full suite
+  `pnpm_config_store_dir` unset: `10312 passed, 6 skipped, 80 deselected, 40 warnings in 1111.61s (0:18:31)`. The green run, the full suite
   and the gates ran on host `ai` (`uv run --isolated --all-extras -p 3.10`),
-  from a worktree of the pushed `bf648d5`.
+  from a worktree of the pushed `6edb9f6`.
 - [x] Gates: ruff check: `All checks passed!`; ruff format --check: `193 files already formatted`; mypy: `Success: no issues found in 57 source files`.
 
 ## Mutation evidence
 
 `mutants.py` ran on host `ai`, three lanes per pass, on worktrees of
-`bf648d5`. Each mutant ran in a fresh `uv run --isolated` environment
+`6edb9f6`. Each mutant ran in a fresh `uv run --isolated` environment
 (`PYCMD`).
 
 The procedure:
@@ -1366,12 +1477,12 @@ The procedure:
   checked with `cmp` and against HEAD's blob by sha-256;
 - `git status` after the run: `0` and `0`.
 
-The purposes of M1–M190 are in the history table's plans (M186–M190:
-`7900699`). Rev 28 adds M191 (the title printed verbatim) and M192 (every
-loaded module's model names declared).
+The purposes of M1–M192 are in the history table's plans (M191–M192:
+`761ccb0`). Rev 29 adds M193 (the Accept text), M194 (a session id's
+prefix), M195 (an unknown header's name) and M196 (the client address).
 
 ```text
-168 mutants applied; 166 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M192
+172 mutants applied; 170 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M196
 survived: M23 SDK parse error keeps its message
 survived: M25 malformed error message kept
 ```
@@ -1379,7 +1490,7 @@ survived: M25 malformed error message kept
 `NO_STATIC=1` deselects the sink guard and the helpers-only rule:
 
 ```text
-168 mutants applied; 161 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M149 M151–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M192
+172 mutants applied; 165 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M149 M151–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M196
 survived: M19 tasks_get response uses str(e)
 survived: M20 tasks_get audit buffer uses str(e)
 survived: M22 installer crash message uses raw exc (static guard)
@@ -1391,7 +1502,7 @@ survived: M150 a narrow OSError handler renders its raw text (CLI auth-token fil
 
 M23 and M25 are equivalent mutants. Their combined partners, M102 and M90,
 die in both passes. M19, M20, M22, M35 and M150 die only on the sink guard,
-by design. These survivors are the same as in revs 23 to 27.
+by design. These survivors are the same as in revs 23 to 28.
 
 Rev 27's mutants still die in both passes:
 - M186, M187, M188 and M189 die on the SDK-helper matrix:
@@ -1401,9 +1512,14 @@ Rev 27's mutants still die in both passes:
 - M190 dies on `test_downstream_frame_echo`'s session-message rows, the
   regression the first ai run found.
 
-Rev 28's mutants die in both passes. Each stops first, under `-x`, on
+Rev 28's mutants still die in both passes. Each stops first, under `-x`, on
 `test_argument_error_echo.py`'s re-pinned `_CollidingErrors` expectation:
 a test's model title reads `<model>`, and both mutants print it.
+
+Rev 29's mutants die in both passes:
+- M193, M194 and M195 die on the header grid;
+- M196 dies on the AST check, because the rate-limit row cannot choose the
+  test client's address.
 
 ## Non-goals and unverified
 
@@ -1455,6 +1571,10 @@ a test's model title reads `<model>`, and both mutants print it.
     of the *Rev 24* section. Rev 24's own plan (`6b17d3d`) has that red
     table filled. This rev fills it again, and adds a check that no
     placeholder survives assembly.
+  - **The title rule trusts the packages' module namespaces** (round 27
+    claude). A model class bound into a pmcp, `mcp_types` or SDK module
+    under its own `__name__` is a declared name. No code binds models
+    there at run time today.
   - **The origin rule needs an intact traceback** (round 25 claude N1).
     It fails open, falling back to registration by class, when the
     frames are gone. Three cases do that, each of which leaks an
@@ -1543,7 +1663,7 @@ a test's model title reads `<model>`, and both mutants print it.
 
 ## Embedding proof
 
-From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@bf648d5`. The proof was run again on the final file, with this section in it, and printed the same listing.
+From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@6edb9f6`. The proof was run again on the final file, with this section in it, and printed the same listing.
 
 ```text
 $ git -C <proof worktree> rev-parse --short HEAD
@@ -1576,7 +1696,7 @@ done
 git apply --unidiff-zero --check <scratch>/*.patch && git apply --unidiff-zero <scratch>/*.patch
 ```
 
-The patches are `git diff -U0 bc0a9ce bf648d5 -- <file>`. To fit the size
+The patches are `git diff -U0 bc0a9ce 6edb9f6 -- <file>`. To fit the size
 budget, each is cut to plain unified-diff form: there are no `diff --git`,
 `index` or `new file mode` lines, and no function context in the hunk
 headers. `git apply` reads them the same way; a new file is created with
@@ -1633,7 +1753,7 @@ print(f"{out}: {j - i - 1} lines")
 @@ -611,0 +612,17 @@
 +- **A value pmcp rejects is no longer echoed into a response, a log line, a traceback or an audit record (Consiliency/pmcp#297).** A rejected gateway-tool argument used to come back with jsonschema's or pydantic's message, which carried the value (`'Bearer sk-…' is not of type 'object'`, `input_value=…`), in the response, the log and the scoped audit. Rejections now read `<JSON path>: <reason>`, for example `Input validation error: $.options: must be of type object or null`. The reason is a fixed phrase filled only from the tool's own schema or model, and a key the caller chose shows as `*`. A call rejected by the argument model is audited as an `audit.rejection`. **Wording change:** a client matching jsonschema phrases such as `is not of type` must match the new form.
 +
-+  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`, where `<Model>` is a model class pmcp or the MCP SDK defines, and any other title reads `<model>`. An exception that chains a validation or parse error, as its cause, its context or a group member, shows only its class and that error's description, never its own message; pmcp's own refusals (an invalid policy file, a trust store it cannot parse) chain nothing and still name the file and the refusal. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500. The MCP SDK's own rejections no longer quote the request, on every transport: an unknown method's name is no longer returned as `data`, an unsupported protocol version's `requested` is returned only when it is a protocol revision, an SDK message pmcp has not reviewed reads as a fixed phrase for its code, and on `/mcp` a body that is not JSON or not a JSON-RPC message is described from its structure (`Validation error: N validation errors for …: $.<path>: <reason>`). Errors from pmcp's own tools are unchanged, and so is the request id. The SDK's server-side DEBUG logs and `sse_starlette`'s no longer show request text. A failed tool call whose error carries a rejected value is never read as a URL-elicitation request or an auth challenge. An HTTP response pmcp rejects -- a malformed status or header line, bad chunk framing, a truncated or undecodable body, an unexpected content type, an error status's reason phrase, a proxy's refusal of any status, a redirect to an unsupported scheme -- is reported by its class and status number, never its bytes, by every HTTP client pmcp uses (registry, version and package lookups, JWKS and auth metadata, feedback, the CLI's health probes, and remote MCP servers in `gateway.health`); the HTTP client libraries' DEBUG traces are masked likewise. Every error an HTTP client pmcp uses raises (aiohttp, httpx, httpcore, h11, urllib and `http.client`) reads `an HTTP request failed (<class>[, status N])`, without its library or OS text: that text can name a host a followed redirect chose, or a proxy's reason phrase. Each call site still names its own package, URL or server. Any exception, of any type, that such a client's own code raises reads the same way, a redirect `Location` its URL parser rejects included. The MCP SDK's client transports are held to the same rule: a reply the SDK writes for the downstream from the response (`Unexpected content type: …`) reads as its code's fixed phrase in connect errors and `gateway.health`; an exception the SDK raises with text pmcp has not reviewed reads by its class and code; and every `mcp.*` logger, client and server, is masked, its tracebacks printing each exception by class. A traceback whose chain holds such an error prints every other exception in it by its class alone. An `MCPError` a gateway tool raises while handling a value it rejected keeps its code, and its message becomes the structural description.
++  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`, where `<Model>` is a model class pmcp or the MCP SDK defines, and any other title reads `<model>`. An exception that chains a validation or parse error, as its cause, its context or a group member, shows only its class and that error's description, never its own message; pmcp's own refusals (an invalid policy file, a trust store it cannot parse) chain nothing and still name the file and the refusal. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500. Request headers, like the body, are caller content: the HTTP transport's DEBUG entry log names the method, whether a session header came, how `Accept` classifies (`json+sse`, `json`, `sse`, `other`) and the header names, never a header's value, and the rate-limit log no longer names the client address. The MCP SDK's own rejections no longer quote the request, on every transport: an unknown method's name is no longer returned as `data`, an unsupported protocol version's `requested` is returned only when it is a protocol revision, an SDK message pmcp has not reviewed reads as a fixed phrase for its code, and on `/mcp` a body that is not JSON or not a JSON-RPC message is described from its structure (`Validation error: N validation errors for …: $.<path>: <reason>`). Errors from pmcp's own tools are unchanged, and so is the request id. The SDK's server-side DEBUG logs and `sse_starlette`'s no longer show request text. A failed tool call whose error carries a rejected value is never read as a URL-elicitation request or an auth challenge. An HTTP response pmcp rejects -- a malformed status or header line, bad chunk framing, a truncated or undecodable body, an unexpected content type, an error status's reason phrase, a proxy's refusal of any status, a redirect to an unsupported scheme -- is reported by its class and status number, never its bytes, by every HTTP client pmcp uses (registry, version and package lookups, JWKS and auth metadata, feedback, the CLI's health probes, and remote MCP servers in `gateway.health`); the HTTP client libraries' DEBUG traces are masked likewise. Every error an HTTP client pmcp uses raises (aiohttp, httpx, httpcore, h11, urllib and `http.client`) reads `an HTTP request failed (<class>[, status N])`, without its library or OS text: that text can name a host a followed redirect chose, or a proxy's reason phrase. Each call site still names its own package, URL or server. Any exception, of any type, that such a client's own code raises reads the same way, a redirect `Location` its URL parser rejects included. The MCP SDK's client transports are held to the same rule: a reply the SDK writes for the downstream from the response (`Unexpected content type: …`) reads as its code's fixed phrase in connect errors and `gateway.health`; an exception the SDK raises with text pmcp has not reviewed reads by its class and code; and every `mcp.*` logger, client and server, is masked, its tracebacks printing each exception by class. A traceback whose chain holds such an error prints every other exception in it by its class alone. An `MCPError` a gateway tool raises while handling a value it rejected keeps its code, and its message becomes the structural description.
 +
 +  Downstream frames:
 +  - A frame that is not JSON-RPC 2.0 is dropped with a value-free DEBUG record and never settles a request. This holds on stdio, SSE and streamable HTTP.
@@ -6243,7 +6363,7 @@ print(f"{out}: {j - i - 1} lines")
 +    except ValueError:
 +        return None
 +    if not parsed.scheme or not hostname:
-@@ -284,2 +297,86 @@
+@@ -284,2 +297,141 @@
 -    port = str(parsed.port) if parsed.port is not None else default_port
 -    return parsed.hostname, port
 +    port = str(explicit_port) if explicit_port is not None else default_port
@@ -6332,14 +6452,94 @@ print(f"{out}: {j - i - 1} lines")
 +        return body
 +    payload = {**payload, "error": changed}
 +    return json.dumps(payload, separators=(",", ":")).encode()
-@@ -710 +807 @@
++
++
++#: The HTTP methods the entry log names; any other reads `other` (rev 29).
++_LOGGED_METHODS = frozenset({"GET", "POST", "DELETE", "HEAD", "OPTIONS"})
++#: Request header names the entry log names; any other reads `other`, since a
++#: header's name is the caller's choice too (rev 29).
++_KNOWN_HEADER_NAMES = frozenset(
++    {
++        "accept",
++        "accept-encoding",
++        "authorization",
++        "baggage",
++        "connection",
++        "content-length",
++        "content-type",
++        "host",
++        "last-event-id",
++        "mcp-method",
++        "mcp-name",
++        "mcp-protocol-version",
++        "mcp-session-id",
++        "origin",
++        "traceparent",
++        "tracestate",
++        "transfer-encoding",
++        "user-agent",
++    }
++)
++
++
++def _method_class(method: str) -> str:
++    return method if method in _LOGGED_METHODS else "other"
++
++
++def _accept_class(accept: str) -> str:
++    """How an Accept header classifies, never its text: which of the two
++    media types the transport negotiates it offers."""
++    offered = {part.split(";", 1)[0].strip().lower() for part in accept.split(",")}
++    json_ok = bool(offered & {"application/json", "application/*", "*/*"})
++    sse_ok = bool(offered & {"text/event-stream", "text/*", "*/*"})
++    if json_ok and sse_ok:
++        return "json+sse"
++    if json_ok:
++        return "json"
++    if sse_ok:
++        return "sse"
++    return "absent" if not accept.strip() else "other"
++
++
++def _header_names(request: Any) -> set[str]:
++    """The request's header names, each a known name or ``other``."""
++    return {
++        name if name in _KNOWN_HEADER_NAMES else "other"
++        for name in (key.lower() for key in request.headers.keys())
++    }
+@@ -555 +707,4 @@
+-        session_id_short = (request.headers.get("mcp-session-id") or "")[:8] or "<none>"
++        # Request metadata is caller content, like the body (rev 29,
++        # round-27 codex F001): the entry log carries its structure only --
++        # the HTTP method from a fixed set, whether a session header came,
++        # how the Accept header classifies, and the header names.
+@@ -557 +712 @@
+-            "handle_mcp [%s]: %s method=%s session=%s accept=%r",
++            "handle_mcp [%s]: method=%s session=%s accept=%s headers=%s",
+@@ -559,4 +714,4 @@
+-            request.url.path,
+-            request.method,
+-            session_id_short,
+-            request.headers.get("accept", ""),
++            _method_class(request.method),
++            "present" if request.headers.get("mcp-session-id") else "absent",
++            _accept_class(request.headers.get("accept", "")),
++            ",".join(sorted(_header_names(request))),
+@@ -653,3 +808,3 @@
+-                logger.debug(
+-                    "handle_mcp [%s]: 429 rate limited ip=%s", request_id, client_ip
+-                )
++                # Not the address: behind a trusting proxy it is the caller's
++                # `X-Forwarded-For` (rev 29).
++                logger.debug("handle_mcp [%s]: 429 rate limited", request_id)
+@@ -710 +865 @@
 -                body_method = json.loads(body_bytes).get("method")
 +                body_method = load_json(body_bytes, source="request body").get("method")
-@@ -751,0 +849,3 @@
+@@ -751,0 +907,3 @@
 +        request_body = body_bytes if request.method == "POST" else None
 +        held_start: MutableMapping[str, Any] | None = None
 +        held_body: list[bytes] = []
-@@ -754,2 +854,11 @@
+@@ -754,2 +912,11 @@
 -            nonlocal response_started
 -            if message.get("type") == "http.response.start":
 +            # A JSON response the SDK sends with an error status is held until
@@ -6353,7 +6553,7 @@ print(f"{out}: {j - i - 1} lines")
 +                ).startswith(b"application/json"):
 +                    held_start = message
 +                    return
-@@ -756,0 +866,18 @@
+@@ -756,0 +924,18 @@
 +            elif kind == "http.response.body" and held_start is not None:
 +                held_body.append(message.get("body", b""))
 +                if message.get("more_body", False):
@@ -12856,7 +13056,9 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- a/tests/test_http_transport.py
 +++ b/tests/test_http_transport.py
-@@ -491,0 +492,46 @@
+@@ -4,0 +5 @@
++import ast
+@@ -491,0 +493,46 @@
 +    @pytest.mark.parametrize(
 +        "client_kwargs",
 +        [
@@ -12903,7 +13105,7 @@ print(f"{out}: {j - i - 1} lines")
 +        assert sentinel not in observed
 +        assert sentinel.encode("utf-8").hex() not in observed.encode("utf-8").hex()
 +
-@@ -594,0 +641,1647 @@
+@@ -594,0 +642,1949 @@
 +
 +
 +# --- rev 19: the SDK's transport rejections are value-free (round-17 grok F001,
@@ -14551,6 +14753,308 @@ print(f"{out}: {j - i - 1} lines")
 +        )
 +        == "Header mismatch"
 +    )
++
++
++# --- request headers are caller content (rev 29, round-27 codex F001) --------
++
++_HEADER_S = "callerheadersentinelvaluezulu"
++
++#: Every request header pmcp's transport or the SDK's reads, plus one it
++#: does not, each carrying the sentinel in a shape the reader accepts or
++#: rejects.
++_SENTINEL_HEADERS: dict[str, str] = {
++    "accept": f"text/{_HEADER_S}",
++    "content-type": f"application/{_HEADER_S}",
++    "mcp-session-id": _HEADER_S,
++    "mcp-protocol-version": _HEADER_S,
++    "last-event-id": _HEADER_S,
++    "origin": f"http://{_HEADER_S}.example",
++    "host": f"{_HEADER_S}.example",
++    "authorization": f"Bearer {_HEADER_S}",
++    "x-extra-header": _HEADER_S,
++    # A header whose *name* is the caller's choice (rev 29).
++    f"x-{_HEADER_S}": "1",
++}
++
++_INITIALIZE = {
++    "jsonrpc": "2.0",
++    "id": 1,
++    "method": "initialize",
++    "params": {
++        "protocolVersion": "2025-06-18",
++        "capabilities": {},
++        "clientInfo": {"name": "grid", "version": "1"},
++    },
++}
++
++
++@pytest.mark.parametrize(
++    "config",
++    ["none", "shared-secret", "allowed-origins", "rate-limited"],
++)
++@pytest.mark.parametrize("header", sorted(_SENTINEL_HEADERS))
++def test_no_request_header_reaches_any_output(
++    header: str, config: str, caplog: pytest.LogCaptureFixture
++) -> None:
++    """Each header the transport reads, and one it does not, with the
++    sentinel as its value, on an `initialize` POST, a session POST, a GET
++    and a DELETE, under each auth and origin configuration: no form of it
++    in any log record at DEBUG (traceback included), response body or
++    response header (rev 29)."""
++    import logging
++    from typing import Any
++
++    import pmcp  # noqa: F401 - installs the scrubbers
++    from mcp.server.lowlevel import Server
++    from starlette.testclient import TestClient
++
++    from pmcp.transport.http import create_http_app
++    from tests.test_argument_error_echo import _forbidden, _record_text
++
++    caplog.set_level(logging.DEBUG)
++    kwargs: dict[str, Any] = {}
++    base = {"accept": "application/json, text/event-stream"}
++    if config == "shared-secret":
++        kwargs = {"auth_token": "configured-secret", "auth_mode": "shared-secret"}
++        base["authorization"] = "Bearer configured-secret"
++    elif config == "allowed-origins":
++        kwargs = {"allowed_origins": ["https://allowed.example"]}
++    elif config == "rate-limited":
++        kwargs = {"rate_limit_rpm": 1}
++    app = create_http_app(Server("header-grid"), **kwargs)
++    headers = {**base, header: _SENTINEL_HEADERS[header]}
++    outputs: list[str] = []
++    with TestClient(app, base_url="http://127.0.0.1") as client:
++        for method, body in (
++            ("POST", _INITIALIZE),
++            ("POST", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
++            ("GET", None),
++            ("DELETE", None),
++        ):
++            request_headers = dict(headers)
++            if method == "GET" and header != "accept":
++                request_headers["accept"] = "text/event-stream"
++            try:
++                response = client.request(
++                    method, "/mcp", headers=request_headers, json=body, timeout=10
++                )
++            except Exception as error:  # noqa: BLE001 -- inspected
++                from pmcp.argument_errors import exception_text, safe_traceback_text
++
++                outputs.append(exception_text(error) + safe_traceback_text(error))
++                continue
++            outputs.append(response.text)
++            outputs.append(repr(sorted(response.headers.items())))
++    outputs.append("\n".join(_record_text(record) for record in caplog.records))
++    # No vacuous pass: the transport saw each request.
++    assert any(
++        r.name == "pmcp.transport.http" and "handle_mcp" in r.getMessage()
++        for r in caplog.records
++    )
++    # Every 8-character window too: rev 28's entry log kept a session id's
++    # first 8 characters, below `_forbidden`'s 12-character windows.
++    forbidden = _forbidden(_HEADER_S) | {
++        _HEADER_S[i : i + 8] for i in range(len(_HEADER_S) - 7)
++    }
++    leaked = [text[:400] for text in outputs if any(f in text for f in forbidden)]
++    assert not leaked, leaked
++
++
++def test_a_rejected_accept_header_is_not_logged(
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    """Round 27 codex F001, as filed: an `initialize` offering
++    `Accept: text/<S>` is refused 406, and the transport's entry log does not
++    carry the value."""
++    import logging
++
++    from mcp.server.lowlevel import Server
++    from starlette.testclient import TestClient
++
++    from pmcp.transport.http import create_http_app
++
++    sentinel = "rejectedacceptvaluezulu"
++    caplog.set_level(logging.DEBUG)
++    app = create_http_app(Server("accept-header-review"))
++    with TestClient(app, base_url="http://127.0.0.1") as client:
++        response = client.post(
++            "/mcp", headers={"accept": f"text/{sentinel}"}, json=_INITIALIZE
++        )
++    assert response.status_code == 406, response.text
++    messages = "\n".join(
++        record.getMessage()
++        for record in caplog.records
++        if record.name == "pmcp.transport.http"
++    )
++    assert "accept=other" in messages, messages
++    assert sentinel not in messages, messages
++
++
++#: Request-metadata attributes and scope keys whose values are caller
++#: content (rev 29).
++_REQUEST_METADATA_ATTRS = frozenset(
++    {"headers", "query_params", "path_params", "url", "client", "method", "cookies"}
++)
++_REQUEST_SCOPE_KEYS = frozenset(
++    {"headers", "path", "raw_path", "query_string", "client", "method"}
++)
++#: Callees that turn request metadata into a fixed classification, reviewed
++#: (rev 29): their arguments may be request metadata.
++_REQUEST_METADATA_CLASSIFIERS = frozenset(
++    {"_method_class", "_accept_class", "_header_names"}
++)
++#: Callees whose arguments reach a log record or a response.
++_LOG_METHODS = frozenset(
++    {"debug", "info", "warning", "warn", "error", "exception", "critical", "log"}
++)
++_RESPONSE_CALLS = frozenset(
++    {
++        "Response",
++        "JSONResponse",
++        "PlainTextResponse",
++        "HTMLResponse",
++        "StreamingResponse",
++        "_reject",
++        "_auth_response",
++    }
++)
++
++
++def _reads_request_metadata(node: ast.AST, tainted: set[str]) -> bool:
++    """Whether ``node`` carries a request-metadata value: an attribute chain
++    through one of `_REQUEST_METADATA_ATTRS` on a request-like object, a
++    `scope[...]` read of a metadata key, or a name assigned from one. The
++    test of a conditional and a reviewed classifier's arguments are not
++    values that reach the output."""
++    if isinstance(node, ast.IfExp):
++        return _reads_request_metadata(node.body, tainted) or _reads_request_metadata(
++            node.orelse, tainted
++        )
++    if isinstance(node, ast.Call):
++        func = node.func
++        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
++        if name in _REQUEST_METADATA_CLASSIFIERS:
++            return False
++    if isinstance(node, ast.Attribute) and node.attr in _REQUEST_METADATA_ATTRS:
++        base = ast.unparse(node.value)
++        if base.split(".")[-1] in ("request", "req", "conn", "websocket"):
++            return True
++    if (
++        isinstance(node, ast.Subscript)
++        and ast.unparse(node.value).split(".")[-1] == "scope"
++        and isinstance(node.slice, ast.Constant)
++        and node.slice.value in _REQUEST_SCOPE_KEYS
++    ):
++        return True
++    if isinstance(node, ast.Name) and node.id in tainted:
++        return True
++    return any(
++        _reads_request_metadata(child, tainted) for child in ast.iter_child_nodes(node)
++    )
++
++
++def _request_metadata_sinks(tree: ast.AST) -> list[int]:
++    found: list[int] = []
++    for function in ast.walk(tree):
++        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
++            continue
++        tainted: set[str] = set()
++        for node in ast.walk(function):
++            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
++                if _reads_request_metadata(node.value, tainted):
++                    targets = (
++                        node.targets if isinstance(node, ast.Assign) else [node.target]
++                    )
++                    for target in targets:
++                        # A name bound to the value, not a store into an
++                        # object (`request.scope[...] = ...` taints nothing).
++                        elements = (
++                            target.elts
++                            if isinstance(target, (ast.Tuple, ast.List))
++                            else [target]
++                        )
++                        for element in elements:
++                            if isinstance(element, ast.Name):
++                                tainted.add(element.id)
++        for node in ast.walk(function):
++            if not isinstance(node, ast.Call):
++                continue
++            func = node.func
++            name = (
++                func.attr
++                if isinstance(func, ast.Attribute)
++                else getattr(func, "id", "")
++            )
++            is_log = (
++                isinstance(func, ast.Attribute)
++                and name in _LOG_METHODS
++                and ast.unparse(func.value).split(".")[-1]
++                in ("logger", "log", "_logger", "logging")
++            )
++            if not (is_log or name in _RESPONSE_CALLS):
++                continue
++            values = [*node.args, *(k.value for k in node.keywords)]
++            if any(_reads_request_metadata(v, tainted) for v in values):
++                found.append(node.lineno)
++    return found
++
++
++#: Reviewed sites (`path::line-free function`) where request metadata
++#: reaches a log or a response on purpose (rev 29): none.
++_REVIEWED_REQUEST_METADATA_SINKS: frozenset[str] = frozenset()
++
++
++def test_no_request_metadata_reaches_a_log_or_a_response() -> None:
++    """No request header, query string, path, method, client address,
++    cookie or URL value reaches a logging call or a response in `src/pmcp`,
++    directly or through one assignment, outside the reviewed classifiers
++    (rev 29)."""
++    from pathlib import Path
++
++    src = Path(__file__).resolve().parents[1] / "src" / "pmcp"
++    found = []
++    for path in sorted(src.rglob("*.py")):
++        if "baml_client" in path.parts:
++            continue
++        for line in _request_metadata_sinks(ast.parse(path.read_text())):
++            found.append(f"{path.relative_to(src)}:{line}")
++    assert not found, found
++
++
++@pytest.mark.parametrize(
++    ("snippet", "flagged"),
++    [
++        (
++            "def f(request):\n    logger.debug('a %s', request.headers.get('accept'))\n",
++            True,
++        ),
++        ("def f(request):\n    logger.info('%s', request.url.path)\n", True),
++        (
++            "def f(request):\n    ip = request.client.host\n    logger.debug('%s', ip)\n",
++            True,
++        ),
++        ("def f(request):\n    return Response(request.headers['x'])\n", True),
++        ("def f(scope):\n    logger.debug('%s', scope['query_string'])\n", True),
++        (
++            "def f(request):\n    logger.debug('%s', _accept_class(request.headers.get('accept', '')))\n",
++            False,
++        ),
++        (
++            "def f(request):\n    logger.debug('%s', 'present' if request.headers.get('x') else 'absent')\n",
++            False,
++        ),
++        ("def f(request):\n    logger.debug('fixed %s', 1)\n", False),
++        (
++            "def f(request):\n    request.scope['k'] = request.headers.get('x')\n"
++            "    return Response(status_code=401, headers=g(request))\n",
++            False,
++        ),
++    ],
++)
++def test_the_request_metadata_check_sees_each_shape(
++    snippet: str, flagged: bool
++) -> None:
++    assert bool(_request_metadata_sinks(ast.parse(snippet))) is flagged
 ````
 
 ### Patch — `tests/test_log_record_scrubber.py`
@@ -18520,12 +19024,14 @@ print(f"{out}: {j - i - 1} lines")
 
 Run it as `PYTHONDONTWRITEBYTECODE=1 python mutants.py <worktree> <out-dir> [M4 ...]`; `NO_STATIC=1` deselects both sink checks, `DESELECT="<nodeid> ..."` deselects the named tests (rev 24), and `PYCMD="uv run --isolated --all-extras -p 3.10 python"` runs each mutant in a fresh environment (rev 25). Without the bytecode setting, a same-size first mutant written in the checkout's mtime second leaves a stale `.pyc` (see *Mutation evidence*).
 
-To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e`, `0dc22a4`, `40e2ba4`, `acf99e9`, `d73d6cb`, `7bcb209`, `221115a`, `5054a76`, `6b17d3d`, `ef7ad60`, `62ab87e` and `7900699`, in that order. Then apply this diff (rev 28: M191–M192 added).
+To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e`, `0dc22a4`, `40e2ba4`, `acf99e9`, `d73d6cb`, `7bcb209`, `221115a`, `5054a76`, `6b17d3d`, `ef7ad60`, `62ab87e`, `7900699` and `761ccb0`, in that order. Then apply this diff (rev 29: M193–M196 added).
 
 ````diff
 --- a/mutants.py
 +++ b/mutants.py
-@@ -187,0 +188,2 @@
-+ ("M191 a validation error's title printed verbatim", A, [("            f\"{count} validation error{plural} for {_model_title(error)}: \"\n", "            f\"{count} validation error{plural} for {error.title}: \"\n")]),
-+ ("M192 every loaded class's name a declared model", A, [("        if module is None or module_name.split(\".\")[0] not in _MODEL_PACKAGES:\n", "        if module is None:\n")]),
+@@ -189,0 +190,4 @@
++ ("M193 the entry log carries the Accept header's text", W, [('            _accept_class(request.headers.get("accept", "")),\n', '            request.headers.get("accept", ""),\n')]),
++ ("M194 the entry log carries a session id's prefix", W, [('            "present" if request.headers.get("mcp-session-id") else "absent",\n', '            (request.headers.get("mcp-session-id") or "")[:8] or "absent",\n')]),
++ ("M195 an unknown header name logged as sent", W, [('        name if name in _KNOWN_HEADER_NAMES else "other"\n', '        name\n')]),
++ ("M196 the rate-limit log names the client address", W, [('                logger.debug("handle_mcp [%s]: 429 rate limited", request_id)\n', '                logger.debug("handle_mcp [%s]: 429 rate limited ip=%s", request_id, client_ip)\n')]),
 ````
