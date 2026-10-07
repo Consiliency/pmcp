@@ -2846,3 +2846,108 @@ def test_an_env_reached_through_a_checkout_link_is_the_repositorys(
     monkeypatch.chdir(home)
     cli.load_startup_env(dotenv_path=str(repo / "link" / ".env"))
     assert "THROUGH_LINK_372" not in os.environ
+
+
+# --------------------------------------------------------------------------- #
+# Board round 22, claude N-1, folding in Consiliency/pmcp#374: the gate let an
+# access through when HOME could not be examined, and trust_store_path still
+# resolved with Path.resolve(), whose lexical `missing/..` collapse named the
+# checkout. HOME=repo/missing/../home then let the repository's trust.json
+# approve a .mcp.json outside it. The trust store now resolves as the writer
+# does, and trust and approval decisions fail closed on an unexaminable HOME.
+# --------------------------------------------------------------------------- #
+
+
+def _planted_repo_store(base: Path) -> tuple[Path, Path, bytes]:
+    """repo/home/.config/pmcp/trust.json approving a project OUTSIDE repo."""
+    repo = base / "repo"
+    (repo / ".git").mkdir(parents=True)
+    store = repo / "home" / ".config" / "pmcp"
+    store.mkdir(parents=True)
+    outside = base / "outside"
+    (outside / ".git").mkdir(parents=True)
+    config = outside / ".mcp.json"
+    content = b'{"mcpServers":{"planted":{"command":"echo"}}}'
+    config.write_bytes(content)
+    (store / "trust.json").write_text(_approval_for(config, content))
+    return repo, config, content
+
+
+def test_claude_r22_n1_a_home_spelled_through_missing_dotdot_grants_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from pmcp import trust_store
+    from pmcp.package_approvals import package_approvals_path
+
+    base = tmp_path.resolve()
+    repo, config, content = _planted_repo_store(base)
+    monkeypatch.setenv("HOME", f"{repo}/missing/../home")
+    monkeypatch.chdir(base / "outside")
+    trust_store.reset_launch_directory()
+    assert trust_store.is_approved(config, content, project_root=config.parent) is False
+    with pytest.raises(trust_store.TrustStoreError, match="cannot be examined"):
+        trust_store.trust_store_path()
+    with pytest.raises(trust_store.TrustStoreError):
+        package_approvals_path()
+    assert "the home directory cannot be examined" in capsys.readouterr().err
+
+
+def test_an_unexaminable_home_refuses_trust_but_plain_reads_report_their_own_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A HOME that does not exist: trust refused; a plain read is simply absent."""
+    from pmcp import trust_store
+    from pmcp.config.loader import default_user_config_paths
+
+    missing = tmp_path.resolve() / "no-such-home"
+    monkeypatch.setenv("HOME", str(missing))
+    with pytest.raises(trust_store.TrustStoreError, match="cannot be examined"):
+        trust_store.trust_store_path()
+    # Plain reads go through and find nothing there.
+    assert default_user_config_paths() == [
+        missing / ".mcp.json",
+        missing / ".claude" / ".mcp.json",
+    ]
+    assert env_store.read_store("user") == {}
+
+
+def test_a_trust_store_link_through_missing_dotdot_is_never_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consiliency/pmcp#374, read side: the kernel says the link names nothing."""
+    from pmcp import trust_store
+
+    base = tmp_path.resolve()
+    home = base / "home"
+    pmcp_dir = home / ".config" / "pmcp"
+    pmcp_dir.mkdir(parents=True)
+    project = base / "project"
+    (project / ".git").mkdir(parents=True)
+    config = project / ".mcp.json"
+    content = b'{"mcpServers":{"x":{"command":"echo"}}}'
+    config.write_bytes(content)
+    (pmcp_dir / "elsewhere.json").write_text(_approval_for(config, content))
+    os.symlink("missing/../elsewhere.json", pmcp_dir / "trust.json")
+    monkeypatch.setenv("HOME", str(home))
+    assert not os.path.exists(pmcp_dir / "trust.json")
+    assert trust_store.is_approved(config, content, project_root=project) is False
+
+
+def test_an_unexaminable_home_owns_no_ancestor_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HOME=D/missing/../home: realpath says D/home, the kernel says nothing.
+
+    Nothing derived from that spelling is the operator's, so D's `.env` is a
+    repository file and stays out of the environment.
+    """
+    plain = tmp_path.resolve() / "plain"
+    (plain / "home").mkdir(parents=True)
+    (plain / ".env").write_text("SPELLED_HOME_372=leaked\n")
+    monkeypatch.setenv("HOME", f"{plain}/missing/../home")
+    monkeypatch.delenv("SPELLED_HOME_372", raising=False)
+    monkeypatch.chdir(plain / "home")
+    cli.load_startup_env(dotenv_path=str(plain / ".env"))
+    assert "SPELLED_HOME_372" not in os.environ

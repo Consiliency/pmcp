@@ -43,9 +43,32 @@ def physical_home(home: Path | None = None) -> Path:
     return Path(os.path.realpath(home if home is not None else Path.home()))
 
 
+def examinable_home(home: Path | None = None) -> Path | None:
+    """The physical home, or ``None`` when HOME cannot be examined.
+
+    Examinable means the kernel resolves HOME as spelled (``os.stat``) to the
+    same directory ``realpath`` names. ``realpath`` collapses ``missing/..``
+    lexically; the kernel does not -- for HOME spelled ``repo/missing/../home``
+    the two disagree, and nothing derived from that spelling may grant trust
+    (Consiliency/pmcp#372 round 23, board round 22 claude N-1).
+    """
+    spelled = home if home is not None else Path.home()
+    seen = _identity(spelled)
+    real = Path(os.path.realpath(spelled))
+    if seen is None or seen != _identity(real):
+        return None
+    return real
+
+
 def home_and_ancestor_identities(home: Path | None = None) -> set[Identity]:
-    """``(st_dev, st_ino)`` of the home directory and each of its PHYSICAL ancestors."""
-    real = physical_home(home)
+    """``(st_dev, st_ino)`` of the home directory and each of its PHYSICAL ancestors.
+
+    Empty while HOME cannot be examined (:func:`examinable_home`): nothing is
+    the operator's then, so no residency or ownership exemption applies.
+    """
+    real = examinable_home(home)
+    if real is None:
+        return set()
     found: set[Identity] = set()
     for directory in (real, *real.parents):
         identity = _identity(directory)
@@ -61,7 +84,9 @@ def default_store_directory_identities(home: Path | None = None) -> set[Identity
     anything below it), so a store linked into another directory is judged by
     where it lands.
     """
-    real = physical_home(home)
+    real = examinable_home(home)
+    if real is None:
+        return set()  # cannot examine HOME: no exemption (round 23)
     found: set[Identity] = set()
     current = real
     for name in (".config", "pmcp"):
@@ -77,9 +102,13 @@ def default_store_directory_identities(home: Path | None = None) -> set[Identity
 
 
 def is_home(directory: os.PathLike[str] | str, home: Path | None = None) -> bool:
-    """Is ``directory`` the home directory itself (by identity)?"""
+    """Is ``directory`` the home directory itself (by identity)?
+
+    Never while HOME cannot be examined (:func:`examinable_home`).
+    """
+    real = examinable_home(home)
     identity = _identity(directory)
-    return identity is not None and identity == _identity(physical_home(home))
+    return real is not None and identity is not None and identity == _identity(real)
 
 
 # --------------------------------------------------------------------------- #
@@ -235,6 +264,8 @@ def is_operator_owned(
 # --------------------------------------------------------------------------- #
 
 _HOME_REFUSAL = "the home directory lies inside a checkout"
+#: The refusal for a trust or approval decision while HOME cannot be examined.
+HOME_UNEXAMINABLE = "the home directory cannot be examined"
 _WARNED_HOME = False
 
 
@@ -278,6 +309,21 @@ def operator_home() -> Path:
         _warn_home_once()
         raise _refuse_home()
     return home
+
+
+def trust_home_path(*parts: str) -> Path:
+    """``home_path`` for TRUST and APPROVAL stores: fails closed.
+
+    Plain reads (the user store, user config) may go through a home that cannot
+    be examined and report the access's own error. A trust or approval decision
+    may not: a HOME the kernel cannot resolve as spelled -- or resolves to a
+    different directory than its lexical spelling -- is refused, with one
+    value-free line (Consiliency/pmcp#372 round 23).
+    """
+    if examinable_home() is None:
+        print(f"pmcp: Refusing the trust stores: {HOME_UNEXAMINABLE}", file=_sys.stderr)
+        raise HomeInsideCheckoutError(_errno.EPERM, HOME_UNEXAMINABLE)
+    return home_path(*parts)
 
 
 def optional_operator_home() -> Path | None:

@@ -44,19 +44,22 @@ from pathlib import Path
 from typing import Any
 
 from pmcp.home_identity import (
+    HOME_UNEXAMINABLE,
     HomeInsideCheckoutError,
     checkout_controlling_home,
     enclosing_checkouts,
     has_checkout_marker,
-    home_path,
     is_operator_owned,
+    trust_home_path,
 )
+from pmcp import atomic_write as _atomic_write_module
 from pmcp.atomic_write import (
     atomic_write,
     falls_back_to_pathname,
     is_absent,
     make_store_dirs,
     open_directory,
+    open_final_directory,
     resolve_write_target,
 )
 
@@ -311,10 +314,15 @@ def trust_store_path(*, also: tuple[Path, ...] = ()) -> Path:
     planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
     # Home-scoped (Consiliency/pmcp#372 round 22): refused while a checkout
-    # controls the home directory.
+    # controls the home directory -- and, for this trust decision, while the
+    # home directory cannot even be examined (round 23: fail closed).
     try:
-        path = home_path(".config", "pmcp", "trust.json").resolve()
+        spelled = trust_home_path(".config", "pmcp", "trust.json")
     except HomeInsideCheckoutError as exc:
+        if exc.strerror == HOME_UNEXAMINABLE:
+            raise TrustStoreError(
+                f"Trust store trust.json: {HOME_UNEXAMINABLE}; refusing it."
+            ) from exc
         checkout = checkout_controlling_home()
         where = f"the checkout at {checkout}" if checkout is not None else "a checkout"
         raise TrustStoreError(
@@ -322,8 +330,43 @@ def trust_store_path(*, also: tuple[Path, ...] = ()) -> Path:
             "lies inside it. A store inside a project's checkout lets it approve "
             "its own content; move the home directory outside the repository."
         ) from exc
-    refuse_checkout_resident(path, "Trust store", also=also)
-    return path
+    # Resolved as the WRITER resolves it -- the kernel's own verdict on the
+    # whole path, then the final link chain hop by hop through descriptors --
+    # never Path.resolve(), whose lexical `missing/..` collapse once named a
+    # different file than the kernel would (see Consiliency/pmcp#374).
+    fd: int | None = None
+    try:
+        if is_absent(spelled.parent):
+            # A fresh install: no store, no link to follow. Judge where it will
+            # be created (the residency walk steps up across plain names).
+            target = os.fspath(spelled)
+        else:
+            if _atomic_write_module._DIR_FD_SUPPORTED:
+                try:
+                    fd, _name = open_final_directory(spelled)
+                except FileNotFoundError:
+                    # The link's directory does not exist yet: judged by its
+                    # nearest existing directory, stepping only across plain
+                    # names (a `missing/..` is refused there).
+                    fd = None
+                except OSError as exc:
+                    if not falls_back_to_pathname(exc):
+                        raise
+            target = resolve_write_target(spelled)
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+        raise TrustStoreError(
+            f"Cannot resolve trust.json: {os.strerror(exc.errno) if exc.errno else exc}"
+        ) from exc
+    try:
+        # The chain's own pathname, also where a descriptor is judged: a
+        # platform without directory descriptors judges the pathname.
+        refuse_checkout_resident(target, "Trust store", dir_fd=fd, also=also)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return Path(target)
 
 
 def refuse_checkout_resident(

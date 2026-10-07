@@ -332,9 +332,9 @@ def test_every_writer_caller_has_a_missing_dotdot_driver() -> None:
 
 
 #: Writer callers whose `missing/../x` behaviour is a tracked known issue.
-KNOWN_ISSUES = {
-    ("trust_store.py", "_write_store"): "Consiliency/pmcp#374",
-}
+#: Empty: trust_store_path resolves as the writer does since Consiliency/pmcp#372
+#: round 23 (see Consiliency/pmcp#374).
+KNOWN_ISSUES: dict[tuple[str, str], str] = {}
 
 
 @pytest.mark.parametrize(

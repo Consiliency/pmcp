@@ -724,7 +724,10 @@ def test_a_checkout_resident_store_is_refused_through_a_symlink(
     shutil.copytree(vendored, elsewhere)
     (home / ".config" / "pmcp").unlink()
     (home / ".config" / "pmcp").symlink_to(elsewhere, target_is_directory=True)
-    assert trust_store.trust_store_path().is_relative_to(elsewhere.resolve())
+    # The store path is the writer's own (the final link chain, see
+    # Consiliency/pmcp#374); the kernel resolves its directories at use.
+    store = Path(os.path.realpath(trust_store.trust_store_path()))
+    assert store.is_relative_to(elsewhere.resolve())
     granted = [
         c.name for c in load_configs(project_root=checkout, user_config_paths=[])
     ]
