@@ -1168,6 +1168,8 @@ _NOT_HTTP_CLIENTS = frozenset(
         "string",
         "subprocess",
         "sys",
+        # where the installed libraries live, for an exception's origin (rev 26)
+        "sysconfig",
         "tempfile",
         "threading",
         "time",
