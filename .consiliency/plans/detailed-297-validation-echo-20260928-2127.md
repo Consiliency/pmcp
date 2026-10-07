@@ -1,30 +1,29 @@
 # Detailed plan: describe validation errors from their structure, never their value — everywhere pmcp turns an exception into text
 
-> **Revision 26 (2026-10-07), on main `bc0a9ce`.** Consiliency/pmcp#297, the
+> **Revision 27 (2026-10-07), on main `bc0a9ce`.** Consiliency/pmcp#297, the
 > prerequisite for piece B (`extra="forbid"`) of Consiliency/pmcp#236. The
 > change is **embedded, not described**. The 52 blocks under *Verbatim
 > bodies* are `git apply` patches against `origin/main` @ `bc0a9ce`. They are
 > byte-identical to the verified code on the branch `wip/297-code` @
-> `5a93b9c`. *Embedding proof* extracts them from this file and applies them
+> `e8e7ef6`. *Embedding proof* extracts them from this file and applies them
 > on a fresh `bc0a9ce`, then compares every file. The base stays `bc0a9ce`
 > for this rev; merging later main is for the implementation PR.
 >
-> **For the board:** review the spike's tree (`wip/297-code` @ `5a93b9c`,
+> **For the board:** review the spike's tree (`wip/297-code` @ `e8e7ef6`,
 > whose diff from `bc0a9ce` is these patches). The bundle may leave the
 > patches out.
 >
-> **What rev 26 changes:** it answers round 24 on Consiliency/pmcp#314 @
-> `ef7ad60`. Gemini: AGREE.
-> - Claude (and grok): the MCP SDK's client transports put
->   response-chosen values into errors and logs. Every `mcp.*` logger is
->   now masked. What the SDK raises or answers keeps its text only when
->   pmcp has reviewed it.
-> - Codex: urllib's redirect parsing raises a bare built-in `ValueError`
->   quoting the `Location`. Any exception raised from an HTTP client's
->   frames is now registered, by origin.
-> - Redirect, SDK-transport and origin rows bind these (*Rev 26*).
+> **What rev 27 changes:** it answers round 25 on Consiliency/pmcp#314 @
+> `62ab87e`. Gemini: AGREE. Claude: PARTIALLY AGREE, with nothing blocking.
+> Grok and codex: DISAGREE, with one finding.
+> - An exception's origin and the SDK raise site now come from one
+>   traceback walk. An error whose origin is the SDK is withheld unless it
+>   is matched where the SDK itself raised it; a missing site fails closed.
+> - An SDK-called-helper matrix, an end-to-end endpoint row, and a static
+>   guard against losing tracebacks bind it (*Rev 27*).
+> - Claude's N1–N3 are stated under *Unverified*.
 
-## History (revs 1–25)
+## History (revs 1–26)
 
 Each revision answered the previous board. The full text is in the plan at
 that sha, at `.consiliency/plans/detailed-297-validation-echo-20260928-2127.md`.
@@ -55,6 +54,7 @@ The line ranges are that file's.
 | 21 | `7bcb209` | round 19: 65–77 | 78–131 (every `except` binding; templates bound) |
 | 22 | `221115a` | round 20: 67–83 | 84–134 (response decoding; parser kinds; attribute allowlist); merge of `bc0a9ce`: 136–172 |
 | 23 | `5054a76` | round 21: 69–89 | 90–180 (every HTTP client's response errors; the grid; pmcp fields bound to pmcp classes) |
+| 26 | `62ab87e` | round 24: 70–93 | 94–210 (the SDK's client side; any exception an HTTP client raises, by origin) |
 | 25 | `ef7ad60` | round 23: 70–87 | 88–179 (every HTTP client exception registered; one phrase; TLS-mismatch rows) |
 | 24 | `6b17d3d` | round 22: 73–103 | 104–248 (proxy refusals; redirect scheme and host; source-checked reasons; class-only links) |
 
@@ -62,8 +62,120 @@ The code for revs 1–17 is at `19dac95`, `929f693`, `026aadc`, `ee644a9`,
 `1824a09`, `9b24daa`, `dd3f707`, `2d9e736`, `8d33b49`, `6078419`,
 `46c4904`, `0a93265`, `ebcf4fc`, `06a9e01`, `67bd04d`, `403a83a` (rev 16),
 `18824c1` (rev 17), `b34717e` (rev 18), `fc88ea8` (rev 19), `f89527e` (rev
-20), `eb8796c` (rev 21), `30dc945` (rev 22), `825c43a` (rev 23), `86a63a6` (rev 24) and `89a47c1` (rev 25, on origin). Rev 17 before the
+20), `eb8796c` (rev 21), `30dc945` (rev 22), `825c43a` (rev 23), `86a63a6` (rev 24), `89a47c1` (rev 25) and `5a93b9c` (rev 26, on origin). Rev 17 before the
 merge of `6edf8a4` was `9e5cb57`.
+
+## Rev 27: one traceback walk, two answers
+
+**Round 25.**
+- Gemini: AGREE.
+- Claude: PARTIALLY AGREE, with nothing blocking. It confirmed:
+  - the embedding;
+  - every round-24 falsifier;
+  - the origin walk across re-raise, rewrap, executors and callbacks.
+
+  It filed N1–N3 (see *Non-goals and unverified*).
+- Grok and codex: DISAGREE, with the same blocking finding.
+
+**F001 (grok, codex).** For an exception a helper library raised beneath
+an SDK frame, the origin and the raise site disagreed.
+- **The example:** a legacy-SSE `endpoint` whose host is bracketed,
+  `http://[<S>]/`. The SDK's `sse_reader` calls `urljoin`, and
+  `ipaddress` raises `ValueError: '<S>' does not appear to be an IPv4 or
+  IPv6 address`.
+- **What happened:**
+  - `exception_origin` passed over the `ipaddress` and `urllib.parse`
+    frames, and found the SDK: origin `mcp`.
+  - `raise_site` read only the innermost frame, `ipaddress`, so it found
+    no SDK site and returned `None`.
+  - `withheld_sdk_error` took a missing site as "keep".
+- **Result:** the host reached `_read_sse`'s DEBUG log through
+  `describe_exception`.
+
+**The coordinator's ruling: one walk, two answers.**
+- The origin and the SDK raise site come from the same traceback walk,
+  with the same rule for skipping helper-library frames.
+- Missing site information never overrides an established origin.
+- An exception whose origin is the SDK or an HTTP client is withheld
+  unless it is positively matched to a reviewed template at a known site.
+  It fails closed.
+
+**Rev 27.**
+- **`exception_walk(error)`** returns, from one walk:
+  - the origin;
+  - the deciding frame's file and function;
+  - `direct`, whether that frame is the innermost one, the frame that
+    raised.
+
+  `exception_origin` and `raise_site` both read it. `raise_site` is the
+  deciding SDK frame's `path::function`, not the innermost frame's.
+- **`withheld_sdk_error` fails closed.** An exception whose origin is the
+  SDK is withheld when its site is missing, or when it was not raised
+  directly by the SDK frame (a helper raised it beneath one). A direct
+  SDK raise keeps its text only when it is positively matched:
+  - empty;
+  - a literal of the SDK's source;
+  - a reviewed template;
+  - at a relay site, a peer's message that matches no SDK template.
+- **A validation error raised beneath an SDK frame** keeps its structural
+  description. For example, pydantic inside `ClientSession` validating a
+  notification gives `N validation errors for <Model>: $.<path>: …`,
+  which is value-free. The SDK's fixed phrase replaces only text that is
+  not structural.
+  - The first ai run on `244a06a` caught this regression: four
+    `test_downstream_frame_echo` rows failed.
+  - `test_a_validation_error_beneath_an_sdk_frame_keeps_its_description`
+    pins it.
+- **HTTP-client origin** was already fail-closed: every exception from
+  those frames is registered and renders by class and status (rev 25–26).
+
+**The bindings.**
+- **`test_a_helper_the_sdk_calls_is_the_sdks`** places a call at three
+  SDK frames:
+  - the SSE endpoint handler (`client/sse.py::sse_reader`);
+  - the streamable-HTTP stream (`client/streamable_http.py::_handle_sse_response`);
+  - the relay site (`shared/jsonrpc_dispatcher.py::send_raw_request`).
+
+  At each, it calls each helper the transports can reach on response
+  data: `ipaddress`; `urllib.parse` (host and port); `json`; `email`
+  (`parsedate_to_datetime`); `base64`. It checks the text, the
+  traceback, and `describe_exception` bare and in a group. It pins that
+  the walk gives origin `mcp`, not direct, with the SDK site, and that
+  the error is withheld.
+  - The `json` and `base64` errors carry no value. Their rows pin the
+    walk only.
+  - The SDK's streamable-HTTP transport calls none of these helpers on
+    response data today. Its rows bind the rule at that frame for when it
+    does.
+- **`test_a_rejected_sse_endpoint_host_reaches_no_log`** is grok's and
+  codex's case end to end, over a real socket. A same-origin `endpoint`,
+  then a bracketed one, through pmcp's connect path and `_read_sse`,
+  checked across the connect errors and every log record at DEBUG.
+- **`test_nothing_in_pmcp_drops_an_exceptions_traceback`** (claude N1) is
+  a static guard over `src/pmcp`. It flags each of these until the use is
+  reviewed against the origin rule:
+  - `with_traceback`;
+  - a write to `__traceback__`;
+  - `ProcessPoolExecutor`, `concurrent.futures.process` and
+    `multiprocessing`.
+
+  pmcp uses none.
+
+**Red on rev 26's code:**
+On rev 26's code (`5a93b9c`'s `src` with this `test_parse_error_echo.py` and `test_http_transport.py`):
+
+```text
+ 18 test_parse_error_echo.py::test_a_helper_the_sdk_calls_is_the_sdks
+  1 test_parse_error_echo.py::test_a_rejected_sse_endpoint_host_reaches_no_log
+  1 test_parse_error_echo.py::test_a_validation_error_beneath_an_sdk_frame_keeps_its_description
+20 failed, 367 passed in 84.71s (0:01:24)
+```
+
+- The end-to-end endpoint row fails on the leak: grok's and codex's case.
+- 12 matrix rows (`ipaddress`, `urllib.parse` host and port, `email`) fail on the leak. The 6 `json` and `base64` rows carry no value, and fail only on the walk's name, which rev 26 lacks.
+- The validation-error pin fails on that same name.
+
+**Mutants:** M186–M190 (see *Mutation evidence*).
 
 ## Rev 26: the MCP SDK's client side, and any exception an HTTP client raises
 
@@ -1057,13 +1169,15 @@ read, is a sink.
   `an HTTP request failed (<class>[, status N])`, whether the bytes came
   from the origin, a proxy or a redirect target. In a chain that holds a
   registered error, every other link prints as its class alone (rev 24).
-- **§13, §16, rev 26:** the MCP SDK's client side is held to the server
-  side's rule. Every `mcp.*` logger is masked. What the SDK raises or
-  relays keeps its text only if reviewed.
+- **§13, §16, rev 26–27:** the MCP SDK's client side is held to the
+  server side's rule. Every `mcp.*` logger is masked. What the SDK raises
+  or relays keeps its text only if matched where the SDK itself raised it
+  (rev 27: one traceback walk gives the origin and the site, and a missing
+  site fails closed).
 
 ## Changes
 
-The patches are `git diff bc0a9ce 5a93b9c -- <file>`: 52 files, +15052 / −691. This is
+The patches are `git diff bc0a9ce e8e7ef6 -- <file>`: 52 files, +15322 / −691. This is
 one concern applied at every sink, past the bounded-plan threshold on
 purpose. Rev 20:
 - adds `pmcp/sdk_rejections.py`, installed with the log scrubber;
@@ -1110,6 +1224,13 @@ Rev 26 changes:
   (`test_parse_error_echo.py`), two re-pinned log assertions;
 - `CHANGELOG.md`: the claim made true for the SDK's client.
 
+Rev 27 changes:
+- `argument_errors.py`: `exception_walk`;
+- `sdk_rejections.py`: `raise_site` and `withheld_sdk_error` read it, and
+  fail closed;
+- `test_parse_error_echo.py`: the SDK-helper matrix, the endpoint row and
+  the traceback-loss guard.
+
 All 52 patches are one `git apply`: no import cycles, no
 migration, no config change.
 
@@ -1129,21 +1250,22 @@ On a fresh `bc0a9ce` with the patches applied:
   `test_scoped_advisor_audit`, `test_gateway_tool_schemas`,
   `test_http_transport`), plus Consiliency/pmcp#371's
   `test_nullable_schema_portability` and `test_migration_doc`;
-- the round-16 to 24 falsifiers are in the suite (rounds 21–24's are
-  rows of the HTTP, proxy, TLS-mismatch, redirect and SDK-transport grids;
-  *Rev 23*–*Rev 26*);
+- the round-16 to 25 falsifiers are in the suite (rounds 21–25's are
+  rows of the HTTP, proxy, TLS-mismatch, redirect, SDK-transport and
+  SDK-helper grids; *Rev 23*–*Rev 27*);
 - the eight modules, the full suite, the gates and the mutants run through
   `uv run --isolated --all-extras -p 3.10`, in a fresh environment free of
   host startup hooks (rev 25). The runtime harness boots the checkout's
-  own `.venv/bin/pmcp`, so the checkout is also `uv sync`ed; that venv
-  was checked to carry no hook;
+  own `.venv/bin/pmcp`, so the checkout is also `uv sync`ed. In rev 27's
+  run that venv did carry ai's `killguard` hook (`uv sync` reinstalled
+  it), and the full suite passed with it;
 - run the full suite `-m 'not live and not slow'` with the npm cache
   variables unset.
 
-## Acceptance criteria — measured on `5a93b9c`
+## Acceptance criteria — measured on `e8e7ef6`
 
-- [x] The eight modules and Consiliency/pmcp#371's two are green: `1586 passed in 420.22s (0:07:00)`.
-- [x] Red on main `bc0a9ce`, with the eight test files from `5a93b9c`
+- [x] The eight modules and Consiliency/pmcp#371's two are green: `1607 passed in 452.38s (0:07:32)`.
+- [x] Red on main `bc0a9ce`, with the eight test files from `e8e7ef6`
   (`--tb=line`; the errors are a fixture importing `pmcp.argument_errors`):
 
 ```text
@@ -1153,27 +1275,26 @@ On a fresh `bc0a9ce` with the patches applied:
    3 tests/test_gateway_tool_schemas.py
   28 tests/test_http_transport.py
   80 tests/test_log_record_scrubber.py
- 227 tests/test_parse_error_echo.py
+ 247 tests/test_parse_error_echo.py
    6 tests/test_scoped_advisor_audit.py
-568 failed, 625 passed, 57 errors in 133.59s (0:02:13)
+588 failed, 626 passed, 57 errors in 137.87s (0:02:17)
 ```
 
-- [x] Binding: on rev 25's code, the SDK-transport rows, codex's IPv6-literal redirect,
-and the SDK, logger and origin pins fail (*Rev 26*). The seats' falsifiers
-are among those rows. It passes here. M177–M185 each remove part of the
-rule (see *Mutation evidence*).
+- [x] Binding: on rev 26's code, the end-to-end SSE endpoint row and the SDK-helper
+matrix fail on the leak (*Rev 27*); the seats' falsifiers fail there too.
+It passes here. M186–M190 each remove part of the rule (see *Mutation
+evidence*).
 
 - [x] The full suite, with `npm_config_cache`, `npm_config_store_dir` and
-  `pnpm_config_store_dir` unset: `10238 passed, 6 skipped, 80 deselected in 1032.56s (0:17:12)`. The green run, the full suite
+  `pnpm_config_store_dir` unset: `10259 passed, 6 skipped, 80 deselected in 1055.48s (0:17:35)`. The green run, the full suite
   and the gates ran on host `ai` (`uv run --isolated --all-extras -p 3.10`),
-  from a worktree of the pushed `5a93b9c`.
+  from a worktree of the pushed `e8e7ef6`.
 - [x] Gates: ruff check: `All checks passed!`; ruff format --check: `193 files already formatted`; mypy: `Success: no issues found in 57 source files`.
 
 ## Mutation evidence
 
 `mutants.py` ran on host `ai`, three lanes per pass, on worktrees of
-`5b08713`, with M154 and M180 run again on `5a93b9c` (see the note below
-the tables). Each mutant ran in a fresh `uv run --isolated` environment
+`e8e7ef6`. Each mutant ran in a fresh `uv run --isolated` environment
 (`PYCMD`).
 
 The procedure:
@@ -1184,27 +1305,18 @@ The procedure:
   checked with `cmp` and against HEAD's blob by sha-256;
 - `git status` after the run: `0` and `0`.
 
-The purposes of M1–M176 are in the history table's plans (M175–M176:
-`ef7ad60`).
-- **Retired:** M165. urllib's refused tunnel is now one case of the
-  origin rule, and its separate check is gone.
-- **Re-anchored** on the refactored traceback renderer:
-  - M45: the unqualified class name;
-  - M125: a wrapper printed from its own message;
-  - M168: a link beneath a registered error printed with its text.
-- **Added:**
-  - M177 masks only the SDK's server and shared loggers;
-  - M178 derives none of the SDK's literal logger names;
-  - M179 keeps a message the SDK pre-built;
-  - M180 keeps each exception's text in an SDK traceback;
-  - M181 never withholds an SDK-raised error;
-  - M182 keeps a relayed SDK-built message in `_downstream_error`;
-  - M183 keeps a relayed message whatever template it matches;
-  - M184 stops registering an HTTP client's built-ins by origin;
-  - M185 lets a library frame decide the origin.
+The purposes of M1–M185 are in the history table's plans (M177–M185:
+`62ab87e`). Rev 27 adds M186–M190:
+- M186 lets an error through when its SDK site is missing;
+- M187 keeps a helper's raise beneath an SDK frame like the SDK's own;
+- M188 walks the raise site apart from the origin (rev 26's innermost
+  frame);
+- M189 counts every deciding frame as the raising frame;
+- M190 replaces a validation error beneath an SDK frame with the SDK's
+  phrase.
 
 ```text
-161 mutants applied; 159 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M185
+166 mutants applied; 164 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M190
 survived: M23 SDK parse error keeps its message
 survived: M25 malformed error message kept
 ```
@@ -1212,7 +1324,7 @@ survived: M25 malformed error message kept
 `NO_STATIC=1` deselects the sink guard and the helpers-only rule:
 
 ```text
-161 mutants applied; 154 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M149 M151–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M185
+166 mutants applied; 159 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M149 M151–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M190
 survived: M19 tasks_get response uses str(e)
 survived: M20 tasks_get audit buffer uses str(e)
 survived: M22 installer crash message uses raw exc (static guard)
@@ -1224,31 +1336,15 @@ survived: M150 a narrow OSError handler renders its raw text (CLI auth-token fil
 
 M23 and M25 are equivalent mutants. Their combined partners, M102 and M90,
 die in both passes. M19, M20, M22, M35 and M150 die only on the sink guard,
-by design. These survivors are the same as in revs 23 to 25.
+by design. These survivors are the same as in revs 23 to 26.
 
-Rev 26's mutants die in both passes:
-- M177 and M178 die on `test_every_sdk_logger_is_masked`.
-- M179 dies on the SDK-transport rows: the endpoint's pre-built message.
-- M181 and M183 die on the classifier's unit test.
-- M182 dies on the SDK-transport rows: `Unexpected content type` in the
-  connect errors and `gateway.health`.
-- M184 and M185 die on the redirect rows at `fetch_json_metadata`.
-
-**M154 and M180 survived the run on `5b08713`.**
-- M154 survived because a response body that a client decodes is now
-  registered by origin. Nothing exercised a body that pmcp decodes in its
-  own frame.
-- M180 survived because each SDK-logged exception the rows produce is
-  registered, so the record scrubber, not the class-only traceback,
-  handled it.
-
-Two tests on `5a93b9c` pin both, and M154 and M180 ran again there in both
-passes; the tables show those runs:
-- `test_a_body_pmcp_decodes_itself_is_described_by_its_codec`;
-- `test_an_sdk_record_prints_its_traceback_by_class`.
-
-Every other mutant ran on `5b08713`. That commit differs from `5a93b9c`
-only by those two tests, and adding a test cannot revive a killed mutant.
+Rev 27's mutants die in both passes:
+- M186, M187, M188 and M189 die on the SDK-helper matrix:
+  - M186 and M187 on the withholding assertion;
+  - M188 on the agreed raise site;
+  - M189 on the walk's `direct`.
+- M190 dies on `test_downstream_frame_echo`'s session-message rows, the
+  regression the first ai run found.
 
 ## Non-goals and unverified
 
@@ -1300,11 +1396,42 @@ only by those two tests, and adding a test cannot revive a killed mutant.
     of the *Rev 24* section. Rev 24's own plan (`6b17d3d`) has that red
     table filled. This rev fills it again, and adds a check that no
     placeholder survives assembly.
-  - The origin rule reads the traceback's file names against the
-    installed packages' paths (`sysconfig`, `site`). An installation that
-    puts a library outside those paths makes its frames decide "not by
-    origin". Exceptions the clients define are registered by class
-    regardless.
+  - **The origin rule needs an intact traceback** (round 25 claude N1).
+    It fails open, falling back to registration by class, when the
+    frames are gone. Three cases do that, each of which leaks an
+    `ipaddress` message on a real urllib redirect:
+    - `e.with_traceback(None)`, re-raised outside a handler of the
+      original;
+    - an exception constructed from a client error's text but never
+      raised;
+    - a process boundary: `ProcessPoolExecutor(...).submit(...).result()`
+      re-raises a pickled exception with no client frames, whose
+      `__cause__` is `_RemoteTraceback`, the full remote traceback as
+      text.
+
+    None occurs in `src/pmcp`. Building from `e.args` is flagged by the
+    sink guard. `test_nothing_in_pmcp_drops_an_exceptions_traceback`
+    flags `with_traceback`, a write to `__traceback__`, and
+    `ProcessPoolExecutor`/`concurrent.futures.process`/`multiprocessing`,
+    so a new use is reviewed first.
+  - **OpenTelemetry spans are a sink outside logging** (round 25 claude
+    N2).
+    - `mcp/shared/_otel.py` records exceptions on spans
+      (`record_exception=True`: the message and the stack).
+    - `mcp/server/_otel.py` sets `span.set_status(ERROR, e.error.message)`.
+    - Only `opentelemetry-api` is installed, so both are no-ops.
+    - Under operator-installed auto-instrumentation they would export SDK
+      and HTTP exception text unscrubbed. pmcp installs no SDK or
+      exporter.
+  - **Library frames are recognised by install path** (round 25 claude
+    N3). The walk treats a frame outside `sysconfig`'s
+    stdlib/purelib/platlib and `site.getsitepackages()` as "not a
+    library".
+    - With an editable or vendored dependency (a development checkout of
+      `anyio`, say), a library frame reads as user code, and the walk
+      stops before the client frame.
+    - Registration by class still covers every client class, so only a
+      bare built-in raised beneath such a frame would be missed.
   - The proxy and renderer rows ran on Python 3.10. On 3.11 and 3.12 a
     standalone probe confirmed the tunnel's origin check: the innermost
     frame is `_tunnel`'s code object, and its `code` local is the
@@ -1357,7 +1484,7 @@ only by those two tests, and adding a test cannot revive a killed mutant.
 
 ## Embedding proof
 
-From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@5a93b9c`. The proof was run again on the final file, with this section in it, and printed the same listing.
+From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@e8e7ef6`. The proof was run again on the final file, with this section in it, and printed the same listing.
 
 ```text
 $ git -C <proof worktree> rev-parse --short HEAD
@@ -1390,7 +1517,7 @@ done
 git apply --unidiff-zero --check <scratch>/*.patch && git apply --unidiff-zero <scratch>/*.patch
 ```
 
-The patches are `git diff -U0 bc0a9ce 5a93b9c -- <file>`. To fit the size
+The patches are `git diff -U0 bc0a9ce e8e7ef6 -- <file>`. To fit the size
 budget, each is cut to plain unified-diff form: there are no `diff --git`,
 `index` or `new file mode` lines, and no function context in the hunk
 headers. `git apply` reads them the same way; a new file is created with
@@ -1550,7 +1677,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/src/pmcp/argument_errors.py
-@@ -0,0 +1,1672 @@
+@@ -0,0 +1,1697 @@
 +"""Describe a rejected gateway-tool argument without the value that failed.
 +
 +A gateway tool's arguments are checked twice: by the advertised JSON Schema
@@ -1597,7 +1724,7 @@ print(f"{out}: {j - i - 1} lines")
 +import traceback
 +from collections.abc import Callable, Iterable, Iterator
 +from types import ModuleType
-+from typing import Any
++from typing import Any, NamedTuple
 +
 +import jsonschema
 +from pydantic import ValidationError
@@ -2233,35 +2360,55 @@ print(f"{out}: {j - i - 1} lines")
 +    return tuple(sorted(p.rstrip(os.sep) + os.sep for p in prefixes if p))
 +
 +
-+def exception_origin(error: BaseException) -> str | None:
-+    """Where ``error`` was raised (rev 26): ``"http"`` for an HTTP client,
-+    ``"mcp"`` for the MCP SDK, else ``None``.
++class Origin(NamedTuple):
++    """Where an exception was raised, from one traceback walk (rev 27)."""
++
++    #: ``"http"`` (an HTTP client), ``"mcp"`` (the MCP SDK) or ``None``.
++    kind: str | None
++    #: The deciding frame's file and function, if a frame decided.
++    filename: str | None
++    function: str | None
++    #: Whether the deciding frame is the innermost one -- the frame that
++    #: raised -- rather than one a library helper raised beneath it.
++    direct: bool
++
++
++def exception_walk(error: BaseException) -> Origin:
++    """The one walk behind :func:`exception_origin` and the SDK's raise site
++    (rev 27, round-25 grok and codex F001: the two used to walk differently,
++    so an `ipaddress` error under the SDK had an origin but no site, and the
++    missing site let it through).
 +
 +    The traceback is read from its innermost frame outwards. A frame in an
 +    HTTP client or the SDK decides for it. A frame of any other installed
-+    library -- ``ipaddress``, ``urllib.parse``, ``email``, ``anyio``,
-+    ``yarl``, ``asyncio`` -- is passed over, so an exception a helper raises
-+    is its caller's. A frame of pmcp's, or of any code that is not an
-+    installed library (a test, a script), decides for "not by origin":
-+    a client calling back into such code does not make what it raises the
-+    client's. An exception with no traceback has no origin."""
++    library -- ``ipaddress``, ``urllib.parse``, ``json``, ``email``,
++    ``base64``, ``anyio``, ``asyncio`` -- is passed over, so an exception a
++    helper raises is its caller's. A frame of pmcp's, or of any code that is
++    not an installed library (a test, a script), decides "not by origin".
++    An exception with no traceback has no origin."""
 +    tb = error.__traceback__
-+    filenames: list[str] = []
++    frames: list[tuple[str, str]] = []
 +    while tb is not None:
-+        filenames.append(tb.tb_frame.f_code.co_filename)
++        frames.append((tb.tb_frame.f_code.co_filename, tb.tb_frame.f_code.co_name))
 +        tb = tb.tb_next
 +    paths = _origin_paths()
 +    libraries = _library_prefixes()
-+    for filename in reversed(filenames):
++    for depth, (filename, function) in enumerate(reversed(frames)):
 +        kind = next((k for path, k in paths if filename.startswith(path)), None)
 +        if kind in ("http", "mcp"):
-+            return kind
++            return Origin(kind, filename, function, depth == 0)
 +        if kind == "pmcp":
-+            return None
++            return Origin(None, filename, function, depth == 0)
 +        if filename.startswith("<frozen ") or filename.startswith(libraries):
 +            continue
-+        return None
-+    return None
++        return Origin(None, filename, function, depth == 0)
++    return Origin(None, None, None, False)
++
++
++def exception_origin(error: BaseException) -> str | None:
++    """Where ``error`` was raised (rev 26): ``"http"`` for an HTTP client,
++    ``"mcp"`` for the MCP SDK, else ``None`` (:func:`exception_walk`)."""
++    return exception_walk(error).kind
 +
 +
 +def _tunnel_refusal_status(error: BaseException) -> int | None | bool:
@@ -2464,10 +2611,15 @@ print(f"{out}: {j - i - 1} lines")
 +        or _is_response_decode_error(error)
 +        or exception_origin(error) == "http"
 +    )
-+    if not is_http and _withheld_sdk(error):
++    structural = isinstance(
++        error, (ValidationError, jsonschema.ValidationError, jsonschema.SchemaError)
++    )
++    if not is_http and not structural and _withheld_sdk(error):
 +        from pmcp.sdk_rejections import sdk_error_text
 +
-+        # The SDK's own text is withheld: its code's phrase and class (rev 26).
++        # The SDK's own text is withheld: its code's phrase and class (rev
++        # 26). A validation error the SDK raises (pydantic beneath an SDK
++        # frame) keeps its structural description, which is value-free.
 +        return sdk_error_text(error)
 +    if is_http:
 +        # The class and the status number: never the error's text, its
@@ -4733,7 +4885,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/src/pmcp/sdk_rejections.py
-@@ -0,0 +1,795 @@
+@@ -0,0 +1,800 @@
 +"""The MCP SDK's own rejections and server-side logs, value-free (Consiliency/pmcp#297 rev 20).
 +
 +Before any pmcp handler runs, the MCP SDK answers some requests itself: an
@@ -5295,41 +5447,46 @@ print(f"{out}: {j - i - 1} lines")
 +
 +
 +def raise_site(error: BaseException) -> str | None:
-+    """``path::function`` of where ``error`` was raised, when that is in the
-+    `mcp` package: the innermost frame of its traceback."""
-+    tb = error.__traceback__
-+    if tb is None:
++    """``path::function`` of the SDK frame that decided ``error``'s origin
++    (the same walk as :func:`pmcp.argument_errors.exception_origin`, rev
++    27), or ``None`` when its origin is not the SDK."""
++    from pmcp.argument_errors import exception_walk
++
++    walk = exception_walk(error)
++    if walk.kind != "mcp" or walk.filename is None:
 +        return None
-+    while tb.tb_next is not None:
-+        tb = tb.tb_next
-+    filename = tb.tb_frame.f_code.co_filename
 +    prefix = _mcp_prefix()
-+    if not filename.startswith(prefix):
++    if not walk.filename.startswith(prefix):
 +        return None
-+    return f"{filename[len(prefix) :]}::{tb.tb_frame.f_code.co_name}"
++    return f"{walk.filename[len(prefix) :]}::{walk.function}"
 +
 +
 +def withheld_sdk_error(error: BaseException) -> bool:
-+    """Whether ``error`` was raised by the SDK with a message pmcp has not
-+    reviewed (rev 26, round-24 claude F001). Kept: an empty message, a
-+    literal of the SDK's source, a reviewed template, and the relayed
-+    message of a :data:`RECEIVED_ERROR_SITES` raise that matches no template
-+    the SDK builds. Everything else the SDK raises -- formatted from a
-+    response, a URL, ``str(e)`` -- is withheld: rendered by class and code."""
-+    from pmcp.argument_errors import exception_origin
++    """Whether ``error``, raised under the SDK, is withheld (rev 26; fail
++    closed since rev 27). An exception whose origin is the SDK keeps its
++    text only when it is positively matched where the SDK raised it itself
++    (the deciding frame is the raising frame): an empty message, a literal
++    of the SDK's source, a reviewed template, or -- at a
++    :data:`RECEIVED_ERROR_SITES` raise -- a relayed message that matches no
++    template the SDK builds. Everything else is withheld: text the SDK
++    formats, ``str(e)``, and anything a library helper raised beneath an SDK
++    frame (`ipaddress` quoting a rejected endpoint host, round-25 grok and
++    codex F001). A missing site never lets an error through."""
++    from pmcp.argument_errors import exception_walk
 +
-+    if exception_origin(error) != "mcp":
++    walk = exception_walk(error)
++    if walk.kind != "mcp":
 +        return False
 +    site = raise_site(error)
-+    if site is None:
-+        return False
++    if site is None or not walk.direct:
++        return True
 +    try:
 +        text = str(error)
 +    except Exception:  # noqa: BLE001 -- an unprintable error is withheld
 +        return True
 +    if not text:
 +        return False
-+    literals, patterns = _sdk_message_texts()
++    literals, _patterns = _sdk_message_texts()
 +    if text in literals or _reviewed_message(text, getattr(error, "code", None)):
 +        return False
 +    if site not in RECEIVED_ERROR_SITES:
@@ -14786,7 +14943,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/tests/test_parse_error_echo.py
-@@ -0,0 +1,2719 @@
+@@ -0,0 +1,2959 @@
 +"""A parse error never echoes the structured text it rejected
 +(Consiliency/pmcp#297; rev 6, reclassified by origin in rev 7).
 +
@@ -17506,6 +17663,246 @@ print(f"{out}: {j - i - 1} lines")
 +    assert record.exc_text and "Traceback (most recent call last)" in record.exc_text
 +    assert record.exc_text.rstrip().endswith("RuntimeError"), record.exc_text
 +    assert s not in _record_text(record)
++
++
++# --- a helper the SDK calls (rev 27, round-25 grok and codex F001) -----------
++
++
++def _sdk_helper_calls(s: str) -> dict[str, str]:
++    """Source for one call per helper library the SDK's transports can reach
++    on response data, each raising on ``s``: `urllib.parse` (`urljoin`,
++    `urlparse`, and `ipaddress` beneath it), `json`, `email`, `base64`."""
++    return {
++        "ipaddress": f"__import__('ipaddress').ip_address({s!r})",
++        "urllib.parse-host": f"__import__('urllib.parse').parse.urljoin('http://o/', 'http://[{s}]/')",
++        "urllib.parse-port": f"__import__('urllib.parse').parse.urlsplit('http://h:{s}/').port",
++        "json": f"__import__('json').loads('{{\"{s}\": }}')",
++        "email": f"__import__('email.utils').utils.parsedate_to_datetime({s!r})",
++        "base64": f"__import__('base64').b64decode({s + '!'!r}, validate=True)",
++    }
++
++
++@pytest.mark.parametrize(
++    "site",
++    [
++        "client/sse.py::sse_reader",
++        "client/streamable_http.py::_handle_sse_response",
++        "shared/jsonrpc_dispatcher.py::send_raw_request",
++    ],
++)
++@pytest.mark.parametrize("helper", sorted(_sdk_helper_calls("x")))
++def test_a_helper_the_sdk_calls_is_the_sdks(helper: str, site: str) -> None:
++    """A helper library raising beneath an SDK frame -- at an SSE endpoint,
++    a streamable-HTTP stream, and the relay site -- is the SDK's by the same
++    walk that finds the site, and is withheld: neither origin nor site is
++    lost to the helper's frame, and a relay site does not keep it (rev 27)."""
++    from pathlib import Path
++
++    import mcp
++
++    from pmcp.argument_errors import exception_text, safe_traceback_text
++    from pmcp.client.manager import describe_exception
++    from tests.test_argument_error_echo import _exception_group
++
++    s = _GRID_S
++    path, function = site.split("::")
++    filename = str(Path(mcp.__file__).parent / path)
++    namespace: dict[str, Any] = {}
++    exec(  # noqa: S102 -- a frame with the SDK's file name, for the test
++        compile(
++            f"def {function}():\n    {_sdk_helper_calls(s)[helper]}\n",
++            filename,
++            "exec",
++        ),
++        namespace,
++    )
++    with pytest.raises(Exception) as caught:
++        namespace[function]()
++    error = caught.value
++    texts = {
++        "exception_text": exception_text(error),
++        "safe_traceback_text": safe_traceback_text(error),
++        "describe_exception": describe_exception(error),
++        "describe_exception(group)": describe_exception(
++            _exception_group()("group", [error])
++        ),
++    }
++    leaked = {k: v[:200] for k, v in texts.items() if s in v}
++    assert not leaked, leaked
++    # One walk, two answers: the origin and the SDK site agree.
++    from pmcp.argument_errors import _is_validation_error, exception_walk
++    from pmcp.sdk_rejections import raise_site, withheld_sdk_error
++
++    walk = exception_walk(error)
++    assert (walk.kind, walk.direct) == ("mcp", False), walk
++    assert raise_site(error) == site
++    assert _is_validation_error(error)
++    if type(error).__name__ != "JSONDecodeError":
++        assert withheld_sdk_error(error)
++
++
++def test_a_rejected_sse_endpoint_host_reaches_no_log(
++    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """End to end on legacy SSE: a first `endpoint` on the connection's
++    origin, then one whose bracketed host `urllib.parse` rejects
++    (`ipaddress` quotes it). The SDK sends that error on the read stream,
++    and pmcp's `_read_sse` logs it (rev 27, grok's and codex's case)."""
++    import socket
++    import threading
++    import time
++
++    import pmcp  # noqa: F401 - installs the scrubbers
++
++    s = _GRID_S
++    for name in (
++        "HTTPS_PROXY",
++        "https_proxy",
++        "HTTP_PROXY",
++        "http_proxy",
++        "ALL_PROXY",
++        "all_proxy",
++    ):
++        monkeypatch.delenv(name, raising=False)
++    caplog.set_level(logging.DEBUG)
++    listener = socket.socket()
++    listener.bind(("127.0.0.1", 0))
++    listener.listen(64)
++    port = listener.getsockname()[1]
++
++    def handle(conn: Any) -> None:
++        try:
++            line = conn.recv(65536).decode("latin-1").split("\r\n", 1)[0]
++            _GRID_REQUESTS.append(line.encode())
++            if line.startswith("GET"):
++                body = (
++                    "event: endpoint\ndata: /messages?session_id=abc\n\n"
++                    f"event: endpoint\ndata: http://[{s}]/messages\n\n"
++                )
++                conn.sendall(
++                    (
++                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
++                        + body
++                    ).encode()
++                )
++                time.sleep(3)
++            else:
++                conn.sendall(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
++        except OSError:
++            pass
++        finally:
++            conn.close()
++
++    def loop() -> None:
++        while True:
++            try:
++                conn, _ = listener.accept()
++            except OSError:
++                return
++            threading.Thread(target=handle, args=(conn,), daemon=True).start()
++
++    threading.Thread(target=loop, daemon=True).start()
++    _GRID_URL[0] = f"http://127.0.0.1:{port}/sse"
++    before = len(_GRID_REQUESTS)
++    try:
++        try:
++            errors, last = asyncio.run(asyncio.wait_for(_drive_remote("sse", port), 20))
++            outcome = json.dumps([errors, last], default=str)
++        except Exception as error:  # noqa: BLE001 -- inspected
++            from pmcp.argument_errors import exception_text, safe_traceback_text
++
++            outcome = exception_text(error) + safe_traceback_text(error)
++    finally:
++        listener.close()
++    assert len(_GRID_REQUESTS) > before, "never connected"
++    texts = {
++        "result": outcome,
++        "log": "\n".join(_record_text(record) for record in caplog.records),
++    }
++    leaked = {
++        k: v[:400]
++        for k, v in texts.items()
++        if any(f in v for f in _forbidden_any_case(s))
++    }
++    assert not leaked, leaked
++
++
++#: Constructs that lose an exception's traceback, and so its origin (rev 27,
++#: round-25 claude N1): any use in `src/pmcp` must be reviewed against the
++#: origin rule first. None is used today.
++_TRACEBACK_LOSING = (
++    "with_traceback",
++    "__traceback__",
++    "ProcessPoolExecutor",
++    "multiprocessing",
++    "concurrent.futures.process",
++)
++
++
++def test_nothing_in_pmcp_drops_an_exceptions_traceback() -> None:
++    """`e.with_traceback(None)`, an assignment to `__traceback__`, and a
++    process-pool or `multiprocessing` boundary (which pickles an exception
++    without its frames) all lose the origin the rule reads. pmcp uses none;
++    a new use fails here until reviewed."""
++    found = []
++    for path in sorted(_SRC.rglob("*.py")):
++        if "baml_client" in path.parts:
++            continue
++        tree = ast.parse(path.read_text())
++        for node in ast.walk(tree):
++            names: list[str] = []
++            if isinstance(node, ast.Attribute):
++                # `__traceback__` is read everywhere; only a write loses it.
++                if node.attr != "__traceback__" or isinstance(node.ctx, ast.Store):
++                    names.append(node.attr)
++            elif isinstance(node, ast.Name):
++                names.append(node.id)
++            elif isinstance(node, ast.Import):
++                names.extend(alias.name for alias in node.names)
++            elif isinstance(node, ast.ImportFrom):
++                names.append(node.module or "")
++                names.extend(alias.name for alias in node.names)
++            for name in names:
++                if any(
++                    name == bad or name.startswith(bad + ".")
++                    for bad in _TRACEBACK_LOSING
++                ):
++                    found.append(f"{path.relative_to(_SRC)}:{node.lineno}: {name}")
++    assert not found, found
++
++
++def test_a_validation_error_beneath_an_sdk_frame_keeps_its_description() -> None:
++    """pydantic raising beneath an SDK frame (`ClientSession` validating a
++    notification) is the SDK's by origin and not direct, but a validation
++    error's structural description is value-free: it is kept, not replaced
++    by the SDK's fixed phrase (rev 27)."""
++    from pathlib import Path
++
++    import mcp
++    from pydantic import BaseModel
++
++    from pmcp.argument_errors import exception_text, exception_walk
++
++    class Probe(BaseModel):
++        task_id: int
++
++    s = _GRID_S
++    filename = str(Path(mcp.__file__).parent / "client/session.py")
++    namespace: dict[str, Any] = {"Probe": Probe}
++    exec(  # noqa: S102 -- a frame with the SDK's file name, for the test
++        compile(
++            f"def _received_notification():\n    Probe.model_validate({{'task_id': {s!r}}})\n",
++            filename,
++            "exec",
++        ),
++        namespace,
++    )
++    with pytest.raises(Exception) as caught:
++        namespace["_received_notification"]()
++    assert exception_walk(caught.value).kind == "mcp"
++    text = exception_text(caught.value)
++    assert text.startswith("1 validation error for Probe: $.task_id"), text
++    assert s not in text
 ````
 
 ### Patch — `tests/test_pkgid_panel_fixes.py`
@@ -17901,30 +18298,15 @@ print(f"{out}: {j - i - 1} lines")
 
 Run it as `PYTHONDONTWRITEBYTECODE=1 python mutants.py <worktree> <out-dir> [M4 ...]`; `NO_STATIC=1` deselects both sink checks, `DESELECT="<nodeid> ..."` deselects the named tests (rev 24), and `PYCMD="uv run --isolated --all-extras -p 3.10 python"` runs each mutant in a fresh environment (rev 25). Without the bytecode setting, a same-size first mutant written in the checkout's mtime second leaves a stale `.pyc` (see *Mutation evidence*).
 
-To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e`, `0dc22a4`, `40e2ba4`, `acf99e9`, `d73d6cb`, `7bcb209`, `221115a`, `5054a76`, `6b17d3d` and `ef7ad60`, in that order. Then apply this diff (rev 26: M165 retired; M45, M125, M168 re-anchored; M177–M185 added).
+To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e`, `0dc22a4`, `40e2ba4`, `acf99e9`, `d73d6cb`, `7bcb209`, `221115a`, `5054a76`, `6b17d3d`, `ef7ad60` and `62ab87e`, in that order. Then apply this diff (rev 27: M186–M190 added).
 
 ````diff
 --- a/mutants.py
 +++ b/mutants.py
-@@ -64 +64 @@
-- ("M45 unqualified class name", A, [('                f"{_qualified_name(type(current))}: {_validation_text(current)}\\n"\n', '                f"{type(current).__name__}: {_validation_text(current)}\\n"\n')]),
-+ ("M45 unqualified class name", A, [("        name = _qualified_name(type(current))\n", "        name = type(current).__name__\n")]),
-@@ -127 +127 @@
-- ("M125 the traceback renders a wrapper node from its own message", A, [('                    f"{_qualified_name(type(current))}: {_validation_text(linked)}\\n"\n', '                    f"{_qualified_name(type(current))}: {current}\\n"\n')]),
-+ ("M125 the traceback renders a wrapper node from its own message", A, [("        return None if linked is None else _validation_text(linked)\n", "        return None if linked is None else str(current)\n")]),
-@@ -168 +167,0 @@
-- ("M165 urllib's refused tunnel not recognised", A, [("    return _tunnel_refusal_status(error) is not False\n", "    return False\n")]),
-@@ -171 +170 @@
-- ("M168 a link beneath a registered error printed with its text", A, [('                parts.append(f"{_qualified_name(type(current))}\\n")\n', '                parts.append(f"{_qualified_name(type(current))}: {current}\\n")\n')]),
-+ ("M168 a link beneath a registered error printed with its text", A, [("        return None if linked is None else _validation_text(linked)\n", "        return str(current) if linked is None else _validation_text(linked)\n")]),
-@@ -174,0 +174,9 @@
-+ ("M177 only the SDK's server and shared loggers masked", "src/pmcp/sdk_rejections.py", [('SDK_LOGGERS = ("mcp", "sse_starlette")\n', 'SDK_LOGGERS = ("mcp.server", "mcp.shared", "sse_starlette")\n')]),
-+ ("M178 the SDK's literal logger names not derived", "src/pmcp/sdk_rejections.py", [("                names.add(argument.value)\n", "                pass\n")]),
-+ ("M179 a message the SDK pre-built is kept", "src/pmcp/sdk_rejections.py", [("        # `.format` before the call): masked whole (rev 26).\n        record.msg, record.args = _PLACEHOLDER, None\n", "        # `.format` before the call): masked whole (rev 26).\n        pass\n")]),
-+ ("M180 the SDK's tracebacks keep each exception's text", "src/pmcp/sdk_rejections.py", [("            record.exc_text = class_only_traceback_text(error)\n            record.exc_info = None\n", "            pass\n")]),
-+ ("M181 an SDK-raised error never withheld", A, [("    return withheld_sdk_error(error)\n", "    return False\n")]),
-+ ("M182 a relayed SDK-built message kept", "src/pmcp/client/manager.py", [("    if sdk_built_message(message, code):\n", "    if False:\n")]),
-+ ("M183 a relayed message kept whatever it matches", "src/pmcp/sdk_rejections.py", [('    return sdk_built_message(text, getattr(error, "code", None))\n', "    return False\n")]),
-+ ("M184 an HTTP client's built-in not registered by origin", A, [('    if exception_origin(error) == "http":\n        return True\n', "")]),
-+ ("M185 a helper frame decides the origin", A, [('        if kind == "helper":\n            continue\n', '        if kind == "helper":\n            return None\n')]),
+@@ -182,0 +183,5 @@
++ ("M186 a missing SDK site lets the error through", "src/pmcp/sdk_rejections.py", [("    if site is None or not walk.direct:\n        return True\n", "    if site is None:\n        return False\n")]),
++ ("M187 a helper's raise beneath an SDK frame kept like the SDK's own", "src/pmcp/sdk_rejections.py", [("    if site is None or not walk.direct:\n", "    if site is None:\n")]),
++ ("M188 the raise site walked apart from the origin", "src/pmcp/sdk_rejections.py", [('    walk = exception_walk(error)\n    if walk.kind != "mcp" or walk.filename is None:\n        return None\n', '    tb = error.__traceback__\n    while tb is not None and tb.tb_next is not None:\n        tb = tb.tb_next\n    if tb is None:\n        return None\n    walk = type(exception_walk(error))("mcp", tb.tb_frame.f_code.co_filename, tb.tb_frame.f_code.co_name, True)\n    if walk.filename is None:\n        return None\n')]),
++ ("M189 every frame counted as the raising frame", A, [("            return Origin(kind, filename, function, depth == 0)\n", "            return Origin(kind, filename, function, True)\n")]),
++ ("M190 a validation error beneath an SDK frame replaced by the SDK's phrase", A, [("    if not is_http and not structural and _withheld_sdk(error):\n", "    if not is_http and _withheld_sdk(error):\n")]),
 ````
