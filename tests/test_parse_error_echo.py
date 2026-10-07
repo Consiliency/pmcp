@@ -2192,6 +2192,11 @@ def test_no_proxy_refusal_reaches_any_renderer(
 
         bare = urllib.error.URLError(error.reason)
         texts["URLError, unchained"] = exception_text(bare) + safe_traceback_text(bare)
+        # And the refused tunnel's `OSError` on its own, as `error.reason`
+        # hands it to a caller: registered by origin (rev 25 mutant M165).
+        reason = error.reason
+        texts["URLError.reason"] = exception_text(reason) + safe_traceback_text(reason)
+        assert str(status) in exception_text(reason), exception_text(reason)
     leaked = {
         name: text[:300]
         for name, text in texts.items()
