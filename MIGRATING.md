@@ -292,8 +292,9 @@ involved:
   *installed* in. For a `uv tool` or `pip --user` install this is usually
   `~/.env`. For an editable install from a checkout it is that checkout's
   `.env`;
-- the `.env` in the gateway's working directory, which pmcp reads when it
-  checks whether a server's credential is available.
+- the `.env` at the project root (`--project`, else the root found from the
+  working directory), which pmcp reads -- into its credential map, never its
+  environment -- when it looks up a credential for that project.
 
 ```bash
 ls -l ~/.env "$PWD/.env" 2>/dev/null
@@ -302,9 +303,13 @@ ls -l ~/.env "$PWD/.env" 2>/dev/null
 Symptoms after upgrading: a server that worked now fails with an
 authentication or "missing variable" error, even though the key is in `.env`.
 
-**What changed.** pmcp still loads `.env` into its own environment, but it now
-strips every key it loaded that way from the environment of the servers it
-spawns. A server still gets **its own declared `env_var`**: the variable a
+**What changed.** A `~/.env` (in your home directory or an ancestor of it) still
+loads into pmcp's own environment, and pmcp now strips every key it loaded that
+way from the environment of the servers it spawns. Any other `.env` -- a
+project's, or a checkout's that the install walk reaches -- never enters pmcp's
+environment at all: its values stay in pmcp's credential map, where only a
+credential lookup for that project reads them, so no spawned server inherits
+them. A server still gets **its own declared `env_var`**: the variable a
 manifest entry names as its credential, resolved from `.env` if necessary.
 Variables you export in your shell are still inherited, deliberately.
 Credentials stored with `pmcp secrets set` or `gateway.auth_connect` reach only
@@ -398,7 +403,9 @@ store at all. These commands refuse a `.env.pmcp` that is a symlink, or that
 sits below a symlinked directory, before reading or writing it, and report
 `refusing to write .env.pmcp: it is a symlink`. 2.7.3 wrote your secrets
 wherever the link pointed, and in a cloned repository the repository chooses
-that target. Every `pmcp` command also loads `<cwd>/.env.pmcp` at startup; it
+that target. Every `pmcp` command also loads the served project's `.env.pmcp`
+(`--project`, else the project root found from the working directory) at
+startup; it
 now skips such a store, prints `pmcp: refusing to load .env.pmcp: it is a
 symlink` on stderr and carries on without those keys, where 2.7.3 loaded
 whatever the link pointed at. A `.env.pmcp` that is not a regular file is

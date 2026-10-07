@@ -106,7 +106,9 @@ _FACTS_273: tuple[tuple[str, str], ...] = (
     ),
     (
         "Spawned servers no longer inherit the keys pmcp loaded from `.env`",
-        "pmcp still loads `.env` into its own environment, but it now strips every key it loaded that way",
+        # Consiliency/pmcp#372: only a `~/.env` (or an ancestor's) enters the
+        # environment now; a project's `.env` stays in the credential map.
+        "still loads into pmcp's own environment, and pmcp now strips every key it loaded",
     ),
 )
 

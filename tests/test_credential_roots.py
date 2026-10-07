@@ -1289,3 +1289,133 @@ def test_a_root_classification_rejects_still_supplies_its_own_credentials(
         "header lookup": build_remote_header_env_lookup(home)("BRAVE_API_KEY"),
     }
     assert answers == dict.fromkeys(answers, "from-home")
+
+
+# --------------------------------------------------------------------------- #
+# Board round 13, grok: `pmcp --project B doctor` parsed `project` as None --
+# the subcommand redefined --project and its default overwrote the top-level
+# value -- so the served root silently fell back to the working directory.
+# Both flag positions now mean the same, for every subcommand that takes it.
+# --------------------------------------------------------------------------- #
+
+
+def _subcommands_taking_project() -> list[tuple[list[str], list[str]]]:
+    """``(path, required filler)`` for every (nested) subcommand with --project."""
+    import argparse as ap
+
+    parser = cli.build_parser() if hasattr(cli, "build_parser") else None
+    if parser is None:
+        captured: dict[str, ap.ArgumentParser] = {}
+        real = ap.ArgumentParser.parse_args
+
+        def grab(self: ap.ArgumentParser, *a: object, **k: object) -> object:
+            captured["p"] = self
+            raise SystemExit(0)
+
+        ap.ArgumentParser.parse_args = grab  # type: ignore[method-assign]
+        try:
+            with pytest.raises(SystemExit):
+                cli.parse_args()
+        finally:
+            ap.ArgumentParser.parse_args = real  # type: ignore[method-assign]
+        parser = captured["p"]
+
+    found: list[tuple[list[str], list[str]]] = []
+
+    def walk(p: ap.ArgumentParser, path: list[str]) -> None:
+        options = {s for a in p._actions for s in a.option_strings}
+        if path and "--project" in options:
+            filler = [
+                "X"
+                for a in p._actions
+                if not a.option_strings
+                and not isinstance(a, ap._SubParsersAction)
+                and a.nargs not in ("?", "*")
+            ]
+            found.append((path, filler))
+        for action in p._actions:
+            if isinstance(action, ap._SubParsersAction):
+                for name, sub in action.choices.items():
+                    walk(sub, [*path, name])
+
+    walk(parser, [])
+    return found
+
+
+SUBCOMMANDS = _subcommands_taking_project()
+
+
+def test_the_subcommand_inventory_is_not_empty() -> None:
+    names = {" ".join(p) for p, _ in SUBCOMMANDS}
+    assert {"doctor", "secrets check", "status", "init"} <= names
+
+
+@pytest.mark.parametrize(
+    ("path", "filler"), SUBCOMMANDS, ids=[" ".join(p) for p, _ in SUBCOMMANDS]
+)
+def test_both_project_flag_positions_mean_the_same(
+    path: list[str],
+    filler: list[str],
+    roots: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    b = str(roots["b"])
+    seen = []
+    for argv in (
+        ["pmcp", "--project", b, *path, *filler],
+        ["pmcp", *path, "--project", b, *filler],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        args = cli.parse_args()
+        seen.append(getattr(args, "project", None))
+    assert seen == [roots["b"], roots["b"]]
+    # And no subcommand flag silently resets it.
+    monkeypatch.setattr(sys, "argv", ["pmcp", "--project", b, *path, *filler])
+    _startup(roots)
+    cli.serve_project(cli.parse_args().project)
+    assert env_store.resolve_project_root(None) == roots["b"]
+
+
+def test_codex_r13_f001_a_lazy_startup_keeps_the_served_project(
+    tmp_path: Path,
+) -> None:
+    """codex r13 F001, verbatim in substance."""
+    from unittest.mock import patch
+
+    home = tmp_path / "home"
+    launch = tmp_path / "launch"
+    served = tmp_path / "served"
+    home.mkdir()
+    for root in (launch, served):
+        (root / ".git").mkdir(parents=True)
+    with (
+        patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+        patch.object(Path, "cwd", return_value=launch),
+        patch.object(cli, "find_dotenv", return_value=""),
+        patch.multiple(
+            env_store,
+            _DEFAULT_ROOT=None,
+            _REPO_CREDENTIALS={},
+            _PINNED_USER_STORE=None,
+            _STARTUP_LOADED=False,
+        ),
+    ):
+        env_store.serve_project_root(served)
+        assert env_store.resolve_project_root() == served
+        build_remote_header_env_lookup()
+        assert env_store.resolve_project_root() == served
+
+
+def test_an_explicit_root_then_a_lazy_load_answers_for_the_explicit_root(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit first, lazy load second: credentials and inputs stay B's."""
+    monkeypatch.delenv("LAZY_TOKEN", raising=False)
+    (roots["a"] / ".env.pmcp").write_text("LAZY_TOKEN=from-a\n")
+    (roots["b"] / ".env.pmcp").write_text("LAZY_TOKEN=from-b\n")
+    env_store.serve_project_root(roots["b"])  # library use, cwd is a
+    assert env_store.credential_lookup()("LAZY_TOKEN") == "from-b"  # lazy load
+    assert env_store.credential_value("LAZY_TOKEN") == "from-b"
+    assert env_store.resolve_project_root(None) == roots["b"]

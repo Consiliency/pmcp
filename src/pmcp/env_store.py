@@ -441,6 +441,22 @@ def project_scope_root(project: Path | None = None) -> Path | None:
     return root
 
 
+def ensure_served_project_root() -> Path:
+    """The served project root, discovering it from the working directory ONLY if unset.
+
+    Loading the environment never chooses the project (Consiliency/pmcp#372
+    round 14, board round 13 codex F001): a lazy startup load -- the first
+    credential lookup in a library process -- used to call
+    ``serve_project_root(None)`` unconditionally, replacing a root the caller
+    had already served (``serve_project_root(B)``) with the launch directory's
+    project. Only the first, unset state discovers one; an explicit
+    :func:`serve_project_root` call always wins.
+    """
+    if _DEFAULT_ROOT is None:
+        return serve_project_root(None)
+    return _DEFAULT_ROOT
+
+
 def serve_project_root(project: Path | None) -> Path:
     """Make the project this process serves the root every unqualified lookup answers for.
 
@@ -880,7 +896,7 @@ def ensure_startup_load() -> None:
 
     The runtime reads repository credentials from ONE map, built by the startup
     load (the discovered ``.env``, the user store into the environment, the
-    working directory's ``.env.pmcp``) and extended by the same loader
+    served project's ``.env.pmcp``) and extended by the same loader
     (:func:`load_store`) whenever another store is consulted. A diagnostic that
     runs in a process which never ran the startup load runs it here rather than
     reading the stores itself, so it cannot merge them in a different order

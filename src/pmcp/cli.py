@@ -46,6 +46,7 @@ from pmcp.env_store import (
     load_store,
     mark_startup_loaded,
     pin_user_store_path,
+    ensure_served_project_root,
     resolve_project_root,
     serve_project_root,
     record_pmcp_introduced_keys,
@@ -426,6 +427,9 @@ Environment overrides:
         "-p",
         "--project",
         type=Path,
+        # Only when given: the top-level --project then stands (one meaning
+        # for both flag positions, Consiliency/pmcp#372 round 14).
+        default=argparse.SUPPRESS,
         help="Project root directory (for .mcp.json discovery)",
     )
     status_parser.add_argument(
@@ -488,6 +492,9 @@ Environment overrides:
         "--project",
         "-p",
         type=Path,
+        # Only when given: the top-level --project then stands (one meaning
+        # for both flag positions, Consiliency/pmcp#372 round 14).
+        default=argparse.SUPPRESS,
         help="Project directory (default: current directory)",
     )
     init_parser.add_argument(
@@ -621,6 +628,9 @@ Environment overrides:
         "-p",
         "--project",
         type=Path,
+        # Only when given: the top-level --project then stands (one meaning
+        # for both flag positions, Consiliency/pmcp#372 round 14).
+        default=argparse.SUPPRESS,
         help="Project root directory (defaults to auto-discovery)",
     )
     doctor_parser.add_argument(
@@ -710,6 +720,9 @@ Environment overrides:
     secrets_set_parser.add_argument(
         "--project",
         type=Path,
+        # Only when given: the top-level --project then stands (one meaning
+        # for both flag positions, Consiliency/pmcp#372 round 14).
+        default=argparse.SUPPRESS,
         help="Project root directory (for project scope)",
     )
 
@@ -737,6 +750,9 @@ Environment overrides:
     secrets_sync_parser.add_argument(
         "--project",
         type=Path,
+        # Only when given: the top-level --project then stands (one meaning
+        # for both flag positions, Consiliency/pmcp#372 round 14).
+        default=argparse.SUPPRESS,
         help="Project root directory (for project scope)",
     )
 
@@ -747,6 +763,9 @@ Environment overrides:
     secrets_check_parser.add_argument(
         "--project",
         type=Path,
+        # Only when given: the top-level --project then stands (one meaning
+        # for both flag positions, Consiliency/pmcp#372 round 14).
+        default=argparse.SUPPRESS,
         help="Project root directory (for project scope)",
     )
 
@@ -3162,11 +3181,12 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     pin_user_store_path()
     mark_startup_loaded()
     # An unqualified credential lookup answers for the project this process
-    # serves: here the root discovered from the working directory, the one the
-    # gateway loads `.mcp.json` from; main() moves it to `--project` once the
-    # arguments are parsed (env_store.serve_project_root, Consiliency/pmcp#372
-    # round 9).
-    served = serve_project_root(None)
+    # serves. Loading the environment never CHOOSES it: a root already served
+    # (`serve_project_root(B)` in library use, before a lazy load) is kept;
+    # only an unset one is discovered from the working directory -- the root
+    # the gateway loads `.mcp.json` from. main() moves it to `--project` once
+    # the arguments are parsed (Consiliency/pmcp#372 rounds 9 and 14).
+    served = ensure_served_project_root()
     before = set(os.environ)
     found = dotenv_path if dotenv_path is not None else find_dotenv()
     if found:
@@ -3183,7 +3203,7 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
 
 
 def _load_project_store_at_startup(path: Path) -> None:
-    """Load ``<cwd>/.env.pmcp`` through the confined reader, or skip it with a warning.
+    """Load the served project's ``.env.pmcp`` through the confined reader, or skip it with a warning.
 
     The project store is repository-controlled: a clone can ship it as a symlink
     out of the project, as a fifo, or as a socket. This load runs in ``main()``

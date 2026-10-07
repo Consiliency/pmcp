@@ -1682,8 +1682,9 @@ Besides `servers`, `tools` (`server::tool`), `packages`, `limits` and
 
 PMCP looks for the policy at `~/.claude/gateway-policy.yaml` or
 `~/.claude/gateway-policy.json`, and for a project policy at
-`.mcp-gateway-policy.yaml` or `.mcp-gateway-policy.json` in the gateway's
-working directory; a project policy is
+`.mcp-gateway-policy.yaml` or `.mcp-gateway-policy.json` at the project root
+(`--project` when given, otherwise the project root found from the working
+directory -- the same root as every other project input); a project policy is
 ignored until approved with `pmcp trust approve`, and can only narrow the
 operator's policy. `--policy` / `PMCP_POLICY` names one explicitly.
 
