@@ -1,29 +1,25 @@
 # Detailed plan: describe validation errors from their structure, never their value — everywhere pmcp turns an exception into text
 
-> **Revision 27 (2026-10-07), on main `bc0a9ce`.** Consiliency/pmcp#297, the
+> **Revision 28 (2026-10-07), on main `bc0a9ce`.** Consiliency/pmcp#297, the
 > prerequisite for piece B (`extra="forbid"`) of Consiliency/pmcp#236. The
 > change is **embedded, not described**. The 52 blocks under *Verbatim
 > bodies* are `git apply` patches against `origin/main` @ `bc0a9ce`. They are
 > byte-identical to the verified code on the branch `wip/297-code` @
-> `e8e7ef6`. *Embedding proof* extracts them from this file and applies them
+> `bf648d5`. *Embedding proof* extracts them from this file and applies them
 > on a fresh `bc0a9ce`, then compares every file. The base stays `bc0a9ce`
 > for this rev; merging later main is for the implementation PR.
 >
-> **For the board:** review the spike's tree (`wip/297-code` @ `e8e7ef6`,
+> **For the board:** review the spike's tree (`wip/297-code` @ `bf648d5`,
 > whose diff from `bc0a9ce` is these patches). The bundle may leave the
 > patches out.
 >
-> **What rev 27 changes:** it answers round 25 on Consiliency/pmcp#314 @
-> `62ab87e`. Gemini: AGREE. Claude: PARTIALLY AGREE, with nothing blocking.
-> Grok and codex: DISAGREE, with one finding.
-> - An exception's origin and the SDK raise site now come from one
->   traceback walk. An error whose origin is the SDK is withheld unless it
->   is matched where the SDK itself raised it; a missing site fails closed.
-> - An SDK-called-helper matrix, an end-to-end endpoint row, and a static
->   guard against losing tracebacks bind it (*Rev 27*).
-> - Claude's N1–N3 are stated under *Unverified*.
+> **What rev 28 changes:** it answers round 26 on Consiliency/pmcp#314 @
+> `7900699`. Grok and gemini: AGREE. Claude: PARTIALLY AGREE, with nothing
+> blocking. Codex errored. Claude's N1 is fixed: a validation error's
+> `title` is printed only when it is the name of a model pmcp, `mcp_types`
+> or the SDK defines, and any other title reads `<model>` (*Rev 28*).
 
-## History (revs 1–26)
+## History (revs 1–27)
 
 Each revision answered the previous board. The full text is in the plan at
 that sha, at `.consiliency/plans/detailed-297-validation-echo-20260928-2127.md`.
@@ -54,6 +50,7 @@ The line ranges are that file's.
 | 21 | `7bcb209` | round 19: 65–77 | 78–131 (every `except` binding; templates bound) |
 | 22 | `221115a` | round 20: 67–83 | 84–134 (response decoding; parser kinds; attribute allowlist); merge of `bc0a9ce`: 136–172 |
 | 23 | `5054a76` | round 21: 69–89 | 90–180 (every HTTP client's response errors; the grid; pmcp fields bound to pmcp classes) |
+| 27 | `7900699` | round 25: 70–94 | 95–178 (one traceback walk gives origin and site; fail closed) |
 | 26 | `62ab87e` | round 24: 70–93 | 94–210 (the SDK's client side; any exception an HTTP client raises, by origin) |
 | 25 | `ef7ad60` | round 23: 70–87 | 88–179 (every HTTP client exception registered; one phrase; TLS-mismatch rows) |
 | 24 | `6b17d3d` | round 22: 73–103 | 104–248 (proxy refusals; redirect scheme and host; source-checked reasons; class-only links) |
@@ -62,8 +59,67 @@ The code for revs 1–17 is at `19dac95`, `929f693`, `026aadc`, `ee644a9`,
 `1824a09`, `9b24daa`, `dd3f707`, `2d9e736`, `8d33b49`, `6078419`,
 `46c4904`, `0a93265`, `ebcf4fc`, `06a9e01`, `67bd04d`, `403a83a` (rev 16),
 `18824c1` (rev 17), `b34717e` (rev 18), `fc88ea8` (rev 19), `f89527e` (rev
-20), `eb8796c` (rev 21), `30dc945` (rev 22), `825c43a` (rev 23), `86a63a6` (rev 24), `89a47c1` (rev 25) and `5a93b9c` (rev 26, on origin). Rev 17 before the
+20), `eb8796c` (rev 21), `30dc945` (rev 22), `825c43a` (rev 23), `86a63a6` (rev 24), `89a47c1` (rev 25), `5a93b9c` (rev 26) and `e8e7ef6` (rev 27, on origin). Rev 17 before the
 merge of `6edf8a4` was `9e5cb57`.
+
+## Rev 28: a validation error's title, only when it is a declared model
+
+**Round 26.**
+- Grok and gemini: AGREE.
+- Codex errored and did not review. Round 27 will run every seat.
+- Claude: PARTIALLY AGREE, with nothing blocking. It confirmed the
+  embedding, the round-25 falsifiers, that origin and site agree on every
+  path, and that no non-validation error can take the carve-out.
+
+**Claude N1.** The structural description printed a pydantic error's
+`title` verbatim (`N validation errors for {title}`), and a title is not
+always a model's name. Two cases put a value into the text, the traceback
+and `describe_exception`:
+- a hand-built `ValidationError.from_exception_data("<S>", …)`;
+- `TypeAdapter(Literal["<S>"])`, whose title is `literal['<S>']`.
+
+Neither is reachable today. The coordinator's ruling: the carve-out takes
+no value it cannot vouch for.
+
+**Rev 28.** `declared_model_names()` is the `__name__` of every pydantic
+model class defined by a loaded module of pmcp, `mcp_types` or the MCP
+SDK. It is read from those modules' namespaces, as rev 2's
+`_declared_names` reads pmcp's field names. A title is printed only when
+it is one of these; any other title reads `<model>`.
+- A model defined in a module not yet loaded cannot have raised, so
+  reading the loaded modules is complete.
+- **Cost:** a `TypeAdapter`'s error (`int`, `union[…]`) and a test's
+  model now read `<model>`. Three test expectations are re-pinned.
+
+**The bindings.**
+- **`test_a_validation_title_is_printed_only_for_a_declared_model`:** both
+  of claude's cases, each raised in pmcp's own frame and beneath an SDK
+  frame, checked in the text, the traceback and `describe_exception`.
+  `McpTaskInfo` keeps its name.
+- **`test_the_declared_model_names_cover_every_installed_model`:** the
+  census.
+  - It imports every module of pmcp and `mcp_types`, and requires each
+    pydantic model class they define to be a declared name.
+  - It requires the declared set to equal the model classes defined by
+    the loaded pmcp, `mcp_types` and `mcp` modules.
+
+**Red on rev 27's code:**
+On rev 27's code (`e8e7ef6`'s `src` with this `test_parse_error_echo.py` and `test_http_transport.py`):
+
+```text
+  1 test_parse_error_echo.py::test_a_validation_error_beneath_an_sdk_frame_keeps_its_description
+  1 test_parse_error_echo.py::test_a_validation_title_is_printed_only_for_a_declared_model
+  1 test_parse_error_echo.py::test_an_uncaught_chain_prints_no_input
+  1 test_parse_error_echo.py::test_the_declared_model_names_cover_every_installed_model
+4 failed, 385 passed in 90.93s (0:01:30)
+```
+
+- The title rows fail on the leak: claude's two cases.
+- The two re-pinned expectations fail on rev 27's verbatim title.
+- The census fails on the name rev 27 lacks.
+
+**Mutants:** M191 prints the title verbatim. M192 takes every loaded
+module's model names, not only pmcp's and the SDK's.
 
 ## Rev 27: one traceback walk, two answers
 
@@ -1177,7 +1233,7 @@ read, is a sink.
 
 ## Changes
 
-The patches are `git diff bc0a9ce e8e7ef6 -- <file>`: 52 files, +15322 / −691. This is
+The patches are `git diff bc0a9ce bf648d5 -- <file>`: 52 files, +15485 / −691. This is
 one concern applied at every sink, past the bounded-plan threshold on
 purpose. Rev 20:
 - adds `pmcp/sdk_rejections.py`, installed with the log scrubber;
@@ -1231,6 +1287,12 @@ Rev 27 changes:
 - `test_parse_error_echo.py`: the SDK-helper matrix, the endpoint row and
   the traceback-loss guard.
 
+Rev 28 changes:
+- `argument_errors.py`: `declared_model_names` and the title rule;
+- tests: the title rows and the census, plus three re-pinned
+  expectations;
+- `CHANGELOG.md`: the `<Model>` sentence.
+
 All 52 patches are one `git apply`: no import cycles, no
 migration, no config change.
 
@@ -1262,10 +1324,10 @@ On a fresh `bc0a9ce` with the patches applied:
 - run the full suite `-m 'not live and not slow'` with the npm cache
   variables unset.
 
-## Acceptance criteria — measured on `e8e7ef6`
+## Acceptance criteria — measured on `bf648d5`
 
-- [x] The eight modules and Consiliency/pmcp#371's two are green: `1607 passed in 452.38s (0:07:32)`.
-- [x] Red on main `bc0a9ce`, with the eight test files from `e8e7ef6`
+- [x] The eight modules and Consiliency/pmcp#371's two are green: `1609 passed in 456.74s (0:07:36)`.
+- [x] Red on main `bc0a9ce`, with the eight test files from `bf648d5`
   (`--tb=line`; the errors are a fixture importing `pmcp.argument_errors`):
 
 ```text
@@ -1275,26 +1337,25 @@ On a fresh `bc0a9ce` with the patches applied:
    3 tests/test_gateway_tool_schemas.py
   28 tests/test_http_transport.py
   80 tests/test_log_record_scrubber.py
- 247 tests/test_parse_error_echo.py
+ 249 tests/test_parse_error_echo.py
    6 tests/test_scoped_advisor_audit.py
-588 failed, 626 passed, 57 errors in 137.87s (0:02:17)
+590 failed, 626 passed, 57 errors in 141.86s (0:02:21)
 ```
 
-- [x] Binding: on rev 26's code, the end-to-end SSE endpoint row and the SDK-helper
-matrix fail on the leak (*Rev 27*); the seats' falsifiers fail there too.
-It passes here. M186–M190 each remove part of the rule (see *Mutation
-evidence*).
+- [x] Binding: on rev 27's code, the title rows fail on the leak, and the re-pinned
+expectations and the census fail (*Rev 28*). It passes here. M191 and M192
+each remove part of the rule (see *Mutation evidence*).
 
 - [x] The full suite, with `npm_config_cache`, `npm_config_store_dir` and
-  `pnpm_config_store_dir` unset: `10259 passed, 6 skipped, 80 deselected in 1055.48s (0:17:35)`. The green run, the full suite
+  `pnpm_config_store_dir` unset: `10261 passed, 6 skipped, 80 deselected in 1108.08s (0:18:28)`. The green run, the full suite
   and the gates ran on host `ai` (`uv run --isolated --all-extras -p 3.10`),
-  from a worktree of the pushed `e8e7ef6`.
+  from a worktree of the pushed `bf648d5`.
 - [x] Gates: ruff check: `All checks passed!`; ruff format --check: `193 files already formatted`; mypy: `Success: no issues found in 57 source files`.
 
 ## Mutation evidence
 
 `mutants.py` ran on host `ai`, three lanes per pass, on worktrees of
-`e8e7ef6`. Each mutant ran in a fresh `uv run --isolated` environment
+`bf648d5`. Each mutant ran in a fresh `uv run --isolated` environment
 (`PYCMD`).
 
 The procedure:
@@ -1305,18 +1366,12 @@ The procedure:
   checked with `cmp` and against HEAD's blob by sha-256;
 - `git status` after the run: `0` and `0`.
 
-The purposes of M1–M185 are in the history table's plans (M177–M185:
-`62ab87e`). Rev 27 adds M186–M190:
-- M186 lets an error through when its SDK site is missing;
-- M187 keeps a helper's raise beneath an SDK frame like the SDK's own;
-- M188 walks the raise site apart from the origin (rev 26's innermost
-  frame);
-- M189 counts every deciding frame as the raising frame;
-- M190 replaces a validation error beneath an SDK frame with the SDK's
-  phrase.
+The purposes of M1–M190 are in the history table's plans (M186–M190:
+`7900699`). Rev 28 adds M191 (the title printed verbatim) and M192 (every
+loaded module's model names declared).
 
 ```text
-166 mutants applied; 164 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M190
+168 mutants applied; 166 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M192
 survived: M23 SDK parse error keeps its message
 survived: M25 malformed error message kept
 ```
@@ -1324,7 +1379,7 @@ survived: M25 malformed error message kept
 `NO_STATIC=1` deselects the sink guard and the helpers-only rule:
 
 ```text
-166 mutants applied; 159 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M149 M151–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M190
+168 mutants applied; 161 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M149 M151–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M192
 survived: M19 tasks_get response uses str(e)
 survived: M20 tasks_get audit buffer uses str(e)
 survived: M22 installer crash message uses raw exc (static guard)
@@ -1336,15 +1391,19 @@ survived: M150 a narrow OSError handler renders its raw text (CLI auth-token fil
 
 M23 and M25 are equivalent mutants. Their combined partners, M102 and M90,
 die in both passes. M19, M20, M22, M35 and M150 die only on the sink guard,
-by design. These survivors are the same as in revs 23 to 26.
+by design. These survivors are the same as in revs 23 to 27.
 
-Rev 27's mutants die in both passes:
+Rev 27's mutants still die in both passes:
 - M186, M187, M188 and M189 die on the SDK-helper matrix:
   - M186 and M187 on the withholding assertion;
   - M188 on the agreed raise site;
   - M189 on the walk's `direct`.
 - M190 dies on `test_downstream_frame_echo`'s session-message rows, the
   regression the first ai run found.
+
+Rev 28's mutants die in both passes. Each stops first, under `-x`, on
+`test_argument_error_echo.py`'s re-pinned `_CollidingErrors` expectation:
+a test's model title reads `<model>`, and both mutants print it.
 
 ## Non-goals and unverified
 
@@ -1484,7 +1543,7 @@ Rev 27's mutants die in both passes:
 
 ## Embedding proof
 
-From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@e8e7ef6`. The proof was run again on the final file, with this section in it, and printed the same listing.
+From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@bf648d5`. The proof was run again on the final file, with this section in it, and printed the same listing.
 
 ```text
 $ git -C <proof worktree> rev-parse --short HEAD
@@ -1517,7 +1576,7 @@ done
 git apply --unidiff-zero --check <scratch>/*.patch && git apply --unidiff-zero <scratch>/*.patch
 ```
 
-The patches are `git diff -U0 bc0a9ce e8e7ef6 -- <file>`. To fit the size
+The patches are `git diff -U0 bc0a9ce bf648d5 -- <file>`. To fit the size
 budget, each is cut to plain unified-diff form: there are no `diff --git`,
 `index` or `new file mode` lines, and no function context in the hunk
 headers. `git apply` reads them the same way; a new file is created with
@@ -1574,7 +1633,7 @@ print(f"{out}: {j - i - 1} lines")
 @@ -611,0 +612,17 @@
 +- **A value pmcp rejects is no longer echoed into a response, a log line, a traceback or an audit record (Consiliency/pmcp#297).** A rejected gateway-tool argument used to come back with jsonschema's or pydantic's message, which carried the value (`'Bearer sk-…' is not of type 'object'`, `input_value=…`), in the response, the log and the scoped audit. Rejections now read `<JSON path>: <reason>`, for example `Input validation error: $.options: must be of type object or null`. The reason is a fixed phrase filled only from the tool's own schema or model, and a key the caller chose shows as `*`. A call rejected by the argument model is audited as an `audit.rejection`. **Wording change:** a client matching jsonschema phrases such as `is not of type` must match the new form.
 +
-+  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`. An exception that chains a validation or parse error, as its cause, its context or a group member, shows only its class and that error's description, never its own message; pmcp's own refusals (an invalid policy file, a trust store it cannot parse) chain nothing and still name the file and the refusal. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500. The MCP SDK's own rejections no longer quote the request, on every transport: an unknown method's name is no longer returned as `data`, an unsupported protocol version's `requested` is returned only when it is a protocol revision, an SDK message pmcp has not reviewed reads as a fixed phrase for its code, and on `/mcp` a body that is not JSON or not a JSON-RPC message is described from its structure (`Validation error: N validation errors for …: $.<path>: <reason>`). Errors from pmcp's own tools are unchanged, and so is the request id. The SDK's server-side DEBUG logs and `sse_starlette`'s no longer show request text. A failed tool call whose error carries a rejected value is never read as a URL-elicitation request or an auth challenge. An HTTP response pmcp rejects -- a malformed status or header line, bad chunk framing, a truncated or undecodable body, an unexpected content type, an error status's reason phrase, a proxy's refusal of any status, a redirect to an unsupported scheme -- is reported by its class and status number, never its bytes, by every HTTP client pmcp uses (registry, version and package lookups, JWKS and auth metadata, feedback, the CLI's health probes, and remote MCP servers in `gateway.health`); the HTTP client libraries' DEBUG traces are masked likewise. Every error an HTTP client pmcp uses raises (aiohttp, httpx, httpcore, h11, urllib and `http.client`) reads `an HTTP request failed (<class>[, status N])`, without its library or OS text: that text can name a host a followed redirect chose, or a proxy's reason phrase. Each call site still names its own package, URL or server. Any exception, of any type, that such a client's own code raises reads the same way, a redirect `Location` its URL parser rejects included. The MCP SDK's client transports are held to the same rule: a reply the SDK writes for the downstream from the response (`Unexpected content type: …`) reads as its code's fixed phrase in connect errors and `gateway.health`; an exception the SDK raises with text pmcp has not reviewed reads by its class and code; and every `mcp.*` logger, client and server, is masked, its tracebacks printing each exception by class. A traceback whose chain holds such an error prints every other exception in it by its class alone. An `MCPError` a gateway tool raises while handling a value it rejected keeps its code, and its message becomes the structural description.
++  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`, where `<Model>` is a model class pmcp or the MCP SDK defines, and any other title reads `<model>`. An exception that chains a validation or parse error, as its cause, its context or a group member, shows only its class and that error's description, never its own message; pmcp's own refusals (an invalid policy file, a trust store it cannot parse) chain nothing and still name the file and the refusal. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500. The MCP SDK's own rejections no longer quote the request, on every transport: an unknown method's name is no longer returned as `data`, an unsupported protocol version's `requested` is returned only when it is a protocol revision, an SDK message pmcp has not reviewed reads as a fixed phrase for its code, and on `/mcp` a body that is not JSON or not a JSON-RPC message is described from its structure (`Validation error: N validation errors for …: $.<path>: <reason>`). Errors from pmcp's own tools are unchanged, and so is the request id. The SDK's server-side DEBUG logs and `sse_starlette`'s no longer show request text. A failed tool call whose error carries a rejected value is never read as a URL-elicitation request or an auth challenge. An HTTP response pmcp rejects -- a malformed status or header line, bad chunk framing, a truncated or undecodable body, an unexpected content type, an error status's reason phrase, a proxy's refusal of any status, a redirect to an unsupported scheme -- is reported by its class and status number, never its bytes, by every HTTP client pmcp uses (registry, version and package lookups, JWKS and auth metadata, feedback, the CLI's health probes, and remote MCP servers in `gateway.health`); the HTTP client libraries' DEBUG traces are masked likewise. Every error an HTTP client pmcp uses raises (aiohttp, httpx, httpcore, h11, urllib and `http.client`) reads `an HTTP request failed (<class>[, status N])`, without its library or OS text: that text can name a host a followed redirect chose, or a proxy's reason phrase. Each call site still names its own package, URL or server. Any exception, of any type, that such a client's own code raises reads the same way, a redirect `Location` its URL parser rejects included. The MCP SDK's client transports are held to the same rule: a reply the SDK writes for the downstream from the response (`Unexpected content type: …`) reads as its code's fixed phrase in connect errors and `gateway.health`; an exception the SDK raises with text pmcp has not reviewed reads by its class and code; and every `mcp.*` logger, client and server, is masked, its tracebacks printing each exception by class. A traceback whose chain holds such an error prints every other exception in it by its class alone. An `MCPError` a gateway tool raises while handling a value it rejected keeps its code, and its message becomes the structural description.
 +
 +  Downstream frames:
 +  - A frame that is not JSON-RPC 2.0 is dropped with a value-free DEBUG record and never settles a request. This holds on stdio, SSE and streamable HTTP.
@@ -1677,7 +1736,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/src/pmcp/argument_errors.py
-@@ -0,0 +1,1697 @@
+@@ -0,0 +1,1743 @@
 +"""Describe a rejected gateway-tool argument without the value that failed.
 +
 +A gateway tool's arguments are checked twice: by the advertised JSON Schema
@@ -1863,6 +1922,52 @@ print(f"{out}: {j - i - 1} lines")
 +                        names.add(field.alias)
 +    _declared_cache = (key, frozenset(names))
 +    return _declared_cache[1]
++
++
++_model_names_cache: tuple[int, frozenset[str]] | None = None
++
++#: The packages whose own pydantic model classes may be named in a
++#: validation error's description (rev 28).
++_MODEL_PACKAGES = ("pmcp", "mcp_types", "mcp")
++
++
++def declared_model_names() -> frozenset[str]:
++    """The ``__name__`` of every pydantic model class pmcp, `mcp_types` or
++    the MCP SDK defines, read from their loaded modules' namespaces (rev 28,
++    round-26 claude N1). Written by those packages' authors, never by a
++    caller or a downstream: a validation error's ``title`` is printed only
++    when it is one of these."""
++    global _model_names_cache
++    from pydantic import BaseModel
++
++    key = len(sys.modules)
++    if _model_names_cache is not None and _model_names_cache[0] == key:
++        return _model_names_cache[1]
++    names: set[str] = set()
++    for module_name, module in list(sys.modules.items()):
++        if module is None or module_name.split(".")[0] not in _MODEL_PACKAGES:
++            continue
++        for value in list(vars(module).values()):
++            if (
++                isinstance(value, type)
++                and issubclass(value, BaseModel)
++                and value.__module__ == module_name
++            ):
++                names.add(value.__name__)
++    _model_names_cache = (key, frozenset(names))
++    return _model_names_cache[1]
++
++
++#: Printed for a validation error whose ``title`` is not a declared model's
++#: name: a hand-built error's, or a `TypeAdapter`'s (`literal['<value>']`).
++_UNDECLARED_TITLE = "<model>"
++
++
++def _model_title(error: ValidationError) -> str:
++    title = error.title
++    if isinstance(title, str) and title in declared_model_names():
++        return title
++    return _UNDECLARED_TITLE
 +
 +
 +def _render_path(segments: Iterable[str | int | None]) -> str:
@@ -2631,7 +2736,7 @@ print(f"{out}: {j - i - 1} lines")
 +        count = error.error_count()
 +        plural = "" if count == 1 else "s"
 +        return (
-+            f"{count} validation error{plural} for {error.title}: "
++            f"{count} validation error{plural} for {_model_title(error)}: "
 +            f"{describe_model_error(error, None, None)}"
 +        )
 +    assert isinstance(error, (jsonschema.ValidationError, jsonschema.SchemaError))
@@ -6392,7 +6497,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/tests/test_argument_error_echo.py
-@@ -0,0 +1,2654 @@
+@@ -0,0 +1,2655 @@
 +"""A rejected gateway-tool argument never echoes its value (Consiliency/pmcp#297).
 +
 +The oracle is a generated sweep, not hand-picked cases. Its axes come from the
@@ -7478,8 +7583,9 @@ print(f"{out}: {j - i - 1} lines")
 +        (
 +            exception_text(raised.value),
 +            # No schema here, and a test model's fields are no names pmcp
-+            # declares, so the locations read as `*`.
-+            "4 validation errors for _CollidingErrors: $.*: is not an "
++            # declares, so the locations read as `*`; nor is the test model
++            # one pmcp declares, so its title reads `<model>` (rev 28).
++            "4 validation errors for <model>: $.*: is not an "
 +            "allowed value; $.*: is too short; $.*: is too small; "
 +            "$.*: is required",
 +        ),
@@ -14943,7 +15049,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/tests/test_parse_error_echo.py
-@@ -0,0 +1,2959 @@
+@@ -0,0 +1,3075 @@
 +"""A parse error never echoes the structured text it rejected
 +(Consiliency/pmcp#297; rev 6, reclassified by origin in rev 7).
 +
@@ -15813,7 +15919,8 @@ print(f"{out}: {j - i - 1} lines")
 +    # The wrapper's line is its class and what it chains, once (rev 18).
 +    wrapper = {
 +        "yaml": "\nRuntimeError: could not parse YAML (ParserError) at line 1, column",
-+        "pydantic": "\nRuntimeError: 1 validation error for int: $: must be an integer\n",
++        # A `TypeAdapter(int)`'s title is no declared model's (rev 28).
++        "pydantic": "\nRuntimeError: 1 validation error for <model>: $: must be an integer\n",
 +    }[origin]
 +    assert wrapper in result.stderr, result.stderr
 +    assert "boom" not in result.stderr, result.stderr
@@ -17901,8 +18008,123 @@ print(f"{out}: {j - i - 1} lines")
 +        namespace["_received_notification"]()
 +    assert exception_walk(caught.value).kind == "mcp"
 +    text = exception_text(caught.value)
-+    assert text.startswith("1 validation error for Probe: $.task_id"), text
++    # A test's model is not one pmcp or the SDK declares (rev 28).
++    assert text.startswith("1 validation error for <model>: $.task_id"), text
 +    assert s not in text
++
++
++# --- a validation error's title (rev 28, round-26 claude N1) -----------------
++
++
++def test_a_validation_title_is_printed_only_for_a_declared_model() -> None:
++    """The structural description prints a pydantic error's `title` only
++    when it is the name of a model class pmcp, `mcp_types` or the SDK
++    defines; any other title -- a hand-built error's, a `TypeAdapter`'s
++    `literal['<value>']` -- reads `<model>`. Checked in the text, the
++    traceback and `describe_exception`, raised beneath an SDK frame and in
++    pmcp's own."""
++    from pathlib import Path
++    from typing import Literal
++
++    import mcp
++    from pydantic import TypeAdapter, ValidationError
++    from pydantic_core import InitErrorDetails, PydanticCustomError
++
++    from pmcp.argument_errors import exception_text, safe_traceback_text
++    from pmcp.client.manager import describe_exception
++    from pmcp.types import McpTaskInfo
++
++    s = _GRID_S
++
++    def hand_built() -> None:
++        raise ValidationError.from_exception_data(
++            s,
++            [
++                InitErrorDetails(
++                    type=PydanticCustomError("missing", "required"),
++                    loc=("field",),
++                    input={},
++                )
++            ],
++        )
++
++    def adapter() -> None:
++        TypeAdapter(Literal[s]).validate_python("other")  # type: ignore[valid-type]
++
++    filename = str(Path(mcp.__file__).parent / "client/session.py")
++    namespace: dict[str, Any] = {"hand_built": hand_built, "adapter": adapter}
++    exec(  # noqa: S102 -- frames with the SDK's file name, for the test
++        compile(
++            "def sdk_hand_built():\n    hand_built()\n"
++            "def sdk_adapter():\n    adapter()\n",
++            filename,
++            "exec",
++        ),
++        namespace,
++    )
++    for call in (
++        hand_built,
++        adapter,
++        namespace["sdk_hand_built"],
++        namespace["sdk_adapter"],
++    ):
++        with pytest.raises(ValidationError) as caught:
++            call()
++        error = caught.value
++        texts = {
++            "exception_text": exception_text(error),
++            "safe_traceback_text": safe_traceback_text(error),
++            "describe_exception": describe_exception(error),
++        }
++        assert not any(s in t for t in texts.values()), texts
++        assert "validation error for <model>:" in texts["exception_text"], texts
++    with pytest.raises(ValidationError) as declared:
++        McpTaskInfo.model_validate({})
++    assert "for McpTaskInfo:" in exception_text(declared.value)
++
++
++def test_the_declared_model_names_cover_every_installed_model() -> None:
++    """Census (rev 28): after importing every module of pmcp and
++    `mcp_types`, each pydantic model class they define is a declared name,
++    and every declared name is a class one of them, or the SDK, defines."""
++    import importlib
++    import inspect
++    import pkgutil
++
++    import mcp_types
++    from pydantic import BaseModel
++
++    import pmcp
++    from pmcp.argument_errors import declared_model_names
++
++    defined: set[str] = set()
++    for package in (pmcp, mcp_types):
++        for info in pkgutil.walk_packages(package.__path__, package.__name__ + "."):
++            try:
++                module = importlib.import_module(info.name)
++            except Exception:  # noqa: BLE001 -- an optional extra's module
++                continue
++            defined |= {
++                value.__name__
++                for value in vars(module).values()
++                if inspect.isclass(value)
++                and issubclass(value, BaseModel)
++                and value.__module__ == module.__name__
++            }
++    names = declared_model_names()
++    assert defined and defined <= names, sorted(defined - names)
++    import sys
++
++    sdk = {
++        value.__name__
++        for name, module in list(sys.modules.items())
++        if module is not None and name.split(".")[0] in ("pmcp", "mcp_types", "mcp")
++        for value in list(vars(module).values())
++        if inspect.isclass(value)
++        and issubclass(value, BaseModel)
++        and value.__module__ == name
++    }
++    assert names == sdk, sorted(names ^ sdk)
 ````
 
 ### Patch — `tests/test_pkgid_panel_fixes.py`
@@ -18298,15 +18520,12 @@ print(f"{out}: {j - i - 1} lines")
 
 Run it as `PYTHONDONTWRITEBYTECODE=1 python mutants.py <worktree> <out-dir> [M4 ...]`; `NO_STATIC=1` deselects both sink checks, `DESELECT="<nodeid> ..."` deselects the named tests (rev 24), and `PYCMD="uv run --isolated --all-extras -p 3.10 python"` runs each mutant in a fresh environment (rev 25). Without the bytecode setting, a same-size first mutant written in the checkout's mtime second leaves a stale `.pyc` (see *Mutation evidence*).
 
-To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e`, `0dc22a4`, `40e2ba4`, `acf99e9`, `d73d6cb`, `7bcb209`, `221115a`, `5054a76`, `6b17d3d`, `ef7ad60` and `62ab87e`, in that order. Then apply this diff (rev 27: M186–M190 added).
+To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e`, `0dc22a4`, `40e2ba4`, `acf99e9`, `d73d6cb`, `7bcb209`, `221115a`, `5054a76`, `6b17d3d`, `ef7ad60`, `62ab87e` and `7900699`, in that order. Then apply this diff (rev 28: M191–M192 added).
 
 ````diff
 --- a/mutants.py
 +++ b/mutants.py
-@@ -182,0 +183,5 @@
-+ ("M186 a missing SDK site lets the error through", "src/pmcp/sdk_rejections.py", [("    if site is None or not walk.direct:\n        return True\n", "    if site is None:\n        return False\n")]),
-+ ("M187 a helper's raise beneath an SDK frame kept like the SDK's own", "src/pmcp/sdk_rejections.py", [("    if site is None or not walk.direct:\n", "    if site is None:\n")]),
-+ ("M188 the raise site walked apart from the origin", "src/pmcp/sdk_rejections.py", [('    walk = exception_walk(error)\n    if walk.kind != "mcp" or walk.filename is None:\n        return None\n', '    tb = error.__traceback__\n    while tb is not None and tb.tb_next is not None:\n        tb = tb.tb_next\n    if tb is None:\n        return None\n    walk = type(exception_walk(error))("mcp", tb.tb_frame.f_code.co_filename, tb.tb_frame.f_code.co_name, True)\n    if walk.filename is None:\n        return None\n')]),
-+ ("M189 every frame counted as the raising frame", A, [("            return Origin(kind, filename, function, depth == 0)\n", "            return Origin(kind, filename, function, True)\n")]),
-+ ("M190 a validation error beneath an SDK frame replaced by the SDK's phrase", A, [("    if not is_http and not structural and _withheld_sdk(error):\n", "    if not is_http and _withheld_sdk(error):\n")]),
+@@ -187,0 +188,2 @@
++ ("M191 a validation error's title printed verbatim", A, [("            f\"{count} validation error{plural} for {_model_title(error)}: \"\n", "            f\"{count} validation error{plural} for {error.title}: \"\n")]),
++ ("M192 every loaded class's name a declared model", A, [("        if module is None or module_name.split(\".\")[0] not in _MODEL_PACKAGES:\n", "        if module is None:\n")]),
 ````
