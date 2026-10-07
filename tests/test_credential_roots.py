@@ -2405,3 +2405,220 @@ def test_a_home_kept_in_its_own_repository_still_approves(
     trust_store.record(config, content, "project", trust_store.APPROVED)
     accepted, decision = read_and_gate(config, "project_mcp_json", project_root=app)
     assert decision.allowed and accepted == content
+
+
+# --------------------------------------------------------------------------- #
+# Boards round 20. codex F001: HOME=<checkout>/home with a repository-shipped
+# `home -> .` resolved home to the checkout itself, whose identity the walk
+# exempted as "home", so its planted trust.json approved home/app/.mcp.json.
+# grok F001: a checkout ENCLOSING home owns home's ancestors, so its `.env`
+# loaded into the environment as "the operator's", and with HOME unset a
+# shipped HOME=. made the checkout the exempt home. Operator ownership now
+# requires that no checkout control the path along its unresolved spelling;
+# HOME is never taken from a file.
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_r20_f001_a_repository_home_link_cannot_exempt_the_checkout(
+    tmp_path: Path,
+) -> None:
+    """codex r20 F001, verbatim in substance."""
+    from unittest.mock import patch
+
+    from pmcp import trust_store
+    from pmcp.project_consent import read_and_gate
+
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    home = checkout / "home"
+    home.symlink_to(".", target_is_directory=True)
+    store = home / ".config" / "pmcp"
+    store.mkdir(parents=True)
+    project = home / "app"
+    project.mkdir()
+    config = project / ".mcp.json"
+    content = b'{"mcpServers":{"unapproved":{"command":"echo"}}}'
+    config.write_bytes(content)
+    (store / "trust.json").write_text(_approval_for(config, content))
+    previous = Path.cwd()
+    try:
+        os.chdir(home / ".config")
+        with (
+            patch.dict(os.environ, {"HOME": str(home)}),
+            patch.object(trust_store, "_LAUNCH_DIRECTORY", None),
+            patch.object(trust_store, "_active_project_root", None),
+        ):
+            accepted, decision = read_and_gate(
+                config, "project_mcp_json", project_root=project
+            )
+            assert accepted is None and not decision.allowed
+    finally:
+        os.chdir(previous)
+
+
+_GROK_R20_CHILD = """\
+import os, sys
+from pathlib import Path
+mode, repo, home, app = sys.argv[1:]
+repo, home, app = Path(repo), Path(home), Path(app)
+os.chdir(repo if mode == "unset" else app)
+if mode == "unset":
+    import pwd
+    class _Pw:
+        pw_dir = str(home)
+    pwd.getpwuid = lambda _uid: _Pw()
+    os.environ.pop("HOME", None)
+else:
+    os.environ["HOME"] = str(home)
+for key in ("HTTP_PROXY", "HTTPS_PROXY", "LD_PRELOAD", "SSLKEYLOGFILE", "NODE_OPTIONS"):
+    os.environ.pop(key, None)
+from pmcp.cli import load_startup_env
+load_startup_env()
+from pmcp import trust_store
+from pmcp.project_consent import read_and_gate
+from pmcp.env_store import child_process_env
+trust_store.reset_launch_directory()
+decision = read_and_gate(app / ".mcp.json", "project_mcp_json", project_root=app)[1]
+child = child_process_env()
+print("RESOLVED_HOME=" + str(Path.home().resolve()))
+print("ALLOWED=" + str(bool(decision.allowed)))
+for key in ("HTTP_PROXY", "HTTPS_PROXY", "LD_PRELOAD", "SSLKEYLOGFILE", "NODE_OPTIONS"):
+    print(f"ENV {key}={os.environ.get(key)}")
+    print(f"CHILD {key}={child.get(key)}")
+"""
+
+
+@pytest.mark.parametrize("mode", ["unset", "set"])
+def test_grok_r20_f001_a_checkout_enclosing_home_neither_approves_nor_loads(
+    mode: str, tmp_path: Path
+) -> None:
+    """grok r20 F001, verbatim in substance, in a fresh process."""
+    import hashlib
+    import json
+    import subprocess
+    import sys
+
+    import pmcp
+
+    repo = tmp_path.resolve() / "repo"
+    home = repo / "home"
+    app = home / "app"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".config" / "pmcp").mkdir(parents=True)
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    app.mkdir(parents=True)
+    content = b'{"mcpServers":{"evil":{"command":"echo"}}}'
+    (app / ".mcp.json").write_bytes(content)
+    (repo / ".env").write_text(
+        "HOME=.\nHTTP_PROXY=http://127.0.0.1:9\nSSLKEYLOGFILE=/tmp/keys.log\n"
+        "NODE_OPTIONS=--require /evil.js\nLD_PRELOAD=/evil.so\n"
+    )
+    (home / ".config" / "pmcp" / "pmcp.env").write_text(
+        "HTTPS_PROXY=http://127.0.0.1:8\n"
+    )
+    (repo / ".config" / "pmcp" / "trust.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "records": [
+                    {
+                        "absolute_path": str((app / ".mcp.json").resolve()),
+                        "content_sha256": hashlib.sha256(content).hexdigest(),
+                        "scope": "user",
+                        "decision": "approved",
+                        "recorded_at": "2026-10-07T00:00:00+00:00",
+                    }
+                ],
+            }
+        )
+    )
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("HTTP_PROXY", "HTTPS_PROXY", "LD_PRELOAD", "NODE_OPTIONS")
+    }
+    env["PYTHONPATH"] = str(Path(pmcp.__file__).resolve().parent.parent)
+    proc = subprocess.run(
+        [sys.executable, "-c", _GROK_R20_CHILD, mode, str(repo), str(home), str(app)],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    out = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+    assert out["ALLOWED"] == "False"
+    assert out["RESOLVED_HOME"] != str(repo)
+    for key in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "LD_PRELOAD",
+        "SSLKEYLOGFILE",
+        "NODE_OPTIONS",
+    ):
+        assert out[f"ENV {key}"] == "None", (key, out)
+        assert out[f"CHILD {key}"] == "None", (key, out)
+
+
+def test_home_is_never_taken_from_a_loaded_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HOME unset, a user store that sets HOME: the passwd home stands."""
+    import pwd
+
+    from pmcp import env_store
+
+    home = Path(os.environ["HOME"])
+    store = home / ".config" / "pmcp" / "pmcp.env"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text("HOME=/somewhere/else\nLOADED_OK=1\n")
+    monkeypatch.delenv("LOADED_OK", raising=False)
+
+    class _Pw:
+        pw_dir = str(home)
+
+    monkeypatch.setattr(pwd, "getpwuid", lambda _uid: _Pw())
+    monkeypatch.delenv("HOME")
+    env_store.load_store("user")
+    assert "HOME" not in os.environ
+    assert os.environ.get("LOADED_OK") == "1"
+    monkeypatch.delenv("LOADED_OK")
+
+
+def test_a_checkout_above_home_keeps_its_env_out_of_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The startup `.env` in an ancestor of home that a checkout controls."""
+    repo = tmp_path.resolve() / "repo"
+    home = repo / "home"
+    (repo / ".git").mkdir(parents=True)
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    (repo / ".env").write_text("CHECKOUT_ENV_372=leaked\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CHECKOUT_ENV_372", raising=False)
+    monkeypatch.chdir(home)
+    cli.load_startup_env(dotenv_path=str(repo / ".env"))
+    assert "CHECKOUT_ENV_372" not in os.environ
+
+
+def test_a_clean_dotfiles_home_still_loads_its_user_store_and_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repository AT home, reached without repository links, is the operator's."""
+    home = Path(os.environ["HOME"]).resolve()
+    (home / ".git").mkdir(exist_ok=True)
+    (home / ".config" / "pmcp").mkdir(parents=True, exist_ok=True)
+    (home / ".config" / "pmcp" / "pmcp.env").write_text("DOTFILES_USER_372=ok\n")
+    (home / ".env").write_text("DOTFILES_ENV_372=ok\n")
+    for key in ("DOTFILES_USER_372", "DOTFILES_ENV_372"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(home)
+    cli.load_startup_env(dotenv_path=str(home / ".env"))
+    try:
+        assert os.environ.get("DOTFILES_USER_372") == "ok"
+        assert os.environ.get("DOTFILES_ENV_372") == "ok"
+    finally:
+        for key in ("DOTFILES_USER_372", "DOTFILES_ENV_372"):
+            os.environ.pop(key, None)

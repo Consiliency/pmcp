@@ -43,7 +43,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pmcp.home_identity import is_home, is_operators_own_area
+from pmcp.home_identity import (
+    enclosing_checkouts,
+    has_checkout_marker,
+    is_operator_owned,
+)
 from pmcp.atomic_write import (
     atomic_write,
     falls_back_to_pathname,
@@ -135,7 +139,7 @@ def reset_launch_directory() -> None:
 
 def _is_checkout(root: Path) -> bool:
     """Does ``root`` carry a checkout marker?"""
-    return _has_checkout_marker(root)
+    return has_checkout_marker(root)
 
 
 def _boundaries(root: Path) -> list[Path]:
@@ -156,7 +160,7 @@ def _boundaries(root: Path) -> list[Path]:
     # physical ancestors, plus the default store's own real directories
     # (home's .config and .config/pmcp), are the operator's (Consiliency/pmcp
     # #372 round 19, board round 18 codex F001 and claude N-1).
-    if is_operators_own_area(root):
+    if is_operator_owned(root):
         return []
     return [root]
 
@@ -182,27 +186,6 @@ def set_active_project_root(root: Path | None) -> None:
     _active_project_root = root.resolve() if root is not None else None
 
 
-#: What makes a directory a checkout for the residency guard: the same
-#: markers project discovery uses (``config.loader.find_project_root``).
-_CHECKOUT_MARKERS = (
-    ".mcp.json",
-    ".git",
-    "package.json",
-    "pyproject.toml",
-    os.path.join(".pmcp", "manifest.yaml"),
-)
-
-
-def _has_checkout_marker(directory: Path) -> bool:
-    for marker in _CHECKOUT_MARKERS:
-        try:
-            os.lstat(directory / marker)
-        except OSError:
-            continue
-        return True
-    return False
-
-
 def _enclosing_checkouts(start: Path) -> Iterator[Path]:
     """Every checkout at or above ``start``, resolved, nearest first -- up to ``/``.
 
@@ -219,17 +202,9 @@ def _enclosing_checkouts(start: Path) -> Iterator[Path]:
     ``_checkout_roots`` and ``assert_store_outside_path_checkout`` so the walk
     cannot drift between them.
     """
-    try:
-        current = Path(os.path.realpath(start))
-    except (OSError, ValueError):
-        return
-    while True:
-        if _has_checkout_marker(current) and not is_home(current):
-            yield current
-        parent = current.parent
-        if parent == current:
-            return
-        current = parent
+    # The walk lives in pmcp.home_identity (Consiliency/pmcp#372 round 21),
+    # where operator ownership is decided with it.
+    yield from enclosing_checkouts(start)
 
 
 def _checkout_roots(also: tuple[Path, ...] = ()) -> tuple[Path, ...]:

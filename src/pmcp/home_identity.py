@@ -102,3 +102,127 @@ def is_operators_own_area(
     return identity in home_and_ancestor_identities(
         home
     ) or identity in default_store_directory_identities(home)
+
+
+# --------------------------------------------------------------------------- #
+# Operator ownership (Consiliency/pmcp#372 round 21, boards round 20 grok and
+# codex F001). Being home, an ancestor of home or the default store's directory
+# is not enough: a checkout can make a path LOOK like the operator's -- a
+# repository-shipped `home -> .` with HOME=<checkout>/home resolves home to the
+# checkout itself; a checkout that encloses home owns home's ancestors. A path
+# is the operator's only when no checkout controls it.
+# --------------------------------------------------------------------------- #
+
+#: What makes a directory a checkout: the markers project discovery uses
+#: (``config.loader.find_project_root``).
+CHECKOUT_MARKERS = (
+    ".mcp.json",
+    ".git",
+    "package.json",
+    "pyproject.toml",
+    os.path.join(".pmcp", "manifest.yaml"),
+)
+
+
+def has_checkout_marker(directory: os.PathLike[str] | str) -> bool:
+    for marker in CHECKOUT_MARKERS:
+        try:
+            os.lstat(os.path.join(directory, marker))
+        except OSError:
+            continue
+        return True
+    return False
+
+
+def _lexical_prefixes(path: os.PathLike[str] | str) -> list[Path]:
+    """``/``, ``/a``, ``/a/b``, ... of ``path`` AS WRITTEN (absolute, not resolved)."""
+    absolute = Path(os.path.abspath(path))
+    return [*reversed(absolute.parents), absolute]
+
+
+def _marked_at_or_above(resolved: Path) -> bool:
+    """Is any directory from ``resolved`` up to ``/`` a checkout (no exceptions)?"""
+    current = resolved
+    while True:
+        if has_checkout_marker(current):
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
+def home_is_clean(home: Path | None = None) -> bool:
+    """Does HOME, as written, reach home without a link that resolves into a checkout?
+
+    The condition for treating a repository AT home (a dotfiles repository) as
+    the operator's rather than as a checkout: a repository-shipped
+    ``<checkout>/home -> .`` makes home resolve to the checkout itself.
+    """
+    spelled = home if home is not None else Path.home()
+    for prefix in _lexical_prefixes(spelled):
+        if os.path.islink(prefix) and _marked_at_or_above(
+            Path(os.path.realpath(prefix))
+        ):
+            return False
+    return True
+
+
+def enclosing_checkouts(start: os.PathLike[str] | str):  # type: ignore[no-untyped-def]
+    """Every checkout from ``start`` (resolved) up to ``/``, nearest first.
+
+    The residency walk -- not project discovery, which stops at home. The home
+    directory itself is skipped only while HOME is clean (:func:`home_is_clean`):
+    a dotfiles repository at home is the operator's; a checkout home merely
+    resolves to is not.
+    """
+    try:
+        current = Path(os.path.realpath(start))
+    except (OSError, ValueError):
+        return
+    skip_home = home_is_clean()
+    while True:
+        if has_checkout_marker(current) and not (skip_home and is_home(current)):
+            yield current
+        if current.parent == current:
+            return
+        current = current.parent
+
+
+def inside_a_checkout(path: os.PathLike[str] | str) -> bool:
+    """Does a checkout enclose ``path`` along its UNRESOLVED spelling?
+
+    Each component as written, from ``/``: if the directory it names -- or the
+    target a link there resolves to -- lies inside a checkout, so does the path.
+    """
+    for prefix in _lexical_prefixes(path):
+        try:
+            if any(True for _ in enclosing_checkouts(prefix)):
+                return True
+        except OSError:
+            return True  # cannot establish: not the operator's
+    return False
+
+
+def is_operator_owned(
+    directory: os.PathLike[str] | str,
+    *,
+    store_directories: bool = True,
+    home: Path | None = None,
+) -> bool:
+    """THE predicate: is ``directory`` the operator's own?
+
+    Both must hold: (1) by identity it is home, a physical ancestor of home, or
+    (``store_directories``) home's real ``.config`` / ``.config/pmcp``; and (2)
+    no checkout encloses it along its unresolved spelling
+    (:func:`inside_a_checkout`). Used for the residency exemption, the startup
+    ``.env`` rule and the user store.
+    """
+    identity = _identity(directory)
+    if identity is None:
+        return False
+    areas = home_and_ancestor_identities(home)
+    if store_directories:
+        areas |= default_store_directory_identities(home)
+    if identity not in areas:
+        return False
+    return not inside_a_checkout(directory)

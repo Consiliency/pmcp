@@ -547,10 +547,10 @@ def _build_root_entry(root: Path) -> _RootEntry:
     values: dict[str, str] = {}
     sources: list[tuple[str, object]] = []
     stamp = _root_stamp(root)
-    root_identity = _identity(root)
     # In the home directory, or above it, a `.env` is the operator's own
-    # (load_discovered_dotenv loads it into the environment), not a project file.
-    operators = root_identity is not None and root_identity in _home_and_its_ancestors()
+    # (load_discovered_dotenv loads it into the environment), not a project file
+    # -- unless a checkout controls that directory (_operator_owned_directory).
+    operators = _operator_owned_directory(root)
     for name in _ROOT_FILES:
         if operators and name == ".env":
             continue
@@ -1053,38 +1053,41 @@ def load_store(
     goes into the credential map instead (:func:`credential_value`), never into
     the process environment.
     """
-    from dotenv import load_dotenv
-
     located = _locate_or_warn(scope, project, None, path, strict=False, verb=verb)
     if located is None:
         return
     store_path, confinement = located
     if confinement is None:
+        # The user store is the operator's only while no checkout controls
+        # the home directory it lives under (Consiliency/pmcp#372 round 21,
+        # board round 20 grok F001: with HOME inside a checkout, the
+        # repository wrote "the user store"). A link from a clean home into a
+        # dotfiles repository is still the operator's.
         text = _read_user_text(store_path, verb=verb)
-        if text is not None:
-            load_dotenv(stream=io.StringIO(text), override=False)
+        if text is None:
+            return  # refused, with its own warning
+        home = resolve_scope_path("user").parent.parent.parent
+        if not _operator_owned_directory(home):
+            # The verb spelled out: a migration guide may quote this line, and
+            # its checker matches quotes against literal text.
+            if verb == "load":
+                message = (
+                    f"refusing to load {store_path.name}: the home directory "
+                    "lies inside a checkout"
+                )
+            else:
+                message = (
+                    f"refusing to read {store_path.name}: the home directory "
+                    "lies inside a checkout"
+                )
+            _warn_store_refused(store_path, message)
+            return
+        _load_operator_text(text, store_path.name)
         return
     # A repository file is one of its root's project files: (re)build that
     # root's entry with THE builder (_build_root_entry).
     root = confinement[0]
     _REPO_CREDENTIALS[_root_key(root)] = _build_root_entry(root)
-
-
-def _home_and_its_ancestors() -> set[tuple[int, int]]:
-    """``(st_dev, st_ino)`` of the operator's home directory and every ancestor.
-
-    The home directory is the user store's (:func:`resolve_scope_path`): the
-    pinned one once the startup load has pinned it. Asking does not pin -- the
-    pin is the startup load's, taken before any file loads
-    (``cli.load_startup_env``), and a lookup must not take it as a side effect
-    at some later moment. Identity, not path strings: a repository can choose
-    path spellings, not inodes.
-    """
-    from pmcp.home_identity import home_and_ancestor_identities
-
-    # PHYSICAL ancestors: walked from the resolved home, never the spelling
-    # HOME holds (Consiliency/pmcp#372 round 19).
-    return home_and_ancestor_identities(resolve_scope_path("user").parent.parent.parent)
 
 
 def _identity(path: Path) -> tuple[int, int] | None:
@@ -1103,6 +1106,49 @@ def _identity(path: Path) -> tuple[int, int] | None:
     return (status.st_dev, status.st_ino)
 
 
+#: Never set from a file pmcp loads: where the operator's files are is decided
+#: by the real environment (or the passwd database when HOME is unset) before
+#: any file is read (Consiliency/pmcp#372 round 21, board round 20 grok F001:
+#: a shipped ``HOME=.`` was honoured).
+_NEVER_LOADED = frozenset({"HOME", "USERPROFILE"})
+
+
+def _load_operator_text(text: str, name: str) -> None:
+    """Load an operator file's text into ``os.environ``, never overriding.
+
+    ``load_dotenv(override=False)`` as before, except that HOME (and
+    USERPROFILE) are never taken from a file.
+    """
+    from dotenv import dotenv_values
+
+    for key, value in dotenv_values(stream=io.StringIO(text)).items():
+        if value is None or key in os.environ:
+            continue
+        if key.upper() in _NEVER_LOADED:
+            print(
+                f"pmcp: Ignoring {key} in {name}: where the operator's files "
+                "are is never set by a file pmcp loads",
+                file=sys.stderr,
+            )
+            continue
+        os.environ[key] = value
+
+
+def _operator_owned_directory(directory: Path) -> bool:
+    """Is ``directory`` home or above it, by identity, with no checkout controlling it?
+
+    ``home_identity.is_operator_owned`` without the default-store directories,
+    for the home directory pinned by the startup load.
+    """
+    from pmcp.home_identity import is_operator_owned
+
+    return is_operator_owned(
+        directory,
+        store_directories=False,
+        home=resolve_scope_path("user").parent.parent.parent,
+    )
+
+
 def load_discovered_dotenv(path: Path) -> None:
     """Load the ``.env`` python-dotenv's startup walk found, by WHERE it is.
 
@@ -1117,16 +1163,17 @@ def load_discovered_dotenv(path: Path) -> None:
     (Consiliency/pmcp#372 round 3: a marker-file test let a ``setup.py`` or
     ``requirements.txt`` checkout's ``.env`` through).
     """
-    from dotenv import load_dotenv
-
-    directory = _identity(path.parent)
-    operators = directory is not None and directory in _home_and_its_ancestors()
-    if not operators:
+    # The operator's only if no checkout controls its directory
+    # (Consiliency/pmcp#372 round 21, board round 20 grok F001: a checkout
+    # that ENCLOSES home owns home's ancestors, and its `.env` there is the
+    # repository's -- read confined, into the credential map, never the
+    # environment).
+    if not _operator_owned_directory(path.parent):
         load_store("project", path=path)
         return
     text = _read_user_text(path, verb="load")
     if text is not None:
-        load_dotenv(stream=io.StringIO(text), override=False)
+        _load_operator_text(text, path.name)
 
 
 def child_process_env(

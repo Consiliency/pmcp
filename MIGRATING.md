@@ -303,7 +303,8 @@ ls -l ~/.env "$PWD/.env" 2>/dev/null
 Symptoms after upgrading: a server that worked now fails with an
 authentication or "missing variable" error, even though the key is in `.env`.
 
-**What changed.** A `~/.env` (in your home directory or an ancestor of it) still
+**What changed.** A `~/.env` (in your home directory or an ancestor of it, when no
+checkout encloses that directory -- a checkout above your home owns its `.env`) still
 loads into pmcp's own environment, and pmcp now strips every key it loaded that
 way from the environment of the servers it spawns. Any other `.env` -- a
 project's, or a checkout's that the install walk reaches -- never enters pmcp's

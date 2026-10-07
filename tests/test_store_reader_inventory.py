@@ -74,6 +74,7 @@ ENTRY_POINT_INTERNALS = frozenset(
         ("pmcp.env_store", "read_env_file"),
         ("pmcp.env_store", "read_env_text"),
         ("pmcp.env_store", "_read_env_file_strict"),
+        ("pmcp.env_store", "_load_operator_text"),
     }
 )
 
