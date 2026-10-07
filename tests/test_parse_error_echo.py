@@ -3073,3 +3073,204 @@ def test_the_declared_model_names_cover_every_installed_model() -> None:
         and value.__module__ == name
     }
     assert names == sdk, sorted(names ^ sdk)
+
+
+# --- masked log records keep value-free arguments only (rev 30) --------------
+
+
+def test_the_value_free_argument_allowlist_is_exact() -> None:
+    """A masked record keeps an argument only if its exact type is one of
+    these, or it is a member of pmcp's, `mcp_types`' or the SDK's own enum
+    (rev 30, round-28 codex F001)."""
+    from pmcp.sdk_rejections import VALUE_FREE_ARGUMENT_TYPES
+
+    assert VALUE_FREE_ARGUMENT_TYPES == frozenset({int, float, bool, type(None)})
+
+
+@pytest.mark.parametrize(
+    "logger_name",
+    [
+        "mcp.client.streamable_http",
+        "client",
+        "httpx",
+        "httpcore.http11",
+        "aiohttp.client",
+        "sse_starlette.sse",
+    ],
+)
+def test_a_masked_record_keeps_no_valued_argument(logger_name: str) -> None:
+    """Each masked logger family, with a URL object, bytes, a path, a nested
+    dict, a list, a set, an arbitrary object and an `extra=` field carrying
+    the sentinel: none of it survives; an int, a bool, `None` and an SDK
+    enum member do."""
+    import enum
+    import logging
+    from pathlib import PurePosixPath
+
+    import httpx
+
+    import pmcp  # noqa: F401 - installs the scrubbers
+
+    s = _GRID_S
+
+    class Carrier:
+        def __repr__(self) -> str:
+            return s
+
+        __str__ = __repr__
+
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    from mcp_types import LoggingLevel  # an SDK Literal; an enum below
+
+    del LoggingLevel
+    sdk_enum = next(
+        (
+            value
+            for module_name in ("pmcp.types",)
+            for value in vars(__import__(module_name, fromlist=["x"])).values()
+            if isinstance(value, type) and issubclass(value, enum.Enum) and list(value)
+        ),
+        None,
+    )
+    logger = logging.getLogger(logger_name)
+    handler = Capture()
+    logger.addHandler(handler)
+    saved = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        logger.debug(
+            "a %s %s %s %s %s %s %s",
+            httpx.URL(f"https://h.example/{s}"),
+            s.encode(),
+            PurePosixPath("/", s),
+            {"outer": {"inner": s}},
+            [s],
+            {s},
+            Carrier(),
+            extra={"carried": s},
+        )
+        logger.debug("%(m)s", {"m": {"k": [s]}})
+        logger.debug(
+            "kept %d %s %s %s", 7, True, None, list(sdk_enum)[0] if sdk_enum else None
+        )
+        logger.debug("%d", httpx.URL(s))  # a format the masked value fails
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(saved)
+    assert len(records) == 4
+    texts = [_record_text(r) for r in records]
+    assert not any(s in t for t in texts), [t[:300] for t in texts]
+    if logger_name.split(".")[0] not in ("mcp", "client"):
+        # An `mcp.*` message that is not the SDK's own is masked whole
+        # (rev 26); elsewhere the value-free arguments stay readable.
+        assert "kept 7 True None" in records[2].getMessage(), records[2].getMessage()
+
+
+def _redirect_then_status_server(status: int, s: str) -> tuple[Any, int]:
+    """A server whose `/start*` paths redirect to `/<sentinel>`, which
+    answers ``status`` (rev 30)."""
+    import socket
+    import threading
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(64)
+    port = listener.getsockname()[1]
+
+    def handle(conn: Any) -> None:
+        try:
+            line = conn.recv(65536).decode("latin-1").split("\r\n", 1)[0]
+            _GRID_REQUESTS.append(line.encode())
+            if " /start" in line:
+                conn.sendall(
+                    (
+                        f"HTTP/1.1 307 Temporary Redirect\r\nLocation: "
+                        f"http://127.0.0.1:{port}/{s}\r\nContent-Length: 0\r\n"
+                        "Connection: close\r\n\r\n"
+                    ).encode()
+                )
+            else:
+                conn.sendall(
+                    f"HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\n"
+                    "Connection: close\r\n\r\n".encode()
+                )
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def loop() -> None:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+    return listener, port
+
+
+@pytest.mark.parametrize("status", [404, 500, 502])
+@pytest.mark.parametrize(
+    "client", ["httpx", "httpx2", "aiohttp", "remote-http", "remote-sse"]
+)
+def test_a_followed_redirect_to_a_refusing_target_is_not_logged(
+    client: str,
+    status: int,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A redirect to a reachable target, chosen by the downstream, that
+    answers 404, 500 or 502: the target's URL is in the clients' own request
+    logs. Through httpx, httpx2 and aiohttp directly, and pmcp's remote MCP
+    connect path over both transports: logs at DEBUG, connect errors,
+    `gateway.health`'s error, exception text and traceback (rev 30)."""
+    import pmcp  # noqa: F401 - installs the scrubbers
+    from pmcp.argument_errors import exception_text, safe_traceback_text
+
+    s = _GRID_S
+    for name in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    caplog.set_level(logging.DEBUG)
+    listener, port = _redirect_then_status_server(status, s)
+    before = len(_GRID_REQUESTS)
+    texts: dict[str, str] = {}
+    try:
+        if client.startswith("remote-"):
+            transport = client.split("-")[1]
+            _GRID_URL[0] = f"http://127.0.0.1:{port}/start-{transport}"
+            errors, last = asyncio.run(
+                asyncio.wait_for(_drive_remote(transport, port), 25)
+            )
+            texts["connect errors, gateway.health"] = json.dumps(
+                [errors, last], default=str
+            )
+        else:
+            url = f"http://127.0.0.1:{port}/start"
+            try:
+                _client_calls()[client](url)
+            except Exception as error:  # noqa: BLE001 -- inspected
+                texts["error"] = exception_text(error) + safe_traceback_text(error)
+    finally:
+        listener.close()
+    assert any(s.encode() in r for r in _GRID_REQUESTS[before:]), "never redirected"
+    texts["log"] = "\n".join(_record_text(r) for r in caplog.records)
+    leaked = {
+        k: v[:400]
+        for k, v in texts.items()
+        if any(f in v for f in _forbidden_any_case(s))
+    }
+    assert not leaked, leaked

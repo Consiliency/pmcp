@@ -2369,7 +2369,7 @@ def test_no_request_header_reaches_any_output(
                 request_headers["accept"] = "text/event-stream"
             try:
                 response = client.request(
-                    method, "/mcp", headers=request_headers, json=body, timeout=10
+                    method, "/mcp", headers=request_headers, json=body
                 )
             except Exception as error:  # noqa: BLE001 -- inspected
                 from pmcp.argument_errors import exception_text, safe_traceback_text
@@ -2423,125 +2423,247 @@ def test_a_rejected_accept_header_is_not_logged(
     assert sentinel not in messages, messages
 
 
-#: Request-metadata attributes and scope keys whose values are caller
-#: content (rev 29).
-_REQUEST_METADATA_ATTRS = frozenset(
-    {"headers", "query_params", "path_params", "url", "client", "method", "cookies"}
+#: The types whose parameters are request objects (rev 30, round-28 claude
+#: N1): a parameter annotated with one of these, and an ASGI callable's
+#: `scope` and `receive` (by position), are taint sources -- by type and
+#: position, never by variable name.
+_REQUEST_TYPES = frozenset(
+    {"Request", "HTTPConnection", "WebSocket", "Scope", "Receive", "Message"}
 )
-_REQUEST_SCOPE_KEYS = frozenset(
-    {"headers", "path", "raw_path", "query_string", "client", "method"}
-)
-#: Callees that turn request metadata into a fixed classification, reviewed
-#: (rev 29): their arguments may be request metadata.
-_REQUEST_METADATA_CLASSIFIERS = frozenset(
-    {"_method_class", "_accept_class", "_header_names"}
-)
-#: Callees whose arguments reach a log record or a response.
-_LOG_METHODS = frozenset(
-    {"debug", "info", "warning", "warn", "error", "exception", "critical", "log"}
-)
-_RESPONSE_CALLS = frozenset(
-    {
-        "Response",
-        "JSONResponse",
-        "PlainTextResponse",
-        "HTMLResponse",
-        "StreamingResponse",
-        "_reject",
-        "_auth_response",
+
+#: Callees whose result carries no caller value (a decision or a fixed
+#: classification), each reviewed (rev 30). Passing request metadata to one
+#: is not a sink, and its result is not tainted.
+_REQUEST_CLASSIFIERS: dict[str, str] = {
+    "_method_class": "the method from a fixed set, else 'other'",
+    "_accept_class": "how Accept classifies, from a fixed set",
+    "_header_names": "known header names, else 'other'",
+    "_origin_rejected": "a bool: the Origin check",
+    "_host_rejected": "a bool: the Host check",
+    "hmac.compare_digest": "a bool: the shared-secret check",
+    "bool": "a bool",
+    "len": "a count",
+    "isinstance": "a bool",
+    "value_free_rejection": "the SDK's rejection rebuilt from the body's structure (rev 19)",
+}
+
+#: Callees that receive request metadata and are not sinks, each reviewed:
+#: their result stays tainted (rev 30).
+_REQUEST_PROPAGATORS: dict[str, str] = {
+    "_bearer_token": "returns the token, used only for validation",
+    "_split_host_port": "splits a Host for the comparison above",
+    "_origin_host_port": "parses an Origin for the comparison above",
+    "_is_loopback_host": "a bool on a parsed host",
+    "int": "a Content-Length for the cap comparison",
+    "str": "text for a comparison",
+    "_check_rate_limit": "keys a per-client counter; never logged",
+    "_read_body_capped": "reads the body against the cap",
+    "bounded_wait": "awaits the body read or the SDK under a timeout",
+    "load_json": "parses the body for its method (a decision)",
+    "resource_jwks.get_for_token": "fetches the issuer's keys for the token",
+    "validate_resource_server_token": "validates the token; its errors are pmcp's",
+    "session_manager.handle_request": "the SDK's own handling (revs 20, 26)",
+    "tracking_send": "the SDK's response, passed through",
+    "send": "an ASGI send of the SDK's response, passed through",
+    "self.app": "the wrapped ASGI app, passed through",
+    "dict": "a copy of a header mapping, for a decision",
+}
+
+
+def _callee(node: ast.Call) -> str:
+    return ast.unparse(node.func)
+
+
+def _taint_sources(function: ast.AST) -> set[str]:
+    """The parameters of ``function`` that are request objects: annotated
+    with a request type, or an ASGI callable's `scope` and `receive` (its
+    first two positional parameters after `self`, when it takes three)."""
+    assert isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+    params = [
+        *function.args.posonlyargs,
+        *function.args.args,
+        *function.args.kwonlyargs,
+    ]
+    sources = {
+        p.arg
+        for p in params
+        if p.annotation is not None
+        and ast.unparse(p.annotation).split(".")[-1].strip("'\"") in _REQUEST_TYPES
     }
-)
-
-
-def _reads_request_metadata(node: ast.AST, tainted: set[str]) -> bool:
-    """Whether ``node`` carries a request-metadata value: an attribute chain
-    through one of `_REQUEST_METADATA_ATTRS` on a request-like object, a
-    `scope[...]` read of a metadata key, or a name assigned from one. The
-    test of a conditional and a reviewed classifier's arguments are not
-    values that reach the output."""
-    if isinstance(node, ast.IfExp):
-        return _reads_request_metadata(node.body, tainted) or _reads_request_metadata(
-            node.orelse, tainted
-        )
-    if isinstance(node, ast.Call):
-        func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-        if name in _REQUEST_METADATA_CLASSIFIERS:
-            return False
-    if isinstance(node, ast.Attribute) and node.attr in _REQUEST_METADATA_ATTRS:
-        base = ast.unparse(node.value)
-        if base.split(".")[-1] in ("request", "req", "conn", "websocket"):
-            return True
+    positional = [
+        p for p in [*function.args.posonlyargs, *function.args.args] if p.arg != "self"
+    ]
     if (
-        isinstance(node, ast.Subscript)
-        and ast.unparse(node.value).split(".")[-1] == "scope"
-        and isinstance(node.slice, ast.Constant)
-        and node.slice.value in _REQUEST_SCOPE_KEYS
+        isinstance(function, ast.AsyncFunctionDef)
+        and len(positional) == 3
+        and (
+            function.name == "__call__" or all(p.annotation is None for p in positional)
+        )
     ):
-        return True
-    if isinstance(node, ast.Name) and node.id in tainted:
-        return True
-    return any(
-        _reads_request_metadata(child, tainted) for child in ast.iter_child_nodes(node)
-    )
+        sources |= {positional[0].arg, positional[1].arg}
+    return sources
+
+
+def _tainted(node: ast.AST | None, names: set[str]) -> bool:
+    """Whether ``node`` carries a request value, given the tainted names."""
+    if node is None or isinstance(node, (ast.Constant, ast.Lambda)):
+        return False
+    if isinstance(node, ast.Name):
+        return node.id in names
+    if isinstance(node, ast.Compare):
+        return False  # a decision
+    if isinstance(node, ast.IfExp):
+        return _tainted(node.body, names) or _tainted(node.orelse, names)
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+        # A comprehension's targets are its own scope: they shadow an
+        # enclosing name, and are tainted only by their iterable.
+        local = set(names)
+        for generator in node.generators:
+            bound: set[str] = set()
+            _bind(generator.target, bound)
+            iter_tainted = _tainted(generator.iter, local)
+            local -= bound
+            if iter_tainted:
+                local |= bound
+        parts = [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+        return any(_tainted(part, local) for part in parts)
+    if isinstance(node, ast.Call):
+        callee = _callee(node)
+        if (
+            callee in _REQUEST_CLASSIFIERS
+            or callee.split(".")[-1] in _REQUEST_CLASSIFIERS
+        ):
+            return False
+        if isinstance(node.func, ast.Attribute) and _tainted(node.func.value, names):
+            return True
+        return any(
+            _tainted(value, names)
+            for value in [*node.args, *(k.value for k in node.keywords)]
+        )
+    return any(_tainted(child, names) for child in ast.iter_child_nodes(node))
+
+
+def _bind(target: ast.AST, names: set[str]) -> None:
+    if isinstance(target, ast.Name):
+        names.add(target.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            _bind(element, names)
+    elif isinstance(target, ast.Starred):
+        _bind(target.value, names)
+
+
+def _own_nodes(function: ast.AST) -> list[ast.AST]:
+    """The nodes of ``function``'s body, without nested functions'."""
+    out: list[ast.AST] = []
+    pending = list(ast.iter_child_nodes(function))
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        out.append(node)
+        pending.extend(ast.iter_child_nodes(node))
+    return out
 
 
 def _request_metadata_sinks(tree: ast.AST) -> list[int]:
+    """Every place a request value reaches a call, a store or a raise that is
+    not a reviewed classifier or propagator: a log, `print`, a response, a
+    header assignment, a metric label, an exception, a helper (rev 30:
+    fail-closed taint walk, flow-insensitive, through assignments,
+    attributes, `.get`, subscripts, f-strings, `+=`, walrus, `for` targets,
+    and nested functions)."""
     found: list[int] = []
-    for function in ast.walk(tree):
-        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        tainted: set[str] = set()
-        for node in ast.walk(function):
-            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
-                if _reads_request_metadata(node.value, tainted):
-                    targets = (
-                        node.targets if isinstance(node, ast.Assign) else [node.target]
-                    )
-                    for target in targets:
-                        # A name bound to the value, not a store into an
-                        # object (`request.scope[...] = ...` taints nothing).
-                        elements = (
-                            target.elts
-                            if isinstance(target, (ast.Tuple, ast.List))
-                            else [target]
-                        )
-                        for element in elements:
-                            if isinstance(element, ast.Name):
-                                tainted.add(element.id)
-        for node in ast.walk(function):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = (
-                func.attr
-                if isinstance(func, ast.Attribute)
-                else getattr(func, "id", "")
-            )
-            is_log = (
-                isinstance(func, ast.Attribute)
-                and name in _LOG_METHODS
-                and ast.unparse(func.value).split(".")[-1]
-                in ("logger", "log", "_logger", "logging")
-            )
-            if not (is_log or name in _RESPONSE_CALLS):
-                continue
-            values = [*node.args, *(k.value for k in node.keywords)]
-            if any(_reads_request_metadata(v, tainted) for v in values):
+
+    def visit(function: ast.AST, inherited: set[str]) -> None:
+        names = set(inherited) | _taint_sources(function)
+        nodes = _own_nodes(function)
+        changed = True
+        while changed:
+            before = len(names)
+            for node in nodes:
+                if isinstance(node, ast.Assign) and _tainted(node.value, names):
+                    for target in node.targets:
+                        _bind(target, names)
+                elif isinstance(
+                    node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)
+                ) and (_tainted(node.value, names)):
+                    _bind(node.target, names)
+                elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)) and (
+                    _tainted(node.iter, names)
+                ):
+                    _bind(node.target, names)
+                elif isinstance(node, (ast.With, ast.AsyncWith)):
+                    for item in node.items:
+                        if item.optional_vars is not None and _tainted(
+                            item.context_expr, names
+                        ):
+                            _bind(item.optional_vars, names)
+            changed = len(names) != before
+        for node in nodes:
+            if isinstance(node, ast.Call):
+                callee = _callee(node)
+                short = callee.split(".")[-1]
+                values = [*node.args, *(k.value for k in node.keywords)]
+                if not any(_tainted(v, names) for v in values):
+                    continue
+                if isinstance(node.func, ast.Attribute) and _tainted(
+                    node.func.value, names
+                ):
+                    continue  # a method of the request value itself
+                if (
+                    callee in _REQUEST_CLASSIFIERS
+                    or short in _REQUEST_CLASSIFIERS
+                    or callee in _REQUEST_PROPAGATORS
+                ):
+                    continue
                 found.append(node.lineno)
+            elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                value = node.value
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                for target in targets:
+                    if (
+                        isinstance(target, (ast.Subscript, ast.Attribute))
+                        and _tainted(value, names)
+                        and not _tainted(target.value, names)
+                    ):
+                        found.append(node.lineno)  # stored into another object
+            elif isinstance(node, ast.Raise) and _tainted(node.exc, names):
+                found.append(node.lineno)
+        for node in ast.walk(function):
+            if node is not function and isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                if node in _own_children(function):
+                    visit(node, names)
+
+    def _own_children(function: ast.AST) -> list[ast.AST]:
+        out: list[ast.AST] = []
+        pending = list(ast.iter_child_nodes(function))
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.append(node)
+                continue
+            if isinstance(node, ast.ClassDef):
+                pending.extend(ast.iter_child_nodes(node))
+                continue
+            pending.extend(ast.iter_child_nodes(node))
+        return out
+
+    for top in _own_children(tree):
+        visit(top, set())
     return found
 
 
-#: Reviewed sites (`path::line-free function`) where request metadata
-#: reaches a log or a response on purpose (rev 29): none.
-_REVIEWED_REQUEST_METADATA_SINKS: frozenset[str] = frozenset()
-
-
 def test_no_request_metadata_reaches_a_log_or_a_response() -> None:
-    """No request header, query string, path, method, client address,
-    cookie or URL value reaches a logging call or a response in `src/pmcp`,
-    directly or through one assignment, outside the reviewed classifiers
-    (rev 29)."""
+    """No request value -- a header, the query, path, method, client
+    address, a cookie, the URL, the ASGI scope or a received message --
+    reaches a call, a store into another object, or a raise in `src/pmcp`,
+    outside the reviewed classifiers and propagators (rev 29; fail-closed
+    taint walk since rev 30)."""
     from pathlib import Path
 
     src = Path(__file__).resolve().parents[1] / "src" / "pmcp"
@@ -2554,37 +2676,90 @@ def test_no_request_metadata_reaches_a_log_or_a_response() -> None:
     assert not found, found
 
 
-@pytest.mark.parametrize(
-    ("snippet", "flagged"),
-    [
-        (
-            "def f(request):\n    logger.debug('a %s', request.headers.get('accept'))\n",
-            True,
-        ),
-        ("def f(request):\n    logger.info('%s', request.url.path)\n", True),
-        (
-            "def f(request):\n    ip = request.client.host\n    logger.debug('%s', ip)\n",
-            True,
-        ),
-        ("def f(request):\n    return Response(request.headers['x'])\n", True),
-        ("def f(scope):\n    logger.debug('%s', scope['query_string'])\n", True),
-        (
-            "def f(request):\n    logger.debug('%s', _accept_class(request.headers.get('accept', '')))\n",
-            False,
-        ),
-        (
-            "def f(request):\n    logger.debug('%s', 'present' if request.headers.get('x') else 'absent')\n",
-            False,
-        ),
-        ("def f(request):\n    logger.debug('fixed %s', 1)\n", False),
-        (
-            "def f(request):\n    request.scope['k'] = request.headers.get('x')\n"
-            "    return Response(status_code=401, headers=g(request))\n",
-            False,
-        ),
-    ],
-)
-def test_the_request_metadata_check_sees_each_shape(
-    snippet: str, flagged: bool
-) -> None:
-    assert bool(_request_metadata_sinks(ast.parse(snippet))) is flagged
+_R = "from starlette.requests import Request\n"
+
+#: Round-28 claude N1's 22 shapes, and a comprehension (rev 30): each must
+#: be flagged.
+_REQUEST_SINK_SHAPES: dict[str, str] = {
+    "f-string": _R
+    + "def f(request: Request):\n    logger.debug(f\"{request.headers['a']}\")\n",
+    "two hops": _R
+    + "def f(request: Request):\n    a = request.headers\n    b = a.get('x')\n    logger.info(b)\n",
+    "any name": _R + "def f(r: Request):\n    logger.info(r.headers['a'])\n",
+    "attribute": _R
+    + "class C:\n    def f(self, http_request: Request):\n        logger.info(http_request.headers.get('a'))\n",
+    "self attr": _R
+    + "class C:\n    def f(self, req: Request):\n        self._request = req\n        logger.info(self._request.headers)\n",
+    "scope.get": "async def app(scope, receive, send):\n    logger.info(scope.get('headers'))\n",
+    "Headers(scope)": "async def app(scope, receive, send):\n    h = Headers(scope=scope)\n",
+    "state across": _R
+    + "def g(request: Request):\n    logger.info(request.state.origin)\n",
+    "items loop": _R
+    + "def f(request: Request):\n    for k, v in request.headers.items():\n        logger.info('%s=%s', k, v)\n",
+    "helper returns": _R + "def f(request: Request):\n    v = pick(request)\n",
+    "helper logs": _R + "def f(request: Request):\n    log_it(request.headers['a'])\n",
+    "walrus": _R
+    + "def f(request: Request):\n    if (v := request.headers.get('a')):\n        logger.info(v)\n",
+    "aug-assign": _R
+    + "def f(request: Request):\n    s = ''\n    s += request.headers['a']\n    logger.info(s)\n",
+    "logger alias": _R + "def f(request: Request):\n    LOG.info(request.url)\n",
+    "bound method": _R
+    + "def f(request: Request):\n    log_it = logger.debug\n    log_it(request.url)\n",
+    "raise": _R
+    + "def f(request: Request):\n    raise ValueError(f\"bad {request.headers['origin']}\")\n",
+    "HTTPException": _R
+    + "def f(request: Request):\n    raise HTTPException(400, detail=request.headers['a'])\n",
+    "CORS echo": _R
+    + "def f(request: Request, response):\n    response.headers['access-control-allow-origin'] = request.headers['origin']\n",
+    "redirect": _R
+    + "def f(request: Request):\n    return RedirectResponse(str(request.url))\n",
+    "print": _R + "def f(request: Request):\n    print(request.headers)\n",
+    "stderr": _R
+    + "def f(request: Request):\n    sys.stderr.write(request.headers['a'])\n",
+    "metric": _R
+    + "def f(request: Request):\n    _inc(f\"requests_{request.headers['a']}\")\n",
+    "comprehension": _R
+    + "def f(request: Request):\n    logger.info([v for _, v in request.headers.items()])\n",
+}
+
+#: Shapes that must not be flagged: decisions and reviewed classifiers.
+_REQUEST_SAFE_SHAPES: dict[str, str] = {
+    "classifier": _R
+    + "def f(request: Request):\n    logger.debug('%s', _accept_class(request.headers.get('accept', '')))\n",
+    "presence": _R
+    + "def f(request: Request):\n    logger.debug('%s', 'present' if request.headers.get('x') else 'absent')\n",
+    "comparison": _R
+    + "def f(request: Request):\n    if request.headers.get('a') == 'b':\n        logger.debug('fixed')\n",
+    "store into request": _R
+    + "def f(request: Request):\n    request.scope['k'] = request.headers.get('x')\n",
+    "unrelated": "def f(request):\n    logger.debug('%s', request)\n",
+    "comprehension shadow": _R
+    + "def f(request: Request, other):\n    if (value := request.headers.get('a')):\n"
+    + "        pass\n    logger.debug('%s', [value for value in other])\n",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_REQUEST_SINK_SHAPES))
+def test_the_request_metadata_check_flags_each_shape(shape: str) -> None:
+    assert _request_metadata_sinks(ast.parse(_REQUEST_SINK_SHAPES[shape])), shape
+
+
+@pytest.mark.parametrize("shape", sorted(_REQUEST_SAFE_SHAPES))
+def test_the_request_metadata_check_passes_decisions(shape: str) -> None:
+    assert not _request_metadata_sinks(ast.parse(_REQUEST_SAFE_SHAPES[shape])), shape
+
+
+def test_every_reviewed_request_callee_is_used() -> None:
+    """No reviewed classifier or propagator is a dead entry."""
+    from pathlib import Path
+
+    text = (
+        Path(__file__).resolve().parents[1] / "src" / "pmcp" / "transport" / "http.py"
+    ).read_text()
+    unused = [
+        name
+        for name in [*_REQUEST_CLASSIFIERS, *_REQUEST_PROPAGATORS]
+        if name.split(".")[-1] + "(" not in text
+        and name not in ("bool", "len", "isinstance", "str", "dict")
+    ]
+    assert not unused, unused

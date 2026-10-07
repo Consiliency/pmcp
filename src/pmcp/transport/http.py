@@ -619,14 +619,16 @@ def create_http_app(
         return ""
 
     def _auth_headers(
-        request: Request | None = None,
         *,
+        for_request: bool = False,
         error: str | None = None,
         scope: str | None = None,
     ) -> dict[str, str]:
+        # Whether this answers a request, not the request itself: nothing of
+        # the request reaches the challenge (rev 30).
         parts: list[str] = []
         if not auth_metadata.protected_resource_metadata_url:
-            if request is not None and effective_auth_mode == "resource-server":
+            if for_request and effective_auth_mode == "resource-server":
                 parts.append(f'resource="{_resource_audience()}"')
         else:
             parts.append(
@@ -748,14 +750,18 @@ def create_http_app(
             ):
                 logger.debug("handle_mcp [%s]: 401 unauthorized", request_id)
                 return _reject(
-                    401, AuthMessage.UNAUTHORIZED, headers=_auth_headers(request)
+                    401,
+                    AuthMessage.UNAUTHORIZED,
+                    headers=_auth_headers(for_request=True),
                 )
         elif effective_auth_mode == "resource-server":
             token = _bearer_token(request)
             if token is None:
                 logger.debug("handle_mcp [%s]: 401 missing bearer", request_id)
                 return _reject(
-                    401, AuthMessage.UNAUTHORIZED, headers=_auth_headers(request)
+                    401,
+                    AuthMessage.UNAUTHORIZED,
+                    headers=_auth_headers(for_request=True),
                 )
             try:
                 if resource_jwks is None:
@@ -782,7 +788,7 @@ def create_http_app(
                 return _reject(
                     503,
                     AuthMessage.SERVICE_UNAVAILABLE,
-                    headers=_auth_headers(request, error=exc.error),
+                    headers=_auth_headers(for_request=True, error=exc.error),
                 )
             except ResourceServerAuthError as exc:
                 if exc.error == "insufficient_scope":
@@ -791,13 +797,15 @@ def create_http_app(
                     return _reject(
                         403,
                         AuthMessage.FORBIDDEN,
-                        headers=_auth_headers(request, error=exc.error, scope=scope),
+                        headers=_auth_headers(
+                            for_request=True, error=exc.error, scope=scope
+                        ),
                     )
                 logger.debug("handle_mcp [%s]: 401 invalid token", request_id)
                 return _reject(
                     401,
                     AuthMessage.UNAUTHORIZED,
-                    headers=_auth_headers(request, error=exc.error),
+                    headers=_auth_headers(for_request=True, error=exc.error),
                 )
 
         # Per-IP rate limiting (optional — only when rate_limit_rpm > 0)

@@ -730,10 +730,44 @@ def _log_patterns() -> tuple[tuple[re.Pattern[str], str], ...]:
     return tuple(out)
 
 
+#: The argument types a masked record keeps, by exact type (rev 30, round-28
+#: codex F001: an HTTP client's URL object survived the old rule, which
+#: masked only text and bytes). Everything else -- text, bytes, URLs, paths,
+#: exceptions, containers, any object -- is masked whole. Enum members of
+#: pmcp's, `mcp_types`' or the SDK's own enums are kept too
+#: (:func:`_value_free_argument`). `tests/test_http_transport.py` pins this
+#: set exactly.
+VALUE_FREE_ARGUMENT_TYPES: frozenset[type] = frozenset({int, float, bool, type(None)})
+_ENUM_PACKAGES = ("pmcp", "mcp_types", "mcp")
+
+
+def _value_free_argument(value: Any) -> bool:
+    if type(value) in VALUE_FREE_ARGUMENT_TYPES:
+        return True
+    import enum
+
+    kind = type(value)
+    return isinstance(value, enum.Enum) and (
+        str(getattr(kind, "__module__", "")).split(".")[0] in _ENUM_PACKAGES
+    )
+
+
 def _masked_argument(value: Any) -> Any:
-    if isinstance(value, (str, bytes, bytearray, memoryview)):
-        return _TEXT
-    return value
+    """``value`` if its type is value-free by the allowlist, else ``<text>``."""
+    return value if _value_free_argument(value) else _TEXT
+
+
+#: The attributes every `LogRecord` has; any other is an `extra=` field.
+_RECORD_ATTRIBUTES = frozenset(
+    vars(logging.LogRecord("n", 0, "p", 0, "m", None, None))
+) | {"message", "asctime"}
+
+
+def mask_extras(record: logging.LogRecord) -> None:
+    """Mask every `extra=` field of ``record`` by the same allowlist."""
+    for key, value in list(vars(record).items()):
+        if key not in _RECORD_ATTRIBUTES and not _value_free_argument(value):
+            setattr(record, key, _TEXT)
 
 
 def _under(name: Any, prefixes: tuple[str, ...]) -> bool:
@@ -773,6 +807,14 @@ def scrub_sdk_record(record: logging.LogRecord) -> None:
             record.args = tuple(_masked_argument(item) for item in args)
         elif isinstance(args, dict):
             record.args = {key: _masked_argument(item) for key, item in args.items()}
+        elif args is not None:
+            record.args = (_TEXT,)
+        mask_extras(record)
+        try:
+            record.getMessage()
+        except Exception:  # noqa: BLE001 -- a masked argument a format rejects
+            record.msg, record.args = _PLACEHOLDER, None
+            return
         if _under(record.name, HTTP_CLIENT_LOGGERS):
             if not args and isinstance(record.msg, str):
                 head, _, rest = record.msg.partition(" ")

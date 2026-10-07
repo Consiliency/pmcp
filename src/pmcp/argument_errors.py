@@ -1645,6 +1645,7 @@ def install_log_scrubber() -> None:
     current = logging.getLogRecordFactory()
     if not getattr(current, "pmcp_validation_scrubber", False):
         logging.setLogRecordFactory(_scrubbing_factory(current))
+    _install_extra_scrubbing()
     _install_excepthook()
     _install_threading_excepthook()
     _install_handle_error()
@@ -1653,6 +1654,43 @@ def install_log_scrubber() -> None:
     from pmcp.sdk_rejections import install_value_free_sdk_errors
 
     install_value_free_sdk_errors()
+
+
+def _install_extra_scrubbing() -> None:
+    """Scrub a record's `extra=` fields too (rev 30). `Logger.makeRecord`
+    sets them after the record factory has run, so they are scrubbed here,
+    once they exist: for a masked logger (the MCP SDK's, `sse_starlette`,
+    the HTTP clients') every field outside the value-free allowlist is
+    masked; for any other, a field that is or holds a registered error is
+    described, as `args` are. Idempotent."""
+    current = logging.Logger.makeRecord
+    if getattr(current, "pmcp_extra_scrubber", False):
+        return
+
+    def make_record(self: logging.Logger, *args: Any, **kwargs: Any) -> Any:
+        record = current(self, *args, **kwargs)
+        extra = (
+            kwargs.get("extra")
+            if "extra" in kwargs
+            else (args[8] if len(args) > 8 else None)
+        )
+        if extra:
+            try:
+                from pmcp.sdk_rejections import is_sdk_logger, mask_extras
+
+                if is_sdk_logger(record.name):
+                    mask_extras(record)
+                else:
+                    for key in extra:
+                        if hasattr(record, key):
+                            setattr(record, key, _scrubbed(getattr(record, key)))
+            except Exception:  # noqa: BLE001 -- a log call must never fail here
+                pass
+        return record
+
+    make_record.pmcp_extra_scrubber = True  # type: ignore[attr-defined]
+    make_record.original = current  # type: ignore[attr-defined]
+    logging.Logger.makeRecord = make_record  # type: ignore[method-assign]
 
 
 def _install_handle_error() -> None:
