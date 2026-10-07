@@ -922,15 +922,13 @@ def ensure_startup_load() -> None:
 def credential_lookup(project: Path | None = None) -> Callable[[str], str | None]:
     """The one credential lookup: runtime and diagnostics read the same entries.
 
-    The startup load first (:func:`ensure_startup_load`), then
     :func:`credential_value` for root ``project`` (``None``: the served project
-    root) -- exactly what the provision gate, the install child and the
+    root), which runs the startup load before it answers -- exactly what the provision gate, the install child and the
     gateway's credential check read for that root. Remote ``${VAR}`` headers,
     ``pmcp doctor`` and ``pmcp secrets check`` call this;
     ``tests/test_credential_parity.py`` checks their verdicts against the
     runtime's (Consiliency/pmcp#372 rounds 5-8).
     """
-    ensure_startup_load()
     root = None if project is None else resolve_project_root(project)
 
     def lookup(key: str) -> str | None:

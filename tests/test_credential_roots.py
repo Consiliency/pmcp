@@ -1559,3 +1559,13 @@ def test_a_lazy_load_with_no_served_root_chooses_none(
     assert env_store.served_project_root() is None
     monkeypatch.chdir(roots["b"])
     assert env_store.credential_value("LAZY_TOKEN") == "from-b"
+
+
+def test_the_startup_load_keeps_a_root_served_before_it(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``load_startup_env`` (main's, which may choose) keeps an already-served root."""
+    monkeypatch.setattr(cli, "find_dotenv", lambda: "")
+    env_store.serve_project_root(roots["b"])  # cwd is a
+    cli.load_startup_env()
+    assert env_store.served_project_root() == roots["b"]

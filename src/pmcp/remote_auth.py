@@ -108,7 +108,6 @@ def resolve_remote_headers_for_tenant(
         )
 
     from pmcp.env_store import (
-        credential_lookup,
         credential_value,
         repository_values,
         resolve_project_root,
@@ -123,11 +122,8 @@ def resolve_remote_headers_for_tenant(
         "tenant", project=project_root, tenant_id=tenant_id
     )
     root = None if project_root is None else resolve_project_root(project_root)
-    if include_process_env:
-        # The one lookup every reader uses (env_store.credential_lookup): the
-        # environment -- the user store is in it after the startup load -- and
-        # this root's project files, with the tenant store between the two.
-        credential_lookup(project_root)
+    # The one gate (env_store.credential_value) runs the startup load itself,
+    # so the user store is in the environment before any answer.
 
     def lookup(env_var: str) -> str | None:
         # Non-default arguments, deliberately: a caller that asks for tenant
