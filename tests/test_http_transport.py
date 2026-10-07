@@ -2305,6 +2305,8 @@ _SENTINEL_HEADERS: dict[str, str] = {
     "host": f"{_HEADER_S}.example",
     "authorization": f"Bearer {_HEADER_S}",
     "x-extra-header": _HEADER_S,
+    # A header whose *name* is the caller's choice (rev 29).
+    f"x-{_HEADER_S}": "1",
 }
 
 _INITIALIZE = {
