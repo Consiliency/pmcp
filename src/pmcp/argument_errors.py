@@ -185,6 +185,52 @@ def _declared_names() -> frozenset[str]:
     return _declared_cache[1]
 
 
+_model_names_cache: tuple[int, frozenset[str]] | None = None
+
+#: The packages whose own pydantic model classes may be named in a
+#: validation error's description (rev 28).
+_MODEL_PACKAGES = ("pmcp", "mcp_types", "mcp")
+
+
+def declared_model_names() -> frozenset[str]:
+    """The ``__name__`` of every pydantic model class pmcp, `mcp_types` or
+    the MCP SDK defines, read from their loaded modules' namespaces (rev 28,
+    round-26 claude N1). Written by those packages' authors, never by a
+    caller or a downstream: a validation error's ``title`` is printed only
+    when it is one of these."""
+    global _model_names_cache
+    from pydantic import BaseModel
+
+    key = len(sys.modules)
+    if _model_names_cache is not None and _model_names_cache[0] == key:
+        return _model_names_cache[1]
+    names: set[str] = set()
+    for module_name, module in list(sys.modules.items()):
+        if module is None or module_name.split(".")[0] not in _MODEL_PACKAGES:
+            continue
+        for value in list(vars(module).values()):
+            if (
+                isinstance(value, type)
+                and issubclass(value, BaseModel)
+                and value.__module__ == module_name
+            ):
+                names.add(value.__name__)
+    _model_names_cache = (key, frozenset(names))
+    return _model_names_cache[1]
+
+
+#: Printed for a validation error whose ``title`` is not a declared model's
+#: name: a hand-built error's, or a `TypeAdapter`'s (`literal['<value>']`).
+_UNDECLARED_TITLE = "<model>"
+
+
+def _model_title(error: ValidationError) -> str:
+    title = error.title
+    if isinstance(title, str) and title in declared_model_names():
+        return title
+    return _UNDECLARED_TITLE
+
+
 def _render_path(segments: Iterable[str | int | None]) -> str:
     path = "$"
     for segment in segments:
@@ -951,7 +997,7 @@ def _validation_text(error: BaseException) -> str:
         count = error.error_count()
         plural = "" if count == 1 else "s"
         return (
-            f"{count} validation error{plural} for {error.title}: "
+            f"{count} validation error{plural} for {_model_title(error)}: "
             f"{describe_model_error(error, None, None)}"
         )
     assert isinstance(error, (jsonschema.ValidationError, jsonschema.SchemaError))

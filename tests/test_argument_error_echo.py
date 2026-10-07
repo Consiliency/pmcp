@@ -1083,8 +1083,9 @@ def test_a_custom_error_cannot_fill_a_phrase_from_its_context(family: str) -> No
         (
             exception_text(raised.value),
             # No schema here, and a test model's fields are no names pmcp
-            # declares, so the locations read as `*`.
-            "4 validation errors for _CollidingErrors: $.*: is not an "
+            # declares, so the locations read as `*`; nor is the test model
+            # one pmcp declares, so its title reads `<model>` (rev 28).
+            "4 validation errors for <model>: $.*: is not an "
             "allowed value; $.*: is too short; $.*: is too small; "
             "$.*: is required",
         ),

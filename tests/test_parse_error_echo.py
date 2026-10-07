@@ -867,7 +867,8 @@ def test_an_uncaught_chain_prints_no_input(tmp_path: Path, origin: str) -> None:
     # The wrapper's line is its class and what it chains, once (rev 18).
     wrapper = {
         "yaml": "\nRuntimeError: could not parse YAML (ParserError) at line 1, column",
-        "pydantic": "\nRuntimeError: 1 validation error for int: $: must be an integer\n",
+        # A `TypeAdapter(int)`'s title is no declared model's (rev 28).
+        "pydantic": "\nRuntimeError: 1 validation error for <model>: $: must be an integer\n",
     }[origin]
     assert wrapper in result.stderr, result.stderr
     assert "boom" not in result.stderr, result.stderr
@@ -2955,5 +2956,120 @@ def test_a_validation_error_beneath_an_sdk_frame_keeps_its_description() -> None
         namespace["_received_notification"]()
     assert exception_walk(caught.value).kind == "mcp"
     text = exception_text(caught.value)
-    assert text.startswith("1 validation error for Probe: $.task_id"), text
+    # A test's model is not one pmcp or the SDK declares (rev 28).
+    assert text.startswith("1 validation error for <model>: $.task_id"), text
     assert s not in text
+
+
+# --- a validation error's title (rev 28, round-26 claude N1) -----------------
+
+
+def test_a_validation_title_is_printed_only_for_a_declared_model() -> None:
+    """The structural description prints a pydantic error's `title` only
+    when it is the name of a model class pmcp, `mcp_types` or the SDK
+    defines; any other title -- a hand-built error's, a `TypeAdapter`'s
+    `literal['<value>']` -- reads `<model>`. Checked in the text, the
+    traceback and `describe_exception`, raised beneath an SDK frame and in
+    pmcp's own."""
+    from pathlib import Path
+    from typing import Literal
+
+    import mcp
+    from pydantic import TypeAdapter, ValidationError
+    from pydantic_core import InitErrorDetails, PydanticCustomError
+
+    from pmcp.argument_errors import exception_text, safe_traceback_text
+    from pmcp.client.manager import describe_exception
+    from pmcp.types import McpTaskInfo
+
+    s = _GRID_S
+
+    def hand_built() -> None:
+        raise ValidationError.from_exception_data(
+            s,
+            [
+                InitErrorDetails(
+                    type=PydanticCustomError("missing", "required"),
+                    loc=("field",),
+                    input={},
+                )
+            ],
+        )
+
+    def adapter() -> None:
+        TypeAdapter(Literal[s]).validate_python("other")  # type: ignore[valid-type]
+
+    filename = str(Path(mcp.__file__).parent / "client/session.py")
+    namespace: dict[str, Any] = {"hand_built": hand_built, "adapter": adapter}
+    exec(  # noqa: S102 -- frames with the SDK's file name, for the test
+        compile(
+            "def sdk_hand_built():\n    hand_built()\n"
+            "def sdk_adapter():\n    adapter()\n",
+            filename,
+            "exec",
+        ),
+        namespace,
+    )
+    for call in (
+        hand_built,
+        adapter,
+        namespace["sdk_hand_built"],
+        namespace["sdk_adapter"],
+    ):
+        with pytest.raises(ValidationError) as caught:
+            call()
+        error = caught.value
+        texts = {
+            "exception_text": exception_text(error),
+            "safe_traceback_text": safe_traceback_text(error),
+            "describe_exception": describe_exception(error),
+        }
+        assert not any(s in t for t in texts.values()), texts
+        assert "validation error for <model>:" in texts["exception_text"], texts
+    with pytest.raises(ValidationError) as declared:
+        McpTaskInfo.model_validate({})
+    assert "for McpTaskInfo:" in exception_text(declared.value)
+
+
+def test_the_declared_model_names_cover_every_installed_model() -> None:
+    """Census (rev 28): after importing every module of pmcp and
+    `mcp_types`, each pydantic model class they define is a declared name,
+    and every declared name is a class one of them, or the SDK, defines."""
+    import importlib
+    import inspect
+    import pkgutil
+
+    import mcp_types
+    from pydantic import BaseModel
+
+    import pmcp
+    from pmcp.argument_errors import declared_model_names
+
+    defined: set[str] = set()
+    for package in (pmcp, mcp_types):
+        for info in pkgutil.walk_packages(package.__path__, package.__name__ + "."):
+            try:
+                module = importlib.import_module(info.name)
+            except Exception:  # noqa: BLE001 -- an optional extra's module
+                continue
+            defined |= {
+                value.__name__
+                for value in vars(module).values()
+                if inspect.isclass(value)
+                and issubclass(value, BaseModel)
+                and value.__module__ == module.__name__
+            }
+    names = declared_model_names()
+    assert defined and defined <= names, sorted(defined - names)
+    import sys
+
+    sdk = {
+        value.__name__
+        for name, module in list(sys.modules.items())
+        if module is not None and name.split(".")[0] in ("pmcp", "mcp_types", "mcp")
+        for value in list(vars(module).values())
+        if inspect.isclass(value)
+        and issubclass(value, BaseModel)
+        and value.__module__ == name
+    }
+    assert names == sdk, sorted(names ^ sdk)
