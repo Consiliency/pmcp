@@ -3115,7 +3115,9 @@ async def async_main(args: argparse.Namespace) -> None:
         await run_server(args)
 
 
-def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
+def load_startup_env(
+    dotenv_path: str | os.PathLike[str] | None = None, *, choose_root: bool = True
+) -> None:
     """Load the startup env files, recording what the plain ``.env`` introduced.
 
     These are the loads that used to sit inline in ``main()``. ``load_dotenv``
@@ -3186,7 +3188,12 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     # only an unset one is discovered from the working directory -- the root
     # the gateway loads `.mcp.json` from. main() moves it to `--project` once
     # the arguments are parsed (Consiliency/pmcp#372 rounds 9 and 14).
-    served = ensure_served_project_root()
+    # ``choose_root=False`` is the LAZY load a library process runs on its
+    # first credential lookup (env_store.ensure_startup_load): it loads the
+    # project the process would serve now but fixes nothing, so a library
+    # caller that has served no root keeps discovering one from its working
+    # directory (Consiliency/pmcp#372 round 15).
+    served = ensure_served_project_root() if choose_root else resolve_project_root()
     before = set(os.environ)
     found = dotenv_path if dotenv_path is not None else find_dotenv()
     if found:

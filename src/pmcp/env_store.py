@@ -914,7 +914,9 @@ def ensure_startup_load() -> None:
         return
     from pmcp.cli import load_startup_env
 
-    load_startup_env()
+    # Lazy: load what the startup load loads, but choose no served root --
+    # only ``pmcp`` itself (main) or an explicit serve_project_root does.
+    load_startup_env(choose_root=False)
 
 
 def credential_lookup(project: Path | None = None) -> Callable[[str], str | None]:

@@ -1540,3 +1540,22 @@ def test_with_no_prior_startup_every_entry_answers_the_user_store_first(
     assert first == "operator-token"
     assert env_store.credential_value("BRAVE_API_KEY") == "operator-token"
     assert env_store.resolve_project_root(None) == roots["b"]
+
+
+def test_a_lazy_load_with_no_served_root_chooses_none(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lazy load loads; it does not fix the project.
+
+    A library process that served no root and changes directory keeps finding
+    the project from where it now is -- only ``pmcp`` itself (main) or an
+    explicit ``serve_project_root`` fixes one.
+    """
+    monkeypatch.delenv("LAZY_TOKEN", raising=False)
+    monkeypatch.setattr(cli, "find_dotenv", lambda: "")
+    (roots["a"] / ".env.pmcp").write_text("LAZY_TOKEN=from-a\n")
+    (roots["b"] / ".env.pmcp").write_text("LAZY_TOKEN=from-b\n")
+    assert env_store.credential_value("LAZY_TOKEN") == "from-a"  # cold, in a
+    assert env_store.served_project_root() is None
+    monkeypatch.chdir(roots["b"])
+    assert env_store.credential_value("LAZY_TOKEN") == "from-b"
