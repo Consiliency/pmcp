@@ -1533,6 +1533,22 @@ def _http_shapes(s: str) -> dict[str, bytes]:
             f"HTTP/1.1 302 Found\r\nLocation: http://{s.lower()}.invalid/\r\n"
             "Content-Length: 0\r\n\r\n"
         ).encode(),
+        # A `Location` each client's URL parser rejects (rev 26, round-24
+        # codex F001: urllib parses it before pmcp's no-redirect handler,
+        # and `ipaddress` raises a bare `ValueError` quoting the host).
+        **{
+            f"redirect-{kind}": (
+                b"HTTP/1.1 302 Found\r\nLocation: "
+                + location
+                + b"\r\nContent-Length: 0\r\n\r\n"
+            )
+            for kind, location in (
+                ("ipv6", f"https://[{s}]/".encode()),
+                ("port", f"http://h.invalid:{s}/".encode()),
+                ("authority", f"http://[::1]{s}/".encode()),
+                ("encoding", b"http://h\xff" + s.encode() + b".invalid/"),
+            )
+        },
     }
 
 
@@ -2037,7 +2053,9 @@ def _client_calls() -> dict[str, Callable[[str], Any]]:
             module = importlib.import_module(module_name)
 
             async def run() -> Any:
-                async with module.AsyncClient(timeout=10) as client:
+                async with module.AsyncClient(
+                    timeout=10, follow_redirects=True
+                ) as client:
                     response = await client.get(url)
                     response.raise_for_status()
                     return response.json()
@@ -2412,3 +2430,191 @@ def test_a_tunnel_refusal_is_recognised_by_origin_not_text() -> None:
         raise OSError("Tunnel connection failed: 403 words")
     except OSError as error:
         assert not _is_validation_error(error)
+
+
+# --- an exception's origin (rev 26, round-24 codex F001) ---------------------
+
+
+def test_a_builtin_raised_in_an_http_client_is_registered() -> None:
+    """Any exception an HTTP client's frame raises is registered, whatever
+    its type: here urllib's own `ValueError` for a URL it rejects, and
+    `ipaddress`'s, reached through urllib's redirect parsing. One raised in
+    pmcp's (or a test's) own frame is not, nor one a helper raises when
+    pmcp, not a client, called it, nor one with no traceback."""
+    import ipaddress
+    import urllib.parse
+    import urllib.request
+
+    from pmcp.argument_errors import (
+        _is_validation_error,
+        exception_origin,
+        exception_text,
+    )
+
+    s = _GRID_S
+    with pytest.raises(ValueError) as from_urllib:
+        urllib.request.Request(f"{s} is not a URL")
+    assert exception_origin(from_urllib.value) == "http"
+    assert s not in exception_text(from_urllib.value)
+
+    class Redirects(urllib.request.HTTPRedirectHandler):
+        pass
+
+    request = urllib.request.Request("https://registry.invalid/probe")
+    with pytest.raises(ValueError) as from_helper:
+        Redirects().http_error_302(
+            request, None, 302, "Found", {"location": f"https://[{s}]/"}
+        )
+    assert exception_origin(from_helper.value) == "http"
+    assert s not in exception_text(from_helper.value)
+
+    with pytest.raises(ValueError) as own:
+        raise ValueError(s)
+    assert exception_origin(own.value) is None
+    assert not _is_validation_error(own.value)
+
+    with pytest.raises(ValueError) as helper_from_pmcp:
+        ipaddress.ip_address(s)
+    assert exception_origin(helper_from_pmcp.value) is None
+    with pytest.raises(ValueError):
+        urllib.parse.urlsplit(f"http://[{s}]/")
+    assert exception_origin(ValueError(s)) is None
+
+
+def test_a_client_calling_back_into_other_code_is_not_the_clients() -> None:
+    """A client that calls back (an httpx transport, an event hook) into
+    code that is not its own: what that code raises is that code's."""
+    import httpx
+
+    from pmcp.argument_errors import exception_origin
+
+    s = _GRID_S
+
+    def handler(request: Any) -> Any:
+        raise ValueError(s)
+
+    with pytest.raises(ValueError) as caught:
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            client.get("http://callback.invalid/")
+    assert exception_origin(caught.value) is None
+
+
+# --- the MCP SDK's client transports (rev 26, round-24 claude F001) ---------
+
+
+def _sdk_transport_handler(kind: str, s: str) -> Callable[[Any], None]:
+    import time
+
+    def reply(status: str, headers: dict[str, str], body: str) -> bytes:
+        head = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        return (
+            f"HTTP/1.1 {status}\r\n{head}Content-Length: {len(body)}\r\n\r\n{body}"
+        ).encode()
+
+    def handle(conn: Any) -> None:
+        try:
+            line = conn.recv(65536).decode("latin-1").split("\r\n", 1)[0]
+            _GRID_REQUESTS.append(line.encode())
+            if kind == "content-type":
+                conn.sendall(reply("200 OK", {"Content-Type": f"text/{s}"}, "{}"))
+            elif kind == "sse-event":
+                body = f"event: {s}\ndata: {{}}\n\n"
+                conn.sendall(
+                    reply("200 OK", {"Content-Type": "text/event-stream"}, body)
+                )
+            elif line.startswith("GET"):  # legacy SSE: an endpoint elsewhere
+                body = f"event: endpoint\ndata: http://{s}.example/messages\n\n"
+                conn.sendall(
+                    (
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+                        + body
+                    ).encode()
+                )
+                time.sleep(2)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    return handle
+
+
+@pytest.mark.parametrize(
+    ("kind", "transport"),
+    [
+        ("content-type", "http"),
+        ("content-type", "sse"),
+        ("sse-event", "http"),
+        ("sse-event", "sse"),
+        ("sse-endpoint", "sse"),
+    ],
+)
+def test_no_sdk_transport_rejection_reaches_any_output(
+    kind: str,
+    transport: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK's client transports answer a request themselves with text
+    they format from the response (`Unexpected content type: text/<S>`), and
+    log rejected values (`Unknown SSE event: <S>`, an endpoint on another
+    origin with its traceback). Through pmcp's connect path, over both
+    remote transports: the connect errors, `gateway.health`'s error, every
+    log record at DEBUG and its traceback. (An `endpoint` event exists only
+    on legacy SSE.)"""
+    import socket
+    import threading
+
+    import pmcp  # noqa: F401 - installs the scrubbers
+
+    s = _GRID_S
+    for name in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    caplog.set_level(logging.DEBUG)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(64)
+    handle = _sdk_transport_handler(kind, s)
+
+    def loop() -> None:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+    path = "sse" if transport == "sse" else "mcp"
+    _GRID_URL[0] = f"http://127.0.0.1:{listener.getsockname()[1]}/{path}"
+    before = len(_GRID_REQUESTS)
+    try:
+        try:
+            errors, last = asyncio.run(
+                asyncio.wait_for(_drive_remote(transport, 0), 25)
+            )
+            outcome = json.dumps([errors, last], default=str)
+        except Exception as error:  # noqa: BLE001 -- inspected
+            from pmcp.argument_errors import exception_text, safe_traceback_text
+
+            outcome = exception_text(error) + safe_traceback_text(error)
+    finally:
+        listener.close()
+    assert len(_GRID_REQUESTS) > before, "never connected"
+    texts = {
+        "result (connect errors, gateway.health)": outcome,
+        "log": "\n".join(_record_text(record) for record in caplog.records),
+    }
+    leaked = {
+        surface: text[:400]
+        for surface, text in texts.items()
+        if any(form in text for form in _forbidden_any_case(s))
+    }
+    assert not leaked, leaked

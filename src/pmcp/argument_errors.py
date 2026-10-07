@@ -42,7 +42,7 @@ import json
 import logging
 import sys
 import traceback
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from types import ModuleType
 from typing import Any
 
@@ -602,6 +602,99 @@ HTTP_RESPONSE_ERRORS: dict[str, tuple[str, ...]] = {
 }
 
 
+#: The packages whose own frames make an exception an HTTP client's, of any
+#: type, built-ins included (rev 26, round-24 codex F001: urllib parses a
+#: redirect's `Location` and `ipaddress` raises a bare `ValueError` quoting
+#: its host). Module paths, relative to their installed directory.
+HTTP_ORIGIN_MODULES = (
+    "httpx",
+    "httpx2",
+    "httpcore",
+    "httpcore2",
+    "h11",
+    "aiohttp",
+    "urllib/request.py",
+    "urllib/response.py",
+    "urllib/error.py",
+    "http",
+)
+#: Helpers an HTTP client calls, whose frames are passed over to find the
+#: frame that decides: an exception raised in `ipaddress` while urllib parses
+#: a redirect is urllib's; one raised there while pmcp parses its own config
+#: is pmcp's.
+HTTP_HELPER_MODULES = (
+    "urllib/parse.py",
+    "ipaddress.py",
+    "email",
+    "encodings",
+    "idna",
+    "yarl",
+    "multidict",
+    "anyio",
+    "sniffio",
+)
+
+
+def _module_path(name: str) -> str | None:
+    """The installed path of ``name`` (a package directory, with a trailing
+    separator, or a module file), or ``None`` if it is not installed."""
+    import importlib.util
+    import os
+
+    if name.endswith(".py"):
+        dotted = name[:-3].replace("/", ".")
+    else:
+        dotted = name
+    try:
+        spec = importlib.util.find_spec(dotted)
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.origin:
+        return None
+    if spec.submodule_search_locations:
+        return os.path.dirname(spec.origin) + os.sep
+    return spec.origin
+
+
+@functools.cache
+def _origin_paths() -> tuple[tuple[str, str], ...]:
+    """(path, kind) for each origin and helper module: ``http`` or
+    ``helper``; ``mcp`` for the MCP SDK."""
+    paths: list[tuple[str, str]] = []
+    for kind, names in (
+        ("http", HTTP_ORIGIN_MODULES),
+        ("helper", HTTP_HELPER_MODULES),
+        ("mcp", ("mcp",)),
+    ):
+        for name in names:
+            path = _module_path(name)
+            if path is not None:
+                paths.append((path, kind))
+    # The longest first: `urllib/parse.py` before any `urllib/` entry.
+    return tuple(sorted(paths, key=lambda item: -len(item[0])))
+
+
+def exception_origin(error: BaseException) -> str | None:
+    """Where ``error`` was raised (rev 26): ``"http"`` for an HTTP client's
+    frame, ``"mcp"`` for the MCP SDK's, else ``None``. From the innermost
+    frame of its traceback outwards, helper frames are passed over; the
+    first other frame decides. An exception with no traceback has no
+    origin, and one that pmcp's own code raises -- a client calling back
+    into pmcp included -- is pmcp's."""
+    tb = error.__traceback__
+    filenames: list[str] = []
+    while tb is not None:
+        filenames.append(tb.tb_frame.f_code.co_filename)
+        tb = tb.tb_next
+    paths = _origin_paths()
+    for filename in reversed(filenames):
+        kind = next((k for path, k in paths if filename.startswith(path)), None)
+        if kind == "helper":
+            continue
+        return kind if kind in ("http", "mcp") else None
+    return None
+
+
 def _tunnel_refusal_status(error: BaseException) -> int | None | bool:
     """For urllib's refused tunnel -- a bare ``OSError`` that
     ``http.client.HTTPConnection._tunnel`` raises with the proxy's status
@@ -723,8 +816,23 @@ def _is_validation_error(error: BaseException) -> bool:
         _VALUE_BEARING = _value_bearing_types()
     if isinstance(error, _VALUE_BEARING) and not isinstance(error, _value_free_types()):
         return True
-    # A refused urllib tunnel is a bare `OSError`: by origin (rev 24).
-    return _tunnel_refusal_status(error) is not False
+    # A refused urllib tunnel is a bare `OSError`: by origin (rev 24), and
+    # any exception an HTTP client's frame raises (rev 26).
+    if _tunnel_refusal_status(error) is not False:
+        return True
+    if exception_origin(error) == "http":
+        return True
+    return _withheld_sdk(error)
+
+
+def _withheld_sdk(error: BaseException) -> bool:
+    """An error the MCP SDK raised with a message pmcp has not reviewed, by
+    origin (rev 26; :func:`pmcp.sdk_rejections.withheld_sdk_error`)."""
+    if error.__traceback__ is None:
+        return False
+    from pmcp.sdk_rejections import withheld_sdk_error
+
+    return withheld_sdk_error(error)
 
 
 def _parse_text(error: BaseException) -> str:
@@ -784,7 +892,17 @@ def _validation_text(error: BaseException) -> str:
     if isinstance(error, UnicodeDecodeError):
         # The codec and class only: never the undecodable bytes.
         return f"could not decode {error.encoding} text (UnicodeDecodeError)"
-    if _tunnel_refusal_status(error) is not False or _is_response_decode_error(error):
+    is_http = (
+        _tunnel_refusal_status(error) is not False
+        or _is_response_decode_error(error)
+        or exception_origin(error) == "http"
+    )
+    if not is_http and _withheld_sdk(error):
+        from pmcp.sdk_rejections import sdk_error_text
+
+        # The SDK's own text is withheld: its code's phrase and class (rev 26).
+        return sdk_error_text(error)
+    if is_http:
         # The class and the status number: never the error's text, its
         # attributes or anything it chains (rev 25).
         status = _http_status(error)
@@ -873,6 +991,12 @@ def _qualified_name(kind: type[BaseException]) -> str:
     return f"{module}.{name}"
 
 
+def class_only_traceback_text(error: BaseException) -> str:
+    """The traceback's frames, with every exception in the chain printed as
+    its class alone, whatever it is (rev 26: the MCP SDK's logs)."""
+    return _render_traceback(error, lambda current: None)
+
+
 def safe_traceback_text(error: BaseException) -> str:
     """The formatted traceback. When the chain holds a validation or parse
     error, every exception in it is rendered as its frames (file, line,
@@ -885,6 +1009,27 @@ def safe_traceback_text(error: BaseException) -> str:
         return "".join(
             traceback.format_exception(type(error), error, error.__traceback__)
         )
+
+    def text_of(current: BaseException) -> str | None:
+        # The class is printed once: a wrapper's line is its qualified name
+        # and the description of what it chains (rev 18). Every other link
+        # -- beneath a registered error, or beside one in a group -- is its
+        # class alone: a parser that raises inside its own `except` leaves
+        # the rejected bytes in that context (rev 24, round-22 claude N1:
+        # `BadStatusLine` over `int('2<S>')`).
+        if _is_validation_error(current):
+            return _validation_text(current)
+        linked = _chained_value_bearing(current)
+        return None if linked is None else _validation_text(linked)
+
+    return _render_traceback(error, text_of)
+
+
+def _render_traceback(
+    error: BaseException, text_of: Callable[[BaseException], str | None]
+) -> str:
+    """Frames and ``Type[: text]`` for every link of ``error``'s chain, the
+    text from ``text_of`` (``None``: the class alone)."""
     parts: list[str] = []
     seen: set[int] = set()
 
@@ -910,24 +1055,9 @@ def safe_traceback_text(error: BaseException) -> str:
         if current.__traceback__ is not None:
             parts.append("Traceback (most recent call last):\n")
             parts.extend(traceback.format_tb(current.__traceback__))
-        # The class is printed once: a wrapper's line is its qualified name
-        # and the description of what it chains (rev 18). Every other link
-        # -- beneath a registered error, or beside one in a group -- is its
-        # class alone: a parser that raises inside its own `except` leaves
-        # the rejected bytes in that context (rev 24, round-22 claude N1:
-        # `BadStatusLine` over `int('2<S>')`).
-        if _is_validation_error(current):
-            parts.append(
-                f"{_qualified_name(type(current))}: {_validation_text(current)}\n"
-            )
-        else:
-            linked = _chained_value_bearing(current)
-            if linked is None:
-                parts.append(f"{_qualified_name(type(current))}\n")
-            else:
-                parts.append(
-                    f"{_qualified_name(type(current))}: {_validation_text(linked)}\n"
-                )
+        text = text_of(current)
+        name = _qualified_name(type(current))
+        parts.append(f"{name}: {text}\n" if text is not None else f"{name}\n")
 
     render(error)
     return "".join(parts)

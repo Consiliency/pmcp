@@ -419,7 +419,9 @@ def test_a_dict_shaped_message_in_log_arguments_is_described(
     caplog.set_level(logging.DEBUG)
     s = _FAMILIES[family][1]
     frame = {"jsonrpc": "2.0", "id": 1, "result": {"secret": s}}
-    logger = logging.getLogger("mcp.client.future_transport")
+    # Not an `mcp.*` logger: since rev 26 those mask any record whose
+    # message is not the SDK's own, so the description is not reached.
+    logger = logging.getLogger("thirdparty.future_transport")
     logger.debug("received %s", frame)
     logger.debug("received %r and %s", frame, [frame])
     logger.debug("received %s", {"wrapped": frame})

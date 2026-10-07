@@ -416,6 +416,13 @@ def _downstream_error(error: Any) -> DownstreamError:
         # whose content is not the downstream's message (the SDK's transports
         # reject it outright; stdio is parsed without a model).
         return DownstreamError(_MALFORMED_ERROR_MESSAGE, code=code)
+    from pmcp.sdk_rejections import sdk_built_message, sdk_message_phrase
+
+    if sdk_built_message(message, code):
+        # The MCP SDK's client transport answered for the downstream, with
+        # text it formats from the response (`Unexpected content type:
+        # <type>`): its code's fixed phrase, and no `data` (rev 26).
+        return DownstreamError(sdk_message_phrase(code), code=code)
     return DownstreamError(message, code=code, data=error.get("data"))
 
 

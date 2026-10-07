@@ -952,10 +952,10 @@ async def test_no_caller_argument_reaches_the_log_through_a_transport(
         assert "tools/call" in seen, seen
         assert "ok" in "".join(getattr(b, "text", "") for b in answer.content)
         if transport != "stdio":
-            # The SDK did log the outgoing request -- as its structure.
+            # The SDK did log the outgoing request -- masked, as every
+            # `mcp.*` client record is (rev 26).
             assert any(
-                "<JSON-RPC request: method 'tools/call'" in r.getMessage()
-                for r in records
+                r.getMessage() == "Sending client message: <...>" for r in records
             ), [r.getMessage() for r in records][:20]
     finally:
         await manager.disconnect_server("frames", force=True)

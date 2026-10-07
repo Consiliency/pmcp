@@ -131,8 +131,13 @@ _DEFAULT_PHRASE = "Request failed"
 
 _PROTOCOL_REVISION = re.compile(r"\d{4}-\d{2}-\d{2}")
 
-#: Logger-name prefixes whose records are scrubbed by :func:`scrub_sdk_record`.
-SDK_LOGGERS = ("mcp.server", "mcp.shared", "sse_starlette")
+#: Logger-name prefixes whose records are scrubbed by :func:`scrub_sdk_record`:
+#: the whole `mcp` package -- server, shared and client (rev 26, round-24
+#: claude F001: `mcp.client.*` logged `Unknown SSE event: <name>` and a
+#: rejected endpoint URL) -- and `sse_starlette`. The SDK also names loggers
+#: by literal (`mcp/client/session.py` logs as ``"client"``); those come from
+#: the installed package's source (:func:`sdk_logger_names`).
+SDK_LOGGERS = ("mcp", "sse_starlette")
 #: The HTTP client stacks' loggers (rev 23, round-21 claude F001): their
 #: traces quote response bytes (`receive_response_headers.failed
 #: exception=RemoteProtocolError(... b'<status line>')`, httpx's
@@ -155,6 +160,36 @@ def _mcp_root() -> Path:
     import mcp
 
     return Path(mcp.__file__).parent
+
+
+_LOGGER_FACTORIES = ("getLogger", "get_logger")
+
+
+def logger_name_arguments(tree: ast.AST) -> list[ast.expr]:
+    """The name argument of every ``getLogger``/``get_logger`` call."""
+    found: list[ast.expr] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _call_name(node) in _LOGGER_FACTORIES:
+            if node.args:
+                found.append(node.args[0])
+    return found
+
+
+@functools.cache
+def sdk_logger_names() -> tuple[str, ...]:
+    """Every logger-name prefix the installed SDK logs under: the package
+    (``__name__`` in every module) and each literal name it passes to a
+    logger factory (rev 26)."""
+    names = set(SDK_LOGGERS)
+    for path in sorted(_mcp_root().rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        for argument in logger_name_arguments(tree):
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                names.add(argument.value)
+    return tuple(sorted(names))
 
 
 def _call_name(node: ast.Call) -> str | None:
@@ -415,7 +450,237 @@ def install_value_free_sdk_errors() -> None:
         modern._write_rejection = _wrap_write_rejection(current)
 
 
+# --- errors the SDK raises, client side included (rev 26) ---------------------
+
+#: Raise sites (``path::function`` under the `mcp` package) of an `MCPError`
+#: that relays an `ErrorData` built elsewhere: a peer's response
+#: (`send_raw_request`), or pmcp's own handler or callback result. Its message
+#: is kept unless it matches a template the SDK itself builds -- the SDK's
+#: client transport hands its own `ErrorData` (`Unexpected content type:
+#: <type>`) to the session as if the peer had sent it (round-24 claude F001).
+#: `tests/test_http_transport.py` pins this set against the SDK's raises.
+RECEIVED_ERROR_SITES = frozenset(
+    {
+        "client/_input_required.py::_dispatch_all",
+        "client/session.py::_on_request",
+        "server/runner.py::_dump_result",
+        "server/runner.py::_inner",
+        "server/runner.py::on_request",
+        "shared/jsonrpc_dispatcher.py::send_raw_request",
+    }
+)
+
+
+def _is_error_call(name: str | None) -> bool:
+    return bool(name) and (
+        name in _MESSAGE_ARGUMENTS
+        or str(name).endswith(("Error", "Exception", "Warning"))
+    )
+
+
+def error_message_arguments(tree: ast.AST) -> list[tuple[str, ast.expr]]:
+    """(callee, message argument) of every exception or wire-error
+    construction in ``tree``: the ``message``/``msg`` keyword, else the
+    message's position (the second for ``MCPError``, else the first)."""
+    found: list[tuple[str, ast.expr]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node)
+        if not _is_error_call(name):
+            continue
+        keyword, index = _MESSAGE_ARGUMENTS.get(str(name), ("message", 0))
+        value = next(
+            (item.value for item in node.keywords if item.arg in (keyword, "msg")),
+            None,
+        )
+        if value is None and index is not None and len(node.args) > index:
+            value = node.args[index]
+        if value is not None:
+            found.append((str(name), value))
+    return found
+
+
+def _message_pattern(node: ast.expr) -> re.Pattern[str] | None:
+    """A pattern for a message the SDK formats: an f-string, a ``%``-format
+    or a ``.format`` of a literal, each placeholder matching anything."""
+    if isinstance(node, ast.JoinedStr):
+        return _template_pattern(node)
+    literal: str | None = None
+    placeholder: re.Pattern[str] | None = None
+    if (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Mod)
+        and isinstance(node.left, ast.Constant)
+        and isinstance(node.left.value, str)
+    ):
+        literal, placeholder = (
+            node.left.value,
+            re.compile(r"%[-#0 +]*\d*(?:\.\d+)?[sdirfx%]"),
+        )
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "format"
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, str)
+    ):
+        literal, placeholder = node.func.value.value, re.compile(r"\{[^{}]*\}")
+    if literal is None or placeholder is None:
+        return None
+    parts = placeholder.split(literal)
+    return re.compile("(.*?)".join(re.escape(part) for part in parts), re.DOTALL)
+
+
+@functools.cache
+def _sdk_message_texts() -> tuple[frozenset[str], tuple[re.Pattern[str], ...]]:
+    """Every literal message the SDK raises or answers with, and a pattern
+    for every message it formats, from the installed package's source."""
+    literals: set[str] = set()
+    patterns: list[re.Pattern[str]] = []
+    for path in sorted(_mcp_root().rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        for _name, argument in error_message_arguments(tree):
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                literals.add(argument.value)
+                continue
+            pattern = _message_pattern(argument)
+            if pattern is not None:
+                patterns.append(pattern)
+    return frozenset(literals), tuple(patterns)
+
+
+@functools.cache
+def _mcp_prefix() -> str:
+    return str(_mcp_root()) + "/"
+
+
+def raise_site(error: BaseException) -> str | None:
+    """``path::function`` of where ``error`` was raised, when that is in the
+    `mcp` package: the innermost frame of its traceback."""
+    tb = error.__traceback__
+    if tb is None:
+        return None
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    filename = tb.tb_frame.f_code.co_filename
+    prefix = _mcp_prefix()
+    if not filename.startswith(prefix):
+        return None
+    return f"{filename[len(prefix) :]}::{tb.tb_frame.f_code.co_name}"
+
+
+def withheld_sdk_error(error: BaseException) -> bool:
+    """Whether ``error`` was raised by the SDK with a message pmcp has not
+    reviewed (rev 26, round-24 claude F001). Kept: an empty message, a
+    literal of the SDK's source, a reviewed template, and the relayed
+    message of a :data:`RECEIVED_ERROR_SITES` raise that matches no template
+    the SDK builds. Everything else the SDK raises -- formatted from a
+    response, a URL, ``str(e)`` -- is withheld: rendered by class and code."""
+    from pmcp.argument_errors import exception_origin
+
+    if exception_origin(error) != "mcp":
+        return False
+    site = raise_site(error)
+    if site is None:
+        return False
+    try:
+        text = str(error)
+    except Exception:  # noqa: BLE001 -- an unprintable error is withheld
+        return True
+    if not text:
+        return False
+    literals, patterns = _sdk_message_texts()
+    if text in literals or _reviewed_message(text, getattr(error, "code", None)):
+        return False
+    if site not in RECEIVED_ERROR_SITES:
+        return True
+    return sdk_built_message(text, getattr(error, "code", None))
+
+
+#: A formatted SDK message with less literal text than this is too general
+#: to recognise a relayed message by (``f"{error}"`` would match anything);
+#: `tests/test_http_transport.py` pins that the SDK has none today.
+_MIN_TEMPLATE_LITERAL = 8
+
+
+def _literal_length(pattern: re.Pattern[str]) -> int:
+    return len(re.sub(r"\\(.)", r"\1", pattern.pattern.replace("(.*?)", "")))
+
+
+def sdk_built_message(message: Any, code: Any = None) -> bool:
+    """Whether ``message`` -- relayed as a peer's -- is one the SDK formats
+    itself and pmcp has not reviewed: the SDK's client transport answers a
+    request with its own `ErrorData` (`Unexpected content type: <type>`,
+    round-24 claude F001), which reaches pmcp as if the downstream sent it."""
+    if not isinstance(message, str) or _reviewed_message(message, code):
+        return False
+    _literals, patterns = _sdk_message_texts()
+    return any(
+        _literal_length(pattern) >= _MIN_TEMPLATE_LITERAL and pattern.fullmatch(message)
+        for pattern in patterns
+    )
+
+
+def sdk_message_phrase(code: Any) -> str:
+    """The fixed phrase for ``code`` (:data:`_CODE_PHRASES`)."""
+    return (
+        _CODE_PHRASES.get(code, _DEFAULT_PHRASE)
+        if isinstance(code, int)
+        else (_DEFAULT_PHRASE)
+    )
+
+
+def sdk_error_text(error: BaseException) -> str:
+    """A withheld SDK error: its code's phrase, class and code, or its
+    class alone."""
+    code = getattr(error, "code", None)
+    name = type(error).__name__
+    if type(code) is int:
+        return f"{_CODE_PHRASES.get(code, _DEFAULT_PHRASE)} ({name}, code {code})"
+    return f"the MCP SDK raised {name}"
+
+
 # --- logs ---------------------------------------------------------------------
+
+
+def log_messages(tree: ast.AST) -> list[ast.expr]:
+    """The message argument of every logger call in ``tree``."""
+    found: list[ast.expr] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr
+            in ("debug", "info", "warning", "error", "exception", "critical", "log")
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in ("logger", "log", "_logger")
+        ):
+            args = node.args[1:] if node.func.attr == "log" else node.args
+            if args:
+                found.append(args[0])
+    return found
+
+
+@functools.cache
+def _log_literals() -> frozenset[str]:
+    """Every literal message an SDK logger call is given (rev 26): a record
+    of an SDK logger whose message is neither one of these nor an f-string
+    template's is masked whole -- `logger.error(error_msg)` logged a
+    pre-built `Endpoint origin does not match connection origin: <url>`."""
+    literals: set[str] = set()
+    for path in sorted(_mcp_root().rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        for message in log_messages(tree):
+            if isinstance(message, ast.Constant) and isinstance(message.value, str):
+                literals.add(message.value)
+    return frozenset(literals)
 
 
 def log_templates(tree: ast.AST) -> list[ast.JoinedStr]:
@@ -439,23 +704,22 @@ def log_templates(tree: ast.AST) -> list[ast.JoinedStr]:
 @functools.cache
 def _log_patterns() -> tuple[tuple[re.Pattern[str], str], ...]:
     """(pattern, the message with each placeholder as ``<...>``) for every
-    f-string log message in the SDK's server and shared modules."""
+    f-string log message anywhere in the SDK (rev 26: the client too)."""
     root = _mcp_root()
     out: list[tuple[re.Pattern[str], str]] = []
-    for sub in ("server", "shared"):
-        for path in sorted((root / sub).rglob("*.py")):
-            try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-            except (OSError, SyntaxError, UnicodeDecodeError):
-                continue
-            for template in log_templates(tree):
-                masked = "".join(
-                    value.value
-                    if isinstance(value, ast.Constant) and isinstance(value.value, str)
-                    else _PLACEHOLDER
-                    for value in template.values
-                )
-                out.append((_template_pattern(template), masked))
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        for template in log_templates(tree):
+            masked = "".join(
+                value.value
+                if isinstance(value, ast.Constant) and isinstance(value.value, str)
+                else _PLACEHOLDER
+                for value in template.values
+            )
+            out.append((_template_pattern(template), masked))
     # Longest literal text first, so a specific template wins over a general one.
     out.sort(key=lambda item: -len(item[1].replace(_PLACEHOLDER, "")))
     return tuple(out)
@@ -474,7 +738,7 @@ def _under(name: Any, prefixes: tuple[str, ...]) -> bool:
 
 
 def is_sdk_logger(name: Any) -> bool:
-    return _under(name, SDK_LOGGERS) or _under(name, HTTP_CLIENT_LOGGERS)
+    return _under(name, sdk_logger_names()) or _under(name, HTTP_CLIENT_LOGGERS)
 
 
 def scrub_sdk_record(record: logging.LogRecord) -> None:
@@ -486,20 +750,46 @@ def scrub_sdk_record(record: logging.LogRecord) -> None:
     if not is_sdk_logger(record.name):
         return
     try:
+        from pmcp.argument_errors import safe_exc_info
+
+        error = record.exc_info[1] if isinstance(record.exc_info, tuple) else None
+        if isinstance(error, BaseException) and safe_exc_info(error) is not None:
+            # A chain that holds a registered error is described by the
+            # record scrubber; any other is kept as frames and classes.
+            # The traceback's frames, and each exception by its class alone
+            # (rev 26: `logger.exception("Error in sse_reader")` printed a
+            # `ValueError` naming a rejected endpoint URL).
+            from pmcp.argument_errors import class_only_traceback_text
+
+            record.exc_text = class_only_traceback_text(error)
+            record.exc_info = None
         args = record.args
         if isinstance(args, tuple):
             record.args = tuple(_masked_argument(item) for item in args)
         elif isinstance(args, dict):
             record.args = {key: _masked_argument(item) for key, item in args.items()}
-        if not args and isinstance(record.msg, str):
-            if _under(record.name, HTTP_CLIENT_LOGGERS):
+        if _under(record.name, HTTP_CLIENT_LOGGERS):
+            if not args and isinstance(record.msg, str):
                 head, _, rest = record.msg.partition(" ")
                 if rest:
                     record.msg = f"{head} {_PLACEHOLDER}"
-                return
+            return
+        if _under(record.name, ("sse_starlette",)):
+            return  # its `%`-arguments are masked; its messages are literals
+        if isinstance(record.msg, BaseException):
+            return  # rendered by the record scrubber (`exception_text`)
+        if not isinstance(record.msg, str):
+            record.msg, record.args = _PLACEHOLDER, None
+            return
+        if record.msg in _log_literals():
+            return
+        if not args:
             for pattern, masked in _log_patterns():
                 if pattern.fullmatch(record.msg):
                     record.msg = masked
-                    break
+                    return
+        # A message the SDK built some other way (a variable, `%` or
+        # `.format` before the call): masked whole (rev 26).
+        record.msg, record.args = _PLACEHOLDER, None
     except Exception:  # noqa: BLE001 -- a log call must never fail here
         pass

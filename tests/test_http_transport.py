@@ -1211,7 +1211,10 @@ def test_a_pmcp_handler_error_passes_the_write_side_unchanged() -> None:
 _WRITE = "server, in an exchange: rebuilt by pmcp.sdk_rejections"
 _PRE = "server, out of session (id null): rewritten by value_free_rejection"
 _PLUMB = "plumbing: carries an error classified where it is built"
-_CLIENT = "client side: an error pmcp receives or raises as a client"
+_CLIENT = (
+    "client side: withheld by origin unless a literal; a relayed peer message "
+    "is kept unless it matches a template the SDK builds (rev 26)"
+)
 _UNUSED = "unreachable: pmcp serves the low-level Server over JSONRPCDispatcher"
 _SDK_ERROR_CONSTRUCTIONS: dict[tuple[str, str, str, str], str] = {
     ("mcp.client.session", "MCPError", "data", "method"): _CLIENT,
@@ -1493,6 +1496,666 @@ def test_every_sdk_error_construction_is_classified() -> None:
         sorted(found - set(_SDK_ERROR_CONSTRUCTIONS)),
         sorted(set(_SDK_ERROR_CONSTRUCTIONS) - found),
     )
+
+
+#: Every other exception the SDK builds from non-literal text -- `ValueError`,
+#: `RuntimeError`, its own error classes -- anywhere in the package, client
+#: transports included (rev 26, round-24 ruling). Each is withheld by origin
+#: (`pmcp.sdk_rejections.withheld_sdk_error`): raised from the SDK's frames,
+#: it renders as its class (and code), never its text. Exact both ways.
+_SDK_EXCEPTION_CONSTRUCTIONS: frozenset[tuple[str, str, str]] = frozenset(
+    {
+        (
+            "mcp.client._input_required",
+            "InputRequiredRoundsExceededError",
+            "max_rounds",
+        ),
+        (
+            "mcp.client.auth.extensions.identity_assertion",
+            "OAuthFlowError",
+            "f'No authorization server metadata at configured issuer {self._issuer}'",
+        ),
+        (
+            "mcp.client.auth.extensions.identity_assertion",
+            "OAuthFlowError",
+            "f'Token endpoint {token_endpoint} is not on the configured issuer origin {self._issuer}'",
+        ),
+        (
+            "mcp.client.auth.extensions.identity_assertion",
+            "OAuthTokenError",
+            "f'Token exchange failed ({token_response.status_code}): {body}'",
+        ),
+        (
+            "mcp.client.auth.oauth2",
+            "OAuthFlowError",
+            "f'Protected Resource Metadata request failed: {response.status_code}'",
+        ),
+        (
+            "mcp.client.auth.oauth2",
+            "OAuthFlowError",
+            "f'Protected resource {prm_resource} does not match expected {default_resource}'",
+        ),
+        (
+            "mcp.client.auth.oauth2",
+            "OAuthFlowError",
+            "f'State parameter mismatch: {result.state} != {state}'",
+        ),
+        (
+            "mcp.client.auth.oauth2",
+            "OAuthRegistrationError",
+            "f'Authorization server registered the client for {method!r} but issued no client_secret'",
+        ),
+        (
+            "mcp.client.auth.oauth2",
+            "OAuthRegistrationError",
+            "f'Authorization server registered the client with unsupported token_endpoint_auth_method {method!r}'",
+        ),
+        (
+            "mcp.client.auth.oauth2",
+            "OAuthTokenError",
+            "f'Registered client uses unsupported token_endpoint_auth_method {auth_method!r}'",
+        ),
+        (
+            "mcp.client.auth.oauth2",
+            "OAuthTokenError",
+            "f'Token exchange failed ({response.status_code}): {body_text}'",
+        ),
+        (
+            "mcp.client.auth.oauth2",
+            "ValueError",
+            "f'client_metadata_url must be a valid HTTPS URL with a non-root pathname, got: {client_metadata_url}'",
+        ),
+        (
+            "mcp.client.auth.utils",
+            "OAuthFlowError",
+            "f'Authorization response iss mismatch: {iss} != {expected}'",
+        ),
+        (
+            "mcp.client.auth.utils",
+            "OAuthFlowError",
+            "f'Authorization server metadata issuer mismatch: {oauth_metadata.issuer} != {expected_issuer}'",
+        ),
+        (
+            "mcp.client.auth.utils",
+            "OAuthRegistrationError",
+            "f'Invalid registration response: {e}'",
+        ),
+        (
+            "mcp.client.auth.utils",
+            "OAuthRegistrationError",
+            "f'Registration failed: {response.status_code} {response.text}'",
+        ),
+        ("mcp.client.auth.utils", "OAuthTokenError", "f'Invalid token response: {e}'"),
+        (
+            "mcp.client.caching",
+            "ValueError",
+            "f'default_ttl_ms must be >= 0, got {self.default_ttl_ms}'",
+        ),
+        (
+            "mcp.client.caching",
+            "ValueError",
+            "f'max_entries must be >= 0, got {max_entries}'",
+        ),
+        (
+            "mcp.client.client",
+            "ValueError",
+            "f\"mode must be 'legacy', 'auto', or one of {list(MODERN_PROTOCOL_VERSIONS)}; got {self.mode!r}{hint}\"",
+        ),
+        (
+            "mcp.client.client",
+            "ValueError",
+            "f'extension identifier {identifier!r} is passed more than once'",
+        ),
+        (
+            "mcp.client.client",
+            "ValueError",
+            "f'{both} notification method {binding.method!r}; a method can have only one observer'",
+        ),
+        (
+            "mcp.client.client",
+            "ValueError",
+            "f'{both} resultType {tag!r}; a wire tag can have only one resolver'",
+        ),
+        (
+            "mcp.client.client",
+            "ValueError",
+            "f'{type(extension).__name__} has no `identifier`; a ClientExtension must set the `identifier` class attribute (or assign one in `__init__`) before it can be used'",
+        ),
+        (
+            "mcp.client.extension",
+            "ValueError",
+            "f'claims attach to {sorted(_CLAIM_METHODS)} only; got method {self.method!r}'",
+        ),
+        (
+            "mcp.client.extension",
+            "ValueError",
+            "f'protocol_versions {unrecognized} are not modern protocol revisions; claimed shapes cannot be delivered on a legacy wire (None means every modern version)'",
+        ),
+        (
+            "mcp.client.extension",
+            "ValueError",
+            "f'resultType {self.result_type!r} is core protocol vocabulary'",
+        ),
+        (
+            "mcp.client.extension",
+            "ValueError",
+            "f'{self.model.__name__} must subclass mcp_types.Result'",
+        ),
+        (
+            "mcp.client.extension",
+            "ValueError",
+            "f'{self.model.__name__}.result_type must be Literal[{self.result_type!r}]'",
+        ),
+        (
+            "mcp.client.extension",
+            "ValueError",
+            "f'{self.model.__name__}.{name} aliases {clash!r}, a typed field of the core result surface; a colliding value would fail core validation before the claim adapter runs'",
+        ),
+        (
+            "mcp.client.session",
+            "RuntimeError",
+            "f'Invalid schema for tool {name}: {e}'",
+        ),
+        (
+            "mcp.client.session",
+            "RuntimeError",
+            "f'Invalid structured content returned by tool {name}: {error}'",
+        ),
+        (
+            "mcp.client.session",
+            "RuntimeError",
+            "f'No mutually supported modern protocol version (server: {result.supported_versions}, client: {list(MODERN_PROTOCOL_VERSIONS)})'",
+        ),
+        (
+            "mcp.client.session",
+            "RuntimeError",
+            "f'Server returned InputRequiredResult; pass allow_input_required=True to receive it and retry {method}(..., input_responses=..., request_state=result.request_state).'",
+        ),
+        (
+            "mcp.client.session",
+            "RuntimeError",
+            "f'Tool {name} has an output schema but did not return structured content'",
+        ),
+        (
+            "mcp.client.session",
+            "RuntimeError",
+            "f'Unsupported protocol version from the server: {result.protocol_version}'",
+        ),
+        (
+            "mcp.client.session",
+            "ValueError",
+            'f"result_claims key {identifier!r} has no extensions entry; a claim is only advertised through its extension\'s capability ad"',
+        ),
+        (
+            "mcp.client.session",
+            "ValueError",
+            "f'duplicate notification binding for method {binding.method!r}'",
+        ),
+        (
+            "mcp.client.session",
+            "ValueError",
+            "f'duplicate result claim for resultType {claim.result_type!r}'",
+        ),
+        (
+            "mcp.client.session",
+            "ValueError",
+            "f'result_claims[{identifier!r}] is empty and would drop the extension from the capability ad at every version. Omit the key instead'",
+        ),
+        (
+            "mcp.client.session",
+            "ValueError",
+            "f'{method} requires params[{key!r}] for Mcp-Name'",
+        ),
+        ("mcp.client.sse", "ValueError", "error_msg"),
+        (
+            "mcp.client.subscriptions",
+            "ListenNotSupportedError",
+            "session.protocol_version",
+        ),
+        ("mcp.os.win32.utilities", "OSError", "f'SetStdHandle failed for fd {fd}'"),
+        ("mcp.server._streamable_http_modern", "NoBackChannelError", "method"),
+        (
+            "mcp.server.apps",
+            "ValueError",
+            "f'Apps tool {tool.fn.__name__!r} binds resource_uri {uri!r}, but no such resource is registered; add it with add_html_resource() or add_resource()'",
+        ),
+        (
+            "mcp.server.apps",
+            "ValueError",
+            "f'MCP Apps URIs must use the ui:// scheme, got {uri!r}'",
+        ),
+        (
+            "mcp.server.apps",
+            "ValueError",
+            "f'MCP Apps resources are served as {APP_MIME_TYPE!r}, got {resource.mime_type!r}'",
+        ),
+        (
+            "mcp.server.auth.middleware.client_auth",
+            "AuthenticationError",
+            "f'Unsupported auth method: {client.token_endpoint_auth_method}'",
+        ),
+        (
+            "mcp.server.caching",
+            "TypeError",
+            "f'cache_hints[{method!r}] must be a CacheHint, got {type(hint).__name__}'",
+        ),
+        (
+            "mcp.server.caching",
+            "ValueError",
+            "f\"cache_hints keys must be cacheable methods (see CacheableMethod); got: {', '.join(unknown)}\"",
+        ),
+        (
+            "mcp.server.caching",
+            "ValueError",
+            "f\"scope must be 'public' or 'private', got {self.scope!r}\"",
+        ),
+        (
+            "mcp.server.caching",
+            "ValueError",
+            "f'ttl_ms must be >= 0, got {self.ttl_ms}'",
+        ),
+        ("mcp.server.connection", "NoBackChannelError", "method"),
+        (
+            "mcp.server.elicitation",
+            "TypeError",
+            "f'Elicitation schema field {field_name!r} rendered as {prop!r}, which is not a valid PrimitiveSchemaDefinition'",
+        ),
+        (
+            "mcp.server.elicitation",
+            "ValueError",
+            "f'Unexpected elicitation action: {result.action}'",
+        ),
+        (
+            "mcp.server.extension",
+            "ValueError",
+            "f'MethodBinding cannot bind spec method {self.method!r}; extension methods are additive — use Extension.intercept_tool_call or Server.middleware to wrap core behaviour'",
+        ),
+        (
+            "mcp.server.extension",
+            "ValueError",
+            "f'MethodBinding for {self.method!r} has an empty protocol_versions set, so it could never be served; use None to admit every version'",
+        ),
+        (
+            "mcp.server.mcpserver.prompts.base",
+            "ValueError",
+            "f'Could not convert prompt result to message: {msg}'",
+        ),
+        (
+            "mcp.server.mcpserver.prompts.base",
+            "ValueError",
+            "f'Error rendering prompt {self.name}: {e}'",
+        ),
+        (
+            "mcp.server.mcpserver.prompts.base",
+            "ValueError",
+            "f'Missing required arguments: {missing}'",
+        ),
+        (
+            "mcp.server.mcpserver.prompts.manager",
+            "ValueError",
+            "f'Unknown prompt: {name}'",
+        ),
+        (
+            "mcp.server.mcpserver.resolve",
+            "ToolError",
+            "f'Resolver for parameter {name!r} could not resolve: elicitation was {outcome.action}'",
+        ),
+        (
+            "mcp.server.mcpserver.resolve",
+            "ToolError",
+            "f'Resolver {key!r} received a non-elicitation response'",
+        ),
+        (
+            "mcp.server.mcpserver.resolve",
+            "ToolError",
+            "f'Resolver {key!r} received a response of the wrong kind'",
+        ),
+        (
+            "mcp.server.mcpserver.resolve",
+            "ToolError",
+            "f'Resolver {key!r} received an accepted elicitation whose content does not match the requested schema'",
+        ),
+        (
+            "mcp.server.mcpserver.resolve",
+            "ToolError",
+            "f'Resolver {key!r} received an accepted elicitation with no content'",
+        ),
+        (
+            "mcp.server.mcpserver.resources.resource_manager",
+            "ResourceNotFoundError",
+            "f'Unknown resource: {uri}'",
+        ),
+        (
+            "mcp.server.mcpserver.resources.templates",
+            "ResourceError",
+            "f'Error creating resource from template {uri}'",
+        ),
+        (
+            "mcp.server.mcpserver.resources.templates",
+            "ResourceSecurityError",
+            "self.uri_template",
+        ),
+        (
+            "mcp.server.mcpserver.resources.types",
+            "FileNotFoundError",
+            "f'Directory not found: {self.path}'",
+        ),
+        (
+            "mcp.server.mcpserver.resources.types",
+            "NotADirectoryError",
+            "f'Not a directory: {self.path}'",
+        ),
+        (
+            "mcp.server.mcpserver.resources.types",
+            "ValueError",
+            "f'Error listing directory {self.path}: {e}'",
+        ),
+        (
+            "mcp.server.mcpserver.resources.types",
+            "ValueError",
+            "f'Error reading directory {self.path}: {e}'",
+        ),
+        (
+            "mcp.server.mcpserver.resources.types",
+            "ValueError",
+            "f'Error reading file {self.path}: {e}'",
+        ),
+        (
+            "mcp.server.mcpserver.resources.types",
+            "ValueError",
+            "f'Error reading resource {self.uri}: {e}'",
+        ),
+        ("mcp.server.mcpserver.resources.types", "ValueError", "str(e)"),
+        (
+            "mcp.server.mcpserver.server",
+            "ResourceError",
+            "f'Error reading resource {uri}'",
+        ),
+        ("mcp.server.mcpserver.server", "ValueError", "_MISSING_AUDIENCE"),
+        (
+            "mcp.server.mcpserver.server",
+            "ValueError",
+            "f'Extension {identifier!r} binds method {method.method!r}, which is already registered; extension methods are additive and cannot replace another handler'",
+        ),
+        (
+            "mcp.server.mcpserver.server",
+            "ValueError",
+            "f'Extension {identifier!r} is already registered'",
+        ),
+        (
+            "mcp.server.mcpserver.server",
+            "ValueError",
+            "f'Mismatch between URI parameters {uri_params} and function parameters {func_params}'",
+        ),
+        (
+            "mcp.server.mcpserver.server",
+            "ValueError",
+            "f'Resource {uri!r} has no URI template variables, but the handler declares a Context parameter. Context injection for static resources is not supported. Add a template variable to the URI or remove the Context parameter.'",
+        ),
+        (
+            "mcp.server.mcpserver.server",
+            "ValueError",
+            "f'Resource {uri!r} has no URI template variables, but the handler declares parameters {func_params}. Add matching {{...}} variables to the URI or remove the parameters.'",
+        ),
+        (
+            "mcp.server.mcpserver.server",
+            "ValueError",
+            "f'Resource {uri!r}: query parameter(s) {missing_defaults} have no default value. A client may omit a {{?...}}/{{&...}} query parameter, so the matching handler parameter must declare a default.'",
+        ),
+        ("mcp.server.mcpserver.server", "ValueError", "f'Unknown prompt: {name}'"),
+        (
+            "mcp.server.mcpserver.server",
+            "ValueError",
+            "f'Unknown transport: {transport}'",
+        ),
+        ("mcp.server.mcpserver.server", "ValueError", "str(e)"),
+        (
+            "mcp.server.mcpserver.tools.base",
+            "ToolError",
+            "f'Error executing tool {self.name}: {e}'",
+        ),
+        (
+            "mcp.server.mcpserver.tools.tool_manager",
+            "ToolError",
+            "f'Unknown tool: {name}'",
+        ),
+        (
+            "mcp.server.mcpserver.utilities.func_metadata",
+            "ValueError",
+            "f'JSON schema warning: {kind} - {detail}'",
+        ),
+        (
+            "mcp.server.request_state",
+            "TypeError",
+            "f'request-state keys must be bytes, bytearray, or str; keys[{i}] is {type(key).__name__}'",
+        ),
+        (
+            "mcp.server.request_state",
+            "ValueError",
+            "f'keys[{i}] duplicates an earlier ring key'",
+        ),
+        (
+            "mcp.server.request_state",
+            "ValueError",
+            "f'request-state keys must be at least 32 bytes of secret randomness; keys[{i}] is {len(k)} bytes. Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\"'",
+        ),
+        (
+            "mcp.server.request_state",
+            "ValueError",
+            "f'request-state ttl must be a positive finite number, got {ttl!r}'",
+        ),
+        ("mcp.server.runner", "NoBackChannelError", "method"),
+        (
+            "mcp.server.runner",
+            "TypeError",
+            "f'handler returned {type(result).__name__}; expected BaseModel, dict, or None'",
+        ),
+        (
+            "mcp.server.sse",
+            "ValueError",
+            "f\"Given endpoint: {endpoint} is not a relative path (e.g., '/messages/'), expecting a relative path (e.g., '/messages/').\"",
+        ),
+        (
+            "mcp.server.stdio",
+            "OSError",
+            "f'duplicate of fd {fd} landed in the standard range'",
+        ),
+        (
+            "mcp.server.stdio",
+            "RuntimeError",
+            "f'another stdio_server() in this process has already claimed fd {fd}'",
+        ),
+        ("mcp.server.streamable_http", "Exception", "err"),
+        (
+            "mcp.shared.auth",
+            "InvalidRedirectUriError",
+            "f\"Redirect URI '{redirect_uri}' not registered for client\"",
+        ),
+        (
+            "mcp.shared.auth",
+            "InvalidScopeError",
+            "f'Client was not registered with scope {scope}'",
+        ),
+        ("mcp.shared.direct_dispatcher", "NoBackChannelError", "method"),
+        (
+            "mcp.shared.direct_dispatcher",
+            "ValueError",
+            "f'request id {request_id!r} is already in flight'",
+        ),
+        (
+            "mcp.shared.exceptions",
+            "ValueError",
+            "f'Expected error code {URL_ELICITATION_REQUIRED}, got {error.code}'",
+        ),
+        (
+            "mcp.shared.extension",
+            "TypeError",
+            "f'{owner}.identifier must be a `vendor-prefix/name` string (reverse-DNS prefix required), got {identifier!r}'",
+        ),
+        ("mcp.shared.jsonrpc_dispatcher", "NoBackChannelError", "method"),
+        (
+            "mcp.shared.jsonrpc_dispatcher",
+            "ValueError",
+            "f'request id {request_id!r} is already in flight'",
+        ),
+        (
+            "mcp.shared.path_security",
+            "PathEscapeError",
+            "f'Path component contains a null byte; refusing to join onto {base_resolved}'",
+        ),
+        (
+            "mcp.shared.path_security",
+            "PathEscapeError",
+            "f'Path component {part!r} is absolute; refusing to join onto {base_resolved}'",
+        ),
+        (
+            "mcp.shared.path_security",
+            "PathEscapeError",
+            "f'Path {target} escapes base {base_resolved}'",
+        ),
+        (
+            "mcp.shared.uri_template",
+            "TypeError",
+            "f'Variable {var.name!r} must be str or a sequence of str, got {type(value).__name__}'",
+        ),
+    }
+)
+
+
+def test_every_sdk_exception_construction_is_withheld() -> None:
+    """The whole `mcp` package, exact both ways (rev 26)."""
+    import ast
+    from pathlib import Path
+
+    import mcp
+
+    from pmcp.sdk_rejections import _MESSAGE_ARGUMENTS, error_message_arguments
+
+    root = Path(mcp.__file__).parent
+    found: set[tuple[str, str, str]] = set()
+    for path in sorted(root.rglob("*.py")):
+        module = (
+            path.relative_to(root.parent).with_suffix("").as_posix().replace("/", ".")
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for name, argument in error_message_arguments(tree):
+            if name in _MESSAGE_ARGUMENTS or isinstance(argument, ast.Constant):
+                continue
+            found.add((module, name, ast.unparse(argument)))
+    assert found == set(_SDK_EXCEPTION_CONSTRUCTIONS), (
+        sorted(found - set(_SDK_EXCEPTION_CONSTRUCTIONS)),
+        sorted(set(_SDK_EXCEPTION_CONSTRUCTIONS) - found),
+    )
+
+
+def test_the_received_error_sites_are_the_sdks_relays() -> None:
+    """`RECEIVED_ERROR_SITES` is exactly the SDK's raises of an `MCPError`
+    that relays an `ErrorData` built elsewhere -- a peer's response, or
+    pmcp's own handler or callback result -- and not one that formats
+    `str(e)` (rev 26)."""
+    import ast
+    from pathlib import Path
+
+    import mcp
+
+    from pmcp.sdk_rejections import RECEIVED_ERROR_SITES
+
+    root = Path(mcp.__file__).parent
+    relays: set[str] = set()
+    formats: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        functions = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)):
+                continue
+            call = node.exc
+            func = call.func
+            name = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else getattr(func, "id", "")
+            )
+            message: ast.expr | None = None
+            if name in ("from_error_data", "from_jsonrpc_error"):
+                message = call.args[0] if call.args else None
+            elif name in ("MCPError", "McpError"):
+                message = next(
+                    (k.value for k in call.keywords if k.arg == "message"),
+                    call.args[1] if len(call.args) > 1 else None,
+                )
+            if message is None or isinstance(message, (ast.Constant, ast.JoinedStr)):
+                continue
+            owner = min(
+                (
+                    f
+                    for f in functions
+                    if f.lineno <= node.lineno <= (f.end_lineno or f.lineno)
+                ),
+                key=lambda f: (f.end_lineno or f.lineno) - f.lineno,
+            )
+            site = f"{path.relative_to(root).as_posix()}::{owner.name}"
+            if isinstance(message, ast.Call):  # `str(e)`: the SDK formats it
+                formats.add(site)
+            else:  # a received `ErrorData`, or its `.message`
+                relays.add(site)
+    assert relays == set(RECEIVED_ERROR_SITES), (relays, formats)
+    assert not relays & formats, relays & formats
+
+
+def test_no_sdk_template_is_too_general_to_recognise() -> None:
+    """A relayed message is recognised as the SDK's by its template's
+    literal text; a template with less than that would match anything."""
+    from pmcp.sdk_rejections import (
+        _MIN_TEMPLATE_LITERAL,
+        _literal_length,
+        _sdk_message_texts,
+    )
+
+    _literals, patterns = _sdk_message_texts()
+    assert patterns
+    short = [p.pattern for p in patterns if _literal_length(p) < _MIN_TEMPLATE_LITERAL]
+    assert not short, short
+
+
+def test_every_sdk_logger_is_masked() -> None:
+    """Each logger the SDK creates -- by `__name__` (under `mcp`) or by a
+    literal name (`"client"`) -- is one :func:`scrub_sdk_record` masks
+    (rev 26: the client's loggers too)."""
+    import ast
+    from pathlib import Path
+
+    import mcp
+
+    from pmcp.sdk_rejections import is_sdk_logger, logger_name_arguments
+
+    root = Path(mcp.__file__).parent
+    unmasked = []
+    for path in sorted(root.rglob("*.py")):
+        module = (
+            path.relative_to(root.parent).with_suffix("").as_posix().replace("/", ".")
+        )
+        for argument in logger_name_arguments(
+            ast.parse(path.read_text(encoding="utf-8"))
+        ):
+            if isinstance(argument, ast.Name) and argument.id == "__name__":
+                name = module
+            elif isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                name = argument.value
+            elif isinstance(argument, ast.Name) and argument.id == "name":
+                continue  # `get_logger(name)`'s own body: its callers are checked
+            else:
+                unmasked.append((module, ast.unparse(argument)))
+                continue
+            if not is_sdk_logger(name):
+                unmasked.append((module, name))
+    assert not unmasked, unmasked
+    assert is_sdk_logger("client") and is_sdk_logger("mcp.client.streamable_http")
+    assert not is_sdk_logger("pmcp.client.manager")
 
 
 def test_the_reviewed_templates_are_the_ones_the_sdk_builds() -> None:
