@@ -559,41 +559,46 @@ def _mcp_prefix() -> str:
 
 
 def raise_site(error: BaseException) -> str | None:
-    """``path::function`` of where ``error`` was raised, when that is in the
-    `mcp` package: the innermost frame of its traceback."""
-    tb = error.__traceback__
-    if tb is None:
+    """``path::function`` of the SDK frame that decided ``error``'s origin
+    (the same walk as :func:`pmcp.argument_errors.exception_origin`, rev
+    27), or ``None`` when its origin is not the SDK."""
+    from pmcp.argument_errors import exception_walk
+
+    walk = exception_walk(error)
+    if walk.kind != "mcp" or walk.filename is None:
         return None
-    while tb.tb_next is not None:
-        tb = tb.tb_next
-    filename = tb.tb_frame.f_code.co_filename
     prefix = _mcp_prefix()
-    if not filename.startswith(prefix):
+    if not walk.filename.startswith(prefix):
         return None
-    return f"{filename[len(prefix) :]}::{tb.tb_frame.f_code.co_name}"
+    return f"{walk.filename[len(prefix) :]}::{walk.function}"
 
 
 def withheld_sdk_error(error: BaseException) -> bool:
-    """Whether ``error`` was raised by the SDK with a message pmcp has not
-    reviewed (rev 26, round-24 claude F001). Kept: an empty message, a
-    literal of the SDK's source, a reviewed template, and the relayed
-    message of a :data:`RECEIVED_ERROR_SITES` raise that matches no template
-    the SDK builds. Everything else the SDK raises -- formatted from a
-    response, a URL, ``str(e)`` -- is withheld: rendered by class and code."""
-    from pmcp.argument_errors import exception_origin
+    """Whether ``error``, raised under the SDK, is withheld (rev 26; fail
+    closed since rev 27). An exception whose origin is the SDK keeps its
+    text only when it is positively matched where the SDK raised it itself
+    (the deciding frame is the raising frame): an empty message, a literal
+    of the SDK's source, a reviewed template, or -- at a
+    :data:`RECEIVED_ERROR_SITES` raise -- a relayed message that matches no
+    template the SDK builds. Everything else is withheld: text the SDK
+    formats, ``str(e)``, and anything a library helper raised beneath an SDK
+    frame (`ipaddress` quoting a rejected endpoint host, round-25 grok and
+    codex F001). A missing site never lets an error through."""
+    from pmcp.argument_errors import exception_walk
 
-    if exception_origin(error) != "mcp":
+    walk = exception_walk(error)
+    if walk.kind != "mcp":
         return False
     site = raise_site(error)
-    if site is None:
-        return False
+    if site is None or not walk.direct:
+        return True
     try:
         text = str(error)
     except Exception:  # noqa: BLE001 -- an unprintable error is withheld
         return True
     if not text:
         return False
-    literals, patterns = _sdk_message_texts()
+    literals, _patterns = _sdk_message_texts()
     if text in literals or _reviewed_message(text, getattr(error, "code", None)):
         return False
     if site not in RECEIVED_ERROR_SITES:

@@ -44,7 +44,7 @@ import sys
 import traceback
 from collections.abc import Callable, Iterable, Iterator
 from types import ModuleType
-from typing import Any
+from typing import Any, NamedTuple
 
 import jsonschema
 from pydantic import ValidationError
@@ -680,35 +680,55 @@ def _library_prefixes() -> tuple[str, ...]:
     return tuple(sorted(p.rstrip(os.sep) + os.sep for p in prefixes if p))
 
 
-def exception_origin(error: BaseException) -> str | None:
-    """Where ``error`` was raised (rev 26): ``"http"`` for an HTTP client,
-    ``"mcp"`` for the MCP SDK, else ``None``.
+class Origin(NamedTuple):
+    """Where an exception was raised, from one traceback walk (rev 27)."""
+
+    #: ``"http"`` (an HTTP client), ``"mcp"`` (the MCP SDK) or ``None``.
+    kind: str | None
+    #: The deciding frame's file and function, if a frame decided.
+    filename: str | None
+    function: str | None
+    #: Whether the deciding frame is the innermost one -- the frame that
+    #: raised -- rather than one a library helper raised beneath it.
+    direct: bool
+
+
+def exception_walk(error: BaseException) -> Origin:
+    """The one walk behind :func:`exception_origin` and the SDK's raise site
+    (rev 27, round-25 grok and codex F001: the two used to walk differently,
+    so an `ipaddress` error under the SDK had an origin but no site, and the
+    missing site let it through).
 
     The traceback is read from its innermost frame outwards. A frame in an
     HTTP client or the SDK decides for it. A frame of any other installed
-    library -- ``ipaddress``, ``urllib.parse``, ``email``, ``anyio``,
-    ``yarl``, ``asyncio`` -- is passed over, so an exception a helper raises
-    is its caller's. A frame of pmcp's, or of any code that is not an
-    installed library (a test, a script), decides for "not by origin":
-    a client calling back into such code does not make what it raises the
-    client's. An exception with no traceback has no origin."""
+    library -- ``ipaddress``, ``urllib.parse``, ``json``, ``email``,
+    ``base64``, ``anyio``, ``asyncio`` -- is passed over, so an exception a
+    helper raises is its caller's. A frame of pmcp's, or of any code that is
+    not an installed library (a test, a script), decides "not by origin".
+    An exception with no traceback has no origin."""
     tb = error.__traceback__
-    filenames: list[str] = []
+    frames: list[tuple[str, str]] = []
     while tb is not None:
-        filenames.append(tb.tb_frame.f_code.co_filename)
+        frames.append((tb.tb_frame.f_code.co_filename, tb.tb_frame.f_code.co_name))
         tb = tb.tb_next
     paths = _origin_paths()
     libraries = _library_prefixes()
-    for filename in reversed(filenames):
+    for depth, (filename, function) in enumerate(reversed(frames)):
         kind = next((k for path, k in paths if filename.startswith(path)), None)
         if kind in ("http", "mcp"):
-            return kind
+            return Origin(kind, filename, function, depth == 0)
         if kind == "pmcp":
-            return None
+            return Origin(None, filename, function, depth == 0)
         if filename.startswith("<frozen ") or filename.startswith(libraries):
             continue
-        return None
-    return None
+        return Origin(None, filename, function, depth == 0)
+    return Origin(None, None, None, False)
+
+
+def exception_origin(error: BaseException) -> str | None:
+    """Where ``error`` was raised (rev 26): ``"http"`` for an HTTP client,
+    ``"mcp"`` for the MCP SDK, else ``None`` (:func:`exception_walk`)."""
+    return exception_walk(error).kind
 
 
 def _tunnel_refusal_status(error: BaseException) -> int | None | bool:

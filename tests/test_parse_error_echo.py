@@ -2717,3 +2717,209 @@ def test_an_sdk_record_prints_its_traceback_by_class() -> None:
     assert record.exc_text and "Traceback (most recent call last)" in record.exc_text
     assert record.exc_text.rstrip().endswith("RuntimeError"), record.exc_text
     assert s not in _record_text(record)
+
+
+# --- a helper the SDK calls (rev 27, round-25 grok and codex F001) -----------
+
+
+def _sdk_helper_calls(s: str) -> dict[str, str]:
+    """Source for one call per helper library the SDK's transports can reach
+    on response data, each raising on ``s``: `urllib.parse` (`urljoin`,
+    `urlparse`, and `ipaddress` beneath it), `json`, `email`, `base64`."""
+    return {
+        "ipaddress": f"__import__('ipaddress').ip_address({s!r})",
+        "urllib.parse-host": f"__import__('urllib.parse').parse.urljoin('http://o/', 'http://[{s}]/')",
+        "urllib.parse-port": f"__import__('urllib.parse').parse.urlsplit('http://h:{s}/').port",
+        "json": f"__import__('json').loads('{{\"{s}\": }}')",
+        "email": f"__import__('email.utils').utils.parsedate_to_datetime({s!r})",
+        "base64": f"__import__('base64').b64decode({s + '!'!r}, validate=True)",
+    }
+
+
+@pytest.mark.parametrize(
+    "site",
+    [
+        "client/sse.py::sse_reader",
+        "client/streamable_http.py::_handle_sse_response",
+        "shared/jsonrpc_dispatcher.py::send_raw_request",
+    ],
+)
+@pytest.mark.parametrize("helper", sorted(_sdk_helper_calls("x")))
+def test_a_helper_the_sdk_calls_is_the_sdks(helper: str, site: str) -> None:
+    """A helper library raising beneath an SDK frame -- at an SSE endpoint,
+    a streamable-HTTP stream, and the relay site -- is the SDK's by the same
+    walk that finds the site, and is withheld: neither origin nor site is
+    lost to the helper's frame, and a relay site does not keep it (rev 27)."""
+    from pathlib import Path
+
+    import mcp
+
+    from pmcp.argument_errors import exception_text, safe_traceback_text
+    from pmcp.client.manager import describe_exception
+    from tests.test_argument_error_echo import _exception_group
+
+    s = _GRID_S
+    path, function = site.split("::")
+    filename = str(Path(mcp.__file__).parent / path)
+    namespace: dict[str, Any] = {}
+    exec(  # noqa: S102 -- a frame with the SDK's file name, for the test
+        compile(
+            f"def {function}():\n    {_sdk_helper_calls(s)[helper]}\n",
+            filename,
+            "exec",
+        ),
+        namespace,
+    )
+    with pytest.raises(Exception) as caught:
+        namespace[function]()
+    error = caught.value
+    texts = {
+        "exception_text": exception_text(error),
+        "safe_traceback_text": safe_traceback_text(error),
+        "describe_exception": describe_exception(error),
+        "describe_exception(group)": describe_exception(
+            _exception_group()("group", [error])
+        ),
+    }
+    leaked = {k: v[:200] for k, v in texts.items() if s in v}
+    assert not leaked, leaked
+    # One walk, two answers: the origin and the SDK site agree.
+    from pmcp.argument_errors import _is_validation_error, exception_walk
+    from pmcp.sdk_rejections import raise_site, withheld_sdk_error
+
+    walk = exception_walk(error)
+    assert (walk.kind, walk.direct) == ("mcp", False), walk
+    assert raise_site(error) == site
+    assert _is_validation_error(error)
+    if type(error).__name__ != "JSONDecodeError":
+        assert withheld_sdk_error(error)
+
+
+def test_a_rejected_sse_endpoint_host_reaches_no_log(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end on legacy SSE: a first `endpoint` on the connection's
+    origin, then one whose bracketed host `urllib.parse` rejects
+    (`ipaddress` quotes it). The SDK sends that error on the read stream,
+    and pmcp's `_read_sse` logs it (rev 27, grok's and codex's case)."""
+    import socket
+    import threading
+    import time
+
+    import pmcp  # noqa: F401 - installs the scrubbers
+
+    s = _GRID_S
+    for name in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    caplog.set_level(logging.DEBUG)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(64)
+    port = listener.getsockname()[1]
+
+    def handle(conn: Any) -> None:
+        try:
+            line = conn.recv(65536).decode("latin-1").split("\r\n", 1)[0]
+            _GRID_REQUESTS.append(line.encode())
+            if line.startswith("GET"):
+                body = (
+                    "event: endpoint\ndata: /messages?session_id=abc\n\n"
+                    f"event: endpoint\ndata: http://[{s}]/messages\n\n"
+                )
+                conn.sendall(
+                    (
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+                        + body
+                    ).encode()
+                )
+                time.sleep(3)
+            else:
+                conn.sendall(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def loop() -> None:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+    _GRID_URL[0] = f"http://127.0.0.1:{port}/sse"
+    before = len(_GRID_REQUESTS)
+    try:
+        try:
+            errors, last = asyncio.run(asyncio.wait_for(_drive_remote("sse", port), 20))
+            outcome = json.dumps([errors, last], default=str)
+        except Exception as error:  # noqa: BLE001 -- inspected
+            from pmcp.argument_errors import exception_text, safe_traceback_text
+
+            outcome = exception_text(error) + safe_traceback_text(error)
+    finally:
+        listener.close()
+    assert len(_GRID_REQUESTS) > before, "never connected"
+    texts = {
+        "result": outcome,
+        "log": "\n".join(_record_text(record) for record in caplog.records),
+    }
+    leaked = {
+        k: v[:400]
+        for k, v in texts.items()
+        if any(f in v for f in _forbidden_any_case(s))
+    }
+    assert not leaked, leaked
+
+
+#: Constructs that lose an exception's traceback, and so its origin (rev 27,
+#: round-25 claude N1): any use in `src/pmcp` must be reviewed against the
+#: origin rule first. None is used today.
+_TRACEBACK_LOSING = (
+    "with_traceback",
+    "__traceback__",
+    "ProcessPoolExecutor",
+    "multiprocessing",
+    "concurrent.futures.process",
+)
+
+
+def test_nothing_in_pmcp_drops_an_exceptions_traceback() -> None:
+    """`e.with_traceback(None)`, an assignment to `__traceback__`, and a
+    process-pool or `multiprocessing` boundary (which pickles an exception
+    without its frames) all lose the origin the rule reads. pmcp uses none;
+    a new use fails here until reviewed."""
+    found = []
+    for path in sorted(_SRC.rglob("*.py")):
+        if "baml_client" in path.parts:
+            continue
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Attribute):
+                # `__traceback__` is read everywhere; only a write loses it.
+                if node.attr != "__traceback__" or isinstance(node.ctx, ast.Store):
+                    names.append(node.attr)
+            elif isinstance(node, ast.Name):
+                names.append(node.id)
+            elif isinstance(node, ast.Import):
+                names.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                names.append(node.module or "")
+                names.extend(alias.name for alias in node.names)
+            for name in names:
+                if any(
+                    name == bad or name.startswith(bad + ".")
+                    for bad in _TRACEBACK_LOSING
+                ):
+                    found.append(f"{path.relative_to(_SRC)}:{node.lineno}: {name}")
+    assert not found, found
