@@ -2064,3 +2064,177 @@ def test_the_home_directory_as_a_root_still_accepts_the_operators_store(
             assert is_package_approved(identity) is True
     finally:
         trust_store.set_active_project_root(None)
+
+
+# --------------------------------------------------------------------------- #
+# Board round 18. codex F001: home was compared by path spelling, so with HOME
+# spelled through a link, a launch directory holding a link to that home looked
+# like home's ancestor, dropped out of the guard, and a trust.json planted in it
+# approved the served project. claude N-1: launching from ~/.config or
+# ~/.config/pmcp refused the operator's own store. Home-ness is now decided by
+# identity (pmcp.home_identity), with the default store's real directories
+# exempt too.
+# --------------------------------------------------------------------------- #
+
+
+def _approval_for(config: Path, content: bytes) -> str:
+    import hashlib
+    import json
+
+    return json.dumps(
+        {
+            "version": 1,
+            "records": [
+                {
+                    "absolute_path": str(config.resolve()),
+                    "content_sha256": hashlib.sha256(content).hexdigest(),
+                    "scope": "user",
+                    "decision": "approved",
+                    "recorded_at": "2026-10-07T00:00:00+00:00",
+                }
+            ],
+        }
+    )
+
+
+def test_codex_r18_f001_a_home_alias_cannot_exempt_the_launch_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex r18 F001, verbatim in substance."""
+    import tempfile
+
+    from pmcp import trust_store
+
+    tmp_path = tmp_path.resolve()
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(trust_store, "_active_project_root", None)
+    launch, home, served = (tmp_path / n for n in ("launch", "home", "served"))
+    launch.mkdir()
+    (home / ".config").mkdir(parents=True)
+    (served / ".git").mkdir(parents=True)
+    home_alias = launch / "home-link"
+    home_alias.symlink_to(home, target_is_directory=True)
+    store = launch / "store"
+    store.mkdir()
+    (home / ".config" / "pmcp").symlink_to(store, target_is_directory=True)
+    config = served / ".mcp.json"
+    content = b'{"mcpServers":{"unapproved":{"command":"echo"}}}'
+    config.write_bytes(content)
+    (store / "trust.json").write_text(_approval_for(config, content))
+    monkeypatch.chdir(launch)
+    trust_store.reset_launch_directory()
+    trust_store.set_active_project_root(served)
+    try:
+        monkeypatch.setenv("HOME", str(home))
+        assert not trust_store.is_approved(config, content, project_root=served)
+        monkeypatch.setenv("HOME", str(home_alias))
+        assert Path.home().resolve() == home
+        assert not trust_store.is_approved(config, content, project_root=served)
+    finally:
+        trust_store.set_active_project_root(None)
+
+
+@pytest.mark.parametrize("as_root", ["launch", "served", "bound"])
+def test_a_home_spelled_through_a_link_is_still_home(
+    as_root: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HOME via a link, as each kind of root: the operator's store still works."""
+    from pmcp import trust_store
+    from pmcp.manifest.package_identity import PackageIdentity
+    from pmcp.package_approvals import approve_package, is_package_approved
+
+    real = tmp_path.resolve() / "real-home"
+    (real / ".config" / "pmcp").mkdir(parents=True)
+    alias = tmp_path.resolve() / "home-alias"
+    alias.symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(alias))
+    identity = PackageIdentity("npm", "example-mcp", "1.2.3", None)
+    approve_package(identity)
+    monkeypatch.chdir(alias if as_root == "launch" else tmp_path)
+    trust_store.reset_launch_directory()
+    try:
+        if as_root == "served":
+            trust_store.set_active_project_root(alias)
+            assert is_package_approved(identity) is True
+        elif as_root == "bound":
+            assert is_package_approved(identity, project_root=alias) is True
+        else:
+            assert is_package_approved(identity) is True
+    finally:
+        trust_store.set_active_project_root(None)
+
+
+@pytest.mark.parametrize("where", [".config", ".config/pmcp"])
+def test_launching_from_the_default_store_path_accepts_the_operators_store(
+    where: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """claude r18 N-1: ~/.config or ~/.config/pmcp as the launch directory."""
+    from pmcp import trust_store
+    from pmcp.manifest.package_identity import PackageIdentity
+    from pmcp.package_approvals import approve_package, is_package_approved
+
+    home = Path(os.environ["HOME"])
+    (home / ".config" / "pmcp").mkdir(parents=True, exist_ok=True)
+    identity = PackageIdentity("npm", "example-mcp", "1.2.3", None)
+    approve_package(identity)
+    monkeypatch.chdir(home / where)
+    trust_store.reset_launch_directory()
+    assert is_package_approved(identity) is True
+    assert (
+        trust_store.trust_store_path().parent == (home / ".config" / "pmcp").resolve()
+    )
+
+
+def test_a_store_linked_from_home_into_a_plain_launch_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default-store exemption is for the REAL directories only.
+
+    ~/.config/pmcp linked into a plain launch directory: the store resolves in
+    the launch directory, which is a boundary, and the refusal names a
+    directory (not a checkout).
+    """
+    import shutil
+
+    from pmcp import trust_store
+    from pmcp.trust_store import TrustStoreError
+
+    home = Path(os.environ["HOME"])
+    launch = tmp_path.resolve() / "launch"
+    (launch / "store").mkdir(parents=True)
+    pmcp_dir = home / ".config" / "pmcp"
+    if pmcp_dir.exists():
+        shutil.rmtree(pmcp_dir)
+    pmcp_dir.parent.mkdir(parents=True, exist_ok=True)
+    pmcp_dir.symlink_to(launch / "store", target_is_directory=True)
+    monkeypatch.chdir(launch)
+    trust_store.reset_launch_directory()
+    with pytest.raises(TrustStoreError, match="inside the directory at"):
+        trust_store.trust_store_path()
+
+
+def test_launching_inside_the_target_of_a_linked_store_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exemption covers the REAL ~/.config/pmcp, never what a link names.
+
+    ~/.config/pmcp linked to a plain directory, and pmcp launched IN that
+    directory: it is the launch boundary and is not the operator's area.
+    """
+    import shutil
+
+    from pmcp import trust_store
+    from pmcp.trust_store import TrustStoreError
+
+    home = Path(os.environ["HOME"])
+    target = tmp_path.resolve() / "elsewhere" / "store"
+    target.mkdir(parents=True)
+    pmcp_dir = home / ".config" / "pmcp"
+    if pmcp_dir.exists():
+        shutil.rmtree(pmcp_dir)
+    pmcp_dir.parent.mkdir(parents=True, exist_ok=True)
+    pmcp_dir.symlink_to(target, target_is_directory=True)
+    monkeypatch.chdir(target)
+    trust_store.reset_launch_directory()
+    with pytest.raises(TrustStoreError, match="inside the directory at"):
+        trust_store.trust_store_path()

@@ -246,16 +246,17 @@ def _coerce_server_entry(config: object) -> dict[str, Any] | None:
 
 def find_project_root(start_dir: Path) -> Path | None:
     """Find project root by looking for .mcp.json or common project markers."""
+    from pmcp.home_identity import is_home
+
     current = start_dir.resolve()
     temp_root = Path(tempfile.gettempdir()).resolve()
-    home_root = Path.home().resolve()
 
     while current != current.parent:
         if current == temp_root:
             return None
         # $HOME is already covered by the user config source; treating it as a
         # project root would double-attribute ~/.mcp.json (project + user).
-        if current == home_root:
+        if is_home(current):  # by identity, not spelling (#372 round 19)
             return None
         # Check for .mcp.json
         if (current / ".mcp.json").exists():

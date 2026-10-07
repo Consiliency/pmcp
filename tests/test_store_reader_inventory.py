@@ -1351,6 +1351,10 @@ CWD_READERS = {
         "LAUNCHED in, captured once and never re-read (Consiliency/pmcp#372 "
         "round 18); adding roots only refuses more"
     ),
+    ("pmcp.trust_store", "_is_checkout"): (
+        "asks whether a boundary it is given carries a project marker, to "
+        "name it in the refusal; refusal-only"
+    ),
     ("pmcp.trust_store", "_enclosing_checkouts"): (
         "walks up from a path it is given (the guard's roots, the path being "
         "approved) to the checkouts enclosing it; refusal-only"
@@ -1738,3 +1742,99 @@ def test_the_approval_scan_sees_each_shape() -> None:
     assert [line.split(" ")[0].split(":")[1] for line in unbound] == [
         "PolicyManager.load"
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Home is compared by identity, never spelling (Consiliency/pmcp#372 round 19,
+# board round 18 codex F001): HOME spelled through a link made a launch
+# directory holding a link to that home look like home's ancestor. In the
+# trust, residency and store code, nothing derived from Path.home() is compared
+# or walked up by path; pmcp.home_identity does it by (st_dev, st_ino).
+# --------------------------------------------------------------------------- #
+
+HOME_SENSITIVE_MODULES = (
+    "pmcp.trust_store",
+    "pmcp.package_approvals",
+    "pmcp.env_store",
+    "pmcp.project_consent",
+    "pmcp.atomic_write",
+    "pmcp.config.loader",
+    "pmcp.manifest.loader",
+)
+
+
+def _mentions_home(node: ast.AST, home_names: set[str]) -> bool:
+    for sub in ast.walk(node):
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "home"
+        ):
+            return True
+        if isinstance(sub, ast.Name) and sub.id in home_names:
+            return True
+    return False
+
+
+def home_spelling_comparisons(sources: dict[str, str]) -> list[str]:
+    found: list[str] = []
+    for module in HOME_SENSITIVE_MODULES:
+        tree = ast.parse(sources[module])
+        for name, fn in _qualified_functions(tree):
+            home_names = {
+                t.id
+                for node in ast.walk(fn)
+                if isinstance(node, ast.Assign) and _mentions_home(node.value, set())
+                for t in node.targets
+                if isinstance(t, ast.Name)
+            }
+            for node in ast.walk(fn):
+                compared = (
+                    isinstance(node, ast.Compare)
+                    # `x is None` asks whether something is set, not where.
+                    and not all(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops)
+                    and any(
+                        _mentions_home(side, home_names)
+                        for side in (node.left, *node.comparators)
+                    )
+                )
+                walked = (
+                    isinstance(node, ast.Attribute)
+                    and node.attr in ("parents", "parent")
+                    and _mentions_home(node.value, home_names)
+                )
+                relative = (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("is_relative_to", "relative_to", "samefile")
+                    and (
+                        _mentions_home(node.func.value, home_names)
+                        or any(_mentions_home(a, home_names) for a in node.args)
+                    )
+                )
+                if compared or walked or relative:
+                    found.append(f"{module}:{name}:{node.lineno}")
+    return found
+
+
+def test_home_is_compared_by_identity_only() -> None:
+    assert home_spelling_comparisons(_src_sources()) == []
+
+
+def test_the_home_scan_sees_each_shape() -> None:
+    source = (
+        "from pathlib import Path\n"
+        "def eq(p):\n"
+        "    return p == Path.home().resolve()\n"
+        "def named(p):\n"
+        "    home = Path.home()\n"
+        "    return p in home.parents\n"
+        "def rel(p):\n"
+        "    return p.is_relative_to(Path.home())\n"
+        "def fine(p):\n"
+        "    return Path.home() / '.config'\n"
+    )
+    sources = {m: "" for m in HOME_SENSITIVE_MODULES}
+    sources["pmcp.trust_store"] = source
+    flagged = {line.split(":")[1] for line in home_spelling_comparisons(sources)}
+    assert flagged == {"eq", "named", "rel"}

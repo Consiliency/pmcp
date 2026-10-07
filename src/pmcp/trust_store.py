@@ -43,6 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from pmcp.home_identity import is_operators_own_area
 from pmcp.atomic_write import (
     atomic_write,
     falls_back_to_pathname,
@@ -132,18 +133,15 @@ def reset_launch_directory() -> None:
     _LAUNCH_DIRECTORY = None
 
 
-def _is_home_or_above(directory: Path) -> bool:
-    """Is ``directory`` the home directory or one of its ancestors (by identity)?"""
+def _is_checkout(root: Path) -> bool:
+    """Does ``root`` carry a project marker (is it its own project root)?"""
+    from pmcp.config.loader import find_project_root
+
     try:
-        target = os.stat(directory)
-        home = Path.home()
-        for candidate in (home, *home.parents):
-            status = os.stat(candidate)
-            if (status.st_dev, status.st_ino) == (target.st_dev, target.st_ino):
-                return True
+        found = find_project_root(root)
+        return found is not None and os.path.samefile(found, root)
     except OSError:
         return False
-    return False
 
 
 def _boundaries(root: Path) -> list[Path]:
@@ -160,7 +158,11 @@ def _boundaries(root: Path) -> list[Path]:
     enclosing = list(_enclosing_checkouts(root))
     if enclosing:
         return enclosing
-    if _is_home_or_above(root):
+    # By FILE IDENTITY (pmcp.home_identity), never path spelling: home and its
+    # physical ancestors, plus the default store's own real directories
+    # (home's .config and .config/pmcp), are the operator's (Consiliency/pmcp
+    # #372 round 19, board round 18 codex F001 and claude N-1).
+    if is_operators_own_area(root):
         return []
     return [root]
 
@@ -347,10 +349,13 @@ def refuse_checkout_resident(
             "refusing it."
         ) from exc
     if checkout is not None:
+        # A boundary is a checkout when it carries a project marker; otherwise
+        # it is a plain directory pmcp reads a project from (round 18).
+        kind = "checkout" if _is_checkout(checkout) else "directory"
         raise TrustStoreError(
-            f"{label} {name} resolves inside the checkout at {checkout}. "
-            "A checkout-resident store lets a repository approve its own "
-            "content; move it under a home directory outside the repository."
+            f"{label} {name} resolves inside the {kind} at {checkout}. "
+            f"A store inside a project's {kind} lets it approve its own "
+            "content; move it under a home directory outside the project."
         )
 
 

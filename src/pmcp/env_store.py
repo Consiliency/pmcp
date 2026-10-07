@@ -446,13 +446,12 @@ def project_scope_root(project: Path | None = None) -> Path | None:
     ``tests/test_store_reader_inventory.py`` fails if this function's answer
     reaches a credential lookup.
     """
+    from pmcp.home_identity import is_home
+
     root = resolve_project_root(project)
-    try:
-        home = Path.home().resolve()
-        if os.path.realpath(root) == os.fspath(home):
-            return None
-    except (OSError, RuntimeError):
-        pass
+    # By identity, not spelling (Consiliency/pmcp#372 round 19).
+    if is_home(root):
+        return None
     return root
 
 
@@ -1081,13 +1080,11 @@ def _home_and_its_ancestors() -> set[tuple[int, int]]:
     at some later moment. Identity, not path strings: a repository can choose
     path spellings, not inodes.
     """
-    home = resolve_scope_path("user").parent.parent.parent
-    identities: set[tuple[int, int]] = set()
-    for directory in (home, *home.parents):
-        identity = _identity(directory)
-        if identity is not None:
-            identities.add(identity)
-    return identities
+    from pmcp.home_identity import home_and_ancestor_identities
+
+    # PHYSICAL ancestors: walked from the resolved home, never the spelling
+    # HOME holds (Consiliency/pmcp#372 round 19).
+    return home_and_ancestor_identities(resolve_scope_path("user").parent.parent.parent)
 
 
 def _identity(path: Path) -> tuple[int, int] | None:
