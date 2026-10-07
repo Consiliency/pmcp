@@ -415,6 +415,21 @@ def served_project_root() -> Path | None:
     return _DEFAULT_ROOT
 
 
+def bind_project_root(project: Path | None) -> Path:
+    """The concrete project a long-lived object serves, fixed when it is built.
+
+    ``project`` when given, else the served root, else the root discovered from
+    the working directory at this moment (:func:`resolve_project_root`). An
+    object that loads configs or endpoints (``GatewayServer``, ``GatewayTools``,
+    ``ClientManager``) stores this and passes it to every credential lookup it
+    makes, so it never re-resolves: a ``chdir`` after construction cannot pair
+    its endpoints with another project's credential (Consiliency/pmcp#372 round
+    16). A plain function call with no project keeps following the working
+    directory.
+    """
+    return resolve_project_root(project)
+
+
 def project_scope_root(project: Path | None = None) -> Path | None:
     """The root project-scoped CONFIGURATION is read from, or ``None`` for none.
 

@@ -288,9 +288,13 @@ class PolicyManager:
         self._user_policy_loaded = False
         self._redaction_regexes: list[re.Pattern[str]] = []
         self._explicit_policy = policy_path is not None
-        #: The project whose ``.mcp-gateway-policy.*`` is discovered: ``None``
-        #: is the served project (Consiliency/pmcp#372 round 12).
-        self._project_root = project_root
+        #: The project whose ``.mcp-gateway-policy.*`` is discovered, bound
+        #: when the manager is built: the named one, else the served one, else
+        #: the one found from the working directory now (Consiliency/pmcp#372
+        #: rounds 12 and 16).
+        from pmcp.env_store import bind_project_root
+
+        self._project_root: Path = bind_project_root(project_root)
         self._scoped_advisor_active = False
 
         if policy_path:

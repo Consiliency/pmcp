@@ -843,9 +843,9 @@ async def test_a_catalog_search_builds_the_manifest_at_most_once(
     calls: list[int] = []
     real_load = loader.load_manifest
 
-    def counted() -> Any:
+    def counted(**kwargs: Any) -> Any:
         calls.append(1)
-        return real_load()
+        return real_load(**kwargs)
 
     monkeypatch.setattr("pmcp.tools.handlers.load_manifest", counted)
     monkeypatch.setattr(loader, "load_manifest", counted)

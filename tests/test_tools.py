@@ -1570,7 +1570,8 @@ class TestCatalogSearch:
         self, gateway_tools: GatewayTools, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         gateway_tools._detected_cli_infos = {
             "git": CLIInfo(name="git", path="/usr/bin/git")
@@ -1592,7 +1593,8 @@ class TestCatalogSearch:
         self, gateway_tools: GatewayTools, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         gateway_tools._detected_cli_infos = {
             "git": CLIInfo(name="git", path="/usr/bin/git")
@@ -1611,7 +1613,8 @@ class TestCatalogSearch:
         self, gateway_tools: GatewayTools, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         gateway_tools._detected_cli_infos = {
             "git": CLIInfo(name="git", path="/usr/bin/git")
@@ -1790,7 +1793,8 @@ class TestCatalogSearch:
         }
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
@@ -3016,7 +3020,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
@@ -3043,7 +3048,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
@@ -3162,7 +3168,8 @@ class TestCapabilityAndProvision:
         ]
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
 
@@ -3192,7 +3199,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
@@ -3213,7 +3221,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
@@ -3242,7 +3251,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_git_collision_manifest
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_git_collision_manifest(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
@@ -3265,7 +3275,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_git_collision_manifest
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_git_collision_manifest(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
@@ -3289,7 +3300,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_configs", lambda **_: [tenant_code_mode_config()]
@@ -3321,7 +3333,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_configs", lambda **_: [tenant_code_mode_config()]
@@ -3346,7 +3359,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_configs", lambda **_: [tenant_code_mode_config()]
@@ -3373,7 +3387,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_configs", lambda **_: [tenant_code_mode_config()]
@@ -3407,7 +3422,8 @@ class TestCapabilityAndProvision:
             return {"git": CLIInfo(name="git", path="/usr/bin/git")}
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.probe_clis", fake_probe_clis)
 
@@ -3433,7 +3449,8 @@ class TestCapabilityAndProvision:
             return {"git": CLIInfo(name="git", path="/usr/bin/git")}
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.setattr("pmcp.tools.handlers.probe_clis", fake_probe_clis)
@@ -3458,7 +3475,8 @@ class TestCapabilityAndProvision:
             return {"git": CLIInfo(name="git", path="/usr/bin/git")}
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.setattr("pmcp.tools.handlers.probe_clis", fake_probe_clis)
@@ -3484,7 +3502,8 @@ class TestCapabilityAndProvision:
             return {"git": CLIInfo(name="git", path="/usr/bin/git")}
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.setattr("pmcp.tools.handlers.probe_clis", fake_probe_clis)
@@ -3512,7 +3531,8 @@ class TestCapabilityAndProvision:
             raise AssertionError("request_capability should not probe explicit CLIs")
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_manifest_for_request_tests(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.setattr("pmcp.tools.handlers.probe_clis", fake_probe_clis)
@@ -3534,7 +3554,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_git_and_github_manifest
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_git_and_github_manifest(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
@@ -3557,7 +3578,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_git_and_github_manifest
+            "pmcp.tools.handlers.load_manifest",
+            lambda *_a, **_k: create_git_and_github_manifest(),
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
@@ -3868,11 +3890,13 @@ class TestCapabilityAndProvision:
         monkeypatch.setattr(
             "pmcp.config.loader.tempfile.gettempdir", lambda: str(ancestor)
         )
+        # The gateway binds its project when it is built (Consiliency/pmcp#372
+        # round 16), so the working directory is set first.
+        monkeypatch.chdir(child)
         gateway_tools = GatewayTools(
             client_manager=MockClientManager(),  # type: ignore
             policy_manager=PolicyManager(),
         )
-        monkeypatch.chdir(child)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
         result = await gateway_tools.auth_connect(
@@ -3948,12 +3972,14 @@ class TestCapabilityAndProvision:
     async def test_auth_connect_round_trips_shell_significant_credential(
         self, tmp_path: Path, monkeypatch
     ) -> None:
+        # The gateway binds its project when it is built (Consiliency/pmcp#372
+        # round 16), so the working directory is set first.
+        monkeypatch.chdir(tmp_path)
         gateway_tools = GatewayTools(
             client_manager=MockClientManager(),  # type: ignore
             policy_manager=PolicyManager(),
         )
         credential = r'token with spaces # "quotes" and \ slash = value'
-        monkeypatch.chdir(tmp_path)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
         result = await gateway_tools.auth_connect(
@@ -3973,11 +3999,13 @@ class TestCapabilityAndProvision:
     async def test_auth_connect_rejects_newline_credential_without_injection(
         self, tmp_path: Path, monkeypatch
     ) -> None:
+        # The gateway binds its project when it is built (Consiliency/pmcp#372
+        # round 16), so the working directory is set first.
+        monkeypatch.chdir(tmp_path)
         gateway_tools = GatewayTools(
             client_manager=MockClientManager(),  # type: ignore
             policy_manager=PolicyManager(),
         )
-        monkeypatch.chdir(tmp_path)
         monkeypatch.delenv("INJECTED", raising=False)
 
         result = await gateway_tools.auth_connect(

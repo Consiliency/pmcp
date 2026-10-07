@@ -1369,12 +1369,14 @@ class TestRemoteConnectSseHeaders:
     async def test_connect_streamable_http_interpolates_headers_from_project_store(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        manager = ClientManager()
         credential = r'token with spaces # "quotes" and \ slash = value'
         write_env_file(
             tmp_path / ".env.pmcp", {"SOAK_TEST_TOKEN": credential}, confine_to=None
         )
+        # The manager binds its project when it is built (Consiliency/pmcp#372
+        # round 16), so the working directory is set first.
         monkeypatch.chdir(tmp_path)
+        manager = ClientManager()
         monkeypatch.delenv("SOAK_TEST_TOKEN", raising=False)
 
         config = ResolvedServerConfig(

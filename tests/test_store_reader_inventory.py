@@ -1534,3 +1534,112 @@ def test_the_startup_load_never_rechooses_the_served_root() -> None:
     assert "ensure_served_project_root" in called
     assert "serve_project_root" not in called
     assert "set_default_root" not in called
+
+
+# --------------------------------------------------------------------------- #
+# A long-lived object binds its project when it is built (Consiliency/pmcp#372
+# round 16, board round 15 claude F001). An object that takes a project_root
+# holds configs and endpoints across calls; it resolves a CONCRETE root in
+# __init__ (env_store.bind_project_root) and hands exactly that to every
+# credential lookup and project input it reads, so a chdir after construction
+# cannot pair its endpoint with another project's credential.
+# --------------------------------------------------------------------------- #
+
+#: The long-lived objects, derived below: classes whose __init__ takes a
+#: project_root and that read credentials or project inputs. Asserted exact.
+BOUND_OBJECTS = {
+    ("pmcp.server", "GatewayServer"),
+    ("pmcp.tools.handlers", "GatewayTools"),
+    ("pmcp.client.manager", "ClientManager"),
+    ("pmcp.policy.policy", "PolicyManager"),
+}
+
+
+def _is_self_root(node: ast.AST | None) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "_project_root"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    )
+
+
+def bound_object_violations(sources: dict[str, str]) -> tuple[set, list[str]]:
+    gates = consumer_gates(sources)
+    objects: set[tuple[str, str]] = set()
+    found: list[str] = []
+    for module, tree, aliases in _module_trees(sources):
+        for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+            init = next(
+                (
+                    n
+                    for n in cls.body
+                    if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+                ),
+                None,
+            )
+            if init is None or "project_root" not in _parameters(init):
+                continue
+            objects.add((module, cls.name))
+            binds = any(
+                isinstance(node, (ast.Assign, ast.AnnAssign))
+                and any(
+                    _is_self_root(t)
+                    for t in (
+                        node.targets if isinstance(node, ast.Assign) else [node.target]
+                    )
+                )
+                and isinstance(node.value, ast.Call)
+                and _called_name(node.value.func, aliases) == "bind_project_root"
+                for node in ast.walk(init)
+            )
+            if not binds:
+                found.append(f"{module}:{cls.name} does not bind its project root")
+            for method in cls.body:
+                if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if method.name == "__init__":
+                    continue
+                for node in ast.walk(method):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    called = _called_name(node.func, aliases)
+                    if called is None or called not in gates:
+                        continue
+                    if not _is_self_root(_passed(node, gates[called])):
+                        found.append(
+                            f"{module}:{cls.name}.{method.name}:{node.lineno} "
+                            f"{called} is not handed self._project_root"
+                        )
+    return objects, found
+
+
+def test_every_long_lived_object_binds_and_uses_one_root() -> None:
+    objects, found = bound_object_violations(_src_sources())
+    assert objects == BOUND_OBJECTS
+    assert found == []
+
+
+def test_the_bound_object_scan_sees_each_shape() -> None:
+    source = (
+        "from pmcp.env_store import bind_project_root, credential_value\n"
+        "class Unbound:\n"
+        "    def __init__(self, project_root=None):\n"
+        "        self._project_root = project_root\n"
+        "class Rebinds:\n"
+        "    def __init__(self, project_root=None):\n"
+        "        self._project_root = bind_project_root(project_root)\n"
+        "    def check(self, k):\n"
+        "        return credential_value(k, root=None)\n"
+        "class Good:\n"
+        "    def __init__(self, project_root=None):\n"
+        "        self._project_root = bind_project_root(project_root)\n"
+        "    def check(self, k):\n"
+        "        return credential_value(k, root=self._project_root)\n"
+    )
+    objects, found = bound_object_violations({"pmcp.x": source})
+    assert objects == {("pmcp.x", n) for n in ("Unbound", "Rebinds", "Good")}
+    assert {line.split(" ")[0].split(":")[1].split(".")[0] for line in found} == {
+        "Unbound",
+        "Rebinds",
+    }

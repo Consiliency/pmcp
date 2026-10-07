@@ -178,7 +178,9 @@ async def test_hostsoak_discovers_describes_invokes_and_tracks_tenant_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """PMCP brokers hosted tenant code-mode tasks without local CLI execution."""
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", _tenant_manifest)
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_manifest", lambda *_a, **_k: _tenant_manifest()
+    )
     monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
     gateway = _tenant_gateway()
 

@@ -31,7 +31,7 @@ from pydantic import ValidationError
 
 from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
-from pmcp.env_store import sanitized_subprocess_env
+from pmcp.env_store import bind_project_root, sanitized_subprocess_env
 from pmcp.manifest.installer import _operator_safe, _render_install_argv
 from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
@@ -1433,7 +1433,13 @@ class ClientManager:
         self._revision_id: str = _generate_revision_id()
         self._last_refresh_ts: float = time.time()
         self._max_tools_per_server = max_tools_per_server
-        self._project_root = project_root
+        # The project this object serves, BOUND at construction: the explicit
+        # root, else the served one, else the one discovered from the working
+        # directory NOW. Everything it loads (configs, endpoints) and every
+        # credential it looks up use this one root, so a later chdir cannot
+        # pair this project's endpoint with another project's credential
+        # (Consiliency/pmcp#372 round 16, board round 15 claude F001).
+        self._project_root: Path = bind_project_root(project_root)
         self._spawn_semaphore = asyncio.Semaphore(max_concurrent_spawns)
         self._lifecycle_lock = asyncio.Lock()
         # Set once by `abandon_all_now()` and never cleared: see

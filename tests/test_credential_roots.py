@@ -1569,3 +1569,125 @@ def test_the_startup_load_keeps_a_root_served_before_it(
     env_store.serve_project_root(roots["b"])  # cwd is a
     cli.load_startup_env()
     assert env_store.served_project_root() == roots["b"]
+
+
+# --------------------------------------------------------------------------- #
+# Board round 15, claude F001: in a process that never ran main(), a gateway
+# object built with no project kept project_root=None and re-resolved the
+# project from the CURRENT working directory on every lookup -- after a chdir,
+# a lazy connect paired A's endpoint with B's token. Each long-lived object now
+# binds a concrete root when it is built (env_store.bind_project_root).
+# --------------------------------------------------------------------------- #
+
+
+def test_claude_r15_f001_a_gateway_object_keeps_its_projects_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """claude r15 F001, verbatim in substance."""
+    import contextlib
+    import io
+
+    home = tmp_path / "home"
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("F001_TOKEN", raising=False)
+    project = {}
+    for name in ("a", "b"):
+        root = tmp_path / name
+        (root / ".git").mkdir(parents=True)
+        (root / ".env.pmcp").write_text(f"F001_TOKEN=token-of-{name}\n")
+        project[name] = root
+    remote = {
+        "type": "streamable-http",
+        "url": "http://127.0.0.1:9/a",
+        "headers": {"Authorization": "Bearer ${F001_TOKEN}"},
+    }
+    with contextlib.redirect_stderr(io.StringIO()):
+        from pmcp.client import manager as mgr
+        from pmcp.config.loader import RemoteMcpServerConfig
+
+        monkeypatch.chdir(project["a"])
+        client_manager = mgr.ClientManager(project_root=None)
+        config = RemoteMcpServerConfig(**remote)
+        first = mgr._remote_headers(
+            "remote-a", config, project_root=client_manager._project_root
+        )
+        assert first == {"Authorization": "Bearer token-of-a"}
+        monkeypatch.chdir(project["b"])
+        headers = mgr._remote_headers(
+            "remote-a", config, project_root=client_manager._project_root
+        )
+    assert headers == {"Authorization": "Bearer token-of-a"}
+
+
+@pytest.mark.parametrize(
+    "obj", ["ClientManager", "GatewayTools", "GatewayServer", "PolicyManager"]
+)
+def test_a_long_lived_object_built_in_a_stays_in_a_after_a_chdir(
+    obj: str, roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No main(), no served root: built in A, used after chdir(B) -- A's, throughout."""
+    from unittest.mock import MagicMock
+
+    from pmcp import server as server_module
+    from pmcp.client.manager import ClientManager, _remote_headers
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+
+    key = "REVIEW_SHARED_TOKEN"
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("PMCP_MANIFEST_PATH", raising=False)
+    monkeypatch.setattr(cli, "find_dotenv", lambda: "")
+    _distinct_projects(roots, key)
+    assert env_store.served_project_root() is None  # a library process
+    # cwd is a (fixture)
+
+    if obj == "ClientManager":
+        built = ClientManager()
+        monkeypatch.chdir(roots["b"])
+        from pmcp.config.loader import RemoteMcpServerConfig
+
+        config = RemoteMcpServerConfig(
+            type="streamable-http",
+            url="https://a.example.invalid/mcp",
+            headers={"Authorization": "Bearer ${" + key + "}"},
+        )
+        answer = _remote_headers(
+            "review-remote", config, project_root=built._project_root
+        )
+        assert answer == {"Authorization": "Bearer credential-a"}
+    elif obj == "GatewayTools":
+        built = GatewayTools(client_manager=MagicMock(), policy_manager=PolicyManager())
+        monkeypatch.chdir(roots["b"])
+        resolved, refusal, _lookup = built._resolve_lifecycle_target(
+            "review-remote", action="connect", prior_status="offline"
+        )
+        assert refusal is None and resolved is not None
+        assert resolved.config.url == "https://a.example.invalid/mcp"  # type: ignore[union-attr]
+        assert built._check_api_key_available(key)
+        names = {c.name for c in built._load_all_configured_servers().values()}
+        assert "local-a" in names and "local-b" not in names
+    elif obj == "GatewayServer":
+        built = server_module.GatewayServer(cache_dir=roots["base"] / "cache")
+        monkeypatch.chdir(roots["b"])
+        captured: dict[str, object] = {}
+
+        def capture(configs: object, **kwargs: object) -> None:
+            captured["configs"] = configs
+            captured.update(kwargs)
+            raise _Captured(kwargs)
+
+        monkeypatch.setattr(server_module, "resolve_startup_configs", capture)
+        with pytest.raises(_Captured):
+            asyncio.run(built.initialize())
+        names = {c.name for c in captured["configs"]}  # type: ignore[attr-defined]
+        assert "local-a" in names and "local-b" not in names
+        servers = captured["manifest_servers"]
+        assert servers["review-remote"].url == "https://a.example.invalid/mcp"  # type: ignore[index]
+        assert not built._policy_manager.is_server_allowed("only-a-denies")
+    else:
+        built = PolicyManager()
+        monkeypatch.chdir(roots["b"])
+        assert not built.is_server_allowed("only-a-denies")
+        assert built.is_server_allowed("only-b-denies")
+    assert built._project_root == roots["a"]

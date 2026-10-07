@@ -57,6 +57,7 @@ from pmcp.config.loader import (
 )
 from pmcp.errors import ErrorCode, GatewayException, make_error
 from pmcp.env_store import (
+    bind_project_root,
     record_dotenv_keys,
     child_process_env,
     credential_value,
@@ -900,7 +901,13 @@ class GatewayTools:
     ) -> None:
         self._client_manager = client_manager
         self._policy_manager = policy_manager
-        self._project_root = project_root
+        # The project this object serves, BOUND at construction: the explicit
+        # root, else the served one, else the one discovered from the working
+        # directory NOW. Everything it loads (configs, endpoints) and every
+        # credential it looks up use this one root, so a later chdir cannot
+        # pair this project's endpoint with another project's credential
+        # (Consiliency/pmcp#372 round 16, board round 15 claude F001).
+        self._project_root: Path = bind_project_root(project_root)
         self._custom_config_path = custom_config_path
         self._guidance_config = guidance_config
         self._descriptions_cache = descriptions_cache
