@@ -1,31 +1,30 @@
 # Detailed plan: describe validation errors from their structure, never their value — everywhere pmcp turns an exception into text
 
-> **Revision 25 (2026-10-06), on main `bc0a9ce`.** Consiliency/pmcp#297, the
+> **Revision 26 (2026-10-07), on main `bc0a9ce`.** Consiliency/pmcp#297, the
 > prerequisite for piece B (`extra="forbid"`) of Consiliency/pmcp#236. The
 > change is **embedded, not described**. The 52 blocks under *Verbatim
 > bodies* are `git apply` patches against `origin/main` @ `bc0a9ce`. They are
 > byte-identical to the verified code on the branch `wip/297-code` @
-> `89a47c1`. *Embedding proof* extracts them from this file and applies them
+> `5a93b9c`. *Embedding proof* extracts them from this file and applies them
 > on a fresh `bc0a9ce`, then compares every file. The base stays `bc0a9ce`
 > for this rev; merging later main is for the implementation PR.
 >
-> **For the board:** review the spike's tree (`wip/297-code` @ `89a47c1`,
+> **For the board:** review the spike's tree (`wip/297-code` @ `5a93b9c`,
 > whose diff from `bc0a9ce` is these patches). The bundle may leave the
 > patches out.
 >
-> **What rev 25 changes:** it answers round 23 on Consiliency/pmcp#314 @
-> `6b17d3d`. Claude: DISAGREE, with F001: httpx's TLS `ConnectError` names
-> a redirect-chosen host, text built in C and re-raised through a variable
-> class. Claude also filed N1 (re-pin grok's urllib case). Following the
-> coordinator's ruling:
-> - every exception the HTTP clients pmcp uses raise is registered, with
->   no value-free carve-outs;
-> - each renders as its class and, when present, its status;
-> - the value-free table, its census and the map parity are replaced by
->   one registration test;
-> - a redirect-to-TLS-mismatch row binds it (*Rev 25*).
+> **What rev 26 changes:** it answers round 24 on Consiliency/pmcp#314 @
+> `ef7ad60`. Gemini: AGREE.
+> - Claude (and grok): the MCP SDK's client transports put
+>   response-chosen values into errors and logs. Every `mcp.*` logger is
+>   now masked. What the SDK raises or answers keeps its text only when
+>   pmcp has reviewed it.
+> - Codex: urllib's redirect parsing raises a bare built-in `ValueError`
+>   quoting the `Location`. Any exception raised from an HTTP client's
+>   frames is now registered, by origin.
+> - Redirect, SDK-transport and origin rows bind these (*Rev 26*).
 
-## History (revs 1–24)
+## History (revs 1–25)
 
 Each revision answered the previous board. The full text is in the plan at
 that sha, at `.consiliency/plans/detailed-297-validation-echo-20260928-2127.md`.
@@ -56,14 +55,183 @@ The line ranges are that file's.
 | 21 | `7bcb209` | round 19: 65–77 | 78–131 (every `except` binding; templates bound) |
 | 22 | `221115a` | round 20: 67–83 | 84–134 (response decoding; parser kinds; attribute allowlist); merge of `bc0a9ce`: 136–172 |
 | 23 | `5054a76` | round 21: 69–89 | 90–180 (every HTTP client's response errors; the grid; pmcp fields bound to pmcp classes) |
+| 25 | `ef7ad60` | round 23: 70–87 | 88–179 (every HTTP client exception registered; one phrase; TLS-mismatch rows) |
 | 24 | `6b17d3d` | round 22: 73–103 | 104–248 (proxy refusals; redirect scheme and host; source-checked reasons; class-only links) |
 
 The code for revs 1–17 is at `19dac95`, `929f693`, `026aadc`, `ee644a9`,
 `1824a09`, `9b24daa`, `dd3f707`, `2d9e736`, `8d33b49`, `6078419`,
 `46c4904`, `0a93265`, `ebcf4fc`, `06a9e01`, `67bd04d`, `403a83a` (rev 16),
 `18824c1` (rev 17), `b34717e` (rev 18), `fc88ea8` (rev 19), `f89527e` (rev
-20), `eb8796c` (rev 21), `30dc945` (rev 22), `825c43a` (rev 23) and `86a63a6` (rev 24, on origin). Rev 17 before the
+20), `eb8796c` (rev 21), `30dc945` (rev 22), `825c43a` (rev 23), `86a63a6` (rev 24) and `89a47c1` (rev 25, on origin). Rev 17 before the
 merge of `6edf8a4` was `9e5cb57`.
+
+## Rev 26: the MCP SDK's client side, and any exception an HTTP client raises
+
+**Round 24.** Gemini: AGREE. Claude and grok: DISAGREE, with one finding.
+Codex: DISAGREE, with another.
+- **Claude F001 (grok the same):** the MCP SDK's own client transports
+  build errors and log lines from response-chosen values. No HTTP client
+  exception carries these values, so rev 25's registry never saw them.
+  Measured through pmcp's connect path:
+  - `Content-Type: text/<S>` gives `Unexpected content type: text/<s>`. It
+    reached the connect errors, `gateway.health`'s `error` and an ERROR
+    log. The SDK writes this `ErrorData` itself and hands it to the
+    session as if the downstream had sent it.
+  - `Unknown SSE event: <S>` reached WARNING logs on both transports.
+  - A legacy-SSE `endpoint` on another origin gave an ERROR log, through
+    a pre-built message (`logger.error(error_msg)`), and a `ValueError`
+    traceback naming the URL.
+
+  The `mcp.client.*` loggers were not masked, and the CHANGELOG's
+  `gateway.health` claim was false.
+- **Codex F001:** urllib parses a redirect's `Location` before pmcp's
+  `_NoRedirectHandler` sees it. `Location: https://[<S>]/` makes
+  `ipaddress` raise a bare built-in `ValueError` quoting the host, with no
+  cause or context. `_fetch_packument` logged it. Rev 25's registration
+  test covered the classes the clients define, not the built-ins they
+  raise.
+
+**The coordinator's rulings:**
+- fix the class across the whole `mcp` package, client and server;
+- make the CHANGELOG's claim true, not narrower;
+- recognise by origin, generalising rev 24's urllib-tunnel rule.
+
+**1. Every SDK logger is masked.** `SDK_LOGGERS` is now `mcp` (the
+whole package) and `sse_starlette`.
+- `sdk_logger_names()` adds every literal name the installed SDK passes
+  to a logger factory, read from its source. `mcp/client/session.py`
+  logs as `"client"`.
+- `test_every_sdk_logger_is_masked` pins that every `getLogger`/
+  `get_logger` call in the package names a masked logger.
+- For an `mcp.*` record:
+  - `%`-arguments are masked (rev 20);
+  - a message that is an f-string template of the SDK's logs, now read
+    from the whole package, has its placeholders masked;
+  - a message that is a literal of the SDK's logs is kept;
+  - **any other message is masked whole.** This covers a variable, or a
+    `%`/`.format` applied before the call, such as the endpoint case's
+    `logger.error(error_msg)`.
+- An SDK record's traceback keeps its frames, and prints every exception
+  in the chain by its class alone (`class_only_traceback_text`). A chain
+  that holds a registered error is still described by the record
+  scrubber.
+- **Cost:** the SDK's client DEBUG logs lose their content. For example,
+  `Sending client message: <...>` no longer shows rev 10's structural
+  rendering, and two tests are re-pinned for that.
+
+**2. What the SDK raises or answers is withheld unless reviewed**
+(`pmcp.sdk_rejections`).
+- **An exception the SDK raises** is recognised by origin: its raising
+  frame is in the `mcp` package. It keeps its text only in these cases:
+  - the text is empty;
+  - it is a literal message of the SDK's source;
+  - it matches a reviewed template;
+  - at a raise site that relays an `ErrorData` built elsewhere
+    (`RECEIVED_ERROR_SITES`: a peer's response in `send_raw_request`, or
+    pmcp's own handler or callback result), it matches no template the
+    SDK builds.
+
+  Otherwise it reads as its code's phrase, class and code
+  (`Invalid request (MCPError, code -32600)`), or as
+  `the MCP SDK raised <class>`.
+- **A relayed reply the SDK wrote itself.** `_downstream_error` checks
+  every JSON-RPC `error` that reaches pmcp as a downstream's. If its
+  message matches a template the SDK builds (`Unexpected content type:
+  {content_type}`), it becomes the code's fixed phrase, with no `data`.
+  - A downstream's own message passes unchanged, by design.
+  - A downstream that copies an SDK template's shape is masked too, so
+    this fails closed.
+  - A template needs at least 8 literal characters to be used for
+    recognition (`test_no_sdk_template_is_too_general_to_recognise`).
+- **Pinned by AST over the whole package:**
+  - `test_every_sdk_error_construction_is_classified`: rev 18's table of
+    wire-error constructions. Its client-side entries now read "withheld
+    by origin".
+  - `test_every_sdk_exception_construction_is_withheld`: every other
+    exception the SDK builds from non-literal text, 113 of them, the
+    client transports included.
+  - `test_the_received_error_sites_are_the_sdks_relays`: exactly the SDK's
+    raises of an `MCPError` that relays an `ErrorData`, not one that
+    formats `str(e)`.
+  - `test_an_sdk_raised_error_is_withheld_unless_reviewed` drives the
+    classifier from frames placed at the SDK's own files.
+
+**3. Any exception an HTTP client raises is registered, by origin**
+(`exception_origin`).
+- The traceback is read from its innermost frame outwards:
+  - a frame under httpx, httpx2, httpcore, httpcore2, h11, aiohttp,
+    `urllib/request.py`, `urllib/response.py`, `urllib/error.py` or
+    `http` decides "an HTTP client's", of any type. It is registered and
+    renders `an HTTP request failed (<class>[, status N])`;
+  - a frame under `mcp` decides "the SDK's" (rule 2);
+  - a frame of any other installed library (the standard library or
+    site-packages: `ipaddress`, `urllib.parse`, `email`, `encodings`,
+    `idna`, `yarl`, `anyio`, `asyncio`, …) is passed over;
+  - a frame of pmcp's, or of any code that is not an installed library (a
+    test, a script), decides "not by origin".
+
+  A library the clients call is therefore never trusted to decide. It
+  only hands the decision to its caller.
+- urllib's refused tunnel is one case of this rule, so the separate check
+  is gone. Its status is still read from its frame.
+- **Edge cases:**
+  - An exception with **no traceback** has no origin. It is registered
+    only by class.
+  - **pmcp re-raising a client error** with a bare `raise` keeps the
+    client's frames, so it stays registered. Wrapping it
+    (`raise X(...) from e`) is rev 18's chain rule: the wrapper shows its
+    class and the description.
+  - **A client calling back into other code** (an httpx transport or
+    event hook, pmcp's included): what that code raises is decided by its
+    own frame. It is not the client's.
+  - A library that **pmcp** calls directly (`ipaddress.ip_address`, or
+    `urllib.parse.urlsplit` on its own config) is not the client's. The
+    next frame out is pmcp's.
+- `test_a_builtin_raised_in_an_http_client_is_registered` and
+  `test_a_client_calling_back_into_other_code_is_not_the_clients` pin
+  these.
+
+**The bindings.**
+- **The response grid and the client × shape layer gain four redirect
+  shapes:**
+  - an IPv6 literal `https://[<S>]/` (codex's case);
+  - a port `http://h.invalid:<S>/`;
+  - an authority `http://[::1]<S>/`;
+  - a header-encoding case, a raw `\xff` in the host.
+
+  With rev 25's scheme and host rows, these cover malformed redirects
+  across urllib, httpx, httpx2 and aiohttp. httpx now follows redirects
+  in the client layer.
+- **`test_no_sdk_transport_rejection_reaches_any_output`:** content type
+  and SSE event over `http` and `sse`, and the endpoint origin over `sse`
+  (an `endpoint` event exists only there). Each is checked across the
+  connect errors, `gateway.health`'s error, every log record at DEBUG and
+  its traceback.
+
+**Red on rev 25's code:**
+On rev 25's code (`89a47c1`'s `src` with this `test_parse_error_echo.py` and `test_http_transport.py`):
+
+```text
+  1 test_http_transport.py::test_every_sdk_exception_construction_is_withheld
+  1 test_http_transport.py::test_every_sdk_logger_is_masked
+  1 test_http_transport.py::test_no_sdk_template_is_too_general_to_recognise
+  1 test_http_transport.py::test_the_received_error_sites_are_the_sdks_relays
+  1 test_parse_error_echo.py::test_a_body_pmcp_decodes_itself_is_described_by_its_codec
+  1 test_parse_error_echo.py::test_a_builtin_raised_in_an_http_client_is_registered
+  1 test_parse_error_echo.py::test_a_client_calling_back_into_other_code_is_not_the_clients
+  1 test_parse_error_echo.py::test_an_sdk_raised_error_is_withheld_unless_reviewed
+  1 test_parse_error_echo.py::test_an_sdk_record_prints_its_traceback_by_class
+  1 test_parse_error_echo.py::test_every_imported_module_is_classified
+  1 test_parse_error_echo.py::test_no_client_error_prints_a_rejected_response
+  1 test_parse_error_echo.py::test_no_rejected_http_response_reaches_any_output
+  4 test_parse_error_echo.py::test_no_sdk_transport_rejection_reaches_any_output
+16 failed, 350 passed in 73.42s (0:01:13)
+```
+
+- Every SDK-transport row fails except the legacy-SSE content type, which is an httpx2 `SSEError` and was already registered.
+- The IPv6-literal redirect fails at `_fetch_packument` and in the urllib client row: this is codex's case.
+- The four new tests in `test_http_transport.py`, the two origin tests, the classifier test and the two tests that pin M154 and M180 fail on names rev 25 lacks; the import classification fails on rev 26's `sysconfig` import, absent there.
+- The other redirect rows (port, authority, encoding) pass on rev 25: each is already a registered class in every client.
 
 ## Rev 25: every exception an HTTP client raises is registered
 
@@ -337,7 +505,16 @@ the chain below, above and in a group.
 
 **Red on rev 23's renderers** (`825c43a`'s `src` with this
 `test_parse_error_echo.py`):
-@@RED24@@
+```text
+  1 test_a_link_beneath_a_registered_error_prints_its_class_alone
+  1 test_every_http_exception_class_is_classified
+  1 test_every_imported_module_is_classified
+  3 test_no_client_error_prints_a_rejected_response
+  3 test_no_proxy_refusal_reaches_any_output
+  9 test_no_proxy_refusal_reaches_any_renderer
+  2 test_no_rejected_http_response_reaches_any_output
+20 failed, 239 passed in 45.98s
+```
 
 - Every https proxy row fails on httpx, httpx2 and urllib, at each of
   403, 407 and 502.
@@ -873,17 +1050,20 @@ read, is a sink.
   vocabulary (rev 21).
 - **§7–§8, rev 21:** every `except` binding is an exception name, whatever
   it catches. Rev 22: an attribute read is safe only by allowlist.
-- **§10, rev 22–25:** every exception that an HTTP client or transport
+- **§10, rev 22–26:** every exception that an HTTP client or transport
   pmcp uses raises is a registered error (rev 25: no value-free
-  carve-outs). It renders as `an HTTP request failed (<class>[, status N])`,
-  whether the bytes came from the origin, a proxy or a redirect target.
-  urllib's refused tunnel is recognised by origin. In a chain that holds
-  a registered error, every other link prints as its class alone
-  (rev 24).
+  carve-outs). Since rev 26 that includes any exception of any type raised
+  from such a client's frames, by origin. It renders as
+  `an HTTP request failed (<class>[, status N])`, whether the bytes came
+  from the origin, a proxy or a redirect target. In a chain that holds a
+  registered error, every other link prints as its class alone (rev 24).
+- **§13, §16, rev 26:** the MCP SDK's client side is held to the server
+  side's rule. Every `mcp.*` logger is masked. What the SDK raises or
+  relays keeps its text only if reviewed.
 
 ## Changes
 
-The patches are `git diff bc0a9ce 89a47c1 -- <file>`: 52 files, +13641 / −691. This is
+The patches are `git diff bc0a9ce 5a93b9c -- <file>`: 52 files, +15052 / −691. This is
 one concern applied at every sink, past the bounded-plan threshold on
 purpose. Rev 20:
 - adds `pmcp/sdk_rejections.py`, installed with the log scrubber;
@@ -919,6 +1099,17 @@ Rev 25 changes:
   TLS-mismatch rows and the origin pin;
 - `CHANGELOG.md`: one sentence.
 
+Rev 26 changes:
+- `sdk_rejections.py`: the whole package's loggers and log templates,
+  whole-message masking, class-only SDK tracebacks, and the withholding of
+  SDK-raised and SDK-relayed text;
+- `argument_errors.py`: `exception_origin` and the class-only traceback;
+- `client/manager.py`: `_downstream_error` rebuilds a relayed SDK message;
+- tests: the SDK censuses and the logger pin (`test_http_transport.py`),
+  the origin, redirect and SDK-transport rows
+  (`test_parse_error_echo.py`), two re-pinned log assertions;
+- `CHANGELOG.md`: the claim made true for the SDK's client.
+
 All 52 patches are one `git apply`: no import cycles, no
 migration, no config change.
 
@@ -938,8 +1129,9 @@ On a fresh `bc0a9ce` with the patches applied:
   `test_scoped_advisor_audit`, `test_gateway_tool_schemas`,
   `test_http_transport`), plus Consiliency/pmcp#371's
   `test_nullable_schema_portability` and `test_migration_doc`;
-- the round-16 to 23 falsifiers are in the suite (rounds 21–23's are
-  rows of the HTTP, proxy and TLS-mismatch grids; *Rev 23*–*Rev 25*);
+- the round-16 to 24 falsifiers are in the suite (rounds 21–24's are
+  rows of the HTTP, proxy, TLS-mismatch, redirect and SDK-transport grids;
+  *Rev 23*–*Rev 26*);
 - the eight modules, the full suite, the gates and the mutants run through
   `uv run --isolated --all-extras -p 3.10`, in a fresh environment free of
   host startup hooks (rev 25). The runtime harness boots the checkout's
@@ -948,10 +1140,10 @@ On a fresh `bc0a9ce` with the patches applied:
 - run the full suite `-m 'not live and not slow'` with the npm cache
   variables unset.
 
-## Acceptance criteria — measured on `89a47c1`
+## Acceptance criteria — measured on `5a93b9c`
 
-- [x] The eight modules and Consiliency/pmcp#371's two are green: `1552 passed in 400.72s (0:06:40)`.
-- [x] Red on main `bc0a9ce`, with the eight test files from `89a47c1`
+- [x] The eight modules and Consiliency/pmcp#371's two are green: `1586 passed in 420.22s (0:07:00)`.
+- [x] Red on main `bc0a9ce`, with the eight test files from `5a93b9c`
   (`--tb=line`; the errors are a fixture importing `pmcp.argument_errors`):
 
 ```text
@@ -959,40 +1151,30 @@ On a fresh `bc0a9ce` with the patches applied:
   99 tests/test_downstream_frame_echo.py
    9 tests/test_exception_text_sinks.py
    3 tests/test_gateway_tool_schemas.py
-  24 tests/test_http_transport.py
+  28 tests/test_http_transport.py
   80 tests/test_log_record_scrubber.py
- 197 tests/test_parse_error_echo.py
+ 227 tests/test_parse_error_echo.py
    6 tests/test_scoped_advisor_audit.py
-534 failed, 625 passed, 57 errors in 107.23s (0:01:47)
+568 failed, 625 passed, 57 errors in 133.59s (0:02:13)
 ```
 
-- [x] Binding: on rev 24's code, the TLS-mismatch rows fail for httpx, httpx2 and both
-remote transports, and the registration test fails (*Rev 25*). The seat's
-falsifier is among those rows. It passes here. The re-anchored registry
-mutants, M175 and M176 each remove part of the rule, and each dies (see
-*Mutation evidence*).
+- [x] Binding: on rev 25's code, the SDK-transport rows, codex's IPv6-literal redirect,
+and the SDK, logger and origin pins fail (*Rev 26*). The seats' falsifiers
+are among those rows. It passes here. M177–M185 each remove part of the
+rule (see *Mutation evidence*).
 
 - [x] The full suite, with `npm_config_cache`, `npm_config_store_dir` and
-  `pnpm_config_store_dir` unset: `10204 passed, 6 skipped, 80 deselected in 981.03s (0:16:21)`. The green run, the full suite
+  `pnpm_config_store_dir` unset: `10238 passed, 6 skipped, 80 deselected in 1032.56s (0:17:12)`. The green run, the full suite
   and the gates ran on host `ai` (`uv run --isolated --all-extras -p 3.10`),
-  from a worktree of the pushed `89a47c1`.
+  from a worktree of the pushed `5a93b9c`.
 - [x] Gates: ruff check: `All checks passed!`; ruff format --check: `193 files already formatted`; mypy: `Success: no issues found in 57 source files`.
 
 ## Mutation evidence
 
 `mutants.py` ran on host `ai`, three lanes per pass, on worktrees of
-`e49e412`. Each mutant ran in a fresh `uv run --isolated` environment
-(`PYCMD`, rev 25). In rev 24 a host startup hook, installed on `ai`
-partway through the run, had to be worked around; this avoids it.
-
-**M165 survived there.** Once `URLError` is registered by class, nothing
-rendered a refused tunnel's bare `OSError` on its own, which a caller
-gets as `error.reason`.
-- The proxy × renderer layer now renders it, which is the only change
-  from `e49e412` to `89a47c1`.
-- M165 ran again on `89a47c1` in both passes, and the tables show that
-  run.
-- Adding a test cannot revive a killed mutant.
+`5b08713`, with M154 and M180 run again on `5a93b9c` (see the note below
+the tables). Each mutant ran in a fresh `uv run --isolated` environment
+(`PYCMD`).
 
 The procedure:
 - each mutant's anchor must occur exactly once;
@@ -1002,27 +1184,27 @@ The procedure:
   checked with `cmp` and against HEAD's blob by sha-256;
 - `git status` after the run: `0` and `0`.
 
-The purposes of M1–M174 are in the history table's plans (M162–M174:
-`6b17d3d`).
-- **Retired** (their code is gone):
-  - M155 (the decode phrase);
-  - M164 (the value-free census);
-  - M169–M172 (single registrations, now inside whole hierarchies);
-  - M174 (the `URLError` origin branch: `URLError` is registered by
-    class, so that branch now only reads the status).
-- **Re-anchored:**
-  - M156 drops aiohttp's `ClientError`;
-  - M157 drops `http.client`'s `HTTPException`;
-  - M158 drops httpcore2's `ProtocolError`;
-  - M159 describes an HTTP client error by its own text;
-  - M162 drops httpx's `HTTPError`;
-  - M163 drops httpx2's `HTTPError` and httpcore2's `NetworkError`.
+The purposes of M1–M176 are in the history table's plans (M175–M176:
+`ef7ad60`).
+- **Retired:** M165. urllib's refused tunnel is now one case of the
+  origin rule, and its separate check is gone.
+- **Re-anchored** on the refactored traceback renderer:
+  - M45: the unqualified class name;
+  - M125: a wrapper printed from its own message;
+  - M168: a link beneath a registered error printed with its text.
 - **Added:**
-  - M175 drops urllib's `URLError`;
-  - M176 drops httpcore's `NetworkError`.
+  - M177 masks only the SDK's server and shared loggers;
+  - M178 derives none of the SDK's literal logger names;
+  - M179 keeps a message the SDK pre-built;
+  - M180 keeps each exception's text in an SDK traceback;
+  - M181 never withholds an SDK-raised error;
+  - M182 keeps a relayed SDK-built message in `_downstream_error`;
+  - M183 keeps a relayed message whatever template it matches;
+  - M184 stops registering an HTTP client's built-ins by origin;
+  - M185 lets a library frame decide the origin.
 
 ```text
-153 mutants applied; 151 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M152 M154 M156–M161 G1 S5–S8 M162–M163 M165–M168 M173 M175–M176
+161 mutants applied; 159 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M185
 survived: M23 SDK parse error keeps its message
 survived: M25 malformed error message kept
 ```
@@ -1030,7 +1212,7 @@ survived: M25 malformed error message kept
 `NO_STATIC=1` deselects the sink guard and the helpers-only rule:
 
 ```text
-153 mutants applied; 146 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M149 M151–M152 M154 M156–M161 G1 S5–S8 M162–M163 M165–M168 M173 M175–M176
+161 mutants applied; 154 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M149 M151–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M185
 survived: M19 tasks_get response uses str(e)
 survived: M20 tasks_get audit buffer uses str(e)
 survived: M22 installer crash message uses raw exc (static guard)
@@ -1042,13 +1224,31 @@ survived: M150 a narrow OSError handler renders its raw text (CLI auth-token fil
 
 M23 and M25 are equivalent mutants. Their combined partners, M102 and M90,
 die in both passes. M19, M20, M22, M35 and M150 die only on the sink guard,
-by design. These survivors are the same as in revs 23 and 24.
+by design. These survivors are the same as in revs 23 to 25.
 
-Rev 25's registry mutants die in both passes on
-`test_every_http_client_exception_is_registered`: M156–M158, M162, M163,
-M175 and M176. M159, which describes an HTTP client error by its own
-text, dies on the grids. M165 dies on the proxy × renderer layer's bare
-tunnel `OSError` (see above).
+Rev 26's mutants die in both passes:
+- M177 and M178 die on `test_every_sdk_logger_is_masked`.
+- M179 dies on the SDK-transport rows: the endpoint's pre-built message.
+- M181 and M183 die on the classifier's unit test.
+- M182 dies on the SDK-transport rows: `Unexpected content type` in the
+  connect errors and `gateway.health`.
+- M184 and M185 die on the redirect rows at `fetch_json_metadata`.
+
+**M154 and M180 survived the run on `5b08713`.**
+- M154 survived because a response body that a client decodes is now
+  registered by origin. Nothing exercised a body that pmcp decodes in its
+  own frame.
+- M180 survived because each SDK-logged exception the rows produce is
+  registered, so the record scrubber, not the class-only traceback,
+  handled it.
+
+Two tests on `5a93b9c` pin both, and M154 and M180 ran again there in both
+passes; the tables show those runs:
+- `test_a_body_pmcp_decodes_itself_is_described_by_its_codec`;
+- `test_an_sdk_record_prints_its_traceback_by_class`.
+
+Every other mutant ran on `5b08713`. That commit differs from `5a93b9c`
+only by those two tests, and adding a test cannot revive a killed mutant.
 
 ## Non-goals and unverified
 
@@ -1073,14 +1273,9 @@ tunnel `OSError` (see above).
     `Unknown tool/prompt: <name>` carry the caller's lookup key on every
     transport. `test_a_pmcp_handler_error_reaches_the_caller_as_pmcp_wrote_it`
     pins that they pass unchanged.
-  - The SDK dispatcher's `logger.exception("handler for %r raised")` prints
-    such a handler error's traceback to stderr, its text included. The
-    method argument is masked (rev 20), but the traceback of a
-    non-validation handler error is not. This traceback is **out of
-    scope** here: it is the same Consiliency/pmcp#315 lookup echo in the
-    log, and its
-    chain holds no registered error. A chain that does hold one is
-    rendered by `safe_traceback_text`.
+  - The SDK dispatcher's `logger.exception("handler for %r raised")`
+    used to print a pmcp handler error's traceback with its text. Since
+    rev 26 every `mcp.*` traceback prints each exception by its class.
 - **Unverified:**
   - Piece B's `additionalProperties` paths.
   - Repr forms the static rule cannot see (`{x}`, `str(x)`, a local).
@@ -1092,6 +1287,24 @@ tunnel `OSError` (see above).
     re-wraps that error by its text (`OSError(str(e))`). The static sink
     guard flags such a construction (round 23 N1).
   - The TLS-mismatch rows skip where `*.localhost` does not resolve.
+  - Rev 25's plan (`ef7ad60`) left the placeholder ````text
+  1 test_a_link_beneath_a_registered_error_prints_its_class_alone
+  1 test_every_http_exception_class_is_classified
+  1 test_every_imported_module_is_classified
+  3 test_no_client_error_prints_a_rejected_response
+  3 test_no_proxy_refusal_reaches_any_output
+  9 test_no_proxy_refusal_reaches_any_renderer
+  2 test_no_rejected_http_response_reaches_any_output
+20 failed, 239 passed in 45.98s
+```` in its copy
+    of the *Rev 24* section. Rev 24's own plan (`6b17d3d`) has that red
+    table filled. This rev fills it again, and adds a check that no
+    placeholder survives assembly.
+  - The origin rule reads the traceback's file names against the
+    installed packages' paths (`sysconfig`, `site`). An installation that
+    puts a library outside those paths makes its frames decide "not by
+    origin". Exceptions the clients define are registered by class
+    regardless.
   - The proxy and renderer rows ran on Python 3.10. On 3.11 and 3.12 a
     standalone probe confirmed the tunnel's origin check: the innermost
     frame is `_tunnel`'s code object, and its `code` local is the
@@ -1118,8 +1331,12 @@ tunnel `OSError` (see above).
     The rev 18 full suite saw this shape once, with a `RuntimeError` from
     `_drain_outbound`. No pmcp task can end in a registered error: each
     one is retrieved or catches everything (round 17 N2).
-  - The SDK's client-side loggers keep rev 10's structural rendering of
-    messages, not rev 20's masking.
+  - **The cost of rev 26's masking.** The SDK's client DEBUG logs lose
+    their content, for example `Sending client message: <...>`. A message
+    the SDK built before the call is masked whole. An SDK error pmcp has
+    not reviewed reads by its class and code.
+  - A downstream's own error message that copies the shape of a template
+    the SDK builds is masked as the SDK's. This fails closed.
   - **The cost of DEBUG masking (round 19 N3).** The SDK's server-side
     DEBUG records lose non-request text as well. pmcp's own server name
     reads `Initializing server '<text>'`, and a dropped notification's
@@ -1140,7 +1357,7 @@ tunnel `OSError` (see above).
 
 ## Embedding proof
 
-From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@89a47c1`. The proof was run again on the final file, with this section in it, and printed the same listing.
+From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@5a93b9c`. The proof was run again on the final file, with this section in it, and printed the same listing.
 
 ```text
 $ git -C <proof worktree> rev-parse --short HEAD
@@ -1173,7 +1390,7 @@ done
 git apply --unidiff-zero --check <scratch>/*.patch && git apply --unidiff-zero <scratch>/*.patch
 ```
 
-The patches are `git diff -U0 bc0a9ce 89a47c1 -- <file>`. To fit the size
+The patches are `git diff -U0 bc0a9ce 5a93b9c -- <file>`. To fit the size
 budget, each is cut to plain unified-diff form: there are no `diff --git`,
 `index` or `new file mode` lines, and no function context in the hunk
 headers. `git apply` reads them the same way; a new file is created with
@@ -1230,7 +1447,7 @@ print(f"{out}: {j - i - 1} lines")
 @@ -611,0 +612,17 @@
 +- **A value pmcp rejects is no longer echoed into a response, a log line, a traceback or an audit record (Consiliency/pmcp#297).** A rejected gateway-tool argument used to come back with jsonschema's or pydantic's message, which carried the value (`'Bearer sk-…' is not of type 'object'`, `input_value=…`), in the response, the log and the scoped audit. Rejections now read `<JSON path>: <reason>`, for example `Input validation error: $.options: must be of type object or null`. The reason is a fixed phrase filled only from the tool's own schema or model, and a key the caller chose shows as `*`. A call rejected by the argument model is audited as an `audit.rejection`. **Wording change:** a client matching jsonschema phrases such as `is not of type` must match the new form.
 +
-+  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`. An exception that chains a validation or parse error, as its cause, its context or a group member, shows only its class and that error's description, never its own message; pmcp's own refusals (an invalid policy file, a trust store it cannot parse) chain nothing and still name the file and the refusal. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500. The MCP SDK's own rejections no longer quote the request, on every transport: an unknown method's name is no longer returned as `data`, an unsupported protocol version's `requested` is returned only when it is a protocol revision, an SDK message pmcp has not reviewed reads as a fixed phrase for its code, and on `/mcp` a body that is not JSON or not a JSON-RPC message is described from its structure (`Validation error: N validation errors for …: $.<path>: <reason>`). Errors from pmcp's own tools are unchanged, and so is the request id. The SDK's server-side DEBUG logs and `sse_starlette`'s no longer show request text. A failed tool call whose error carries a rejected value is never read as a URL-elicitation request or an auth challenge. An HTTP response pmcp rejects -- a malformed status or header line, bad chunk framing, a truncated or undecodable body, an unexpected content type, an error status's reason phrase, a proxy's refusal of any status, a redirect to an unsupported scheme -- is reported by its class and status number, never its bytes, by every HTTP client pmcp uses (registry, version and package lookups, JWKS and auth metadata, feedback, the CLI's health probes, and remote MCP servers in `gateway.health`); the HTTP client libraries' DEBUG traces are masked likewise. Every error an HTTP client pmcp uses raises (aiohttp, httpx, httpcore, h11, urllib and `http.client`) reads `an HTTP request failed (<class>[, status N])`, without its library or OS text: that text can name a host a followed redirect chose, or a proxy's reason phrase. Each call site still names its own package, URL or server. A traceback whose chain holds such an error prints every other exception in it by its class alone. An `MCPError` a gateway tool raises while handling a value it rejected keeps its code, and its message becomes the structural description.
++  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`. An exception that chains a validation or parse error, as its cause, its context or a group member, shows only its class and that error's description, never its own message; pmcp's own refusals (an invalid policy file, a trust store it cannot parse) chain nothing and still name the file and the refusal. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500. The MCP SDK's own rejections no longer quote the request, on every transport: an unknown method's name is no longer returned as `data`, an unsupported protocol version's `requested` is returned only when it is a protocol revision, an SDK message pmcp has not reviewed reads as a fixed phrase for its code, and on `/mcp` a body that is not JSON or not a JSON-RPC message is described from its structure (`Validation error: N validation errors for …: $.<path>: <reason>`). Errors from pmcp's own tools are unchanged, and so is the request id. The SDK's server-side DEBUG logs and `sse_starlette`'s no longer show request text. A failed tool call whose error carries a rejected value is never read as a URL-elicitation request or an auth challenge. An HTTP response pmcp rejects -- a malformed status or header line, bad chunk framing, a truncated or undecodable body, an unexpected content type, an error status's reason phrase, a proxy's refusal of any status, a redirect to an unsupported scheme -- is reported by its class and status number, never its bytes, by every HTTP client pmcp uses (registry, version and package lookups, JWKS and auth metadata, feedback, the CLI's health probes, and remote MCP servers in `gateway.health`); the HTTP client libraries' DEBUG traces are masked likewise. Every error an HTTP client pmcp uses raises (aiohttp, httpx, httpcore, h11, urllib and `http.client`) reads `an HTTP request failed (<class>[, status N])`, without its library or OS text: that text can name a host a followed redirect chose, or a proxy's reason phrase. Each call site still names its own package, URL or server. Any exception, of any type, that such a client's own code raises reads the same way, a redirect `Location` its URL parser rejects included. The MCP SDK's client transports are held to the same rule: a reply the SDK writes for the downstream from the response (`Unexpected content type: …`) reads as its code's fixed phrase in connect errors and `gateway.health`; an exception the SDK raises with text pmcp has not reviewed reads by its class and code; and every `mcp.*` logger, client and server, is masked, its tracebacks printing each exception by class. A traceback whose chain holds such an error prints every other exception in it by its class alone. An `MCPError` a gateway tool raises while handling a value it rejected keeps its code, and its message becomes the structural description.
 +
 +  Downstream frames:
 +  - A frame that is not JSON-RPC 2.0 is dropped with a value-free DEBUG record and never settles a request. This holds on stdio, SSE and streamable HTTP.
@@ -1333,7 +1550,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/src/pmcp/argument_errors.py
-@@ -0,0 +1,1528 @@
+@@ -0,0 +1,1672 @@
 +"""Describe a rejected gateway-tool argument without the value that failed.
 +
 +A gateway tool's arguments are checked twice: by the advertised JSON Schema
@@ -1378,7 +1595,7 @@ print(f"{out}: {j - i - 1} lines")
 +import logging
 +import sys
 +import traceback
-+from collections.abc import Iterable, Iterator
++from collections.abc import Callable, Iterable, Iterator
 +from types import ModuleType
 +from typing import Any
 +
@@ -1938,6 +2155,115 @@ print(f"{out}: {j - i - 1} lines")
 +}
 +
 +
++#: The packages whose own frames make an exception an HTTP client's, of any
++#: type, built-ins included (rev 26, round-24 codex F001: urllib parses a
++#: redirect's `Location` and `ipaddress` raises a bare `ValueError` quoting
++#: its host). Module paths, relative to their installed directory.
++HTTP_ORIGIN_MODULES = (
++    "httpx",
++    "httpx2",
++    "httpcore",
++    "httpcore2",
++    "h11",
++    "aiohttp",
++    "urllib/request.py",
++    "urllib/response.py",
++    "urllib/error.py",
++    "http",
++)
++
++
++def _module_path(name: str) -> str | None:
++    """The installed path of ``name`` (a package directory, with a trailing
++    separator, or a module file), or ``None`` if it is not installed."""
++    import importlib.util
++    import os
++
++    if name.endswith(".py"):
++        dotted = name[:-3].replace("/", ".")
++    else:
++        dotted = name
++    try:
++        spec = importlib.util.find_spec(dotted)
++    except (ImportError, ValueError):
++        return None
++    if spec is None or not spec.origin:
++        return None
++    if spec.submodule_search_locations:
++        return os.path.dirname(spec.origin) + os.sep
++    return spec.origin
++
++
++@functools.cache
++def _origin_paths() -> tuple[tuple[str, str], ...]:
++    """(path, kind) for each origin module -- ``http`` for an HTTP client,
++    ``mcp`` for the MCP SDK, ``pmcp`` for pmcp itself -- the longest first,
++    so a module file wins over its package's directory."""
++    import os
++
++    paths: list[tuple[str, str]] = []
++    for kind, names in (
++        ("http", HTTP_ORIGIN_MODULES),
++        ("mcp", ("mcp",)),
++    ):
++        for name in names:
++            path = _module_path(name)
++            if path is not None:
++                paths.append((path, kind))
++    paths.append((os.path.dirname(os.path.abspath(__file__)) + os.sep, "pmcp"))
++    return tuple(sorted(paths, key=lambda item: -len(item[0])))
++
++
++@functools.cache
++def _library_prefixes() -> tuple[str, ...]:
++    """The installed libraries' directories: the standard library and the
++    environment's site-packages."""
++    import os
++    import site
++    import sysconfig
++
++    prefixes = {
++        sysconfig.get_paths().get(key, "")
++        for key in ("stdlib", "platstdlib", "purelib", "platlib")
++    }
++    try:
++        prefixes.update(site.getsitepackages())
++    except AttributeError:  # pragma: no cover - a virtualenv without it
++        pass
++    return tuple(sorted(p.rstrip(os.sep) + os.sep for p in prefixes if p))
++
++
++def exception_origin(error: BaseException) -> str | None:
++    """Where ``error`` was raised (rev 26): ``"http"`` for an HTTP client,
++    ``"mcp"`` for the MCP SDK, else ``None``.
++
++    The traceback is read from its innermost frame outwards. A frame in an
++    HTTP client or the SDK decides for it. A frame of any other installed
++    library -- ``ipaddress``, ``urllib.parse``, ``email``, ``anyio``,
++    ``yarl``, ``asyncio`` -- is passed over, so an exception a helper raises
++    is its caller's. A frame of pmcp's, or of any code that is not an
++    installed library (a test, a script), decides for "not by origin":
++    a client calling back into such code does not make what it raises the
++    client's. An exception with no traceback has no origin."""
++    tb = error.__traceback__
++    filenames: list[str] = []
++    while tb is not None:
++        filenames.append(tb.tb_frame.f_code.co_filename)
++        tb = tb.tb_next
++    paths = _origin_paths()
++    libraries = _library_prefixes()
++    for filename in reversed(filenames):
++        kind = next((k for path, k in paths if filename.startswith(path)), None)
++        if kind in ("http", "mcp"):
++            return kind
++        if kind == "pmcp":
++            return None
++        if filename.startswith("<frozen ") or filename.startswith(libraries):
++            continue
++        return None
++    return None
++
++
 +def _tunnel_refusal_status(error: BaseException) -> int | None | bool:
 +    """For urllib's refused tunnel -- a bare ``OSError`` that
 +    ``http.client.HTTPConnection._tunnel`` raises with the proxy's status
@@ -2059,8 +2385,21 @@ print(f"{out}: {j - i - 1} lines")
 +        _VALUE_BEARING = _value_bearing_types()
 +    if isinstance(error, _VALUE_BEARING) and not isinstance(error, _value_free_types()):
 +        return True
-+    # A refused urllib tunnel is a bare `OSError`: by origin (rev 24).
-+    return _tunnel_refusal_status(error) is not False
++    # Any exception an HTTP client's frame raises, by origin (rev 26): this
++    # includes urllib's refused tunnel, a bare `OSError` (rev 24).
++    if exception_origin(error) == "http":
++        return True
++    return _withheld_sdk(error)
++
++
++def _withheld_sdk(error: BaseException) -> bool:
++    """An error the MCP SDK raised with a message pmcp has not reviewed, by
++    origin (rev 26; :func:`pmcp.sdk_rejections.withheld_sdk_error`)."""
++    if error.__traceback__ is None:
++        return False
++    from pmcp.sdk_rejections import withheld_sdk_error
++
++    return withheld_sdk_error(error)
 +
 +
 +def _parse_text(error: BaseException) -> str:
@@ -2120,7 +2459,17 @@ print(f"{out}: {j - i - 1} lines")
 +    if isinstance(error, UnicodeDecodeError):
 +        # The codec and class only: never the undecodable bytes.
 +        return f"could not decode {error.encoding} text (UnicodeDecodeError)"
-+    if _tunnel_refusal_status(error) is not False or _is_response_decode_error(error):
++    is_http = (
++        _tunnel_refusal_status(error) is not False
++        or _is_response_decode_error(error)
++        or exception_origin(error) == "http"
++    )
++    if not is_http and _withheld_sdk(error):
++        from pmcp.sdk_rejections import sdk_error_text
++
++        # The SDK's own text is withheld: its code's phrase and class (rev 26).
++        return sdk_error_text(error)
++    if is_http:
 +        # The class and the status number: never the error's text, its
 +        # attributes or anything it chains (rev 25).
 +        status = _http_status(error)
@@ -2209,6 +2558,12 @@ print(f"{out}: {j - i - 1} lines")
 +    return f"{module}.{name}"
 +
 +
++def class_only_traceback_text(error: BaseException) -> str:
++    """The traceback's frames, with every exception in the chain printed as
++    its class alone, whatever it is (rev 26: the MCP SDK's logs)."""
++    return _render_traceback(error, lambda current: None)
++
++
 +def safe_traceback_text(error: BaseException) -> str:
 +    """The formatted traceback. When the chain holds a validation or parse
 +    error, every exception in it is rendered as its frames (file, line,
@@ -2221,6 +2576,27 @@ print(f"{out}: {j - i - 1} lines")
 +        return "".join(
 +            traceback.format_exception(type(error), error, error.__traceback__)
 +        )
++
++    def text_of(current: BaseException) -> str | None:
++        # The class is printed once: a wrapper's line is its qualified name
++        # and the description of what it chains (rev 18). Every other link
++        # -- beneath a registered error, or beside one in a group -- is its
++        # class alone: a parser that raises inside its own `except` leaves
++        # the rejected bytes in that context (rev 24, round-22 claude N1:
++        # `BadStatusLine` over `int('2<S>')`).
++        if _is_validation_error(current):
++            return _validation_text(current)
++        linked = _chained_value_bearing(current)
++        return None if linked is None else _validation_text(linked)
++
++    return _render_traceback(error, text_of)
++
++
++def _render_traceback(
++    error: BaseException, text_of: Callable[[BaseException], str | None]
++) -> str:
++    """Frames and ``Type[: text]`` for every link of ``error``'s chain, the
++    text from ``text_of`` (``None``: the class alone)."""
 +    parts: list[str] = []
 +    seen: set[int] = set()
 +
@@ -2246,24 +2622,9 @@ print(f"{out}: {j - i - 1} lines")
 +        if current.__traceback__ is not None:
 +            parts.append("Traceback (most recent call last):\n")
 +            parts.extend(traceback.format_tb(current.__traceback__))
-+        # The class is printed once: a wrapper's line is its qualified name
-+        # and the description of what it chains (rev 18). Every other link
-+        # -- beneath a registered error, or beside one in a group -- is its
-+        # class alone: a parser that raises inside its own `except` leaves
-+        # the rejected bytes in that context (rev 24, round-22 claude N1:
-+        # `BadStatusLine` over `int('2<S>')`).
-+        if _is_validation_error(current):
-+            parts.append(
-+                f"{_qualified_name(type(current))}: {_validation_text(current)}\n"
-+            )
-+        else:
-+            linked = _chained_value_bearing(current)
-+            if linked is None:
-+                parts.append(f"{_qualified_name(type(current))}\n")
-+            else:
-+                parts.append(
-+                    f"{_qualified_name(type(current))}: {_validation_text(linked)}\n"
-+                )
++        text = text_of(current)
++        name = _qualified_name(type(current))
++        parts.append(f"{name}: {text}\n" if text is not None else f"{name}\n")
 +
 +    render(error)
 +    return "".join(parts)
@@ -3035,7 +3396,7 @@ print(f"{out}: {j - i - 1} lines")
 +    (not an object, or a non-string `message`). Every other error keeps the
 +    downstream's own message string, returned by design.
 +    """
-@@ -382,5 +409,61 @@
+@@ -382,5 +409,68 @@
 -        return DownstreamError(str(error))
 -    return DownstreamError(
 -        str(error.get("message", "Unknown error")),
@@ -3051,6 +3412,13 @@ print(f"{out}: {j - i - 1} lines")
 +        # whose content is not the downstream's message (the SDK's transports
 +        # reject it outright; stdio is parsed without a model).
 +        return DownstreamError(_MALFORMED_ERROR_MESSAGE, code=code)
++    from pmcp.sdk_rejections import sdk_built_message, sdk_message_phrase
++
++    if sdk_built_message(message, code):
++        # The MCP SDK's client transport answered for the downstream, with
++        # text it formats from the response (`Unexpected content type:
++        # <type>`): its code's fixed phrase, and no `data` (rev 26).
++        return DownstreamError(sdk_message_phrase(code), code=code)
 +    return DownstreamError(message, code=code, data=error.get("data"))
 +
 +
@@ -3102,7 +3470,7 @@ print(f"{out}: {j - i - 1} lines")
 +        task
 +        if isinstance(task, TaskMetadataInput)
 +        else TaskMetadataInput.model_validate(task)
-@@ -387,0 +471,59 @@
+@@ -387,0 +478,59 @@
 +    return parsed.enabled
 +
 +
@@ -3162,19 +3530,19 @@ print(f"{out}: {j - i - 1} lines")
 +        return server_name, int(local_id_str)
 +    except ValueError:
 +        return None
-@@ -902 +1044,5 @@
+@@ -902 +1051,5 @@
 -    return repr(entry)[:120]
 +        # No usable identifier: describe the entry's structure, never its
 +        # content -- the downstream's data that failed validation
 +        # (Consiliency/pmcp#297, rev 10; it was `repr(entry)[:120]`).
 +        return f"(an entry with {len(entry)} key{'' if len(entry) == 1 else 's'})"
 +    return f"(a {type(entry).__name__} entry)"
-@@ -1495 +1641,3 @@
+@@ -1495 +1648,3 @@
 -                error_msg = f"Failed to connect to {config.name}: {result}"
 +                error_msg = (
 +                    f"Failed to connect to {config.name}: {exception_text(result)}"
 +                )
-@@ -2107,9 +2255,2 @@
+@@ -2107,9 +2262,2 @@
 -    def _extract_task_payload(self, result: dict[str, Any]) -> dict[str, Any] | None:
 -        task = result.get("task")
 -        if isinstance(task, dict):
@@ -3186,30 +3554,30 @@ print(f"{out}: {j - i - 1} lines")
 -    def _task_info_from_payload(self, payload: dict[str, Any]) -> McpTaskInfo | None:
 +    @staticmethod
 +    def _task_info_from_payload(payload: dict[str, Any]) -> McpTaskInfo | None:
-@@ -2169 +2310,2 @@
+@@ -2169 +2317,2 @@
 -            # `raw` keeps the downstream's own units (Consiliency/pmcp#330).
 +            # `raw` keeps the downstream's own units (Consiliency/pmcp#330),
 +            # without the values pmcp dropped as unusable (Consiliency/pmcp#297).
-@@ -2172 +2314 @@
+@@ -2172 +2321 @@
 -            raw=payload,
 +            raw=_usable_task_raw(payload),
-@@ -2570 +2712,3 @@
+@@ -2570 +2719,3 @@
 -                logger.debug(f"Server {name} doesn't support {kind}: {result}")
 +                logger.debug(
 +                    f"Server {name} doesn't support {kind}: {exception_text(result)}"
 +                )
-@@ -2659,2 +2803,2 @@
+@@ -2659,2 +2810,2 @@
 -                    f"cursor ({raw_cursor!r}); treating as unreadable rather "
 -                    f"than as the end of the listing"
 +                    f"cursor ({describe_value(raw_cursor)}); treating as "
 +                    f"unreadable rather than as the end of the listing"
-@@ -2665,2 +2809,3 @@
+@@ -2665,2 +2816,3 @@
 -                    f"[{managed.config.name}] {kind}/list repeated cursor "
 -                    f"{raw_cursor!r}; treating as unreadable rather than looping"
 +                    f"[{managed.config.name}] {kind}/list repeated a cursor "
 +                    f"({describe_value(raw_cursor)}); treating as unreadable "
 +                    f"rather than looping"
-@@ -3560,6 +3705,10 @@
+@@ -3560,6 +3712,10 @@
 -            message = json.loads(text)
 -        except json.JSONDecodeError:
 -            # Non-JSON output already counted as a heartbeat by the caller.
@@ -3226,7 +3594,7 @@ print(f"{out}: {j - i - 1} lines")
 +            # on stderr, which is logged as before. The record is fixed text
 +            # plus the parser's value-free description.
 +            logger.debug(f"[{name}] non-protocol stdout line: {exception_text(error)}")
-@@ -3603,13 +3752,20 @@
+@@ -3603,13 +3759,20 @@
 -        Each guard below exists because a later access depends on it, and each
 -        drops the frame with a value-free debug log, as a non-JSON line is
 -        dropped:
@@ -3260,7 +3628,7 @@ print(f"{out}: {j - i - 1} lines")
 +        `set_exception` still raise `InvalidStateError` on a future that is
 +        already settled (a caller cancelled it, and the response raced its
 +        `finally` pop), which is checked below.
-@@ -3617,5 +3773,3 @@
+@@ -3617,5 +3780,3 @@
 -        if not isinstance(frame, dict):
 -            logger.debug(
 -                f"[{name}] dropped invalid frame: not a JSON object "
@@ -3269,7 +3637,7 @@ print(f"{out}: {j - i - 1} lines")
 +        problem = jsonrpc_envelope_problem(frame)
 +        if problem is not None:
 +            logger.debug(f"[{name}] dropped invalid frame: {problem}")
-@@ -3624,7 +3777,0 @@
+@@ -3624,7 +3784,0 @@
 -        if msg_id is not None and (
 -            isinstance(msg_id, bool) or not isinstance(msg_id, (str, int))
 -        ):
@@ -3277,11 +3645,11 @@ print(f"{out}: {j - i - 1} lines")
 -                f"[{name}] dropped invalid frame: id of type {type(msg_id).__name__}"
 -            )
 -            return
-@@ -3639 +3786,2 @@
+@@ -3639 +3793,2 @@
 -                # Notification: no id, nothing to resolve.
 +                # Notification: no id (or `id: null`, which main and the MCP
 +                # SDK read as a notification; rev 15), nothing to resolve.
-@@ -3644,9 +3791,0 @@
+@@ -3644,9 +3798,0 @@
 -        elif "method" in frame:
 -            # A `method` that is present but not a string is not a valid
 -            # JSON-RPC request -- and it is not a response either, so it must
@@ -3291,19 +3659,19 @@ print(f"{out}: {j - i - 1} lines")
 -                f"[{name}] dropped invalid frame: non-string method "
 -                f"({type(method).__name__})"
 -            )
-@@ -4700,4 +4839,2 @@
+@@ -4700,4 +4846,2 @@
 -        task_requested = task is not None
 -        if support == "required":
 -            task_requested = True
 -        if task_requested and support == "forbidden":
 +        asked = task is not None or support == "required"
 +        if asked and support == "forbidden":
-@@ -4705 +4842 @@
+@@ -4705 +4849 @@
 -        if task_requested and not self._server_supports_tasks(managed):
 +        if asked and not self._server_supports_tasks(managed):
-@@ -4714,0 +4852 @@
+@@ -4714,0 +4859 @@
 +        task_requested = effective_task_mode(tool_info, task)
-@@ -4721,5 +4859,2 @@
+@@ -4721,5 +4866,2 @@
 -            if not parsed_task.enabled and support != "required":
 -                task_requested = False
 -            else:
@@ -3311,7 +3679,7 @@ print(f"{out}: {j - i - 1} lines")
 -                requestor_context = parsed_task.requestor_context
 +            params["task"] = self._task_wire_metadata(parsed_task)
 +            requestor_context = parsed_task.requestor_context
-@@ -4737,11 +4872,12 @@
+@@ -4737,11 +4879,12 @@
 -            task_payload = self._extract_task_payload(result)
 -            if task_payload is not None:
 -                task_info = self._task_info_from_payload(task_payload)
@@ -3335,16 +3703,16 @@ print(f"{out}: {j - i - 1} lines")
 +            # A task call returns, and is sized from, the answer reduced to
 +            # what pmcp could use (Consiliency/pmcp#297 rev 14/17).
 +            result = usable_task_response(result)
-@@ -4943,3 +5079,2 @@
+@@ -4943,3 +5086,2 @@
 -        payload = self._extract_task_payload(result) or result
 -        task_info = self._task_info_from_payload(payload)
 -        if task_info is None:
 +        found = task_answer_of(result)
 +        if found is None:
-@@ -4949 +5084 @@
+@@ -4949 +5091 @@
 -            task_info,
 +            found[1],
-@@ -4989,11 +5124,13 @@
+@@ -4989,11 +5131,13 @@
 -        task_payload = self._extract_task_payload(result)
 -        if task_payload is not None:
 -            task_info = self._task_info_from_payload(task_payload)
@@ -3369,14 +3737,14 @@ print(f"{out}: {j - i - 1} lines")
 +                connection=managed,
 +            )
 +        elif not _names_a_task(result) and self._owns(server_name, managed):
-@@ -5011 +5148,2 @@
+@@ -5011 +5155,2 @@
 -        # task's record.
 +        # task's record. The reply is returned reduced to what pmcp could use
 +        # (Consiliency/pmcp#297).
-@@ -5014 +5152 @@
+@@ -5014 +5159 @@
 -        return TaskReply(result, built)
 +        return TaskReply(usable_task_response(result), built)
-@@ -5059,3 +5197,8 @@
+@@ -5059,3 +5204,8 @@
 -        payload = self._extract_task_payload(result) or result
 -        task_info = self._task_info_from_payload(payload)
 -        if task_info is None:
@@ -3388,13 +3756,13 @@ print(f"{out}: {j - i - 1} lines")
 +            # read: `raw` stays empty rather than holding the whole answer
 +            # (rev 15, round-14 claude F001: an unparseable task's `ttl` went
 +            # back out through `gateway.tasks_cancel`).
-@@ -5066 +5208,0 @@
+@@ -5066 +5215,0 @@
 -                raw=result,
-@@ -5367 +5509,2 @@
+@@ -5367 +5516,2 @@
 -                f"Invalid request_id format: {request_id}",
 +                "Invalid request_id format: expected server_name::local_id "
 +                f"({describe_value(request_id)})",
-@@ -5371,6 +5514,9 @@
+@@ -5371,6 +5521,9 @@
 -
 -        server_name, local_id_str = request_id.rsplit("::", 1)
 -        try:
@@ -4365,7 +4733,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/src/pmcp/sdk_rejections.py
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,795 @@
 +"""The MCP SDK's own rejections and server-side logs, value-free (Consiliency/pmcp#297 rev 20).
 +
 +Before any pmcp handler runs, the MCP SDK answers some requests itself: an
@@ -4499,8 +4867,13 @@ print(f"{out}: {j - i - 1} lines")
 +
 +_PROTOCOL_REVISION = re.compile(r"\d{4}-\d{2}-\d{2}")
 +
-+#: Logger-name prefixes whose records are scrubbed by :func:`scrub_sdk_record`.
-+SDK_LOGGERS = ("mcp.server", "mcp.shared", "sse_starlette")
++#: Logger-name prefixes whose records are scrubbed by :func:`scrub_sdk_record`:
++#: the whole `mcp` package -- server, shared and client (rev 26, round-24
++#: claude F001: `mcp.client.*` logged `Unknown SSE event: <name>` and a
++#: rejected endpoint URL) -- and `sse_starlette`. The SDK also names loggers
++#: by literal (`mcp/client/session.py` logs as ``"client"``); those come from
++#: the installed package's source (:func:`sdk_logger_names`).
++SDK_LOGGERS = ("mcp", "sse_starlette")
 +#: The HTTP client stacks' loggers (rev 23, round-21 claude F001): their
 +#: traces quote response bytes (`receive_response_headers.failed
 +#: exception=RemoteProtocolError(... b'<status line>')`, httpx's
@@ -4523,6 +4896,36 @@ print(f"{out}: {j - i - 1} lines")
 +    import mcp
 +
 +    return Path(mcp.__file__).parent
++
++
++_LOGGER_FACTORIES = ("getLogger", "get_logger")
++
++
++def logger_name_arguments(tree: ast.AST) -> list[ast.expr]:
++    """The name argument of every ``getLogger``/``get_logger`` call."""
++    found: list[ast.expr] = []
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Call) and _call_name(node) in _LOGGER_FACTORIES:
++            if node.args:
++                found.append(node.args[0])
++    return found
++
++
++@functools.cache
++def sdk_logger_names() -> tuple[str, ...]:
++    """Every logger-name prefix the installed SDK logs under: the package
++    (``__name__`` in every module) and each literal name it passes to a
++    logger factory (rev 26)."""
++    names = set(SDK_LOGGERS)
++    for path in sorted(_mcp_root().rglob("*.py")):
++        try:
++            tree = ast.parse(path.read_text(encoding="utf-8"))
++        except (OSError, SyntaxError, UnicodeDecodeError):
++            continue
++        for argument in logger_name_arguments(tree):
++            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
++                names.add(argument.value)
++    return tuple(sorted(names))
 +
 +
 +def _call_name(node: ast.Call) -> str | None:
@@ -4783,7 +5186,237 @@ print(f"{out}: {j - i - 1} lines")
 +        modern._write_rejection = _wrap_write_rejection(current)
 +
 +
++# --- errors the SDK raises, client side included (rev 26) ---------------------
++
++#: Raise sites (``path::function`` under the `mcp` package) of an `MCPError`
++#: that relays an `ErrorData` built elsewhere: a peer's response
++#: (`send_raw_request`), or pmcp's own handler or callback result. Its message
++#: is kept unless it matches a template the SDK itself builds -- the SDK's
++#: client transport hands its own `ErrorData` (`Unexpected content type:
++#: <type>`) to the session as if the peer had sent it (round-24 claude F001).
++#: `tests/test_http_transport.py` pins this set against the SDK's raises.
++RECEIVED_ERROR_SITES = frozenset(
++    {
++        "client/_input_required.py::_dispatch_all",
++        "client/session.py::_on_request",
++        "server/runner.py::_dump_result",
++        "server/runner.py::_inner",
++        "server/runner.py::on_request",
++        "shared/jsonrpc_dispatcher.py::send_raw_request",
++    }
++)
++
++
++def _is_error_call(name: str | None) -> bool:
++    return bool(name) and (
++        name in _MESSAGE_ARGUMENTS
++        or str(name).endswith(("Error", "Exception", "Warning"))
++    )
++
++
++def error_message_arguments(tree: ast.AST) -> list[tuple[str, ast.expr]]:
++    """(callee, message argument) of every exception or wire-error
++    construction in ``tree``: the ``message``/``msg`` keyword, else the
++    message's position (the second for ``MCPError``, else the first)."""
++    found: list[tuple[str, ast.expr]] = []
++    for node in ast.walk(tree):
++        if not isinstance(node, ast.Call):
++            continue
++        name = _call_name(node)
++        if not _is_error_call(name):
++            continue
++        keyword, index = _MESSAGE_ARGUMENTS.get(str(name), ("message", 0))
++        value = next(
++            (item.value for item in node.keywords if item.arg in (keyword, "msg")),
++            None,
++        )
++        if value is None and index is not None and len(node.args) > index:
++            value = node.args[index]
++        if value is not None:
++            found.append((str(name), value))
++    return found
++
++
++def _message_pattern(node: ast.expr) -> re.Pattern[str] | None:
++    """A pattern for a message the SDK formats: an f-string, a ``%``-format
++    or a ``.format`` of a literal, each placeholder matching anything."""
++    if isinstance(node, ast.JoinedStr):
++        return _template_pattern(node)
++    literal: str | None = None
++    placeholder: re.Pattern[str] | None = None
++    if (
++        isinstance(node, ast.BinOp)
++        and isinstance(node.op, ast.Mod)
++        and isinstance(node.left, ast.Constant)
++        and isinstance(node.left.value, str)
++    ):
++        literal, placeholder = (
++            node.left.value,
++            re.compile(r"%[-#0 +]*\d*(?:\.\d+)?[sdirfx%]"),
++        )
++    elif (
++        isinstance(node, ast.Call)
++        and isinstance(node.func, ast.Attribute)
++        and node.func.attr == "format"
++        and isinstance(node.func.value, ast.Constant)
++        and isinstance(node.func.value.value, str)
++    ):
++        literal, placeholder = node.func.value.value, re.compile(r"\{[^{}]*\}")
++    if literal is None or placeholder is None:
++        return None
++    parts = placeholder.split(literal)
++    return re.compile("(.*?)".join(re.escape(part) for part in parts), re.DOTALL)
++
++
++@functools.cache
++def _sdk_message_texts() -> tuple[frozenset[str], tuple[re.Pattern[str], ...]]:
++    """Every literal message the SDK raises or answers with, and a pattern
++    for every message it formats, from the installed package's source."""
++    literals: set[str] = set()
++    patterns: list[re.Pattern[str]] = []
++    for path in sorted(_mcp_root().rglob("*.py")):
++        try:
++            tree = ast.parse(path.read_text(encoding="utf-8"))
++        except (OSError, SyntaxError, UnicodeDecodeError):
++            continue
++        for _name, argument in error_message_arguments(tree):
++            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
++                literals.add(argument.value)
++                continue
++            pattern = _message_pattern(argument)
++            if pattern is not None:
++                patterns.append(pattern)
++    return frozenset(literals), tuple(patterns)
++
++
++@functools.cache
++def _mcp_prefix() -> str:
++    return str(_mcp_root()) + "/"
++
++
++def raise_site(error: BaseException) -> str | None:
++    """``path::function`` of where ``error`` was raised, when that is in the
++    `mcp` package: the innermost frame of its traceback."""
++    tb = error.__traceback__
++    if tb is None:
++        return None
++    while tb.tb_next is not None:
++        tb = tb.tb_next
++    filename = tb.tb_frame.f_code.co_filename
++    prefix = _mcp_prefix()
++    if not filename.startswith(prefix):
++        return None
++    return f"{filename[len(prefix) :]}::{tb.tb_frame.f_code.co_name}"
++
++
++def withheld_sdk_error(error: BaseException) -> bool:
++    """Whether ``error`` was raised by the SDK with a message pmcp has not
++    reviewed (rev 26, round-24 claude F001). Kept: an empty message, a
++    literal of the SDK's source, a reviewed template, and the relayed
++    message of a :data:`RECEIVED_ERROR_SITES` raise that matches no template
++    the SDK builds. Everything else the SDK raises -- formatted from a
++    response, a URL, ``str(e)`` -- is withheld: rendered by class and code."""
++    from pmcp.argument_errors import exception_origin
++
++    if exception_origin(error) != "mcp":
++        return False
++    site = raise_site(error)
++    if site is None:
++        return False
++    try:
++        text = str(error)
++    except Exception:  # noqa: BLE001 -- an unprintable error is withheld
++        return True
++    if not text:
++        return False
++    literals, patterns = _sdk_message_texts()
++    if text in literals or _reviewed_message(text, getattr(error, "code", None)):
++        return False
++    if site not in RECEIVED_ERROR_SITES:
++        return True
++    return sdk_built_message(text, getattr(error, "code", None))
++
++
++#: A formatted SDK message with less literal text than this is too general
++#: to recognise a relayed message by (``f"{error}"`` would match anything);
++#: `tests/test_http_transport.py` pins that the SDK has none today.
++_MIN_TEMPLATE_LITERAL = 8
++
++
++def _literal_length(pattern: re.Pattern[str]) -> int:
++    return len(re.sub(r"\\(.)", r"\1", pattern.pattern.replace("(.*?)", "")))
++
++
++def sdk_built_message(message: Any, code: Any = None) -> bool:
++    """Whether ``message`` -- relayed as a peer's -- is one the SDK formats
++    itself and pmcp has not reviewed: the SDK's client transport answers a
++    request with its own `ErrorData` (`Unexpected content type: <type>`,
++    round-24 claude F001), which reaches pmcp as if the downstream sent it."""
++    if not isinstance(message, str) or _reviewed_message(message, code):
++        return False
++    _literals, patterns = _sdk_message_texts()
++    return any(
++        _literal_length(pattern) >= _MIN_TEMPLATE_LITERAL and pattern.fullmatch(message)
++        for pattern in patterns
++    )
++
++
++def sdk_message_phrase(code: Any) -> str:
++    """The fixed phrase for ``code`` (:data:`_CODE_PHRASES`)."""
++    return (
++        _CODE_PHRASES.get(code, _DEFAULT_PHRASE)
++        if isinstance(code, int)
++        else (_DEFAULT_PHRASE)
++    )
++
++
++def sdk_error_text(error: BaseException) -> str:
++    """A withheld SDK error: its code's phrase, class and code, or its
++    class alone."""
++    code = getattr(error, "code", None)
++    name = type(error).__name__
++    if type(code) is int:
++        return f"{_CODE_PHRASES.get(code, _DEFAULT_PHRASE)} ({name}, code {code})"
++    return f"the MCP SDK raised {name}"
++
++
 +# --- logs ---------------------------------------------------------------------
++
++
++def log_messages(tree: ast.AST) -> list[ast.expr]:
++    """The message argument of every logger call in ``tree``."""
++    found: list[ast.expr] = []
++    for node in ast.walk(tree):
++        if (
++            isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Attribute)
++            and node.func.attr
++            in ("debug", "info", "warning", "error", "exception", "critical", "log")
++            and isinstance(node.func.value, ast.Name)
++            and node.func.value.id in ("logger", "log", "_logger")
++        ):
++            args = node.args[1:] if node.func.attr == "log" else node.args
++            if args:
++                found.append(args[0])
++    return found
++
++
++@functools.cache
++def _log_literals() -> frozenset[str]:
++    """Every literal message an SDK logger call is given (rev 26): a record
++    of an SDK logger whose message is neither one of these nor an f-string
++    template's is masked whole -- `logger.error(error_msg)` logged a
++    pre-built `Endpoint origin does not match connection origin: <url>`."""
++    literals: set[str] = set()
++    for path in sorted(_mcp_root().rglob("*.py")):
++        try:
++            tree = ast.parse(path.read_text(encoding="utf-8"))
++        except (OSError, SyntaxError, UnicodeDecodeError):
++            continue
++        for message in log_messages(tree):
++            if isinstance(message, ast.Constant) and isinstance(message.value, str):
++                literals.add(message.value)
++    return frozenset(literals)
 +
 +
 +def log_templates(tree: ast.AST) -> list[ast.JoinedStr]:
@@ -4807,23 +5440,22 @@ print(f"{out}: {j - i - 1} lines")
 +@functools.cache
 +def _log_patterns() -> tuple[tuple[re.Pattern[str], str], ...]:
 +    """(pattern, the message with each placeholder as ``<...>``) for every
-+    f-string log message in the SDK's server and shared modules."""
++    f-string log message anywhere in the SDK (rev 26: the client too)."""
 +    root = _mcp_root()
 +    out: list[tuple[re.Pattern[str], str]] = []
-+    for sub in ("server", "shared"):
-+        for path in sorted((root / sub).rglob("*.py")):
-+            try:
-+                tree = ast.parse(path.read_text(encoding="utf-8"))
-+            except (OSError, SyntaxError, UnicodeDecodeError):
-+                continue
-+            for template in log_templates(tree):
-+                masked = "".join(
-+                    value.value
-+                    if isinstance(value, ast.Constant) and isinstance(value.value, str)
-+                    else _PLACEHOLDER
-+                    for value in template.values
-+                )
-+                out.append((_template_pattern(template), masked))
++    for path in sorted(root.rglob("*.py")):
++        try:
++            tree = ast.parse(path.read_text(encoding="utf-8"))
++        except (OSError, SyntaxError, UnicodeDecodeError):
++            continue
++        for template in log_templates(tree):
++            masked = "".join(
++                value.value
++                if isinstance(value, ast.Constant) and isinstance(value.value, str)
++                else _PLACEHOLDER
++                for value in template.values
++            )
++            out.append((_template_pattern(template), masked))
 +    # Longest literal text first, so a specific template wins over a general one.
 +    out.sort(key=lambda item: -len(item[1].replace(_PLACEHOLDER, "")))
 +    return tuple(out)
@@ -4842,7 +5474,7 @@ print(f"{out}: {j - i - 1} lines")
 +
 +
 +def is_sdk_logger(name: Any) -> bool:
-+    return _under(name, SDK_LOGGERS) or _under(name, HTTP_CLIENT_LOGGERS)
++    return _under(name, sdk_logger_names()) or _under(name, HTTP_CLIENT_LOGGERS)
 +
 +
 +def scrub_sdk_record(record: logging.LogRecord) -> None:
@@ -4854,21 +5486,47 @@ print(f"{out}: {j - i - 1} lines")
 +    if not is_sdk_logger(record.name):
 +        return
 +    try:
++        from pmcp.argument_errors import safe_exc_info
++
++        error = record.exc_info[1] if isinstance(record.exc_info, tuple) else None
++        if isinstance(error, BaseException) and safe_exc_info(error) is not None:
++            # A chain that holds a registered error is described by the
++            # record scrubber; any other is kept as frames and classes.
++            # The traceback's frames, and each exception by its class alone
++            # (rev 26: `logger.exception("Error in sse_reader")` printed a
++            # `ValueError` naming a rejected endpoint URL).
++            from pmcp.argument_errors import class_only_traceback_text
++
++            record.exc_text = class_only_traceback_text(error)
++            record.exc_info = None
 +        args = record.args
 +        if isinstance(args, tuple):
 +            record.args = tuple(_masked_argument(item) for item in args)
 +        elif isinstance(args, dict):
 +            record.args = {key: _masked_argument(item) for key, item in args.items()}
-+        if not args and isinstance(record.msg, str):
-+            if _under(record.name, HTTP_CLIENT_LOGGERS):
++        if _under(record.name, HTTP_CLIENT_LOGGERS):
++            if not args and isinstance(record.msg, str):
 +                head, _, rest = record.msg.partition(" ")
 +                if rest:
 +                    record.msg = f"{head} {_PLACEHOLDER}"
-+                return
++            return
++        if _under(record.name, ("sse_starlette",)):
++            return  # its `%`-arguments are masked; its messages are literals
++        if isinstance(record.msg, BaseException):
++            return  # rendered by the record scrubber (`exception_text`)
++        if not isinstance(record.msg, str):
++            record.msg, record.args = _PLACEHOLDER, None
++            return
++        if record.msg in _log_literals():
++            return
++        if not args:
 +            for pattern, masked in _log_patterns():
 +                if pattern.fullmatch(record.msg):
 +                    record.msg = masked
-+                    break
++                    return
++        # A message the SDK built some other way (a variable, `%` or
++        # `.format` before the call): masked whole (rev 26).
++        record.msg, record.args = _PLACEHOLDER, None
 +    except Exception:  # noqa: BLE001 -- a log call must never fail here
 +        pass
 ````
@@ -9212,10 +9870,10 @@ print(f"{out}: {j - i - 1} lines")
 +        assert "tools/call" in seen, seen
 +        assert "ok" in "".join(getattr(b, "text", "") for b in answer.content)
 +        if transport != "stdio":
-+            # The SDK did log the outgoing request -- as its structure.
++            # The SDK did log the outgoing request -- masked, as every
++            # `mcp.*` client record is (rev 26).
 +            assert any(
-+                "<JSON-RPC request: method 'tools/call'" in r.getMessage()
-+                for r in records
++                r.getMessage() == "Sending client message: <...>" for r in records
 +            ), [r.getMessage() for r in records][:20]
 +    finally:
 +        await manager.disconnect_server("frames", force=True)
@@ -11982,7 +12640,7 @@ print(f"{out}: {j - i - 1} lines")
 +        assert sentinel not in observed
 +        assert sentinel.encode("utf-8").hex() not in observed.encode("utf-8").hex()
 +
-@@ -594,0 +641,984 @@
+@@ -594,0 +641,1647 @@
 +
 +
 +# --- rev 19: the SDK's transport rejections are value-free (round-17 grok F001,
@@ -12556,7 +13214,10 @@ print(f"{out}: {j - i - 1} lines")
 +_WRITE = "server, in an exchange: rebuilt by pmcp.sdk_rejections"
 +_PRE = "server, out of session (id null): rewritten by value_free_rejection"
 +_PLUMB = "plumbing: carries an error classified where it is built"
-+_CLIENT = "client side: an error pmcp receives or raises as a client"
++_CLIENT = (
++    "client side: withheld by origin unless a literal; a relayed peer message "
++    "is kept unless it matches a template the SDK builds (rev 26)"
++)
 +_UNUSED = "unreachable: pmcp serves the low-level Server over JSONRPCDispatcher"
 +_SDK_ERROR_CONSTRUCTIONS: dict[tuple[str, str, str, str], str] = {
 +    ("mcp.client.session", "MCPError", "data", "method"): _CLIENT,
@@ -12840,6 +13501,666 @@ print(f"{out}: {j - i - 1} lines")
 +    )
 +
 +
++#: Every other exception the SDK builds from non-literal text -- `ValueError`,
++#: `RuntimeError`, its own error classes -- anywhere in the package, client
++#: transports included (rev 26, round-24 ruling). Each is withheld by origin
++#: (`pmcp.sdk_rejections.withheld_sdk_error`): raised from the SDK's frames,
++#: it renders as its class (and code), never its text. Exact both ways.
++_SDK_EXCEPTION_CONSTRUCTIONS: frozenset[tuple[str, str, str]] = frozenset(
++    {
++        (
++            "mcp.client._input_required",
++            "InputRequiredRoundsExceededError",
++            "max_rounds",
++        ),
++        (
++            "mcp.client.auth.extensions.identity_assertion",
++            "OAuthFlowError",
++            "f'No authorization server metadata at configured issuer {self._issuer}'",
++        ),
++        (
++            "mcp.client.auth.extensions.identity_assertion",
++            "OAuthFlowError",
++            "f'Token endpoint {token_endpoint} is not on the configured issuer origin {self._issuer}'",
++        ),
++        (
++            "mcp.client.auth.extensions.identity_assertion",
++            "OAuthTokenError",
++            "f'Token exchange failed ({token_response.status_code}): {body}'",
++        ),
++        (
++            "mcp.client.auth.oauth2",
++            "OAuthFlowError",
++            "f'Protected Resource Metadata request failed: {response.status_code}'",
++        ),
++        (
++            "mcp.client.auth.oauth2",
++            "OAuthFlowError",
++            "f'Protected resource {prm_resource} does not match expected {default_resource}'",
++        ),
++        (
++            "mcp.client.auth.oauth2",
++            "OAuthFlowError",
++            "f'State parameter mismatch: {result.state} != {state}'",
++        ),
++        (
++            "mcp.client.auth.oauth2",
++            "OAuthRegistrationError",
++            "f'Authorization server registered the client for {method!r} but issued no client_secret'",
++        ),
++        (
++            "mcp.client.auth.oauth2",
++            "OAuthRegistrationError",
++            "f'Authorization server registered the client with unsupported token_endpoint_auth_method {method!r}'",
++        ),
++        (
++            "mcp.client.auth.oauth2",
++            "OAuthTokenError",
++            "f'Registered client uses unsupported token_endpoint_auth_method {auth_method!r}'",
++        ),
++        (
++            "mcp.client.auth.oauth2",
++            "OAuthTokenError",
++            "f'Token exchange failed ({response.status_code}): {body_text}'",
++        ),
++        (
++            "mcp.client.auth.oauth2",
++            "ValueError",
++            "f'client_metadata_url must be a valid HTTPS URL with a non-root pathname, got: {client_metadata_url}'",
++        ),
++        (
++            "mcp.client.auth.utils",
++            "OAuthFlowError",
++            "f'Authorization response iss mismatch: {iss} != {expected}'",
++        ),
++        (
++            "mcp.client.auth.utils",
++            "OAuthFlowError",
++            "f'Authorization server metadata issuer mismatch: {oauth_metadata.issuer} != {expected_issuer}'",
++        ),
++        (
++            "mcp.client.auth.utils",
++            "OAuthRegistrationError",
++            "f'Invalid registration response: {e}'",
++        ),
++        (
++            "mcp.client.auth.utils",
++            "OAuthRegistrationError",
++            "f'Registration failed: {response.status_code} {response.text}'",
++        ),
++        ("mcp.client.auth.utils", "OAuthTokenError", "f'Invalid token response: {e}'"),
++        (
++            "mcp.client.caching",
++            "ValueError",
++            "f'default_ttl_ms must be >= 0, got {self.default_ttl_ms}'",
++        ),
++        (
++            "mcp.client.caching",
++            "ValueError",
++            "f'max_entries must be >= 0, got {max_entries}'",
++        ),
++        (
++            "mcp.client.client",
++            "ValueError",
++            "f\"mode must be 'legacy', 'auto', or one of {list(MODERN_PROTOCOL_VERSIONS)}; got {self.mode!r}{hint}\"",
++        ),
++        (
++            "mcp.client.client",
++            "ValueError",
++            "f'extension identifier {identifier!r} is passed more than once'",
++        ),
++        (
++            "mcp.client.client",
++            "ValueError",
++            "f'{both} notification method {binding.method!r}; a method can have only one observer'",
++        ),
++        (
++            "mcp.client.client",
++            "ValueError",
++            "f'{both} resultType {tag!r}; a wire tag can have only one resolver'",
++        ),
++        (
++            "mcp.client.client",
++            "ValueError",
++            "f'{type(extension).__name__} has no `identifier`; a ClientExtension must set the `identifier` class attribute (or assign one in `__init__`) before it can be used'",
++        ),
++        (
++            "mcp.client.extension",
++            "ValueError",
++            "f'claims attach to {sorted(_CLAIM_METHODS)} only; got method {self.method!r}'",
++        ),
++        (
++            "mcp.client.extension",
++            "ValueError",
++            "f'protocol_versions {unrecognized} are not modern protocol revisions; claimed shapes cannot be delivered on a legacy wire (None means every modern version)'",
++        ),
++        (
++            "mcp.client.extension",
++            "ValueError",
++            "f'resultType {self.result_type!r} is core protocol vocabulary'",
++        ),
++        (
++            "mcp.client.extension",
++            "ValueError",
++            "f'{self.model.__name__} must subclass mcp_types.Result'",
++        ),
++        (
++            "mcp.client.extension",
++            "ValueError",
++            "f'{self.model.__name__}.result_type must be Literal[{self.result_type!r}]'",
++        ),
++        (
++            "mcp.client.extension",
++            "ValueError",
++            "f'{self.model.__name__}.{name} aliases {clash!r}, a typed field of the core result surface; a colliding value would fail core validation before the claim adapter runs'",
++        ),
++        (
++            "mcp.client.session",
++            "RuntimeError",
++            "f'Invalid schema for tool {name}: {e}'",
++        ),
++        (
++            "mcp.client.session",
++            "RuntimeError",
++            "f'Invalid structured content returned by tool {name}: {error}'",
++        ),
++        (
++            "mcp.client.session",
++            "RuntimeError",
++            "f'No mutually supported modern protocol version (server: {result.supported_versions}, client: {list(MODERN_PROTOCOL_VERSIONS)})'",
++        ),
++        (
++            "mcp.client.session",
++            "RuntimeError",
++            "f'Server returned InputRequiredResult; pass allow_input_required=True to receive it and retry {method}(..., input_responses=..., request_state=result.request_state).'",
++        ),
++        (
++            "mcp.client.session",
++            "RuntimeError",
++            "f'Tool {name} has an output schema but did not return structured content'",
++        ),
++        (
++            "mcp.client.session",
++            "RuntimeError",
++            "f'Unsupported protocol version from the server: {result.protocol_version}'",
++        ),
++        (
++            "mcp.client.session",
++            "ValueError",
++            'f"result_claims key {identifier!r} has no extensions entry; a claim is only advertised through its extension\'s capability ad"',
++        ),
++        (
++            "mcp.client.session",
++            "ValueError",
++            "f'duplicate notification binding for method {binding.method!r}'",
++        ),
++        (
++            "mcp.client.session",
++            "ValueError",
++            "f'duplicate result claim for resultType {claim.result_type!r}'",
++        ),
++        (
++            "mcp.client.session",
++            "ValueError",
++            "f'result_claims[{identifier!r}] is empty and would drop the extension from the capability ad at every version. Omit the key instead'",
++        ),
++        (
++            "mcp.client.session",
++            "ValueError",
++            "f'{method} requires params[{key!r}] for Mcp-Name'",
++        ),
++        ("mcp.client.sse", "ValueError", "error_msg"),
++        (
++            "mcp.client.subscriptions",
++            "ListenNotSupportedError",
++            "session.protocol_version",
++        ),
++        ("mcp.os.win32.utilities", "OSError", "f'SetStdHandle failed for fd {fd}'"),
++        ("mcp.server._streamable_http_modern", "NoBackChannelError", "method"),
++        (
++            "mcp.server.apps",
++            "ValueError",
++            "f'Apps tool {tool.fn.__name__!r} binds resource_uri {uri!r}, but no such resource is registered; add it with add_html_resource() or add_resource()'",
++        ),
++        (
++            "mcp.server.apps",
++            "ValueError",
++            "f'MCP Apps URIs must use the ui:// scheme, got {uri!r}'",
++        ),
++        (
++            "mcp.server.apps",
++            "ValueError",
++            "f'MCP Apps resources are served as {APP_MIME_TYPE!r}, got {resource.mime_type!r}'",
++        ),
++        (
++            "mcp.server.auth.middleware.client_auth",
++            "AuthenticationError",
++            "f'Unsupported auth method: {client.token_endpoint_auth_method}'",
++        ),
++        (
++            "mcp.server.caching",
++            "TypeError",
++            "f'cache_hints[{method!r}] must be a CacheHint, got {type(hint).__name__}'",
++        ),
++        (
++            "mcp.server.caching",
++            "ValueError",
++            "f\"cache_hints keys must be cacheable methods (see CacheableMethod); got: {', '.join(unknown)}\"",
++        ),
++        (
++            "mcp.server.caching",
++            "ValueError",
++            "f\"scope must be 'public' or 'private', got {self.scope!r}\"",
++        ),
++        (
++            "mcp.server.caching",
++            "ValueError",
++            "f'ttl_ms must be >= 0, got {self.ttl_ms}'",
++        ),
++        ("mcp.server.connection", "NoBackChannelError", "method"),
++        (
++            "mcp.server.elicitation",
++            "TypeError",
++            "f'Elicitation schema field {field_name!r} rendered as {prop!r}, which is not a valid PrimitiveSchemaDefinition'",
++        ),
++        (
++            "mcp.server.elicitation",
++            "ValueError",
++            "f'Unexpected elicitation action: {result.action}'",
++        ),
++        (
++            "mcp.server.extension",
++            "ValueError",
++            "f'MethodBinding cannot bind spec method {self.method!r}; extension methods are additive — use Extension.intercept_tool_call or Server.middleware to wrap core behaviour'",
++        ),
++        (
++            "mcp.server.extension",
++            "ValueError",
++            "f'MethodBinding for {self.method!r} has an empty protocol_versions set, so it could never be served; use None to admit every version'",
++        ),
++        (
++            "mcp.server.mcpserver.prompts.base",
++            "ValueError",
++            "f'Could not convert prompt result to message: {msg}'",
++        ),
++        (
++            "mcp.server.mcpserver.prompts.base",
++            "ValueError",
++            "f'Error rendering prompt {self.name}: {e}'",
++        ),
++        (
++            "mcp.server.mcpserver.prompts.base",
++            "ValueError",
++            "f'Missing required arguments: {missing}'",
++        ),
++        (
++            "mcp.server.mcpserver.prompts.manager",
++            "ValueError",
++            "f'Unknown prompt: {name}'",
++        ),
++        (
++            "mcp.server.mcpserver.resolve",
++            "ToolError",
++            "f'Resolver for parameter {name!r} could not resolve: elicitation was {outcome.action}'",
++        ),
++        (
++            "mcp.server.mcpserver.resolve",
++            "ToolError",
++            "f'Resolver {key!r} received a non-elicitation response'",
++        ),
++        (
++            "mcp.server.mcpserver.resolve",
++            "ToolError",
++            "f'Resolver {key!r} received a response of the wrong kind'",
++        ),
++        (
++            "mcp.server.mcpserver.resolve",
++            "ToolError",
++            "f'Resolver {key!r} received an accepted elicitation whose content does not match the requested schema'",
++        ),
++        (
++            "mcp.server.mcpserver.resolve",
++            "ToolError",
++            "f'Resolver {key!r} received an accepted elicitation with no content'",
++        ),
++        (
++            "mcp.server.mcpserver.resources.resource_manager",
++            "ResourceNotFoundError",
++            "f'Unknown resource: {uri}'",
++        ),
++        (
++            "mcp.server.mcpserver.resources.templates",
++            "ResourceError",
++            "f'Error creating resource from template {uri}'",
++        ),
++        (
++            "mcp.server.mcpserver.resources.templates",
++            "ResourceSecurityError",
++            "self.uri_template",
++        ),
++        (
++            "mcp.server.mcpserver.resources.types",
++            "FileNotFoundError",
++            "f'Directory not found: {self.path}'",
++        ),
++        (
++            "mcp.server.mcpserver.resources.types",
++            "NotADirectoryError",
++            "f'Not a directory: {self.path}'",
++        ),
++        (
++            "mcp.server.mcpserver.resources.types",
++            "ValueError",
++            "f'Error listing directory {self.path}: {e}'",
++        ),
++        (
++            "mcp.server.mcpserver.resources.types",
++            "ValueError",
++            "f'Error reading directory {self.path}: {e}'",
++        ),
++        (
++            "mcp.server.mcpserver.resources.types",
++            "ValueError",
++            "f'Error reading file {self.path}: {e}'",
++        ),
++        (
++            "mcp.server.mcpserver.resources.types",
++            "ValueError",
++            "f'Error reading resource {self.uri}: {e}'",
++        ),
++        ("mcp.server.mcpserver.resources.types", "ValueError", "str(e)"),
++        (
++            "mcp.server.mcpserver.server",
++            "ResourceError",
++            "f'Error reading resource {uri}'",
++        ),
++        ("mcp.server.mcpserver.server", "ValueError", "_MISSING_AUDIENCE"),
++        (
++            "mcp.server.mcpserver.server",
++            "ValueError",
++            "f'Extension {identifier!r} binds method {method.method!r}, which is already registered; extension methods are additive and cannot replace another handler'",
++        ),
++        (
++            "mcp.server.mcpserver.server",
++            "ValueError",
++            "f'Extension {identifier!r} is already registered'",
++        ),
++        (
++            "mcp.server.mcpserver.server",
++            "ValueError",
++            "f'Mismatch between URI parameters {uri_params} and function parameters {func_params}'",
++        ),
++        (
++            "mcp.server.mcpserver.server",
++            "ValueError",
++            "f'Resource {uri!r} has no URI template variables, but the handler declares a Context parameter. Context injection for static resources is not supported. Add a template variable to the URI or remove the Context parameter.'",
++        ),
++        (
++            "mcp.server.mcpserver.server",
++            "ValueError",
++            "f'Resource {uri!r} has no URI template variables, but the handler declares parameters {func_params}. Add matching {{...}} variables to the URI or remove the parameters.'",
++        ),
++        (
++            "mcp.server.mcpserver.server",
++            "ValueError",
++            "f'Resource {uri!r}: query parameter(s) {missing_defaults} have no default value. A client may omit a {{?...}}/{{&...}} query parameter, so the matching handler parameter must declare a default.'",
++        ),
++        ("mcp.server.mcpserver.server", "ValueError", "f'Unknown prompt: {name}'"),
++        (
++            "mcp.server.mcpserver.server",
++            "ValueError",
++            "f'Unknown transport: {transport}'",
++        ),
++        ("mcp.server.mcpserver.server", "ValueError", "str(e)"),
++        (
++            "mcp.server.mcpserver.tools.base",
++            "ToolError",
++            "f'Error executing tool {self.name}: {e}'",
++        ),
++        (
++            "mcp.server.mcpserver.tools.tool_manager",
++            "ToolError",
++            "f'Unknown tool: {name}'",
++        ),
++        (
++            "mcp.server.mcpserver.utilities.func_metadata",
++            "ValueError",
++            "f'JSON schema warning: {kind} - {detail}'",
++        ),
++        (
++            "mcp.server.request_state",
++            "TypeError",
++            "f'request-state keys must be bytes, bytearray, or str; keys[{i}] is {type(key).__name__}'",
++        ),
++        (
++            "mcp.server.request_state",
++            "ValueError",
++            "f'keys[{i}] duplicates an earlier ring key'",
++        ),
++        (
++            "mcp.server.request_state",
++            "ValueError",
++            "f'request-state keys must be at least 32 bytes of secret randomness; keys[{i}] is {len(k)} bytes. Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\"'",
++        ),
++        (
++            "mcp.server.request_state",
++            "ValueError",
++            "f'request-state ttl must be a positive finite number, got {ttl!r}'",
++        ),
++        ("mcp.server.runner", "NoBackChannelError", "method"),
++        (
++            "mcp.server.runner",
++            "TypeError",
++            "f'handler returned {type(result).__name__}; expected BaseModel, dict, or None'",
++        ),
++        (
++            "mcp.server.sse",
++            "ValueError",
++            "f\"Given endpoint: {endpoint} is not a relative path (e.g., '/messages/'), expecting a relative path (e.g., '/messages/').\"",
++        ),
++        (
++            "mcp.server.stdio",
++            "OSError",
++            "f'duplicate of fd {fd} landed in the standard range'",
++        ),
++        (
++            "mcp.server.stdio",
++            "RuntimeError",
++            "f'another stdio_server() in this process has already claimed fd {fd}'",
++        ),
++        ("mcp.server.streamable_http", "Exception", "err"),
++        (
++            "mcp.shared.auth",
++            "InvalidRedirectUriError",
++            "f\"Redirect URI '{redirect_uri}' not registered for client\"",
++        ),
++        (
++            "mcp.shared.auth",
++            "InvalidScopeError",
++            "f'Client was not registered with scope {scope}'",
++        ),
++        ("mcp.shared.direct_dispatcher", "NoBackChannelError", "method"),
++        (
++            "mcp.shared.direct_dispatcher",
++            "ValueError",
++            "f'request id {request_id!r} is already in flight'",
++        ),
++        (
++            "mcp.shared.exceptions",
++            "ValueError",
++            "f'Expected error code {URL_ELICITATION_REQUIRED}, got {error.code}'",
++        ),
++        (
++            "mcp.shared.extension",
++            "TypeError",
++            "f'{owner}.identifier must be a `vendor-prefix/name` string (reverse-DNS prefix required), got {identifier!r}'",
++        ),
++        ("mcp.shared.jsonrpc_dispatcher", "NoBackChannelError", "method"),
++        (
++            "mcp.shared.jsonrpc_dispatcher",
++            "ValueError",
++            "f'request id {request_id!r} is already in flight'",
++        ),
++        (
++            "mcp.shared.path_security",
++            "PathEscapeError",
++            "f'Path component contains a null byte; refusing to join onto {base_resolved}'",
++        ),
++        (
++            "mcp.shared.path_security",
++            "PathEscapeError",
++            "f'Path component {part!r} is absolute; refusing to join onto {base_resolved}'",
++        ),
++        (
++            "mcp.shared.path_security",
++            "PathEscapeError",
++            "f'Path {target} escapes base {base_resolved}'",
++        ),
++        (
++            "mcp.shared.uri_template",
++            "TypeError",
++            "f'Variable {var.name!r} must be str or a sequence of str, got {type(value).__name__}'",
++        ),
++    }
++)
++
++
++def test_every_sdk_exception_construction_is_withheld() -> None:
++    """The whole `mcp` package, exact both ways (rev 26)."""
++    import ast
++    from pathlib import Path
++
++    import mcp
++
++    from pmcp.sdk_rejections import _MESSAGE_ARGUMENTS, error_message_arguments
++
++    root = Path(mcp.__file__).parent
++    found: set[tuple[str, str, str]] = set()
++    for path in sorted(root.rglob("*.py")):
++        module = (
++            path.relative_to(root.parent).with_suffix("").as_posix().replace("/", ".")
++        )
++        tree = ast.parse(path.read_text(encoding="utf-8"))
++        for name, argument in error_message_arguments(tree):
++            if name in _MESSAGE_ARGUMENTS or isinstance(argument, ast.Constant):
++                continue
++            found.add((module, name, ast.unparse(argument)))
++    assert found == set(_SDK_EXCEPTION_CONSTRUCTIONS), (
++        sorted(found - set(_SDK_EXCEPTION_CONSTRUCTIONS)),
++        sorted(set(_SDK_EXCEPTION_CONSTRUCTIONS) - found),
++    )
++
++
++def test_the_received_error_sites_are_the_sdks_relays() -> None:
++    """`RECEIVED_ERROR_SITES` is exactly the SDK's raises of an `MCPError`
++    that relays an `ErrorData` built elsewhere -- a peer's response, or
++    pmcp's own handler or callback result -- and not one that formats
++    `str(e)` (rev 26)."""
++    import ast
++    from pathlib import Path
++
++    import mcp
++
++    from pmcp.sdk_rejections import RECEIVED_ERROR_SITES
++
++    root = Path(mcp.__file__).parent
++    relays: set[str] = set()
++    formats: set[str] = set()
++    for path in sorted(root.rglob("*.py")):
++        tree = ast.parse(path.read_text(encoding="utf-8"))
++        functions = [
++            n
++            for n in ast.walk(tree)
++            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
++        ]
++        for node in ast.walk(tree):
++            if not (isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)):
++                continue
++            call = node.exc
++            func = call.func
++            name = (
++                func.attr
++                if isinstance(func, ast.Attribute)
++                else getattr(func, "id", "")
++            )
++            message: ast.expr | None = None
++            if name in ("from_error_data", "from_jsonrpc_error"):
++                message = call.args[0] if call.args else None
++            elif name in ("MCPError", "McpError"):
++                message = next(
++                    (k.value for k in call.keywords if k.arg == "message"),
++                    call.args[1] if len(call.args) > 1 else None,
++                )
++            if message is None or isinstance(message, (ast.Constant, ast.JoinedStr)):
++                continue
++            owner = min(
++                (
++                    f
++                    for f in functions
++                    if f.lineno <= node.lineno <= (f.end_lineno or f.lineno)
++                ),
++                key=lambda f: (f.end_lineno or f.lineno) - f.lineno,
++            )
++            site = f"{path.relative_to(root).as_posix()}::{owner.name}"
++            if isinstance(message, ast.Call):  # `str(e)`: the SDK formats it
++                formats.add(site)
++            else:  # a received `ErrorData`, or its `.message`
++                relays.add(site)
++    assert relays == set(RECEIVED_ERROR_SITES), (relays, formats)
++    assert not relays & formats, relays & formats
++
++
++def test_no_sdk_template_is_too_general_to_recognise() -> None:
++    """A relayed message is recognised as the SDK's by its template's
++    literal text; a template with less than that would match anything."""
++    from pmcp.sdk_rejections import (
++        _MIN_TEMPLATE_LITERAL,
++        _literal_length,
++        _sdk_message_texts,
++    )
++
++    _literals, patterns = _sdk_message_texts()
++    assert patterns
++    short = [p.pattern for p in patterns if _literal_length(p) < _MIN_TEMPLATE_LITERAL]
++    assert not short, short
++
++
++def test_every_sdk_logger_is_masked() -> None:
++    """Each logger the SDK creates -- by `__name__` (under `mcp`) or by a
++    literal name (`"client"`) -- is one :func:`scrub_sdk_record` masks
++    (rev 26: the client's loggers too)."""
++    import ast
++    from pathlib import Path
++
++    import mcp
++
++    from pmcp.sdk_rejections import is_sdk_logger, logger_name_arguments
++
++    root = Path(mcp.__file__).parent
++    unmasked = []
++    for path in sorted(root.rglob("*.py")):
++        module = (
++            path.relative_to(root.parent).with_suffix("").as_posix().replace("/", ".")
++        )
++        for argument in logger_name_arguments(
++            ast.parse(path.read_text(encoding="utf-8"))
++        ):
++            if isinstance(argument, ast.Name) and argument.id == "__name__":
++                name = module
++            elif isinstance(argument, ast.Constant) and isinstance(argument.value, str):
++                name = argument.value
++            elif isinstance(argument, ast.Name) and argument.id == "name":
++                continue  # `get_logger(name)`'s own body: its callers are checked
++            else:
++                unmasked.append((module, ast.unparse(argument)))
++                continue
++            if not is_sdk_logger(name):
++                unmasked.append((module, name))
++    assert not unmasked, unmasked
++    assert is_sdk_logger("client") and is_sdk_logger("mcp.client.streamable_http")
++    assert not is_sdk_logger("pmcp.client.manager")
++
++
 +def test_the_reviewed_templates_are_the_ones_the_sdk_builds() -> None:
 +    """Each reviewed message template exists in the SDK as written, so none
 +    is a dead entry; and each is one this table classifies as written inside
@@ -12974,7 +14295,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/tests/test_log_record_scrubber.py
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,431 @@
 +"""Every log record is scrubbed at creation, whoever logs it
 +(Consiliency/pmcp#297, rev 4).
 +
@@ -13396,7 +14717,9 @@ print(f"{out}: {j - i - 1} lines")
 +    caplog.set_level(logging.DEBUG)
 +    s = _FAMILIES[family][1]
 +    frame = {"jsonrpc": "2.0", "id": 1, "result": {"secret": s}}
-+    logger = logging.getLogger("mcp.client.future_transport")
++    # Not an `mcp.*` logger: since rev 26 those mask any record whose
++    # message is not the SDK's own, so the description is not reached.
++    logger = logging.getLogger("thirdparty.future_transport")
 +    logger.debug("received %s", frame)
 +    logger.debug("received %r and %s", frame, [frame])
 +    logger.debug("received %s", {"wrapped": frame})
@@ -13463,7 +14786,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/tests/test_parse_error_echo.py
-@@ -0,0 +1,2414 @@
+@@ -0,0 +1,2719 @@
 +"""A parse error never echoes the structured text it rejected
 +(Consiliency/pmcp#297; rev 6, reclassified by origin in rev 7).
 +
@@ -14634,6 +15957,8 @@ print(f"{out}: {j - i - 1} lines")
 +        "string",
 +        "subprocess",
 +        "sys",
++        # where the installed libraries live, for an exception's origin (rev 26)
++        "sysconfig",
 +        "tempfile",
 +        "threading",
 +        "time",
@@ -14999,6 +16324,22 @@ print(f"{out}: {j - i - 1} lines")
 +            f"HTTP/1.1 302 Found\r\nLocation: http://{s.lower()}.invalid/\r\n"
 +            "Content-Length: 0\r\n\r\n"
 +        ).encode(),
++        # A `Location` each client's URL parser rejects (rev 26, round-24
++        # codex F001: urllib parses it before pmcp's no-redirect handler,
++        # and `ipaddress` raises a bare `ValueError` quoting the host).
++        **{
++            f"redirect-{kind}": (
++                b"HTTP/1.1 302 Found\r\nLocation: "
++                + location
++                + b"\r\nContent-Length: 0\r\n\r\n"
++            )
++            for kind, location in (
++                ("ipv6", f"https://[{s}]/".encode()),
++                ("port", f"http://h.invalid:{s}/".encode()),
++                ("authority", f"http://[::1]{s}/".encode()),
++                ("encoding", b"http://h\xff" + s.encode() + b".invalid/"),
++            )
++        },
 +    }
 +
 +
@@ -15503,7 +16844,9 @@ print(f"{out}: {j - i - 1} lines")
 +            module = importlib.import_module(module_name)
 +
 +            async def run() -> Any:
-+                async with module.AsyncClient(timeout=10) as client:
++                async with module.AsyncClient(
++                    timeout=10, follow_redirects=True
++                ) as client:
 +                    response = await client.get(url)
 +                    response.raise_for_status()
 +                    return response.json()
@@ -15878,6 +17221,291 @@ print(f"{out}: {j - i - 1} lines")
 +        raise OSError("Tunnel connection failed: 403 words")
 +    except OSError as error:
 +        assert not _is_validation_error(error)
++
++
++# --- an exception's origin (rev 26, round-24 codex F001) ---------------------
++
++
++def test_a_builtin_raised_in_an_http_client_is_registered() -> None:
++    """Any exception an HTTP client's frame raises is registered, whatever
++    its type: here urllib's own `ValueError` for a URL it rejects, and
++    `ipaddress`'s, reached through urllib's redirect parsing. One raised in
++    pmcp's (or a test's) own frame is not, nor one a helper raises when
++    pmcp, not a client, called it, nor one with no traceback."""
++    import ipaddress
++    import urllib.parse
++    import urllib.request
++
++    from pmcp.argument_errors import (
++        _is_validation_error,
++        exception_origin,
++        exception_text,
++    )
++
++    s = _GRID_S
++    with pytest.raises(ValueError) as from_urllib:
++        urllib.request.Request(f"{s} is not a URL")
++    assert exception_origin(from_urllib.value) == "http"
++    assert s not in exception_text(from_urllib.value)
++
++    class Redirects(urllib.request.HTTPRedirectHandler):
++        pass
++
++    request = urllib.request.Request("https://registry.invalid/probe")
++    with pytest.raises(ValueError) as from_helper:
++        Redirects().http_error_302(
++            request, None, 302, "Found", {"location": f"https://[{s}]/"}
++        )
++    assert exception_origin(from_helper.value) == "http"
++    assert s not in exception_text(from_helper.value)
++
++    with pytest.raises(ValueError) as own:
++        raise ValueError(s)
++    assert exception_origin(own.value) is None
++    assert not _is_validation_error(own.value)
++
++    with pytest.raises(ValueError) as helper_from_pmcp:
++        ipaddress.ip_address(s)
++    assert exception_origin(helper_from_pmcp.value) is None
++    with pytest.raises(ValueError):
++        urllib.parse.urlsplit(f"http://[{s}]/")
++    assert exception_origin(ValueError(s)) is None
++
++
++def test_a_client_calling_back_into_other_code_is_not_the_clients() -> None:
++    """A client that calls back (an httpx transport, an event hook) into
++    code that is not its own: what that code raises is that code's."""
++    import httpx
++
++    from pmcp.argument_errors import exception_origin
++
++    s = _GRID_S
++
++    def handler(request: Any) -> Any:
++        raise ValueError(s)
++
++    with pytest.raises(ValueError) as caught:
++        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
++            client.get("http://callback.invalid/")
++    assert exception_origin(caught.value) is None
++
++
++# --- the MCP SDK's client transports (rev 26, round-24 claude F001) ---------
++
++
++def _sdk_transport_handler(kind: str, s: str) -> Callable[[Any], None]:
++    import time
++
++    def reply(status: str, headers: dict[str, str], body: str) -> bytes:
++        head = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
++        return (
++            f"HTTP/1.1 {status}\r\n{head}Content-Length: {len(body)}\r\n\r\n{body}"
++        ).encode()
++
++    def handle(conn: Any) -> None:
++        try:
++            line = conn.recv(65536).decode("latin-1").split("\r\n", 1)[0]
++            _GRID_REQUESTS.append(line.encode())
++            if kind == "content-type":
++                conn.sendall(reply("200 OK", {"Content-Type": f"text/{s}"}, "{}"))
++            elif kind == "sse-event":
++                body = f"event: {s}\ndata: {{}}\n\n"
++                conn.sendall(
++                    reply("200 OK", {"Content-Type": "text/event-stream"}, body)
++                )
++            elif line.startswith("GET"):  # legacy SSE: an endpoint elsewhere
++                body = f"event: endpoint\ndata: http://{s}.example/messages\n\n"
++                conn.sendall(
++                    (
++                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
++                        + body
++                    ).encode()
++                )
++                time.sleep(2)
++        except OSError:
++            pass
++        finally:
++            conn.close()
++
++    return handle
++
++
++@pytest.mark.parametrize(
++    ("kind", "transport"),
++    [
++        ("content-type", "http"),
++        ("content-type", "sse"),
++        ("sse-event", "http"),
++        ("sse-event", "sse"),
++        ("sse-endpoint", "sse"),
++    ],
++)
++def test_no_sdk_transport_rejection_reaches_any_output(
++    kind: str,
++    transport: str,
++    caplog: pytest.LogCaptureFixture,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """The SDK's client transports answer a request themselves with text
++    they format from the response (`Unexpected content type: text/<S>`), and
++    log rejected values (`Unknown SSE event: <S>`, an endpoint on another
++    origin with its traceback). Through pmcp's connect path, over both
++    remote transports: the connect errors, `gateway.health`'s error, every
++    log record at DEBUG and its traceback. (An `endpoint` event exists only
++    on legacy SSE.)"""
++    import socket
++    import threading
++
++    import pmcp  # noqa: F401 - installs the scrubbers
++
++    s = _GRID_S
++    for name in (
++        "HTTPS_PROXY",
++        "https_proxy",
++        "HTTP_PROXY",
++        "http_proxy",
++        "ALL_PROXY",
++        "all_proxy",
++    ):
++        monkeypatch.delenv(name, raising=False)
++    caplog.set_level(logging.DEBUG)
++    listener = socket.socket()
++    listener.bind(("127.0.0.1", 0))
++    listener.listen(64)
++    handle = _sdk_transport_handler(kind, s)
++
++    def loop() -> None:
++        while True:
++            try:
++                conn, _ = listener.accept()
++            except OSError:
++                return
++            threading.Thread(target=handle, args=(conn,), daemon=True).start()
++
++    threading.Thread(target=loop, daemon=True).start()
++    path = "sse" if transport == "sse" else "mcp"
++    _GRID_URL[0] = f"http://127.0.0.1:{listener.getsockname()[1]}/{path}"
++    before = len(_GRID_REQUESTS)
++    try:
++        try:
++            errors, last = asyncio.run(
++                asyncio.wait_for(_drive_remote(transport, 0), 25)
++            )
++            outcome = json.dumps([errors, last], default=str)
++        except Exception as error:  # noqa: BLE001 -- inspected
++            from pmcp.argument_errors import exception_text, safe_traceback_text
++
++            outcome = exception_text(error) + safe_traceback_text(error)
++    finally:
++        listener.close()
++    assert len(_GRID_REQUESTS) > before, "never connected"
++    texts = {
++        "result (connect errors, gateway.health)": outcome,
++        "log": "\n".join(_record_text(record) for record in caplog.records),
++    }
++    leaked = {
++        surface: text[:400]
++        for surface, text in texts.items()
++        if any(form in text for form in _forbidden_any_case(s))
++    }
++    assert not leaked, leaked
++
++
++def _raised_at(site: str, error: BaseException) -> BaseException:
++    """``error``, raised from a frame at ``site`` (``path::function`` in the
++    installed `mcp` package): the classifier reads only the frame's file and
++    function name."""
++    from pathlib import Path
++
++    import mcp
++
++    path, function = site.split("::")
++    filename = str(Path(mcp.__file__).parent / path)
++    namespace: dict[str, Any] = {}
++    exec(  # noqa: S102 -- a frame with the SDK's file name, for the test
++        compile(f"def {function}(error):\n    raise error\n", filename, "exec"),
++        namespace,
++    )
++    try:
++        namespace[function](error)
++    except BaseException as raised:  # noqa: BLE001 -- returned
++        return raised
++    raise AssertionError("not raised")
++
++
++def test_an_sdk_raised_error_is_withheld_unless_reviewed() -> None:
++    """Rev 26: an exception the SDK raises keeps its text only when that is
++    a literal of the SDK's source, a reviewed template, or -- at a site that
++    relays an `ErrorData` -- a message matching no template the SDK builds."""
++    from mcp.shared.exceptions import MCPError
++
++    from pmcp.argument_errors import exception_text
++    from pmcp.sdk_rejections import withheld_sdk_error
++
++    s = _GRID_S
++    relay = "shared/jsonrpc_dispatcher.py::send_raw_request"
++    other = "client/sse.py::sse_reader"
++    cases = [
++        (relay, MCPError(-32600, f"Unexpected content type: text/{s}"), True),
++        (relay, MCPError(-32603, f"the downstream's own words {s}"), False),
++        (other, ValueError(f"Endpoint origin does not match: http://{s}/"), True),
++        (other, MCPError(-32000, "Connection closed"), False),
++        (other, RuntimeError(""), False),
++    ]
++    for site, error, withheld in cases:
++        raised = _raised_at(site, error)
++        assert withheld_sdk_error(raised) is withheld, (site, error)
++        text = exception_text(raised)
++        assert (s in text) is (not withheld and s in str(error)), text
++    assert not withheld_sdk_error(MCPError(-32600, f"Unexpected content type: {s}"))
++
++
++def test_a_body_pmcp_decodes_itself_is_described_by_its_codec() -> None:
++    """A `UnicodeDecodeError` raised in pmcp's (here a test's) own frame is
++    not an HTTP client's by origin, so its class registration is what
++    describes it: by codec, never the bytes (rev 26: M154)."""
++    from pmcp.argument_errors import exception_origin, exception_text
++
++    s = _GRID_S
++    with pytest.raises(UnicodeDecodeError) as caught:
++        (s.encode() + b"\xff\xfe").decode("utf-8")
++    assert exception_origin(caught.value) is None
++    text = exception_text(caught.value)
++    assert text == "could not decode utf-8 text (UnicodeDecodeError)", text
++
++
++def test_an_sdk_record_prints_its_traceback_by_class() -> None:
++    """Every `mcp.*` record's traceback keeps its frames and prints each
++    exception by its class alone, whatever the exception (rev 26: M180)."""
++    import logging
++
++    import pmcp  # noqa: F401 - installs the scrubbers
++
++    s = _GRID_S
++    records: list[logging.LogRecord] = []
++
++    class Capture(logging.Handler):
++        def emit(self, record: logging.LogRecord) -> None:
++            records.append(record)
++
++    logger = logging.getLogger("mcp.client.streamable_http")
++    handler = Capture()
++    logger.addHandler(handler)
++    saved = logger.level
++    logger.setLevel(logging.DEBUG)
++    try:
++        try:
++            raise RuntimeError(f"not registered {s}")
++        except RuntimeError:
++            logger.exception("Error in post_writer")
++    finally:
++        logger.removeHandler(handler)
++        logger.setLevel(saved)
++    (record,) = records
++    assert record.exc_info is None
++    assert record.exc_text and "Traceback (most recent call last)" in record.exc_text
++    assert record.exc_text.rstrip().endswith("RuntimeError"), record.exc_text
++    assert s not in _record_text(record)
 ````
 
 ### Patch — `tests/test_pkgid_panel_fixes.py`
@@ -16273,40 +17901,30 @@ print(f"{out}: {j - i - 1} lines")
 
 Run it as `PYTHONDONTWRITEBYTECODE=1 python mutants.py <worktree> <out-dir> [M4 ...]`; `NO_STATIC=1` deselects both sink checks, `DESELECT="<nodeid> ..."` deselects the named tests (rev 24), and `PYCMD="uv run --isolated --all-extras -p 3.10 python"` runs each mutant in a fresh environment (rev 25). Without the bytecode setting, a same-size first mutant written in the checkout's mtime second leaves a stale `.pyc` (see *Mutation evidence*).
 
-To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e`, `0dc22a4`, `40e2ba4`, `acf99e9`, `d73d6cb`, `7bcb209`, `221115a`, `5054a76` and `6b17d3d`, in that order. Then apply this diff (rev 25: M155, M164, M169–M172, M174 retired; M156–M159, M162, M163 re-anchored; M175, M176 added; `PYCMD`).
+To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e`, `0dc22a4`, `40e2ba4`, `acf99e9`, `d73d6cb`, `7bcb209`, `221115a`, `5054a76`, `6b17d3d` and `ef7ad60`, in that order. Then apply this diff (rev 26: M165 retired; M45, M125, M168 re-anchored; M177–M185 added).
 
 ````diff
 --- a/mutants.py
 +++ b/mutants.py
-@@ -155,5 +155,4 @@
-- ("M155 a response-decoding error described by its own text", A, [("            return f\"could not decode an HTTP response ({name})\"\n", "            return f\"could not decode an HTTP response: {error}\"\n")]),
-- ("M156 aiohttp's ClientResponseError not registered", A, [("        \"ClientResponseError\",  # parser failures, ContentTypeError, statuses\n", "")]),
-- ("M157 http.client's HTTPException not registered", A, [("    \"http.client\": (\"HTTPException\",),  # BadStatusLine, LineTooLong, ...\n", "    \"http.client\": (),\n")]),
-- ("M158 httpcore2's ProtocolError not registered", A, [("    \"httpcore2\": (\"ProtocolError\", \"ProxyError\", \"UnsupportedProtocol\"),\n", "    \"httpcore2\": (\"ProxyError\", \"UnsupportedProtocol\"),\n")]),
-- ("M159 a rejected HTTP response described by its own text", A, [("        return f\"rejected an HTTP response ({name}{where})\"\n", "        return f\"rejected an HTTP response: {error}\"\n")]),
-+ ("M156 aiohttp's ClientError not registered", A, [('        "ClientError",\n        "BadContentDispositionHeader",\n', '        "BadContentDispositionHeader",\n')]),
-+ ("M157 http.client's HTTPException not registered", A, [('    "http.client": ("HTTPException",),\n', '    "http.client": (),\n')]),
-+ ("M158 httpcore2's ProtocolError not registered", A, [('    "httpcore2": (\n        "ConnectionNotAvailable",\n        "NetworkError",\n        "ProtocolError",\n', '    "httpcore2": (\n        "ConnectionNotAvailable",\n        "NetworkError",\n')]),
-+ ("M159 an HTTP client error described by its own text", A, [('        return f"an HTTP request failed ({type(error).__name__}{where})"\n', '        return f"an HTTP request failed: {error}"\n')]),
-@@ -167,3 +166,2 @@
-- ("M162 httpx's ProxyError not registered", A, [('        "HTTPStatusError",\n        "ProxyError",\n        "UnsupportedProtocol",\n    ),\n    "httpx2": (', '        "HTTPStatusError",\n        "UnsupportedProtocol",\n    ),\n    "httpx2": (')]),
-- ("M163 httpx2's and httpcore2's ProxyError not registered", A, [('        "SSEError",\n        "ProxyError",\n', '        "SSEError",\n'), ('    "httpcore2": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),\n', '    "httpcore2": ("ProtocolError", "UnsupportedProtocol"),\n')]),
-- ("M164 ProxyError back to value-free with rev 23's reason", (A, PE), [(A, '        "HTTPStatusError",\n        "ProxyError",\n        "UnsupportedProtocol",\n    ),\n    "httpx2": (', '        "HTTPStatusError",\n        "UnsupportedProtocol",\n    ),\n    "httpx2": ('), (A, '        "SSEError",\n        "ProxyError",\n', '        "SSEError",\n'), (A, '    "httpcore": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),\n    "httpcore2": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),\n', '    "httpcore": ("ProtocolError", "UnsupportedProtocol"),\n    "httpcore2": ("ProtocolError", "UnsupportedProtocol"),\n'), (PE, '        "ReadTimeout": _TIMEOUT,\n        "RequestError": _BASE,\n', '        "ReadTimeout": _TIMEOUT,\n        "ProxyError": "the operator\'s proxy refused the tunnel",\n        "RequestError": _BASE,\n'), (PE, '        "ReadTimeout": _TIMEOUT,\n        "TimeoutException": _TIMEOUT,\n        "WriteError": _CONNECT,\n', '        "ReadTimeout": _TIMEOUT,\n        "ProxyError": "the operator\'s proxy refused the tunnel",\n        "TimeoutException": _TIMEOUT,\n        "WriteError": _CONNECT,\n')]),
-+ ("M162 httpx's HTTPError not registered", A, [('    "httpx": ("HTTPError", "InvalidURL", "CookieConflict", "StreamError"),\n', '    "httpx": ("InvalidURL", "CookieConflict", "StreamError"),\n')]),
-+ ("M163 httpx2's HTTPError and httpcore2's NetworkError not registered", A, [('    "httpx2": ("HTTPError", "InvalidURL", "CookieConflict", "StreamError"),\n', '    "httpx2": ("InvalidURL", "CookieConflict", "StreamError"),\n'), ('    "httpcore2": (\n        "ConnectionNotAvailable",\n        "NetworkError",\n', '    "httpcore2": (\n        "ConnectionNotAvailable",\n')]),
-@@ -174,4 +171,0 @@
-- ("M169 aiohttp's connection errors not registered", A, [('        # Every connection error (rev 24): its text names the host, port or\n        # URL it connected to, which a followed redirect\'s `Location` chose.\n        "ClientConnectionError",\n', '')]),
-- ("M170 a connection error described by its text", A, [('            return f"the connection failed ({name}{where})"\n', '            return f"the connection failed: {error}"\n')]),
-- ("M171 httpx2's and httpcore2's UnsupportedProtocol not registered", A, [('        "ProxyError",\n        "UnsupportedProtocol",\n    ),\n    "httpcore": (', '        "ProxyError",\n    ),\n    "httpcore": ('), ('    "httpcore2": ("ProtocolError", "ProxyError", "UnsupportedProtocol"),\n', '    "httpcore2": ("ProtocolError", "ProxyError"),\n')]),
-- ("M172 aiohttp's WSMessageTypeError not registered", A, [('        "WSMessageTypeError",  # quotes the message\'s data (rev 24)\n', '')]),
-@@ -179 +173,2 @@
-- ("M174 a URLError over a refused tunnel not registered by origin", A, [("        if isinstance(error, urllib.error.URLError) and isinstance(\n            error.reason, BaseException\n        ):\n            return _tunnel_refusal_status(error.reason)\n", "")]),
-+ ("M175 urllib's URLError not registered by class", A, [('    "urllib.error": ("URLError",),\n', '    "urllib.error": (),\n')]),
-+ ("M176 httpcore's NetworkError not registered", A, [('    "httpcore": (\n        "ConnectionNotAvailable",\n        "NetworkError",\n', '    "httpcore": (\n        "ConnectionNotAvailable",\n')]),
-@@ -209 +204,4 @@
--    r = subprocess.run([str(root / ".venv/bin/python"), "-m", "pytest", *TESTS, "-q", "-p", "no:cacheprovider", "-x", "--tb=line", *extra],
-+    # rev 25: PYCMD (e.g. `uv run --isolated --all-extras -p 3.10 python`)
-+    # runs each mutant in a fresh environment, free of host startup hooks.
-+    python = os.environ.get("PYCMD", "").split() or [str(root / ".venv/bin/python")]
-+    r = subprocess.run([*python, "-m", "pytest", *TESTS, "-q", "-p", "no:cacheprovider", "-x", "--tb=line", *extra],
+@@ -64 +64 @@
+- ("M45 unqualified class name", A, [('                f"{_qualified_name(type(current))}: {_validation_text(current)}\\n"\n', '                f"{type(current).__name__}: {_validation_text(current)}\\n"\n')]),
++ ("M45 unqualified class name", A, [("        name = _qualified_name(type(current))\n", "        name = type(current).__name__\n")]),
+@@ -127 +127 @@
+- ("M125 the traceback renders a wrapper node from its own message", A, [('                    f"{_qualified_name(type(current))}: {_validation_text(linked)}\\n"\n', '                    f"{_qualified_name(type(current))}: {current}\\n"\n')]),
++ ("M125 the traceback renders a wrapper node from its own message", A, [("        return None if linked is None else _validation_text(linked)\n", "        return None if linked is None else str(current)\n")]),
+@@ -168 +167,0 @@
+- ("M165 urllib's refused tunnel not recognised", A, [("    return _tunnel_refusal_status(error) is not False\n", "    return False\n")]),
+@@ -171 +170 @@
+- ("M168 a link beneath a registered error printed with its text", A, [('                parts.append(f"{_qualified_name(type(current))}\\n")\n', '                parts.append(f"{_qualified_name(type(current))}: {current}\\n")\n')]),
++ ("M168 a link beneath a registered error printed with its text", A, [("        return None if linked is None else _validation_text(linked)\n", "        return str(current) if linked is None else _validation_text(linked)\n")]),
+@@ -174,0 +174,9 @@
++ ("M177 only the SDK's server and shared loggers masked", "src/pmcp/sdk_rejections.py", [('SDK_LOGGERS = ("mcp", "sse_starlette")\n', 'SDK_LOGGERS = ("mcp.server", "mcp.shared", "sse_starlette")\n')]),
++ ("M178 the SDK's literal logger names not derived", "src/pmcp/sdk_rejections.py", [("                names.add(argument.value)\n", "                pass\n")]),
++ ("M179 a message the SDK pre-built is kept", "src/pmcp/sdk_rejections.py", [("        # `.format` before the call): masked whole (rev 26).\n        record.msg, record.args = _PLACEHOLDER, None\n", "        # `.format` before the call): masked whole (rev 26).\n        pass\n")]),
++ ("M180 the SDK's tracebacks keep each exception's text", "src/pmcp/sdk_rejections.py", [("            record.exc_text = class_only_traceback_text(error)\n            record.exc_info = None\n", "            pass\n")]),
++ ("M181 an SDK-raised error never withheld", A, [("    return withheld_sdk_error(error)\n", "    return False\n")]),
++ ("M182 a relayed SDK-built message kept", "src/pmcp/client/manager.py", [("    if sdk_built_message(message, code):\n", "    if False:\n")]),
++ ("M183 a relayed message kept whatever it matches", "src/pmcp/sdk_rejections.py", [('    return sdk_built_message(text, getattr(error, "code", None))\n', "    return False\n")]),
++ ("M184 an HTTP client's built-in not registered by origin", A, [('    if exception_origin(error) == "http":\n        return True\n', "")]),
++ ("M185 a helper frame decides the origin", A, [('        if kind == "helper":\n            continue\n', '        if kind == "helper":\n            return None\n')]),
 ````
