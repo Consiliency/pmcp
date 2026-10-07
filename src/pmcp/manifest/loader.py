@@ -1957,7 +1957,12 @@ def _gather_overlay_sources(
             # tools/handlers.py, still answers None for it. User and env
             # scope are the operator's own files and stay ungated. The gate
             # reads the file once; its bytes are the ones keyed and parsed.
-            content, decision = read_and_gate(overlay_path, "project_manifest")
+            # <project>/.pmcp/manifest.yaml: judged with its project's root.
+            content, decision = read_and_gate(
+                overlay_path,
+                "project_manifest",
+                project_root=overlay_path.parent.parent,
+            )
             sources.append(
                 _OverlaySource(
                     label,

@@ -224,7 +224,13 @@ def _why_refused(path: Path) -> ConsentReason:
     return "no_record"
 
 
-def gate_bytes(path: Path, content: bytes, kind: ProjectSourceKind) -> ConsentDecision:
+def gate_bytes(
+    path: Path,
+    content: bytes,
+    kind: ProjectSourceKind,
+    *,
+    project_root: Path | None = None,
+) -> ConsentDecision:
     """Has the operator approved exactly ``content`` being applied as ``path``?
 
     For callers that already hold the bytes -- those bytes are what is judged,
@@ -233,11 +239,18 @@ def gate_bytes(path: Path, content: bytes, kind: ProjectSourceKind) -> ConsentDe
 
     Never raises. Every failure answers ``allowed=False``.
     """
-    return _gate_resolved(_resolve(path), content, kind, source=path)
+    return _gate_resolved(
+        _resolve(path), content, kind, source=path, project_root=project_root
+    )
 
 
 def _gate_resolved(
-    target: Path, content: bytes, kind: ProjectSourceKind, *, source: Path
+    target: Path,
+    content: bytes,
+    kind: ProjectSourceKind,
+    *,
+    source: Path,
+    project_root: Path | None = None,
 ) -> ConsentDecision:
     """Judge ``content`` for a target that has ALREADY been resolved, once.
 
@@ -247,7 +260,9 @@ def _gate_resolved(
     the gate judge a different file from the one whose bytes were read.
     """
     try:
-        approved = trust_store.is_approved(target, content)
+        # ``project_root``: the project the reader is bound to, judged with the
+        # file's own checkout for residency (Consiliency/pmcp#372 round 17).
+        approved = trust_store.is_approved(target, content, project_root=project_root)
     except Exception:  # noqa: BLE001 - see module docstring: failures are refusals
         # `is_approved` promises never to raise. This is defence in depth: if
         # that promise is ever broken, the break must not read as permission.
@@ -265,7 +280,7 @@ def _gate_resolved(
 
 
 def read_and_gate(
-    path: Path, kind: ProjectSourceKind
+    path: Path, kind: ProjectSourceKind, *, project_root: Path | None = None
 ) -> tuple[bytes | None, ConsentDecision]:
     """Read ``path`` **once**, gate those bytes, and hand them back if allowed.
 
@@ -286,7 +301,7 @@ def read_and_gate(
         return None, _refusal(target, kind, "unreadable", path)
 
     decision = replace(
-        _gate_resolved(target, content, kind, source=path),
+        _gate_resolved(target, content, kind, source=path, project_root=project_root),
         content_sha256=hashlib.sha256(content).hexdigest(),
     )
     return (content if decision.allowed else None), decision

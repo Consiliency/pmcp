@@ -409,7 +409,10 @@ def _gate_project_config(path: Path) -> tuple[bytes | None, ConsentDecision | No
     """
     if not path.exists():
         return None, None
-    content, decision = read_and_gate(path, "project_mcp_json")
+    # The project is the directory holding the .mcp.json being judged.
+    content, decision = read_and_gate(
+        path, "project_mcp_json", project_root=path.parent
+    )
     if not decision.allowed:
         log_refusal(decision, logger)
         return None, decision
@@ -916,7 +919,7 @@ def set_startup_policy(
     # approved? Keyed verbatim on the pinned canonical path -- never re-resolved,
     # so a swap of `target.path` cannot redirect the lookup to another file.
     was_approved = input_bytes is not None and trust_store.is_approved_resolved(
-        pinned_key, input_bytes
+        pinned_key, input_bytes, project_root=project_root
     )
 
     names = sorted({name for name in operation.names if name})

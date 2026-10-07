@@ -1691,3 +1691,218 @@ def test_a_long_lived_object_built_in_a_stays_in_a_after_a_chdir(
         assert not built.is_server_allowed("only-a-denies")
         assert built.is_server_allowed("only-b-denies")
     assert built._project_root == roots["a"]
+
+
+# --------------------------------------------------------------------------- #
+# Boards round 16, grok and codex F001: the trust-store residency guard judged
+# with the launch checkout (cwd) and a global, not the object's bound project.
+# A gateway built in A, run after chdir(B), read A's files while the guard no
+# longer covered A -- so a ~/.config/pmcp linked into A let A's trust.json
+# approve A's own .mcp.json. The guard now judges against the approved file's
+# own checkout and the reader's bound root as well.
+# --------------------------------------------------------------------------- #
+
+
+def test_grok_r16_f001_a_bound_gateway_refuses_its_checkouts_trust_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """grok r16 F001, verbatim in substance."""
+    import json
+
+    from pmcp import trust_store
+    from pmcp.config.loader import load_configs
+    from pmcp.server import GatewayServer
+
+    key = "OPERATOR_TOKEN"
+    home = tmp_path / "home"
+    (home / ".config").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv(key, "operator-secret")
+    monkeypatch.delenv("PMCP_CONFIG", raising=False)
+    monkeypatch.delenv("PMCP_MANIFEST_PATH", raising=False)
+    trust_store.set_active_project_root(None)
+    checkout = tmp_path / "checkout"
+    elsewhere = tmp_path / "elsewhere"
+    for root in (checkout, elsewhere):
+        (root / ".git").mkdir(parents=True)
+    project_config = checkout / ".mcp.json"
+    project_config.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "review-remote": {
+                        "type": "streamable-http",
+                        "url": "https://checkout.example.invalid/mcp",
+                        "headers": {"Authorization": "Bearer ${" + key + "}"},
+                    }
+                }
+            }
+        )
+    )
+    planted = checkout / "planted-config"
+    planted.mkdir()
+    (home / ".config" / "pmcp").symlink_to(planted)
+    monkeypatch.chdir(elsewhere)
+    trust_store.record(
+        project_config,
+        project_config.read_bytes(),
+        trust_store.PROJECT_SCOPE,
+        trust_store.APPROVED,
+    )
+    monkeypatch.chdir(checkout)
+    gateway = GatewayServer(cache_dir=tmp_path / "cache")
+    inside = {c.name for c in load_configs(project_root=gateway._project_root)}
+    assert "review-remote" not in inside
+    monkeypatch.chdir(elsewhere)
+    after = {c.name for c in load_configs(project_root=gateway._project_root)}
+    assert gateway._project_root == checkout.resolve()
+    assert "review-remote" not in after
+
+
+def test_codex_r16_f001_a_bound_gateway_refuses_checkout_resident_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex r16 F001, verbatim in substance."""
+    import hashlib
+    import json
+
+    from pmcp import trust_store
+    from pmcp.server import GatewayServer
+
+    monkeypatch.setattr(trust_store, "_active_project_root", None)
+    monkeypatch.setattr(cli, "find_dotenv", lambda: "")
+    for key in ("PMCP_CONFIG", "PMCP_POLICY", "PMCP_MANIFEST_PATH"):
+        monkeypatch.delenv(key, raising=False)
+    home = tmp_path / "home"
+    (home / ".config").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    project_a, project_b = tmp_path / "a", tmp_path / "b"
+    for project in (project_a, project_b):
+        (project / ".git").mkdir(parents=True)
+    store_dir = project_a / "store"
+    store_dir.mkdir()
+    (home / ".config" / "pmcp").symlink_to(store_dir, target_is_directory=True)
+    config = project_a / ".mcp.json"
+    content = json.dumps(
+        {"mcpServers": {"review-unapproved": {"command": "echo"}}}
+    ).encode()
+    config.write_bytes(content)
+    (store_dir / "trust.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "records": [
+                    {
+                        "absolute_path": str(config.resolve()),
+                        "content_sha256": hashlib.sha256(content).hexdigest(),
+                        "scope": "project",
+                        "decision": "approved",
+                        "recorded_at": "2026-10-07T00:00:00+00:00",
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.chdir(project_a)
+    gateway = GatewayServer(cache_dir=tmp_path / "cache")
+    assert "review-unapproved" not in (
+        gateway._gateway_tools._load_all_configured_servers()
+    )
+    monkeypatch.chdir(project_b)
+    assert gateway._project_root == project_a
+    assert "review-unapproved" not in (
+        gateway._gateway_tools._load_all_configured_servers()
+    )
+
+
+def _plant_store_in(roots: dict[str, Path]) -> None:
+    """~/.config/pmcp is a link into A: every approval store resolves inside A."""
+    import shutil
+
+    target = roots["a"] / "planted-config"
+    target.mkdir()
+    pmcp_dir = roots["home"] / ".config" / "pmcp"
+    shutil.rmtree(pmcp_dir)
+    pmcp_dir.symlink_to(target, target_is_directory=True)
+
+
+@pytest.mark.parametrize("obj", ["GatewayServer", "GatewayTools", "PolicyManager"])
+def test_a_bound_object_refuses_its_projects_self_approval_after_a_chdir(
+    obj: str, roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Built in A, used after chdir(B): A's own approval store is still refused."""
+    from unittest.mock import MagicMock
+
+    from pmcp import trust_store
+    from pmcp import server as server_module
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+
+    key = "REVIEW_SHARED_TOKEN"
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("PMCP_MANIFEST_PATH", raising=False)
+    monkeypatch.setattr(cli, "find_dotenv", lambda: "")
+    trust_store.set_active_project_root(None)
+    # Approvals recorded while the store was the operator's, then the store is
+    # moved inside A -- as a repository that ships ~/.config/pmcp would.
+    _distinct_projects(roots, key)
+    approvals = (roots["home"] / ".config" / "pmcp" / "trust.json").read_bytes()
+    _plant_store_in(roots)
+    (roots["a"] / "planted-config" / "trust.json").write_bytes(approvals)
+
+    # cwd is a (fixture)
+    if obj == "GatewayServer":
+        built = server_module.GatewayServer(cache_dir=roots["base"] / "cache")
+        monkeypatch.chdir(roots["b"])
+        names = set(built._gateway_tools._load_all_configured_servers())
+        assert "local-a" not in names
+        assert built._policy_manager.is_server_allowed("only-a-denies")
+    elif obj == "GatewayTools":
+        built = GatewayTools(client_manager=MagicMock(), policy_manager=PolicyManager())
+        monkeypatch.chdir(roots["b"])
+        assert "local-a" not in set(built._load_all_configured_servers())
+        from pmcp.manifest.loader import load_manifest
+
+        overlay = load_manifest(project_root=built._project_root)
+        assert "review-remote" not in overlay.servers
+    else:
+        monkeypatch.chdir(roots["a"])
+        built = PolicyManager()  # discovers at construction, in a
+        monkeypatch.chdir(roots["b"])
+        assert built.is_server_allowed("only-a-denies")
+    assert built._project_root == roots["a"]
+
+
+def test_a_bound_policy_refuses_its_projects_package_approvals_after_a_chdir(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The provision gate judges package-approval residency by the bound project."""
+    from pmcp import trust_store
+    from pmcp.manifest.loader import ServerConfig
+    from pmcp.package_approvals import approve_package
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.provision_gate import evaluate_provision
+    from pmcp.manifest.package_identity import PackageIdentity
+
+    trust_store.set_active_project_root(None)
+    identity = PackageIdentity("npm", "example-mcp", "1.2.3", None)
+    config = ServerConfig(
+        name="srv",
+        description="",
+        keywords=[],
+        install={"linux": ["npx", "-y", "example-mcp@1.2.3"]},
+        command="npx",
+        args=["-y", "example-mcp@1.2.3"],
+    )
+    approve_package(identity)  # by the operator, store outside every checkout
+    stored = (
+        roots["home"] / ".config" / "pmcp" / "package_approvals.json"
+    ).read_bytes()
+    _plant_store_in(roots)  # now the store resolves inside A
+    (roots["a"] / "planted-config" / "package_approvals.json").write_bytes(stored)
+
+    policy = PolicyManager()  # bound in a
+    monkeypatch.chdir(roots["b"])
+    decision = evaluate_provision(config, identity, source="configured", policy=policy)
+    assert decision.reason != "package_approved"
+    assert not decision.allowed

@@ -1643,3 +1643,97 @@ def test_the_bound_object_scan_sees_each_shape() -> None:
         "Unbound",
         "Rebinds",
     }
+
+
+# --------------------------------------------------------------------------- #
+# The residency guard is a project-scoped input too (Consiliency/pmcp#372 round
+# 17, boards round 16 grok/codex F001): a gateway built in A whose cwd moved to
+# B judged A's files with only the cwd arm, so a trust store resident in A
+# approved A's own .mcp.json. Every approval read names the project being read
+# -- the bound root in a long-lived object -- and the guard also walks up from
+# the file being approved; the launch checkout stays an extra refusal arm.
+# --------------------------------------------------------------------------- #
+
+#: Approval reads and the parameter that names the project being read.
+RESIDENCY_GATES: dict[str, tuple[str, int | None]] = {
+    "read_and_gate": ("project_root", None),
+    "gate_bytes": ("project_root", None),
+    "is_approved": ("project_root", None),
+    "is_approved_resolved": ("project_root", None),
+    "is_package_approved": ("project_root", None),
+    "package_approvals_path": ("project_root", None),
+}
+
+#: ``(module, function)`` -> why it may read approvals naming no project.
+#: Asserted exact.
+UNSCOPED_APPROVAL_READS = {
+    ("pmcp.package_approvals", "approve_package"): (
+        "`pmcp approve-package`, the operator's own verb: judged by the "
+        "served root and the launch checkout, as every `pmcp trust` verb is"
+    ),
+    ("pmcp.package_approvals", "revoke_package"): "the operator's own verb",
+    ("pmcp.package_approvals", "list_package_approvals"): "the operator's own verb",
+}
+
+
+def unscoped_approval_reads(sources: dict[str, str]) -> tuple[set, list[str]]:
+    found: set[tuple[str, str]] = set()
+    unbound: list[str] = []
+    bound_classes = {cls for _m, cls in BOUND_OBJECTS}
+    for module, tree, aliases in _module_trees(sources):
+        for name, fn in _qualified_functions(tree):
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call):
+                    continue
+                called = _called_name(node.func, aliases)
+                if called not in RESIDENCY_GATES:
+                    continue
+                value = _passed(node, RESIDENCY_GATES[called])
+                if value is None:
+                    found.add((module, name))
+                elif name.split(".")[0] in bound_classes and not _is_self_root(value):
+                    unbound.append(f"{module}:{name}:{node.lineno} {called}")
+    return found, unbound
+
+
+def test_every_approval_read_names_the_project_it_reads() -> None:
+    found, unbound = unscoped_approval_reads(_src_sources())
+    assert found == set(UNSCOPED_APPROVAL_READS)
+    assert unbound == []
+
+
+def test_the_guard_judges_the_approved_files_own_checkout() -> None:
+    fn = _function("pmcp.trust_store", "is_approved_resolved")
+    calls = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "trust_store_path"
+    ]
+    assert calls and all(
+        any(
+            k.arg == "also"
+            and isinstance(k.value, ast.Call)
+            and getattr(k.value.func, "id", None) == "judged_roots"
+            for k in c.keywords
+        )
+        for c in calls
+    )
+
+
+def test_the_approval_scan_sees_each_shape() -> None:
+    source = (
+        "from pmcp.project_consent import read_and_gate\n"
+        "def unscoped(p):\n"
+        "    return read_and_gate(p, 'project_policy')\n"
+        "def scoped(p, root):\n"
+        "    return read_and_gate(p, 'project_policy', project_root=root)\n"
+        "class PolicyManager:\n"
+        "    def load(self, p):\n"
+        "        return read_and_gate(p, 'project_policy', project_root=None)\n"
+    )
+    found, unbound = unscoped_approval_reads({"pmcp.x": source})
+    assert found == {("pmcp.x", "unscoped")}
+    assert [line.split(" ")[0].split(":")[1] for line in unbound] == [
+        "PolicyManager.load"
+    ]

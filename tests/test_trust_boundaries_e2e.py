@@ -905,8 +905,8 @@ def test_s03_the_parsed_bytes_are_the_gated_bytes_at_every_loader(
         seen: list[Path] = []
         real = module.read_and_gate
 
-        def wrapper(path: Path, kind: str) -> Any:
-            result = real(path, kind)
+        def wrapper(path: Path, kind: str, **kwargs: Any) -> Any:
+            result = real(path, kind, **kwargs)
             if Path(path).resolve() == target.resolve():
                 seen.append(Path(path))
                 target.write_text(hostile)

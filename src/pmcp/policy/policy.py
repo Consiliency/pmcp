@@ -306,6 +306,11 @@ class PolicyManager:
 
         self._compile_redaction_patterns()
 
+    @property
+    def project_root(self) -> Path:
+        """The project this manager was bound to when it was built."""
+        return self._project_root
+
     def _discover_policies(self) -> None:
         """Find the user base policy and the candidate project overlay.
 
@@ -359,7 +364,9 @@ class PolicyManager:
         startup crash, which is a denial of service the operator never consented
         to either.
         """
-        content, decision = read_and_gate(policy_path, "project_policy")
+        content, decision = read_and_gate(
+            policy_path, "project_policy", project_root=self._project_root
+        )
         if content is None:
             log_refusal(decision, logger)
             return

@@ -317,10 +317,14 @@ def test_no_project_file_means_no_consent_gate_is_consulted(
             real = module.read_and_gate
 
             def _record(
-                path: Path, kind: str, _real: Any = real, _label: str = label
+                path: Path,
+                kind: str,
+                _real: Any = real,
+                _label: str = label,
+                **kwargs: Any,
             ) -> Any:
                 consulted.append((_label, path))
-                return _real(path, kind)
+                return _real(path, kind, **kwargs)
 
             monkeypatch.setattr(module, "read_and_gate", _record)
 

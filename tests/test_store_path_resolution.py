@@ -525,7 +525,7 @@ def test_a_deep_checkout_cannot_host_package_approvals_either(
     store.parent.mkdir(parents=True)
     os.symlink(planted, store)
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (checkout,))
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda *_a: (checkout,))
     with pytest.raises(TrustStoreError, match="inside the checkout"):
         package_approvals.package_approvals_path()
 
@@ -548,7 +548,9 @@ def test_residency_that_cannot_be_established_is_a_refusal(
             raise OSError(errno.ENAMETOOLONG, "File name too long")
         return real_open(p, flags, *a, **kw)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (base / "checkout",))
+    monkeypatch.setattr(
+        trust_store, "_checkout_roots", lambda *_a: (base / "checkout",)
+    )
     monkeypatch.setattr(os, "open", failing_open)
     with pytest.raises(TrustStoreError, match="cannot establish"):
         trust_store.refuse_checkout_resident(store, "Trust store")
@@ -612,7 +614,7 @@ def test_the_windows_residency_fallback_refuses_a_planted_store(
     (home / ".config" / "pmcp").mkdir(parents=True)
     os.symlink(planted, home / ".config" / "pmcp" / "trust.json")
     monkeypatch.setattr(Path, "home", lambda: home)
-    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (checkout,))
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda *_a: (checkout,))
     monkeypatch.setattr(trust_store, "os", _windows_os())
     assert not trust_store.is_approved(checkout / ".mcp.json", content)
 
@@ -636,7 +638,9 @@ def test_the_windows_residency_fallback_refuses_on_any_error(
         return real_stat(p, *a, **kw)  # type: ignore[arg-type]
 
     windows.stat = failing_stat
-    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (base / "checkout",))
+    monkeypatch.setattr(
+        trust_store, "_checkout_roots", lambda *_a: (base / "checkout",)
+    )
     monkeypatch.setattr(trust_store, "os", windows)
     with pytest.raises(TrustStoreError, match="cannot establish"):
         trust_store.refuse_checkout_resident(store, "Trust store")
@@ -654,7 +658,7 @@ def test_a_served_root_that_does_not_exist_yet_refuses_nothing(
     (home / ".config" / "pmcp").mkdir(parents=True)
     monkeypatch.setattr(Path, "home", lambda: home)
     monkeypatch.setattr(
-        trust_store, "_checkout_roots", lambda: (base / "not-created-yet",)
+        trust_store, "_checkout_roots", lambda *_a: (base / "not-created-yet",)
     )
     if walk == "windows fallback":
         monkeypatch.setattr(trust_store, "os", _windows_os())
@@ -800,7 +804,7 @@ def test_approval_reads_writes_and_residency_through_a_search_only_directory(
     trust_target.write_text('{"version": 1, "records": []}\n', encoding="utf-8")
     os.symlink(trust_target, home / ".config" / "pmcp" / "trust.json")
     monkeypatch.setattr(Path, "home", lambda: home)
-    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (checkout,))
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda *_a: (checkout,))
     identity = PackageIdentity(
         registry="npm", name="example-mcp", resolved_version="1.2.3", integrity=None
     )
@@ -852,7 +856,7 @@ def test_the_pathname_fallback_still_refuses_a_planted_store(
         vault / "approvals.json", home / ".config" / "pmcp" / "package_approvals.json"
     )
     monkeypatch.setattr(Path, "home", lambda: home)
-    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (checkout,))
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda *_a: (checkout,))
     os.chmod(vault, 0o311)
     try:
         with pytest.raises(TrustStoreError, match="inside the checkout"):

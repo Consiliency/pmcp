@@ -156,7 +156,7 @@ def _enclosing_checkouts(start: Path) -> Iterator[Path]:
         current = parent if parent != enclosing else None
 
 
-def _checkout_roots() -> tuple[Path, ...]:
+def _checkout_roots(also: tuple[Path, ...] = ()) -> tuple[Path, ...]:
     """Resolved checkout roots the store's residency is judged against.
 
     The store is refused if it resolves inside **any** of these. They are the
@@ -231,10 +231,23 @@ def _checkout_roots() -> tuple[Path, ...]:
     # case, EC-TRUST-5 cwd-subdirectory).
     for enclosing in _enclosing_checkouts(Path.cwd()):
         _add(enclosing)
+    # The roots pmcp is reading project inputs from for THIS judgement
+    # (Consiliency/pmcp#372 round 17, board round 16 F001): the directory of
+    # the file being approved and the project root its reader is bound to,
+    # each walked up to every enclosing checkout. A gateway built in A that
+    # later runs with its cwd in B still judges A's files against A's
+    # checkout: the cwd arm alone left a store inside A free to approve A's own
+    # content. Not kept verbatim (unlike an explicitly served root): a bound
+    # root can be a plain directory -- the home directory pmcp was started in
+    # -- which is no checkout and must not refuse the operator's own store.
+    # Adding roots only refuses more.
+    for root in also:
+        for enclosing in _enclosing_checkouts(root):
+            _add(enclosing)
     return tuple(roots)
 
 
-def trust_store_path() -> Path:
+def trust_store_path(*, also: tuple[Path, ...] = ()) -> Path:
     """Resolved path of the user-scoped trust store.
 
     Raises ``TrustStoreError`` if the store would land inside a checkout being
@@ -245,12 +258,16 @@ def trust_store_path() -> Path:
     planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
     path = (Path.home() / ".config" / "pmcp" / "trust.json").resolve()
-    refuse_checkout_resident(path, "Trust store")
+    refuse_checkout_resident(path, "Trust store", also=also)
     return path
 
 
 def refuse_checkout_resident(
-    path: Path | str, label: str, *, dir_fd: int | None = None
+    path: Path | str,
+    label: str,
+    *,
+    dir_fd: int | None = None,
+    also: tuple[Path, ...] = (),
 ) -> None:
     """Raise ``TrustStoreError`` if ``path``'s directory lies inside a judged checkout.
 
@@ -262,7 +279,7 @@ def refuse_checkout_resident(
     """
     name = os.path.basename(os.fspath(path))
     try:
-        checkout = _resident_checkout(path, _checkout_roots(), dir_fd=dir_fd)
+        checkout = _resident_checkout(path, _checkout_roots(also), dir_fd=dir_fd)
     except OSError as exc:
         raise TrustStoreError(
             f"{label} {name}: cannot establish that it lies outside every "
@@ -543,7 +560,22 @@ def _store_lock(path: Path) -> Iterator[None]:
         os.close(fd)
 
 
-def is_approved(path: Path, content: bytes) -> bool:
+def judged_roots(target: Path, project_root: Path | None) -> tuple[Path, ...]:
+    """The roots a judgement of ``target`` adds to the residency guard.
+
+    The directory of the file being approved, and the project root its reader
+    is bound to (``None``: none beyond the file's own). See
+    :func:`_checkout_roots`.
+    """
+    roots = [target.parent]
+    if project_root is not None:
+        roots.append(Path(project_root))
+    return tuple(roots)
+
+
+def is_approved(
+    path: Path, content: bytes, *, project_root: Path | None = None
+) -> bool:
     """Is ``content`` approved to be applied as ``path``?
 
     ``content`` is the bytes the caller is about to use, not a promise about
@@ -557,12 +589,16 @@ def is_approved(path: Path, content: bytes) -> bool:
     trust by a corrupt file.
     """
     try:
-        return is_approved_resolved(Path(path).resolve(), content)
+        return is_approved_resolved(
+            Path(path).resolve(), content, project_root=project_root
+        )
     except Exception:  # noqa: BLE001 -- fail closed; see docstring
         return False
 
 
-def is_approved_resolved(resolved_path: Path, content: bytes) -> bool:
+def is_approved_resolved(
+    resolved_path: Path, content: bytes, *, project_root: Path | None = None
+) -> bool:
     """Is ``content`` approved for the ALREADY-RESOLVED canonical ``resolved_path``?
 
     Identical to ``is_approved`` except that ``resolved_path`` is used as the
@@ -577,7 +613,11 @@ def is_approved_resolved(resolved_path: Path, content: bytes) -> bool:
     Never raises, for the same fail-closed reason as ``is_approved``.
     """
     try:
-        records = _read_store(trust_store_path())
+        # Residency is judged against the approved file's own checkout and the
+        # reader's bound project too, never the working directory alone.
+        records = _read_store(
+            trust_store_path(also=judged_roots(resolved_path, project_root))
+        )
         digest = hashlib.sha256(content).hexdigest()
         for rec in records:
             if rec.absolute_path == resolved_path:

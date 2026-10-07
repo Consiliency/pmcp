@@ -99,7 +99,7 @@ class PackageApproval:
     recorded_at: datetime
 
 
-def package_approvals_path() -> Path:
+def package_approvals_path(*, project_root: Path | None = None) -> Path:
     """Where the store lives. Raises ``TrustStoreError`` if checkout-resident.
 
     The directory is the trust store's, whose residency ``trust_store_path``
@@ -109,7 +109,10 @@ def package_approvals_path() -> Path:
     identity -- or a ``package_approvals.json`` linked into a judged checkout
     would be a checkout-resident store reached through its final component.
     """
-    path = trust_store_path().parent / PACKAGE_APPROVALS_FILENAME
+    # Residency is judged against the reader's bound project too
+    # (Consiliency/pmcp#372 round 17), never the working directory alone.
+    also = (Path(project_root),) if project_root is not None else ()
+    path = trust_store_path(also=also).parent / PACKAGE_APPROVALS_FILENAME
     try:
         if is_absent(path.parent):
             # A fresh install: no store, no link to follow. Judge where it will
@@ -135,7 +138,7 @@ def package_approvals_path() -> Path:
         ) from exc
     try:
         refuse_checkout_resident(
-            target if fd is None else path, "Package approvals", dir_fd=fd
+            target if fd is None else path, "Package approvals", dir_fd=fd, also=also
         )
     finally:
         if fd is not None:
@@ -395,7 +398,9 @@ def approve_package(identity: PackageIdentity) -> PackageApproval:
     return entry
 
 
-def is_package_approved(identity: PackageIdentity) -> bool:
+def is_package_approved(
+    identity: PackageIdentity, *, project_root: Path | None = None
+) -> bool:
     """Has an operator approved exactly this identity?
 
     ``True`` only for an ``"approved"`` record with the same registry, name and
@@ -410,7 +415,7 @@ def is_package_approved(identity: PackageIdentity) -> bool:
     """
     try:
         target = _key(identity.registry, identity.name, identity.resolved_version)
-        for rec in _read_store(package_approvals_path()):
+        for rec in _read_store(package_approvals_path(project_root=project_root)):
             if _key(rec.registry, rec.name, rec.resolved_version) != target:
                 continue
             if rec.decision != APPROVED:
