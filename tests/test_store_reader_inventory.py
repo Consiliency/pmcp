@@ -1346,9 +1346,10 @@ CWD_READERS = {
         "an explicit RELATIVE --project is joined to the working directory, "
         "as the operator typed it"
     ),
-    ("pmcp.trust_store", "_checkout_roots"): (
-        "the residency guard also refuses a trust store inside the checkout "
-        "pmcp was launched from; adding roots only refuses more"
+    ("pmcp.trust_store", "_capture_launch_directory"): (
+        "the residency guard also refuses a store inside the directory pmcp was "
+        "LAUNCHED in, captured once and never re-read (Consiliency/pmcp#372 "
+        "round 18); adding roots only refuses more"
     ),
     ("pmcp.trust_store", "_enclosing_checkouts"): (
         "walks up from a path it is given (the guard's roots, the path being "

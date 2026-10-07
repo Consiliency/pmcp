@@ -104,6 +104,67 @@ class TrustRecord:
 _active_project_root: Path | None = None
 
 
+#: The directory pmcp was LAUNCHED in, captured once -- at import, or at the
+#: first residency judgement after the test-only reset -- as ``(absolute path,
+#: (st_dev, st_ino))``, and never re-read from the working directory
+#: (Consiliency/pmcp#372 round 18, board round 17 codex F001: re-reading the
+#: cwd on every call let a later ``chdir`` drop the launch checkout from the
+#: guard, so approvals stored inside it started granting the served project's
+#: config and packages).
+_LAUNCH_DIRECTORY: tuple[Path, tuple[int, int] | None] | None = None
+
+
+def _capture_launch_directory() -> tuple[Path, tuple[int, int] | None]:
+    global _LAUNCH_DIRECTORY
+    if _LAUNCH_DIRECTORY is None:
+        try:
+            where = Path(os.getcwd())
+            status = os.stat(where)
+            _LAUNCH_DIRECTORY = (where, (status.st_dev, status.st_ino))
+        except OSError:
+            _LAUNCH_DIRECTORY = (Path(os.path.abspath(os.curdir)), None)
+    return _LAUNCH_DIRECTORY
+
+
+def reset_launch_directory() -> None:
+    """Forget the captured launch directory. **Test-only seam.**"""
+    global _LAUNCH_DIRECTORY
+    _LAUNCH_DIRECTORY = None
+
+
+def _is_home_or_above(directory: Path) -> bool:
+    """Is ``directory`` the home directory or one of its ancestors (by identity)?"""
+    try:
+        target = os.stat(directory)
+        home = Path.home()
+        for candidate in (home, *home.parents):
+            status = os.stat(candidate)
+            if (status.st_dev, status.st_ino) == (target.st_dev, target.st_ino):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _boundaries(root: Path) -> list[Path]:
+    """The residency boundaries one root contributes -- the same rule for every root.
+
+    Every checkout enclosing ``root`` (``root`` itself included when it carries
+    a marker). With none, ``root`` itself -- a plain directory pmcp reads a
+    project from is that project's boundary -- unless it is the home directory
+    or an ancestor of it, where the operator's own store lives (Consiliency/pmcp
+    #372 round 18, board round 17 grok F001: a markerless bound root added
+    nothing, so a store linked into it approved its own packages and policy,
+    while ``--project`` on the same directory refused it).
+    """
+    enclosing = list(_enclosing_checkouts(root))
+    if enclosing:
+        return enclosing
+    if _is_home_or_above(root):
+        return []
+    return [root]
+
+
 def set_active_project_root(root: Path | None) -> None:
     """Bind the residency check to the project the gateway is SERVING.
 
@@ -167,7 +228,12 @@ def _checkout_roots(also: tuple[Path, ...] = ()) -> tuple[Path, ...]:
       *verbatim* -- a store resident in a served directory that lies inside no
       checkout must still be refused;
     * every checkout ENCLOSING the served root; and
-    * every checkout ENCLOSING ``Path.cwd()``.
+    * every checkout ENCLOSING the directory pmcp was LAUNCHED in (captured
+      once; Consiliency/pmcp#372 round 18); and
+    * the file being approved and the reader's bound project (``also``).
+
+    Every root follows one rule (``_boundaries``): its enclosing checkouts, else
+    the root itself unless it is the home directory or above.
 
     Both the served root and cwd are walked UP to the enclosing checkout, not
     judged against the single directory they name. ``find_project_root`` stops at
@@ -216,34 +282,28 @@ def _checkout_roots(also: tuple[Path, ...] = ()) -> tuple[Path, ...]:
         if resolved not in roots:
             roots.append(resolved)
 
+    # ONE rule for every root the guard receives (``_boundaries``): its
+    # enclosing checkouts, else the root itself unless it is the home
+    # directory or above it (Consiliency/pmcp#372 round 18).
+    #
+    # The served root, and the checkouts enclosing it. Walking UP matters: a
+    # subdirectory of a checkout normally carries its own `.mcp.json`, so a
+    # single lookup would stop there and never reach the real checkout.
     if _active_project_root is not None:
-        # The served root itself is always a boundary (a served dir inside no
-        # checkout must still be refused); then every checkout enclosing it,
-        # walked from the PARENT so the served dir's own `.mcp.json` cannot stop
-        # the walk at the served root.
-        _add(_active_project_root)
-        for enclosing in _enclosing_checkouts(_active_project_root.parent):
-            _add(enclosing)
-
-    # The cwd arm walks up too: cwd may itself be a checkout subdirectory
-    # carrying the payload `.mcp.json`, so a single lookup would stop there and
-    # miss the enclosing checkout (the bare `pmcp serve` and `pmcp trust` verb
-    # case, EC-TRUST-5 cwd-subdirectory).
-    for enclosing in _enclosing_checkouts(Path.cwd()):
-        _add(enclosing)
+        for boundary in _boundaries(_active_project_root):
+            _add(boundary)
+    # The LAUNCH directory, captured once and never re-read from the cwd
+    # (EC-TRUST-5 cwd-subdirectory; round 18 codex F001).
+    for boundary in _boundaries(_capture_launch_directory()[0]):
+        _add(boundary)
     # The roots pmcp is reading project inputs from for THIS judgement
-    # (Consiliency/pmcp#372 round 17, board round 16 F001): the directory of
-    # the file being approved and the project root its reader is bound to,
-    # each walked up to every enclosing checkout. A gateway built in A that
-    # later runs with its cwd in B still judges A's files against A's
-    # checkout: the cwd arm alone left a store inside A free to approve A's own
-    # content. Not kept verbatim (unlike an explicitly served root): a bound
-    # root can be a plain directory -- the home directory pmcp was started in
-    # -- which is no checkout and must not refuse the operator's own store.
+    # (round 17, board round 16 F001): the directory of the file being
+    # approved and the project root its reader is bound to. A gateway built in
+    # A that later runs with its cwd in B still judges A's files against A.
     # Adding roots only refuses more.
     for root in also:
-        for enclosing in _enclosing_checkouts(root):
-            _add(enclosing)
+        for boundary in _boundaries(root):
+            _add(boundary)
     return tuple(roots)
 
 
@@ -737,3 +797,7 @@ def list_records() -> list[TrustRecord]:
     permission by anything.
     """
     return _read_store(trust_store_path())
+
+
+# The launch directory, captured at import (see _LAUNCH_DIRECTORY).
+_capture_launch_directory()

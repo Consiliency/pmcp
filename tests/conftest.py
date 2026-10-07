@@ -185,7 +185,13 @@ def isolate_trust_store(
             f"could write the real store under {_REAL_HOME}."
         )
 
+    # The launch directory is captured at the first residency judgement; the
+    # check above was one, made from wherever pytest runs. Forget it, so each
+    # test's own first judgement captures the directory the test launched in
+    # (Consiliency/pmcp#372 round 18).
+    trust_store.reset_launch_directory()
     yield fake_home
+    trust_store.reset_launch_directory()
 
 
 @pytest.fixture(autouse=True)

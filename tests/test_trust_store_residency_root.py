@@ -208,6 +208,9 @@ def test_serving_one_project_still_refuses_a_store_resident_in_the_launch_checko
 
     # Launched from inside the launch checkout, serving the other one.
     monkeypatch.chdir(launch)
+    # pmcp is LAUNCHED here: the launch directory is captured once
+    # (Consiliency/pmcp#372 round 18), so model a fresh process.
+    trust_store.reset_launch_directory()
     trust_store.set_active_project_root(served)
 
     with pytest.raises(TrustStoreError) as raised:
@@ -301,6 +304,9 @@ def test_a_bare_serve_from_a_subdirectory_refuses_a_store_in_the_enclosing_check
 
     # No served root bound; the process simply runs from the subdirectory.
     monkeypatch.chdir(app)
+    # pmcp is LAUNCHED here: the launch directory is captured once
+    # (Consiliency/pmcp#372 round 18), so model a fresh process.
+    trust_store.reset_launch_directory()
     assert trust_store._active_project_root is None
 
     with pytest.raises(TrustStoreError) as raised:

@@ -1906,3 +1906,161 @@ def test_a_bound_policy_refuses_its_projects_package_approvals_after_a_chdir(
     decision = evaluate_provision(config, identity, source="configured", policy=policy)
     assert decision.reason != "package_approved"
     assert not decision.allowed
+
+
+# --------------------------------------------------------------------------- #
+# Board round 17. codex F001: the launch checkout was re-read from the cwd on
+# every judgement, so after chdir(B) approvals stored inside the launch
+# checkout A granted the served project C. grok F001: a bound root with no
+# checkout marker contributed nothing, so a store linked into it approved its
+# own packages and policy (while --project on it refused). Now: the launch
+# directory is captured once; every root follows one rule -- its enclosing
+# checkouts, else itself unless it is the home directory or above.
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_r17_f001_the_launch_checkout_stays_refused_after_a_chdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex r17 F001, verbatim in substance."""
+    import hashlib
+    import json
+    import tempfile
+
+    from pmcp import trust_store
+    from pmcp.project_consent import read_and_gate
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(trust_store, "_active_project_root", None)
+    home = tmp_path / "home"
+    (home / ".config").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    launch, later, served = (tmp_path / name for name in ("a", "b", "c"))
+    for root in (launch, later, served):
+        (root / ".git").mkdir(parents=True)
+    store = launch / "store"
+    store.mkdir()
+    (home / ".config" / "pmcp").symlink_to(store, target_is_directory=True)
+    config = served / ".mcp.json"
+    content = b'{"mcpServers":{"repo-server":{"command":"echo"}}}'
+    config.write_bytes(content)
+    (store / "trust.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "records": [
+                    {
+                        "absolute_path": str(config.resolve()),
+                        "content_sha256": hashlib.sha256(content).hexdigest(),
+                        "scope": "user",
+                        "decision": "approved",
+                        "recorded_at": "2026-10-07T00:00:00+00:00",
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.chdir(launch)
+    trust_store.reset_launch_directory()  # a process launched in a
+    trust_store.set_active_project_root(served)
+    try:
+        assert not read_and_gate(config, "project_mcp_json", project_root=served)[
+            1
+        ].allowed
+        monkeypatch.chdir(later)
+        assert not read_and_gate(config, "project_mcp_json", project_root=served)[
+            1
+        ].allowed
+    finally:
+        trust_store.set_active_project_root(None)
+
+
+def _markerless_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple:
+    """A package approval whose store is linked into a plain directory D."""
+    import shutil
+
+    from pmcp.manifest.loader import ServerConfig
+    from pmcp.manifest.package_identity import PackageIdentity
+    from pmcp.package_approvals import approve_package
+
+    home = Path(os.environ["HOME"])
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    identity = PackageIdentity("npm", "example-mcp", "1.2.3", None)
+    config = ServerConfig(
+        name="srv",
+        description="",
+        keywords=[],
+        install={"linux": ["npx", "-y", "example-mcp@1.2.3"]},
+        command="npx",
+        args=["-y", "example-mcp@1.2.3"],
+    )
+    monkeypatch.chdir(other)
+    approve_package(identity)
+    stored = (home / ".config" / "pmcp" / "package_approvals.json").read_bytes()
+    planted = plain / "planted-config"
+    planted.mkdir()
+    pmcp_dir = home / ".config" / "pmcp"
+    shutil.rmtree(pmcp_dir)
+    pmcp_dir.symlink_to(planted, target_is_directory=True)
+    (planted / "package_approvals.json").write_bytes(stored)
+    return plain, other, identity, config
+
+
+@pytest.mark.parametrize("path", ["served", "bound"])
+def test_a_markerless_root_refuses_a_store_inside_it(
+    path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """grok r17 F001, both the CLI shape (served) and the library shape (bound)."""
+    from pmcp import trust_store
+    from pmcp.config.loader import find_project_root
+    from pmcp.package_approvals import is_package_approved
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.provision_gate import evaluate_provision
+
+    trust_store.set_active_project_root(None)
+    plain, other, identity, config = _markerless_store(tmp_path, monkeypatch)
+    assert find_project_root(plain) is None
+    trust_store.reset_launch_directory()  # launched in `other`
+    try:
+        if path == "served":
+            trust_store.set_active_project_root(plain)  # pmcp --project D
+            assert is_package_approved(identity) is False
+        else:
+            policy = PolicyManager(project_root=plain)
+            monkeypatch.chdir(other)
+            decision = evaluate_provision(
+                config, identity, source="configured", policy=policy
+            )
+            assert decision.reason != "package_approved"
+            assert decision.allowed is False
+    finally:
+        trust_store.set_active_project_root(None)
+
+
+@pytest.mark.parametrize("path", ["served", "bound", "launched"])
+def test_the_home_directory_as_a_root_still_accepts_the_operators_store(
+    path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HOME (or above) is never a boundary: the operator's own store works."""
+    from pmcp import trust_store
+    from pmcp.manifest.package_identity import PackageIdentity
+    from pmcp.package_approvals import approve_package, is_package_approved
+
+    home = Path(os.environ["HOME"])
+    identity = PackageIdentity("npm", "example-mcp", "1.2.3", None)
+    approve_package(identity)
+    monkeypatch.chdir(home if path == "launched" else tmp_path)
+    trust_store.reset_launch_directory()
+    try:
+        if path == "served":
+            trust_store.set_active_project_root(home)
+            assert is_package_approved(identity) is True
+        elif path == "bound":
+            assert is_package_approved(identity, project_root=home) is True
+        else:
+            assert is_package_approved(identity) is True
+    finally:
+        trust_store.set_active_project_root(None)
