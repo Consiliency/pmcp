@@ -2923,3 +2923,37 @@ def test_nothing_in_pmcp_drops_an_exceptions_traceback() -> None:
                 ):
                     found.append(f"{path.relative_to(_SRC)}:{node.lineno}: {name}")
     assert not found, found
+
+
+def test_a_validation_error_beneath_an_sdk_frame_keeps_its_description() -> None:
+    """pydantic raising beneath an SDK frame (`ClientSession` validating a
+    notification) is the SDK's by origin and not direct, but a validation
+    error's structural description is value-free: it is kept, not replaced
+    by the SDK's fixed phrase (rev 27)."""
+    from pathlib import Path
+
+    import mcp
+    from pydantic import BaseModel
+
+    from pmcp.argument_errors import exception_text, exception_walk
+
+    class Probe(BaseModel):
+        task_id: int
+
+    s = _GRID_S
+    filename = str(Path(mcp.__file__).parent / "client/session.py")
+    namespace: dict[str, Any] = {"Probe": Probe}
+    exec(  # noqa: S102 -- a frame with the SDK's file name, for the test
+        compile(
+            f"def _received_notification():\n    Probe.model_validate({{'task_id': {s!r}}})\n",
+            filename,
+            "exec",
+        ),
+        namespace,
+    )
+    with pytest.raises(Exception) as caught:
+        namespace["_received_notification"]()
+    assert exception_walk(caught.value).kind == "mcp"
+    text = exception_text(caught.value)
+    assert text.startswith("1 validation error for Probe: $.task_id"), text
+    assert s not in text

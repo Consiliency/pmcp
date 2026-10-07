@@ -931,10 +931,15 @@ def _validation_text(error: BaseException) -> str:
         or _is_response_decode_error(error)
         or exception_origin(error) == "http"
     )
-    if not is_http and _withheld_sdk(error):
+    structural = isinstance(
+        error, (ValidationError, jsonschema.ValidationError, jsonschema.SchemaError)
+    )
+    if not is_http and not structural and _withheld_sdk(error):
         from pmcp.sdk_rejections import sdk_error_text
 
-        # The SDK's own text is withheld: its code's phrase and class (rev 26).
+        # The SDK's own text is withheld: its code's phrase and class (rev
+        # 26). A validation error the SDK raises (pydantic beneath an SDK
+        # frame) keeps its structural description, which is value-free.
         return sdk_error_text(error)
     if is_http:
         # The class and the status number: never the error's text, its
