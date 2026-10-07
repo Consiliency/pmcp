@@ -2622,3 +2622,40 @@ def test_a_clean_dotfiles_home_still_loads_its_user_store_and_env(
     finally:
         for key in ("DOTFILES_USER_372", "DOTFILES_ENV_372"):
             os.environ.pop(key, None)
+
+
+def test_a_launch_from_home_config_inside_a_checkout_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exemption is decided only after the checkout walk.
+
+    HOME inside a checkout, launched from HOME/.config, approving a project
+    OUTSIDE the checkout: the launch directory is the only root that reaches
+    the store, and it looks like the default store's directory. The checkout
+    above it still makes it a boundary.
+    """
+    from pmcp import trust_store
+    from pmcp.project_consent import read_and_gate
+
+    checkout = tmp_path.resolve() / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    home = checkout / "home"
+    store = home / ".config" / "pmcp"
+    store.mkdir(parents=True)
+    elsewhere = tmp_path.resolve() / "elsewhere"
+    (elsewhere / ".git").mkdir(parents=True)
+    config = elsewhere / ".mcp.json"
+    content = b'{"mcpServers":{"planted":{"command":"echo"}}}'
+    config.write_bytes(content)
+    (store / "trust.json").write_text(_approval_for(config, content))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(home / ".config")
+    trust_store.reset_launch_directory()
+    trust_store.set_active_project_root(elsewhere)
+    try:
+        accepted, decision = read_and_gate(
+            config, "project_mcp_json", project_root=elsewhere
+        )
+        assert accepted is None and not decision.allowed
+    finally:
+        trust_store.set_active_project_root(None)

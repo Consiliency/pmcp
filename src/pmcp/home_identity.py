@@ -80,30 +80,6 @@ def is_home(directory: os.PathLike[str] | str, home: Path | None = None) -> bool
     return identity is not None and identity == _identity(physical_home(home))
 
 
-def is_home_or_above(
-    directory: os.PathLike[str] | str, home: Path | None = None
-) -> bool:
-    """Is ``directory`` the home directory or one of its physical ancestors?"""
-    identity = _identity(directory)
-    return identity is not None and identity in home_and_ancestor_identities(home)
-
-
-def is_operators_own_area(
-    directory: os.PathLike[str] | str, home: Path | None = None
-) -> bool:
-    """Home, a physical ancestor of it, or a directory of the default store's path.
-
-    The residency guard's exemption: none of these is ever a repository's
-    boundary, so the operator's own store keeps working wherever pmcp starts.
-    """
-    identity = _identity(directory)
-    if identity is None:
-        return False
-    return identity in home_and_ancestor_identities(
-        home
-    ) or identity in default_store_directory_identities(home)
-
-
 # --------------------------------------------------------------------------- #
 # Operator ownership (Consiliency/pmcp#372 round 21, boards round 20 grok and
 # codex F001). Being home, an ancestor of home or the default store's directory
