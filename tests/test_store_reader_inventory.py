@@ -1351,14 +1351,6 @@ CWD_READERS = {
         "LAUNCHED in, captured once and never re-read (Consiliency/pmcp#372 "
         "round 18); adding roots only refuses more"
     ),
-    ("pmcp.trust_store", "_is_checkout"): (
-        "asks whether a boundary it is given carries a project marker, to "
-        "name it in the refusal; refusal-only"
-    ),
-    ("pmcp.trust_store", "_enclosing_checkouts"): (
-        "walks up from a path it is given (the guard's roots, the path being "
-        "approved) to the checkouts enclosing it; refusal-only"
-    ),
     ("pmcp.manifest.environment", "get_environment_info"): (
         "reports the working directory as a fact about the environment; no "
         "project input is read from it"
@@ -1838,3 +1830,65 @@ def test_the_home_scan_sees_each_shape() -> None:
     sources["pmcp.trust_store"] = source
     flagged = {line.split(":")[1] for line in home_spelling_comparisons(sources)}
     assert flagged == {"eq", "named", "rel"}
+
+
+# --------------------------------------------------------------------------- #
+# Residency is not project discovery (Consiliency/pmcp#372 round 20, boards
+# round 19 grok/codex F001). find_project_root stops at the home directory, so
+# reusing it for residency hid a checkout that encloses home. The residency
+# modules never call project discovery or classification; they walk up to /
+# themselves (trust_store._enclosing_checkouts).
+# --------------------------------------------------------------------------- #
+
+RESIDENCY_MODULES = (
+    "pmcp.trust_store",
+    "pmcp.package_approvals",
+    "pmcp.project_consent",
+    "pmcp.home_identity",
+)
+PROJECT_DISCOVERY = frozenset(
+    {
+        "find_project_root",
+        "project_scope_root",
+        "_project_scope_root",
+        "resolve_project_root",
+        "_discover_project_root",
+    }
+)
+
+
+def discovery_in_residency(sources: dict[str, str]) -> list[str]:
+    found: list[str] = []
+    for module, tree, aliases in _module_trees(sources):
+        if module not in RESIDENCY_MODULES:
+            continue
+        for name, fn in _qualified_functions(tree):
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.Call)
+                    and _called_name(node.func, aliases) in PROJECT_DISCOVERY
+                ):
+                    found.append(f"{module}:{name}:{node.lineno}")
+    return found
+
+
+def test_residency_never_uses_project_discovery() -> None:
+    assert discovery_in_residency(_src_sources()) == []
+
+
+def test_the_residency_discovery_scan_sees_each_shape() -> None:
+    source = (
+        "from pmcp.config.loader import find_project_root\n"
+        "def walk(p):\n"
+        "    return find_project_root(p)\n"
+        "def classify(p):\n"
+        "    from pmcp.env_store import project_scope_root\n"
+        "    return project_scope_root(p)\n"
+        "def fine(p):\n"
+        "    return p.parent\n"
+    )
+    flagged = {
+        line.split(":")[1]
+        for line in discovery_in_residency({"pmcp.trust_store": source})
+    }
+    assert flagged == {"walk", "classify"}

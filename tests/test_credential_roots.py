@@ -2238,3 +2238,170 @@ def test_launching_inside_the_target_of_a_linked_store_is_refused(
     trust_store.reset_launch_directory()
     with pytest.raises(TrustStoreError, match="inside the directory at"):
         trust_store.trust_store_path()
+
+
+# --------------------------------------------------------------------------- #
+# Boards round 19, grok and codex F001: the residency walk reused project
+# discovery, which stops at the home directory, so a checkout ENCLOSING home
+# was invisible -- with HOME at <checkout>/home, a repository-shipped
+# HOME/.config/pmcp/trust.json approved HOME/app/.mcp.json. Residency now walks
+# up to / on its own; only home itself (by identity) is never a checkout.
+# --------------------------------------------------------------------------- #
+
+
+def test_grok_r19_f001_a_checkout_enclosing_home_supplies_no_trust_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """grok r19 F001, verbatim in substance."""
+    from pmcp import trust_store
+    from pmcp.project_consent import gate_bytes
+
+    repo = tmp_path / "repo"
+    home = repo / "userhome"
+    app = home / "app"
+    (repo / ".git").mkdir(parents=True)
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    app.mkdir()
+    content = b'{"mcpServers":{"evil":{"command":"echo"}}}'
+    config = app / ".mcp.json"
+    config.write_bytes(content)
+    (home / ".config" / "pmcp" / "trust.json").write_text(
+        _approval_for(config, content)
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(app)
+    trust_store.reset_launch_directory()
+    trust_store.set_active_project_root(app)
+    try:
+        assert (
+            gate_bytes(config, content, "project_mcp_json", project_root=app).allowed
+            is False
+        )
+        assert trust_store.is_approved(config, content, project_root=app) is False
+    finally:
+        trust_store.set_active_project_root(None)
+
+
+def test_codex_r19_f001_home_inside_a_checkout_cannot_exempt_an_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex r19 F001, verbatim in substance."""
+    import tempfile
+
+    from pmcp import trust_store
+    from pmcp.project_consent import read_and_gate
+
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    home = checkout / "home"
+    store = home / ".config" / "pmcp"
+    store.mkdir(parents=True)
+    served = home / "app"
+    served.mkdir()
+    config = served / ".mcp.json"
+    content = b'{"mcpServers":{"unapproved":{"command":"echo"}}}'
+    config.write_bytes(content)
+    (store / "trust.json").write_text(_approval_for(config, content))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(trust_store, "_LAUNCH_DIRECTORY", None)
+    monkeypatch.setattr(trust_store, "_active_project_root", served)
+    monkeypatch.chdir(home / ".config")
+    accepted, decision = read_and_gate(config, "project_mcp_json", project_root=served)
+    assert not decision.allowed
+    assert accepted is None
+
+
+HOME_IN_CHECKOUT = [
+    (launch, mode, depth)
+    for launch in ("home", ".config", "app")
+    for mode in ("served", "bound")
+    for depth in (1, 2)
+]
+
+
+@pytest.mark.parametrize(
+    ("launch", "mode", "depth"),
+    HOME_IN_CHECKOUT,
+    ids=[f"{w}-{m}-depth{d}" for w, m, d in HOME_IN_CHECKOUT],
+)
+def test_a_home_inside_a_checkout_never_approves_from_its_default_store(
+    launch: str,
+    mode: str,
+    depth: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HOME at <checkout>/home (depth 1) or <checkout>/x/home (depth 2)."""
+    from pmcp import trust_store
+    from pmcp.project_consent import read_and_gate
+
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    home = checkout / "home" if depth == 1 else checkout / "x" / "home"
+    store = home / ".config" / "pmcp"
+    store.mkdir(parents=True)
+    app = home / "app"
+    app.mkdir()
+    config = app / ".mcp.json"
+    content = b'{"mcpServers":{"planted":{"command":"echo"}}}'
+    config.write_bytes(content)
+    (store / "trust.json").write_text(_approval_for(config, content))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir({"home": home, ".config": home / ".config", "app": app}[launch])
+    trust_store.reset_launch_directory()
+    try:
+        if mode == "served":
+            trust_store.set_active_project_root(app)
+            accepted, decision = read_and_gate(config, "project_mcp_json")
+        else:
+            accepted, decision = read_and_gate(
+                config, "project_mcp_json", project_root=app
+            )
+        assert not decision.allowed and accepted is None
+    finally:
+        trust_store.set_active_project_root(None)
+
+
+@pytest.mark.parametrize("launch", ["home", ".config", "app"])
+def test_an_ordinary_home_with_no_enclosing_checkout_still_approves(
+    launch: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator's normal home: the same layout, no checkout above it, works."""
+    from pmcp import trust_store
+    from pmcp.project_consent import read_and_gate
+
+    home = Path(os.environ["HOME"]).resolve()
+    (home / ".config" / "pmcp").mkdir(parents=True, exist_ok=True)
+    app = home / "app"
+    (app / ".git").mkdir(parents=True)
+    config = app / ".mcp.json"
+    content = b'{"mcpServers":{"approved":{"command":"echo"}}}'
+    config.write_bytes(content)
+    monkeypatch.chdir({"home": home, ".config": home / ".config", "app": app}[launch])
+    trust_store.reset_launch_directory()
+    trust_store.record(config, content, "project", trust_store.APPROVED)
+    accepted, decision = read_and_gate(config, "project_mcp_json", project_root=app)
+    assert decision.allowed and accepted == content
+
+
+def test_a_home_kept_in_its_own_repository_still_approves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dotfiles repository AT home is the operator's, not a checkout boundary."""
+    from pmcp import trust_store
+    from pmcp.project_consent import read_and_gate
+
+    home = Path(os.environ["HOME"]).resolve()
+    (home / ".git").mkdir(exist_ok=True)
+    (home / ".config" / "pmcp").mkdir(parents=True, exist_ok=True)
+    app = home / "code" / "app"
+    (app / ".git").mkdir(parents=True)
+    config = app / ".mcp.json"
+    content = b'{"mcpServers":{"approved":{"command":"echo"}}}'
+    config.write_bytes(content)
+    monkeypatch.chdir(app)
+    trust_store.reset_launch_directory()
+    trust_store.record(config, content, "project", trust_store.APPROVED)
+    accepted, decision = read_and_gate(config, "project_mcp_json", project_root=app)
+    assert decision.allowed and accepted == content

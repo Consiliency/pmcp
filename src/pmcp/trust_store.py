@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pmcp.home_identity import is_operators_own_area
+from pmcp.home_identity import is_home, is_operators_own_area
 from pmcp.atomic_write import (
     atomic_write,
     falls_back_to_pathname,
@@ -134,14 +134,8 @@ def reset_launch_directory() -> None:
 
 
 def _is_checkout(root: Path) -> bool:
-    """Does ``root`` carry a project marker (is it its own project root)?"""
-    from pmcp.config.loader import find_project_root
-
-    try:
-        found = find_project_root(root)
-        return found is not None and os.path.samefile(found, root)
-    except OSError:
-        return False
+    """Does ``root`` carry a checkout marker?"""
+    return _has_checkout_marker(root)
 
 
 def _boundaries(root: Path) -> list[Path]:
@@ -188,35 +182,54 @@ def set_active_project_root(root: Path | None) -> None:
     _active_project_root = root.resolve() if root is not None else None
 
 
+#: What makes a directory a checkout for the residency guard: the same
+#: markers project discovery uses (``config.loader.find_project_root``).
+_CHECKOUT_MARKERS = (
+    ".mcp.json",
+    ".git",
+    "package.json",
+    "pyproject.toml",
+    os.path.join(".pmcp", "manifest.yaml"),
+)
+
+
+def _has_checkout_marker(directory: Path) -> bool:
+    for marker in _CHECKOUT_MARKERS:
+        try:
+            os.lstat(directory / marker)
+        except OSError:
+            continue
+        return True
+    return False
+
+
 def _enclosing_checkouts(start: Path) -> Iterator[Path]:
-    """Every checkout at or above ``start``, resolved, nearest first.
+    """Every checkout at or above ``start``, resolved, nearest first -- up to ``/``.
 
-    Walks up from ``start`` via ``find_project_root``, then chains
-    ``root.parent`` upward so an intermediate marker -- a subdirectory's own
-    ``.mcp.json`` -- cannot stop the walk short of the real checkout. Terminates
-    when ``find_project_root`` returns ``None`` (its temp/home guards) or at the
-    filesystem root (``parent == enclosing``). Shared by ``_checkout_roots`` (the
-    residency guard's served and cwd arms) and by
-    ``assert_store_outside_path_checkout`` (the approve verb's guard -- the
-    checkout enclosing the path being approved, Consiliency/pmcp#252) so the walk
-    cannot drift between them. ``record`` itself stays unguarded, so a store a
-    repository *ships* can still be planted in tests and shown refused.
+    The RESIDENCY walk, deliberately not project discovery
+    (Consiliency/pmcp#372 round 20, boards round 19 grok/codex F001):
+    ``find_project_root`` stops at the home directory and the temp root, so a
+    checkout that ENCLOSES the home directory was invisible here -- with HOME
+    at ``<checkout>/home``, a repository-shipped ``HOME/.config/pmcp/
+    trust.json`` approved ``HOME/app/.mcp.json``. This walk goes all the way to
+    ``/``, through and above home, on the kernel-resolved path. The one
+    directory it never counts is the home directory ITSELF (by identity): a
+    home kept under version control -- a dotfiles repository -- is the
+    operator's, and counting it would refuse every operator store. Shared by
+    ``_checkout_roots`` and ``assert_store_outside_path_checkout`` so the walk
+    cannot drift between them.
     """
-    # Imported here, not at module scope, to break an import cycle introduced
-    # when CONSENT landed: pmcp.config.loader now imports pmcp.project_consent,
-    # which imports this module. At module scope that made `import
-    # pmcp.config.loader` fail outright in a clean interpreter. The residency
-    # check only needs the project root at call time.
-    from pmcp.config.loader import find_project_root
-
-    current: Path | None = start
-    while current is not None:
-        enclosing = find_project_root(current)
-        if enclosing is None:
+    try:
+        current = Path(os.path.realpath(start))
+    except (OSError, ValueError):
+        return
+    while True:
+        if _has_checkout_marker(current) and not is_home(current):
+            yield current
+        parent = current.parent
+        if parent == current:
             return
-        yield enclosing.resolve()
-        parent = enclosing.parent
-        current = parent if parent != enclosing else None
+        current = parent
 
 
 def _checkout_roots(also: tuple[Path, ...] = ()) -> tuple[Path, ...]:
