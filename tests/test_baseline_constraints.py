@@ -244,7 +244,8 @@ class TestSingletonLockConstraints:
 
         source = inspect.getsource(acquire_singleton_lock)
 
-        assert 'Path.home() / ".pmcp"' in source, (
+        # ~/.pmcp through the home gate (Consiliency/pmcp#372 round 22).
+        assert 'home_path(".pmcp")' in source, (
             "Default lock directory should be ~/.pmcp"
         )
         assert '"gateway.lock"' in source, "Lock file should be named 'gateway.lock'"
@@ -283,7 +284,8 @@ class TestSingletonLockConstraints:
 
         # Verify the default path logic in identity.py
         source = inspect.getsource(acquire_singleton_lock)
-        assert 'Path.home() / ".pmcp"' in source, (
+        # ~/.pmcp through the home gate (Consiliency/pmcp#372 round 22).
+        assert 'home_path(".pmcp")' in source, (
             "acquire_singleton_lock should default to ~/.pmcp"
         )
 
