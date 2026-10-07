@@ -2618,3 +2618,52 @@ def test_no_sdk_transport_rejection_reaches_any_output(
         if any(form in text for form in _forbidden_any_case(s))
     }
     assert not leaked, leaked
+
+
+def _raised_at(site: str, error: BaseException) -> BaseException:
+    """``error``, raised from a frame at ``site`` (``path::function`` in the
+    installed `mcp` package): the classifier reads only the frame's file and
+    function name."""
+    from pathlib import Path
+
+    import mcp
+
+    path, function = site.split("::")
+    filename = str(Path(mcp.__file__).parent / path)
+    namespace: dict[str, Any] = {}
+    exec(  # noqa: S102 -- a frame with the SDK's file name, for the test
+        compile(f"def {function}(error):\n    raise error\n", filename, "exec"),
+        namespace,
+    )
+    try:
+        namespace[function](error)
+    except BaseException as raised:  # noqa: BLE001 -- returned
+        return raised
+    raise AssertionError("not raised")
+
+
+def test_an_sdk_raised_error_is_withheld_unless_reviewed() -> None:
+    """Rev 26: an exception the SDK raises keeps its text only when that is
+    a literal of the SDK's source, a reviewed template, or -- at a site that
+    relays an `ErrorData` -- a message matching no template the SDK builds."""
+    from mcp.shared.exceptions import MCPError
+
+    from pmcp.argument_errors import exception_text
+    from pmcp.sdk_rejections import withheld_sdk_error
+
+    s = _GRID_S
+    relay = "shared/jsonrpc_dispatcher.py::send_raw_request"
+    other = "client/sse.py::sse_reader"
+    cases = [
+        (relay, MCPError(-32600, f"Unexpected content type: text/{s}"), True),
+        (relay, MCPError(-32603, f"the downstream's own words {s}"), False),
+        (other, ValueError(f"Endpoint origin does not match: http://{s}/"), True),
+        (other, MCPError(-32000, "Connection closed"), False),
+        (other, RuntimeError(""), False),
+    ]
+    for site, error, withheld in cases:
+        raised = _raised_at(site, error)
+        assert withheld_sdk_error(raised) is withheld, (site, error)
+        text = exception_text(raised)
+        assert (s in text) is (not withheld and s in str(error)), text
+    assert not withheld_sdk_error(MCPError(-32600, f"Unexpected content type: {s}"))

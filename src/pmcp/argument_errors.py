@@ -618,21 +618,6 @@ HTTP_ORIGIN_MODULES = (
     "urllib/error.py",
     "http",
 )
-#: Helpers an HTTP client calls, whose frames are passed over to find the
-#: frame that decides: an exception raised in `ipaddress` while urllib parses
-#: a redirect is urllib's; one raised there while pmcp parses its own config
-#: is pmcp's.
-HTTP_HELPER_MODULES = (
-    "urllib/parse.py",
-    "ipaddress.py",
-    "email",
-    "encodings",
-    "idna",
-    "yarl",
-    "multidict",
-    "anyio",
-    "sniffio",
-)
 
 
 def _module_path(name: str) -> str | None:
@@ -658,40 +643,71 @@ def _module_path(name: str) -> str | None:
 
 @functools.cache
 def _origin_paths() -> tuple[tuple[str, str], ...]:
-    """(path, kind) for each origin and helper module: ``http`` or
-    ``helper``; ``mcp`` for the MCP SDK."""
+    """(path, kind) for each origin module -- ``http`` for an HTTP client,
+    ``mcp`` for the MCP SDK, ``pmcp`` for pmcp itself -- the longest first,
+    so a module file wins over its package's directory."""
+    import os
+
     paths: list[tuple[str, str]] = []
     for kind, names in (
         ("http", HTTP_ORIGIN_MODULES),
-        ("helper", HTTP_HELPER_MODULES),
         ("mcp", ("mcp",)),
     ):
         for name in names:
             path = _module_path(name)
             if path is not None:
                 paths.append((path, kind))
-    # The longest first: `urllib/parse.py` before any `urllib/` entry.
+    paths.append((os.path.dirname(os.path.abspath(__file__)) + os.sep, "pmcp"))
     return tuple(sorted(paths, key=lambda item: -len(item[0])))
 
 
+@functools.cache
+def _library_prefixes() -> tuple[str, ...]:
+    """The installed libraries' directories: the standard library and the
+    environment's site-packages."""
+    import os
+    import site
+    import sysconfig
+
+    prefixes = {
+        sysconfig.get_paths().get(key, "")
+        for key in ("stdlib", "platstdlib", "purelib", "platlib")
+    }
+    try:
+        prefixes.update(site.getsitepackages())
+    except AttributeError:  # pragma: no cover - a virtualenv without it
+        pass
+    return tuple(sorted(p.rstrip(os.sep) + os.sep for p in prefixes if p))
+
+
 def exception_origin(error: BaseException) -> str | None:
-    """Where ``error`` was raised (rev 26): ``"http"`` for an HTTP client's
-    frame, ``"mcp"`` for the MCP SDK's, else ``None``. From the innermost
-    frame of its traceback outwards, helper frames are passed over; the
-    first other frame decides. An exception with no traceback has no
-    origin, and one that pmcp's own code raises -- a client calling back
-    into pmcp included -- is pmcp's."""
+    """Where ``error`` was raised (rev 26): ``"http"`` for an HTTP client,
+    ``"mcp"`` for the MCP SDK, else ``None``.
+
+    The traceback is read from its innermost frame outwards. A frame in an
+    HTTP client or the SDK decides for it. A frame of any other installed
+    library -- ``ipaddress``, ``urllib.parse``, ``email``, ``anyio``,
+    ``yarl``, ``asyncio`` -- is passed over, so an exception a helper raises
+    is its caller's. A frame of pmcp's, or of any code that is not an
+    installed library (a test, a script), decides for "not by origin":
+    a client calling back into such code does not make what it raises the
+    client's. An exception with no traceback has no origin."""
     tb = error.__traceback__
     filenames: list[str] = []
     while tb is not None:
         filenames.append(tb.tb_frame.f_code.co_filename)
         tb = tb.tb_next
     paths = _origin_paths()
+    libraries = _library_prefixes()
     for filename in reversed(filenames):
         kind = next((k for path, k in paths if filename.startswith(path)), None)
-        if kind == "helper":
+        if kind in ("http", "mcp"):
+            return kind
+        if kind == "pmcp":
+            return None
+        if filename.startswith("<frozen ") or filename.startswith(libraries):
             continue
-        return kind if kind in ("http", "mcp") else None
+        return None
     return None
 
 
@@ -816,10 +832,8 @@ def _is_validation_error(error: BaseException) -> bool:
         _VALUE_BEARING = _value_bearing_types()
     if isinstance(error, _VALUE_BEARING) and not isinstance(error, _value_free_types()):
         return True
-    # A refused urllib tunnel is a bare `OSError`: by origin (rev 24), and
-    # any exception an HTTP client's frame raises (rev 26).
-    if _tunnel_refusal_status(error) is not False:
-        return True
+    # Any exception an HTTP client's frame raises, by origin (rev 26): this
+    # includes urllib's refused tunnel, a bare `OSError` (rev 24).
     if exception_origin(error) == "http":
         return True
     return _withheld_sdk(error)
