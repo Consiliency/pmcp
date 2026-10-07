@@ -382,6 +382,61 @@ def value_free_rejection(body: bytes, request_body: bytes | None) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode()
 
 
+#: The HTTP methods the entry log names; any other reads `other` (rev 29).
+_LOGGED_METHODS = frozenset({"GET", "POST", "DELETE", "HEAD", "OPTIONS"})
+#: Request header names the entry log names; any other reads `other`, since a
+#: header's name is the caller's choice too (rev 29).
+_KNOWN_HEADER_NAMES = frozenset(
+    {
+        "accept",
+        "accept-encoding",
+        "authorization",
+        "baggage",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "last-event-id",
+        "mcp-method",
+        "mcp-name",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "origin",
+        "traceparent",
+        "tracestate",
+        "transfer-encoding",
+        "user-agent",
+    }
+)
+
+
+def _method_class(method: str) -> str:
+    return method if method in _LOGGED_METHODS else "other"
+
+
+def _accept_class(accept: str) -> str:
+    """How an Accept header classifies, never its text: which of the two
+    media types the transport negotiates it offers."""
+    offered = {part.split(";", 1)[0].strip().lower() for part in accept.split(",")}
+    json_ok = bool(offered & {"application/json", "application/*", "*/*"})
+    sse_ok = bool(offered & {"text/event-stream", "text/*", "*/*"})
+    if json_ok and sse_ok:
+        return "json+sse"
+    if json_ok:
+        return "json"
+    if sse_ok:
+        return "sse"
+    return "absent" if not accept.strip() else "other"
+
+
+def _header_names(request: Any) -> set[str]:
+    """The request's header names, each a known name or ``other``."""
+    return {
+        name if name in _KNOWN_HEADER_NAMES else "other"
+        for name in (key.lower() for key in request.headers.keys())
+    }
+
+
 def create_http_app(
     mcp_server: Server,
     auth_token: str | None = None,
@@ -649,14 +704,17 @@ def create_http_app(
         request_id = uuid.uuid4().hex[:8]
         _inc("requests_total")
 
-        session_id_short = (request.headers.get("mcp-session-id") or "")[:8] or "<none>"
+        # Request metadata is caller content, like the body (rev 29,
+        # round-27 codex F001): the entry log carries its structure only --
+        # the HTTP method from a fixed set, whether a session header came,
+        # how the Accept header classifies, and the header names.
         logger.debug(
-            "handle_mcp [%s]: %s method=%s session=%s accept=%r",
+            "handle_mcp [%s]: method=%s session=%s accept=%s headers=%s",
             request_id,
-            request.url.path,
-            request.method,
-            session_id_short,
-            request.headers.get("accept", ""),
+            _method_class(request.method),
+            "present" if request.headers.get("mcp-session-id") else "absent",
+            _accept_class(request.headers.get("accept", "")),
+            ",".join(sorted(_header_names(request))),
         )
         request.scope["pmcp.trace_context"] = {
             key: value
@@ -747,9 +805,9 @@ def create_http_app(
             client_ip = request.client.host if request.client else "unknown"
             if not await _check_rate_limit(client_ip, rate_limit_rpm):
                 _inc("requests_429")
-                logger.debug(
-                    "handle_mcp [%s]: 429 rate limited ip=%s", request_id, client_ip
-                )
+                # Not the address: behind a trusting proxy it is the caller's
+                # `X-Forwarded-For` (rev 29).
+                logger.debug("handle_mcp [%s]: 429 rate limited", request_id)
                 return Response("Too Many Requests", status_code=429)
 
         # Input size guard — fast-path reject when the advertised Content-Length

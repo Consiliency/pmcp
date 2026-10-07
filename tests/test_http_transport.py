@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, get_args
@@ -2285,3 +2286,303 @@ def test_a_reviewed_template_is_bound_to_its_code_and_vocabulary() -> None:
         )
         == "Header mismatch"
     )
+
+
+# --- request headers are caller content (rev 29, round-27 codex F001) --------
+
+_HEADER_S = "callerheadersentinelvaluezulu"
+
+#: Every request header pmcp's transport or the SDK's reads, plus one it
+#: does not, each carrying the sentinel in a shape the reader accepts or
+#: rejects.
+_SENTINEL_HEADERS: dict[str, str] = {
+    "accept": f"text/{_HEADER_S}",
+    "content-type": f"application/{_HEADER_S}",
+    "mcp-session-id": _HEADER_S,
+    "mcp-protocol-version": _HEADER_S,
+    "last-event-id": _HEADER_S,
+    "origin": f"http://{_HEADER_S}.example",
+    "host": f"{_HEADER_S}.example",
+    "authorization": f"Bearer {_HEADER_S}",
+    "x-extra-header": _HEADER_S,
+}
+
+_INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "grid", "version": "1"},
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "config",
+    ["none", "shared-secret", "allowed-origins", "rate-limited"],
+)
+@pytest.mark.parametrize("header", sorted(_SENTINEL_HEADERS))
+def test_no_request_header_reaches_any_output(
+    header: str, config: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each header the transport reads, and one it does not, with the
+    sentinel as its value, on an `initialize` POST, a session POST, a GET
+    and a DELETE, under each auth and origin configuration: no form of it
+    in any log record at DEBUG (traceback included), response body or
+    response header (rev 29)."""
+    import logging
+    from typing import Any
+
+    import pmcp  # noqa: F401 - installs the scrubbers
+    from mcp.server.lowlevel import Server
+    from starlette.testclient import TestClient
+
+    from pmcp.transport.http import create_http_app
+    from tests.test_argument_error_echo import _forbidden, _record_text
+
+    caplog.set_level(logging.DEBUG)
+    kwargs: dict[str, Any] = {}
+    base = {"accept": "application/json, text/event-stream"}
+    if config == "shared-secret":
+        kwargs = {"auth_token": "configured-secret", "auth_mode": "shared-secret"}
+        base["authorization"] = "Bearer configured-secret"
+    elif config == "allowed-origins":
+        kwargs = {"allowed_origins": ["https://allowed.example"]}
+    elif config == "rate-limited":
+        kwargs = {"rate_limit_rpm": 1}
+    app = create_http_app(Server("header-grid"), **kwargs)
+    headers = {**base, header: _SENTINEL_HEADERS[header]}
+    outputs: list[str] = []
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        for method, body in (
+            ("POST", _INITIALIZE),
+            ("POST", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            ("GET", None),
+            ("DELETE", None),
+        ):
+            request_headers = dict(headers)
+            if method == "GET" and header != "accept":
+                request_headers["accept"] = "text/event-stream"
+            try:
+                response = client.request(
+                    method, "/mcp", headers=request_headers, json=body, timeout=10
+                )
+            except Exception as error:  # noqa: BLE001 -- inspected
+                from pmcp.argument_errors import exception_text, safe_traceback_text
+
+                outputs.append(exception_text(error) + safe_traceback_text(error))
+                continue
+            outputs.append(response.text)
+            outputs.append(repr(sorted(response.headers.items())))
+    outputs.append("\n".join(_record_text(record) for record in caplog.records))
+    # No vacuous pass: the transport saw each request.
+    assert any(
+        r.name == "pmcp.transport.http" and "handle_mcp" in r.getMessage()
+        for r in caplog.records
+    )
+    # Every 8-character window too: rev 28's entry log kept a session id's
+    # first 8 characters, below `_forbidden`'s 12-character windows.
+    forbidden = _forbidden(_HEADER_S) | {
+        _HEADER_S[i : i + 8] for i in range(len(_HEADER_S) - 7)
+    }
+    leaked = [text[:400] for text in outputs if any(f in text for f in forbidden)]
+    assert not leaked, leaked
+
+
+def test_a_rejected_accept_header_is_not_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round 27 codex F001, as filed: an `initialize` offering
+    `Accept: text/<S>` is refused 406, and the transport's entry log does not
+    carry the value."""
+    import logging
+
+    from mcp.server.lowlevel import Server
+    from starlette.testclient import TestClient
+
+    from pmcp.transport.http import create_http_app
+
+    sentinel = "rejectedacceptvaluezulu"
+    caplog.set_level(logging.DEBUG)
+    app = create_http_app(Server("accept-header-review"))
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/mcp", headers={"accept": f"text/{sentinel}"}, json=_INITIALIZE
+        )
+    assert response.status_code == 406, response.text
+    messages = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "pmcp.transport.http"
+    )
+    assert "accept=other" in messages, messages
+    assert sentinel not in messages, messages
+
+
+#: Request-metadata attributes and scope keys whose values are caller
+#: content (rev 29).
+_REQUEST_METADATA_ATTRS = frozenset(
+    {"headers", "query_params", "path_params", "url", "client", "method", "cookies"}
+)
+_REQUEST_SCOPE_KEYS = frozenset(
+    {"headers", "path", "raw_path", "query_string", "client", "method"}
+)
+#: Callees that turn request metadata into a fixed classification, reviewed
+#: (rev 29): their arguments may be request metadata.
+_REQUEST_METADATA_CLASSIFIERS = frozenset(
+    {"_method_class", "_accept_class", "_header_names"}
+)
+#: Callees whose arguments reach a log record or a response.
+_LOG_METHODS = frozenset(
+    {"debug", "info", "warning", "warn", "error", "exception", "critical", "log"}
+)
+_RESPONSE_CALLS = frozenset(
+    {
+        "Response",
+        "JSONResponse",
+        "PlainTextResponse",
+        "HTMLResponse",
+        "StreamingResponse",
+        "_reject",
+        "_auth_response",
+    }
+)
+
+
+def _reads_request_metadata(node: ast.AST, tainted: set[str]) -> bool:
+    """Whether ``node`` carries a request-metadata value: an attribute chain
+    through one of `_REQUEST_METADATA_ATTRS` on a request-like object, a
+    `scope[...]` read of a metadata key, or a name assigned from one. The
+    test of a conditional and a reviewed classifier's arguments are not
+    values that reach the output."""
+    if isinstance(node, ast.IfExp):
+        return _reads_request_metadata(node.body, tainted) or _reads_request_metadata(
+            node.orelse, tainted
+        )
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name in _REQUEST_METADATA_CLASSIFIERS:
+            return False
+    if isinstance(node, ast.Attribute) and node.attr in _REQUEST_METADATA_ATTRS:
+        base = ast.unparse(node.value)
+        if base.split(".")[-1] in ("request", "req", "conn", "websocket"):
+            return True
+    if (
+        isinstance(node, ast.Subscript)
+        and ast.unparse(node.value).split(".")[-1] == "scope"
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value in _REQUEST_SCOPE_KEYS
+    ):
+        return True
+    if isinstance(node, ast.Name) and node.id in tainted:
+        return True
+    return any(
+        _reads_request_metadata(child, tainted) for child in ast.iter_child_nodes(node)
+    )
+
+
+def _request_metadata_sinks(tree: ast.AST) -> list[int]:
+    found: list[int] = []
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        tainted: set[str] = set()
+        for node in ast.walk(function):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                if _reads_request_metadata(node.value, tainted):
+                    targets = (
+                        node.targets if isinstance(node, ast.Assign) else [node.target]
+                    )
+                    for target in targets:
+                        # A name bound to the value, not a store into an
+                        # object (`request.scope[...] = ...` taints nothing).
+                        elements = (
+                            target.elts
+                            if isinstance(target, (ast.Tuple, ast.List))
+                            else [target]
+                        )
+                        for element in elements:
+                            if isinstance(element, ast.Name):
+                                tainted.add(element.id)
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else getattr(func, "id", "")
+            )
+            is_log = (
+                isinstance(func, ast.Attribute)
+                and name in _LOG_METHODS
+                and ast.unparse(func.value).split(".")[-1]
+                in ("logger", "log", "_logger", "logging")
+            )
+            if not (is_log or name in _RESPONSE_CALLS):
+                continue
+            values = [*node.args, *(k.value for k in node.keywords)]
+            if any(_reads_request_metadata(v, tainted) for v in values):
+                found.append(node.lineno)
+    return found
+
+
+#: Reviewed sites (`path::line-free function`) where request metadata
+#: reaches a log or a response on purpose (rev 29): none.
+_REVIEWED_REQUEST_METADATA_SINKS: frozenset[str] = frozenset()
+
+
+def test_no_request_metadata_reaches_a_log_or_a_response() -> None:
+    """No request header, query string, path, method, client address,
+    cookie or URL value reaches a logging call or a response in `src/pmcp`,
+    directly or through one assignment, outside the reviewed classifiers
+    (rev 29)."""
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src" / "pmcp"
+    found = []
+    for path in sorted(src.rglob("*.py")):
+        if "baml_client" in path.parts:
+            continue
+        for line in _request_metadata_sinks(ast.parse(path.read_text())):
+            found.append(f"{path.relative_to(src)}:{line}")
+    assert not found, found
+
+
+@pytest.mark.parametrize(
+    ("snippet", "flagged"),
+    [
+        (
+            "def f(request):\n    logger.debug('a %s', request.headers.get('accept'))\n",
+            True,
+        ),
+        ("def f(request):\n    logger.info('%s', request.url.path)\n", True),
+        (
+            "def f(request):\n    ip = request.client.host\n    logger.debug('%s', ip)\n",
+            True,
+        ),
+        ("def f(request):\n    return Response(request.headers['x'])\n", True),
+        ("def f(scope):\n    logger.debug('%s', scope['query_string'])\n", True),
+        (
+            "def f(request):\n    logger.debug('%s', _accept_class(request.headers.get('accept', '')))\n",
+            False,
+        ),
+        (
+            "def f(request):\n    logger.debug('%s', 'present' if request.headers.get('x') else 'absent')\n",
+            False,
+        ),
+        ("def f(request):\n    logger.debug('fixed %s', 1)\n", False),
+        (
+            "def f(request):\n    request.scope['k'] = request.headers.get('x')\n"
+            "    return Response(status_code=401, headers=g(request))\n",
+            False,
+        ),
+    ],
+)
+def test_the_request_metadata_check_sees_each_shape(
+    snippet: str, flagged: bool
+) -> None:
+    assert bool(_request_metadata_sinks(ast.parse(snippet))) is flagged
