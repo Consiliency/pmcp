@@ -1419,3 +1419,124 @@ def test_an_explicit_root_then_a_lazy_load_answers_for_the_explicit_root(
     assert env_store.credential_lookup()("LAZY_TOKEN") == "from-b"  # lazy load
     assert env_store.credential_value("LAZY_TOKEN") == "from-b"
     assert env_store.resolve_project_root(None) == roots["b"]
+
+
+# --------------------------------------------------------------------------- #
+# Board round 14, codex F001: before any startup load, a library caller's
+# first credential answer came from the project file -- the user store was not
+# in the environment yet -- and later answers from the user store. Every
+# credential answer now loads the user store first (env_store.credential_value
+# -> ensure_startup_load, idempotent, never re-choosing the served root).
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_r14_f001_a_cold_library_startup_keeps_user_precedence(
+    tmp_path: Path,
+) -> None:
+    """codex r14 F001, verbatim in substance."""
+    import json
+    from unittest.mock import patch
+
+    from pmcp.config.loader import load_configs, resolve_startup_configs
+    from pmcp.manifest.loader import load_manifest
+
+    home = tmp_path / "home"
+    user_store = home / ".config" / "pmcp" / "pmcp.env"
+    user_store.parent.mkdir(parents=True)
+    user_store.write_text("BRAVE_API_KEY=operator-token\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".env.pmcp").write_text("BRAVE_API_KEY=project-token\n")
+    (home / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"brave-search": {"command": "echo"}}})
+    )
+    with (
+        patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+        patch.object(cli, "find_dotenv", return_value=""),
+        patch.multiple(
+            env_store,
+            _DEFAULT_ROOT=None,
+            _REPO_CREDENTIALS={},
+            _PINNED_USER_STORE=None,
+            _STARTUP_LOADED=False,
+            _DOTENV_SOURCED_KEYS=set(),
+            _PMCP_INTRODUCED_KEYS=set(),
+            _WARNED_REFUSALS=set(),
+        ),
+    ):
+        env_store.serve_project_root(project)
+        configs = load_configs(project_root=project)
+        manifest = load_manifest(project_root=project)
+        resolution = resolve_startup_configs(
+            configs,
+            manifest_servers={"brave-search": manifest.servers["brave-search"]},
+            enabled_auto_start={"brave-search"},
+            project_root=project,
+            is_auth_available=lambda key: bool(
+                env_store.credential_value(key, root=project)
+            ),
+        )
+        assert env_store.credential_lookup(project)("BRAVE_API_KEY") == (
+            "operator-token"
+        )
+        [server] = resolution.eager_configs
+        assert server.config.env["BRAVE_API_KEY"] == "operator-token"
+
+
+COLD_ENTRIES = ["credential_value", "credential_lookup", "load_configs", "gateway"]
+
+
+@pytest.mark.parametrize("entry", COLD_ENTRIES)
+def test_with_no_prior_startup_every_entry_answers_the_user_store_first(
+    entry: str, roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh process, no startup load: the FIRST answer already has user precedence.
+
+    And the cold load keeps a served root set before it (round 14).
+    """
+    import json
+
+    from pmcp import server as server_module
+    from pmcp.config.loader import load_configs
+
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    monkeypatch.setattr(cli, "find_dotenv", lambda: "")
+    user_store = roots["home"] / ".config" / "pmcp" / "pmcp.env"
+    user_store.write_text("BRAVE_API_KEY=operator-token\n")
+    (roots["b"] / ".env.pmcp").write_text("BRAVE_API_KEY=project-token\n")
+    (roots["home"] / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"brave-search": {"command": "echo"}}})
+    )
+    assert env_store._STARTUP_LOADED is False
+    env_store.serve_project_root(roots["b"])  # library use; cwd is a
+
+    if entry == "credential_value":
+        first = env_store.credential_value("BRAVE_API_KEY")
+    elif entry == "credential_lookup":
+        first = env_store.credential_lookup(roots["b"])("BRAVE_API_KEY")
+    elif entry == "load_configs":
+        [config] = [c for c in load_configs() if c.name == "brave-search"]
+        first = (config.config.env or {}).get("BRAVE_API_KEY")
+    else:
+        captured: dict[str, object] = {}
+
+        def capture(configs: object, **kwargs: object) -> None:
+            captured["configs"] = configs
+            raise _Captured(kwargs)
+
+        monkeypatch.setattr(server_module, "resolve_startup_configs", capture)
+        gateway = server_module.GatewayServer(
+            project_root=roots["b"], cache_dir=roots["base"] / "cache"
+        )
+        with pytest.raises(_Captured):
+            asyncio.run(gateway.initialize())
+        [config] = [
+            c
+            for c in captured["configs"]  # type: ignore[attr-defined]
+            if c.name == "brave-search"
+        ]
+        first = (config.config.env or {}).get("BRAVE_API_KEY")
+
+    assert first == "operator-token"
+    assert env_store.credential_value("BRAVE_API_KEY") == "operator-token"
+    assert env_store.resolve_project_root(None) == roots["b"]

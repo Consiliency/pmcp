@@ -860,7 +860,15 @@ def credential_value(
     A name a repository may not supply (:func:`repository_may_supply`: pmcp's
     own variables in any case, any ``*_proxy``, code-loading and package-manager
     families) is never answered from a repository source.
+
+    No answer is given before the startup load has put the user store into
+    the environment (:func:`ensure_startup_load`; idempotent, and it never
+    changes the served root): otherwise a library caller's first lookup --
+    ``GatewayServer.initialize`` building configs before anything loaded --
+    answered from the project file and later lookups from the user store
+    (Consiliency/pmcp#372 round 15, board round 14 codex F001).
     """
+    ensure_startup_load()
     if environ and key in os.environ:
         return os.environ[key] or None
     repository_may_answer = repository_may_supply(key)

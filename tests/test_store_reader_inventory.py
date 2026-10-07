@@ -1482,3 +1482,55 @@ def test_the_classification_scan_sees_each_shape() -> None:
     )
     flagged = {line.split(":")[1] for line in classification_leaks({"pmcp.x": source})}
     assert flagged == {"by_name", "inline", "through_a_wrapper"}
+
+
+# --------------------------------------------------------------------------- #
+# No credential answer before the user store is in the environment
+# (Consiliency/pmcp#372 round 15, board round 14 codex F001). Every credential
+# read goes through credential_value (the inventories above), so the rule is
+# held at that one gate: its first statement is ensure_startup_load(), and the
+# startup load it runs never re-chooses the served root (round 14).
+# --------------------------------------------------------------------------- #
+
+
+def _function(module: str, name: str) -> ast.FunctionDef:
+    tree = ast.parse(_src_sources()[module])
+    return next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
+def _first_statement_calls(fn: ast.FunctionDef, callee: str) -> bool:
+    body = list(fn.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]  # the docstring
+    first = body[0] if body else None
+    return (
+        isinstance(first, ast.Expr)
+        and isinstance(first.value, ast.Call)
+        and getattr(first.value.func, "id", None) == callee
+    )
+
+
+def test_the_credential_gate_loads_the_user_store_first() -> None:
+    fn = _function("pmcp.env_store", "credential_value")
+    assert _first_statement_calls(fn, "ensure_startup_load")
+
+
+def test_the_startup_load_never_rechooses_the_served_root() -> None:
+    fn = _function("pmcp.cli", "load_startup_env")
+    called = {
+        getattr(node.func, "id", getattr(node.func, "attr", None))
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+    }
+    assert "ensure_served_project_root" in called
+    assert "serve_project_root" not in called
+    assert "set_default_root" not in called
