@@ -2669,3 +2669,51 @@ def test_an_sdk_raised_error_is_withheld_unless_reviewed() -> None:
         text = exception_text(raised)
         assert (s in text) is (not withheld and s in str(error)), text
     assert not withheld_sdk_error(MCPError(-32600, f"Unexpected content type: {s}"))
+
+
+def test_a_body_pmcp_decodes_itself_is_described_by_its_codec() -> None:
+    """A `UnicodeDecodeError` raised in pmcp's (here a test's) own frame is
+    not an HTTP client's by origin, so its class registration is what
+    describes it: by codec, never the bytes (rev 26: M154)."""
+    from pmcp.argument_errors import exception_origin, exception_text
+
+    s = _GRID_S
+    with pytest.raises(UnicodeDecodeError) as caught:
+        (s.encode() + b"\xff\xfe").decode("utf-8")
+    assert exception_origin(caught.value) is None
+    text = exception_text(caught.value)
+    assert text == "could not decode utf-8 text (UnicodeDecodeError)", text
+
+
+def test_an_sdk_record_prints_its_traceback_by_class() -> None:
+    """Every `mcp.*` record's traceback keeps its frames and prints each
+    exception by its class alone, whatever the exception (rev 26: M180)."""
+    import logging
+
+    import pmcp  # noqa: F401 - installs the scrubbers
+
+    s = _GRID_S
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("mcp.client.streamable_http")
+    handler = Capture()
+    logger.addHandler(handler)
+    saved = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        try:
+            raise RuntimeError(f"not registered {s}")
+        except RuntimeError:
+            logger.exception("Error in post_writer")
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(saved)
+    (record,) = records
+    assert record.exc_info is None
+    assert record.exc_text and "Traceback (most recent call last)" in record.exc_text
+    assert record.exc_text.rstrip().endswith("RuntimeError"), record.exc_text
+    assert s not in _record_text(record)
