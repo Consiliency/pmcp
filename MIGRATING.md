@@ -26,6 +26,7 @@ log is `~/.pmcp/logs/gateway.log`.
   [`.env` keys](#spawned-servers-no-longer-inherit-the-keys-pmcp-loaded-from-env) ·
   [symlinked `.env.pmcp`](#a-symlinked-project-envpmcp-is-refused) ·
   [project files supply credentials only](#a-project-file-supplies-credentials-only) ·
+  [plain `HOME`](#home-must-be-a-plain-absolute-path) ·
   [discovered servers](#discovered-servers-are-default-deny) ·
   [`packages:` policy](#new-packages-policy-section) ·
   [feedback](#feedback-submission-is-off-by-default) ·
@@ -304,11 +305,9 @@ Symptoms after upgrading: a server that worked now fails with an
 authentication or "missing variable" error, even though the key is in `.env`.
 
 **What changed.** A `~/.env` (in your home directory or an ancestor of it, when no
-checkout encloses that directory -- a checkout above your home owns its `.env`; and if
-resolving your home directory passes through a checkout -- it lies inside one, or a
-link on the way leads through one, or a missing home would be created inside one --
-pmcp uses none of your home-scoped files and says so once; a dotfiles repository AT
-your home directory, and a home reached through your own links, are fine) still
+checkout encloses that directory -- a checkout above your home owns its `.env`; and
+while `HOME` is not [a plain absolute path](#home-must-be-a-plain-absolute-path) outside
+every checkout, pmcp uses none of your home-scoped files and says so once) still
 loads into pmcp's own environment, and pmcp now strips every key it loaded that
 way from the environment of the servers it spawns. Any other `.env` -- a
 project's, or a checkout's that the install walk reaches -- never enters pmcp's
@@ -570,6 +569,46 @@ user store. pmcp prints an `Ignoring` line only for its own variables and for
 values it will not expand; any other non-credential variable in a project
 file is ignored without one. `pmcp secrets check` lists the project keys you
 expect.
+
+### HOME must be a plain absolute path
+
+**Am I affected?** You are if `HOME` (on Windows, `USERPROFILE`) is relative, has a
+`.` or `..` component, or names a directory that does not exist or that you cannot
+search; or if a checkout lies above your home directory, or holds a link on the way to
+it. A checkout is a directory holding `.git`, `.mcp.json`, `package.json`,
+`pyproject.toml` or `.pmcp/manifest.yaml`; a filesystem or drive root never counts, so a
+container image built with `COPY . /` and `HOME=/root` is not affected. A dotfiles
+repository AT your home directory, and links you made yourself such as
+`/home -> /var/home`, are fine.
+
+```bash
+printf '%s\n' "$HOME"; ls -ld "$HOME"
+```
+
+**What changed.** pmcp uses the files under your home directory -- `~/.mcp.json`,
+`~/.claude/gateway-policy.yaml`, `~/.claude/gateway-guidance.yaml`,
+`~/.pmcp/manifest.yaml`, `~/.config/pmcp/pmcp.env`, the trust and package-approval
+stores, the registry caches and the singleton lock -- only while the home directory is
+yours by the rule above. Otherwise it prints `pmcp: Ignoring the operator's files under
+the home directory: HOME is not a plain absolute path the system resolves; set HOME to a
+plain absolute path` (or `... the home directory lies inside a checkout`) once on
+stderr, runs without those files, creates nothing under that home, and refuses every
+trust and package-approval decision, so `pmcp trust approve` and `pmcp secrets set
+--scope user` fail. 2.7.3 used whatever `HOME` named. Only you set `HOME`, so a
+spelling pmcp cannot judge exactly is refused rather than guessed at.
+
+**What to do.** Set `HOME` to the absolute path of your home directory, with no `.` or
+`..`, in the environment that starts pmcp -- your shell, a systemd unit, a container
+image:
+
+```bash
+export HOME=/home/alice
+```
+
+If your home directory lies inside a repository checkout, move it out.
+
+**How to verify.** `pmcp guidance` prints your settings and stderr has no `Ignoring the
+operator's files` line.
 
 ### Discovered servers are default-deny
 
@@ -1433,6 +1472,7 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
 | [Spawned servers no longer inherit the keys pmcp loaded from `.env`](#spawned-servers-no-longer-inherit-the-keys-pmcp-loaded-from-env) | Safe on 2.7.3: shell exports are inherited, a server's `env` block in `~/.mcp.json` is passed as written,† and `pmcp secrets set` works the same. |
 | [A symlinked project `.env.pmcp` is refused](#a-symlinked-project-envpmcp-is-refused) | Safe on 2.7.3: a regular `.env.pmcp` and your user store work the same. 2.7.3 follows a symlinked `.env.pmcp` again, for writes and at startup, wherever it points, and hangs on a fifo `.env.pmcp`, so check `ls -l .env.pmcp` in repositories you clone. |
 | [A project file supplies credentials only](#a-project-file-supplies-credentials-only) | Reverse: if you moved entries from a subdirectory's `.env.pmcp` into the project root's `.env.pmcp`, 2.7.3 started from that subdirectory reads only that subdirectory's `.env.pmcp` and does not see them: copy the entries back into the subdirectory's `.env.pmcp`, or start pmcp from the project root (`cd` to it first). Otherwise 2.7.3 loads a project `.env.pmcp` and `.env` into its own environment again, so settings in them apply, a checkout's `.env` wins over your user store, and `pmcp secrets check` again prefers a project `.env.pmcp`, and `pmcp secrets sync --from-scope project --to-scope user` again copies every key, `UV_INDEX_URL` and the like included; credentials keep working. Re-check your user store after any such sync on 2.7.3. |
+| [HOME must be a plain absolute path](#home-must-be-a-plain-absolute-path) | Safe on 2.7.3: a plain absolute `HOME` works the same there. 2.7.3 does not check `HOME` at all and uses the files under whatever it names. |
 | [Discovered servers are default-deny](#discovered-servers-are-default-deny) | Safe on 2.7.3: package approvals are ignored and discovered packages provision without one. A `packages.allowlist` must go, as for the next row. |
 | [New `packages:` policy section](#new-packages-policy-section) | Reverse: remove every `packages:` section (step 1 above), or 2.7.3 refuses to start.† |
 | [Feedback submission is off by default](#feedback-submission-is-off-by-default) | Reverse: 2.7.3 ignores `enable_feedback_submission`† and posts on `confirm_submission=true` through the first of these that works: `PMCP_FEEDBACK_TOKEN`, then `GITHUB_TOKEN` (each exported, or loaded from a `.env`, a checkout's `.env.pmcp` or `~/.config/pmcp/pmcp.env`), then a `gh` CLI on the gateway's `PATH` using its stored login.† It posts to `ViperJuice/pmcp`, the project's former name, which GitHub redirects to `Consiliency/pmcp`, unless `PMCP_FEEDBACK_REPO` names another.† To stop every channel, run `pmcp guidance --telemetry off` before you restart on 2.7.3; the call then refuses before it reads any token.† 3.0 honours the same setting. Otherwise unset `PMCP_FEEDBACK_TOKEN` and `GITHUB_TOKEN`, delete them from those files, and keep `gh` off the gateway's `PATH`.† `GH_TOKEN` alone posts nothing without `gh`.† |

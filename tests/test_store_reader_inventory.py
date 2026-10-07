@@ -1343,9 +1343,9 @@ CWD_READERS = {
         "THE derivation of a project from where pmcp started: its answer is "
         "the served root (serve_project_root)"
     ),
-    ("pmcp.home_identity", "traverse"): (
-        "a RELATIVE path is walked from the working directory, as the kernel "
-        "walks it; reads no project input"
+    ("pmcp.home_identity", "is_operator_owned"): (
+        "a RELATIVE directory is judged by its absolute spelling, as the "
+        "kernel resolves it; reads no project input"
     ),
     ("pmcp.env_store", "resolve_project_root"): (
         "an explicit RELATIVE --project is joined to the working directory, "

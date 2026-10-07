@@ -1271,8 +1271,15 @@ def test_the_user_store_behind_an_unsearchable_home_is_not_absent(
         cli.load_startup_env(dotenv_path=str(lay["base"] / "no-such.env"))
         assert VAR not in os.environ
         err = capfd.readouterr().err
-        assert err.count("pmcp: refusing to read pmcp.env: Permission denied") == 1
-        assert err.count("pmcp: refusing to load pmcp.env: Permission denied") == 1
+        # Round 24: a HOME the system cannot resolve is not the operator's --
+        # one line asking for a plain HOME, and the store is refused, not read.
+        assert err.count("HOME is not a plain absolute path the system resolves") == 1
+        assert (
+            err.count("pmcp: refusing to read pmcp.env: Operation not permitted") == 1
+        )
+        assert (
+            err.count("pmcp: refusing to load pmcp.env: Operation not permitted") == 1
+        )
         with pytest.raises(PermissionError):
             env_store.read_store("user", strict=True)
         with pytest.raises(PermissionError):
@@ -1284,6 +1291,34 @@ def test_the_user_store_behind_an_unsearchable_home_is_not_absent(
         assert _decide(lay["project"]).reason == "gate_error"
     finally:
         os.chmod(gate, 0o700)
+
+
+def test_a_user_store_in_an_unsearchable_directory_is_not_absent(
+    lay: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """HOME is the operator's and resolves; the store's own directory cannot
+    be searched. Lenient readers warn once and read empty; strict ones raise."""
+    if os.name != "posix" or os.geteuid() == 0:
+        pytest.skip("needs POSIX search permissions and a non-root process")
+    home = lay["base"] / "operatorhome"
+    store_dir = home / ".config" / "pmcp"
+    store_dir.mkdir(parents=True)
+    (store_dir / "pmcp.env").write_text(f"{VAR}=x\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(env_store, "_PINNED_USER_STORE", None)
+    os.chmod(store_dir, 0o600)
+    try:
+        assert env_store.read_store("user") == {}
+        assert env_store.read_store("user") == {}
+        err = capfd.readouterr().err
+        assert err.count("pmcp: refusing to read pmcp.env: Permission denied") == 1
+        assert "Ignoring the operator's files" not in err
+        with pytest.raises(PermissionError):
+            env_store.read_store("user", strict=True)
+    finally:
+        os.chmod(store_dir, 0o700)
 
 
 # --------------------------------------------------------------------------- #

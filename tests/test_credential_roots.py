@@ -2887,33 +2887,33 @@ def test_claude_r22_n1_a_home_spelled_through_missing_dotdot_grants_nothing(
     monkeypatch.chdir(base / "outside")
     trust_store.reset_launch_directory()
     assert trust_store.is_approved(config, content, project_root=config.parent) is False
-    # Round 23's rule: resolving HOME traverses `repo`, a checkout.
-    with pytest.raises(trust_store.TrustStoreError, match="the home directory lies"):
+    # Round 24: a HOME with a `..` component is not plain, so not the operator's.
+    with pytest.raises(trust_store.TrustStoreError, match="not a plain absolute path"):
         trust_store.trust_store_path()
     with pytest.raises(trust_store.TrustStoreError):
         package_approvals_path()
     err = capsys.readouterr().err
-    assert "the home directory lies inside a checkout" in err
+    assert "HOME is not a plain absolute path the system resolves" in err
     assert "planted" not in err
 
 
-def test_an_unexaminable_home_refuses_trust_but_plain_reads_report_their_own_error(
+def test_a_home_the_system_cannot_resolve_supplies_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A HOME that does not exist: trust refused; a plain read is simply absent."""
-    from pmcp import trust_store
+    """A HOME that does not exist is not the operator's (round 24): trust is
+    refused, and so is every home-scoped file -- nothing is created there."""
+    from pmcp import home_identity, trust_store
     from pmcp.config.loader import default_user_config_paths
 
     missing = tmp_path.resolve() / "no-such-home"
     monkeypatch.setenv("HOME", str(missing))
-    with pytest.raises(trust_store.TrustStoreError, match="cannot be examined"):
+    with pytest.raises(trust_store.TrustStoreError, match="not a plain absolute path"):
         trust_store.trust_store_path()
-    # Plain reads go through and find nothing there.
-    assert default_user_config_paths() == [
-        missing / ".mcp.json",
-        missing / ".claude" / ".mcp.json",
-    ]
+    assert default_user_config_paths() == []
     assert env_store.read_store("user") == {}
+    with pytest.raises(home_identity.HomeInsideCheckoutError):
+        env_store.set_env_value("user", "MISSING_HOME_372", "inert")
+    assert not missing.exists()
 
 
 def test_a_trust_store_link_through_missing_dotdot_is_never_read(
@@ -2957,12 +2957,12 @@ def test_an_unexaminable_home_owns_no_ancestor_env(
 
 
 # --------------------------------------------------------------------------- #
-# Board round 22 (grok F001, codex F001-F003, gemini F001) -> round 23 ruling:
-# ONE rule replaces every home special case. HOME is operator-owned iff no
-# directory TRAVERSED while resolving HOME (kernel order, links spliced as
-# written, `..` applied after earlier links) -- other than HOME's own final
-# directory -- carries a checkout marker. The grid generates HOME shapes and
-# checks each verdict, and what follows from it, end to end.
+# Board round 23 (grok F001, codex F001-F003, claude N-1) -> round 24 ruling:
+# HOME must be PLAIN -- absolute for the platform, no `.`/`..` component, and
+# resolvable -- and is then judged on its kernel prefixes (a link held by a
+# checkout refuses) and on the physical ancestors of realpath(HOME), HOME
+# itself excluded. A filesystem root is never a checkout. The grid generates
+# HOME shapes and checks each verdict, and what follows from it, end to end.
 # --------------------------------------------------------------------------- #
 
 
@@ -2975,6 +2975,8 @@ def _shape(base: Path, name: str) -> str:
     real.mkdir()
     if name == "plain":
         return str(real)
+    if name == "plain-trailing-slash":
+        return f"{real}/"
     if name == "dotfiles-at-home":
         (real / ".git").mkdir()
         (real / ".mcp.json").write_text('{"mcpServers": {}}')
@@ -3002,29 +3004,34 @@ def _shape(base: Path, name: str) -> str:
     if name == "repo-link-to-sibling":
         (repo / "home").symlink_to("../real", target_is_directory=True)
         return str(repo / "home")
-    if name == "repo-dotdot-before-link":
-        (repo / "home").symlink_to(real, target_is_directory=True)
-        return f"{repo}/child/../home"
-    if name == "plain-dotdot-before-link":
+    if name == "repo-link-in-a-parent":
+        (repo / "out").symlink_to(base / "real", target_is_directory=True)
+        (real / "user").mkdir()
+        return str(repo / "out" / "user")
+    if name == "dotdot-before-a-link":
         (real / "sub").mkdir()
         (base / "alias").symlink_to(real, target_is_directory=True)
         return f"{real}/sub/../../alias"
-    if name == "link-into-repo-then-dotdot":
-        (base / "alias").symlink_to(repo / "child", target_is_directory=True)
-        return f"{base}/alias/.."
-    if name == "repo-link-then-dotdot":
-        (repo / "home").symlink_to("child", target_is_directory=True)
-        return f"{repo}/home/.."
-    if name == "operator-link-then-dotdot":
+    if name == "dotdot-after-a-link":
         (real / "user").mkdir()
         (base / "alias").symlink_to(real / "user", target_is_directory=True)
         return f"{base}/alias/.."
+    if name == "dotdot-into-a-checkout":
+        (repo / "home").mkdir()
+        return f"{real}/../repo/home"
+    if name == "dot-component":
+        return f"{base}/./real"
+    if name == "missing-then-dotdot":  # grok round 23
+        (repo / "home").mkdir()
+        return f"{real}/missing/../../repo/home"
+    if name == "relative":
+        return "real"
+    if name == "unsearchable":
+        (base / "locked" / "home").mkdir(parents=True)
+        (base / "locked").chmod(0)
+        return str(base / "locked" / "home")
     if name == "missing-inside-a-checkout":
         return str(repo / "not-created")
-    if name == "missing-deep-inside-a-checkout":
-        return str(repo / "a" / "b")
-    if name == "missing-through-dotdot-inside-a-checkout":
-        return f"{repo}/missing/../home"
     if name == "missing-outside":
         return str(base / "not-created")
     if name == "checkout-one-level-up":
@@ -3049,76 +3056,86 @@ def _shape(base: Path, name: str) -> str:
     raise AssertionError(name)
 
 
-#: shape -> (operator-owned?, examinable?)
-HOME_SHAPES = {
-    "plain": (True, True),
-    "dotfiles-at-home": (True, True),
-    "operator-link": (True, True),
-    "operator-link-marked-target": (True, True),
-    "operator-link-relative": (True, True),
-    "operator-link-to-a-checkout": (True, True),
-    "repo-link-to-dot": (False, False),
-    "repo-link-to-child": (False, False),
-    "repo-link-to-sibling": (False, False),
-    "repo-dotdot-before-link": (False, False),
-    "plain-dotdot-before-link": (True, True),
-    "link-into-repo-then-dotdot": (False, False),
-    "repo-link-then-dotdot": (False, False),
-    "operator-link-then-dotdot": (True, True),
-    "missing-inside-a-checkout": (False, False),
-    "missing-deep-inside-a-checkout": (False, False),
-    "missing-through-dotdot-inside-a-checkout": (False, False),
-    "missing-outside": (True, False),
-    "checkout-one-level-up": (False, False),
-    "checkout-two-levels-up": (False, False),
-    "operator-parent-link": (True, True),
-    "operator-parent-link-marked-home": (True, True),
-    "parent-link-into-a-checkout": (False, False),
+_PLAIN = "HOME is not a plain absolute path the system resolves"
+_CHECKOUT = "the home directory lies inside a checkout"
+
+#: shape -> None (the operator's) or the refusal it gets.
+HOME_SHAPES: dict[str, str | None] = {
+    "plain": None,
+    "plain-trailing-slash": None,
+    "dotfiles-at-home": None,
+    "operator-link": None,
+    "operator-link-marked-target": None,
+    "operator-link-relative": None,
+    "operator-link-to-a-checkout": None,
+    "operator-parent-link": None,
+    "operator-parent-link-marked-home": None,
+    "repo-link-to-dot": _CHECKOUT,
+    "repo-link-to-child": _CHECKOUT,
+    "repo-link-to-sibling": _CHECKOUT,
+    "repo-link-in-a-parent": _CHECKOUT,
+    "checkout-one-level-up": _CHECKOUT,
+    "checkout-two-levels-up": _CHECKOUT,
+    "parent-link-into-a-checkout": _CHECKOUT,
+    "dotdot-before-a-link": _PLAIN,
+    "dotdot-after-a-link": _PLAIN,
+    "dotdot-into-a-checkout": _PLAIN,
+    "dot-component": _PLAIN,
+    "missing-then-dotdot": _PLAIN,
+    "relative": _PLAIN,
+    "unsearchable": _PLAIN,
+    "missing-inside-a-checkout": _PLAIN,
+    "missing-outside": _PLAIN,
 }
 
 
 @pytest.mark.parametrize("shape", sorted(HOME_SHAPES))
-def test_every_home_shape_follows_the_one_rule(
-    shape: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_every_home_shape_follows_the_rule(
+    shape: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     from pmcp import home_identity, trust_store
 
+    if shape == "unsearchable" and (os.name != "posix" or os.geteuid() == 0):
+        pytest.skip("needs POSIX search permissions and a non-root process")
     base = tmp_path.resolve()
     assert all(not home_identity.has_checkout_marker(d) for d in base.parents)
     spelled = _shape(base, shape)
+    monkeypatch.chdir(base)
     monkeypatch.setenv("HOME", spelled)
     monkeypatch.setattr(env_store, "_PINNED_USER_STORE", None)
     monkeypatch.delenv("GRID_TOKEN_372", raising=False)
     home_identity.reset_home_warning()
     trust_store.reset_launch_directory()
-    owned, examinable = HOME_SHAPES[shape]
-
-    assert home_identity.home_is_operators() is owned
-    assert (home_identity.optional_operator_home() == Path(spelled)) is owned
-    assert (home_identity.examinable_home() is not None) is examinable
-    # The rule, restated from the walk itself: final directory excluded.
-    walk = home_identity.traverse(spelled)
-    assert (walk.marked() is None) is owned
-    assert (walk.final is None) is shape.startswith("missing")
-
-    before = {p for p in base.rglob("*")}
-    if examinable:
-        assert trust_store.trust_store_path() is not None
-        env_store.set_env_value("user", "GRID_TOKEN_372", "inert")
-        assert env_store.read_store("user") == {"GRID_TOKEN_372": "inert"}
-    else:
+    refusal = HOME_SHAPES[shape]
+    try:
+        assert home_identity.home_is_operators() is (refusal is None)
+        assert (home_identity.examinable_home() is not None) is (refusal is None)
+        if refusal is None:
+            assert home_identity.optional_operator_home() == Path(spelled)
+            assert trust_store.trust_store_path() is not None
+            env_store.set_env_value("user", "GRID_TOKEN_372", "inert")
+            assert env_store.read_store("user") == {"GRID_TOKEN_372": "inert"}
+            return
+        before = set(base.rglob("*"))
+        assert home_identity.optional_operator_home() is None
+        assert capsys.readouterr().err.count(refusal) == 1
         with pytest.raises(trust_store.TrustStoreError):
             trust_store.trust_store_path()
-        if not owned:
-            with pytest.raises(home_identity.HomeInsideCheckoutError):
-                env_store.set_env_value("user", "GRID_TOKEN_372", "inert")
-            assert env_store.read_store("user") == {}
-            assert not [p for p in base.rglob("pmcp.env")]
-            assert {p for p in base.rglob("*")} == before
+        with pytest.raises(home_identity.HomeInsideCheckoutError, match=refusal):
+            env_store.set_env_value("user", "GRID_TOKEN_372", "inert")
+        assert env_store.read_store("user") == {}
+        assert set(base.rglob("*")) == before
+    finally:
+        if (base / "locked").exists():
+            (base / "locked").chmod(0o700)
 
 
-def test_the_home_grid_covers_every_shape_the_ruling_names() -> None:
+def test_the_home_grid_covers_every_shape_the_rulings_name() -> None:
     named = {
+        # round 23
         "plain",
         "dotfiles-at-home",
         "operator-link",
@@ -3126,20 +3143,111 @@ def test_the_home_grid_covers_every_shape_the_ruling_names() -> None:
         "repo-link-to-dot",
         "repo-link-to-child",
         "repo-link-to-sibling",
-        "repo-dotdot-before-link",
-        "link-into-repo-then-dotdot",
+        "dotdot-before-a-link",
+        "dotdot-after-a-link",
         "missing-inside-a-checkout",
         "missing-outside",
         "checkout-one-level-up",
         "checkout-two-levels-up",
         "operator-parent-link",
+        # round 24: odd spellings
+        "relative",
+        "dot-component",
+        "unsearchable",
+        "missing-then-dotdot",
     }
     assert named <= set(HOME_SHAPES)
-    assert {v for v in HOME_SHAPES.values()} == {
-        (True, True),
-        (False, False),
-        (True, False),
-    }
+    assert set(HOME_SHAPES.values()) == {None, _PLAIN, _CHECKOUT}
+
+
+def test_a_root_is_never_a_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """claude round 23 N-1: a container image with `/package.json` (`COPY . /`)
+    and HOME=/root keeps the operator's home files and its residency walk."""
+    from pmcp import home_identity, trust_store
+
+    home = tmp_path.resolve() / "root"
+    home.mkdir()
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if os.fspath(path) in ("/package.json", "/.git"):
+            return real_lstat("/", *args, **kwargs)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(home_identity.os, "lstat", lstat)
+    monkeypatch.setenv("HOME", str(home))
+    assert os.lstat("/package.json")  # the image's marker is there
+    assert home_identity.has_checkout_marker("/") is False
+    assert home_identity.home_is_operators() is True
+    assert Path("/") not in list(home_identity.enclosing_checkouts(home))
+    assert trust_store.trust_store_path() is not None
+
+
+# Windows, by the platform's own path module (codex round 23 F002): `\`
+# separates, a drive root is a root, and a drive-relative path is relative.
+
+
+def _windows_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, home: str
+) -> None:
+    import ntpath
+    from pathlib import PureWindowsPath
+    from types import SimpleNamespace
+
+    from pmcp import home_identity
+
+    class WindowsPath(PureWindowsPath):
+        @classmethod
+        def home(cls):  # type: ignore[no-untyped-def]
+            return cls(home)
+
+    def local(path):  # type: ignore[no-untyped-def]
+        return tmp_path.joinpath(*PureWindowsPath(path).parts[1:])
+
+    path_module = SimpleNamespace(
+        **{n: getattr(ntpath, n) for n in dir(ntpath) if not n.startswith("__")}
+    )
+    path_module.expanduser = lambda spelled: home if spelled == "~" else spelled
+    path_module.realpath = ntpath.abspath
+    windows_os = SimpleNamespace(
+        path=path_module,
+        fspath=os.fspath,
+        getcwd=lambda: "C:\\",
+        lstat=lambda path: os.lstat(local(path)),
+        stat=lambda path: os.stat(local(path)),
+    )
+    monkeypatch.setattr(home_identity, "Path", WindowsPath)
+    monkeypatch.setattr(home_identity, "os", windows_os)
+
+
+@pytest.mark.parametrize(
+    ("home", "operators"),
+    [
+        ("C:\\Users\\me", True),
+        ("C:/Users/me", True),
+        ("C:\\checkout\\home", False),
+        ("C:/checkout/home", False),
+        ("C:\\Users\\..\\checkout\\home", False),
+        ("C:\\Users\\.\\me", False),
+        ("Users\\me", False),
+        ("C:Users\\me", False),  # drive-relative
+        ("C:\\Users\\nobody", False),  # does not resolve
+    ],
+)
+def test_a_windows_home_follows_the_rule(
+    home: str, operators: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity
+
+    (tmp_path / "checkout" / ".git").mkdir(parents=True)
+    (tmp_path / "checkout" / "home").mkdir()
+    (tmp_path / "Users" / "me").mkdir(parents=True)
+    _windows_platform(tmp_path, monkeypatch, home)
+    assert home_identity.has_checkout_marker("C:\\checkout")
+    assert home_identity.has_checkout_marker("C:\\") is False
+    assert home_identity.home_is_operators() is operators
 
 
 # The seats' falsifiers, as filed (their ancestor-marker patches kept).
@@ -3263,3 +3371,161 @@ def test_the_operators_home_ends_project_discovery(
     (home / ".mcp.json").write_text('{"mcpServers": {}}')
     monkeypatch.setenv("HOME", str(home))
     assert find_project_root(home / "work") is None
+
+
+# Board round 23's falsifiers, as filed.
+
+
+def test_grok_r23_f001_missing_then_dotdot_home_does_not_write_into_a_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.config.guidance import set_feedback_submission_enabled
+    from pmcp.home_identity import (
+        HomeInsideCheckoutError,
+        has_checkout_marker,
+        reset_home_warning,
+    )
+
+    base = tmp_path.resolve()
+    ancestors = set(base.parents)
+    monkeypatch.setattr(
+        "pmcp.home_identity.has_checkout_marker",
+        lambda path: False if Path(path) in ancestors else has_checkout_marker(path),
+    )
+    repo = base / "repo"
+    landing = repo / "home" / ".claude"
+    landing.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    outside = base / "outside-secret"
+    outside.write_text("ORIGINAL\n", encoding="utf-8")
+    (landing / "gateway-guidance.yaml").symlink_to(outside)
+    safe = base / "safe"
+    safe.mkdir()
+    home = os.path.join(
+        str(safe), "missing", "..", "..", "..", base.name, "repo", "home"
+    )
+    monkeypatch.setenv("HOME", home)
+    reset_home_warning()
+    try:
+        set_feedback_submission_enabled(False)
+    except (HomeInsideCheckoutError, OSError):
+        pass
+    assert outside.read_text(encoding="utf-8") == "ORIGINAL\n"
+    assert not (safe / "missing").exists()
+    assert (landing / "gateway-guidance.yaml").is_symlink()
+
+
+def _fresh_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.setattr(env_store, "_PINNED_USER_STORE", None)
+    monkeypatch.setattr(env_store, "_DEFAULT_ROOT", None)
+    monkeypatch.setattr(env_store, "_STARTUP_LOADED", False)
+    monkeypatch.setattr(env_store, "_REPO_CREDENTIALS", {})
+
+
+def test_codex_r23_f001_relative_home_cannot_load_checkout_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    work = checkout / "subdirectory"
+    store = work / "home" / ".config" / "pmcp" / "pmcp.env"
+    store.parent.mkdir(parents=True)
+    store.write_text("PMCP_PORT=45123\n")
+    monkeypatch.chdir(work)
+    _fresh_startup(monkeypatch)
+    monkeypatch.setenv("HOME", "home")
+    monkeypatch.delenv("PMCP_PORT", raising=False)
+    cli.load_startup_env(dotenv_path=str(tmp_path / "absent.env"))
+    assert "PMCP_PORT" not in os.environ
+
+
+def test_codex_r23_f002_windows_home_walk_checks_checkout_ancestors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ntpath
+    from pathlib import PureWindowsPath
+    from types import SimpleNamespace
+
+    from pmcp import home_identity
+
+    (tmp_path / "checkout" / ".git").mkdir(parents=True)
+    (tmp_path / "checkout" / "home").mkdir()
+
+    class WindowsPath(PureWindowsPath):
+        @classmethod
+        def home(cls):  # type: ignore[no-untyped-def]
+            return cls("C:/checkout/home")
+
+    def local(path):  # type: ignore[no-untyped-def]
+        return tmp_path.joinpath(*PureWindowsPath(path).parts[1:])
+
+    windows_os = SimpleNamespace(
+        path=ntpath,
+        fspath=os.fspath,
+        getcwd=lambda: "C:/",
+        lstat=lambda path: os.lstat(local(path)),
+        stat=lambda path: os.stat(local(path)),
+        readlink=lambda path: os.readlink(local(path)),
+    )
+    monkeypatch.setattr(home_identity, "Path", WindowsPath)
+    monkeypatch.setattr(home_identity, "os", windows_os)
+    assert home_identity.has_checkout_marker(WindowsPath("C:/checkout"))
+    assert home_identity.home_is_operators() is False
+
+
+def test_codex_r23_f003_unsearchable_dotdot_home_cannot_load_checkout_dotenv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity
+
+    if os.name != "posix" or os.geteuid() == 0:
+        pytest.skip("requires POSIX search permissions and a non-root process")
+    checkout = tmp_path / "markerless-checkout"
+    locked = checkout / "locked"
+    locked.mkdir(parents=True)
+    (checkout / "home").mkdir()
+    (checkout / "requirements.txt").write_text("")
+    dotenv = checkout / ".env"
+    dotenv.write_text("PMCP_PORT=45123\n")
+    marker = home_identity.has_checkout_marker
+    outside = set(tmp_path.resolve().parents)
+    monkeypatch.setattr(
+        home_identity,
+        "has_checkout_marker",
+        lambda path: False if Path(path) in outside else marker(path),
+    )
+    _fresh_startup(monkeypatch)
+    monkeypatch.setenv("HOME", str(locked / ".." / "home"))
+    monkeypatch.delenv("PMCP_PORT", raising=False)
+    locked.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            os.stat(Path.home())
+        cli.load_startup_env(dotenv_path=str(dotenv))
+        assert "PMCP_PORT" not in os.environ
+    finally:
+        locked.chmod(0o700)
+
+
+def test_a_prefix_the_system_refuses_to_examine_refuses_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rule 2: every prefix of HOME is lstat-ed, and any error refuses -- even
+    one the earlier stat of HOME did not see (a directory changed between)."""
+    from pmcp import home_identity
+
+    home = tmp_path.resolve() / "user"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    assert home_identity.home_is_operators() is True
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if os.fspath(path) == str(home.parent):
+            raise PermissionError(13, "Permission denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(home_identity.os, "lstat", lstat)
+    assert home_identity.home_is_operators() is False
+    assert home_identity.optional_operator_home() is None

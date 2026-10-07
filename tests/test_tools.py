@@ -3663,6 +3663,7 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
+        home.mkdir(exist_ok=True)  # a HOME must resolve (Consiliency/pmcp#372 round 24)
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
@@ -3719,6 +3720,7 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
+        home.mkdir(exist_ok=True)  # a HOME must resolve (Consiliency/pmcp#372 round 24)
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.delenv("API_TOKEN", raising=False)
         monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
@@ -3775,6 +3777,7 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
+        home.mkdir(exist_ok=True)  # a HOME must resolve (Consiliency/pmcp#372 round 24)
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.delenv("API_TOKEN", raising=False)
         monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
@@ -3830,6 +3833,7 @@ class TestCapabilityAndProvision:
             "pmcp.tools.handlers.get_job_manager",
             lambda: types.SimpleNamespace(start_install=start_install),
         )
+        home.mkdir(exist_ok=True)  # a HOME must resolve (Consiliency/pmcp#372 round 24)
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.chdir(project)
         monkeypatch.delenv("SOAK_TEST_KEY", raising=False)

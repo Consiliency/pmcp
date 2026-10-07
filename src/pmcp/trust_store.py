@@ -44,13 +44,13 @@ from pathlib import Path
 from typing import Any
 
 from pmcp.home_identity import (
-    HOME_UNEXAMINABLE,
+    HOME_NOT_PLAIN,
     HomeInsideCheckoutError,
     checkout_controlling_home,
     enclosing_checkouts,
     has_checkout_marker,
     is_operator_owned,
-    trust_home_path,
+    home_path,
 )
 from pmcp import atomic_write as _atomic_write_module
 from pmcp.atomic_write import (
@@ -314,14 +314,14 @@ def trust_store_path(*, also: tuple[Path, ...] = ()) -> Path:
     planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
     # Home-scoped (Consiliency/pmcp#372 round 22): refused while a checkout
-    # controls the home directory -- and, for this trust decision, while the
-    # home directory cannot even be examined (round 23: fail closed).
+    # controls the home directory, or while HOME is not a plain absolute path
+    # the system resolves (round 24: fail closed).
     try:
-        spelled = trust_home_path(".config", "pmcp", "trust.json")
+        spelled = home_path(".config", "pmcp", "trust.json")
     except HomeInsideCheckoutError as exc:
-        if exc.strerror == HOME_UNEXAMINABLE:
+        if exc.strerror == HOME_NOT_PLAIN:
             raise TrustStoreError(
-                f"Trust store trust.json: {HOME_UNEXAMINABLE}; refusing it."
+                f"Trust store trust.json: {HOME_NOT_PLAIN}; refusing it."
             ) from exc
         checkout = checkout_controlling_home()
         where = f"the checkout at {checkout}" if checkout is not None else "a checkout"

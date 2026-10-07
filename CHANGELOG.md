@@ -103,6 +103,16 @@ to do, how to verify it, and how to roll back to 2.7.3.
   runtime would: an exported variable counts as available, an exported empty one as
   missing, where it used to look at the stores alone.
   *Security*
+- **HOME must be a plain absolute path.** pmcp uses the files under your home directory
+  -- user config and policy, guidance, the user manifest overlay, `~/.config/pmcp/pmcp.env`,
+  the trust and package-approval stores, the registry caches, the lock -- only while
+  `HOME` (`USERPROFILE` on Windows) is absolute, has no `.` or `..` component and
+  resolves, and no checkout lies above the home directory or holds a link on the way to
+  it. Otherwise pmcp prints `pmcp: Ignoring the operator's files under the home
+  directory: …` once, runs without those files, creates nothing there, and refuses every
+  trust and package-approval decision. A dotfiles repository at the home directory, your
+  own links (`/home -> /var/home`) and a filesystem or drive root holding a marker (a
+  container's `/package.json`) are fine. 2.7.3 used whatever `HOME` named. *Security*
 - **Discovered servers are default-deny.** `gateway.register_discovered_server` resolves
   and pins the package (and refuses one it cannot pin, or an `env_vars` name that is not
   credential-shaped); `provision`, `connect_server` and `restart_server` refuse it until
