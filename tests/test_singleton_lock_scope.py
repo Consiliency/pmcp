@@ -8,9 +8,12 @@ These tests verify that:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 
 from pmcp.server import GatewayServer
@@ -234,3 +237,123 @@ class TestWindowsLockPath:
         release_singleton_lock()
         # Released via msvcrt as well.
         assert fake_msvcrt.LK_UNLCK in calls  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------- #
+# Board round 30, codex F001: shutdown unlinked the remembered lock path with
+# no check -- after HOME was refused and `.pmcp` redirected, it deleted another
+# directory's gateway.lock. Shutdown now always closes what it holds and
+# removes only the file this process created, and only while the HOME the
+# default lock was taken under is still the operator's.
+# --------------------------------------------------------------------------- #
+
+
+def _isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    from pmcp import home_identity, identity
+
+    base = tmp_path.resolve()
+    home = base / "parent" / "home"
+    home.mkdir(parents=True)
+    original_marker = home_identity.has_checkout_marker
+    ambient = set(base.parents)
+    monkeypatch.setattr(
+        home_identity,
+        "has_checkout_marker",
+        lambda d: False if Path(d) in ambient else original_marker(d),
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(identity, "_LOCK_FILE", None)
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    monkeypatch.setattr(identity, "_LOCK_IDENTITY", None)
+    monkeypatch.setattr(identity, "_LOCK_DIR_FD", None)
+    monkeypatch.setattr(identity, "_LOCK_PIN", None)
+    home_identity.forget_home_verdicts()
+    return home
+
+
+def test_codex_r30_f001_lock_release_rechecks_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity, identity
+
+    home = _isolated_home(tmp_path, monkeypatch)
+    base = home.parent.parent
+    try:
+        assert home_identity.home_is_operators()
+        assert identity.acquire_singleton_lock()
+        (home.parent / ".git").mkdir()
+        assert not home_identity.home_is_operators()
+        victim_dir = base / "unrelated"
+        victim_dir.mkdir()
+        victim = victim_dir / "gateway.lock"
+        victim.write_bytes(b"unrelated lock")
+        lock_dir = home / ".pmcp"
+        lock_dir.rename(home / ".held-lock")
+        lock_dir.symlink_to(victim_dir, target_is_directory=True)
+        assert not home_identity.home_is_operators()
+        identity.release_singleton_lock()
+        assert identity._LOCK_FD is None
+        assert victim.is_file(), (
+            "Shutdown followed a refused HOME path and deleted another lock"
+        )
+        assert victim.read_bytes() == b"unrelated lock"
+    finally:
+        if identity._LOCK_FD is not None:
+            identity._LOCK_FD.close()
+        home_identity.forget_home_verdicts()
+        home_identity.reset_home_warning()
+
+
+def test_shutdown_removes_the_lock_it_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    home = _isolated_home(tmp_path, monkeypatch)
+    assert identity.acquire_singleton_lock()
+    held = identity._LOCK_FD
+    lock = home / ".pmcp" / "gateway.lock"
+    assert lock.is_file()
+    identity.release_singleton_lock()
+    assert held is not None and held.closed
+    assert not lock.exists()
+    assert identity._LOCK_DIR_FD is None
+
+
+@pytest.mark.parametrize("dir_fd", [True, False], ids=["dir_fd", "no-dir_fd"])
+def test_a_lock_replaced_before_shutdown_is_left_alone(
+    dir_fd: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same path, new inode: not this process's file, so not removed."""
+    from pmcp import identity
+
+    home = _isolated_home(tmp_path, monkeypatch)
+    if not dir_fd:
+        monkeypatch.setattr(identity, "_hold_lock_directory", lambda *a: None)
+    assert identity.acquire_singleton_lock()
+    lock = home / ".pmcp" / "gateway.lock"
+    replacement = home / ".pmcp" / "gateway.lock.new"
+    replacement.write_bytes(b"another process's lock")
+    os.replace(replacement, lock)
+    held = identity._LOCK_FD
+    identity.release_singleton_lock()
+    assert held is not None and held.closed
+    assert lock.read_bytes() == b"another process's lock"
+
+
+def test_a_refused_home_removes_nothing_but_closes_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    home = _isolated_home(tmp_path, monkeypatch)
+    assert identity.acquire_singleton_lock()
+    held, directory = identity._LOCK_FD, identity._LOCK_DIR_FD
+    lock = home / ".pmcp" / "gateway.lock"
+    (home.parent / ".git").mkdir()
+    identity.release_singleton_lock()
+    assert held is not None and held.closed
+    assert lock.is_file()  # left behind: no removal under a refused HOME
+    if directory is not None:
+        with pytest.raises(OSError):
+            os.fstat(directory)  # the held directory was closed too

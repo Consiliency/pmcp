@@ -599,6 +599,7 @@ def _write_by_name(
     tmp = os.path.join(parent, f"{prefix}{secrets.token_hex(8)}{suffix}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     fd = os.open(tmp, flags | getattr(os, "O_NOFOLLOW", 0), mode)
+    created = os.fstat(fd)
     committed = False
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -618,8 +619,11 @@ def _write_by_name(
         committed = True
     finally:
         if not committed:
+            # Only the temp this call created: a name swapped since is left
+            # alone (Consiliency/pmcp#372 round 31).
             try:
-                os.unlink(tmp)
+                if _same_file(os.lstat(tmp), created):
+                    os.unlink(tmp)
             except OSError:
                 pass
 
@@ -635,6 +639,7 @@ def _write_in_dir(
         mode,
         dir_fd=dir_fd,
     )
+    created = os.fstat(fd)
     committed = False
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -657,8 +662,11 @@ def _write_in_dir(
         committed = True
     finally:
         if not committed:
+            # Only the temp this call created (Consiliency/pmcp#372 round 31).
             try:
-                os.unlink(tmp_name, dir_fd=dir_fd)
+                seen = os.stat(tmp_name, dir_fd=dir_fd, follow_symlinks=False)
+                if _same_file(seen, created):
+                    os.unlink(tmp_name, dir_fd=dir_fd)
             except OSError:
                 pass
     _fsync_dir(dir_fd)

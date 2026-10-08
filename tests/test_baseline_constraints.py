@@ -244,10 +244,9 @@ class TestSingletonLockConstraints:
 
         source = inspect.getsource(acquire_singleton_lock)
 
-        # ~/.pmcp through the home gate (Consiliency/pmcp#372 round 22).
-        assert 'home_path(".pmcp")' in source, (
-            "Default lock directory should be ~/.pmcp"
-        )
+        # ~/.pmcp through the home gate (Consiliency/pmcp#372 round 22), pinned
+        # so shutdown judges that HOME again before removing the lock (round 31).
+        assert 'HomePin(".pmcp")' in source, "Default lock directory should be ~/.pmcp"
         assert '"gateway.lock"' in source, "Lock file should be named 'gateway.lock'"
 
     def test_server_uses_global_lock_by_default(self) -> None:
@@ -284,8 +283,9 @@ class TestSingletonLockConstraints:
 
         # Verify the default path logic in identity.py
         source = inspect.getsource(acquire_singleton_lock)
-        # ~/.pmcp through the home gate (Consiliency/pmcp#372 round 22).
-        assert 'home_path(".pmcp")' in source, (
+        # ~/.pmcp through the home gate (Consiliency/pmcp#372 round 22), pinned
+        # so shutdown judges that HOME again before removing the lock (round 31).
+        assert 'HomePin(".pmcp")' in source, (
             "acquire_singleton_lock should default to ~/.pmcp"
         )
 

@@ -2049,6 +2049,98 @@ def _is_pin(value: ast.AST | None) -> bool:
     )
 
 
+#: ``(module, kept name)`` -> why keeping a gate-derived value there is safe.
+#: Asserted exact.
+HOME_MEMO_EXEMPT = {
+    ("pmcp.identity", "_LOCK_FILE"): (
+        "the default lock's path, kept to name it in messages and to remove it "
+        "at shutdown -- removal re-judges its HOME through _LOCK_PIN (a "
+        "HomePin) and removes only the inode this process created"
+    ),
+    ("pmcp.identity", "_LOCK_FD"): (
+        "the open lock file: a descriptor, never a path; shutdown only unlocks "
+        "and closes it"
+    ),
+    ("pmcp.identity", "_LOCK_IDENTITY"): (
+        "(st_dev, st_ino) of the file this process created: the check that "
+        "keeps shutdown from removing anything else"
+    ),
+    ("pmcp.identity", "_LOCK_DIR_FD"): (
+        "the lock's directory, held open: removal happens there only after "
+        "_LOCK_PIN re-judges HOME and the entry is the held inode; always closed"
+    ),
+}
+
+
+def _names_in(node: ast.AST) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _pins(fn: ast.AST) -> set[str]:
+    """Locals holding a ``HomePin``: their ``.path()`` is a gate answer."""
+    return {
+        name
+        for sub in ast.walk(fn)
+        if isinstance(sub, ast.Assign) and _is_pin(sub.value)
+        for target in sub.targets
+        for name in _names_in(target)
+    }
+
+
+def _pin_answers(node: ast.AST, pins: set[str]) -> bool:
+    return any(
+        isinstance(sub, ast.Call)
+        and isinstance(sub.func, ast.Attribute)
+        and sub.func.attr == "path"
+        and isinstance(sub.func.value, ast.Name)
+        and sub.func.value.id in pins
+        for sub in ast.walk(node)
+    )
+
+
+def _tainted_locals(fn: ast.AST) -> set[str]:
+    """Locals that hold a gate answer or anything computed from one -- through
+    joins, ``/``, tuples, unpacking, a ``HomePin``'s ``.path()`` -- within one
+    function (to a fixpoint)."""
+    tainted: set[str] = set()
+    pins = _pins(fn)
+    assignments = [
+        sub
+        for sub in ast.walk(fn)
+        if isinstance(sub, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr))
+        and getattr(sub, "value", None) is not None
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for sub in assignments:
+            value = sub.value
+            if _is_pin(value) or not (
+                _gate_calls(value)
+                or _names_in(value) & tainted
+                or _pin_answers(value, pins)
+            ):
+                continue
+            if isinstance(sub, ast.Assign):
+                targets = sub.targets
+            else:
+                targets = [sub.target]
+            for target in targets:
+                for name in (
+                    _names_in(target) if not isinstance(target, ast.Attribute) else ()
+                ):
+                    if name not in tainted:
+                        tainted.add(name)
+                        changed = True
+    return tainted
+
+
+def _derived(value: ast.AST, tainted: set[str], pins: set[str] = frozenset()) -> bool:  # type: ignore[assignment]
+    return not _is_pin(value) and bool(
+        _gate_calls(value) or _names_in(value) & tainted or _pin_answers(value, pins)
+    )
+
+
 def home_memos(sources: dict[str, str]) -> list[str]:
     found: list[str] = []
     for module, source in sources.items():
@@ -2057,7 +2149,7 @@ def home_memos(sources: dict[str, str]) -> list[str]:
         tree = _parse(source)
         for node in tree.body:  # module level
             if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
-                if _gate_calls(node.value) and not _is_pin(node.value):
+                if _derived(node.value, set()):
                     found.append(f"{module}:{node.lineno} module global")
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2074,6 +2166,7 @@ def home_memos(sources: dict[str, str]) -> list[str]:
             for default in [*fn.args.defaults, *fn.args.kw_defaults]:
                 if default is not None and _gate_calls(default):
                     found.append(f"{module}:{fn.lineno} default argument of {fn.name}")
+            tainted = _tainted_locals(fn)
             globals_ = {
                 name
                 for sub in ast.walk(fn)
@@ -2084,19 +2177,48 @@ def home_memos(sources: dict[str, str]) -> list[str]:
                 if not isinstance(sub, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                     continue
                 value = sub.value
-                if value is None or not _gate_calls(value) or _is_pin(value):
+                if value is None or not _derived(value, tainted, _pins(fn)):
                     continue
                 targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
                 for target in targets:
-                    if isinstance(target, ast.Attribute):
-                        found.append(
-                            f"{module}:{sub.lineno} kept in {ast.unparse(target)}"
-                        )
-                    elif isinstance(target, ast.Name) and target.id in globals_:
-                        found.append(
-                            f"{module}:{sub.lineno} kept in global {target.id}"
-                        )
+                    elements = (
+                        target.elts
+                        if isinstance(target, (ast.Tuple, ast.List))
+                        else [target]
+                    )
+                    for element in elements:
+                        if isinstance(element, ast.Attribute):
+                            found.append(
+                                f"{module}:{sub.lineno} kept in {ast.unparse(element)}"
+                            )
+                        elif (
+                            isinstance(element, ast.Name)
+                            and element.id in globals_
+                            and (module, element.id) not in HOME_MEMO_EXEMPT
+                        ):
+                            found.append(
+                                f"{module}:{sub.lineno} kept in global {element.id}"
+                            )
     return found
+
+
+def test_the_home_memo_exemptions_are_exact() -> None:
+    sources = _src_sources()
+    for module, name in HOME_MEMO_EXEMPT:
+        tree = _parse(sources[module])
+        kept = False
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            tainted = _tainted_locals(fn)
+            for sub in ast.walk(fn):
+                if (
+                    isinstance(sub, ast.Assign)
+                    and any(getattr(t, "id", None) == name for t in sub.targets)
+                    and _derived(sub.value, tainted, _pins(fn))
+                ):
+                    kept = True
+        assert kept, f"exemption {module}:{name} matches nothing: drop it"
 
 
 def test_no_home_derived_answer_is_remembered() -> None:
@@ -2124,7 +2246,34 @@ def test_the_home_memo_scan_sees_each_shape() -> None:
         "    _G = HomePin('.w')\n"
         "def fine():\n"
         "    return home_path('.config')\n"
+        "def via_local():\n"
+        "    global _G\n"
+        "    where = home_path('.v')\n"
+        "    _G = where\n"
+        "def via_join(self):\n"
+        "    base = optional_home_path('.j')\n"
+        "    joined = os.path.join(base, 'x')\n"
+        "    self.kept = Path(joined) / 'y'\n"
+        "def via_tuple():\n"
+        "    global _G\n"
+        "    pair = (operator_home(), 1)\n"
+        "    _G, other = pair\n"
+        "def local_only():\n"
+        "    where = home_path('.l')\n"
+        "    return where / 'x'\n"
+        "def via_pin(self):\n"
+        "    pin = HomePin('.p')\n"
+        "    self.kept = pin.path() / 'z'\n"
     )
     found = home_memos({"pmcp.x": source})
     lines = sorted(int(line.split(":")[1].split(" ")[0]) for line in found)
-    assert lines == [2, 7, 9, 11, 13]
+    flagged = [
+        n
+        for n, text in enumerate(source.splitlines(), start=1)
+        if text.startswith("KEPT")
+        or text.strip().startswith(
+            ("_G = optional", "self.where", "self.kept", "_G = where", "_G, other")
+        )
+        or text.startswith(("def c(", "def d("))
+    ]
+    assert lines == sorted(flagged)

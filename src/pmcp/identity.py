@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, TextIO
 from pmcp.types import LocalMcpServerConfig
 
 if TYPE_CHECKING:
+    from pmcp.home_identity import HomePin
     from pmcp.types import ResolvedServerConfig
 
 logger = logging.getLogger(__name__)
@@ -148,6 +149,17 @@ def filter_self_references(
 # Singleton lock support
 _LOCK_FILE: Path | None = None
 _LOCK_FD = None
+#: (st_dev, st_ino) of the lock file this process created and holds: shutdown
+#: removes an entry only if it is still that file (Consiliency/pmcp#372 round
+#: 31: a remembered path, acted on later, must not reach anything else).
+_LOCK_IDENTITY: tuple[int, int] | None = None
+#: The lock's directory, held open since acquisition where ``dir_fd`` is
+#: supported, so the removal happens in that directory whatever its path
+#: names by then.
+_LOCK_DIR_FD: int | None = None
+#: The HOME the default lock directory was taken under, judged again before
+#: any removal (``home_identity.HomePin``).
+_LOCK_PIN: HomePin | None = None
 
 
 def _lock_fd_exclusive(fd: TextIO) -> None:
@@ -199,19 +211,22 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
     Returns:
         True if lock acquired, False if another instance is running
     """
-    global _LOCK_FILE, _LOCK_FD
+    global _LOCK_FILE, _LOCK_FD, _LOCK_IDENTITY, _LOCK_DIR_FD, _LOCK_PIN
 
     # Already holding a lock
     if _LOCK_FD is not None:
         logger.debug("Already holding singleton lock")
         return False
 
+    pin = None
     if lock_dir is None:
         # Home-scoped (Consiliency/pmcp#372 round 22): refused while a
-        # checkout controls the home directory.
-        from pmcp.home_identity import home_path
+        # checkout controls the home directory -- now, and again before the
+        # lock is removed at shutdown (round 31).
+        from pmcp.home_identity import HomePin
 
-        lock_dir = home_path(".pmcp")
+        pin = HomePin(".pmcp")
+        lock_dir = pin.path()
     elif isinstance(lock_dir, str):
         lock_dir = Path(lock_dir)
 
@@ -256,6 +271,10 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
         return True
 
     _LOCK_FD = fd
+    held = os.fstat(fd.fileno())
+    _LOCK_IDENTITY = (held.st_dev, held.st_ino)
+    _LOCK_PIN = pin
+    _LOCK_DIR_FD = _hold_lock_directory(lock_dir, _LOCK_FILE.name, _LOCK_IDENTITY)
     try:
         _LOCK_FD.seek(0)
         _LOCK_FD.truncate(0)
@@ -267,25 +286,85 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
     return True
 
 
+def _hold_lock_directory(
+    lock_dir: Path, name: str, identity: tuple[int, int]
+) -> int | None:
+    """Open the lock's directory and keep it, if it is the one the lock is in.
+
+    ``None`` where ``dir_fd`` is unsupported, or when the directory opened is
+    not the one holding the file this process just locked.
+    """
+    if not (os.unlink in os.supports_dir_fd and os.stat in os.supports_dir_fd):
+        return None
+    try:
+        directory = os.open(lock_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return None
+    try:
+        seen = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except OSError:
+        seen = None
+    if seen is None or (seen.st_dev, seen.st_ino) != identity:
+        os.close(directory)
+        return None
+    return directory
+
+
+def _remove_own_lock(
+    path: Path | None,
+    identity: tuple[int, int] | None,
+    directory: int | None,
+    pin: HomePin | None,
+) -> None:
+    """Remove the lock file -- only the one this process created, and only
+    while the HOME its default location was taken under is still the
+    operator's. Anything else at that name is left alone."""
+    if path is None or identity is None:
+        return
+    if pin is not None:
+        from pmcp.home_identity import HomeInsideCheckoutError
+
+        try:
+            pin.path()
+        except HomeInsideCheckoutError:
+            return  # HOME refused: no removal by name at all
+    try:
+        if directory is not None:
+            seen = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            if (seen.st_dev, seen.st_ino) == identity:
+                os.unlink(path.name, dir_fd=directory)
+        else:
+            seen = os.lstat(path)
+            if (seen.st_dev, seen.st_ino) == identity:
+                path.unlink()
+    except OSError:
+        pass
+
+
 def release_singleton_lock() -> None:
-    """Release the singleton lock."""
-    global _LOCK_FD
+    """Release the singleton lock: always close what was held; remove the
+    lock file only if it is still the one this process created."""
+    global _LOCK_FILE, _LOCK_FD, _LOCK_IDENTITY, _LOCK_DIR_FD, _LOCK_PIN
 
-    if _LOCK_FD:
-        # Unlock and close independently so a failing unlock cannot skip close()
-        # (closing the fd releases the OS lock regardless).
-        try:
-            _unlock_fd(_LOCK_FD)
-        except Exception:
-            pass
-        try:
-            _LOCK_FD.close()
-        except Exception:
-            pass
-        _LOCK_FD = None
-
-    if _LOCK_FILE and _LOCK_FILE.exists():
-        try:
-            _LOCK_FILE.unlink()
-        except Exception:
-            pass
+    fd, path, identity = _LOCK_FD, _LOCK_FILE, _LOCK_IDENTITY
+    directory, pin = _LOCK_DIR_FD, _LOCK_PIN
+    _LOCK_FD = _LOCK_FILE = _LOCK_IDENTITY = _LOCK_DIR_FD = _LOCK_PIN = None
+    try:
+        if fd:
+            # Unlock and close independently so a failing unlock cannot skip
+            # close() (closing the fd releases the OS lock regardless).
+            try:
+                _unlock_fd(fd)
+            except Exception:
+                pass
+            try:
+                fd.close()
+            except Exception:
+                pass
+        _remove_own_lock(path, identity, directory, pin)
+    finally:
+        if directory is not None:
+            try:
+                os.close(directory)
+            except OSError:
+                pass
