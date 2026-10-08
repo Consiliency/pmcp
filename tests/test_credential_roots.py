@@ -3051,6 +3051,10 @@ def _shape(base: Path, name: str) -> str:
         (base / "var" / "home" / "user" / ".mcp.json").write_text("{}")
         (base / "home").symlink_to(base / "var" / "home", target_is_directory=True)
         return str(base / "home" / "user")
+    if name == "operator-parent-link-macos":  # /var -> private/var
+        (base / "private" / "var" / "users" / "me").mkdir(parents=True)
+        (base / "var").symlink_to("private/var", target_is_directory=True)
+        return str(base / "var" / "users" / "me")
     if name == "parent-link-into-a-checkout":
         (repo / "homes" / "user").mkdir(parents=True)
         (base / "home").symlink_to(repo / "homes", target_is_directory=True)
@@ -3072,6 +3076,7 @@ HOME_SHAPES: dict[str, str | None] = {
     "operator-link-to-a-checkout": None,
     "operator-parent-link": None,
     "operator-parent-link-marked-home": None,
+    "operator-parent-link-macos": None,
     "repo-link-to-dot": _CHECKOUT,
     "repo-link-to-child": _CHECKOUT,
     "repo-link-to-sibling": _CHECKOUT,
@@ -3756,3 +3761,194 @@ def test_a_marker_above_home_invalidates_whatever_the_timestamps(
             (base / "x" / marker).mkdir()
 
     assert _accepted_then(monkeypatch, str(base / "x" / "home"), add) is False
+
+
+# --------------------------------------------------------------------------- #
+# Board round 26, codex F001: an operator `alias -> <checkout>/home` with a
+# repository `home -> .` landed HOME on the checkout root, which "HOME itself"
+# then exempted. Every link met while resolving HOME, at any depth, must be
+# held outside every checkout.
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_r26_f001_nested_home_link_cannot_self_approve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+    import json
+
+    from pmcp import home_identity, trust_store
+
+    base = tmp_path.resolve()
+    checkout = base / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    inner = checkout / "home"
+    inner.symlink_to(".", target_is_directory=True)
+    outer = base / "operator-home"
+    outer.symlink_to(inner, target_is_directory=True)
+    project = checkout / "app"
+    project.mkdir()
+    config = project / ".mcp.json"
+    content = b'{"mcpServers":{"unapproved":{"command":"echo"}}}'
+    config.write_bytes(content)
+    store = checkout / ".config" / "pmcp"
+    store.mkdir(parents=True)
+    (store / "trust.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "records": [
+                    {
+                        "absolute_path": str(config),
+                        "content_sha256": hashlib.sha256(content).hexdigest(),
+                        "scope": "user",
+                        "decision": "approved",
+                        "recorded_at": "2026-10-07T00:00:00+00:00",
+                    }
+                ],
+            }
+        )
+    )
+    launch = base / "launch"
+    launch.mkdir()
+    original_marker = home_identity.has_checkout_marker
+    ambient = set(base.parents)
+    monkeypatch.setattr(
+        home_identity,
+        "has_checkout_marker",
+        lambda path: False if Path(path) in ambient else original_marker(path),
+    )
+    monkeypatch.chdir(launch)
+    monkeypatch.setattr(trust_store, "_LAUNCH_DIRECTORY", None)
+    monkeypatch.setattr(trust_store, "_active_project_root", None)
+    monkeypatch.setenv("HOME", str(inner))
+    home_identity.forget_home_verdicts()
+    assert not trust_store.is_approved(config, content, project_root=project)
+    monkeypatch.setenv("HOME", str(outer))
+    home_identity.forget_home_verdicts()
+    assert not trust_store.is_approved(config, content, project_root=project), (
+        "An outer symlink let the checkout's planted trust.json approve itself"
+    )
+
+
+def _chain_rows() -> list[tuple[tuple[str, ...], tuple[str, ...], str]]:
+    """(holder per link, target style per link, final) for chains of 1-3 links."""
+    rows = []
+    for depth in (1, 2, 3):
+        for holders in itertools.product(("in", "out"), repeat=depth):
+            for styles in itertools.product(("abs", "rel", "dotdot"), repeat=depth):
+                for final in ("out/dest", "repo/sub", "repo"):
+                    rows.append((holders, styles, final))
+    return rows
+
+
+def _build_chain(
+    case: Path, holders: tuple[str, ...], styles: tuple[str, ...], final: str
+) -> Path:
+    """Build the chain under ``case``; return HOME (the first link)."""
+    (case / "repo" / ".git").mkdir(parents=True)
+    (case / "repo" / "sub").mkdir()
+    (case / "out" / "dest").mkdir(parents=True)
+    held = {"in": case / "repo", "out": case / "out"}
+    links = [held[h] / f"l{i}" for i, h in enumerate(holders)]
+    targets = [*links[1:], case / final]
+    for link, target, style in zip(links, targets, styles):
+        directory = link.parent
+        if style == "abs":
+            text = str(target)
+        elif style == "rel":
+            text = os.path.relpath(target, directory)
+        else:  # `..` in the target: up out of the holder, then back down
+            text = os.path.join(
+                "..", directory.name, os.path.relpath(target, directory)
+            )
+        link.symlink_to(text, target_is_directory=True)
+    return links[0]
+
+
+def test_every_link_in_a_nested_chain_is_held_outside_a_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generated: chains of 1-3 links, each held inside or outside a checkout,
+    with absolute, relative and `..` targets, ending outside a checkout, in
+    one, or on the checkout root itself. The oracle: refused if and only if a
+    link on the way is held in a checkout, or HOME lands inside one (landing
+    ON the root through the operator's own links is a dotfiles HOME)."""
+    from pmcp import home_identity
+
+    base = tmp_path.resolve()
+    assert all(not home_identity.has_checkout_marker(d) for d in base.parents)
+    wrong = []
+    rows = _chain_rows()
+    for n, (holders, styles, final) in enumerate(rows):
+        case = base / f"c{n}"
+        home = _build_chain(case, holders, styles, final)
+        assert os.path.realpath(home) == str(case / final)
+        expected = not ("in" in holders or final == "repo/sub")
+        monkeypatch.setenv("HOME", str(home))
+        home_identity.forget_home_verdicts()
+        fresh = home_identity.home_is_operators()
+        cached = home_identity.home_is_operators()
+        if fresh is not expected or cached is not expected:
+            wrong.append((holders, styles, final, fresh, cached))
+    assert len(rows) == 774
+    assert wrong == []
+
+
+def test_a_recreated_link_is_read_again_even_with_its_old_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link replaced by one with a new target can reuse the old inode
+    number. The cached verdict re-reads every link's text, so the new
+    target -- here through a repository link, landing on the same checkout
+    root -- is judged afresh."""
+    from pmcp import home_identity
+
+    base = tmp_path.resolve()
+    repo = base / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "home").symlink_to(".", target_is_directory=True)
+    alias = base / "alias"
+    alias.symlink_to(repo, target_is_directory=True)  # a dotfiles HOME
+    old = os.lstat(alias)
+    real_lstat = os.lstat
+
+    def reuse_the_inode() -> None:
+        new = base / "alias.new"
+        new.symlink_to(repo / "home", target_is_directory=True)
+        os.replace(new, alias)
+
+        def lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if os.fspath(path) == str(alias):
+                return old
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(home_identity.os, "lstat", lstat)
+
+    assert os.path.realpath(alias) == str(repo)
+    assert _accepted_then(monkeypatch, str(alias), reuse_the_inode) is False
+
+
+def test_the_walk_and_the_system_must_agree_on_where_home_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``realpath`` is the oracle; a walk that ends anywhere else refuses."""
+    from pmcp import home_identity
+
+    base = tmp_path.resolve()
+    (base / "a").mkdir()
+    (base / "b").mkdir()
+    (base / "alias").symlink_to(base / "a", target_is_directory=True)
+    monkeypatch.setenv("HOME", str(base / "alias"))
+    home_identity.forget_home_verdicts()
+    assert home_identity.home_is_operators() is True
+    real_realpath = os.path.realpath
+
+    def realpath(path: Any, *args: Any, **kwargs: Any) -> str:
+        if os.fspath(path) == str(base / "alias"):
+            return str(base / "b")
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(home_identity.os.path, "realpath", realpath)
+    home_identity.forget_home_verdicts()
+    assert home_identity.home_is_operators() is False

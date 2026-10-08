@@ -12,14 +12,18 @@ cannot. So:
    approval decision is refused, with one value-free line asking for a plain
    absolute HOME. (HOME unset falls back to the passwd entry, as pathlib does;
    that value passes the same test.)
-2. **Kernel prefixes only.** With no dot components, HOME's lexical prefixes
-   (by the platform's own splitting) are the kernel's. Each is ``lstat``-ed
-   (any error refuses); for a prefix that is a symlink, the physical directory
-   holding the link, and its physical ancestors, must not be checkouts. No
-   splicing, no normalising.
+2. **Every link on the way.** Every symlink met while resolving HOME, at any
+   depth -- a link in HOME's spelling, a link inside that link's target, and
+   so on, with ``..`` in a target applied after the earlier links -- must be
+   held by a physical directory that is not a checkout and lies inside none
+   (Consiliency/pmcp#372 round 27: an operator ``alias -> <checkout>/home``
+   with a repository ``home -> .`` landed HOME on the checkout root). The
+   links are collected by one walk (:func:`_walk`) that only records them;
+   ``os.path.realpath`` stays the oracle for where HOME lands, and a walk that
+   fails in any way, or ends anywhere else, refuses.
 3. **Physical ancestors.** No physical ancestor of ``realpath(HOME)`` --
-   HOME itself excluded, so a dotfiles repository AT home is fine -- is a
-   checkout.
+   HOME itself excluded, so a dotfiles repository AT home, reached through the
+   operator's own links, is fine -- is a checkout.
 4. **A filesystem or drive root is never a checkout**: a repository cannot put
    files there, and container images (``COPY . /``) often do.
 
@@ -38,6 +42,7 @@ import os
 import os as _os_module  # the real module: its environ keys the spelling memo
 import stat
 import sys as _sys
+from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
@@ -187,6 +192,8 @@ def _still_seen(reads: tuple[_Read, ...]) -> bool:
             now = _signature(path, follow=True)
         elif kind == "r":
             now = os.path.realpath(path)
+        elif kind == "k":
+            now = _link_text(path)
         else:
             now = _directory_signature(path)
         if now != seen:
@@ -228,6 +235,86 @@ def _judge(spelled: str) -> _Verdict:
     return verdict
 
 
+#: More links than any real path has (the kernel's own limit is 40).
+_MAX_LINKS = 40
+
+
+def _link_text(path: str) -> object:
+    try:
+        return os.readlink(path)
+    except OSError as exc:
+        return ("error", exc.errno)
+
+
+def _root_of(path: str) -> str:
+    current = path
+    while True:
+        parent = os.path.dirname(current)
+        if parent == current:
+            return current
+        current = parent
+
+
+def _components(path: str) -> list[str]:
+    separators = {os.path.sep, os.path.altsep} - {None}
+    parts = [path]
+    for separator in separators:
+        parts = [piece for part in parts for piece in part.split(separator)]
+    return [part for part in parts if part not in ("", ".")]
+
+
+def _walk(spelled: str, reads: list[_Read]) -> tuple[str, list[str]] | None:
+    """Follow ``spelled`` as the kernel does, only to COLLECT the links on the
+    way: the physical directory holding each one, at every depth.
+
+    Returns ``(where it ended, holders)``, or ``None`` when the walk cannot
+    follow (an error, a non-directory in the middle, too many links). Every
+    entry looked up is recorded with its signature and every link with its
+    text, so a cached verdict re-reads the whole chain. The caller compares
+    the end with ``os.path.realpath``, which stays the oracle.
+    """
+    root = _root_of(spelled)
+    current = root
+    remaining = deque(_components(spelled[len(root) :]))
+    holders: list[str] = []
+    links = 0
+    while remaining:
+        name = remaining.popleft()
+        if name == "..":
+            current = os.path.dirname(current)
+            continue
+        candidate = os.path.join(current, name)
+        seen = _signature(candidate, follow=False)
+        if seen[0] == "error":
+            return None
+        reads.append(("l", candidate, seen))
+        mode = cast(int, seen[2])
+        if stat.S_ISLNK(mode):
+            links += 1
+            target = _link_text(candidate)
+            if links > _MAX_LINKS or not isinstance(target, str):
+                return None
+            reads.append(("k", candidate, target))
+            holders.append(current)
+            if os.path.isabs(target):
+                current = _root_of(target)
+                target = target[len(current) :]
+            remaining.extendleft(reversed(_components(target)))
+            continue
+        if remaining and not stat.S_ISDIR(mode):
+            return None
+        current = candidate
+    return current, holders
+
+
+def _same_spelling(walked: str, real: str) -> bool:
+    """Do the walk's end and ``realpath`` name the same path? Compared after
+    the platform's own separator and case folding (the walk keeps a written
+    ``/`` on Windows; it never leaves a ``.`` or ``..`` to fold)."""
+    fold = os.path.normcase
+    return fold(os.path.normpath(walked)) == fold(os.path.normpath(real))
+
+
 def _judge_afresh(spelled: str, reads: list[_Read]) -> tuple[_Verdict, bool]:
     if not _is_plain(spelled):
         return _Verdict(None), False
@@ -235,28 +322,22 @@ def _judge_afresh(spelled: str, reads: list[_Read]) -> tuple[_Verdict, bool]:
     if stat_seen[0] == "error":
         return _Verdict(None), False
     reads.append(("s", spelled, stat_seen))
-    prefix = spelled
-    while True:
-        seen = _signature(prefix, follow=False)
-        if seen[0] == "error":
-            return _Verdict(None), False
-        reads.append(("l", prefix, seen))
-        if stat.S_ISLNK(cast(int, seen[2])):
-            container = os.path.dirname(prefix)
-            physical = os.path.realpath(container)
-            reads.append(("r", container, physical))
-            holder = _marked_from(physical, reads)
-            if holder is not None:
-                return _Verdict(None, holder), True
-        parent = os.path.dirname(prefix)
-        if parent == prefix:
-            break
-        prefix = parent
+    walked = _walk(spelled, reads)
+    if walked is None:
+        return _Verdict(None), False
+    end, holders = walked
     real = os.path.realpath(spelled)
-    if any(kind == "r" for kind, _path, _seen in reads):
-        # A link on the way: where it leads is read again on every reuse.
-        # With none, the unchanged non-link prefixes already fix ``real``.
+    if holders:
+        # Where the links lead is read again on every reuse. With none, the
+        # unchanged non-link entries already fix ``real``.
         reads.append(("r", spelled, real))
+    if not _same_spelling(end, real):
+        # The walk and the system disagree on where HOME lands: refuse.
+        return _Verdict(None), False
+    for directory in dict.fromkeys(holders):
+        holder = _marked_from(directory, reads)
+        if holder is not None:
+            return _Verdict(None, holder), True
     holder = _marked_from(os.path.dirname(real), reads)
     if holder is not None:
         return _Verdict(None, holder), True
