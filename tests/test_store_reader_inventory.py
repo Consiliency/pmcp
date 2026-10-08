@@ -2053,21 +2053,13 @@ def _is_pin(value: ast.AST | None) -> bool:
 #: Asserted exact.
 HOME_MEMO_EXEMPT = {
     ("pmcp.identity", "_LOCK_FILE"): (
-        "the default lock's path, kept to name it in messages and to remove it "
-        "at shutdown -- removal re-judges its HOME through _LOCK_PIN (a "
-        "HomePin) and removes only the inode this process created"
+        "the default lock's path, kept only to name it; the lock file is never "
+        "removed or otherwise acted on by name after acquisition "
+        "(Consiliency/pmcp#372 round 32)"
     ),
     ("pmcp.identity", "_LOCK_FD"): (
-        "the open lock file: a descriptor, never a path; shutdown only unlocks "
+        "the open lock file: a descriptor, never a path; release only unlocks "
         "and closes it"
-    ),
-    ("pmcp.identity", "_LOCK_IDENTITY"): (
-        "(st_dev, st_ino) of the file this process created: the check that "
-        "keeps shutdown from removing anything else"
-    ),
-    ("pmcp.identity", "_LOCK_DIR_FD"): (
-        "the lock's directory, held open: removal happens there only after "
-        "_LOCK_PIN re-judges HOME and the entry is the held inode; always closed"
     ),
 }
 

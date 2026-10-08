@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -240,120 +241,189 @@ class TestWindowsLockPath:
 
 
 # --------------------------------------------------------------------------- #
-# Board round 30, codex F001: shutdown unlinked the remembered lock path with
-# no check -- after HOME was refused and `.pmcp` redirected, it deleted another
-# directory's gateway.lock. Shutdown now always closes what it holds and
-# removes only the file this process created, and only while the HOME the
-# default lock was taken under is still the operator's.
+# Board round 31 (codex F001, claude N-1): removing the lock file at shutdown,
+# even by identity, let a successor that locked the same inode in between lose
+# its lock to a third gateway creating a fresh file -- two "singletons". The
+# lock file is now never removed: release is unlock and close. A gateway that
+# locks a file the path no longer names retries from the open.
 # --------------------------------------------------------------------------- #
 
 
-def _isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    from pmcp import home_identity, identity
+def _gateways(n: int) -> list[Any]:
+    """Independent copies of pmcp.identity: separate opens take independent,
+    real OS locks even within one process."""
+    import importlib.util
 
-    base = tmp_path.resolve()
-    home = base / "parent" / "home"
-    home.mkdir(parents=True)
-    original_marker = home_identity.has_checkout_marker
-    ambient = set(base.parents)
-    monkeypatch.setattr(
-        home_identity,
-        "has_checkout_marker",
-        lambda d: False if Path(d) in ambient else original_marker(d),
-    )
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr(identity, "_LOCK_FILE", None)
-    monkeypatch.setattr(identity, "_LOCK_FD", None)
-    monkeypatch.setattr(identity, "_LOCK_IDENTITY", None)
-    monkeypatch.setattr(identity, "_LOCK_DIR_FD", None)
-    monkeypatch.setattr(identity, "_LOCK_PIN", None)
-    home_identity.forget_home_verdicts()
-    return home
+    from pmcp import identity
 
-
-def test_codex_r30_f001_lock_release_rechecks_home(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from pmcp import home_identity, identity
-
-    home = _isolated_home(tmp_path, monkeypatch)
-    base = home.parent.parent
-    try:
-        assert home_identity.home_is_operators()
-        assert identity.acquire_singleton_lock()
-        (home.parent / ".git").mkdir()
-        assert not home_identity.home_is_operators()
-        victim_dir = base / "unrelated"
-        victim_dir.mkdir()
-        victim = victim_dir / "gateway.lock"
-        victim.write_bytes(b"unrelated lock")
-        lock_dir = home / ".pmcp"
-        lock_dir.rename(home / ".held-lock")
-        lock_dir.symlink_to(victim_dir, target_is_directory=True)
-        assert not home_identity.home_is_operators()
-        identity.release_singleton_lock()
-        assert identity._LOCK_FD is None
-        assert victim.is_file(), (
-            "Shutdown followed a refused HOME path and deleted another lock"
+    copies = []
+    for number in range(n):
+        spec = importlib.util.spec_from_file_location(
+            f"gateway_{number}", identity.__file__
         )
-        assert victim.read_bytes() == b"unrelated lock"
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        copies.append(module)
+    return copies
+
+
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
+
+
+@posix_only
+def test_codex_r31_f001_shutdown_preserves_the_next_gateways_lock(
+    tmp_path: Path,
+) -> None:
+    """As filed, with the injection point it patched (the removed
+    ``_remove_own_lock``) replaced by the moment after release returns --
+    after unlock and close, which is all release does now."""
+    old, successor, contender = _gateways(3)
+    try:
+        assert old.acquire_singleton_lock(tmp_path)
+        assert not successor.acquire_singleton_lock(tmp_path)
+        old.release_singleton_lock()
+        assert successor.acquire_singleton_lock(tmp_path)
+        assert successor._LOCK_FD is not None
+        assert not contender.acquire_singleton_lock(tmp_path), (
+            "Shutdown unlinked the successor's live lock; a third gateway "
+            "acquired a different inode while the successor still held its lock"
+        )
     finally:
-        if identity._LOCK_FD is not None:
-            identity._LOCK_FD.close()
-        home_identity.forget_home_verdicts()
-        home_identity.reset_home_warning()
+        for gateway in (old, successor, contender):
+            gateway.release_singleton_lock()
 
 
-def test_shutdown_removes_the_lock_it_created(
+@posix_only
+@pytest.mark.parametrize(
+    "between",
+    [
+        "A releases",
+        "A releases, C acquires",
+        "A releases, the file is unlinked, C acquires",
+        "A releases, the file is replaced, C acquires",
+        "C tries, A releases",
+    ],
+)
+def test_claude_r31_n1_three_instances_never_two_holders(
+    between: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A holds the singleton; B is starting, and between B's OPEN and B's
+    LOCK the steps named happen (the unlink stands in for an older pmcp that
+    removed the file). Afterwards at most one gateway holds a lock, and the
+    one that does holds the file at the path."""
+    a, b, c = _gateways(3)
+    lock = tmp_path / "gateway.lock"
+    assert a.acquire_singleton_lock(tmp_path)
+    real = b._lock_fd_exclusive
+    fired: list[bool] = []
+
+    def interleaved(fd: Any) -> None:
+        if not fired:
+            fired.append(True)
+            for step in [s.strip() for s in between.split(",")]:
+                if step == "A releases":
+                    a.release_singleton_lock()
+                elif step == "C acquires":
+                    assert c.acquire_singleton_lock(tmp_path)
+                elif step == "C tries":
+                    assert not c.acquire_singleton_lock(tmp_path)
+                elif step == "the file is unlinked":
+                    lock.unlink()
+                elif step == "the file is replaced":
+                    (tmp_path / "gateway.lock.new").write_text("")
+                    os.replace(tmp_path / "gateway.lock.new", lock)
+        real(fd)
+
+    monkeypatch.setattr(b, "_lock_fd_exclusive", interleaved)
+    try:
+        b.acquire_singleton_lock(tmp_path)
+        assert fired
+        holders = [m for m in (a, b, c) if m._LOCK_FD is not None]
+        assert len(holders) == 1, f"{between}: {len(holders)} holders"
+        (holder,) = holders
+        assert holder._holds_the_file_at(holder._LOCK_FD, lock)
+        # And nobody else can take it now.
+        (late,) = _gateways(1)
+        assert not late.acquire_singleton_lock(tmp_path)
+    finally:
+        for gateway in (a, b, c):
+            gateway.release_singleton_lock()
+
+
+@posix_only
+@pytest.mark.parametrize("change", ["unlinked", "replaced"])
+def test_a_lock_file_changed_between_open_and_lock_is_retried(
+    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The acquirer never treats a lock on a file the path no longer names as
+    held: it re-opens and ends up holding the inode at the path."""
+    from pmcp import identity
+
+    lock = tmp_path / "gateway.lock"
+    real = identity._lock_fd_exclusive
+    changed: list[int] = []
+
+    def lock_after_a_change(fd: Any) -> None:
+        if not changed:
+            changed.append(os.fstat(fd.fileno()).st_ino)
+            if change == "unlinked":
+                lock.unlink()
+            else:
+                (tmp_path / "gateway.lock.new").write_text("")
+                os.replace(tmp_path / "gateway.lock.new", lock)
+        real(fd)
+
+    monkeypatch.setattr(identity, "_lock_fd_exclusive", lock_after_a_change)
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    try:
+        assert identity.acquire_singleton_lock(tmp_path)
+        assert changed, "the seam never fired"
+        held = os.fstat(identity._LOCK_FD.fileno())
+        named = os.stat(lock)
+        assert (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+    finally:
+        identity.release_singleton_lock()
+
+
+def test_a_leftover_lock_file_never_blocks_a_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file a dead gateway left (its PID inside, nobody holding it)."""
+    from pmcp import identity
+
+    lock = tmp_path / "gateway.lock"
+    lock.write_text("99999")
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    try:
+        assert identity.acquire_singleton_lock(tmp_path)
+        assert lock.read_text() == str(os.getpid())
+    finally:
+        identity.release_singleton_lock()
+
+
+def test_release_never_removes_the_lock_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from pmcp import identity
 
-    home = _isolated_home(tmp_path, monkeypatch)
-    assert identity.acquire_singleton_lock()
-    held = identity._LOCK_FD
-    lock = home / ".pmcp" / "gateway.lock"
-    assert lock.is_file()
-    identity.release_singleton_lock()
-    assert held is not None and held.closed
-    assert not lock.exists()
-    assert identity._LOCK_DIR_FD is None
-
-
-@pytest.mark.parametrize("dir_fd", [True, False], ids=["dir_fd", "no-dir_fd"])
-def test_a_lock_replaced_before_shutdown_is_left_alone(
-    dir_fd: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Same path, new inode: not this process's file, so not removed."""
-    from pmcp import identity
-
-    home = _isolated_home(tmp_path, monkeypatch)
-    if not dir_fd:
-        monkeypatch.setattr(identity, "_hold_lock_directory", lambda *a: None)
-    assert identity.acquire_singleton_lock()
-    lock = home / ".pmcp" / "gateway.lock"
-    replacement = home / ".pmcp" / "gateway.lock.new"
-    replacement.write_bytes(b"another process's lock")
-    os.replace(replacement, lock)
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    assert identity.acquire_singleton_lock(tmp_path)
     held = identity._LOCK_FD
     identity.release_singleton_lock()
     assert held is not None and held.closed
-    assert lock.read_bytes() == b"another process's lock"
+    assert (tmp_path / "gateway.lock").exists()
+    assert identity.singleton_lock_held(tmp_path) is False
 
 
-def test_a_refused_home_removes_nothing_but_closes_everything(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_the_doctor_probe_sees_a_held_lock(tmp_path: Path) -> None:
     from pmcp import identity
 
-    home = _isolated_home(tmp_path, monkeypatch)
-    assert identity.acquire_singleton_lock()
-    held, directory = identity._LOCK_FD, identity._LOCK_DIR_FD
-    lock = home / ".pmcp" / "gateway.lock"
-    (home.parent / ".git").mkdir()
-    identity.release_singleton_lock()
-    assert held is not None and held.closed
-    assert lock.is_file()  # left behind: no removal under a refused HOME
-    if directory is not None:
-        with pytest.raises(OSError):
-            os.fstat(directory)  # the held directory was closed too
+    assert identity.singleton_lock_held(tmp_path) is None
+    (gateway,) = _gateways(1)
+    try:
+        assert gateway.acquire_singleton_lock(tmp_path)
+        assert identity.singleton_lock_held(tmp_path) is True
+    finally:
+        gateway.release_singleton_lock()
+    assert identity.singleton_lock_held(tmp_path) is False

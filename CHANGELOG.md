@@ -780,6 +780,7 @@ to do, how to verify it, and how to roll back to 2.7.3.
   (D-01); see [Consiliency/pmcp#228](https://github.com/Consiliency/pmcp/pull/228).
 
 ### Fixed
+- **The singleton lock file is never removed.** Shutdown used to unlink `~/.pmcp/gateway.lock` after releasing it, so a second gateway that locked the same file in between lost its lock to a third that created a fresh file: two gateways ran at once. The file now stays; a lock is held only by a running gateway and dies with it, so a leftover file never blocks a start. A gateway that locks a file the path no longer names (unlinked or replaced) retries. `pmcp doctor` reports whether a gateway holds the lock rather than whether the file exists. See Consiliency/pmcp#367.
 - **An overlay no longer hides other servers from discovery, and one bad overlay entry
   no longer takes down the others.** Discovery weighs a keyword by how many servers
   declare it, and it counted over the merged manifest. So an approved project overlay

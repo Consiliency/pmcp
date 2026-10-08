@@ -2193,14 +2193,28 @@ async def run_doctor(args: argparse.Namespace) -> None:
     checks: list[tuple[str, str, str]] = []
 
     from pmcp.home_identity import optional_home_path
+    from pmcp.identity import singleton_lock_held
 
-    lock_path = optional_home_path(".pmcp", "gateway.lock")
-    if lock_path is not None and lock_path.exists():
+    # The lock file persists between runs (Consiliency/pmcp#372 round 32): what
+    # matters is whether a gateway HOLDS it, not whether it exists.
+    lock_dir = optional_home_path(".pmcp")
+    held = singleton_lock_held(lock_dir) if lock_dir is not None else None
+    if held:
         checks.append(
             (
                 "lock",
                 "warn",
-                "Lock file exists at ~/.pmcp/gateway.lock. If no gateway is running, remove stale lock: rm ~/.pmcp/gateway.lock",
+                "A gateway holds the singleton lock (~/.pmcp/gateway.lock): another "
+                "local launch will not start. Use the running gateway, or stop it first.",
+            )
+        )
+    elif held is False:
+        checks.append(
+            (
+                "lock",
+                "ok",
+                "No gateway holds the singleton lock (the lock file is left between "
+                "runs and is harmless).",
             )
         )
     else:

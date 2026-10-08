@@ -1989,7 +1989,7 @@ Other environment variables:
 
 Use `pmcp doctor` to diagnose common PMCP startup and connectivity issues. It checks:
 
-- `lock`: detects singleton lock state and stale lock collisions at `~/.pmcp/gateway.lock`
+- `lock`: reports whether a gateway holds the singleton lock at `~/.pmcp/gateway.lock` (the file itself stays between runs and is harmless when nothing holds it)
 - `mode`: detects local command-mode MCP config conflicts when a shared PMCP system service is running
 - `http`: probes the unauthenticated `/health` endpoint derived from `PMCP_GATEWAY_URL` or `http://127.0.0.1:3344/mcp`
 - `remote`: detects unresolved remote downstream header environment references
@@ -2005,7 +2005,7 @@ If any checks fail, follow the command in the output and rerun `pmcp doctor`.
 
 ### Singleton Lock
 
-By default, PMCP uses a global lock at `~/.pmcp/gateway.lock` to ensure only one gateway runs per user. This prevents multiple gateway instances from spawning duplicate downstream servers.
+By default, PMCP uses a global lock at `~/.pmcp/gateway.lock` to ensure only one gateway runs per user. The lock is held by the running gateway and released when it exits (or dies); the file itself is never removed, so a leftover file never blocks a start and never needs deleting. This prevents multiple gateway instances from spawning duplicate downstream servers.
 
 **Override the lock directory:**
 

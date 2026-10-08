@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, TextIO
 from pmcp.types import LocalMcpServerConfig
 
 if TYPE_CHECKING:
-    from pmcp.home_identity import HomePin
     from pmcp.types import ResolvedServerConfig
 
 logger = logging.getLogger(__name__)
@@ -146,20 +145,16 @@ def filter_self_references(
     return filtered
 
 
-# Singleton lock support
+# Singleton lock support. The lock FILE is a persistent inode: it is never
+# removed (Consiliency/pmcp#372 round 32). A lock dies with the process that
+# holds it, so a leftover file never blocks a start; removing it at shutdown
+# let a successor that had just locked the same inode lose its lock to a third
+# gateway creating a fresh file.
 _LOCK_FILE: Path | None = None
 _LOCK_FD = None
-#: (st_dev, st_ino) of the lock file this process created and holds: shutdown
-#: removes an entry only if it is still that file (Consiliency/pmcp#372 round
-#: 31: a remembered path, acted on later, must not reach anything else).
-_LOCK_IDENTITY: tuple[int, int] | None = None
-#: The lock's directory, held open since acquisition where ``dir_fd`` is
-#: supported, so the removal happens in that directory whatever its path
-#: names by then.
-_LOCK_DIR_FD: int | None = None
-#: The HOME the default lock directory was taken under, judged again before
-#: any removal (``home_identity.HomePin``).
-_LOCK_PIN: HomePin | None = None
+#: Attempts to lock the file the path names, when it is unlinked or replaced
+#: between the open and the lock.
+_ACQUIRE_ATTEMPTS = 5
 
 
 def _lock_fd_exclusive(fd: TextIO) -> None:
@@ -202,6 +197,18 @@ def _unlock_fd(fd: TextIO) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+def _holds_the_file_at(fd: TextIO, path: Path) -> bool:
+    """Is the locked descriptor the file ``path`` names now? A lock on an
+    unlinked or replaced file guards nothing: another process can create and
+    lock the file at the path."""
+    try:
+        held = os.fstat(fd.fileno())
+        named = os.stat(path)
+    except OSError:
+        return False
+    return (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+
+
 def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
     """Ensure only one gateway instance runs per user.
 
@@ -211,70 +218,78 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
     Returns:
         True if lock acquired, False if another instance is running
     """
-    global _LOCK_FILE, _LOCK_FD, _LOCK_IDENTITY, _LOCK_DIR_FD, _LOCK_PIN
+    global _LOCK_FILE, _LOCK_FD
 
     # Already holding a lock
     if _LOCK_FD is not None:
         logger.debug("Already holding singleton lock")
         return False
 
-    pin = None
     if lock_dir is None:
         # Home-scoped (Consiliency/pmcp#372 round 22): refused while a
-        # checkout controls the home directory -- now, and again before the
-        # lock is removed at shutdown (round 31).
-        from pmcp.home_identity import HomePin
+        # checkout controls the home directory.
+        from pmcp.home_identity import home_path
 
-        pin = HomePin(".pmcp")
-        lock_dir = pin.path()
+        lock_dir = home_path(".pmcp")
     elif isinstance(lock_dir, str):
         lock_dir = Path(lock_dir)
 
     lock_dir.mkdir(parents=True, exist_ok=True)
-    _LOCK_FILE = lock_dir / "gateway.lock"
+    lock_file = lock_dir / "gateway.lock"
+    _LOCK_FILE = lock_file
 
-    # Open WITHOUT truncating ("r+" on an ensured-existing file) so a losing
-    # second instance cannot wipe the holder's PID before its lock attempt
-    # fails. We truncate + write our own PID only after we win the lock.
-    try:
-        _LOCK_FILE.touch(exist_ok=True)
-        fd = open(_LOCK_FILE, "r+")
-    except OSError as e:
-        logger.warning(f"Could not open singleton lock file {_LOCK_FILE}: {e}")
-        return False
-
-    try:
-        _lock_fd_exclusive(fd)
-    except (BlockingIOError, OSError) as e:
-        pid_info = ""
+    for _attempt in range(_ACQUIRE_ATTEMPTS):
+        # Open WITHOUT truncating ("r+" on an ensured-existing file) so a losing
+        # second instance cannot wipe the holder's PID before its lock attempt
+        # fails. We truncate + write our own PID only after we win the lock.
         try:
-            fd.seek(0)
-            existing = fd.read().strip()
-            if existing:
-                pid_info = f" PID {existing},"
+            lock_file.touch(exist_ok=True)
+            fd = open(lock_file, "r+")
+        except OSError as e:
+            logger.warning(f"Could not open singleton lock file {lock_file}: {e}")
+            return False
+
+        try:
+            _lock_fd_exclusive(fd)
+        except (BlockingIOError, OSError) as e:
+            pid_info = ""
+            try:
+                fd.seek(0)
+                existing = fd.read().strip()
+                if existing:
+                    pid_info = f" PID {existing},"
+            except Exception:
+                pass
+            logger.warning(
+                f"Another gateway instance is running ({pid_info} lock: {lock_file}): {e}"
+            )
+            fd.close()
+            return False
+        except ImportError as e:
+            # No platform locking primitive available (e.g. an exotic Windows
+            # build without msvcrt). Don't crash startup -- proceed without
+            # single-instance protection rather than re-introducing the #84
+            # import-crash class.
+            logger.warning(
+                f"Singleton lock primitive unavailable ({e}); proceeding without "
+                "single-instance protection."
+            )
+            fd.close()
+            return True
+
+        if _holds_the_file_at(fd, lock_file):
+            break
+        # Locked a file the path no longer names (unlinked or replaced between
+        # the open and the lock): not the singleton. Start again from the open.
+        try:
+            fd.close()
         except Exception:
             pass
-        logger.warning(
-            f"Another gateway instance is running ({pid_info} lock: {_LOCK_FILE}): {e}"
-        )
-        fd.close()
+    else:
+        logger.warning(f"Could not lock {lock_file}: it was replaced on every attempt")
         return False
-    except ImportError as e:
-        # No platform locking primitive available (e.g. an exotic Windows build
-        # without msvcrt). Don't crash startup — proceed without single-instance
-        # protection rather than re-introducing the #84 import-crash class.
-        logger.warning(
-            f"Singleton lock primitive unavailable ({e}); proceeding without "
-            "single-instance protection."
-        )
-        fd.close()
-        return True
 
     _LOCK_FD = fd
-    held = os.fstat(fd.fileno())
-    _LOCK_IDENTITY = (held.st_dev, held.st_ino)
-    _LOCK_PIN = pin
-    _LOCK_DIR_FD = _hold_lock_directory(lock_dir, _LOCK_FILE.name, _LOCK_IDENTITY)
     try:
         _LOCK_FD.seek(0)
         _LOCK_FD.truncate(0)
@@ -282,89 +297,58 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
         _LOCK_FD.flush()
     except Exception:
         pass
-    logger.debug(f"Acquired singleton lock: {_LOCK_FILE}")
+    logger.debug(f"Acquired singleton lock: {lock_file}")
     return True
 
 
-def _hold_lock_directory(
-    lock_dir: Path, name: str, identity: tuple[int, int]
-) -> int | None:
-    """Open the lock's directory and keep it, if it is the one the lock is in.
-
-    ``None`` where ``dir_fd`` is unsupported, or when the directory opened is
-    not the one holding the file this process just locked.
-    """
-    if not (os.unlink in os.supports_dir_fd and os.stat in os.supports_dir_fd):
-        return None
-    try:
-        directory = os.open(lock_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except OSError:
-        return None
-    try:
-        seen = os.stat(name, dir_fd=directory, follow_symlinks=False)
-    except OSError:
-        seen = None
-    if seen is None or (seen.st_dev, seen.st_ino) != identity:
-        os.close(directory)
-        return None
-    return directory
-
-
-def _remove_own_lock(
-    path: Path | None,
-    identity: tuple[int, int] | None,
-    directory: int | None,
-    pin: HomePin | None,
-) -> None:
-    """Remove the lock file -- only the one this process created, and only
-    while the HOME its default location was taken under is still the
-    operator's. Anything else at that name is left alone."""
-    if path is None or identity is None:
-        return
-    if pin is not None:
-        from pmcp.home_identity import HomeInsideCheckoutError
-
-        try:
-            pin.path()
-        except HomeInsideCheckoutError:
-            return  # HOME refused: no removal by name at all
-    try:
-        if directory is not None:
-            seen = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
-            if (seen.st_dev, seen.st_ino) == identity:
-                os.unlink(path.name, dir_fd=directory)
-        else:
-            seen = os.lstat(path)
-            if (seen.st_dev, seen.st_ino) == identity:
-                path.unlink()
-    except OSError:
-        pass
-
-
 def release_singleton_lock() -> None:
-    """Release the singleton lock: always close what was held; remove the
-    lock file only if it is still the one this process created."""
-    global _LOCK_FILE, _LOCK_FD, _LOCK_IDENTITY, _LOCK_DIR_FD, _LOCK_PIN
+    """Release the singleton lock: unlock and close, nothing else.
 
-    fd, path, identity = _LOCK_FD, _LOCK_FILE, _LOCK_IDENTITY
-    directory, pin = _LOCK_DIR_FD, _LOCK_PIN
-    _LOCK_FD = _LOCK_FILE = _LOCK_IDENTITY = _LOCK_DIR_FD = _LOCK_PIN = None
+    The lock file stays (Consiliency/pmcp#372 round 32): removing it, even by
+    identity, lets a successor that locked the same inode in between lose its
+    lock to a third gateway creating a fresh file.
+    """
+    global _LOCK_FD, _LOCK_FILE
+
+    fd, _LOCK_FD, _LOCK_FILE = _LOCK_FD, None, None
+    if fd:
+        # Unlock and close independently so a failing unlock cannot skip
+        # close() (closing the fd releases the OS lock regardless).
+        try:
+            _unlock_fd(fd)
+        except Exception:
+            pass
+        try:
+            fd.close()
+        except Exception:
+            pass
+
+
+def singleton_lock_held(lock_dir: Path) -> bool | None:
+    """Does a gateway hold the lock in ``lock_dir``? ``None``: no lock file.
+
+    A probe for ``pmcp doctor``: opens the existing file (never creates it),
+    tries a non-blocking exclusive lock and, if that succeeds, releases it at
+    once. A file nobody holds is a leftover and harmless.
+    """
+    lock_file = lock_dir / "gateway.lock"
     try:
-        if fd:
-            # Unlock and close independently so a failing unlock cannot skip
-            # close() (closing the fd releases the OS lock regardless).
-            try:
-                _unlock_fd(fd)
-            except Exception:
-                pass
-            try:
-                fd.close()
-            except Exception:
-                pass
-        _remove_own_lock(path, identity, directory, pin)
+        fd = open(lock_file, "r+")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return True  # cannot probe: report it as possibly held
+    try:
+        try:
+            _lock_fd_exclusive(fd)
+        except (BlockingIOError, OSError):
+            return True
+        except ImportError:
+            return None
+        try:
+            _unlock_fd(fd)
+        except Exception:
+            pass
+        return False
     finally:
-        if directory is not None:
-            try:
-                os.close(directory)
-            except OSError:
-                pass
+        fd.close()
