@@ -1,26 +1,30 @@
 # Detailed plan: describe validation errors from their structure, never their value — everywhere pmcp turns an exception into text
 
-> **Revision 29 (2026-10-07), on main `bc0a9ce`.** Consiliency/pmcp#297, the
+> **Revision 30 (2026-10-07), on main `bc0a9ce`.** Consiliency/pmcp#297, the
 > prerequisite for piece B (`extra="forbid"`) of Consiliency/pmcp#236. The
 > change is **embedded, not described**. The 52 blocks under *Verbatim
 > bodies* are `git apply` patches against `origin/main` @ `bc0a9ce`. They are
 > byte-identical to the verified code on the branch `wip/297-code` @
-> `6edb9f6`. *Embedding proof* extracts them from this file and applies them
+> `ec8dd8e`. *Embedding proof* extracts them from this file and applies them
 > on a fresh `bc0a9ce`, then compares every file. The base stays `bc0a9ce`
 > for this rev; merging later main is for the implementation PR.
 >
-> **For the board:** review the spike's tree (`wip/297-code` @ `6edb9f6`,
+> **For the board:** review the spike's tree (`wip/297-code` @ `ec8dd8e`,
 > whose diff from `bc0a9ce` is these patches). The bundle may leave the
 > patches out.
 >
-> **What rev 29 changes:** it answers round 27 on Consiliency/pmcp#314 @
-> `761ccb0`. Claude and gemini: AGREE. Grok timed out. Codex: DISAGREE,
-> with one finding: the HTTP transport logged the raw `Accept` header.
-> Request metadata is now caller content like the body. pmcp's transport
-> logs its structure only, and an AST check and a header grid bind that
-> (*Rev 29*).
+> **What rev 30 changes:** it answers round 28 on Consiliency/pmcp#314 @
+> `3778431`. Grok and gemini: AGREE. Claude: PARTIALLY AGREE, with nothing
+> blocking. Codex: DISAGREE, with one finding: an HTTP client's URL object
+> survived log masking.
+> - A masked record now keeps an argument or `extra=` field only when its
+>   type is value-free by an exact allowlist.
+> - The request-metadata guard is a fail-closed taint walk, found by type
+>   and position.
+> - Allowlist, logger-family and followed-redirect rows bind these
+>   (*Rev 30*).
 
-## History (revs 1–28)
+## History (revs 1–29)
 
 Each revision answered the previous board. The full text is in the plan at
 that sha, at `.consiliency/plans/detailed-297-validation-echo-20260928-2127.md`.
@@ -51,6 +55,7 @@ The line ranges are that file's.
 | 21 | `7bcb209` | round 19: 65–77 | 78–131 (every `except` binding; templates bound) |
 | 22 | `221115a` | round 20: 67–83 | 84–134 (response decoding; parser kinds; attribute allowlist); merge of `bc0a9ce`: 136–172 |
 | 23 | `5054a76` | round 21: 69–89 | 90–180 (every HTTP client's response errors; the grid; pmcp fields bound to pmcp classes) |
+| 29 | `3778431` | round 27: 69–89 | 90–165 (request headers are caller content; header grid; AST guard) |
 | 28 | `761ccb0` | round 26: 67–80 | 81–121 (a validation error's title, only for a declared model) |
 | 27 | `7900699` | round 25: 70–94 | 95–178 (one traceback walk gives origin and site; fail closed) |
 | 26 | `62ab87e` | round 24: 70–93 | 94–210 (the SDK's client side; any exception an HTTP client raises, by origin) |
@@ -61,8 +66,137 @@ The code for revs 1–17 is at `19dac95`, `929f693`, `026aadc`, `ee644a9`,
 `1824a09`, `9b24daa`, `dd3f707`, `2d9e736`, `8d33b49`, `6078419`,
 `46c4904`, `0a93265`, `ebcf4fc`, `06a9e01`, `67bd04d`, `403a83a` (rev 16),
 `18824c1` (rev 17), `b34717e` (rev 18), `fc88ea8` (rev 19), `f89527e` (rev
-20), `eb8796c` (rev 21), `30dc945` (rev 22), `825c43a` (rev 23), `86a63a6` (rev 24), `89a47c1` (rev 25), `5a93b9c` (rev 26), `e8e7ef6` (rev 27) and `bf648d5` (rev 28, on origin). Rev 17 before the
+20), `eb8796c` (rev 21), `30dc945` (rev 22), `825c43a` (rev 23), `86a63a6` (rev 24), `89a47c1` (rev 25), `5a93b9c` (rev 26), `e8e7ef6` (rev 27), `bf648d5` (rev 28) and `6edb9f6` (rev 29, on origin). Rev 17 before the
 merge of `6edf8a4` was `9e5cb57`.
+
+## Rev 30: masked log records keep value-free arguments only; the request guard fails closed
+
+**Round 28.**
+- Grok and gemini: AGREE.
+- Claude: PARTIALLY AGREE, with nothing blocking. It ran a real uvicorn
+  server over 4 configurations × 16 request shapes and found no sink.
+- Codex: DISAGREE, with one blocking finding.
+
+**Codex F001.** `_masked_argument` kept every argument that was not text
+or bytes, and the record scrubber leaves such arguments alone too. So an
+HTTP client's URL object survived. pmcp follows redirects
+(`_connect_streamable_http`). When a downstream redirects to a target it
+chose, and that target answers 500, httpx's request log names the
+target's URL: `HTTP Request: GET <url> "… 500 …"`.
+
+**The ruling: mask by allowlist, not by type exclusion.**
+
+**Rev 30.**
+- **The allowlist.** In a masked record (the MCP SDK's loggers,
+  `sse_starlette`, the HTTP client libraries'), an argument survives only
+  when:
+  - its exact type is in `VALUE_FREE_ARGUMENT_TYPES`, which is `int`,
+    `float`, `bool` and `NoneType`; or
+  - it is a member of an enum that pmcp, `mcp_types` or the SDK defines.
+
+  pmcp has no value-free marker types of its own, so none is listed.
+  Everything else reads `<text>`, masked whole: text, bytes, URLs, paths,
+  exceptions, dicts, lists, tuples, sets, other enums' members, any
+  object. That applies to the `%`-arguments, a single mapping argument's
+  values, and a lone non-tuple argument.
+- **`extra=` fields.** `Logger.makeRecord` sets them *after* the record
+  factory runs, so no factory-based scrubber ever saw them.
+  - pmcp now wraps `makeRecord` (`_install_extra_scrubbing`).
+  - A masked logger's extra fields are masked by the same allowlist.
+  - Any other logger's extra fields are scrubbed like its `args`: a
+    registered error in them is described.
+- **Formats.** A message whose format rejects a masked value (`%d` of
+  `<text>`) is masked whole, so the log call never fails.
+- **The message itself** keeps rev 20–26's rules: a literal is kept, an
+  f-string template has its placeholders masked, and anything else is
+  masked whole (`mcp.*`); an HTTP client's pre-formatted trace keeps its
+  event name.
+- **Verification note.** The first full-suite run on `ai` errored in
+  setup (`FileExistsError` on its `--basetemp`). A run killed after a
+  mistyped worktree path had left that directory behind. The full suite
+  ran again with a fresh `--basetemp`; that is the run the acceptance
+  criteria show.
+- **The ruling's scope.** It applies to records of masked loggers. pmcp's
+  own loggers keep their text arguments, which name servers, tools and
+  files. Their values are governed by the static sink guard and the
+  request-metadata guard, not by a type allowlist.
+
+**Claude N1: the request-metadata guard fails closed.** Rev 29's guard
+recognised a request only by the variable names `request`, `req`, `conn`
+and `websocket`, and caught 2 of claude's 22 shapes.
+- **Sources** are found by type and position, never by name:
+  - a parameter annotated `Request`, `HTTPConnection`, `WebSocket`,
+    `Scope`, `Receive` or `Message`;
+  - an ASGI callable's `scope` and `receive`, its first two positional
+    parameters after `self` when it takes three.
+- **Taint follows** assignments, attributes, `.get`, subscripts,
+  f-strings, `+=`, walrus, `for` targets, comprehensions and nested
+  functions. It is flow-insensitive. A comprehension's targets are its own
+  scope.
+- **Any call, store into another object, or `raise` that takes a request
+  value is a sink.** That covers logging under any name, `print`,
+  `sys.stderr.write`, a response, a header assignment, a metric label and
+  an exception.
+  - **Exceptions:** a method of the request value itself, and the callees
+    in two reviewed tables, each entry with a reason.
+  - **`_REQUEST_CLASSIFIERS`:** results that carry no caller value. They
+    are `_method_class`, `_accept_class`, `_header_names`,
+    `_origin_rejected`, `_host_rejected`, `hmac.compare_digest`,
+    `value_free_rejection`, `bool`, `len` and `isinstance`.
+  - **`_REQUEST_PROPAGATORS`:** callees whose result stays tainted but
+    which are not sinks. They are the token, Host and Origin parsers, the
+    body read and cap, the rate counter, and the SDK's own handling.
+  - A comparison's result is a decision, not a value.
+- **One code change:** `_auth_headers` now takes `for_request: bool`, not
+  the request. Its challenge never used anything of the request.
+- **Self-tests:** claude's 22 shapes and a comprehension must each be
+  flagged; decisions and the classifiers must not.
+  `test_every_reviewed_request_callee_is_used` keeps the tables free of
+  dead entries.
+
+**Claude N2.** The header grid no longer passes the deprecated `timeout=`
+to `TestClient.request`. Its 40 warnings are gone.
+
+**The bindings.**
+- `test_the_value_free_argument_allowlist_is_exact`.
+- **`test_a_masked_record_keeps_no_valued_argument`** runs each masked
+  logger family (`mcp.client.*`, `"client"`, httpx, httpcore, aiohttp and
+  `sse_starlette`).
+  - **Arguments carrying the sentinel:** a URL object, bytes, a path, a
+    nested dict, a list, a set, an arbitrary object, another enum's
+    member, and `extra=` fields.
+  - None of these survives. An int, a bool and `None` do, and the
+    unformattable `%d` is masked whole.
+- **`test_a_followed_redirect_to_a_refusing_target_is_not_logged`:** a
+  redirect to a reachable target that answers 404, 500 or 502.
+  - **Clients:** httpx, httpx2 and aiohttp directly, and pmcp's remote MCP
+    connect path over both transports.
+  - **Checked:** logs at DEBUG, connect errors, `gateway.health`'s error,
+    and the exception text and traceback.
+  - The connections close after each answer, so a client never reuses a
+    closed one; an early version flaked on that.
+- Codex's falsifier fails on rev 29's code and passes here.
+
+**Red on rev 29's code:**
+On rev 29's code (`6edb9f6`'s `src` with this `test_parse_error_echo.py` and `test_http_transport.py`):
+
+```text
+  1 test_http_transport.py::test_no_request_metadata_reaches_a_log_or_a_response
+ 12 test_parse_error_echo.py::test_a_followed_redirect_to_a_refusing_target_is_not_logged
+  6 test_parse_error_echo.py::test_a_masked_record_keeps_no_valued_argument
+  1 test_parse_error_echo.py::test_the_value_free_argument_allowlist_is_exact
+20 failed, 463 passed in 102.35s (0:01:42)
+```
+
+- The followed-redirect rows fail for httpx and httpx2 directly, and
+  through both remote transports, at 404, 500 and 502: codex's case.
+  aiohttp's rows pass on rev 29, because it does not log request URLs.
+- Every logger family's row fails on the URL object, bytes, a container
+  or an `extra=` field.
+- The taint walk flags `_auth_headers(request)`; the allowlist test
+  fails on the name rev 29 lacks.
+
+**Mutants:** M197–M201 (see *Mutation evidence*).
 
 ## Rev 29: request headers are caller content
 
@@ -1336,7 +1470,7 @@ read, is a sink.
 
 ## Changes
 
-The patches are `git diff bc0a9ce 6edb9f6 -- <file>`: 52 files, +15855 / −700. This is
+The patches are `git diff bc0a9ce ec8dd8e -- <file>`: 52 files, +16329 / −707. This is
 one concern applied at every sink, past the bounded-plan threshold on
 purpose. Rev 20:
 - adds `pmcp/sdk_rejections.py`, installed with the log scrubber;
@@ -1403,6 +1537,15 @@ Rev 29 changes:
   falsifier;
 - `CHANGELOG.md`: one sentence.
 
+Rev 30 changes:
+- `sdk_rejections.py`: the value-free argument allowlist, `extra=`
+  masking, and the format fallback;
+- `argument_errors.py`: `_install_extra_scrubbing`;
+- `transport/http.py`: `_auth_headers(for_request=…)`;
+- tests: the taint walk and its self-tests, the allowlist and
+  logger-family rows, and the followed-redirect rows;
+- `CHANGELOG.md`: one sentence.
+
 All 52 patches are one `git apply`: no import cycles, no
 migration, no config change.
 
@@ -1434,10 +1577,10 @@ On a fresh `bc0a9ce` with the patches applied:
 - run the full suite `-m 'not live and not slow'` with the npm cache
   variables unset.
 
-## Acceptance criteria — measured on `6edb9f6`
+## Acceptance criteria — measured on `ec8dd8e`
 
-- [x] The eight modules and Consiliency/pmcp#371's two are green: `1660 passed, 40 warnings in 451.09s (0:07:31)`.
-- [x] Red on main `bc0a9ce`, with the eight test files from `6edb9f6`
+- [x] The eight modules and Consiliency/pmcp#371's two are green: `1703 passed in 450.37s (0:07:30)`.
+- [x] Red on main `bc0a9ce`, with the eight test files from `ec8dd8e`
   (`--tb=line`; the errors are a fixture importing `pmcp.argument_errors`):
 
 ```text
@@ -1445,28 +1588,28 @@ On a fresh `bc0a9ce` with the patches applied:
   99 tests/test_downstream_frame_echo.py
    9 tests/test_exception_text_sinks.py
    3 tests/test_gateway_tool_schemas.py
-  38 tests/test_http_transport.py
+  39 tests/test_http_transport.py
   80 tests/test_log_record_scrubber.py
- 249 tests/test_parse_error_echo.py
+ 271 tests/test_parse_error_echo.py
    6 tests/test_scoped_advisor_audit.py
-600 failed, 667 passed, 40 warnings, 57 errors in 141.12s (0:02:21)
+623 failed, 687 passed, 57 errors in 152.71s (0:02:32)
 ```
 
-- [x] Binding: on rev 28's code, the header grid fails for `Accept` and `Mcp-Session-Id`,
-codex's falsifier fails, and the AST check flags both logs (*Rev 29*). It
-passes here. M193–M196 each remove part of the rule (see *Mutation
-evidence*).
+- [x] Binding: on rev 29's code, the followed-redirect rows and every logger family's
+argument row fail on the leak, and the taint walk flags the challenge
+builder (*Rev 30*). It passes here. M197–M201 each remove part of the rule
+(see *Mutation evidence*).
 
 - [x] The full suite, with `npm_config_cache`, `npm_config_store_dir` and
-  `pnpm_config_store_dir` unset: `10312 passed, 6 skipped, 80 deselected, 40 warnings in 1111.61s (0:18:31)`. The green run, the full suite
+  `pnpm_config_store_dir` unset: `10355 passed, 6 skipped, 80 deselected in 1065.12s (0:17:45)`. The green run, the full suite
   and the gates ran on host `ai` (`uv run --isolated --all-extras -p 3.10`),
-  from a worktree of the pushed `6edb9f6`.
+  from a worktree of the pushed `ec8dd8e`.
 - [x] Gates: ruff check: `All checks passed!`; ruff format --check: `193 files already formatted`; mypy: `Success: no issues found in 57 source files`.
 
 ## Mutation evidence
 
 `mutants.py` ran on host `ai`, three lanes per pass, on worktrees of
-`6edb9f6`. Each mutant ran in a fresh `uv run --isolated` environment
+`ec8dd8e`. Each mutant ran in a fresh `uv run --isolated` environment
 (`PYCMD`).
 
 The procedure:
@@ -1477,12 +1620,17 @@ The procedure:
   checked with `cmp` and against HEAD's blob by sha-256;
 - `git status` after the run: `0` and `0`.
 
-The purposes of M1–M192 are in the history table's plans (M191–M192:
-`761ccb0`). Rev 29 adds M193 (the Accept text), M194 (a session id's
-prefix), M195 (an unknown header's name) and M196 (the client address).
+The purposes of M1–M196 are in the history table's plans (M193–M196:
+`3778431`). Rev 30 adds:
+- M197: rev 29's type exclusion, masking only text and bytes;
+- M198: a masked logger's `extra=` fields kept;
+- M199: any enum's member kept;
+- M200: an unformattable masked argument left in place;
+- M201: the challenge builder handed a request header again, which only
+  the taint walk can see.
 
 ```text
-172 mutants applied; 170 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M196
+177 mutants applied; 175 killed: M1–M20 M22 M24 M26–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M201
 survived: M23 SDK parse error keeps its message
 survived: M25 malformed error message kept
 ```
@@ -1490,7 +1638,7 @@ survived: M25 malformed error message kept
 `NO_STATIC=1` deselects the sink guard and the helpers-only rule:
 
 ```text
-172 mutants applied; 165 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M149 M151–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M196
+177 mutants applied; 170 killed with both sink checks deselected: M1–M18 M24 M26–M34 M36–M40 M42–M45 M48 M54–M58 M60 M65–M72 M75–M91 M94–M112 M114–M136 M138–M149 M151–M152 M154 M156–M161 G1 S5–S8 M162–M163 M166–M168 M173 M175–M201
 survived: M19 tasks_get response uses str(e)
 survived: M20 tasks_get audit buffer uses str(e)
 survived: M22 installer crash message uses raw exc (static guard)
@@ -1502,7 +1650,7 @@ survived: M150 a narrow OSError handler renders its raw text (CLI auth-token fil
 
 M23 and M25 are equivalent mutants. Their combined partners, M102 and M90,
 die in both passes. M19, M20, M22, M35 and M150 die only on the sink guard,
-by design. These survivors are the same as in revs 23 to 28.
+by design. These survivors are the same as in revs 23 to 29.
 
 Rev 27's mutants still die in both passes:
 - M186, M187, M188 and M189 die on the SDK-helper matrix:
@@ -1516,10 +1664,15 @@ Rev 28's mutants still die in both passes. Each stops first, under `-x`, on
 `test_argument_error_echo.py`'s re-pinned `_CollidingErrors` expectation:
 a test's model title reads `<model>`, and both mutants print it.
 
-Rev 29's mutants die in both passes:
+Rev 29's mutants still die in both passes:
 - M193, M194 and M195 die on the header grid;
-- M196 dies on the AST check, because the rate-limit row cannot choose the
-  test client's address.
+- M196 dies on the request-metadata guard, because the rate-limit row
+  cannot choose the test client's address.
+
+Rev 30's mutants die in both passes:
+- M197, M198 and M199 die on the logger-family argument rows;
+- M200 dies on the unformattable `%d` row;
+- M201 dies on the taint walk (`test_no_request_metadata_reaches_a_log_or_a_response`).
 
 ## Non-goals and unverified
 
@@ -1637,6 +1790,14 @@ Rev 29's mutants die in both passes:
     The rev 18 full suite saw this shape once, with a `RuntimeError` from
     `_drain_outbound`. No pmcp task can end in a registered error: each
     one is retrieved or catches everything (round 17 N2).
+  - **The value-free allowlist applies to masked loggers** (the SDK's,
+    `sse_starlette`, the HTTP clients'). pmcp's own loggers keep text
+    arguments, and are bound by the static guards instead (*Rev 30*).
+  - **The request-metadata taint walk is per module and
+    flow-insensitive.** A request value handed to a function in another
+    module is caught at the call, since that call is a sink. A request
+    object reached without a typed parameter (a global, `**kwargs`) is not
+    a source. pmcp's only request reader is `transport/http.py`.
   - **The cost of rev 26's masking.** The SDK's client DEBUG logs lose
     their content, for example `Sending client message: <...>`. A message
     the SDK built before the call is masked whole. An SDK error pmcp has
@@ -1663,7 +1824,7 @@ Rev 29's mutants die in both passes:
 
 ## Embedding proof
 
-From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@6edb9f6`. The proof was run again on the final file, with this section in it, and printed the same listing.
+From **this file**: on a fresh worktree of `bc0a9ce`, each of the 52 patches was extracted with the embedded extractor and applied. "Identical" means `cmp`-identical to `wip/297-code@ec8dd8e`. The proof was run again on the final file, with this section in it, and printed the same listing.
 
 ```text
 $ git -C <proof worktree> rev-parse --short HEAD
@@ -1696,7 +1857,7 @@ done
 git apply --unidiff-zero --check <scratch>/*.patch && git apply --unidiff-zero <scratch>/*.patch
 ```
 
-The patches are `git diff -U0 bc0a9ce 6edb9f6 -- <file>`. To fit the size
+The patches are `git diff -U0 bc0a9ce ec8dd8e -- <file>`. To fit the size
 budget, each is cut to plain unified-diff form: there are no `diff --git`,
 `index` or `new file mode` lines, and no function context in the hunk
 headers. `git apply` reads them the same way; a new file is created with
@@ -1753,7 +1914,7 @@ print(f"{out}: {j - i - 1} lines")
 @@ -611,0 +612,17 @@
 +- **A value pmcp rejects is no longer echoed into a response, a log line, a traceback or an audit record (Consiliency/pmcp#297).** A rejected gateway-tool argument used to come back with jsonschema's or pydantic's message, which carried the value (`'Bearer sk-…' is not of type 'object'`, `input_value=…`), in the response, the log and the scoped audit. Rejections now read `<JSON path>: <reason>`, for example `Input validation error: $.options: must be of type object or null`. The reason is a fixed phrase filled only from the tool's own schema or model, and a key the caller chose shows as `*`. A call rejected by the argument model is audited as an `audit.rejection`. **Wording change:** a client matching jsonschema phrases such as `is not of type` must match the new form.
 +
-+  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`, where `<Model>` is a model class pmcp or the MCP SDK defines, and any other title reads `<model>`. An exception that chains a validation or parse error, as its cause, its context or a group member, shows only its class and that error's description, never its own message; pmcp's own refusals (an invalid policy file, a trust store it cannot parse) chain nothing and still name the file and the refusal. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500. Request headers, like the body, are caller content: the HTTP transport's DEBUG entry log names the method, whether a session header came, how `Accept` classifies (`json+sse`, `json`, `sse`, `other`) and the header names, never a header's value, and the rate-limit log no longer names the client address. The MCP SDK's own rejections no longer quote the request, on every transport: an unknown method's name is no longer returned as `data`, an unsupported protocol version's `requested` is returned only when it is a protocol revision, an SDK message pmcp has not reviewed reads as a fixed phrase for its code, and on `/mcp` a body that is not JSON or not a JSON-RPC message is described from its structure (`Validation error: N validation errors for …: $.<path>: <reason>`). Errors from pmcp's own tools are unchanged, and so is the request id. The SDK's server-side DEBUG logs and `sse_starlette`'s no longer show request text. A failed tool call whose error carries a rejected value is never read as a URL-elicitation request or an auth challenge. An HTTP response pmcp rejects -- a malformed status or header line, bad chunk framing, a truncated or undecodable body, an unexpected content type, an error status's reason phrase, a proxy's refusal of any status, a redirect to an unsupported scheme -- is reported by its class and status number, never its bytes, by every HTTP client pmcp uses (registry, version and package lookups, JWKS and auth metadata, feedback, the CLI's health probes, and remote MCP servers in `gateway.health`); the HTTP client libraries' DEBUG traces are masked likewise. Every error an HTTP client pmcp uses raises (aiohttp, httpx, httpcore, h11, urllib and `http.client`) reads `an HTTP request failed (<class>[, status N])`, without its library or OS text: that text can name a host a followed redirect chose, or a proxy's reason phrase. Each call site still names its own package, URL or server. Any exception, of any type, that such a client's own code raises reads the same way, a redirect `Location` its URL parser rejects included. The MCP SDK's client transports are held to the same rule: a reply the SDK writes for the downstream from the response (`Unexpected content type: …`) reads as its code's fixed phrase in connect errors and `gateway.health`; an exception the SDK raises with text pmcp has not reviewed reads by its class and code; and every `mcp.*` logger, client and server, is masked, its tracebacks printing each exception by class. A traceback whose chain holds such an error prints every other exception in it by its class alone. An `MCPError` a gateway tool raises while handling a value it rejected keeps its code, and its message becomes the structural description.
++  The same rule holds wherever pmcp turns an exception into text: tool responses, logs, tracebacks, the audit-event buffer and `gateway.tasks_*` errors. A validation error reads `N validation error(s) for <Model>: $.<path>: <reason>`, where `<Model>` is a model class pmcp or the MCP SDK defines, and any other title reads `<model>`. An exception that chains a validation or parse error, as its cause, its context or a group member, shows only its class and that error's description, never its own message; pmcp's own refusals (an invalid policy file, a trust store it cannot parse) chain nothing and still name the file and the refusal. A parse error of YAML, JSON, TOML or a timestamp, in config files or downstream data, reports its format, source, position and class, never the offending text. From `import pmcp` on, a log record whose traceback or arguments carry such an error is rewritten at creation. An `Origin` header with a bad port gets a 403, not a 500. Request headers, like the body, are caller content: the HTTP transport's DEBUG entry log names the method, whether a session header came, how `Accept` classifies (`json+sse`, `json`, `sse`, `other`) and the header names, never a header's value, and the rate-limit log no longer names the client address. The MCP SDK's own rejections no longer quote the request, on every transport: an unknown method's name is no longer returned as `data`, an unsupported protocol version's `requested` is returned only when it is a protocol revision, an SDK message pmcp has not reviewed reads as a fixed phrase for its code, and on `/mcp` a body that is not JSON or not a JSON-RPC message is described from its structure (`Validation error: N validation errors for …: $.<path>: <reason>`). Errors from pmcp's own tools are unchanged, and so is the request id. The SDK's server-side DEBUG logs and `sse_starlette`'s no longer show request text. In the logs of the MCP SDK, `sse_starlette` and the HTTP client libraries, an argument or `extra=` field survives only when it is a number, a boolean, `None`, or a member of pmcp's or the SDK's own enums; anything else, a URL included, reads `<text>`. A failed tool call whose error carries a rejected value is never read as a URL-elicitation request or an auth challenge. An HTTP response pmcp rejects -- a malformed status or header line, bad chunk framing, a truncated or undecodable body, an unexpected content type, an error status's reason phrase, a proxy's refusal of any status, a redirect to an unsupported scheme -- is reported by its class and status number, never its bytes, by every HTTP client pmcp uses (registry, version and package lookups, JWKS and auth metadata, feedback, the CLI's health probes, and remote MCP servers in `gateway.health`); the HTTP client libraries' DEBUG traces are masked likewise. Every error an HTTP client pmcp uses raises (aiohttp, httpx, httpcore, h11, urllib and `http.client`) reads `an HTTP request failed (<class>[, status N])`, without its library or OS text: that text can name a host a followed redirect chose, or a proxy's reason phrase. Each call site still names its own package, URL or server. Any exception, of any type, that such a client's own code raises reads the same way, a redirect `Location` its URL parser rejects included. The MCP SDK's client transports are held to the same rule: a reply the SDK writes for the downstream from the response (`Unexpected content type: …`) reads as its code's fixed phrase in connect errors and `gateway.health`; an exception the SDK raises with text pmcp has not reviewed reads by its class and code; and every `mcp.*` logger, client and server, is masked, its tracebacks printing each exception by class. A traceback whose chain holds such an error prints every other exception in it by its class alone. An `MCPError` a gateway tool raises while handling a value it rejected keeps its code, and its message becomes the structural description.
 +
 +  Downstream frames:
 +  - A frame that is not JSON-RPC 2.0 is dropped with a value-free DEBUG record and never settles a request. This holds on stdio, SSE and streamable HTTP.
@@ -1856,7 +2017,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/src/pmcp/argument_errors.py
-@@ -0,0 +1,1743 @@
+@@ -0,0 +1,1781 @@
 +"""Describe a rejected gateway-tool argument without the value that failed.
 +
 +A gateway tool's arguments are checked twice: by the advertised JSON Schema
@@ -3504,6 +3665,7 @@ print(f"{out}: {j - i - 1} lines")
 +    current = logging.getLogRecordFactory()
 +    if not getattr(current, "pmcp_validation_scrubber", False):
 +        logging.setLogRecordFactory(_scrubbing_factory(current))
++    _install_extra_scrubbing()
 +    _install_excepthook()
 +    _install_threading_excepthook()
 +    _install_handle_error()
@@ -3512,6 +3674,43 @@ print(f"{out}: {j - i - 1} lines")
 +    from pmcp.sdk_rejections import install_value_free_sdk_errors
 +
 +    install_value_free_sdk_errors()
++
++
++def _install_extra_scrubbing() -> None:
++    """Scrub a record's `extra=` fields too (rev 30). `Logger.makeRecord`
++    sets them after the record factory has run, so they are scrubbed here,
++    once they exist: for a masked logger (the MCP SDK's, `sse_starlette`,
++    the HTTP clients') every field outside the value-free allowlist is
++    masked; for any other, a field that is or holds a registered error is
++    described, as `args` are. Idempotent."""
++    current = logging.Logger.makeRecord
++    if getattr(current, "pmcp_extra_scrubber", False):
++        return
++
++    def make_record(self: logging.Logger, *args: Any, **kwargs: Any) -> Any:
++        record = current(self, *args, **kwargs)
++        extra = (
++            kwargs.get("extra")
++            if "extra" in kwargs
++            else (args[8] if len(args) > 8 else None)
++        )
++        if extra:
++            try:
++                from pmcp.sdk_rejections import is_sdk_logger, mask_extras
++
++                if is_sdk_logger(record.name):
++                    mask_extras(record)
++                else:
++                    for key in extra:
++                        if hasattr(record, key):
++                            setattr(record, key, _scrubbed(getattr(record, key)))
++            except Exception:  # noqa: BLE001 -- a log call must never fail here
++                pass
++        return record
++
++    make_record.pmcp_extra_scrubber = True  # type: ignore[attr-defined]
++    make_record.original = current  # type: ignore[attr-defined]
++    logging.Logger.makeRecord = make_record  # type: ignore[method-assign]
 +
 +
 +def _install_handle_error() -> None:
@@ -5110,7 +5309,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/src/pmcp/sdk_rejections.py
-@@ -0,0 +1,800 @@
+@@ -0,0 +1,842 @@
 +"""The MCP SDK's own rejections and server-side logs, value-free (Consiliency/pmcp#297 rev 20).
 +
 +Before any pmcp handler runs, the MCP SDK answers some requests itself: an
@@ -5843,10 +6042,44 @@ print(f"{out}: {j - i - 1} lines")
 +    return tuple(out)
 +
 +
++#: The argument types a masked record keeps, by exact type (rev 30, round-28
++#: codex F001: an HTTP client's URL object survived the old rule, which
++#: masked only text and bytes). Everything else -- text, bytes, URLs, paths,
++#: exceptions, containers, any object -- is masked whole. Enum members of
++#: pmcp's, `mcp_types`' or the SDK's own enums are kept too
++#: (:func:`_value_free_argument`). `tests/test_http_transport.py` pins this
++#: set exactly.
++VALUE_FREE_ARGUMENT_TYPES: frozenset[type] = frozenset({int, float, bool, type(None)})
++_ENUM_PACKAGES = ("pmcp", "mcp_types", "mcp")
++
++
++def _value_free_argument(value: Any) -> bool:
++    if type(value) in VALUE_FREE_ARGUMENT_TYPES:
++        return True
++    import enum
++
++    kind = type(value)
++    return isinstance(value, enum.Enum) and (
++        str(getattr(kind, "__module__", "")).split(".")[0] in _ENUM_PACKAGES
++    )
++
++
 +def _masked_argument(value: Any) -> Any:
-+    if isinstance(value, (str, bytes, bytearray, memoryview)):
-+        return _TEXT
-+    return value
++    """``value`` if its type is value-free by the allowlist, else ``<text>``."""
++    return value if _value_free_argument(value) else _TEXT
++
++
++#: The attributes every `LogRecord` has; any other is an `extra=` field.
++_RECORD_ATTRIBUTES = frozenset(
++    vars(logging.LogRecord("n", 0, "p", 0, "m", None, None))
++) | {"message", "asctime"}
++
++
++def mask_extras(record: logging.LogRecord) -> None:
++    """Mask every `extra=` field of ``record`` by the same allowlist."""
++    for key, value in list(vars(record).items()):
++        if key not in _RECORD_ATTRIBUTES and not _value_free_argument(value):
++            setattr(record, key, _TEXT)
 +
 +
 +def _under(name: Any, prefixes: tuple[str, ...]) -> bool:
@@ -5886,6 +6119,14 @@ print(f"{out}: {j - i - 1} lines")
 +            record.args = tuple(_masked_argument(item) for item in args)
 +        elif isinstance(args, dict):
 +            record.args = {key: _masked_argument(item) for key, item in args.items()}
++        elif args is not None:
++            record.args = (_TEXT,)
++        mask_extras(record)
++        try:
++            record.getMessage()
++        except Exception:  # noqa: BLE001 -- a masked argument a format rejects
++            record.msg, record.args = _PLACEHOLDER, None
++            return
 +        if _under(record.name, HTTP_CLIENT_LOGGERS):
 +            if not args and isinstance(record.msg, str):
 +                head, _, rest = record.msg.partition(" ")
@@ -6507,16 +6748,26 @@ print(f"{out}: {j - i - 1} lines")
 +        name if name in _KNOWN_HEADER_NAMES else "other"
 +        for name in (key.lower() for key in request.headers.keys())
 +    }
-@@ -555 +707,4 @@
+@@ -470 +621,0 @@
+-        request: Request | None = None,
+@@ -471,0 +623 @@
++        for_request: bool = False,
+@@ -474,0 +627,2 @@
++        # Whether this answers a request, not the request itself: nothing of
++        # the request reaches the challenge (rev 30).
+@@ -477 +631 @@
+-            if request is not None and effective_auth_mode == "resource-server":
++            if for_request and effective_auth_mode == "resource-server":
+@@ -555 +709,4 @@
 -        session_id_short = (request.headers.get("mcp-session-id") or "")[:8] or "<none>"
 +        # Request metadata is caller content, like the body (rev 29,
 +        # round-27 codex F001): the entry log carries its structure only --
 +        # the HTTP method from a fixed set, whether a session header came,
 +        # how the Accept header classifies, and the header names.
-@@ -557 +712 @@
+@@ -557 +714 @@
 -            "handle_mcp [%s]: %s method=%s session=%s accept=%r",
 +            "handle_mcp [%s]: method=%s session=%s accept=%s headers=%s",
-@@ -559,4 +714,4 @@
+@@ -559,4 +716,4 @@
 -            request.url.path,
 -            request.method,
 -            session_id_short,
@@ -6525,21 +6776,42 @@ print(f"{out}: {j - i - 1} lines")
 +            "present" if request.headers.get("mcp-session-id") else "absent",
 +            _accept_class(request.headers.get("accept", "")),
 +            ",".join(sorted(_header_names(request))),
-@@ -653,3 +808,3 @@
+@@ -596 +753,3 @@
+-                    401, AuthMessage.UNAUTHORIZED, headers=_auth_headers(request)
++                    401,
++                    AuthMessage.UNAUTHORIZED,
++                    headers=_auth_headers(for_request=True),
+@@ -603 +762,3 @@
+-                    401, AuthMessage.UNAUTHORIZED, headers=_auth_headers(request)
++                    401,
++                    AuthMessage.UNAUTHORIZED,
++                    headers=_auth_headers(for_request=True),
+@@ -630 +791 @@
+-                    headers=_auth_headers(request, error=exc.error),
++                    headers=_auth_headers(for_request=True, error=exc.error),
+@@ -639 +800,3 @@
+-                        headers=_auth_headers(request, error=exc.error, scope=scope),
++                        headers=_auth_headers(
++                            for_request=True, error=exc.error, scope=scope
++                        ),
+@@ -645 +808 @@
+-                    headers=_auth_headers(request, error=exc.error),
++                    headers=_auth_headers(for_request=True, error=exc.error),
+@@ -653,3 +816,3 @@
 -                logger.debug(
 -                    "handle_mcp [%s]: 429 rate limited ip=%s", request_id, client_ip
 -                )
 +                # Not the address: behind a trusting proxy it is the caller's
 +                # `X-Forwarded-For` (rev 29).
 +                logger.debug("handle_mcp [%s]: 429 rate limited", request_id)
-@@ -710 +865 @@
+@@ -710 +873 @@
 -                body_method = json.loads(body_bytes).get("method")
 +                body_method = load_json(body_bytes, source="request body").get("method")
-@@ -751,0 +907,3 @@
+@@ -751,0 +915,3 @@
 +        request_body = body_bytes if request.method == "POST" else None
 +        held_start: MutableMapping[str, Any] | None = None
 +        held_body: list[bytes] = []
-@@ -754,2 +912,11 @@
+@@ -754,2 +920,11 @@
 -            nonlocal response_started
 -            if message.get("type") == "http.response.start":
 +            # A JSON response the SDK sends with an error status is held until
@@ -6553,7 +6825,7 @@ print(f"{out}: {j - i - 1} lines")
 +                ).startswith(b"application/json"):
 +                    held_start = message
 +                    return
-@@ -756,0 +924,18 @@
+@@ -756,0 +932,18 @@
 +            elif kind == "http.response.body" and held_start is not None:
 +                held_body.append(message.get("body", b""))
 +                if message.get("more_body", False):
@@ -13105,7 +13377,7 @@ print(f"{out}: {j - i - 1} lines")
 +        assert sentinel not in observed
 +        assert sentinel.encode("utf-8").hex() not in observed.encode("utf-8").hex()
 +
-@@ -594,0 +642,1949 @@
+@@ -594,0 +642,2124 @@
 +
 +
 +# --- rev 19: the SDK's transport rejections are value-free (round-17 grok F001,
@@ -14836,7 +15108,7 @@ print(f"{out}: {j - i - 1} lines")
 +                request_headers["accept"] = "text/event-stream"
 +            try:
 +                response = client.request(
-+                    method, "/mcp", headers=request_headers, json=body, timeout=10
++                    method, "/mcp", headers=request_headers, json=body
 +                )
 +            except Exception as error:  # noqa: BLE001 -- inspected
 +                from pmcp.argument_errors import exception_text, safe_traceback_text
@@ -14890,125 +15162,247 @@ print(f"{out}: {j - i - 1} lines")
 +    assert sentinel not in messages, messages
 +
 +
-+#: Request-metadata attributes and scope keys whose values are caller
-+#: content (rev 29).
-+_REQUEST_METADATA_ATTRS = frozenset(
-+    {"headers", "query_params", "path_params", "url", "client", "method", "cookies"}
++#: The types whose parameters are request objects (rev 30, round-28 claude
++#: N1): a parameter annotated with one of these, and an ASGI callable's
++#: `scope` and `receive` (by position), are taint sources -- by type and
++#: position, never by variable name.
++_REQUEST_TYPES = frozenset(
++    {"Request", "HTTPConnection", "WebSocket", "Scope", "Receive", "Message"}
 +)
-+_REQUEST_SCOPE_KEYS = frozenset(
-+    {"headers", "path", "raw_path", "query_string", "client", "method"}
-+)
-+#: Callees that turn request metadata into a fixed classification, reviewed
-+#: (rev 29): their arguments may be request metadata.
-+_REQUEST_METADATA_CLASSIFIERS = frozenset(
-+    {"_method_class", "_accept_class", "_header_names"}
-+)
-+#: Callees whose arguments reach a log record or a response.
-+_LOG_METHODS = frozenset(
-+    {"debug", "info", "warning", "warn", "error", "exception", "critical", "log"}
-+)
-+_RESPONSE_CALLS = frozenset(
-+    {
-+        "Response",
-+        "JSONResponse",
-+        "PlainTextResponse",
-+        "HTMLResponse",
-+        "StreamingResponse",
-+        "_reject",
-+        "_auth_response",
++
++#: Callees whose result carries no caller value (a decision or a fixed
++#: classification), each reviewed (rev 30). Passing request metadata to one
++#: is not a sink, and its result is not tainted.
++_REQUEST_CLASSIFIERS: dict[str, str] = {
++    "_method_class": "the method from a fixed set, else 'other'",
++    "_accept_class": "how Accept classifies, from a fixed set",
++    "_header_names": "known header names, else 'other'",
++    "_origin_rejected": "a bool: the Origin check",
++    "_host_rejected": "a bool: the Host check",
++    "hmac.compare_digest": "a bool: the shared-secret check",
++    "bool": "a bool",
++    "len": "a count",
++    "isinstance": "a bool",
++    "value_free_rejection": "the SDK's rejection rebuilt from the body's structure (rev 19)",
++}
++
++#: Callees that receive request metadata and are not sinks, each reviewed:
++#: their result stays tainted (rev 30).
++_REQUEST_PROPAGATORS: dict[str, str] = {
++    "_bearer_token": "returns the token, used only for validation",
++    "_split_host_port": "splits a Host for the comparison above",
++    "_origin_host_port": "parses an Origin for the comparison above",
++    "_is_loopback_host": "a bool on a parsed host",
++    "int": "a Content-Length for the cap comparison",
++    "str": "text for a comparison",
++    "_check_rate_limit": "keys a per-client counter; never logged",
++    "_read_body_capped": "reads the body against the cap",
++    "bounded_wait": "awaits the body read or the SDK under a timeout",
++    "load_json": "parses the body for its method (a decision)",
++    "resource_jwks.get_for_token": "fetches the issuer's keys for the token",
++    "validate_resource_server_token": "validates the token; its errors are pmcp's",
++    "session_manager.handle_request": "the SDK's own handling (revs 20, 26)",
++    "tracking_send": "the SDK's response, passed through",
++    "send": "an ASGI send of the SDK's response, passed through",
++    "self.app": "the wrapped ASGI app, passed through",
++    "dict": "a copy of a header mapping, for a decision",
++}
++
++
++def _callee(node: ast.Call) -> str:
++    return ast.unparse(node.func)
++
++
++def _taint_sources(function: ast.AST) -> set[str]:
++    """The parameters of ``function`` that are request objects: annotated
++    with a request type, or an ASGI callable's `scope` and `receive` (its
++    first two positional parameters after `self`, when it takes three)."""
++    assert isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
++    params = [
++        *function.args.posonlyargs,
++        *function.args.args,
++        *function.args.kwonlyargs,
++    ]
++    sources = {
++        p.arg
++        for p in params
++        if p.annotation is not None
++        and ast.unparse(p.annotation).split(".")[-1].strip("'\"") in _REQUEST_TYPES
 +    }
-+)
-+
-+
-+def _reads_request_metadata(node: ast.AST, tainted: set[str]) -> bool:
-+    """Whether ``node`` carries a request-metadata value: an attribute chain
-+    through one of `_REQUEST_METADATA_ATTRS` on a request-like object, a
-+    `scope[...]` read of a metadata key, or a name assigned from one. The
-+    test of a conditional and a reviewed classifier's arguments are not
-+    values that reach the output."""
-+    if isinstance(node, ast.IfExp):
-+        return _reads_request_metadata(node.body, tainted) or _reads_request_metadata(
-+            node.orelse, tainted
-+        )
-+    if isinstance(node, ast.Call):
-+        func = node.func
-+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-+        if name in _REQUEST_METADATA_CLASSIFIERS:
-+            return False
-+    if isinstance(node, ast.Attribute) and node.attr in _REQUEST_METADATA_ATTRS:
-+        base = ast.unparse(node.value)
-+        if base.split(".")[-1] in ("request", "req", "conn", "websocket"):
-+            return True
++    positional = [
++        p for p in [*function.args.posonlyargs, *function.args.args] if p.arg != "self"
++    ]
 +    if (
-+        isinstance(node, ast.Subscript)
-+        and ast.unparse(node.value).split(".")[-1] == "scope"
-+        and isinstance(node.slice, ast.Constant)
-+        and node.slice.value in _REQUEST_SCOPE_KEYS
++        isinstance(function, ast.AsyncFunctionDef)
++        and len(positional) == 3
++        and (
++            function.name == "__call__" or all(p.annotation is None for p in positional)
++        )
 +    ):
-+        return True
-+    if isinstance(node, ast.Name) and node.id in tainted:
-+        return True
-+    return any(
-+        _reads_request_metadata(child, tainted) for child in ast.iter_child_nodes(node)
-+    )
++        sources |= {positional[0].arg, positional[1].arg}
++    return sources
++
++
++def _tainted(node: ast.AST | None, names: set[str]) -> bool:
++    """Whether ``node`` carries a request value, given the tainted names."""
++    if node is None or isinstance(node, (ast.Constant, ast.Lambda)):
++        return False
++    if isinstance(node, ast.Name):
++        return node.id in names
++    if isinstance(node, ast.Compare):
++        return False  # a decision
++    if isinstance(node, ast.IfExp):
++        return _tainted(node.body, names) or _tainted(node.orelse, names)
++    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
++        # A comprehension's targets are its own scope: they shadow an
++        # enclosing name, and are tainted only by their iterable.
++        local = set(names)
++        for generator in node.generators:
++            bound: set[str] = set()
++            _bind(generator.target, bound)
++            iter_tainted = _tainted(generator.iter, local)
++            local -= bound
++            if iter_tainted:
++                local |= bound
++        parts = [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
++        return any(_tainted(part, local) for part in parts)
++    if isinstance(node, ast.Call):
++        callee = _callee(node)
++        if (
++            callee in _REQUEST_CLASSIFIERS
++            or callee.split(".")[-1] in _REQUEST_CLASSIFIERS
++        ):
++            return False
++        if isinstance(node.func, ast.Attribute) and _tainted(node.func.value, names):
++            return True
++        return any(
++            _tainted(value, names)
++            for value in [*node.args, *(k.value for k in node.keywords)]
++        )
++    return any(_tainted(child, names) for child in ast.iter_child_nodes(node))
++
++
++def _bind(target: ast.AST, names: set[str]) -> None:
++    if isinstance(target, ast.Name):
++        names.add(target.id)
++    elif isinstance(target, (ast.Tuple, ast.List)):
++        for element in target.elts:
++            _bind(element, names)
++    elif isinstance(target, ast.Starred):
++        _bind(target.value, names)
++
++
++def _own_nodes(function: ast.AST) -> list[ast.AST]:
++    """The nodes of ``function``'s body, without nested functions'."""
++    out: list[ast.AST] = []
++    pending = list(ast.iter_child_nodes(function))
++    while pending:
++        node = pending.pop()
++        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
++            continue
++        out.append(node)
++        pending.extend(ast.iter_child_nodes(node))
++    return out
 +
 +
 +def _request_metadata_sinks(tree: ast.AST) -> list[int]:
++    """Every place a request value reaches a call, a store or a raise that is
++    not a reviewed classifier or propagator: a log, `print`, a response, a
++    header assignment, a metric label, an exception, a helper (rev 30:
++    fail-closed taint walk, flow-insensitive, through assignments,
++    attributes, `.get`, subscripts, f-strings, `+=`, walrus, `for` targets,
++    and nested functions)."""
 +    found: list[int] = []
-+    for function in ast.walk(tree):
-+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-+            continue
-+        tainted: set[str] = set()
-+        for node in ast.walk(function):
-+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
-+                if _reads_request_metadata(node.value, tainted):
-+                    targets = (
-+                        node.targets if isinstance(node, ast.Assign) else [node.target]
-+                    )
-+                    for target in targets:
-+                        # A name bound to the value, not a store into an
-+                        # object (`request.scope[...] = ...` taints nothing).
-+                        elements = (
-+                            target.elts
-+                            if isinstance(target, (ast.Tuple, ast.List))
-+                            else [target]
-+                        )
-+                        for element in elements:
-+                            if isinstance(element, ast.Name):
-+                                tainted.add(element.id)
-+        for node in ast.walk(function):
-+            if not isinstance(node, ast.Call):
-+                continue
-+            func = node.func
-+            name = (
-+                func.attr
-+                if isinstance(func, ast.Attribute)
-+                else getattr(func, "id", "")
-+            )
-+            is_log = (
-+                isinstance(func, ast.Attribute)
-+                and name in _LOG_METHODS
-+                and ast.unparse(func.value).split(".")[-1]
-+                in ("logger", "log", "_logger", "logging")
-+            )
-+            if not (is_log or name in _RESPONSE_CALLS):
-+                continue
-+            values = [*node.args, *(k.value for k in node.keywords)]
-+            if any(_reads_request_metadata(v, tainted) for v in values):
++
++    def visit(function: ast.AST, inherited: set[str]) -> None:
++        names = set(inherited) | _taint_sources(function)
++        nodes = _own_nodes(function)
++        changed = True
++        while changed:
++            before = len(names)
++            for node in nodes:
++                if isinstance(node, ast.Assign) and _tainted(node.value, names):
++                    for target in node.targets:
++                        _bind(target, names)
++                elif isinstance(
++                    node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)
++                ) and (_tainted(node.value, names)):
++                    _bind(node.target, names)
++                elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)) and (
++                    _tainted(node.iter, names)
++                ):
++                    _bind(node.target, names)
++                elif isinstance(node, (ast.With, ast.AsyncWith)):
++                    for item in node.items:
++                        if item.optional_vars is not None and _tainted(
++                            item.context_expr, names
++                        ):
++                            _bind(item.optional_vars, names)
++            changed = len(names) != before
++        for node in nodes:
++            if isinstance(node, ast.Call):
++                callee = _callee(node)
++                short = callee.split(".")[-1]
++                values = [*node.args, *(k.value for k in node.keywords)]
++                if not any(_tainted(v, names) for v in values):
++                    continue
++                if isinstance(node.func, ast.Attribute) and _tainted(
++                    node.func.value, names
++                ):
++                    continue  # a method of the request value itself
++                if (
++                    callee in _REQUEST_CLASSIFIERS
++                    or short in _REQUEST_CLASSIFIERS
++                    or callee in _REQUEST_PROPAGATORS
++                ):
++                    continue
 +                found.append(node.lineno)
++            elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
++                value = node.value
++                targets = (
++                    node.targets if isinstance(node, ast.Assign) else [node.target]
++                )
++                for target in targets:
++                    if (
++                        isinstance(target, (ast.Subscript, ast.Attribute))
++                        and _tainted(value, names)
++                        and not _tainted(target.value, names)
++                    ):
++                        found.append(node.lineno)  # stored into another object
++            elif isinstance(node, ast.Raise) and _tainted(node.exc, names):
++                found.append(node.lineno)
++        for node in ast.walk(function):
++            if node is not function and isinstance(
++                node, (ast.FunctionDef, ast.AsyncFunctionDef)
++            ):
++                if node in _own_children(function):
++                    visit(node, names)
++
++    def _own_children(function: ast.AST) -> list[ast.AST]:
++        out: list[ast.AST] = []
++        pending = list(ast.iter_child_nodes(function))
++        while pending:
++            node = pending.pop()
++            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                out.append(node)
++                continue
++            if isinstance(node, ast.ClassDef):
++                pending.extend(ast.iter_child_nodes(node))
++                continue
++            pending.extend(ast.iter_child_nodes(node))
++        return out
++
++    for top in _own_children(tree):
++        visit(top, set())
 +    return found
 +
 +
-+#: Reviewed sites (`path::line-free function`) where request metadata
-+#: reaches a log or a response on purpose (rev 29): none.
-+_REVIEWED_REQUEST_METADATA_SINKS: frozenset[str] = frozenset()
-+
-+
 +def test_no_request_metadata_reaches_a_log_or_a_response() -> None:
-+    """No request header, query string, path, method, client address,
-+    cookie or URL value reaches a logging call or a response in `src/pmcp`,
-+    directly or through one assignment, outside the reviewed classifiers
-+    (rev 29)."""
++    """No request value -- a header, the query, path, method, client
++    address, a cookie, the URL, the ASGI scope or a received message --
++    reaches a call, a store into another object, or a raise in `src/pmcp`,
++    outside the reviewed classifiers and propagators (rev 29; fail-closed
++    taint walk since rev 30)."""
 +    from pathlib import Path
 +
 +    src = Path(__file__).resolve().parents[1] / "src" / "pmcp"
@@ -15021,40 +15415,93 @@ print(f"{out}: {j - i - 1} lines")
 +    assert not found, found
 +
 +
-+@pytest.mark.parametrize(
-+    ("snippet", "flagged"),
-+    [
-+        (
-+            "def f(request):\n    logger.debug('a %s', request.headers.get('accept'))\n",
-+            True,
-+        ),
-+        ("def f(request):\n    logger.info('%s', request.url.path)\n", True),
-+        (
-+            "def f(request):\n    ip = request.client.host\n    logger.debug('%s', ip)\n",
-+            True,
-+        ),
-+        ("def f(request):\n    return Response(request.headers['x'])\n", True),
-+        ("def f(scope):\n    logger.debug('%s', scope['query_string'])\n", True),
-+        (
-+            "def f(request):\n    logger.debug('%s', _accept_class(request.headers.get('accept', '')))\n",
-+            False,
-+        ),
-+        (
-+            "def f(request):\n    logger.debug('%s', 'present' if request.headers.get('x') else 'absent')\n",
-+            False,
-+        ),
-+        ("def f(request):\n    logger.debug('fixed %s', 1)\n", False),
-+        (
-+            "def f(request):\n    request.scope['k'] = request.headers.get('x')\n"
-+            "    return Response(status_code=401, headers=g(request))\n",
-+            False,
-+        ),
-+    ],
-+)
-+def test_the_request_metadata_check_sees_each_shape(
-+    snippet: str, flagged: bool
-+) -> None:
-+    assert bool(_request_metadata_sinks(ast.parse(snippet))) is flagged
++_R = "from starlette.requests import Request\n"
++
++#: Round-28 claude N1's 22 shapes, and a comprehension (rev 30): each must
++#: be flagged.
++_REQUEST_SINK_SHAPES: dict[str, str] = {
++    "f-string": _R
++    + "def f(request: Request):\n    logger.debug(f\"{request.headers['a']}\")\n",
++    "two hops": _R
++    + "def f(request: Request):\n    a = request.headers\n    b = a.get('x')\n    logger.info(b)\n",
++    "any name": _R + "def f(r: Request):\n    logger.info(r.headers['a'])\n",
++    "attribute": _R
++    + "class C:\n    def f(self, http_request: Request):\n        logger.info(http_request.headers.get('a'))\n",
++    "self attr": _R
++    + "class C:\n    def f(self, req: Request):\n        self._request = req\n        logger.info(self._request.headers)\n",
++    "scope.get": "async def app(scope, receive, send):\n    logger.info(scope.get('headers'))\n",
++    "Headers(scope)": "async def app(scope, receive, send):\n    h = Headers(scope=scope)\n",
++    "state across": _R
++    + "def g(request: Request):\n    logger.info(request.state.origin)\n",
++    "items loop": _R
++    + "def f(request: Request):\n    for k, v in request.headers.items():\n        logger.info('%s=%s', k, v)\n",
++    "helper returns": _R + "def f(request: Request):\n    v = pick(request)\n",
++    "helper logs": _R + "def f(request: Request):\n    log_it(request.headers['a'])\n",
++    "walrus": _R
++    + "def f(request: Request):\n    if (v := request.headers.get('a')):\n        logger.info(v)\n",
++    "aug-assign": _R
++    + "def f(request: Request):\n    s = ''\n    s += request.headers['a']\n    logger.info(s)\n",
++    "logger alias": _R + "def f(request: Request):\n    LOG.info(request.url)\n",
++    "bound method": _R
++    + "def f(request: Request):\n    log_it = logger.debug\n    log_it(request.url)\n",
++    "raise": _R
++    + "def f(request: Request):\n    raise ValueError(f\"bad {request.headers['origin']}\")\n",
++    "HTTPException": _R
++    + "def f(request: Request):\n    raise HTTPException(400, detail=request.headers['a'])\n",
++    "CORS echo": _R
++    + "def f(request: Request, response):\n    response.headers['access-control-allow-origin'] = request.headers['origin']\n",
++    "redirect": _R
++    + "def f(request: Request):\n    return RedirectResponse(str(request.url))\n",
++    "print": _R + "def f(request: Request):\n    print(request.headers)\n",
++    "stderr": _R
++    + "def f(request: Request):\n    sys.stderr.write(request.headers['a'])\n",
++    "metric": _R
++    + "def f(request: Request):\n    _inc(f\"requests_{request.headers['a']}\")\n",
++    "comprehension": _R
++    + "def f(request: Request):\n    logger.info([v for _, v in request.headers.items()])\n",
++}
++
++#: Shapes that must not be flagged: decisions and reviewed classifiers.
++_REQUEST_SAFE_SHAPES: dict[str, str] = {
++    "classifier": _R
++    + "def f(request: Request):\n    logger.debug('%s', _accept_class(request.headers.get('accept', '')))\n",
++    "presence": _R
++    + "def f(request: Request):\n    logger.debug('%s', 'present' if request.headers.get('x') else 'absent')\n",
++    "comparison": _R
++    + "def f(request: Request):\n    if request.headers.get('a') == 'b':\n        logger.debug('fixed')\n",
++    "store into request": _R
++    + "def f(request: Request):\n    request.scope['k'] = request.headers.get('x')\n",
++    "unrelated": "def f(request):\n    logger.debug('%s', request)\n",
++    "comprehension shadow": _R
++    + "def f(request: Request, other):\n    if (value := request.headers.get('a')):\n"
++    + "        pass\n    logger.debug('%s', [value for value in other])\n",
++}
++
++
++@pytest.mark.parametrize("shape", sorted(_REQUEST_SINK_SHAPES))
++def test_the_request_metadata_check_flags_each_shape(shape: str) -> None:
++    assert _request_metadata_sinks(ast.parse(_REQUEST_SINK_SHAPES[shape])), shape
++
++
++@pytest.mark.parametrize("shape", sorted(_REQUEST_SAFE_SHAPES))
++def test_the_request_metadata_check_passes_decisions(shape: str) -> None:
++    assert not _request_metadata_sinks(ast.parse(_REQUEST_SAFE_SHAPES[shape])), shape
++
++
++def test_every_reviewed_request_callee_is_used() -> None:
++    """No reviewed classifier or propagator is a dead entry."""
++    from pathlib import Path
++
++    text = (
++        Path(__file__).resolve().parents[1] / "src" / "pmcp" / "transport" / "http.py"
++    ).read_text()
++    unused = [
++        name
++        for name in [*_REQUEST_CLASSIFIERS, *_REQUEST_PROPAGATORS]
++        if name.split(".")[-1] + "(" not in text
++        and name not in ("bool", "len", "isinstance", "str", "dict")
++    ]
++    assert not unused, unused
 ````
 
 ### Patch — `tests/test_log_record_scrubber.py`
@@ -15553,7 +16000,7 @@ print(f"{out}: {j - i - 1} lines")
 ````diff
 --- /dev/null
 +++ b/tests/test_parse_error_echo.py
-@@ -0,0 +1,3075 @@
+@@ -0,0 +1,3279 @@
 +"""A parse error never echoes the structured text it rejected
 +(Consiliency/pmcp#297; rev 6, reclassified by origin in rev 7).
 +
@@ -18629,6 +19076,210 @@ print(f"{out}: {j - i - 1} lines")
 +        and value.__module__ == name
 +    }
 +    assert names == sdk, sorted(names ^ sdk)
++
++
++# --- masked log records keep value-free arguments only (rev 30) --------------
++
++
++def test_the_value_free_argument_allowlist_is_exact() -> None:
++    """A masked record keeps an argument only if its exact type is one of
++    these, or it is a member of pmcp's, `mcp_types`' or the SDK's own enum
++    (rev 30, round-28 codex F001)."""
++    from pmcp.sdk_rejections import VALUE_FREE_ARGUMENT_TYPES
++
++    assert VALUE_FREE_ARGUMENT_TYPES == frozenset({int, float, bool, type(None)})
++
++
++@pytest.mark.parametrize(
++    "logger_name",
++    [
++        "mcp.client.streamable_http",
++        "client",
++        "httpx",
++        "httpcore.http11",
++        "aiohttp.client",
++        "sse_starlette.sse",
++    ],
++)
++def test_a_masked_record_keeps_no_valued_argument(logger_name: str) -> None:
++    """Each masked logger family, with a URL object, bytes, a path, a nested
++    dict, a list, a set, an arbitrary object and an `extra=` field carrying
++    the sentinel: none of it survives; an int, a bool, `None` and an SDK
++    enum member do."""
++    import enum
++    import logging
++    from pathlib import PurePosixPath
++
++    import httpx
++
++    import pmcp  # noqa: F401 - installs the scrubbers
++
++    s = _GRID_S
++
++    class Carrier:
++        def __repr__(self) -> str:
++            return s
++
++        __str__ = __repr__
++
++    # An enum that is not pmcp's or the SDK's: its member's value is text.
++    Foreign = enum.Enum("Foreign", {"MEMBER": s})
++
++    records: list[logging.LogRecord] = []
++
++    class Capture(logging.Handler):
++        def emit(self, record: logging.LogRecord) -> None:
++            records.append(record)
++
++    from mcp_types import LoggingLevel  # an SDK Literal; an enum below
++
++    del LoggingLevel
++    sdk_enum = next(
++        (
++            value
++            for module_name in ("pmcp.types",)
++            for value in vars(__import__(module_name, fromlist=["x"])).values()
++            if isinstance(value, type) and issubclass(value, enum.Enum) and list(value)
++        ),
++        None,
++    )
++    logger = logging.getLogger(logger_name)
++    handler = Capture()
++    logger.addHandler(handler)
++    saved = logger.level
++    logger.setLevel(logging.DEBUG)
++    try:
++        logger.debug(
++            "a %s %s %s %s %s %s %s",
++            httpx.URL(f"https://h.example/{s}"),
++            s.encode(),
++            PurePosixPath("/", s),
++            {"outer": {"inner": s}},
++            [s],
++            {s},
++            Carrier(),
++            extra={"carried": s, "foreign": Foreign.MEMBER},
++        )
++        logger.debug("%(m)s %(e)s", {"m": {"k": [s]}, "e": Foreign.MEMBER})
++        logger.debug(
++            "kept %d %s %s %s", 7, True, None, list(sdk_enum)[0] if sdk_enum else None
++        )
++        logger.debug("%d", httpx.URL(s))  # a format the masked value fails
++    finally:
++        logger.removeHandler(handler)
++        logger.setLevel(saved)
++    assert len(records) == 4
++    texts = [_record_text(r) for r in records]
++    assert not any(s in t for t in texts), [t[:300] for t in texts]
++    if logger_name.split(".")[0] not in ("mcp", "client"):
++        # An `mcp.*` message that is not the SDK's own is masked whole
++        # (rev 26); elsewhere the value-free arguments stay readable.
++        assert "kept 7 True None" in records[2].getMessage(), records[2].getMessage()
++
++
++def _redirect_then_status_server(status: int, s: str) -> tuple[Any, int]:
++    """A server whose `/start*` paths redirect to `/<sentinel>`, which
++    answers ``status`` (rev 30)."""
++    import socket
++    import threading
++
++    listener = socket.socket()
++    listener.bind(("127.0.0.1", 0))
++    listener.listen(64)
++    port = listener.getsockname()[1]
++
++    def handle(conn: Any) -> None:
++        try:
++            line = conn.recv(65536).decode("latin-1").split("\r\n", 1)[0]
++            _GRID_REQUESTS.append(line.encode())
++            if " /start" in line:
++                conn.sendall(
++                    (
++                        f"HTTP/1.1 307 Temporary Redirect\r\nLocation: "
++                        f"http://127.0.0.1:{port}/{s}\r\nContent-Length: 0\r\n"
++                        "Connection: close\r\n\r\n"
++                    ).encode()
++                )
++            else:
++                conn.sendall(
++                    f"HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\n"
++                    "Connection: close\r\n\r\n".encode()
++                )
++        except OSError:
++            pass
++        finally:
++            conn.close()
++
++    def loop() -> None:
++        while True:
++            try:
++                conn, _ = listener.accept()
++            except OSError:
++                return
++            threading.Thread(target=handle, args=(conn,), daemon=True).start()
++
++    threading.Thread(target=loop, daemon=True).start()
++    return listener, port
++
++
++@pytest.mark.parametrize("status", [404, 500, 502])
++@pytest.mark.parametrize(
++    "client", ["httpx", "httpx2", "aiohttp", "remote-http", "remote-sse"]
++)
++def test_a_followed_redirect_to_a_refusing_target_is_not_logged(
++    client: str,
++    status: int,
++    caplog: pytest.LogCaptureFixture,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A redirect to a reachable target, chosen by the downstream, that
++    answers 404, 500 or 502: the target's URL is in the clients' own request
++    logs. Through httpx, httpx2 and aiohttp directly, and pmcp's remote MCP
++    connect path over both transports: logs at DEBUG, connect errors,
++    `gateway.health`'s error, exception text and traceback (rev 30)."""
++    import pmcp  # noqa: F401 - installs the scrubbers
++    from pmcp.argument_errors import exception_text, safe_traceback_text
++
++    s = _GRID_S
++    for name in (
++        "HTTPS_PROXY",
++        "https_proxy",
++        "HTTP_PROXY",
++        "http_proxy",
++        "ALL_PROXY",
++        "all_proxy",
++    ):
++        monkeypatch.delenv(name, raising=False)
++    caplog.set_level(logging.DEBUG)
++    listener, port = _redirect_then_status_server(status, s)
++    before = len(_GRID_REQUESTS)
++    texts: dict[str, str] = {}
++    try:
++        if client.startswith("remote-"):
++            transport = client.split("-")[1]
++            _GRID_URL[0] = f"http://127.0.0.1:{port}/start-{transport}"
++            errors, last = asyncio.run(
++                asyncio.wait_for(_drive_remote(transport, port), 25)
++            )
++            texts["connect errors, gateway.health"] = json.dumps(
++                [errors, last], default=str
++            )
++        else:
++            url = f"http://127.0.0.1:{port}/start"
++            try:
++                _client_calls()[client](url)
++            except Exception as error:  # noqa: BLE001 -- inspected
++                texts["error"] = exception_text(error) + safe_traceback_text(error)
++    finally:
++        listener.close()
++    assert any(s.encode() in r for r in _GRID_REQUESTS[before:]), "never redirected"
++    texts["log"] = "\n".join(_record_text(r) for r in caplog.records)
++    leaked = {
++        k: v[:400]
++        for k, v in texts.items()
++        if any(f in v for f in _forbidden_any_case(s))
++    }
++    assert not leaked, leaked
 ````
 
 ### Patch — `tests/test_pkgid_panel_fixes.py`
@@ -19024,14 +19675,15 @@ print(f"{out}: {j - i - 1} lines")
 
 Run it as `PYTHONDONTWRITEBYTECODE=1 python mutants.py <worktree> <out-dir> [M4 ...]`; `NO_STATIC=1` deselects both sink checks, `DESELECT="<nodeid> ..."` deselects the named tests (rev 24), and `PYCMD="uv run --isolated --all-extras -p 3.10 python"` runs each mutant in a fresh environment (rev 25). Without the bytecode setting, a same-size first mutant written in the checkout's mtime second leaves a stale `.pyc` (see *Mutation evidence*).
 
-To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e`, `0dc22a4`, `40e2ba4`, `acf99e9`, `d73d6cb`, `7bcb209`, `221115a`, `5054a76`, `6b17d3d`, `ef7ad60`, `62ab87e`, `7900699` and `761ccb0`, in that order. Then apply this diff (rev 29: M193–M196 added).
+To rebuild it, take the block in `a449dd9`. Then `patch -p1` it with the `mutants.py` diffs of `48b7a89`, `8b45ddd`, `440d170`, `e6c248f`, `360fe3e`, `0dc22a4`, `40e2ba4`, `acf99e9`, `d73d6cb`, `7bcb209`, `221115a`, `5054a76`, `6b17d3d`, `ef7ad60`, `62ab87e`, `7900699`, `761ccb0` and `3778431`, in that order. Then apply this diff (rev 30: M197–M201 added).
 
 ````diff
 --- a/mutants.py
 +++ b/mutants.py
-@@ -189,0 +190,4 @@
-+ ("M193 the entry log carries the Accept header's text", W, [('            _accept_class(request.headers.get("accept", "")),\n', '            request.headers.get("accept", ""),\n')]),
-+ ("M194 the entry log carries a session id's prefix", W, [('            "present" if request.headers.get("mcp-session-id") else "absent",\n', '            (request.headers.get("mcp-session-id") or "")[:8] or "absent",\n')]),
-+ ("M195 an unknown header name logged as sent", W, [('        name if name in _KNOWN_HEADER_NAMES else "other"\n', '        name\n')]),
-+ ("M196 the rate-limit log names the client address", W, [('                logger.debug("handle_mcp [%s]: 429 rate limited", request_id)\n', '                logger.debug("handle_mcp [%s]: 429 rate limited ip=%s", request_id, client_ip)\n')]),
+@@ -193,0 +194,5 @@
++ ("M197 only text and bytes masked (rev 29's type exclusion)", "src/pmcp/sdk_rejections.py", [("    return value if _value_free_argument(value) else _TEXT\n", "    return _TEXT if isinstance(value, (str, bytes, bytearray, memoryview)) else value\n")]),
++ ("M198 extra= fields of a masked logger kept", A, [("                if is_sdk_logger(record.name):\n                    mask_extras(record)\n", "                if is_sdk_logger(record.name):\n                    pass\n")]),
++ ("M199 any enum's member kept", "src/pmcp/sdk_rejections.py", [('    return isinstance(value, enum.Enum) and (\n        str(getattr(kind, "__module__", "")).split(".")[0] in _ENUM_PACKAGES\n    )\n', "    return isinstance(value, enum.Enum)\n")]),
++ ("M200 a masked argument a format rejects left in place", "src/pmcp/sdk_rejections.py", [("        except Exception:  # noqa: BLE001 -- a masked argument a format rejects\n            record.msg, record.args = _PLACEHOLDER, None\n            return\n", "        except Exception:  # noqa: BLE001 -- a masked argument a format rejects\n            pass\n")]),
++ ("M201 the challenge builder takes a request value again", W, [('                logger.debug("handle_mcp [%s]: 401 unauthorized", request_id)\n                return _reject(\n                    401,\n                    AuthMessage.UNAUTHORIZED,\n                    headers=_auth_headers(for_request=True),\n', '                logger.debug("handle_mcp [%s]: 401 unauthorized", request_id)\n                return _reject(\n                    401,\n                    AuthMessage.UNAUTHORIZED,\n                    headers=_auth_headers(for_request=request.headers.get("authorization", "")),\n')]),
 ````
