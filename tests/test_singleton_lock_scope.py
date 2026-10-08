@@ -1402,3 +1402,30 @@ def test_an_explicit_lock_dir_that_is_a_link_is_refused(
     (home.parent / "linked").symlink_to(state, target_is_directory=True)
     assert identity.acquire_singleton_lock(home.parent / "linked") is False
     assert list(state.iterdir()) == []
+
+
+@pytest.mark.parametrize("shape", ["two links", "fifo"])
+def test_windows_refuses_a_handle_before_it_becomes_a_descriptor(
+    shape: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Windows open judges the HANDLE (link count, file type) and closes
+    it; nothing that is not a plain disk file is handed to the C runtime."""
+    from pmcp import atomic_write as w
+
+    kernel32 = _windows_layer(monkeypatch)
+    converted: list[int] = []
+    layer = w._WINDOWS_FILES
+    real_convert = layer.open_osfhandle
+    layer.open_osfhandle = lambda handle, flags: converted.append(
+        handle
+    ) or real_convert(handle, flags)
+    lock = tmp_path / "gateway.lock"
+    if shape == "two links":
+        lock.write_bytes(b"shared\n")
+        os.link(lock, tmp_path / "other-name")
+    else:
+        os.mkfifo(lock)
+    with pytest.raises(w.PlainFileRefused):
+        w._open_windows(layer, str(lock), "gateway.lock", write=True, create=True)
+    assert converted == []
+    assert kernel32.kinds == {}  # the handle was closed
