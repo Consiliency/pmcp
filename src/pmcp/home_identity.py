@@ -40,6 +40,7 @@ from __future__ import annotations
 import errno as _errno
 import os
 import os as _os_module  # the real module: its environ keys the spelling memo
+import re
 import stat
 import sys as _sys
 from collections import deque
@@ -175,9 +176,29 @@ def _signature(path: str, *, follow: bool) -> tuple[object, ...]:
     return (status.st_dev, status.st_ino, status.st_mode, tag)
 
 
+#: The reparse-tag bit that marks a NAME SURROGATE -- a symlink, a junction,
+#: a volume mount point: an entry that names another. Other tagged entries
+#: (cloud-file placeholders, dedup, container layers) are ordinary entries.
+_NAME_SURROGATE = 0x20000000
+
+#: A volume mount point's text: the volume itself, not a path to splice.
+_VOLUME_TARGET = re.compile(r"\\\\\?\\Volume\{[0-9A-Fa-f-]+\}\\?")
+
+
+def _windows() -> bool:
+    """Is the path module in use Windows'? THE one switch for every Windows
+    rule of the walk -- reparse points, NT-namespace link text, volume mount
+    points -- so none of them ever applies to a POSIX path, where those
+    characters are only characters (Consiliency/pmcp#372 round 29)."""
+    return os.path.sep == "\\"
+
+
 def _is_redirect(seen: tuple[object, ...]) -> bool:
-    """A symlink, or any reparse point (a junction is a directory by mode)."""
-    return stat.S_ISLNK(cast(int, seen[2])) or bool(seen[3])
+    """A symlink; on Windows also a name-surrogate reparse point (a junction
+    or a volume mount point is a directory by mode)."""
+    if stat.S_ISLNK(cast(int, seen[2])):
+        return True
+    return _windows() and bool(cast(int, seen[3]) & _NAME_SURROGATE)
 
 
 def _directory_signature(directory: str) -> object:
@@ -302,11 +323,21 @@ def _walk(spelled: str, reads: list[_Read]) -> tuple[str, list[str]] | None:
             target = _link_text(candidate)
             if links > _MAX_LINKS or not isinstance(target, str):
                 return None
-            if target.startswith("\\\\?\\") and not target.startswith("\\\\?\\UNC\\"):
-                # A junction's text names its target in the NT namespace.
-                target = target[4:]
             reads.append(("k", candidate, target))
             holders.append(current)
+            if _windows() and _VOLUME_TARGET.fullmatch(target):
+                # A volume mounted at a folder: a filesystem boundary, not a
+                # path to splice. Its holder is judged like any link's; the
+                # walk goes on into the folder itself.
+                current = candidate
+                continue
+            if (
+                _windows()
+                and target.startswith("\\\\?\\")
+                and not target.startswith("\\\\?\\UNC\\")
+            ):
+                # A junction's text names its target in the NT namespace.
+                target = target[4:]
             if os.path.isabs(target):
                 current = _root_of(target)
                 target = target[len(current) :]

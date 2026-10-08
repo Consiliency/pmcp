@@ -3962,14 +3962,25 @@ def test_the_walk_and_the_system_must_agree_on_where_home_lands(
 # --------------------------------------------------------------------------- #
 
 
-def _windows_seam(base: Path, junctions: set[Path], unreadable: set[Path] = set()):  # type: ignore[no-untyped-def]  # noqa: B006
+def _windows_seam(  # type: ignore[no-untyped-def]
+    base: Path,
+    junctions: set[Path],
+    unreadable: set[Path] = set(),  # noqa: B006
+    tags: dict[Path, int] | None = None,
+    texts: dict[Path, str] | None = None,
+):
     """``os`` for home_identity on ntpath over the real tree under ``base``:
     ``C:\\`` is ``base``; each path in ``junctions`` is a real symlink that
-    ``lstat`` reports as a directory with a mount-point reparse tag."""
+    ``lstat`` reports as a directory with a mount-point reparse tag. ``tags``
+    gives a real directory a reparse tag; ``texts`` gives an entry the link
+    text ``readlink`` returns (a volume mount point's ``\\\\?\\Volume{..}\\``)."""
     import ntpath
     import stat as stat_module
     from pathlib import PureWindowsPath
     from types import SimpleNamespace
+
+    tags = tags or {}
+    texts = texts or {}
 
     def local(path: str) -> Path:
         return base.joinpath(*PureWindowsPath(path).parts[1:])
@@ -3978,21 +3989,24 @@ def _windows_seam(base: Path, junctions: set[Path], unreadable: set[Path] = set(
         return str(PureWindowsPath("C:/") / path.relative_to(base))
 
     def readlink(path: str) -> str:
-        if local(path) in unreadable:
+        entry = local(path)
+        if entry in unreadable:
             raise PermissionError(13, "Permission denied")
-        target = Path(os.readlink(local(path)))
+        if entry in texts:
+            return texts[entry]
+        target = Path(os.readlink(entry))
         return windows(target) if target.is_absolute() else str(PureWindowsPath(target))
 
     def lstat(path: str) -> Any:
         entry = local(path)
         seen = os.lstat(entry)
-        if entry in junctions:
+        if entry in junctions or entry in tags:
             return SimpleNamespace(
                 st_dev=seen.st_dev,
                 st_ino=seen.st_ino,
                 st_mode=stat_module.S_IFDIR | 0o755,
                 st_file_attributes=0x400,
-                st_reparse_tag=0xA0000003,
+                st_reparse_tag=tags.get(entry, 0xA0000003),
             )
         return seen
 
@@ -4235,3 +4249,211 @@ def test_claude_r27_n1_a_leading_double_slash_home_is_accepted(
     home_identity.forget_home_verdicts()
     assert home_identity.home_is_operators() is True
     assert home_identity.examinable_home() == home
+
+
+# --------------------------------------------------------------------------- #
+# Board round 28: codex F001 -- the walk stripped `\\?\` from a link target on
+# POSIX, where it is four ordinary characters, so it walked a different path
+# from the kernel. Every Windows rule is now behind one switch (the path
+# module in use). claude N-1: a volume mounted at a folder is a boundary, not
+# a relative path. claude N-2: only name-surrogate reparse tags redirect.
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_r28_f001_posix_nt_prefix_cannot_hide_a_checkout_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+    import json
+
+    from pmcp import home_identity, trust_store
+
+    if os.name != "posix":
+        pytest.skip("POSIX link text")
+    base = tmp_path.resolve()
+    checkout = base / "\\\\?\\checkout"
+    (checkout / ".git").mkdir(parents=True)
+    (checkout / "home").symlink_to(".", target_is_directory=True)
+    decoy = base / "checkout"
+    decoy.mkdir()
+    (decoy / "home").symlink_to(checkout, target_is_directory=True)
+    alias = base / "operator-home"
+    alias.symlink_to(checkout.name + "/home", target_is_directory=True)
+    project = checkout / "app"
+    project.mkdir()
+    config = project / ".mcp.json"
+    content = b'{"mcpServers":{"unapproved":{"command":"echo"}}}'
+    config.write_bytes(content)
+    store = checkout / ".config" / "pmcp"
+    store.mkdir(parents=True)
+    (store / "trust.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "records": [
+                    {
+                        "absolute_path": str(config),
+                        "content_sha256": hashlib.sha256(content).hexdigest(),
+                        "scope": "user",
+                        "decision": "approved",
+                        "recorded_at": "2026-10-07T00:00:00+00:00",
+                    }
+                ],
+            }
+        )
+    )
+    launch = base / "launch"
+    launch.mkdir()
+    status = launch.stat()
+    original_marker = home_identity.has_checkout_marker
+    ambient = set(base.parents)
+    monkeypatch.setattr(
+        home_identity,
+        "has_checkout_marker",
+        lambda path: False if Path(path) in ambient else original_marker(path),
+    )
+    monkeypatch.setattr(
+        trust_store, "_LAUNCH_DIRECTORY", (launch, (status.st_dev, status.st_ino))
+    )
+    monkeypatch.setattr(trust_store, "_active_project_root", None)
+    monkeypatch.setenv("HOME", str(alias))
+    home_identity.forget_home_verdicts()
+    assert alias.resolve() == checkout
+    assert home_identity.has_checkout_marker(checkout)
+    assert not trust_store.is_approved(config, content, project_root=project), (
+        "A POSIX symlink target was rewritten, admitting a planted approval"
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "\\\\?\\x",
+        "\\\\server\\share",
+        "C:",
+        "C:\\Users",
+        "a\\b",
+        "\\\\?\\UNC\\s\\x",
+        "Volume{1}",
+    ],
+)
+@pytest.mark.parametrize("held", ["outside", "in-a-checkout"])
+@pytest.mark.parametrize("leading", [False, True], ids=["inner", "leading"])
+def test_windows_syntax_in_a_posix_link_is_only_characters(
+    name: str,
+    held: str,
+    leading: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A POSIX link whose text looks like Windows syntax names an entry with
+    exactly those characters: the walk follows it as the kernel does, and a
+    checkout holding the target directory is still found."""
+    from pmcp import home_identity
+
+    if os.name != "posix":
+        pytest.skip("POSIX link text")
+    base = tmp_path.resolve()
+    (base / "repo" / ".git").mkdir(parents=True)
+    parent = base / "out" if held == "outside" else base / "repo"
+    parent.mkdir(exist_ok=True)
+    (parent / name / "home").mkdir(parents=True)
+    if leading:  # the link text BEGINS with the Windows-looking name
+        alias = base / "out" / "alias"
+        (base / "out").mkdir(exist_ok=True)
+        if parent != base / "out":
+            alias = parent / "alias"
+        alias.symlink_to(f"{name}/home", target_is_directory=True)
+    else:
+        alias = base / "alias"
+        alias.symlink_to(f"{parent.name}/{name}/home", target_is_directory=True)
+    monkeypatch.setenv("HOME", str(alias))
+    home_identity.forget_home_verdicts()
+    real = os.path.realpath(alias)
+    assert real == str(parent / name / "home")
+    accepted = held == "outside"
+    assert home_identity.home_is_operators() is accepted
+    assert home_identity.home_is_operators() is accepted  # cached
+    if accepted:
+        assert home_identity.examinable_home() == Path(real)
+
+
+_VOLUME = "\\\\?\\Volume{3f2504e0-4f89-11d3-9a0c-0305e82c3301}\\"
+
+
+@pytest.mark.parametrize(
+    ("shape", "operators"),
+    [
+        ("volume-mounted-at-the-profiles-folder", True),
+        ("volume-mounted-at-a-folder-in-a-checkout", False),
+        ("cloud-placeholder-home-folder", True),
+        ("dedup-tagged-parent-folder", True),
+        ("surrogate-tag-with-unreadable-text", False),
+        ("volume-text-on-a-non-surrogate-tag", True),
+    ],
+)
+def test_windows_reparse_points_by_kind(
+    shape: str, operators: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity
+
+    base = tmp_path.resolve()
+    repo = base / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (base / "Users" / "me").mkdir(parents=True)
+    tags: dict[Path, int] = {}
+    texts: dict[Path, str] = {}
+    unreadable: set[Path] = set()
+    home = base / "Users" / "me"
+    if shape == "volume-mounted-at-the-profiles-folder":
+        tags[base / "Users"] = 0xA0000003
+        texts[base / "Users"] = _VOLUME
+    elif shape == "volume-mounted-at-a-folder-in-a-checkout":
+        (repo / "mnt" / "me").mkdir(parents=True)
+        tags[repo / "mnt"] = 0xA0000003
+        texts[repo / "mnt"] = _VOLUME
+        home = repo / "mnt" / "me"
+    elif shape == "cloud-placeholder-home-folder":
+        tags[home] = 0x9000601A  # IO_REPARSE_TAG_CLOUD_6: not a surrogate
+    elif shape == "dedup-tagged-parent-folder":
+        tags[base / "Users"] = 0x80000013  # IO_REPARSE_TAG_DEDUP
+    elif shape == "surrogate-tag-with-unreadable-text":
+        tags[base / "Users"] = 0xA0000003
+        unreadable = {base / "Users"}
+    else:  # text a surrogate would carry, on an entry that is not one
+        tags[base / "Users"] = 0x80000013
+        texts[base / "Users"] = _VOLUME
+    seam, windows = _windows_seam(base, set(), unreadable, tags, texts)
+    monkeypatch.setattr(home_identity, "os", seam)
+    monkeypatch.setattr(home_identity, "_home_spelling", lambda: windows(home))
+    home_identity.forget_home_verdicts()
+    assert home_identity.home_is_operators() is operators
+    assert home_identity.home_is_operators() is operators  # cached
+
+
+def test_a_reparse_tag_never_redirects_on_posix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even a stat that reported a Windows tag (a FUSE or SMB export, a
+    seam) would not make a POSIX directory a link: no Windows rule applies
+    to a POSIX path."""
+    from types import SimpleNamespace
+
+    from pmcp import home_identity
+
+    base = tmp_path.resolve()
+    (base / "users" / "me").mkdir(parents=True)
+    real_lstat = os.lstat
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        seen = real_lstat(path, *args, **kwargs)
+        if os.fspath(path) == str(base / "users"):
+            fields = {n: getattr(seen, n) for n in dir(seen) if n.startswith("st_")}
+            fields["st_reparse_tag"] = 0xA0000003
+            return SimpleNamespace(**fields)
+        return seen
+
+    monkeypatch.setattr(home_identity.os, "lstat", lstat)
+    monkeypatch.setenv("HOME", str(base / "users" / "me"))
+    home_identity.forget_home_verdicts()
+    assert home_identity.home_is_operators() is True
