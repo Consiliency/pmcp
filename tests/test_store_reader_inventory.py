@@ -52,6 +52,7 @@ reads:
 from __future__ import annotations
 
 import ast
+import functools
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -221,7 +222,7 @@ def inventory(sources: dict[str, str]) -> dict[tuple[str, str], FunctionFacts]:
     result: dict[tuple[str, str], FunctionFacts] = {}
     for module, source in sources.items():
         walker = _Walker()
-        walker.visit(ast.parse(source))
+        walker.visit(_parse(source))
         for function, facts in walker.facts.items():
             # Methods: the class is part of the stack; keep "Class.method".
             result[(module, function)] = facts
@@ -253,11 +254,25 @@ def bypasses(inv: dict[tuple[str, str], FunctionFacts]) -> list[str]:
     return found
 
 
-def _src_sources() -> dict[str, str]:
-    return {
-        _module_name(path): path.read_text(encoding="utf-8")
+@functools.lru_cache(maxsize=None)
+def _parse(source: str) -> ast.Module:
+    """``ast.parse``, once per distinct source per process: the inventories
+    walk every module of ``src`` many times, and no walker mutates a tree
+    (Consiliency/pmcp#372: suite time)."""
+    return ast.parse(source)
+
+
+@functools.lru_cache(maxsize=1)
+def _src_source_items() -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (_module_name(path), path.read_text(encoding="utf-8"))
         for path in sorted(SRC.rglob("*.py"))
-    }
+    )
+
+
+def _src_sources() -> dict[str, str]:
+    # A fresh dict each call: callers may edit their copy.
+    return dict(_src_source_items())
 
 
 # --------------------------------------------------------------------------- #
@@ -418,7 +433,7 @@ def _env_reading_helpers(sources: dict[str, str]) -> set[str]:
     """Functions that read the environment by the name a PARAMETER holds."""
     helpers: set[str] = set()
     for source in sources.values():
-        for fn in ast.walk(ast.parse(source)):
+        for fn in ast.walk(_parse(source)):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             params = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
@@ -448,7 +463,7 @@ def env_reads(sources: dict[str, str]) -> dict[str, set[str]]:
     reads: dict[str, set[str]] = defaultdict(set)
     helpers = _env_reading_helpers(sources)
     for module, source in sources.items():
-        tree = ast.parse(source)
+        tree = _parse(source)
         consts: dict[str, str] = {}
         for stmt in tree.body:
             targets = (
@@ -548,7 +563,7 @@ def test_every_provenance_gated_variable_is_gated_where_it_is_read() -> None:
     reads = env_reads(sources)
     gate_calls: set[str] = set()
     for module, source in sources.items():
-        for node in ast.walk(ast.parse(source)):
+        for node in ast.walk(_parse(source)):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 names = {
                     n.func.id
@@ -716,7 +731,7 @@ def spawn_sites(sources: dict[str, str]) -> list[tuple[str, str, bool]]:
     """
     sites: list[tuple[str, str, bool]] = []
     for module, source in sources.items():
-        tree = ast.parse(source)
+        tree = _parse(source)
         aliases = _spawn_aliases(tree)
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -815,7 +830,7 @@ def dynamic_environ_reads(sources: dict[str, str]) -> set[tuple[str, str]]:
     for module, source in sources.items():
         if module == "pmcp.env_store":
             continue
-        tree = ast.parse(source)
+        tree = _parse(source)
         for fn in tree.body:
             targets = (
                 [fn]
@@ -943,7 +958,7 @@ def _outermost_functions(tree: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunct
 def credential_value_bypasses(sources: dict[str, str]) -> list[str]:
     found: list[str] = []
     for module, source in sources.items():
-        tree = ast.parse(source)
+        tree = _parse(source)
         for fn in _outermost_functions(tree):
             bound: set[str] = set()
             for node in ast.walk(fn):
@@ -1002,7 +1017,7 @@ def test_only_credential_value_reads_a_credential() -> None:
 
 
 def test_the_map_touchers_all_exist() -> None:
-    tree = ast.parse(_src_sources()["pmcp.env_store"])
+    tree = _parse(_src_sources()["pmcp.env_store"])
     names = {f.name for f in _outermost_functions(tree)}
     assert set(MAP_TOUCHERS) <= names
 
@@ -1072,7 +1087,7 @@ def _writer_scopes(call: ast.Call) -> set[str]:
 def unchecked_store_copies(sources: dict[str, str]) -> list[str]:
     found: list[str] = []
     for module, source in sources.items():
-        for fn in _outermost_functions(ast.parse(source)):
+        for fn in _outermost_functions(_parse(source)):
             calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
             names = {getattr(c.func, "id", getattr(c.func, "attr", "")) for c in calls}
             read_scopes = {
@@ -1193,7 +1208,7 @@ def _passed(call: ast.Call, gate: tuple[str, int | None]) -> ast.AST | None:
 def _module_trees(sources: dict[str, str]) -> list[tuple[str, ast.AST, dict[str, str]]]:
     trees = []
     for module, source in sources.items():
-        tree = ast.parse(source)
+        tree = _parse(source)
         aliases = {
             alias.asname or alias.name: alias.name
             for node in ast.walk(tree)
@@ -1371,7 +1386,7 @@ def cwd_readers(sources: dict[str, str]) -> set[tuple[str, str]]:
     """``(module, function)`` of every function that reads the working directory."""
     found: set[tuple[str, str]] = set()
     for module, source in sources.items():
-        tree = ast.parse(source)
+        tree = _parse(source)
         for name, fn in _qualified_functions(tree):
             for node in ast.walk(fn):
                 if not isinstance(node, ast.Call):
@@ -1496,7 +1511,7 @@ def test_the_classification_scan_sees_each_shape() -> None:
 
 
 def _function(module: str, name: str) -> ast.FunctionDef:
-    tree = ast.parse(_src_sources()[module])
+    tree = _parse(_src_sources()[module])
     return next(
         node
         for node in tree.body
@@ -1776,7 +1791,7 @@ def _mentions_home(node: ast.AST, home_names: set[str]) -> bool:
 def home_spelling_comparisons(sources: dict[str, str]) -> list[str]:
     found: list[str] = []
     for module in HOME_SENSITIVE_MODULES:
-        tree = ast.parse(sources[module])
+        tree = _parse(sources[module])
         for name, fn in _qualified_functions(tree):
             home_names = {
                 t.id
@@ -1915,7 +1930,7 @@ def home_derivations(sources: dict[str, str]) -> list[str]:
     for module, source in sources.items():
         if module == "pmcp.home_identity":
             continue
-        tree = ast.parse(source)
+        tree = _parse(source)
         in_function: set[int] = set()
         for _name, fn in _qualified_functions(tree):
             in_function |= {id(n) for n in ast.walk(fn)}

@@ -28,7 +28,7 @@ import re
 import string
 import tracemalloc
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 import pytest
 
@@ -41,12 +41,34 @@ from tests import _redaction_grammar as G
 MAIN_PATTERNS = M.compiled_default_patterns()
 
 
+_POLICY: PolicyManager | None = None
+
+
+@pytest.fixture(autouse=True)
+def _one_policy_per_test() -> Iterator[None]:
+    """Each test builds its PolicyManager once, under its own HOME: building
+    one per input re-discovered the project and the operator's policy files
+    hundreds of thousands of times, and redaction only reads the compiled
+    patterns (Consiliency/pmcp#372: suite time)."""
+    global _POLICY
+    _POLICY = None
+    yield
+    _POLICY = None
+
+
+def _policy() -> PolicyManager:
+    global _POLICY
+    if _POLICY is None:
+        _POLICY = PolicyManager()
+    return _POLICY
+
+
 def _ours_e(text: str) -> str:
     return sanitize_auth_diagnostic(text, max_length=None)
 
 
 def _ours_p(text: str) -> str:
-    return PolicyManager().redact_secrets(text)
+    return _policy().redact_secrets(text)
 
 
 def _main_e(text: str) -> str:
@@ -58,7 +80,7 @@ def _main_p(text: str) -> str:
 
 
 def _ours_process(obj: object) -> object:
-    return PolicyManager().process_output(obj, redact=True, max_bytes=G.BIG)["result"]
+    return _policy().process_output(obj, redact=True, max_bytes=G.BIG)["result"]
 
 
 def _main_process(obj: object) -> object:
@@ -724,7 +746,7 @@ def _marker_problems(texts: list[str]) -> list[str]:
             again = (
                 A.redact_additive(out)
                 if label == "E"
-                else PolicyManager()._redact_additive(out)
+                else _policy()._redact_additive(out)
                 if label == "P"
                 else out
             )
