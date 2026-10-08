@@ -107,9 +107,11 @@ TAG_TRIGGERED_WORKFLOWS = {"release.yml", "docker.yml"}
 
 # Timeouts: a floor stops a job being throttled to death, a ceiling stops the
 # six-hour default being re-created by a large value. Both ends are load
-# bearing; see .consiliency/evidence/bypass-proofs-187.md.
+# bearing; see .consiliency/evidence/bypass-proofs-187.md. The ceiling was 30
+# until the test matrix job reached 29m42s; 45 is a stopgap while the suite is
+# parallelised (see Consiliency/pmcp#383).
 TIMEOUT_MIN = 10
-TIMEOUT_MAX = 30
+TIMEOUT_MAX = 45
 
 
 def get_on(doc: Any) -> Any:
