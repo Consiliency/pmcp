@@ -772,7 +772,28 @@ def test_the_last_served_slots_are_bounded(tmp_path: Path) -> None:
         path.write_text(f"version: '{i}'\nservers: {{}}\ncli_alternatives: {{}}\n")
         load_manifest(path)
     assert len(loader._last_served_keys) == loader._MANIFEST_CACHE_SLOTS
-    assert None in loader._last_served_keys  # the default stream is never evicted
+    # The overlaid stream is never evicted for an explicit path.
+    assert any(isinstance(k, tuple) for k in loader._last_served_keys)
+
+
+def test_two_project_roots_alternating_are_two_steady_states(
+    tmp_path: Path, builds: list[int]
+) -> None:
+    """A gateway's tools load for their bound root while other callers load
+    for the served one (Consiliency/pmcp#372): each root is its own stream,
+    so alternating them does not rebuild on every call."""
+    one, two = tmp_path / "one", tmp_path / "two"
+    for root in (one, two):
+        (root / ".git").mkdir(parents=True)
+        # Each root's own (unapproved) overlay: two different states.
+        (root / ".pmcp").mkdir()
+        (root / ".pmcp" / "manifest.yaml").write_text(
+            f"servers: {{{root.name}: {{}}}}\n"
+        )
+    for _ in range(3):
+        load_manifest(project_root=one)
+        load_manifest(project_root=two)
+    assert builds == [1, 1]
 
 
 # ---------------------------------------------------------------------------

@@ -35,10 +35,12 @@ from __future__ import annotations
 
 import errno as _errno
 import os
+import os as _os_module  # the real module: its environ keys the spelling memo
 import stat
 import sys as _sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 Identity = tuple[int, int]
 
@@ -79,10 +81,15 @@ def has_checkout_marker(directory: os.PathLike[str] | str) -> bool:
     return False
 
 
-def _marked_from(directory: str) -> str | None:
-    """The first checkout at ``directory`` or above it, physically, or ``None``."""
+def _marked_from(directory: str, reads: list[_Read] | None = None) -> str | None:
+    """The first checkout at ``directory`` or above it, physically, or ``None``.
+
+    With ``reads``, every directory examined is recorded with its signature
+    (see :func:`_judge`)."""
     current = directory
     while not _is_root(current):
+        if reads is not None:
+            reads.append(("d", current, _directory_signature(current)))
         if has_checkout_marker(current):
             return current
         current = os.path.dirname(current)
@@ -100,15 +107,35 @@ def _is_plain(spelled: str) -> bool:
     return not any(part in (".", "..") for part in parts)
 
 
+#: (memo key, spelling); see :func:`_home_spelling`.
+_SPELLING: tuple[tuple[object, ...], str] | None = None
+
+
 def _home_spelling() -> str:
     """HOME as spelled. pathlib drops ``.`` components, so the raw value
     ``expanduser`` reads (``HOME``; ``USERPROFILE`` on Windows; else the
-    passwd entry) is used when it is the one pathlib read."""
+    passwd entry) is used when it is the one pathlib read.
+
+    Memoized on the environment values pathlib reads (and the path modules in
+    use) while one of them is set; the passwd fallback is read every time."""
+    global _SPELLING
+    env = _os_module.environ
+    key = (
+        id(Path),
+        id(os),
+        env.get("HOME"),
+        env.get("USERPROFILE"),
+        env.get("HOMEDRIVE"),
+        env.get("HOMEPATH"),
+    )
+    memo = _SPELLING
+    if memo is not None and memo[0] == key:
+        return memo[1]
     home = os.fspath(Path.home())
     raw = os.path.expanduser("~")
-    if os.fspath(Path(raw)) == home:
-        return raw
-    return home
+    spelled = raw if os.fspath(Path(raw)) == home else home
+    _SPELLING = (key, spelled) if (key[2] or key[3]) else None
+    return spelled
 
 
 class _Verdict:
@@ -119,33 +146,114 @@ class _Verdict:
         self.checkout = checkout
 
 
-def _judge(spelled: str) -> _Verdict:
-    """Rules 1-3 for ``spelled``; ``real`` is ``None`` unless all pass."""
-    if not _is_plain(spelled):
-        return _Verdict(None)
+#: One thing a verdict read: ``(kind, path, what it saw)``.
+_Read = tuple[str, str, object]
+
+#: Verdicts by (spelling, path module, marker predicate) -> (reads, verdict).
+#: A hit is revalidated against every read before it is used (:func:`_judge`).
+_VERDICTS: dict[tuple[str, int, int], tuple[tuple[_Read, ...], _Verdict]] = {}
+_VERDICTS_MAX = 256
+
+
+def _signature(path: str, *, follow: bool) -> tuple[object, ...]:
+    """What a later read must see for a verdict built on this one to stand:
+    identity, type and change time (a directory's changes on every entry
+    created, removed or renamed in it; a replaced link is a new inode)."""
     try:
-        os.stat(spelled)
-    except OSError:
-        return _Verdict(None)
+        status = os.stat(path) if follow else os.lstat(path)
+    except OSError as exc:
+        return ("error", exc.errno)
+    return (status.st_dev, status.st_ino, status.st_mode, status.st_ctime_ns)
+
+
+def _directory_signature(directory: str) -> object:
+    """A directory's own entries, and those of the ``.pmcp`` directory a
+    ``.pmcp/manifest.yaml`` marker lives in (followed, as the kernel does)."""
+    return (
+        _signature(directory, follow=True),
+        _signature(os.path.join(directory, ".pmcp"), follow=True),
+    )
+
+
+def _still_seen(reads: tuple[_Read, ...]) -> bool:
+    for kind, path, seen in reads:
+        if kind == "l":
+            now: object = _signature(path, follow=False)
+        elif kind == "s":
+            now = _signature(path, follow=True)
+        elif kind == "r":
+            now = os.path.realpath(path)
+        else:
+            now = _directory_signature(path)
+        if now != seen:
+            return False
+    return True
+
+
+def forget_home_verdicts() -> None:
+    """Drop every cached verdict. Trust and approval decisions call this
+    first, so they always judge afresh."""
+    global _SPELLING
+    _VERDICTS.clear()
+    _SPELLING = None
+
+
+def _judge(spelled: str) -> _Verdict:
+    """Rules 1-3 for ``spelled``; ``real`` is ``None`` unless all pass.
+
+    Cached per process: a verdict is reused only while everything it read --
+    each prefix's ``lstat``, HOME's ``stat``, every ``realpath`` and every
+    directory examined for markers -- still reads the same. A spelling that
+    is not plain, or that the system cannot resolve, is judged every time.
+    """
+    key = (spelled, id(os), id(has_checkout_marker))
+    hit = _VERDICTS.get(key)
+    if hit is not None and _still_seen(hit[0]):
+        return hit[1]
+    reads: list[_Read] = []
+    verdict, cacheable = _judge_afresh(spelled, reads)
+    if cacheable:
+        if len(_VERDICTS) >= _VERDICTS_MAX:
+            _VERDICTS.clear()
+        _VERDICTS[key] = (tuple(reads), verdict)
+    else:
+        _VERDICTS.pop(key, None)
+    return verdict
+
+
+def _judge_afresh(spelled: str, reads: list[_Read]) -> tuple[_Verdict, bool]:
+    if not _is_plain(spelled):
+        return _Verdict(None), False
+    stat_seen = _signature(spelled, follow=True)
+    if stat_seen[0] == "error":
+        return _Verdict(None), False
+    reads.append(("s", spelled, stat_seen))
     prefix = spelled
     while True:
-        try:
-            status = os.lstat(prefix)
-        except OSError:
-            return _Verdict(None)
-        if stat.S_ISLNK(status.st_mode):
-            holder = _marked_from(os.path.realpath(os.path.dirname(prefix)))
+        seen = _signature(prefix, follow=False)
+        if seen[0] == "error":
+            return _Verdict(None), False
+        reads.append(("l", prefix, seen))
+        if stat.S_ISLNK(cast(int, seen[2])):
+            container = os.path.dirname(prefix)
+            physical = os.path.realpath(container)
+            reads.append(("r", container, physical))
+            holder = _marked_from(physical, reads)
             if holder is not None:
-                return _Verdict(None, holder)
+                return _Verdict(None, holder), True
         parent = os.path.dirname(prefix)
         if parent == prefix:
             break
         prefix = parent
     real = os.path.realpath(spelled)
-    holder = _marked_from(os.path.dirname(real))
+    if any(kind == "r" for kind, _path, _seen in reads):
+        # A link on the way: where it leads is read again on every reuse.
+        # With none, the unchanged non-link prefixes already fix ``real``.
+        reads.append(("r", spelled, real))
+    holder = _marked_from(os.path.dirname(real), reads)
     if holder is not None:
-        return _Verdict(None, holder)
-    return _Verdict(real)
+        return _Verdict(None, holder), True
+    return _Verdict(real), True
 
 
 def home_is_operators() -> bool:

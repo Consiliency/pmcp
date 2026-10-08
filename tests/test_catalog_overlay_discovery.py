@@ -155,15 +155,19 @@ def _one_manifest_parse() -> Any:
     from unittest.mock import patch as _patch
 
     real = loader.load_manifest
-    shared: dict[str, Any] = {}
+    shared: dict[Any, Any] = {}
+    fingerprints: dict[Any, bytes] = {}
 
     def load(*args: Any, **kwargs: Any) -> Any:
-        if args or kwargs:
+        # The tools bind their project root (Consiliency/pmcp#372) and ask
+        # for that root's manifest: shared per root, like the no-argument load.
+        if args or set(kwargs) - {"project_root"}:
             return real(*args, **kwargs)
-        if "manifest" not in shared:
-            shared["manifest"] = real()
-            shared["fingerprint"] = pickle.dumps(shared["manifest"])
-        return shared["manifest"]
+        root = kwargs.get("project_root")
+        if root not in shared:
+            shared[root] = real(**kwargs)
+            fingerprints[root] = pickle.dumps(shared[root])
+        return shared[root]
 
     with (
         _patch.object(loader, "load_manifest", load),
@@ -171,8 +175,8 @@ def _one_manifest_parse() -> Any:
         _patch("pmcp.cli_commands.secrets.load_manifest", load),
     ):
         yield
-    if "manifest" in shared:
-        assert pickle.dumps(shared["manifest"]) == shared["fingerprint"], (
+    for root, manifest in shared.items():
+        assert pickle.dumps(manifest) == fingerprints[root], (
             "a consumer mutated the manifest load_manifest() returned"
         )
 

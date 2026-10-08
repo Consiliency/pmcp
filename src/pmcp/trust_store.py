@@ -48,6 +48,7 @@ from pmcp.home_identity import (
     HomeInsideCheckoutError,
     checkout_controlling_home,
     enclosing_checkouts,
+    forget_home_verdicts,
     has_checkout_marker,
     is_operator_owned,
     home_path,
@@ -269,6 +270,8 @@ def _checkout_roots(also: tuple[Path, ...] = ()) -> tuple[Path, ...]:
     inside a checkout keeps working (its store lives in the operator's home,
     outside the checkout).
     """
+    # A trust decision never rests on a cached home verdict.
+    forget_home_verdicts()
     roots: list[Path] = []
 
     def _add(candidate: Path | None) -> None:
@@ -316,6 +319,8 @@ def trust_store_path(*, also: tuple[Path, ...] = ()) -> Path:
     # Home-scoped (Consiliency/pmcp#372 round 22): refused while a checkout
     # controls the home directory, or while HOME is not a plain absolute path
     # the system resolves (round 24: fail closed).
+    # A trust decision never rests on a cached home verdict.
+    forget_home_verdicts()
     try:
         spelled = home_path(".config", "pmcp", "trust.json")
     except HomeInsideCheckoutError as exc:

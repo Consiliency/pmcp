@@ -1467,12 +1467,18 @@ def _project_scope_root(project_root: Path | None) -> Path | None:
 def _credential_value_for(root: Path | None) -> Callable[[str], str | None]:
     """``env_store.credential_value`` for project ``root`` (``None``: the served root).
 
-    Imported late (env_store imports this module).
+    Imported late (env_store imports this module). The root is resolved on
+    the first lookup and kept for the rest: one config build reads one
+    project, and resolving it per key re-discovered it for every server.
     """
-    from pmcp.env_store import credential_value
+    from pmcp.env_store import credential_value, resolve_project_root
+
+    resolved: list[Path] = []
 
     def lookup(key: str) -> str | None:
-        return credential_value(key, root=root)
+        if not resolved:
+            resolved.append(resolve_project_root(root))
+        return credential_value(key, root=resolved[0])
 
     return lookup
 

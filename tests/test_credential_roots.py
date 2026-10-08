@@ -20,7 +20,9 @@ import copy
 import itertools
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -3529,3 +3531,169 @@ def test_a_prefix_the_system_refuses_to_examine_refuses_home(
     monkeypatch.setattr(home_identity.os, "lstat", lstat)
     assert home_identity.home_is_operators() is False
     assert home_identity.optional_operator_home() is None
+
+
+# --------------------------------------------------------------------------- #
+# The home verdict is cached per process (suite and request time; see
+# Consiliency/pmcp#372). A cached verdict is reused only while everything it
+# read still reads the same; these are the changes that must invalidate it.
+# --------------------------------------------------------------------------- #
+
+
+def _accepted_then(
+    monkeypatch: pytest.MonkeyPatch, home: str, change: Callable[[], None]
+) -> bool:
+    from pmcp import home_identity
+
+    monkeypatch.setenv("HOME", home)
+    home_identity.forget_home_verdicts()
+    assert home_identity.home_is_operators() is True
+    assert home_identity.home_is_operators() is True  # served from the cache
+    change()
+    return home_identity.home_is_operators()
+
+
+def test_the_cached_verdict_follows_a_change_of_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = tmp_path.resolve()
+    (base / "plain").mkdir()
+    (base / "repo" / ".git").mkdir(parents=True)
+    (base / "repo" / "home").mkdir()
+    assert (
+        _accepted_then(
+            monkeypatch,
+            str(base / "plain"),
+            lambda: monkeypatch.setenv("HOME", str(base / "repo" / "home")),
+        )
+        is False
+    )
+
+
+def test_the_cached_verdict_follows_a_retargeted_prefix_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = tmp_path.resolve()
+    (base / "real").mkdir()
+    (base / "repo" / ".git").mkdir(parents=True)
+    (base / "repo" / "child").mkdir()
+    (base / "alias").symlink_to(base / "real", target_is_directory=True)
+
+    def retarget() -> None:
+        (base / "alias.new").symlink_to(
+            base / "repo" / "child", target_is_directory=True
+        )
+        os.replace(base / "alias.new", base / "alias")
+
+    assert _accepted_then(monkeypatch, str(base / "alias"), retarget) is False
+
+
+def test_the_cached_verdict_follows_a_link_inside_a_link_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HOME's own prefixes are unchanged; a link its target passes through is
+    retargeted into a checkout."""
+    base = tmp_path.resolve()
+    (base / "safe" / "home").mkdir(parents=True)
+    (base / "repo" / ".git").mkdir(parents=True)
+    (base / "repo" / "home").mkdir()
+    # The link lives in a directory no verdict examines for markers, so only
+    # reading again where HOME leads can notice it changed.
+    (base / "links").mkdir()
+    (base / "links" / "mid").symlink_to(base / "safe", target_is_directory=True)
+    (base / "alias").symlink_to(
+        base / "links" / "mid" / "home", target_is_directory=True
+    )
+
+    def retarget() -> None:
+        new = base / "links" / "mid.new"
+        new.symlink_to(base / "repo", target_is_directory=True)
+        os.replace(new, base / "links" / "mid")
+
+    assert _accepted_then(monkeypatch, str(base / "alias"), retarget) is False
+
+
+@pytest.mark.parametrize(
+    "marker", [".git", ".mcp.json", "package.json", "pyproject.toml", "pmcp-overlay"]
+)
+def test_the_cached_verdict_follows_a_marker_added_above_home(
+    marker: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = tmp_path.resolve()
+    (base / "x" / "home").mkdir(parents=True)
+    if marker == "pmcp-overlay":
+        # The .pmcp directory exists already: only its own entries change.
+        (base / "x" / ".pmcp").mkdir()
+
+        def add() -> None:
+            (base / "x" / ".pmcp" / "manifest.yaml").write_text("servers: {}\n")
+
+    else:
+
+        def add() -> None:
+            (base / "x" / marker).mkdir()
+
+    assert _accepted_then(monkeypatch, str(base / "x" / "home"), add) is False
+
+
+def test_the_cached_verdict_follows_a_home_that_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = tmp_path.resolve()
+    (base / "home").mkdir()
+    assert (
+        _accepted_then(monkeypatch, str(base / "home"), (base / "home").rmdir) is False
+    )
+
+
+def test_trust_decisions_never_use_a_cached_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even a cache that failed to notice a change cannot carry into a trust
+    decision: trust judges HOME afresh."""
+    from pmcp import home_identity, trust_store
+
+    base = tmp_path.resolve()
+    (base / "x" / "home").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(base / "x" / "home"))
+    assert home_identity.home_is_operators() is True
+    (base / "x" / ".git").mkdir()
+    # A cache that never invalidates:
+    monkeypatch.setattr(home_identity, "_still_seen", lambda reads: True)
+    assert home_identity.home_is_operators() is True  # stale, by construction
+    with pytest.raises(trust_store.TrustStoreError, match="lies inside"):
+        trust_store.trust_store_path()
+    # The residency roots, too, are judged afresh.
+    (base / "y" / "home").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(base / "y" / "home"))
+    assert home_identity.home_is_operators() is True
+    (base / "y" / ".git").mkdir()
+    assert home_identity.home_is_operators() is True  # stale, by construction
+    trust_store._checkout_roots()
+    assert home_identity.home_is_operators() is False  # judged afresh there
+
+
+def test_the_cached_verdict_rereads_where_a_link_leads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same directory reached at a new physical path (a bind mount: no
+    directory pmcp examined changes, HOME's identity is the same). Only
+    reading again where the link leads can notice; simulated at the seam."""
+    from pmcp import home_identity
+
+    base = tmp_path.resolve()
+    (base / "safe" / "home").mkdir(parents=True)
+    (base / "repo" / ".git").mkdir(parents=True)
+    (base / "repo" / "mount").mkdir()
+    (base / "alias").symlink_to(base / "safe" / "home", target_is_directory=True)
+    real_realpath = os.path.realpath
+
+    def bind_mounted() -> None:
+        def realpath(path: Any, *args: Any, **kwargs: Any) -> str:
+            if os.fspath(path) == str(base / "alias"):
+                return str(base / "repo" / "mount" / "home")
+            return real_realpath(path, *args, **kwargs)
+
+        monkeypatch.setattr(home_identity.os.path, "realpath", realpath)
+
+    assert _accepted_then(monkeypatch, str(base / "alias"), bind_mounted) is False

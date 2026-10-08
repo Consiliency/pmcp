@@ -191,12 +191,14 @@ def isolate_trust_store(
     # (Consiliency/pmcp#372 round 18).
     trust_store.reset_launch_directory()
     # The home refusal is reported once per process; each test sees its own.
-    from pmcp.home_identity import reset_home_warning
+    from pmcp.home_identity import forget_home_verdicts, reset_home_warning
 
     reset_home_warning()
+    forget_home_verdicts()
     yield fake_home
     trust_store.reset_launch_directory()
     reset_home_warning()
+    forget_home_verdicts()
 
 
 @pytest.fixture(autouse=True)

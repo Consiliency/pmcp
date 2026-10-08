@@ -1866,7 +1866,7 @@ _manifest_cache_lock = threading.RLock()
 # again with the same bytes -- warns exactly as main does. Separate slots keep
 # an explicit-path caller (or two) from turning every load into a transition.
 # Bounded like the cache: the oldest explicit-path slot goes first.
-_last_served_keys: dict[str | None, tuple[Any, ...]] = {}
+_last_served_keys: dict[str | tuple[str, str], tuple[Any, ...]] = {}
 # Whether this process has already said, at WARNING, that the cache could not
 # store or read back a result for a reason other than recursion depth.
 _cache_failure_reported = False
@@ -2053,15 +2053,25 @@ def load_manifest(
         tuple(notices),
         _on_windows(),
     )
+    # One slot per caller stream: the overlaid load for each project root,
+    # and each explicit path (keyed as given). Two different roots or paths
+    # alternating are two steady states, not a transition on every call (a
+    # gateway's tools load for their bound root while other callers load for
+    # the served one; Consiliency/pmcp#372).
+    slot: str | tuple[str, str] = str(base_path)
+    if apply_overlays:
+        from pmcp.env_store import resolve_project_root
+
+        slot = ("overlays", os.fspath(resolve_project_root(project_root)))
     with _manifest_cache_lock:
-        # One slot per caller stream: the default load, and each explicit path
-        # (keyed as given). Two different explicit paths alternating are two
-        # steady states, not a transition on every call.
-        slot = None if apply_overlays else str(base_path)
         steady = key == _last_served_keys.get(slot)
         _last_served_keys[slot] = key
         while len(_last_served_keys) > _MANIFEST_CACHE_SLOTS:
-            oldest = next(k for k in _last_served_keys if k is not None)
+            # Explicit paths go first; an overlaid stream only when none is left.
+            oldest = next(
+                (k for k in _last_served_keys if isinstance(k, str) and k != slot),
+                None,
+            ) or next(k for k in _last_served_keys if k != slot)
             del _last_served_keys[oldest]
         blob = _manifest_cache.get(key)
         if blob is not None and steady:
