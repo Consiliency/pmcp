@@ -225,6 +225,12 @@ to do, how to verify it, and how to roll back to 2.7.3.
   runs out), pmcp now SIGKILLs the server's whole process group instead of waiting
   out its SIGTERM grace, so a server that needs a graceful flush on exit can lose
   it in that case. An uncancelled teardown still sends SIGTERM first. *Fixed*
+- **Stop every running gateway before upgrading.** 3.0 never removes the singleton lock
+  file `~/.pmcp/gateway.lock` (a lock dies with its gateway), and refuses a lock path that
+  is a link or not a plain file. 2.7.3 removes the file when it shuts down, so while an
+  older gateway still runs, its shutdown can delete a 3.0 gateway's live lock and a third
+  start can then run beside it. Until every running pmcp is upgraded the one-gateway
+  guarantee does not hold; stop them all first, and do the same before rolling back.
 - **Known issues in 3.0.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
   but the gateway reads `.mcp-gateway`; until that is fixed, run
   `pmcp refresh --cache-dir .mcp-gateway`

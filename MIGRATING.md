@@ -45,6 +45,7 @@ log is `~/.pmcp/logs/gateway.log`.
   [symlinked `.mcp.json`](#a-symlinked-mcpjson-is-no-longer-edited) ·
   [`NaN`](#nan-from-httpsse-servers) ·
   [error text](#error-text-names-the-real-failure) ·
+  [stop gateways first](#stop-every-running-gateway-before-upgrading) ·
   [known issues](#known-issues-in-300)
 - [Other things you may notice](#other-things-you-may-notice)
 - [Rolling back to 2.7.3](#rolling-back-to-273)
@@ -1372,6 +1373,39 @@ timeout longer than the gateway's 10-second shutdown budget.
 SIGTERM no longer outlives a cancelled disconnect or a timed-out shutdown
 (`ps` shows no leftover process group).
 
+### Stop every running gateway before upgrading
+
+**Am I affected?** You are if a pmcp gateway is running while you upgrade -- a
+system service, a client that started `pmcp` itself, or one left in a terminal:
+
+```bash
+pmcp doctor
+```
+
+`[WARN] lock: A gateway holds the singleton lock` means one is running.
+
+**What changed.** 3.0 never removes the singleton lock file `~/.pmcp/gateway.lock`:
+a lock is held only by a running gateway and dies with it, so a leftover file is
+harmless and never blocks a start. 3.0 also refuses a lock path that is a link, a
+fifo, a directory or a file with other names. 2.7.3 removed the file when it shut
+down. While a 2.7.3 gateway still runs beside a 3.0 one, its shutdown can delete
+the 3.0 gateway's live lock file, and a third start then creates a fresh file and
+runs as well -- two gateways at once. The guarantee holds again once every running
+pmcp is 3.0.
+
+**What to do.** Stop every running gateway -- the service, and any client that
+started its own -- upgrade, then start one:
+
+```bash
+systemctl --user stop pmcp
+pmcp upgrade
+systemctl --user start pmcp
+```
+
+**How to verify.** `pmcp doctor` shows `[WARN] lock: A gateway holds the singleton
+lock` for the one gateway you started, and a second `pmcp` started by hand exits
+saying another gateway instance is running.
+
 ### Known issues in 3.0.0
 
 - **`pmcp refresh` writes to the wrong cache directory.** By default it
@@ -1492,5 +1526,6 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
 | [`NaN` from HTTP/SSE servers](#nan-from-httpsse-servers) | Safe on 2.7.3: a lenient parser also reads the `null` 2.7.3 sends. |
 | [Error text names the real failure](#error-text-names-the-real-failure) | Reverse: 2.7.3 logs only `unhandled errors in a TaskGroup (1 sub-exception)`, without the cause,† so a matcher on `ConnectError` finds nothing. Match both. |
 | [A cancelled teardown kills stdio servers at once](#a-cancelled-teardown-kills-stdio-servers-at-once) | Safe on 2.7.3: an uncancelled `gateway.disconnect_server` and a longer stop timeout work the same. |
+| [Stop every running gateway before upgrading](#stop-every-running-gateway-before-upgrading) | Safe on 2.7.3: stop every running gateway before you downgrade too -- 2.7.3 removes the lock file at shutdown, so a mix of versions can briefly run two gateways. The leftover `~/.pmcp/gateway.lock` is harmless to it. |
 
 Prefer holding at `pmcp<3` for a short time over running 2.7.3 for long.

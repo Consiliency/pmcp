@@ -2057,10 +2057,6 @@ HOME_MEMO_EXEMPT = {
         "removed or otherwise acted on by name after acquisition "
         "(Consiliency/pmcp#372 round 32)"
     ),
-    ("pmcp.identity", "_LOCK_FD"): (
-        "the open lock file: a descriptor, never a path; release only unlocks "
-        "and closes it"
-    ),
 }
 
 

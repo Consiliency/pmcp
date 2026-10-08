@@ -248,7 +248,12 @@ class TestSingletonLockConstraints:
         assert 'home_path(".pmcp")' in source, (
             "Default lock directory should be ~/.pmcp"
         )
-        assert '"gateway.lock"' in source, "Lock file should be named 'gateway.lock'"
+        import pmcp.identity as identity_module
+
+        assert identity_module._LOCK_NAME == "gateway.lock", (
+            "Lock file should be named 'gateway.lock'"
+        )
+        assert "_LOCK_NAME" in source
 
     def test_server_uses_global_lock_by_default(self) -> None:
         """Verify GatewayServer uses global lock (None) by default, not cache_dir."""

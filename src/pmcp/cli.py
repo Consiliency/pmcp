@@ -2198,8 +2198,8 @@ async def run_doctor(args: argparse.Namespace) -> None:
     # The lock file persists between runs (Consiliency/pmcp#372 round 32): what
     # matters is whether a gateway HOLDS it, not whether it exists.
     lock_dir = optional_home_path(".pmcp")
-    held = singleton_lock_held(lock_dir) if lock_dir is not None else None
-    if held:
+    state = singleton_lock_held(lock_dir) if lock_dir is not None else "absent"
+    if state == "held":
         checks.append(
             (
                 "lock",
@@ -2208,7 +2208,17 @@ async def run_doctor(args: argparse.Namespace) -> None:
                 "local launch will not start. Use the running gateway, or stop it first.",
             )
         )
-    elif held is False:
+    elif state == "unusable":
+        checks.append(
+            (
+                "lock",
+                "warn",
+                "~/.pmcp/gateway.lock is not a plain regular file (a link, a fifo, a "
+                "directory or a file with other names); a gateway refuses it. Remove "
+                "it: rm ~/.pmcp/gateway.lock",
+            )
+        )
+    elif state == "free":
         checks.append(
             (
                 "lock",
