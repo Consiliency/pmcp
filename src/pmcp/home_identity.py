@@ -169,7 +169,15 @@ def _signature(path: str, *, follow: bool) -> tuple[object, ...]:
         status = os.stat(path) if follow else os.lstat(path)
     except OSError as exc:
         return ("error", exc.errno)
-    return (status.st_dev, status.st_ino, status.st_mode)
+    # A Windows reparse point (a junction, a mount point) is a redirect the
+    # mode does not show: its tag is part of what the entry is.
+    tag = getattr(status, "st_reparse_tag", 0) or 0
+    return (status.st_dev, status.st_ino, status.st_mode, tag)
+
+
+def _is_redirect(seen: tuple[object, ...]) -> bool:
+    """A symlink, or any reparse point (a junction is a directory by mode)."""
+    return stat.S_ISLNK(cast(int, seen[2])) or bool(seen[3])
 
 
 def _directory_signature(directory: str) -> object:
@@ -289,11 +297,14 @@ def _walk(spelled: str, reads: list[_Read]) -> tuple[str, list[str]] | None:
             return None
         reads.append(("l", candidate, seen))
         mode = cast(int, seen[2])
-        if stat.S_ISLNK(mode):
+        if _is_redirect(seen):
             links += 1
             target = _link_text(candidate)
             if links > _MAX_LINKS or not isinstance(target, str):
                 return None
+            if target.startswith("\\\\?\\") and not target.startswith("\\\\?\\UNC\\"):
+                # A junction's text names its target in the NT namespace.
+                target = target[4:]
             reads.append(("k", candidate, target))
             holders.append(current)
             if os.path.isabs(target):
@@ -331,11 +342,20 @@ def _judge_afresh(spelled: str, reads: list[_Read]) -> tuple[_Verdict, bool]:
         # Where the links lead is read again on every reuse. With none, the
         # unchanged non-link entries already fix ``real``.
         reads.append(("r", spelled, real))
-    if not _same_spelling(end, real):
+    # The walk's end has no link left in it, so ``realpath`` of it is only
+    # its canonical spelling (a leading ``//`` folds as it does for HOME).
+    if not _same_spelling(os.path.realpath(end), real):
         # The walk and the system disagree on where HOME lands: refuse.
         return _Verdict(None), False
     for directory in dict.fromkeys(holders):
-        holder = _marked_from(directory, reads)
+        # Judged where the holder physically is: whatever the walk does not
+        # model as a link (a bind mount, a reparse point, a magic link)
+        # still resolves here. Unresolvable, refused.
+        physical = os.path.realpath(directory)
+        reads.append(("r", directory, physical))
+        if _signature(physical, follow=True)[0] == "error":
+            return _Verdict(None), False
+        holder = _marked_from(physical, reads)
         if holder is not None:
             return _Verdict(None, holder), True
     holder = _marked_from(os.path.dirname(real), reads)

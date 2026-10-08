@@ -3952,3 +3952,286 @@ def test_the_walk_and_the_system_must_agree_on_where_home_lands(
     monkeypatch.setattr(home_identity.os.path, "realpath", realpath)
     home_identity.forget_home_verdicts()
     assert home_identity.home_is_operators() is False
+
+
+# --------------------------------------------------------------------------- #
+# Board round 27, codex F001: a Windows junction (a directory by mode) hid a
+# repository link's holder -- the holder was checked where the walk spelled it,
+# never where it physically is. Every holder is now judged at realpath(holder),
+# and a reparse point the walk meets is collected as a link.
+# --------------------------------------------------------------------------- #
+
+
+def _windows_seam(base: Path, junctions: set[Path], unreadable: set[Path] = set()):  # type: ignore[no-untyped-def]  # noqa: B006
+    """``os`` for home_identity on ntpath over the real tree under ``base``:
+    ``C:\\`` is ``base``; each path in ``junctions`` is a real symlink that
+    ``lstat`` reports as a directory with a mount-point reparse tag."""
+    import ntpath
+    import stat as stat_module
+    from pathlib import PureWindowsPath
+    from types import SimpleNamespace
+
+    def local(path: str) -> Path:
+        return base.joinpath(*PureWindowsPath(path).parts[1:])
+
+    def windows(path: Path) -> str:
+        return str(PureWindowsPath("C:/") / path.relative_to(base))
+
+    def readlink(path: str) -> str:
+        if local(path) in unreadable:
+            raise PermissionError(13, "Permission denied")
+        target = Path(os.readlink(local(path)))
+        return windows(target) if target.is_absolute() else str(PureWindowsPath(target))
+
+    def lstat(path: str) -> Any:
+        entry = local(path)
+        seen = os.lstat(entry)
+        if entry in junctions:
+            return SimpleNamespace(
+                st_dev=seen.st_dev,
+                st_ino=seen.st_ino,
+                st_mode=stat_module.S_IFDIR | 0o755,
+                st_file_attributes=0x400,
+                st_reparse_tag=0xA0000003,
+            )
+        return seen
+
+    paths = SimpleNamespace(**vars(ntpath))
+    paths.realpath = lambda path: windows(local(path).resolve())
+    return (
+        SimpleNamespace(
+            path=paths,
+            fspath=os.fspath,
+            stat=lambda path: os.stat(local(path)),
+            lstat=lstat,
+            readlink=readlink,
+        ),
+        windows,
+    )
+
+
+def test_codex_r27_f001_junction_cannot_hide_checkout_held_home_link(
+    tmp_path: Path,
+) -> None:
+    import ntpath
+    import stat as stat_module
+    from pathlib import PureWindowsPath
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from pmcp import home_identity
+
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    held = checkout / "held"
+    held.mkdir()
+    (held / "home").symlink_to("../../checkout", target_is_directory=True)
+    (tmp_path / "outside").mkdir()
+    junction = tmp_path / "outside" / "junction"
+    junction.symlink_to(held, target_is_directory=True)
+
+    def local(path):  # type: ignore[no-untyped-def]
+        return tmp_path.joinpath(*PureWindowsPath(path).parts[1:])
+
+    def windows(path):  # type: ignore[no-untyped-def]
+        return str(PureWindowsPath("C:/") / path.relative_to(tmp_path))
+
+    def readlink(path):  # type: ignore[no-untyped-def]
+        target = Path(os.readlink(local(path)))
+        return windows(target) if target.is_absolute() else str(PureWindowsPath(target))
+
+    def lstat(path):  # type: ignore[no-untyped-def]
+        entry = local(path)
+        seen = os.lstat(entry)
+        if entry == junction:
+            return SimpleNamespace(
+                st_dev=seen.st_dev,
+                st_ino=seen.st_ino,
+                st_mode=stat_module.S_IFDIR | 0o755,
+                st_file_attributes=0x400,
+                st_reparse_tag=0xA0000003,
+            )
+        return seen
+
+    paths = SimpleNamespace(**vars(ntpath))
+    paths.realpath = lambda path: windows(local(path).resolve())
+    windows_os = SimpleNamespace(
+        path=paths,
+        fspath=os.fspath,
+        stat=lambda path: os.stat(local(path)),
+        lstat=lstat,
+        readlink=readlink,
+    )
+    home = windows(junction / "home")
+    with (
+        patch.object(home_identity, "os", windows_os),
+        patch.object(home_identity, "_home_spelling", return_value=home),
+    ):
+        home_identity.forget_home_verdicts()
+        try:
+            assert paths.realpath(home) == windows(checkout)
+            assert home_identity._marked_from(windows(held)) == windows(checkout)
+            assert not home_identity.home_is_operators(), (
+                "A junction hid the checkout that holds HOME's final symlink"
+            )
+        finally:
+            home_identity.forget_home_verdicts()
+
+
+@pytest.mark.parametrize(
+    ("shape", "operators"),
+    [
+        ("junction-into-a-checkout-held-link", False),  # codex's shape
+        ("junction-to-an-operator-directory", True),
+        ("junction-to-a-dotfiles-checkout-root", True),
+        ("junction-inside-a-checkout", False),
+        ("junction-whose-target-cannot-be-read", False),
+        ("chain-junction-then-link-then-junction", False),
+    ],
+)
+def test_a_windows_junction_is_a_link_on_the_way(
+    shape: str, operators: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity
+
+    base = tmp_path.resolve()
+    repo = base / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "held").mkdir()
+    (base / "outside").mkdir()
+    (base / "users" / "me").mkdir(parents=True)
+    junction = base / "outside" / "junction"
+    junctions = {junction}
+    unreadable: set[Path] = set()
+    if shape == "junction-into-a-checkout-held-link":
+        (repo / "held" / "home").symlink_to("../../repo", target_is_directory=True)
+        junction.symlink_to(repo / "held", target_is_directory=True)
+        home = junction / "home"
+    elif shape == "junction-to-an-operator-directory":
+        junction.symlink_to(base / "users", target_is_directory=True)
+        home = junction / "me"
+    elif shape == "junction-to-a-dotfiles-checkout-root":
+        junction.symlink_to(repo, target_is_directory=True)
+        home = junction
+    elif shape == "junction-inside-a-checkout":
+        inner = repo / "jn"
+        inner.symlink_to(base / "users", target_is_directory=True)
+        junctions = {inner}
+        home = inner / "me"
+    elif shape == "junction-whose-target-cannot-be-read":
+        junction.symlink_to(base / "users", target_is_directory=True)
+        unreadable = {junction}
+        home = junction / "me"
+    else:  # an operator junction, a repository link, another junction
+        second = repo / "held" / "jn2"
+        second.symlink_to(base / "users", target_is_directory=True)
+        (base / "outside" / "link").symlink_to(second, target_is_directory=True)
+        junction.symlink_to(base / "outside", target_is_directory=True)
+        junctions = {junction, second}
+        home = junction / "link" / "me"
+    seam, windows = _windows_seam(base, junctions, unreadable)
+    monkeypatch.setattr(home_identity, "os", seam)
+    monkeypatch.setattr(home_identity, "_home_spelling", lambda: windows(home))
+    home_identity.forget_home_verdicts()
+    assert home_identity.home_is_operators() is operators
+    assert home_identity.home_is_operators() is operators  # cached
+
+
+def test_every_holder_is_judged_where_it_physically_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generated, POSIX: chains of 1-2 links whose holders are a plain
+    directory outside, one inside a checkout, or a directory whose PHYSICAL
+    location (realpath) is inside a checkout though its spelling is not -- an
+    indirection the walk does not model as a link (a bind mount). Refused if
+    and only if a holder is physically in a checkout or HOME lands in one."""
+    from pmcp import home_identity
+
+    base = tmp_path.resolve()
+    assert all(not home_identity.has_checkout_marker(d) for d in base.parents)
+    bound: dict[str, str] = {}
+    real_realpath = os.path.realpath
+
+    def realpath(path: Any, *args: Any, **kwargs: Any) -> str:
+        spelled = os.fspath(path)
+        return bound.get(spelled) or real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(home_identity.os.path, "realpath", realpath)
+    wrong = []
+    rows = [
+        (holders, styles, final)
+        for depth in (1, 2)
+        for holders in itertools.product(("in", "out", "bound"), repeat=depth)
+        for styles in itertools.product(("abs", "rel", "dotdot"), repeat=depth)
+        for final in ("out/dest", "repo/sub", "repo")
+    ]
+    for n, (holders, styles, final) in enumerate(rows):
+        case = base / f"c{n}"
+        (case / "repo" / ".git").mkdir(parents=True)
+        (case / "repo" / "sub").mkdir()
+        (case / "repo" / "mount").mkdir()
+        (case / "out" / "dest").mkdir(parents=True)
+        (case / "bind").mkdir()
+        bound[str(case / "bind")] = str(case / "repo" / "mount")
+        held = {"in": case / "repo", "out": case / "out", "bound": case / "bind"}
+        links = [held[h] / f"l{i}" for i, h in enumerate(holders)]
+        targets = [*links[1:], case / final]
+        for link, target, style in zip(links, targets, styles):
+            directory = link.parent
+            if style == "abs":
+                text = str(target)
+            elif style == "rel":
+                text = os.path.relpath(target, directory)
+            else:
+                text = os.path.join(
+                    "..", directory.name, os.path.relpath(target, directory)
+                )
+            link.symlink_to(text, target_is_directory=True)
+        expected = not ("in" in holders or "bound" in holders or final == "repo/sub")
+        monkeypatch.setenv("HOME", str(links[0]))
+        home_identity.forget_home_verdicts()
+        fresh = home_identity.home_is_operators()
+        cached = home_identity.home_is_operators()
+        if fresh is not expected or cached is not expected:
+            wrong.append((holders, styles, final, fresh, cached))
+    assert len(rows) == 270
+    assert wrong == []
+
+
+def test_a_holder_whose_physical_location_cannot_be_resolved_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity
+
+    base = tmp_path.resolve()
+    (base / "out").mkdir()
+    (base / "users" / "me").mkdir(parents=True)
+    (base / "out" / "alias").symlink_to(base / "users", target_is_directory=True)
+    monkeypatch.setenv("HOME", str(base / "out" / "alias" / "me"))
+    home_identity.forget_home_verdicts()
+    assert home_identity.home_is_operators() is True
+    real_realpath = os.path.realpath
+
+    def realpath(path: Any, *args: Any, **kwargs: Any) -> str:
+        if os.fspath(path) == str(base / "out"):
+            return str(base / "gone")
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(home_identity.os.path, "realpath", realpath)
+    home_identity.forget_home_verdicts()
+    assert home_identity.home_is_operators() is False
+
+
+def test_claude_r27_n1_a_leading_double_slash_home_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POSIX lets ``//`` mean something; normpath keeps it, realpath folds it.
+    A HOME spelled with it was accepted through round 26."""
+    from pmcp import home_identity
+
+    home = tmp_path.resolve() / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", "/" + str(home))
+    home_identity.forget_home_verdicts()
+    assert home_identity.home_is_operators() is True
+    assert home_identity.examinable_home() == home
