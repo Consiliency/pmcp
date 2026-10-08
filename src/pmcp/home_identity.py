@@ -46,7 +46,7 @@ import sys as _sys
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 
 Identity = tuple[int, int]
 
@@ -497,8 +497,8 @@ class HomeInsideCheckoutError(PermissionError):
     ``strerror`` says which."""
 
 
-def _refusal() -> str | None:
-    verdict = _judge(_home_spelling())
+def _refusal(spelled: str | None = None) -> str | None:
+    verdict = _judge(_home_spelling() if spelled is None else spelled)
     if verdict.real is not None:
         return None
     return _HOME_REFUSAL if verdict.checkout is not None else HOME_NOT_PLAIN
@@ -510,19 +510,48 @@ def reset_home_warning() -> None:
     _WARNED_HOME = False
 
 
+def _refuse(reason: str) -> NoReturn:
+    global _WARNED_HOME
+    if not _WARNED_HOME:
+        _WARNED_HOME = True
+        print(
+            f"pmcp: Ignoring the operator's files under the home directory: {reason}",
+            file=_sys.stderr,
+        )
+    raise HomeInsideCheckoutError(_errno.EPERM, reason)
+
+
 def operator_home() -> Path:
     """HOME, only while it is the operator's; otherwise raise (a PermissionError)."""
-    global _WARNED_HOME
     reason = _refusal()
     if reason is not None:
-        if not _WARNED_HOME:
-            _WARNED_HOME = True
-            print(
-                f"pmcp: Ignoring the operator's files under the home directory: {reason}",
-                file=_sys.stderr,
-            )
-        raise HomeInsideCheckoutError(_errno.EPERM, reason)
+        _refuse(reason)
     return Path.home()
+
+
+class HomePin:
+    """A home-scoped path fixed once and judged again on EVERY use.
+
+    The pin keeps the HOME it was taken under, so nothing that changes
+    ``HOME`` later in the process can move the file. It does not keep the
+    verdict: each :meth:`path` re-judges that HOME through the gate (cached
+    verdicts revalidate against the filesystem), and raises -- value-free, as
+    :func:`operator_home` does -- once it is no longer the operator's
+    (Consiliency/pmcp#372 round 30: a pinned user store was handed out after a
+    marker appeared above HOME, and a credential was written inside the
+    checkout).
+    """
+
+    def __init__(self, *parts: str) -> None:
+        self._spelled = _home_spelling()
+        self._home = operator_home()  # refused now: raises now
+        self._parts = parts
+
+    def path(self) -> Path:
+        reason = _refusal(self._spelled)
+        if reason is not None:
+            _refuse(reason)
+        return self._home.joinpath(*self._parts)
 
 
 def optional_operator_home() -> Path | None:

@@ -1991,3 +1991,140 @@ def test_the_home_derivation_scan_sees_each_shape() -> None:
     found = home_derivations({"pmcp.x": source})
     lines = sorted(int(line.split(":")[1].split(" ")[0]) for line in found)
     assert lines == [5, 7, 9, 11]
+
+
+# --------------------------------------------------------------------------- #
+# Nothing remembers a HOME-derived answer (Consiliency/pmcp#372 round 30,
+# board round 29 codex F001: the pinned user store skipped the gate). A gate's
+# answer -- a path under HOME, or a verdict about HOME -- may be used, never
+# kept: not in a module global, an attribute, a default argument or a cached
+# function. The one remembered home-scoped location is a ``HomePin``, which
+# judges its HOME again on every use. home_identity's own verdict cache
+# revalidates every read before reuse and is exempt by construction.
+# --------------------------------------------------------------------------- #
+
+#: Calls whose result is a HOME-derived path or verdict.
+HOME_GATE_CALLS = frozenset(
+    {
+        "home_path",
+        "optional_home_path",
+        "operator_home",
+        "optional_operator_home",
+        "examinable_home",
+        "home_is_operators",
+        "is_home",
+        "is_operator_owned",
+        "pin_user_store_path",
+        "default_user_config_paths",
+        "default_user_policy_paths",
+        "_effective_user_policy_paths",
+        "_user_policy_paths",
+        "_default_policy_paths",
+        "trust_store_path",
+        "package_approvals_path",
+        "default_registry_cache_path",
+        "_uv_tool_dir",
+        "resolve_scope_path",
+    }
+)
+_CACHING_DECORATORS = frozenset({"cache", "lru_cache", "cached_property"})
+
+
+def _gate_calls(node: ast.AST) -> list[str]:
+    names = []
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            func = sub.func
+            name = getattr(func, "id", None) or getattr(func, "attr", None)
+            if name in HOME_GATE_CALLS:
+                names.append(name)
+    return names
+
+
+def _is_pin(value: ast.AST | None) -> bool:
+    return (
+        isinstance(value, ast.Call)
+        and (getattr(value.func, "id", None) or getattr(value.func, "attr", None))
+        == "HomePin"
+    )
+
+
+def home_memos(sources: dict[str, str]) -> list[str]:
+    found: list[str] = []
+    for module, source in sources.items():
+        if module == "pmcp.home_identity":
+            continue
+        tree = _parse(source)
+        for node in tree.body:  # module level
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                if _gate_calls(node.value) and not _is_pin(node.value):
+                    found.append(f"{module}:{node.lineno} module global")
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            decorators = {
+                getattr(d, "id", None)
+                or getattr(d, "attr", None)
+                or getattr(getattr(d, "func", None), "id", None)
+                or getattr(getattr(d, "func", None), "attr", None)
+                for d in fn.decorator_list
+            }
+            if decorators & _CACHING_DECORATORS and _gate_calls(fn):
+                found.append(f"{module}:{fn.lineno} cached {fn.name}")
+            for default in [*fn.args.defaults, *fn.args.kw_defaults]:
+                if default is not None and _gate_calls(default):
+                    found.append(f"{module}:{fn.lineno} default argument of {fn.name}")
+            globals_ = {
+                name
+                for sub in ast.walk(fn)
+                if isinstance(sub, ast.Global)
+                for name in sub.names
+            }
+            for sub in ast.walk(fn):
+                if not isinstance(sub, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    continue
+                value = sub.value
+                if value is None or not _gate_calls(value) or _is_pin(value):
+                    continue
+                targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+                for target in targets:
+                    if isinstance(target, ast.Attribute):
+                        found.append(
+                            f"{module}:{sub.lineno} kept in {ast.unparse(target)}"
+                        )
+                    elif isinstance(target, ast.Name) and target.id in globals_:
+                        found.append(
+                            f"{module}:{sub.lineno} kept in global {target.id}"
+                        )
+    return found
+
+
+def test_no_home_derived_answer_is_remembered() -> None:
+    assert home_memos(_src_sources()) == []
+
+
+def test_the_home_memo_scan_sees_each_shape() -> None:
+    source = (
+        "import functools\n"
+        "KEPT = home_path('.x')\n"
+        "PIN = HomePin('.y')\n"
+        "_G = None\n"
+        "def a():\n"
+        "    global _G\n"
+        "    _G = optional_home_path('.z')\n"
+        "def b(self):\n"
+        "    self.where = pin_user_store_path()\n"
+        "@functools.lru_cache(maxsize=1)\n"
+        "def c():\n"
+        "    return default_user_config_paths()\n"
+        "def d(where=operator_home()):\n"
+        "    return where\n"
+        "def e():\n"
+        "    global _G\n"
+        "    _G = HomePin('.w')\n"
+        "def fine():\n"
+        "    return home_path('.config')\n"
+    )
+    found = home_memos({"pmcp.x": source})
+    lines = sorted(int(line.split(":")[1].split(" ")[0]) for line in found)
+    assert lines == [2, 7, 9, 11, 13]

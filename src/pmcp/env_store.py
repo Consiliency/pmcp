@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from collections.abc import Callable, Collection, Iterable, Mapping
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from dotenv import dotenv_values
 
@@ -22,6 +22,9 @@ from pmcp.atomic_write import (
     read_confined,
 )
 from pmcp.config.loader import find_project_root
+
+if TYPE_CHECKING:
+    from pmcp.home_identity import HomePin
 
 ENV_VAR_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -77,30 +80,32 @@ def _discover_project_root() -> Path:
     return Path.cwd()
 
 
-#: The user store's path, fixed by :func:`pin_user_store_path` before any
+#: The user store's location, fixed by :func:`pin_user_store_path` before any
 #: repository-controlled store is loaded, so nothing loaded later -- a ``HOME``
 #: a project file filled in while it was unset -- can move it
-#: (Consiliency/pmcp#372 round 1). ``None`` until pinned: library use and tests
-#: resolve it from ``Path.home()`` on every call.
-_PINNED_USER_STORE: Path | None = None
+#: (Consiliency/pmcp#372 round 1). Its ownership is judged again on every use
+#: (round 30). ``None`` until pinned: library use and tests resolve it from
+#: ``Path.home()`` on every call.
+_PINNED_USER_STORE: HomePin | None = None
 
 
 def pin_user_store_path() -> Path | None:
-    """Resolve ``~/.config/pmcp/pmcp.env`` now and keep that answer for the process.
+    """Fix ``~/.config/pmcp/pmcp.env`` now, and answer it while HOME is the operator's.
 
-    ``None`` -- nothing pinned -- while a checkout controls the home directory
-    (Consiliency/pmcp#372 round 22): every later user-store access then fails
-    like an unreadable store, and pmcp runs without it.
+    ``None`` -- nothing pinned, or the pinned HOME no longer the operator's --
+    while a checkout controls the home directory (Consiliency/pmcp#372 rounds
+    22 and 30): every user-store access then fails like an unreadable store,
+    and pmcp runs without it.
     """
     global _PINNED_USER_STORE
-    if _PINNED_USER_STORE is None:
-        from pmcp.home_identity import HomeInsideCheckoutError, home_path
+    from pmcp.home_identity import HomeInsideCheckoutError, HomePin
 
-        try:
-            _PINNED_USER_STORE = home_path(".config", "pmcp", "pmcp.env")
-        except HomeInsideCheckoutError:
-            return None
-    return _PINNED_USER_STORE
+    try:
+        if _PINNED_USER_STORE is None:
+            _PINNED_USER_STORE = HomePin(".config", "pmcp", "pmcp.env")
+        return _PINNED_USER_STORE.path()
+    except HomeInsideCheckoutError:
+        return None
 
 
 def reset_user_store_pin() -> None:
@@ -112,13 +117,13 @@ def reset_user_store_pin() -> None:
 def resolve_scope_path(scope: str, project: Path | None = None) -> Path:
     """Resolve env file path for a credential scope."""
     if scope == "user":
+        # Home-scoped (Consiliency/pmcp#372 rounds 22 and 30): raises -- a
+        # PermissionError, so a lenient reader treats it as an unreadable
+        # store -- while a checkout controls the home directory, pinned or not.
         if _PINNED_USER_STORE is not None:
-            return _PINNED_USER_STORE
+            return _PINNED_USER_STORE.path()
         from pmcp.home_identity import home_path
 
-        # Home-scoped (Consiliency/pmcp#372 round 22): raises -- a
-        # PermissionError, so a lenient reader treats it as an unreadable
-        # store -- while a checkout controls the home directory.
         return home_path(".config", "pmcp", "pmcp.env")
     if scope == "project":
         return resolve_project_root(project) / ".env.pmcp"

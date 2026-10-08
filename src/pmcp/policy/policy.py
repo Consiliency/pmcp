@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 
+from pmcp.home_identity import spelled_home as _spelled_home
 from pmcp.project_consent import log_refusal, read_and_gate
 from pmcp.types import (
     GatewayPolicy,
@@ -195,14 +196,17 @@ class _FrozenDefault(tuple[Path, ...]):
     __slots__ = ()
 
 
-# Do NOT read this frozen value at runtime: it captures `Path.home()` at import
+# Do NOT read this frozen value at runtime: it captures HOME, UNCHECKED, at import
+# (home_identity.spelled_home -- a documentation constant; no gate runs at import)
 # time. Read `_effective_user_policy_paths()` instead. It stays a module
 # attribute because `monkeypatch.setattr` on it is a documented test seam, and
 # the resolvers below key on OBJECT IDENTITY -- if this attribute is still this
 # exact object, the live home is used; if a caller replaced it, that caller's
 # value is used verbatim and the live home is never consulted. Immutable, so an
 # in-place mutation raises instead of being silently ignored.
-USER_POLICY_PATHS: Sequence[Path] = _FrozenDefault(default_user_policy_paths())
+USER_POLICY_PATHS: Sequence[Path] = _FrozenDefault(
+    _spelled_home() / tail for tail in _USER_POLICY_TAILS
+)
 _FROZEN_USER_POLICY_PATHS = USER_POLICY_PATHS
 
 # Same contract: patched -> used verbatim; untouched -> derived from the

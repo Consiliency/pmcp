@@ -4457,3 +4457,166 @@ def test_a_reparse_tag_never_redirects_on_posix(
     monkeypatch.setenv("HOME", str(base / "users" / "me"))
     home_identity.forget_home_verdicts()
     assert home_identity.home_is_operators() is True
+
+
+# --------------------------------------------------------------------------- #
+# Board round 29, codex F001: the pinned user store was handed out before the
+# HOME gate ran, so after a marker appeared above HOME a credential was still
+# written inside the checkout. Every HOME-derived path remembered across calls
+# is judged again on every use (home_identity.HomePin), and nothing else
+# remembers one (tests/test_store_reader_inventory.py).
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_r29_f001_pinned_user_store_must_recheck_home_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity
+
+    base = tmp_path.resolve()
+    home = base / "parent" / "home"
+    home.mkdir(parents=True)
+    store = home / ".config" / "pmcp" / "pmcp.env"
+    original_marker = home_identity.has_checkout_marker
+    ambient = set(base.parents)
+    monkeypatch.setattr(
+        home_identity,
+        "has_checkout_marker",
+        lambda path: False if Path(path) in ambient else original_marker(path),
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(env_store, "_PINNED_USER_STORE", None)
+    home_identity.forget_home_verdicts()
+    try:
+        assert home_identity.home_is_operators()
+        assert env_store.pin_user_store_path() == store
+        assert not store.exists()
+        (home.parent / ".git").mkdir()
+        assert not home_identity.home_is_operators()
+        assert home_identity.optional_home_path(".config", "pmcp", "pmcp.env") is None
+        try:
+            env_store.set_env_value("user", "F001_TOKEN", "synthetic-secret")
+        except home_identity.HomeInsideCheckoutError:
+            pass
+        assert not store.exists(), (
+            "A pinned user-store path bypassed the HOME gate and wrote a secret "
+            "inside the checkout after HOME was refused"
+        )
+    finally:
+        home_identity.forget_home_verdicts()
+        home_identity.reset_home_warning()
+
+
+def _home_scoped_accessors(
+    home: Path,
+) -> dict[str, tuple[Callable[[], Any], Callable[[Any], bool]]]:
+    """Every home-scoped reader and writer pmcp has, by the file it touches:
+    name -> (the access, "did it refuse?" given its result or exception).
+    Planted files carry the sentinel ``PLANTED_372``; a refused read never
+    returns it."""
+    from pmcp import home_identity, trust_store
+    from pmcp.cli_commands.install import _uv_tool_dir
+    from pmcp.config.guidance import (
+        load_guidance_config,
+        set_feedback_submission_enabled,
+    )
+    from pmcp.config.loader import default_user_config_paths
+    from pmcp.manifest.loader import load_manifest
+    from pmcp.manifest.registry import default_registry_cache_path
+    from pmcp.package_approvals import package_approvals_path
+    from pmcp.policy.policy import default_user_policy_paths
+
+    refused_error = (home_identity.HomeInsideCheckoutError, trust_store.TrustStoreError)
+
+    def raised(result: Any) -> bool:
+        return isinstance(result, refused_error)
+
+    return {
+        "user store, read (pinned)": (
+            lambda: env_store.read_store("user"),
+            lambda r: r == {},
+        ),
+        "user store, write (pinned)": (
+            lambda: env_store.set_env_value("user", "NEW_372", "x"),
+            raised,
+        ),
+        "user store, pin": (env_store.pin_user_store_path, lambda r: r is None),
+        "user store, scope path": (
+            lambda: env_store.resolve_scope_path("user"),
+            raised,
+        ),
+        "trust store": (trust_store.trust_store_path, raised),
+        "package approvals": (package_approvals_path, raised),
+        "user config": (default_user_config_paths, lambda r: r == []),
+        "user manifest overlay": (
+            lambda: load_manifest(),
+            lambda r: not raised(r) and "planted372" not in r.servers,
+        ),
+        "base policy": (default_user_policy_paths, lambda r: r == []),
+        "guidance, read": (
+            lambda: load_guidance_config(),
+            lambda r: not raised(r) and r.enable_feedback_submission is False,
+        ),
+        "guidance, write": (lambda: set_feedback_submission_enabled(True), raised),
+        "registry cache": (default_registry_cache_path, raised),
+        "uv tool directory": (_uv_tool_dir, raised),
+    }
+
+
+def _plant_home_files(home: Path) -> None:
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    (home / ".config" / "pmcp" / "pmcp.env").write_text("PLANTED_372=1\n")
+    (home / ".pmcp").mkdir()
+    (home / ".pmcp" / "manifest.yaml").write_text(
+        "servers:\n  planted372:\n    description: planted\n    command: echo\n"
+    )
+    (home / ".claude").mkdir()
+    (home / ".claude" / "gateway-guidance.yaml").write_text(
+        "guidance:\n  enable_feedback_submission: true\n"
+    )
+
+
+def _tree(base: Path) -> dict[str, bytes | None]:
+    return {
+        str(p): (p.read_bytes() if p.is_file() and not p.is_symlink() else None)
+        for p in sorted(base.rglob("*"))
+    }
+
+
+@pytest.mark.parametrize("name", sorted(_home_scoped_accessors(Path("/")).keys()))
+def test_every_home_scoped_access_is_judged_again_after_warming(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinned or warmed under a good HOME, then a marker above HOME: the next
+    access refuses, creating and reading nothing."""
+    from pmcp import home_identity
+
+    base = tmp_path.resolve()
+    home = base / "parent" / "home"
+    home.mkdir(parents=True)
+    _plant_home_files(home)
+    for variable in ("XDG_CACHE_HOME", "XDG_DATA_HOME", "PMCP_UV_TOOL_DIR"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(env_store, "_PINNED_USER_STORE", None)
+    monkeypatch.delenv("PLANTED_372", raising=False)
+    monkeypatch.delenv("NEW_372", raising=False)
+    home_identity.forget_home_verdicts()
+    access, refused = _home_scoped_accessors(home)[name]
+    env_store.pin_user_store_path()  # what the startup load does first
+    try:
+        warm = access()  # the operator's, so it answers
+    except Exception as exc:  # pragma: no cover - a warm failure is the bug
+        raise AssertionError(
+            f"{name} refused under the operator's HOME: {exc}"
+        ) from exc
+    assert not refused(warm), f"{name} refused under the operator's HOME"
+    (home.parent / ".git").mkdir()
+    before = _tree(base)
+    try:
+        result: Any = access()
+    except Exception as exc:  # noqa: BLE001 - the refusal is the result
+        result = exc
+    assert refused(result), f"{name} answered after HOME was refused: {result!r}"
+    assert "PLANTED_372" not in repr(result)
+    assert _tree(base) == before, f"{name} changed the tree under a refused HOME"
