@@ -238,13 +238,6 @@ def _lock_dir_fd(lock_dir: Path) -> int | None:
         return None
 
 
-def _named(lock_file: Path, directory: int | None) -> os.stat_result:
-    """The entry at the lock path itself -- never what a link there names."""
-    if directory is not None:
-        return os.stat(_LOCK_NAME, dir_fd=directory, follow_symlinks=False)
-    return os.lstat(lock_file)
-
-
 def _directory_at(lock_dir: Path, directory: int | None) -> tuple[int, int] | None:
     """The lock directory at its PATHNAME: a real directory (not a link), and
     -- where one is held -- the very directory ``directory`` is. Its identity,
@@ -277,17 +270,6 @@ def _still_the_lock(
     except OSError:
         return False
     return True
-
-
-def _holds_the_file_at(fd: TextIO, path: Path, directory: int | None = None) -> bool:
-    """Is the locked descriptor the file ``path`` names now -- the entry
-    itself, never what a link there names?"""
-    try:
-        held = os.fstat(fd.fileno())
-        named = _named(path, directory)
-    except OSError:
-        return False
-    return (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
 
 
 def _lock_waiting_out_a_probe(fd: TextIO) -> None:

@@ -270,6 +270,16 @@ def _gateways(n: int) -> list[Any]:
     return copies
 
 
+def _holds_the_file_at(fd: Any, path: Path) -> bool:
+    """Is the locked descriptor the entry at ``path`` itself (not followed)?"""
+    held = os.fstat(fd.fileno())
+    try:
+        named = os.lstat(path)
+    except OSError:
+        return False
+    return (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+
+
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
 
 
@@ -344,7 +354,7 @@ def test_claude_r31_n1_three_instances_never_two_holders(
         holders = [m for m in (a, b, c) if m._LOCK_FD is not None]
         assert len(holders) == 1, f"{between}: {len(holders)} holders"
         (holder,) = holders
-        assert holder._holds_the_file_at(holder._LOCK_FD, lock)
+        assert _holds_the_file_at(holder._LOCK_FD, lock)
         # And nobody else can take it now.
         (late,) = _gateways(1)
         assert not late.acquire_singleton_lock(tmp_path)
@@ -728,7 +738,7 @@ def test_codex_r33_f001_replaced_lock_directory_preserves_singleton(
         )
         # The retry started again from the new directory and holds its lock.
         assert first_acquired is True
-        assert first._holds_the_file_at(first._LOCK_FD, lock_dir / "gateway.lock")
+        assert _holds_the_file_at(first._LOCK_FD, lock_dir / "gateway.lock")
     finally:
         first.release_singleton_lock()
         second.release_singleton_lock()
@@ -899,10 +909,20 @@ def test_a_store_sidecar_lock_never_creates_through_a_link(
     with pytest.raises(TrustStoreError):
         opener(path)
     assert not target.exists()
+    # And through the stores' own lock entry point, which every read-modify-
+    # write of the store takes.
+    store_lock = (
+        trust_store._store_lock if store == "trust" else package_approvals._store_lock
+    )
+    with pytest.raises(TrustStoreError), store_lock(path):
+        pass
+    assert not target.exists()
     (tmp_path / (path.name + ".lock")).unlink()
     fd = opener(path)
     os.close(fd)
     assert (tmp_path / (path.name + ".lock")).is_file()
+    with store_lock(path):
+        pass
 
 
 @posix_only
