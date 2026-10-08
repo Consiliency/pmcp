@@ -2005,7 +2005,7 @@ If any checks fail, follow the command in the output and rerun `pmcp doctor`.
 
 ### Singleton Lock
 
-By default, PMCP uses a global lock at `~/.pmcp/gateway.lock` to ensure only one gateway runs per user. The lock is held by the running gateway and released when it exits (or dies); the file itself is never removed, so a leftover file never blocks a start and never needs deleting. This prevents multiple gateway instances from spawning duplicate downstream servers.
+By default, PMCP uses a global lock at `~/.pmcp/gateway.lock` to ensure only one gateway runs per user. The lock is held by the running gateway and released when it exits (or dies); the file itself is never removed, so a leftover file never blocks a start and never needs deleting. The lock directory must be a real directory and the lock file a plain regular file: a link at either is refused. This prevents multiple gateway instances from spawning duplicate downstream servers.
 
 **Override the lock directory:**
 

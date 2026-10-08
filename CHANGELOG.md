@@ -227,7 +227,7 @@ to do, how to verify it, and how to roll back to 2.7.3.
   it in that case. An uncancelled teardown still sends SIGTERM first. *Fixed*
 - **Stop every running gateway before upgrading.** 3.0 never removes the singleton lock
   file `~/.pmcp/gateway.lock` (a lock dies with its gateway), and refuses a lock path that
-  is a link or not a plain file. 2.7.3 removes the file when it shuts down, so while an
+  is a link or not a plain file, and a lock directory that is itself a link. 2.7.3 removes the file when it shuts down, so while an
   older gateway still runs, its shutdown can delete a 3.0 gateway's live lock and a third
   start can then run beside it. Until every running pmcp is upgraded the one-gateway
   guarantee does not hold; stop them all first, and do the same before rolling back.

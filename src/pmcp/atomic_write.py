@@ -695,3 +695,131 @@ def _fsync_dir(dir_fd: int) -> None:
         pass
     finally:
         os.close(readable)
+
+
+# --------------------------------------------------------------------------- #
+# A plain regular file, opened -- and created only if absent -- never through
+# a link (Consiliency/pmcp#372 round 34). Used for lock files: the singleton
+# lock and the stores' sidecar locks.
+# --------------------------------------------------------------------------- #
+
+
+class PlainFileRefused(OSError):
+    """The name is not a plain regular file: a link, a reparse point, another
+    file type, or a file with other names."""
+
+
+def _entry(name: str, parent: str, dir_fd: int | None) -> os.stat_result:
+    if dir_fd is not None:
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    return os.lstat(os.path.join(parent, name))
+
+
+def check_plain_file(fd: int, name: str, parent: str, dir_fd: int | None) -> None:
+    """``fd`` is a regular file with one name, and the entry ``name`` is that
+    same file itself -- not a link, not a reparse point. Raises
+    :class:`PlainFileRefused` (value-free) otherwise."""
+    held = os.fstat(fd)
+    if not stat.S_ISREG(held.st_mode) or held.st_nlink != 1:
+        raise PlainFileRefused(f"{name} is not a plain regular file")
+    try:
+        entry = _entry(name, parent, dir_fd)
+    except OSError as exc:
+        raise PlainFileRefused(f"{name} changed while it was opened") from exc
+    tag: int = getattr(entry, "st_reparse_tag", 0) or 0
+    if stat.S_ISLNK(entry.st_mode) or tag:
+        raise PlainFileRefused(f"{name} is a link")
+    if not _same_file(entry, held):
+        raise PlainFileRefused(f"{name} changed while it was opened")
+
+
+def _create_by_link(
+    name: str, parent: str, dir_fd: int | None, flags: int, mode: int
+) -> int:
+    """Create ``name`` where no ``O_NOFOLLOW`` is in use: a fresh file under a
+    random name (``O_CREAT|O_EXCL``, which never follows anything), then a hard
+    link to ``name`` -- ``link()`` fails on ANY existing name, a dangling link
+    or junction included -- then the temporary name removed. Raises
+    ``FileExistsError`` when ``name`` exists by then."""
+    tmp = f".{name}.{secrets.token_hex(8)}.new"
+    create = (
+        (flags & ~(os.O_RDONLY | os.O_WRONLY | os.O_RDWR))
+        | os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+    )
+    if dir_fd is not None:
+        fd = os.open(tmp, create, mode, dir_fd=dir_fd)
+    else:
+        fd = os.open(os.path.join(parent, tmp), create, mode)
+    created = os.fstat(fd)
+    try:
+        if dir_fd is not None:
+            os.link(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        else:
+            os.link(os.path.join(parent, tmp), os.path.join(parent, name))
+    except BaseException:
+        os.close(fd)
+        raise
+    finally:
+        try:
+            if _same_file(_entry(tmp, parent, dir_fd), created):
+                if dir_fd is not None:
+                    os.unlink(tmp, dir_fd=dir_fd)
+                else:
+                    os.unlink(os.path.join(parent, tmp))
+        except OSError:
+            pass
+    return fd
+
+
+def open_plain_file(
+    name: str,
+    *,
+    parent: str,
+    dir_fd: int | None,
+    flags: int,
+    mode: int = 0o600,
+    create: bool = True,
+) -> int:
+    """Open the regular file ``name`` in ``parent`` (relative to ``dir_fd``
+    where given) and return its descriptor -- creating it only if absent, and
+    never through a link on any platform.
+
+    ``flags`` are the access flags (``O_NOFOLLOW`` where the platform has it;
+    never ``O_CREAT``). An existing entry is opened without ``O_CREAT``. An
+    absent one is created exclusively: ``O_CREAT|O_EXCL|O_NOFOLLOW`` where
+    ``O_NOFOLLOW`` is in use, else by a hard link from a fresh temporary file
+    (:func:`_create_by_link`). Losing a creation race raises
+    ``FileExistsError``: the caller starts again. Anything but a plain regular
+    file with one name raises :class:`PlainFileRefused`.
+    """
+    path = os.path.join(parent, name)
+    nofollow = flags & getattr(os, "O_NOFOLLOW", 0)
+    try:
+        if dir_fd is not None:
+            fd = os.open(name, flags, mode, dir_fd=dir_fd)
+        else:
+            fd = os.open(path, flags, mode)
+    except FileNotFoundError:
+        if not create:
+            raise
+        # Absent -- or, without O_NOFOLLOW, a link to something absent: the
+        # exclusive create below fails on the link's name.
+        if nofollow:
+            if dir_fd is not None:
+                fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, mode, dir_fd=dir_fd)
+            else:
+                fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, mode)
+        else:
+            fd = _create_by_link(name, parent, dir_fd, flags, mode)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO, errno.EMLINK):
+            raise PlainFileRefused(f"{name} is not a plain regular file") from exc
+        raise
+    try:
+        check_plain_file(fd, name, parent, dir_fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd

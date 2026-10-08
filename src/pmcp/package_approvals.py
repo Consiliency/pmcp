@@ -339,6 +339,32 @@ def _write_store(path: Path, records: list[PackageApproval]) -> None:
     )
 
 
+def _open_sidecar_lock(path: Path) -> int:
+    """The store's ``.lock`` sidecar: opened, or created only if absent and
+    exclusively, never through a link (Consiliency/pmcp#372 round 34: an
+    ``O_RDWR|O_CREAT`` open followed a planted link and created its target)."""
+    from pmcp.atomic_write import PlainFileRefused, open_plain_file
+
+    flags = (
+        os.O_RDWR
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    for _attempt in range(5):
+        try:
+            return open_plain_file(
+                path.name + ".lock", parent=str(path.parent), dir_fd=None, flags=flags
+            )
+        except FileExistsError:
+            continue  # lost a creation race: open what is there now
+        except PlainFileRefused as exc:
+            raise TrustStoreError(
+                f"{path.name}.lock is not a plain regular file; refusing it"
+            ) from exc
+    raise TrustStoreError(f"{path.name}.lock kept changing; refusing it")
+
+
 @contextlib.contextmanager
 def _store_lock(path: Path) -> Iterator[None]:
     """Hold an exclusive advisory lock for one read-modify-write.
@@ -353,7 +379,7 @@ def _store_lock(path: Path) -> Iterator[None]:
     except ImportError:  # pragma: no cover - non-POSIX
         yield
         return
-    fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fd = _open_sidecar_lock(path)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield

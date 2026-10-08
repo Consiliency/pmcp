@@ -661,3 +661,312 @@ def test_a_link_swapped_in_between_open_and_lock_is_never_held(
         assert other.read_bytes() == b""  # nothing written through the link
     finally:
         identity.release_singleton_lock()
+
+
+# --------------------------------------------------------------------------- #
+# Board round 33 (codex F001-F003, grok F001, claude N-1): without O_NOFOLLOW
+# an O_CREAT open created a dangling link's target; a lock directory replaced
+# between open and lock gave two holders; a hard link added before the lock
+# let the PID write reach a file named outside the lock directory. One rule:
+# creation never follows a link on any platform, and after the lock is held
+# every precondition is established again, from the directory down, before
+# anything is written.
+# --------------------------------------------------------------------------- #
+
+
+def test_grok_r33_f001_dangling_lock_symlink_is_not_created_without_nofollow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    monkeypatch.setattr(identity, "_LOCK_FILE", None)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    monkeypatch.setattr(identity, "_OPEN_FLAGS", identity._OPEN_FLAGS & ~nofollow)
+    monkeypatch.setattr(identity, "_PROBE_FLAGS", identity._PROBE_FLAGS & ~nofollow)
+    monkeypatch.setattr(identity, "_lock_dir_fd", lambda _lock_dir: None)
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    target = tmp_path / "made-by-a-follow"
+    (lock_dir / "gateway.lock").symlink_to(target)
+    state = identity.singleton_lock_held(lock_dir)
+    acquired = identity.acquire_singleton_lock(lock_dir)
+    try:
+        assert not target.exists()
+        assert acquired is False
+        assert state == "unusable"
+        assert identity._LOCK_FD is None
+    finally:
+        identity.release_singleton_lock()
+
+
+def test_codex_r33_f001_replaced_lock_directory_preserves_singleton(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, second = _gateways(2)
+    first._CONTENDED_WAIT_SECONDS = 0.01
+    second._CONTENDED_WAIT_SECONDS = 0.01
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    real_lock = first._lock_fd_exclusive
+    replaced = False
+
+    def replace_directory_then_lock(fd: Any) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            lock_dir.rename(tmp_path / "old-locks")
+            lock_dir.mkdir()
+        real_lock(fd)
+
+    monkeypatch.setattr(first, "_lock_fd_exclusive", replace_directory_then_lock)
+    try:
+        first_acquired = first.acquire_singleton_lock(lock_dir)
+        second_acquired = second.acquire_singleton_lock(lock_dir)
+        assert not (first_acquired and second_acquired), (
+            "Two gateways hold different lock inodes for the same lock directory"
+        )
+        # The retry started again from the new directory and holds its lock.
+        assert first_acquired is True
+        assert first._holds_the_file_at(first._LOCK_FD, lock_dir / "gateway.lock")
+    finally:
+        first.release_singleton_lock()
+        second.release_singleton_lock()
+
+
+def test_codex_r33_f002_no_nofollow_fallback_does_not_create_symlink_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    monkeypatch.setattr(
+        identity, "_OPEN_FLAGS", identity._OPEN_FLAGS & ~getattr(os, "O_NOFOLLOW", 0)
+    )
+    monkeypatch.setattr(identity, "_lock_dir_fd", lambda directory: None)
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    target = tmp_path / "unrelated-new-file"
+    (lock_dir / "gateway.lock").symlink_to(target)
+    try:
+        identity.acquire_singleton_lock(lock_dir)
+    except OSError:
+        pass
+    finally:
+        identity.release_singleton_lock()
+    assert not target.exists(), "Refusing the lock created its symlink target"
+
+
+def test_codex_r33_f003_hardlink_added_before_lock_is_not_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    lock = lock_dir / "gateway.lock"
+    original = b"preserve this content\n"
+    lock.write_bytes(original)
+    other_name = tmp_path / "other-name"
+    real_lock = identity._lock_fd_exclusive
+
+    def add_name_then_lock(fd: Any) -> None:
+        if not other_name.exists():
+            os.link(lock, other_name)
+        real_lock(fd)
+
+    monkeypatch.setattr(identity, "_lock_fd_exclusive", add_name_then_lock)
+    try:
+        identity.acquire_singleton_lock(lock_dir)
+    finally:
+        identity.release_singleton_lock()
+    assert other_name.read_bytes() == original, (
+        "PID write changed a file with a name outside the lock directory"
+    )
+
+
+@pytest.mark.parametrize("dir_fd", [True, False], ids=["dir_fd", "no-dir_fd"])
+@pytest.mark.parametrize("nofollow", [True, False], ids=["O_NOFOLLOW", "no-O_NOFOLLOW"])
+@pytest.mark.parametrize("shape", ["dangling", "to-a-file"])
+def test_a_link_at_the_lock_path_is_refused_on_every_fallback(
+    shape: str,
+    nofollow: bool,
+    dir_fd: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With or without O_NOFOLLOW and dir_fd: refused, nothing created,
+    nothing written; the probe calls it unusable."""
+    from pmcp import identity
+
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    if not nofollow:
+        flag = getattr(os, "O_NOFOLLOW", 0)
+        monkeypatch.setattr(identity, "_OPEN_FLAGS", identity._OPEN_FLAGS & ~flag)
+        monkeypatch.setattr(identity, "_PROBE_FLAGS", identity._PROBE_FLAGS & ~flag)
+    if not dir_fd:
+        monkeypatch.setattr(identity, "_lock_dir_fd", lambda _d: None)
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    target = tmp_path / "target"
+    if shape == "to-a-file":
+        target.write_bytes(b"keep\n")
+    (lock_dir / "gateway.lock").symlink_to(target)
+    before = _tree(tmp_path)
+    assert identity.singleton_lock_held(lock_dir) == "unusable"
+    assert identity.acquire_singleton_lock(lock_dir) is False
+    assert identity._LOCK_FD is None
+    assert _tree(tmp_path) == before
+
+
+@pytest.mark.parametrize("dir_fd", [True, False], ids=["dir_fd", "no-dir_fd"])
+@pytest.mark.parametrize("nofollow", [True, False], ids=["O_NOFOLLOW", "no-O_NOFOLLOW"])
+def test_an_absent_lock_file_is_created_on_every_fallback(
+    nofollow: bool, dir_fd: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    if not nofollow:
+        flag = getattr(os, "O_NOFOLLOW", 0)
+        monkeypatch.setattr(identity, "_OPEN_FLAGS", identity._OPEN_FLAGS & ~flag)
+    if not dir_fd:
+        monkeypatch.setattr(identity, "_lock_dir_fd", lambda _d: None)
+    try:
+        assert identity.acquire_singleton_lock(tmp_path) is True
+        lock = tmp_path / "gateway.lock"
+        assert lock.read_text() == str(os.getpid())
+        assert os.lstat(lock).st_nlink == 1
+        assert [p.name for p in tmp_path.iterdir()] == ["gateway.lock"]  # no temp left
+    finally:
+        identity.release_singleton_lock()
+
+
+@posix_only
+def test_an_exclusive_creation_race_leaves_one_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finds no lock file; before A's exclusive create, B creates and locks
+    it. A's create fails (EEXIST), A starts again, and finds it held."""
+    import pmcp.atomic_write as writer
+
+    a, b = _gateways(2)
+    real_open = os.open
+    fired: list[bool] = []
+
+    def open_racing(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if (
+            not fired
+            and flags & os.O_CREAT
+            and flags & os.O_EXCL
+            and os.fspath(path).endswith("gateway.lock")
+        ):
+            fired.append(True)
+            assert b.acquire_singleton_lock(tmp_path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(writer.os, "open", open_racing)
+    try:
+        assert a.acquire_singleton_lock(tmp_path) is False
+        assert fired
+        assert b._LOCK_FD is not None and a._LOCK_FD is None
+    finally:
+        monkeypatch.undo()
+        a.release_singleton_lock()
+        b.release_singleton_lock()
+
+
+@pytest.mark.parametrize("store", ["trust", "package approvals"])
+@pytest.mark.parametrize("nofollow", [True, False], ids=["O_NOFOLLOW", "no-O_NOFOLLOW"])
+def test_a_store_sidecar_lock_never_creates_through_a_link(
+    store: str, nofollow: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The audited O_CREAT sites: the stores' ``.lock`` sidecars."""
+    from pmcp import package_approvals, trust_store
+    from pmcp.trust_store import TrustStoreError
+
+    if not nofollow:
+        monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    path = tmp_path / ("trust.json" if store == "trust" else "package_approvals.json")
+    target = tmp_path / "made-by-a-follow"
+    (tmp_path / (path.name + ".lock")).symlink_to(target)
+    opener = (
+        trust_store._open_sidecar_lock
+        if store == "trust"
+        else package_approvals._open_sidecar_lock
+    )
+    with pytest.raises(TrustStoreError):
+        opener(path)
+    assert not target.exists()
+    (tmp_path / (path.name + ".lock")).unlink()
+    fd = opener(path)
+    os.close(fd)
+    assert (tmp_path / (path.name + ".lock")).is_file()
+
+
+@posix_only
+def test_windows_creation_never_creates_through_a_link_even_if_create_new_followed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On an ntpath seam with no O_NOFOLLOW and no dir_fd -- whose ``open``
+    takes the WORST reading of CreateFile's CREATE_NEW and creates a dangling
+    link's target -- creating the lock file still never touches the target:
+    the exclusive create only ever names a fresh random temporary file, and the
+    lock name is reached by ``link()``, which fails on any existing name
+    (FILE_LINK_INFORMATION.ReplaceIfExists = FALSE)."""
+    import ntpath
+    from pathlib import PureWindowsPath
+    from types import SimpleNamespace
+
+    import pmcp.atomic_write as writer
+
+    base = tmp_path.resolve()
+
+    def local(path: str) -> str:
+        return str(base.joinpath(*PureWindowsPath(path).parts[1:]))
+
+    def windows_open(path: str, flags: int, mode: int = 0o777, **_: Any) -> int:
+        target = local(path)
+        if flags & os.O_CREAT and os.path.islink(target):
+            # The worst case: CREATE_NEW follows the link and creates its target.
+            return os.open(os.path.realpath(target), flags & ~os.O_EXCL, mode)
+        return os.open(target, flags, mode)
+
+    constants = {
+        name: getattr(os, name)
+        for name in dir(os)
+        if name.startswith("O_") and name != "O_NOFOLLOW"
+    }
+    seam = SimpleNamespace(
+        path=ntpath,
+        open=windows_open,
+        close=os.close,
+        fstat=os.fstat,
+        lstat=lambda p: os.lstat(local(p)),
+        stat=lambda p, **k: os.stat(local(p), **k),
+        link=lambda a, b, **k: os.link(local(a), local(b)),
+        unlink=lambda p, **k: os.unlink(local(p)),
+        supports_dir_fd=set(),
+        **constants,
+    )
+    monkeypatch.setattr(writer, "os", seam)
+    (base / "locks").mkdir()
+    target = base / "made-by-a-follow"
+    (base / "locks" / "gateway.lock").symlink_to(target)
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    with pytest.raises((FileExistsError, writer.PlainFileRefused)):
+        writer.open_plain_file(
+            "gateway.lock", parent="C:\\locks", dir_fd=None, flags=flags
+        )
+    assert not target.exists()
+    assert sorted(p.name for p in (base / "locks").iterdir()) == ["gateway.lock"]
+    # An absent name is created through the temp-and-link path.
+    (base / "locks" / "gateway.lock").unlink()
+    fd = writer.open_plain_file(
+        "gateway.lock", parent="C:\\locks", dir_fd=None, flags=flags
+    )
+    os.close(fd)
+    assert (base / "locks" / "gateway.lock").is_file()
+    assert os.lstat(base / "locks" / "gateway.lock").st_nlink == 1
+    assert sorted(p.name for p in (base / "locks").iterdir()) == ["gateway.lock"]
