@@ -157,21 +157,25 @@ _VERDICTS_MAX = 256
 
 def _signature(path: str, *, follow: bool) -> tuple[object, ...]:
     """What a later read must see for a verdict built on this one to stand:
-    identity, type and change time (a directory's changes on every entry
-    created, removed or renamed in it; a replaced link is a new inode)."""
+    the entry's identity and type, or the error reading it. No timestamp:
+    a filesystem need not update one (Windows reports creation time as
+    ``st_ctime``; network filesystems may be coarse), so none is evidence."""
     try:
         status = os.stat(path) if follow else os.lstat(path)
     except OSError as exc:
         return ("error", exc.errno)
-    return (status.st_dev, status.st_ino, status.st_mode, status.st_ctime_ns)
+    return (status.st_dev, status.st_ino, status.st_mode)
 
 
 def _directory_signature(directory: str) -> object:
-    """A directory's own entries, and those of the ``.pmcp`` directory a
-    ``.pmcp/manifest.yaml`` marker lives in (followed, as the kernel does)."""
+    """A directory examined for markers: its identity, and each marker path
+    looked up directly (present, with its identity, or absent)."""
     return (
         _signature(directory, follow=True),
-        _signature(os.path.join(directory, ".pmcp"), follow=True),
+        tuple(
+            _signature(os.path.join(directory, marker), follow=False)
+            for marker in CHECKOUT_MARKERS
+        ),
     )
 
 
@@ -201,10 +205,13 @@ def forget_home_verdicts() -> None:
 def _judge(spelled: str) -> _Verdict:
     """Rules 1-3 for ``spelled``; ``real`` is ``None`` unless all pass.
 
-    Cached per process: a verdict is reused only while everything it read --
-    each prefix's ``lstat``, HOME's ``stat``, every ``realpath`` and every
-    directory examined for markers -- still reads the same. A spelling that
-    is not plain, or that the system cannot resolve, is judged every time.
+    Cached per process: a verdict is reused only while everything it read
+    still reads the same -- each prefix's ``lstat`` (identity and type),
+    HOME's ``stat``, every ``realpath`` through a link, and for every
+    directory examined for markers its identity and a direct ``lstat`` of
+    each marker path. No timestamp is ever the evidence that a marker is
+    absent (Consiliency/pmcp#372 round 26). A spelling that is not plain, or
+    that the system cannot resolve, is judged every time.
     """
     key = (spelled, id(os), id(has_checkout_marker))
     hit = _VERDICTS.get(key)

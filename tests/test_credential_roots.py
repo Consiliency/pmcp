@@ -3697,3 +3697,62 @@ def test_the_cached_verdict_rereads_where_a_link_leads(
         monkeypatch.setattr(home_identity.os.path, "realpath", realpath)
 
     assert _accepted_then(monkeypatch, str(base / "alias"), bind_mounted) is False
+
+
+def _frozen_time_os(kind: str) -> Any:
+    """``os`` for home_identity whose stat results carry timestamps a
+    filesystem might report: ``windows`` -- ``st_ctime`` is the creation time
+    and ``st_mtime`` is not updated for a new entry; ``frozen`` -- every
+    timestamp fixed. Identity and type are real."""
+    from types import SimpleNamespace
+
+    def frozen(result: os.stat_result) -> Any:
+        fields = {
+            name: getattr(result, name)
+            for name in dir(result)
+            if name.startswith("st_")
+        }
+        for name in ("st_mtime", "st_mtime_ns", "st_atime", "st_atime_ns"):
+            fields[name] = 0
+        if kind == "frozen":
+            fields["st_ctime"] = fields["st_ctime_ns"] = 0
+        else:  # windows: ctime is the birth time, fixed at creation
+            fields["st_ctime_ns"] = getattr(result, "st_birthtime_ns", 1)
+            fields["st_ctime"] = fields["st_ctime_ns"] / 1e9
+        return SimpleNamespace(**fields)
+
+    return SimpleNamespace(
+        path=os.path,
+        fspath=os.fspath,
+        getcwd=os.getcwd,
+        environ=os.environ,
+        stat=lambda path, *a, **k: frozen(os.stat(path, *a, **k)),
+        lstat=lambda path, *a, **k: frozen(os.lstat(path, *a, **k)),
+    )
+
+
+@pytest.mark.parametrize("kind", ["windows", "frozen"])
+@pytest.mark.parametrize(
+    "marker", [".git", ".mcp.json", "package.json", "pyproject.toml", "pmcp-overlay"]
+)
+def test_a_marker_above_home_invalidates_whatever_the_timestamps(
+    kind: str, marker: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex round 25 F001: on Windows ``st_ctime`` is the creation time, so a
+    folder's timestamps need not change when a marker is created in it. The
+    cache must see the marker itself."""
+    from pmcp import home_identity
+
+    base = tmp_path.resolve()
+    (base / "x" / "home").mkdir(parents=True)
+    if marker == "pmcp-overlay":
+        (base / "x" / ".pmcp").mkdir()
+    monkeypatch.setattr(home_identity, "os", _frozen_time_os(kind))
+
+    def add() -> None:
+        if marker == "pmcp-overlay":
+            (base / "x" / ".pmcp" / "manifest.yaml").write_text("servers: {}\n")
+        else:
+            (base / "x" / marker).mkdir()
+
+    assert _accepted_then(monkeypatch, str(base / "x" / "home"), add) is False
