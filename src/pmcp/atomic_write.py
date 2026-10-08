@@ -73,6 +73,7 @@ import os
 import secrets
 import stat
 from pathlib import Path, PurePath
+from typing import Any
 
 #: Same bound the kernel applies to one path resolution (Linux MAXSYMLINKS).
 _MAX_LINK_HOPS = 40
@@ -733,43 +734,159 @@ def check_plain_file(fd: int, name: str, parent: str, dir_fd: int | None) -> Non
         raise PlainFileRefused(f"{name} changed while it was opened")
 
 
-def _create_by_link(
-    name: str, parent: str, dir_fd: int | None, flags: int, mode: int
+# --------------------------------------------------------------------------- #
+# Windows: the platform's own no-follow open (Consiliency/pmcp#372 round 35).
+# Windows has no O_NOFOLLOW, and CPython's os.open there neither opens a
+# reparse point as itself nor lets the file be deleted while open. CreateFileW
+# does both, per Microsoft's CreateFileW reference
+# (learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-createfilew):
+#   * FILE_FLAG_OPEN_REPARSE_POINT: "Normal reparse point processing will not
+#     occur; CreateFile will attempt to open the reparse point" -- a symlink or
+#     junction at the name is opened as itself, never followed ("If the file is
+#     not a reparse point, then this flag is ignored").
+#   * CREATE_NEW: "Creates a new file, only if it does not already exist. If the
+#     specified file exists, the function fails ... ERROR_FILE_EXISTS (80)."
+#     With the reparse-point flag the name itself is the object, so a dangling
+#     link or junction there exists and the call fails instead of creating its
+#     target.
+#   * FILE_SHARE_DELETE: "Enables subsequent open operations ... to request
+#     delete access" -- so holding the lock never stops another process from
+#     renaming or deleting the file.
+# The calls go through a small layer (kernel32, the last error, the handle to
+# fd conversion) that tests replace with a model of Windows.
+# --------------------------------------------------------------------------- #
+
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+FILE_SHARE_READ = 0x1
+FILE_SHARE_WRITE = 0x2
+FILE_SHARE_DELETE = 0x4
+CREATE_NEW = 1
+OPEN_EXISTING = 3
+FILE_ATTRIBUTE_DIRECTORY = 0x10
+FILE_ATTRIBUTE_NORMAL = 0x80
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+FILE_TYPE_DISK = 0x1
+ERROR_FILE_NOT_FOUND = 2
+ERROR_FILE_EXISTS = 80
+ERROR_ALREADY_EXISTS = 183
+
+#: A replacement for the Windows layer (tests); ``None``: the real one, on Windows.
+_WINDOWS_FILES: Any = None
+_REAL_WINDOWS_FILES: Any = None
+
+
+def _by_handle_information() -> Any:
+    import ctypes
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    return ByHandleFileInformation()
+
+
+def _windows_files() -> Any:
+    """The Windows file layer in use, or ``None`` off Windows."""
+    global _REAL_WINDOWS_FILES
+    if _WINDOWS_FILES is not None:
+        return _WINDOWS_FILES
+    if getattr(os, "name", "") != "nt":
+        return None
+    if _REAL_WINDOWS_FILES is None:  # pragma: no cover - Windows only
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        from types import SimpleNamespace
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.GetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_void_p,
+        ]
+        kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+        kernel32.GetFileType.argtypes = [wintypes.HANDLE]
+        kernel32.GetFileType.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        _REAL_WINDOWS_FILES = SimpleNamespace(
+            kernel32=kernel32,
+            get_last_error=ctypes.get_last_error,  # type: ignore[attr-defined]
+            open_osfhandle=msvcrt.open_osfhandle,  # type: ignore[attr-defined]
+            invalid_handle=ctypes.c_void_p(-1).value,
+        )
+    return _REAL_WINDOWS_FILES
+
+
+def _windows_error(code: int, name: str) -> OSError:
+    if code == ERROR_FILE_NOT_FOUND:
+        return FileNotFoundError(errno.ENOENT, f"{name} does not exist")
+    if code in (ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS):
+        return FileExistsError(errno.EEXIST, f"{name} exists")
+    return OSError(errno.EACCES, f"{name} could not be opened (Windows error {code})")
+
+
+def _open_windows(
+    layer: Any, path: str, name: str, *, write: bool, create: bool
 ) -> int:
-    """Create ``name`` where no ``O_NOFOLLOW`` is in use: a fresh file under a
-    random name (``O_CREAT|O_EXCL``, which never follows anything), then a hard
-    link to ``name`` -- ``link()`` fails on ANY existing name, a dangling link
-    or junction included -- then the temporary name removed. Raises
-    ``FileExistsError`` when ``name`` exists by then."""
-    tmp = f".{name}.{secrets.token_hex(8)}.new"
-    create = (
-        (flags & ~(os.O_RDONLY | os.O_WRONLY | os.O_RDWR))
-        | os.O_RDWR
-        | os.O_CREAT
-        | os.O_EXCL
-    )
-    if dir_fd is not None:
-        fd = os.open(tmp, create, mode, dir_fd=dir_fd)
-    else:
-        fd = os.open(os.path.join(parent, tmp), create, mode)
-    created = os.fstat(fd)
+    """Open ``path`` -- creating it only if absent -- as itself, never through a
+    reparse point; return a CRT descriptor for a plain regular file with one
+    name. ``FileExistsError`` when a creation race is lost."""
+    import ctypes
+
+    kernel32 = layer.kernel32
+    access = GENERIC_READ | (GENERIC_WRITE if write else 0)
+    share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT
+    invalid = (None, layer.invalid_handle)
+
+    handle = kernel32.CreateFileW(path, access, share, None, OPEN_EXISTING, flags, None)
+    if handle in invalid:
+        code = layer.get_last_error()
+        if code != ERROR_FILE_NOT_FOUND or not create:
+            raise _windows_error(code, name)
+        handle = kernel32.CreateFileW(
+            path, access, share, None, CREATE_NEW, flags, None
+        )
+        if handle in invalid:
+            raise _windows_error(layer.get_last_error(), name)
     try:
-        if dir_fd is not None:
-            os.link(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-        else:
-            os.link(os.path.join(parent, tmp), os.path.join(parent, name))
+        info = _by_handle_information()
+        if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+            raise _windows_error(layer.get_last_error(), name)
+        if (
+            info.dwFileAttributes
+            & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
+            or kernel32.GetFileType(handle) != FILE_TYPE_DISK
+            or info.nNumberOfLinks != 1
+        ):
+            raise PlainFileRefused(f"{name} is not a plain regular file")
+        fd: int = layer.open_osfhandle(handle, os.O_RDWR if write else os.O_RDONLY)
     except BaseException:
-        os.close(fd)
+        kernel32.CloseHandle(handle)
         raise
-    finally:
-        try:
-            if _same_file(_entry(tmp, parent, dir_fd), created):
-                if dir_fd is not None:
-                    os.unlink(tmp, dir_fd=dir_fd)
-                else:
-                    os.unlink(os.path.join(parent, tmp))
-        except OSError:
-            pass
     return fd
 
 
@@ -786,37 +903,52 @@ def open_plain_file(
     where given) and return its descriptor -- creating it only if absent, and
     never through a link on any platform.
 
-    ``flags`` are the access flags (``O_NOFOLLOW`` where the platform has it;
-    never ``O_CREAT``). An existing entry is opened without ``O_CREAT``. An
-    absent one is created exclusively: ``O_CREAT|O_EXCL|O_NOFOLLOW`` where
-    ``O_NOFOLLOW`` is in use, else by a hard link from a fresh temporary file
-    (:func:`_create_by_link`). Losing a creation race raises
-    ``FileExistsError``: the caller starts again. Anything but a plain regular
-    file with one name raises :class:`PlainFileRefused`.
+    ``flags`` are the access flags (never ``O_CREAT``).
+      * Windows: ``CreateFileW`` with ``FILE_FLAG_OPEN_REPARSE_POINT`` --
+        ``OPEN_EXISTING``, else ``CREATE_NEW`` (:func:`_open_windows`).
+      * POSIX: the existing entry is opened with ``O_NOFOLLOW`` (added here
+        whatever ``flags`` say); an absent one is created with
+        ``O_CREAT|O_EXCL``, which POSIX requires to fail on ANY existing name,
+        a symbolic link -- dangling or not -- included.
+      * Anything else: never created (refused).
+    Losing a creation race raises ``FileExistsError``: the caller starts again.
+    Anything but a plain regular file with one name raises
+    :class:`PlainFileRefused`.
     """
     path = os.path.join(parent, name)
-    nofollow = flags & getattr(os, "O_NOFOLLOW", 0)
-    try:
-        if dir_fd is not None:
-            fd = os.open(name, flags, mode, dir_fd=dir_fd)
-        else:
-            fd = os.open(path, flags, mode)
-    except FileNotFoundError:
-        if not create:
-            raise
-        # Absent -- or, without O_NOFOLLOW, a link to something absent: the
-        # exclusive create below fails on the link's name.
-        if nofollow:
+    windows = _windows_files()
+    if windows is not None:
+        fd = _open_windows(
+            windows,
+            path,
+            name,
+            write=bool(flags & (os.O_WRONLY | os.O_RDWR)),
+            create=create,
+        )
+        dir_fd = None
+    else:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
             if dir_fd is not None:
-                fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, mode, dir_fd=dir_fd)
+                fd = os.open(name, flags, mode, dir_fd=dir_fd)
             else:
-                fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, mode)
-        else:
-            fd = _create_by_link(name, parent, dir_fd, flags, mode)
-    except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO, errno.EMLINK):
-            raise PlainFileRefused(f"{name} is not a plain regular file") from exc
-        raise
+                fd = os.open(path, flags, mode)
+        except FileNotFoundError:
+            if not create:
+                raise
+            if getattr(os, "name", "") != "posix":
+                raise PlainFileRefused(
+                    f"{name} cannot be created without following a link on this platform"
+                ) from None
+            exclusive = flags | os.O_CREAT | os.O_EXCL
+            if dir_fd is not None:
+                fd = os.open(name, exclusive, mode, dir_fd=dir_fd)
+            else:
+                fd = os.open(path, exclusive, mode)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO, errno.EMLINK):
+                raise PlainFileRefused(f"{name} is not a plain regular file") from exc
+            raise
     try:
         check_plain_file(fd, name, parent, dir_fd)
     except BaseException:

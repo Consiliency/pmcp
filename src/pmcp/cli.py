@@ -2198,7 +2198,11 @@ async def run_doctor(args: argparse.Namespace) -> None:
     # The lock file persists between runs (Consiliency/pmcp#372 round 32): what
     # matters is whether a gateway HOLDS it, not whether it exists.
     lock_dir = optional_home_path(".pmcp")
-    state = singleton_lock_held(lock_dir) if lock_dir is not None else "absent"
+    state = (
+        singleton_lock_held(lock_dir, home_scoped=True)
+        if lock_dir is not None
+        else "absent"
+    )
     if state == "held":
         checks.append(
             (

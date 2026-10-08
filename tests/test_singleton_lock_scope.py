@@ -925,68 +925,480 @@ def test_a_store_sidecar_lock_never_creates_through_a_link(
         pass
 
 
-@posix_only
-def test_windows_creation_never_creates_through_a_link_even_if_create_new_followed(
+# --------------------------------------------------------------------------- #
+# Board round 34 (grok, codex, claude): the no-O_NOFOLLOW fallback created the
+# lock by hard-linking a temporary file and unlinking it while still open --
+# Windows refuses that delete (no FILE_SHARE_DELETE on os.open), leaving two
+# names so the lock was refused forever; and FAT has no hard links. Windows now
+# uses CreateFileW with FILE_FLAG_OPEN_REPARSE_POINT (OPEN_EXISTING, else
+# CREATE_NEW); POSIX creates with O_CREAT|O_EXCL, which POSIX requires to fail
+# on any existing name; anything else refuses to create.
+# --------------------------------------------------------------------------- #
+
+
+def test_grok_r34_f001_absent_lock_is_singly_linked_when_unlink_of_an_open_file_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """On an ntpath seam with no O_NOFOLLOW and no dir_fd -- whose ``open``
-    takes the WORST reading of CreateFile's CREATE_NEW and creates a dangling
-    link's target -- creating the lock file still never touches the target:
-    the exclusive create only ever names a fresh random temporary file, and the
-    lock name is reached by ``link()``, which fails on any existing name
-    (FILE_LINK_INFORMATION.ReplaceIfExists = FALSE)."""
-    import ntpath
-    from pathlib import PureWindowsPath
+    import errno
+
+    from pmcp.atomic_write import open_plain_file
+
+    parent = tmp_path / "plain-lock"
+    parent.mkdir()
+    real_unlink = os.unlink
+
+    def unlink(path: Any, *args: Any, **kwargs: Any) -> None:
+        st = os.lstat(path)
+        for entry in os.listdir("/proc/self/fd"):
+            try:
+                held = os.fstat(int(entry))
+            except OSError:
+                continue
+            if (held.st_dev, held.st_ino) == (st.st_dev, st.st_ino):
+                raise PermissionError(
+                    errno.EACCES,
+                    "The process cannot access the file because it is being used",
+                )
+        return real_unlink(path, *args, **kwargs)
+
+    if not Path("/proc/self/fd").is_dir():
+        pytest.skip("needs /proc/self/fd")
+    monkeypatch.setattr(os, "unlink", unlink)
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = open_plain_file(
+        "gateway.lock", parent=str(parent), dir_fd=None, flags=flags, mode=0o600
+    )
+    try:
+        assert os.fstat(fd).st_nlink == 1
+        assert sorted(p.name for p in parent.iterdir()) == ["gateway.lock"]
+        assert os.lstat(parent / "gateway.lock").st_nlink == 1
+    finally:
+        os.close(fd)
+
+
+def test_codex_r34_f001_windows_open_temporary_does_not_poison_singleton(
+    tmp_path: Path,
+) -> None:
+    import errno
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from pmcp import atomic_write, identity
+
+    active: set[int] = set()
+    windows_os = SimpleNamespace(**vars(os))
+
+    def tracked_open(*args: Any, **kwargs: Any) -> int:
+        fd = os.open(*args, **kwargs)
+        active.add(fd)
+        return fd
+
+    def tracked_close(fd: int) -> None:
+        active.discard(fd)
+        os.close(fd)
+
+    def windows_unlink(path: Any, **kwargs: Any) -> None:
+        named = os.stat(path, follow_symlinks=False, **kwargs)
+        for fd in active:
+            held = os.fstat(fd)
+            if (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino):
+                raise PermissionError(errno.EACCES, "Open handle denies deletion")
+        os.unlink(path, **kwargs)
+
+    windows_os.open = tracked_open
+    windows_os.close = tracked_close
+    windows_os.unlink = windows_unlink
+    flags = identity._OPEN_FLAGS & ~getattr(os, "O_NOFOLLOW", 0)
+    with (
+        patch.object(atomic_write, "os", windows_os),
+        patch.object(identity, "_OPEN_FLAGS", flags),
+        patch.object(identity, "_lock_dir_fd", lambda _: None),
+        patch.object(identity, "_LOCK_FD", None),
+        patch.object(identity, "_LOCK_FILE", None),
+    ):
+        try:
+            assert identity.acquire_singleton_lock(tmp_path) is True
+            assert sorted(p.name for p in tmp_path.iterdir()) == ["gateway.lock"]
+            assert (tmp_path / "gateway.lock").stat().st_nlink == 1
+        finally:
+            identity.release_singleton_lock()
+
+
+def test_codex_r34_f002_plain_lock_works_without_filesystem_hard_links(
+    tmp_path: Path,
+) -> None:
+    import errno
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from pmcp import atomic_write, identity
+
+    filesystem_os = SimpleNamespace(**vars(os))
+
+    def unsupported_link(*args: Any, **kwargs: Any) -> None:
+        raise OSError(errno.EOPNOTSUPP, "Filesystem does not support hard links")
+
+    filesystem_os.link = unsupported_link
+    flags = identity._OPEN_FLAGS & ~getattr(os, "O_NOFOLLOW", 0)
+    with (
+        patch.object(atomic_write, "os", filesystem_os),
+        patch.object(identity, "_OPEN_FLAGS", flags),
+        patch.object(identity, "_lock_dir_fd", lambda _: None),
+        patch.object(identity, "_LOCK_FD", None),
+        patch.object(identity, "_LOCK_FILE", None),
+    ):
+        try:
+            assert identity.acquire_singleton_lock(tmp_path) is True
+            assert (tmp_path / "gateway.lock").read_text() == str(os.getpid())
+        finally:
+            identity.release_singleton_lock()
+
+
+class _FakeKernel32:
+    """Windows, modelled over a real directory tree, for the ctypes calls
+    ``atomic_write._open_windows`` makes. What it models:
+
+    * a symlink at a name is opened AS ITSELF only with
+      FILE_FLAG_OPEN_REPARSE_POINT; without it the name is followed (and
+      CREATE_NEW / OPEN_ALWAYS through a dangling link create the target --
+      the reading the redesign must never depend on);
+    * CREATE_NEW fails (ERROR_FILE_EXISTS) on any existing name, a dangling
+      link included, when the name itself is the object;
+    * a pipe reports FILE_TYPE_PIPE; a directory FILE_ATTRIBUTE_DIRECTORY;
+    * every call is recorded with its flags, share mode and disposition.
+    """
+
+    def __init__(self) -> None:
+        import ctypes
+
+        self.calls: list[tuple[int, int, int, int]] = []
+        self.error = 0
+        self.kinds: dict[int, tuple[int, int]] = {}  # handle -> (attributes, type)
+        self.invalid = ctypes.c_void_p(-1).value
+        self.before_create_new: Any = None
+
+    def CreateFileW(  # noqa: N802 - the Win32 name
+        self,
+        path: str,
+        access: int,
+        share: int,
+        security: Any,
+        disposition: int,
+        flags: int,
+        template: Any,
+    ) -> int | None:
+        import stat as stat_module
+
+        from pmcp import atomic_write as w
+
+        self.calls.append((disposition, flags, share, access))
+        if disposition == w.CREATE_NEW and self.before_create_new is not None:
+            self.before_create_new()
+            self.before_create_new = None
+        target = path
+        as_itself = bool(flags & w.FILE_FLAG_OPEN_REPARSE_POINT)
+        if not as_itself and os.path.islink(target):
+            target = os.path.realpath(target)
+        exists = os.path.lexists(target)
+        if disposition == w.OPEN_EXISTING and not exists:
+            self.error = w.ERROR_FILE_NOT_FOUND
+            return self.invalid
+        if disposition == w.CREATE_NEW and exists:
+            self.error = w.ERROR_FILE_EXISTS
+            return self.invalid
+        if not exists:  # CREATE_NEW, or OPEN_ALWAYS on an absent name
+            try:
+                fd = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileNotFoundError:
+                self.error = 3  # ERROR_PATH_NOT_FOUND
+                return self.invalid
+            self.kinds[fd] = (w.FILE_ATTRIBUTE_NORMAL, w.FILE_TYPE_DISK)
+            return fd
+        seen = os.lstat(target)
+        if stat_module.S_ISLNK(seen.st_mode):
+            fd = os.open(target, os.O_PATH | os.O_NOFOLLOW)
+            self.kinds[fd] = (w.FILE_ATTRIBUTE_REPARSE_POINT, w.FILE_TYPE_DISK)
+        elif stat_module.S_ISDIR(seen.st_mode):
+            fd = os.open(target, os.O_RDONLY)
+            self.kinds[fd] = (w.FILE_ATTRIBUTE_DIRECTORY, w.FILE_TYPE_DISK)
+        elif stat_module.S_ISFIFO(seen.st_mode):
+            fd = os.open(target, os.O_RDONLY | os.O_NONBLOCK)
+            self.kinds[fd] = (w.FILE_ATTRIBUTE_NORMAL, 3)  # FILE_TYPE_PIPE
+        else:
+            mode = os.O_RDWR if access & w.GENERIC_WRITE else os.O_RDONLY
+            fd = os.open(target, mode)
+            self.kinds[fd] = (w.FILE_ATTRIBUTE_NORMAL, w.FILE_TYPE_DISK)
+        return fd
+
+    def GetFileInformationByHandle(self, handle: int, info: Any) -> int:  # noqa: N802
+        record = info._obj
+        record.dwFileAttributes = self.kinds[handle][0]
+        record.nNumberOfLinks = os.fstat(handle).st_nlink
+        return 1
+
+    def GetFileType(self, handle: int) -> int:  # noqa: N802
+        return self.kinds[handle][1]
+
+    def CloseHandle(self, handle: int) -> int:  # noqa: N802
+        self.kinds.pop(handle, None)
+        os.close(handle)
+        return 1
+
+
+def _windows_layer(
+    monkeypatch: pytest.MonkeyPatch, *, hard_links: bool = False
+) -> _FakeKernel32:
+    """Install the fake Windows layer, and Windows' delete rule (no unlink of
+    an entry while a handle to it is open) and -- for FAT -- no hard links."""
+    import errno
     from types import SimpleNamespace
 
-    import pmcp.atomic_write as writer
+    from pmcp import atomic_write, identity
+
+    kernel32 = _FakeKernel32()
+    layer = SimpleNamespace(
+        kernel32=kernel32,
+        get_last_error=lambda: kernel32.error,
+        open_osfhandle=lambda handle, _flags: handle,
+        invalid_handle=kernel32.invalid,
+    )
+    monkeypatch.setattr(atomic_write, "_WINDOWS_FILES", layer)
+    monkeypatch.setattr(identity, "_lock_dir_fd", lambda _d: None)  # no dir_fd
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    monkeypatch.setattr(identity, "_LOCK_FILE", None)
+    windows_os = SimpleNamespace(**vars(os))
+
+    def windows_unlink(path: Any, **kwargs: Any) -> None:
+        named = os.stat(path, follow_symlinks=False)
+        for handle in kernel32.kinds:
+            held = os.fstat(handle)
+            if (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino):
+                raise PermissionError(errno.EACCES, "sharing violation")
+        os.unlink(path)
+
+    windows_os.unlink = windows_unlink
+    if not hard_links:
+
+        def no_link(*_a: Any, **_k: Any) -> None:
+            raise OSError(errno.EOPNOTSUPP, "no hard links (FAT)")
+
+        windows_os.link = no_link
+    monkeypatch.setattr(atomic_write, "os", windows_os)
+    return kernel32
+
+
+def test_windows_creates_the_lock_with_the_no_follow_call_sequence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact Win32 calls: OPEN_EXISTING then CREATE_NEW, each with
+    FILE_FLAG_OPEN_REPARSE_POINT and sharing read, write AND delete; a second
+    start opens the existing file only. On FAT (no hard links), under the
+    delete rule."""
+    from pmcp import atomic_write as w
+    from pmcp import identity
+
+    kernel32 = _windows_layer(monkeypatch)
+    flags = w.FILE_ATTRIBUTE_NORMAL | w.FILE_FLAG_OPEN_REPARSE_POINT
+    share = w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE
+    access = w.GENERIC_READ | w.GENERIC_WRITE
+    try:
+        assert identity.acquire_singleton_lock(tmp_path) is True
+        assert kernel32.calls == [
+            (w.OPEN_EXISTING, flags, share, access),
+            (w.CREATE_NEW, flags, share, access),
+        ]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["gateway.lock"]
+        assert (tmp_path / "gateway.lock").read_text() == str(os.getpid())
+    finally:
+        identity.release_singleton_lock()
+    kernel32.calls.clear()
+    try:
+        assert identity.acquire_singleton_lock(tmp_path) is True
+        assert kernel32.calls == [(w.OPEN_EXISTING, flags, share, access)]
+    finally:
+        identity.release_singleton_lock()
+
+
+@pytest.mark.parametrize("shape", ["dangling", "to-a-file", "to-a-directory"])
+def test_windows_never_creates_or_opens_through_a_reparse_point(
+    shape: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    _windows_layer(monkeypatch)
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    target = tmp_path / "target"
+    if shape == "to-a-file":
+        target.write_bytes(b"keep\n")
+    elif shape == "to-a-directory":
+        target.mkdir()
+    (lock_dir / "gateway.lock").symlink_to(target)
+    before = _tree(tmp_path)
+    assert identity.acquire_singleton_lock(lock_dir) is False
+    assert identity.singleton_lock_held(lock_dir) == "unusable"
+    assert _tree(tmp_path) == before
+
+
+def test_windows_create_new_refuses_a_reparse_point_that_appears_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OPEN_EXISTING finds nothing; before CREATE_NEW a dangling link appears
+    at the name. CREATE_NEW fails on it (ERROR_FILE_EXISTS), the attempt
+    starts again, opens the link as itself and refuses it: nothing created."""
+    from pmcp import atomic_write as w
+    from pmcp import identity
+
+    kernel32 = _windows_layer(monkeypatch)
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    target = tmp_path / "made-by-a-follow"
+    kernel32.before_create_new = lambda: (lock_dir / "gateway.lock").symlink_to(target)
+    assert identity.acquire_singleton_lock(lock_dir) is False
+    assert not target.exists()
+    assert [c[0] for c in kernel32.calls[:3]] == [
+        w.OPEN_EXISTING,
+        w.CREATE_NEW,
+        w.OPEN_EXISTING,
+    ]
+
+
+@pytest.mark.parametrize("shape", ["two links", "fifo", "directory"])
+def test_windows_refuses_what_is_not_a_plain_file(
+    shape: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    lock = lock_dir / "gateway.lock"
+    if shape == "two links":
+        lock.write_bytes(b"shared\n")
+        os.link(lock, tmp_path / "other-name")
+    elif shape == "fifo":
+        os.mkfifo(lock)
+    else:
+        lock.mkdir()
+    _windows_layer(monkeypatch)
+    before = _tree(tmp_path)
+    assert _run_with_a_guard(lambda: identity.acquire_singleton_lock(lock_dir)) is False
+    assert _tree(tmp_path) == before
+
+
+def test_windows_holding_the_lock_lets_it_be_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FILE_SHARE_DELETE: another process (an older pmcp, the operator) can
+    still remove the file while a gateway holds it."""
+    from pmcp import atomic_write as w
+    from pmcp import identity
+
+    kernel32 = _windows_layer(monkeypatch)
+    try:
+        assert identity.acquire_singleton_lock(tmp_path) is True
+        assert all(call[2] & w.FILE_SHARE_DELETE for call in kernel32.calls)
+    finally:
+        identity.release_singleton_lock()
+
+
+def test_a_platform_with_neither_no_follow_primitive_never_creates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not POSIX, not Windows: no lock file is created at all (refused); an
+    existing plain one still opens."""
+    from types import SimpleNamespace
+
+    from pmcp import atomic_write, identity
+
+    other_os = SimpleNamespace(**vars(os))
+    other_os.name = "java"
+    del other_os.O_NOFOLLOW
+    monkeypatch.setattr(atomic_write, "os", other_os)
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    monkeypatch.setattr(identity, "_lock_dir_fd", lambda _d: None)
+    assert identity.acquire_singleton_lock(tmp_path) is False
+    assert list(tmp_path.iterdir()) == []
+    (tmp_path / "gateway.lock").write_text("")
+    try:
+        assert identity.acquire_singleton_lock(tmp_path) is True
+    finally:
+        identity.release_singleton_lock()
+
+
+# claude N-1: the DEFAULT lock directory ~/.pmcp may be the operator's own
+# link (dotfiles); it is followed only where the HOME gate's rules allow. An
+# explicit --lock-dir is never followed (a repository can supply it).
+
+
+def _home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    from pmcp import home_identity, identity
 
     base = tmp_path.resolve()
-
-    def local(path: str) -> str:
-        return str(base.joinpath(*PureWindowsPath(path).parts[1:]))
-
-    def windows_open(path: str, flags: int, mode: int = 0o777, **_: Any) -> int:
-        target = local(path)
-        if flags & os.O_CREAT and os.path.islink(target):
-            # The worst case: CREATE_NEW follows the link and creates its target.
-            return os.open(os.path.realpath(target), flags & ~os.O_EXCL, mode)
-        return os.open(target, flags, mode)
-
-    constants = {
-        name: getattr(os, name)
-        for name in dir(os)
-        if name.startswith("O_") and name != "O_NOFOLLOW"
-    }
-    seam = SimpleNamespace(
-        path=ntpath,
-        open=windows_open,
-        close=os.close,
-        fstat=os.fstat,
-        lstat=lambda p: os.lstat(local(p)),
-        stat=lambda p, **k: os.stat(local(p), **k),
-        link=lambda a, b, **k: os.link(local(a), local(b)),
-        unlink=lambda p, **k: os.unlink(local(p)),
-        supports_dir_fd=set(),
-        **constants,
+    home = base / "home"
+    home.mkdir()
+    original_marker = home_identity.has_checkout_marker
+    ambient = set(base.parents)
+    monkeypatch.setattr(
+        home_identity,
+        "has_checkout_marker",
+        lambda d: False if Path(d) in ambient else original_marker(d),
     )
-    monkeypatch.setattr(writer, "os", seam)
-    (base / "locks").mkdir()
-    target = base / "made-by-a-follow"
-    (base / "locks" / "gateway.lock").symlink_to(target)
-    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-    with pytest.raises((FileExistsError, writer.PlainFileRefused)):
-        writer.open_plain_file(
-            "gateway.lock", parent="C:\\locks", dir_fd=None, flags=flags
-        )
-    assert not target.exists()
-    assert sorted(p.name for p in (base / "locks").iterdir()) == ["gateway.lock"]
-    # An absent name is created through the temp-and-link path.
-    (base / "locks" / "gateway.lock").unlink()
-    fd = writer.open_plain_file(
-        "gateway.lock", parent="C:\\locks", dir_fd=None, flags=flags
-    )
-    os.close(fd)
-    assert (base / "locks" / "gateway.lock").is_file()
-    assert os.lstat(base / "locks" / "gateway.lock").st_nlink == 1
-    assert sorted(p.name for p in (base / "locks").iterdir()) == ["gateway.lock"]
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    monkeypatch.setattr(identity, "_LOCK_FILE", None)
+    home_identity.forget_home_verdicts()
+    return home
+
+
+def test_an_operator_linked_dot_pmcp_holds_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    home = _home(tmp_path, monkeypatch)
+    state = home.parent / "state" / "pmcp"
+    state.mkdir(parents=True)
+    (home / ".pmcp").symlink_to(state, target_is_directory=True)
+    try:
+        assert identity.acquire_singleton_lock() is True
+        assert (state / "gateway.lock").read_text() == str(os.getpid())
+        assert identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "held"
+    finally:
+        identity.release_singleton_lock()
+    assert identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "free"
+
+
+@pytest.mark.parametrize("into", ["a checkout", "a link a checkout holds"])
+def test_a_dot_pmcp_that_leads_into_a_checkout_is_refused(
+    into: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    home = _home(tmp_path, monkeypatch)
+    repo = home.parent / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "state").mkdir()
+    if into == "a checkout":
+        (home / ".pmcp").symlink_to(repo / "state", target_is_directory=True)
+    else:
+        outside = home.parent / "outside"
+        outside.mkdir()
+        (repo / "out").symlink_to(outside, target_is_directory=True)
+        (home / ".pmcp").symlink_to(repo / "out", target_is_directory=True)
+    before = _tree(home.parent)
+    assert identity.acquire_singleton_lock() is False
+    assert _tree(home.parent) == before
+    assert identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "unusable"
+
+
+def test_an_explicit_lock_dir_that_is_a_link_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    home = _home(tmp_path, monkeypatch)
+    state = home.parent / "state"
+    state.mkdir()
+    (home.parent / "linked").symlink_to(state, target_is_directory=True)
+    assert identity.acquire_singleton_lock(home.parent / "linked") is False
+    assert list(state.iterdir()) == []

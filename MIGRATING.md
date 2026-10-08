@@ -1387,7 +1387,9 @@ pmcp doctor
 **What changed.** 3.0 never removes the singleton lock file `~/.pmcp/gateway.lock`:
 a lock is held only by a running gateway and dies with it, so a leftover file is
 harmless and never blocks a start. 3.0 also refuses a lock path that is a link, a
-fifo, a directory or a file with other names. 2.7.3 removed the file when it shut
+fifo, a directory or a file with other names. A symlinked `~/.pmcp` (dotfiles) is
+still used when it leads outside every checkout; an explicit `--lock-dir` that is
+itself a symlink is refused. 2.7.3 removed the file when it shut
 down. While a 2.7.3 gateway still runs beside a 3.0 one, its shutdown can delete
 the 3.0 gateway's live lock file, and a third start then creates a fresh file and
 runs as well -- two gateways at once. The guarantee holds again once every running

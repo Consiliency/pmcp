@@ -11,6 +11,7 @@ import os
 import stat
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
@@ -238,12 +239,41 @@ def _lock_dir_fd(lock_dir: Path) -> int | None:
         return None
 
 
+#: A reparse point that names another entry (symlink, junction, mount point).
+_NAME_SURROGATE = 0x20000000
+
+
+def _is_link(seen: os.stat_result) -> bool:
+    tag: int = getattr(seen, "st_reparse_tag", 0) or 0
+    return stat.S_ISLNK(seen.st_mode) or bool(tag & _NAME_SURROGATE)
+
+
+def _physical_lock_dir(lock_dir: Path, home_scoped: bool) -> Path | None:
+    """The directory the lock lives in. An explicit ``--lock-dir`` is used as
+    spelled, and a link there is refused later (a repository can supply that
+    path). The default ``~/.pmcp`` may be the operator's own link (dotfiles):
+    it is followed only to where the HOME gate's rules say it physically is
+    -- no checkout holding a link on the way, none above the place it lands
+    (Consiliency/pmcp#372 round 35). ``None``: refused."""
+    if not home_scoped:
+        return lock_dir
+    try:
+        seen = os.lstat(lock_dir)
+    except OSError:
+        return None
+    if not _is_link(seen):
+        return lock_dir
+    from pmcp.home_identity import operator_location
+
+    return operator_location(lock_dir)
+
+
 def _directory_at(lock_dir: Path, directory: int | None) -> tuple[int, int] | None:
     """The lock directory at its PATHNAME: a real directory (not a link), and
     -- where one is held -- the very directory ``directory`` is. Its identity,
     or ``None`` when the pathname names something else now."""
     seen = os.lstat(lock_dir)
-    if stat.S_ISLNK(seen.st_mode) or not stat.S_ISDIR(seen.st_mode):
+    if _is_link(seen) or not stat.S_ISDIR(seen.st_mode):
         raise LockFileRefused(f"{lock_dir.name} is not a plain directory")
     if directory is not None:
         held = os.fstat(directory)
@@ -304,6 +334,7 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
         logger.debug("Already holding singleton lock")
         return False
 
+    home_scoped = lock_dir is None
     if lock_dir is None:
         # Home-scoped (Consiliency/pmcp#372 round 22): refused while a
         # checkout controls the home directory.
@@ -317,11 +348,23 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
     lock_file = lock_dir / _LOCK_NAME
     _LOCK_FILE = lock_file
     for _attempt in range(_ACQUIRE_ATTEMPTS):
+        physical = _physical_lock_dir(lock_dir, home_scoped)
+        if physical is None:
+            logger.warning(
+                f"Refusing the singleton lock directory {lock_dir}: it leads into "
+                "a checkout, or cannot be resolved"
+            )
+            return False
         # Every attempt starts again from opening the DIRECTORY: a retry never
         # trusts a directory descriptor an earlier attempt opened.
-        directory = _lock_dir_fd(lock_dir)
+        directory = _lock_dir_fd(physical)
         try:
-            outcome = _attempt_acquire(lock_dir, lock_file, directory)
+            outcome = _attempt_acquire(
+                physical,
+                physical / _LOCK_NAME,
+                directory,
+                lambda: _physical_lock_dir(lock_dir, home_scoped) == physical,
+            )
         finally:
             if directory is not None:
                 os.close(directory)
@@ -332,7 +375,10 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
 
 
 def _attempt_acquire(
-    lock_dir: Path, lock_file: Path, directory: int | None
+    lock_dir: Path,
+    lock_file: Path,
+    directory: int | None,
+    still_leads_here: Callable[[], bool] = lambda: True,
 ) -> bool | None:
     """One attempt: True/False decided, ``None`` to start again."""
     global _LOCK_FD
@@ -393,7 +439,10 @@ def _attempt_acquire(
         fd.close()
         return True
 
-    if not _still_the_lock(fd, lock_dir, lock_file, directory, directory_seen):
+    if not (
+        still_leads_here()
+        and _still_the_lock(fd, lock_dir, lock_file, directory, directory_seen)
+    ):
         # Held a lock on something the path no longer names, in a
         # directory the path no longer names, or on a file that gained a
         # name: not the singleton. Start again from the directory.
@@ -437,7 +486,7 @@ def release_singleton_lock() -> None:
             pass
 
 
-def singleton_lock_held(lock_dir: Path) -> str:
+def singleton_lock_held(lock_dir: Path, *, home_scoped: bool = False) -> str:
     """The lock in ``lock_dir``, for ``pmcp doctor``: ``"absent"``, ``"free"``,
     ``"held"`` by a running gateway, or ``"unusable"`` (not a plain regular
     file in a plain directory; a gateway refuses it).
@@ -446,6 +495,10 @@ def singleton_lock_held(lock_dir: Path) -> str:
     following a link, never writing -- tries a non-blocking lock released at
     once, and checks the same preconditions a gateway does.
     """
+    physical = _physical_lock_dir(lock_dir, home_scoped)
+    if physical is None:
+        return "absent" if not os.path.lexists(lock_dir) else "unusable"
+    lock_dir = physical
     lock_file = lock_dir / _LOCK_NAME
     try:
         directory_seen = _directory_at(lock_dir, None)

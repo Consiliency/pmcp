@@ -400,6 +400,20 @@ def home_is_operators() -> bool:
     return _judge(_home_spelling()).real is not None
 
 
+def operator_location(path: os.PathLike[str] | str) -> Path | None:
+    """Where ``path`` physically is, judged by the rules HOME is judged by --
+    a plain absolute spelling the system resolves, every link on the way held
+    outside every checkout, no physical ancestor a checkout -- or ``None``.
+
+    For an operator's link under HOME (``~/.pmcp -> /data/pmcp``): the place
+    it leads is the operator's only if no checkout controls the way there
+    (Consiliency/pmcp#372 round 35). Not cached beyond the verdict cache,
+    which revalidates every read.
+    """
+    real = _judge(os.fspath(path)).real
+    return None if real is None else Path(real)
+
+
 def examinable_home() -> Path | None:
     """HOME's physical directory while HOME is the operator's, else ``None``."""
     real = _judge(_home_spelling()).real
