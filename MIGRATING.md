@@ -786,20 +786,22 @@ export the token, a confirmed call returns `"submitted": false` and a message
 naming `PMCP_FEEDBACK_TOKEN`. After you export it, the call reports
 `submission_outcome: "created"` and an `issue_url`.
 
-If the call is refused with `untrusted_token`, a file pmcp loads is involved, in one of
-two ways:
+If the call is refused with `untrusted_token`, pmcp has found that one of its files lists
+the key or supplied the value:
 
-- **A pmcp store lists the key.** The served checkout's `.env.pmcp` or
-  `~/.config/pmcp/pmcp.env` names `PMCP_FEEDBACK_TOKEN`. Either one blocks whenever it
-  lists the key, even if you exported the value yourself, so a checkout whose
-  `.env.pmcp` merely lists it blocks submission. Remove the key from that file.
-- **Your startup `.env` supplied the value.** pmcp loads a `.env` at startup from your
-  home directory or one of its ancestors (`~/.env` for a `uv tool` or `pip --user`
-  install), and never overrides a variable that is already set. That file blocks only
-  when the process that started the gateway, often your MCP client rather than your
-  shell, did not have the token exported, so the value came from the file. Export it in
-  the environment that starts pmcp and restart the gateway. Editing the file does not
-  help a gateway that is already running, which keeps refusing until it restarts.
+- the served checkout's `.env.pmcp` or `~/.config/pmcp/pmcp.env` lists
+  `PMCP_FEEDBACK_TOKEN`. Either file blocks whenever it lists the key, even if you
+  exported the value yourself;
+- the `.env` pmcp loads at startup from your home directory or one of its ancestors
+  (`~/.env` for a `uv tool` or `pip --user` install) supplied the value. This happens
+  only when the process that started the gateway, often your MCP client rather than
+  your shell, did not have the token exported.
+
+To fix either case:
+1. Remove the key from `.env.pmcp` and `pmcp.env`.
+2. Export the token in the environment that starts pmcp.
+3. Restart the gateway. A running gateway remembers which names its files supplied and
+   keeps refusing until it restarts.
 
 A checkout's plain `.env` never supplies the key and doesn't block.
 
