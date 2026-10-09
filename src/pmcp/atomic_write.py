@@ -120,6 +120,17 @@ class ConfinedWriteError(PermissionError):
 # --------------------------------------------------------------------------- #
 
 
+def names_a_directory(spelling: str) -> bool:
+    """Does the spelling itself say "a directory"? A trailing separator, or a
+    final ``.`` / ``..`` component, makes the kernel require a directory --
+    and ``Path()``/``normpath`` silently drop exactly that (Consiliency/pmcp#372
+    round 40). A FILE's spelling that says so is refused, never normalised."""
+    separators = tuple(sep for sep in (os.sep, os.altsep) if sep)
+    if spelling.endswith(separators):
+        return True
+    return os.path.basename(spelling) in (os.curdir, os.pardir)
+
+
 def resolve_write_target(path: Path | str) -> str:
     """The pathname an unconfined write of ``path`` replaces: its final link chain.
 
@@ -141,6 +152,10 @@ def resolve_write_target(path: Path | str) -> str:
     except FileNotFoundError:
         pass  # absent target: the chain below names the file to create
     for _hop in range(_MAX_LINK_HOPS + 1):
+        if names_a_directory(current):
+            # A link text such as `not-yet/.` or `x/`: a file is never
+            # created or replaced there, dangling or not.
+            raise IsADirectoryError(errno.EISDIR, "names a directory", current)
         try:
             st = os.lstat(current)
         except FileNotFoundError:
@@ -172,6 +187,8 @@ def open_final_directory(path: Path | str) -> tuple[int, str]:
         os.stat(spelled)
     except FileNotFoundError:
         pass  # absent target: the chain below names the file to create
+    if names_a_directory(spelled):
+        raise IsADirectoryError(errno.EISDIR, "names a directory", spelled)
     fd = open_directory(os.path.dirname(spelled) or os.curdir)
     name = os.path.basename(spelled)
     handed_over = False

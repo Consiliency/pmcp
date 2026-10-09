@@ -2224,3 +2224,162 @@ def test_a_folder_swapped_between_its_check_and_its_open_is_refused(
     monkeypatch.setattr(trust_store, "open_directory", open_elsewhere)
     assert identity.acquire_singleton_lock() is False
     assert not (outside / "gateway.lock").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Board round 39, codex F001: Path() dropped a trailing `/.` from a link's
+# target, so trust.json -> not-yet/. made record() create regular files
+# `not-yet` and `not-yet.lock` and report success. A spelling that says "a
+# directory" (a trailing separator, or a final `.` / `..`) is refused for any
+# FILE leaf before anything is created (atomic_write.names_a_directory, in the
+# writer's own chain follower).
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_r39_f001_trust_store_rejects_directory_suffixed_link() -> None:
+    import sys
+    import tempfile
+    from unittest import TestCase
+    from unittest.mock import patch
+
+    root = Path(__file__).resolve().parents[1]
+    with patch.object(sys, "path", [str(root / "src"), *sys.path]):
+        from pmcp import atomic_write, home_identity, trust_store
+
+    marker = home_identity.has_checkout_marker
+    cwd = Path.cwd()
+    with tempfile.TemporaryDirectory(dir=root) as temporary:
+        base = Path(temporary)
+        home = base / "home"
+        store_dir = home / ".config" / "pmcp"
+        store_dir.mkdir(parents=True)
+        project = base / "project"
+        project.mkdir()
+        config = project / ".mcp.json"
+        config.write_bytes(b"{}")
+        link = store_dir / "trust.json"
+        link.symlink_to("not-yet/.")
+        ambient = set(base.parents)
+        with (
+            patch.dict(os.environ, HOME=str(home), USERPROFILE=str(home)),
+            patch.object(
+                home_identity,
+                "has_checkout_marker",
+                lambda p: False if Path(p) in ambient else marker(p),
+            ),
+            patch.object(trust_store, "_LAUNCH_DIRECTORY", None),
+            patch.object(trust_store, "_active_project_root", None),
+        ):
+            try:
+                os.chdir(home)
+                home_identity.forget_home_verdicts()
+                with TestCase().assertRaises(OSError):
+                    atomic_write.atomic_write(link, b"{}", confine_to=None)
+                assert not (store_dir / "not-yet").exists()
+                with TestCase().assertRaises(trust_store.TrustStoreError):
+                    trust_store.record(
+                        config, b"{}", trust_store.PROJECT_SCOPE, trust_store.APPROVED
+                    )
+                assert not (store_dir / "not-yet").exists()
+                assert not (store_dir / "not-yet.lock").exists()
+            finally:
+                os.chdir(cwd)
+                home_identity.forget_home_verdicts()
+
+
+_FILE_LEAVES = [
+    ".config/pmcp/trust.json",
+    ".config/pmcp/package_approvals.json",
+    ".pmcp/gateway.lock",
+    ".config/pmcp/trust.json.lock",
+    ".config/pmcp/package_approvals.json.lock",
+    ".config/pmcp/pmcp.env",
+]
+
+
+@pytest.mark.parametrize("dir_fd", [True, False], ids=["dir_fd", "pathname"])
+@pytest.mark.parametrize("existing", [False, True], ids=["dangling", "existing"])
+@pytest.mark.parametrize("ending", ["/", "/.", "//"])
+@pytest.mark.parametrize("leaf", _FILE_LEAVES)
+def test_a_file_leaf_linked_to_a_directory_spelling_is_refused(
+    leaf: str,
+    ending: str,
+    existing: bool,
+    dir_fd: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each home-scoped FILE: a link whose text ends in `/`, `/.` or `//` --
+    to a folder that exists or not -- is refused; nothing is created, and no
+    `.lock` sidecar appears."""
+    from pmcp import env_store, identity, package_approvals, trust_store
+    from pmcp.manifest.package_identity import PackageIdentity
+
+    from pmcp import atomic_write
+
+    home, _outside = _audit_home(tmp_path, monkeypatch)
+    monkeypatch.setattr(env_store, "_PINNED_USER_STORE", None)
+    if not dir_fd:
+        monkeypatch.setattr(atomic_write, "_DIR_FD_SUPPORTED", False)
+    folder = home / leaf.rsplit("/", 1)[0]
+    if existing:
+        (folder / "target").mkdir()
+    (home / leaf).symlink_to("target" + ending)
+    project = tmp_path.resolve() / "project"
+    project.mkdir()
+    (project / ".mcp.json").write_bytes(b"{}")
+    before = _tree(home)
+
+    def refused(action: Any) -> bool:
+        try:
+            result = action()
+        except (OSError, trust_store.TrustStoreError):
+            return True
+        return result is False
+
+    if leaf.endswith("gateway.lock"):
+        assert refused(identity.acquire_singleton_lock)
+    elif leaf.endswith("trust.json") or leaf.endswith("trust.json.lock"):
+        assert refused(
+            lambda: trust_store.record(
+                project / ".mcp.json",
+                b"{}",
+                trust_store.PROJECT_SCOPE,
+                trust_store.APPROVED,
+            )
+        )
+    elif "package_approvals" in leaf:
+        assert refused(
+            lambda: package_approvals.approve_package(
+                PackageIdentity("npm", "x-mcp", "1.0.0", None)
+            )
+        )
+    else:
+        assert refused(lambda: env_store.set_env_value("user", "LEAF_372", "x"))
+    assert _tree(home) == before
+    assert not list(home.rglob("*.lock")) or all(
+        p.is_symlink() for p in home.rglob("*.lock")
+    )
+
+
+def test_a_dangling_dot_pmcp_says_to_create_the_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """claude round 39: the refusal tells the operator what to do, naming
+    the link (~/.pmcp) and never the place it points to."""
+    import logging
+
+    from pmcp import identity
+
+    home, outside = _audit_home(tmp_path, monkeypatch)
+    (home / ".pmcp").rmdir()
+    target = outside / "pmcp-state-not-created"
+    (home / ".pmcp").symlink_to(target, target_is_directory=True)
+    with caplog.at_level(logging.WARNING, logger="pmcp.identity"):
+        assert identity.acquire_singleton_lock() is False
+    text = caplog.text
+    assert "is a link to a folder that does not exist" in text
+    assert "create the folder it points to" in text
+    assert str(home / ".pmcp") in text
+    assert "pmcp-state-not-created" not in text
+    assert not target.exists()

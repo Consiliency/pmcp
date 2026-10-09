@@ -363,9 +363,16 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
     except OSError as e:
         # ~/.pmcp exists but is not a directory, or cannot be made: refused,
         # value-free, like any other unusable lock path.
-        logger.warning(
-            f"Refusing the singleton lock directory {lock_dir}: {e.strerror}"
-        )
+        if os.path.islink(lock_dir) and not os.path.exists(lock_dir):
+            # A link to a folder not created yet: say so, naming the link only.
+            logger.warning(
+                f"Refusing the singleton lock directory {lock_dir}: it is a link to "
+                "a folder that does not exist; create the folder it points to"
+            )
+        else:
+            logger.warning(
+                f"Refusing the singleton lock directory {lock_dir}: {e.strerror}"
+            )
         return False
     lock_file = lock_dir / _LOCK_NAME
     _LOCK_FILE = lock_file
