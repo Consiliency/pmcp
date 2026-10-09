@@ -786,12 +786,13 @@ export the token, a confirmed call returns `"submitted": false` and a message
 naming `PMCP_FEEDBACK_TOKEN`. After you export it, the call reports
 `submission_outcome: "created"` and an `issue_url`.
 
-If the call is still refused with `untrusted_token` after you export the token, one
-of pmcp's stores lists `PMCP_FEEDBACK_TOKEN`: the served checkout's `.env.pmcp` or
-`~/.config/pmcp/pmcp.env`. pmcp won't post under a name a store could have supplied,
-even if you exported the value yourself, so a checkout whose `.env.pmcp` merely lists
-the key blocks submission. Remove the key from that file. A plain `.env` never
-supplies it and doesn't block.
+If the call is still refused with `untrusted_token` after you export the token, a file
+pmcp loads lists `PMCP_FEEDBACK_TOKEN`. It is one of the served checkout's `.env.pmcp`,
+`~/.config/pmcp/pmcp.env`, or the `.env` pmcp loads at startup from your home directory
+or one of its ancestors (`~/.env` for a `uv tool` or `pip --user` install). pmcp won't
+post under a name such a file could have supplied, even if you exported the value
+yourself, so a checkout whose `.env.pmcp` merely lists the key blocks submission. Remove
+the key from that file. A checkout's plain `.env` never supplies it and doesn't block.
 
 ### Auth URLs must be canonical
 
