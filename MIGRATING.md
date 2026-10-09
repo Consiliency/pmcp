@@ -728,7 +728,7 @@ pmcp status --policy ~/.claude/gateway-policy.yaml 2>&1 | head -n 3
 ```
 
 An invalid file fails with `Fatal error: Failed to load explicit policy …` and
-names the bad entry (`package pattern 'evil-pkg@1.2.3' names a version`). Pass
+names the list holding the bad entry, not its value (`$.packages.denylist: a package pattern names a version; …`). Pass
 `--policy` after `status`: the gateway's own `--policy` before a subcommand
 does not reach `status`. Once the file
 is valid, provisioning a denied manifest server returns `"auth_state":
@@ -927,19 +927,19 @@ with an `{"error": true, …}` JSON payload instead. Some cases checked on 3.0:
 
 | Call | 2.7.3 | 3.0 |
 |---|---|---|
-| `gateway.invoke` with `task: {"enabled": 1}` | accepted, coerced to `true` | `Input validation error: 1 is not of type 'boolean'` |
-| `gateway.invoke` with `task: {"enabled": true, "ttl": "5"}` | accepted, coerced to `5` | `Input validation error: '5' is not of type 'integer', 'null'` |
-| `gateway.describe` with `tool_id: ""` | reached the handler | `Input validation error: '' should be non-empty` |
-| `gateway.submit_feedback` with a 5-character title | reached the handler | `Input validation error: 'short' is too short` (titles are 8–160 characters) |
+| `gateway.invoke` with `task: {"enabled": 1}` | accepted, coerced to `true` | `Input validation error: $.task.enabled: must be of type boolean` |
+| `gateway.invoke` with `task: {"enabled": true, "ttl": "5"}` | accepted, coerced to `5` | `Input validation error: $.task.ttl: must be of type integer or null` |
+| `gateway.describe` with `tool_id: ""` | reached the handler | `Input validation error: $.tool_id: must be at least 1 character` |
+| `gateway.submit_feedback` with a 5-character title | reached the handler | `Input validation error: $.title: must be at least 8 characters` (titles are 8–160 characters) |
 | `gateway.catalog_search` with `query: null` | `Input validation error: None is not of type 'string'` | accepted |
 
-<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": 1}}} => 1 is not of type 'boolean' -->
-<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": "5"}}} => '5' is not of type 'integer', 'null' -->
-<!-- gate-case: {"name": "gateway.describe", "arguments": {"tool_id": ""}} => '' should be non-empty -->
-<!-- gate-case: {"name": "gateway.submit_feedback", "arguments": {"title": "short", "description": "x"}} => 'short' is too short -->
+<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": 1}}} => $.task.enabled: must be of type boolean -->
+<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": "5"}}} => $.task.ttl: must be of type integer or null -->
+<!-- gate-case: {"name": "gateway.describe", "arguments": {"tool_id": ""}} => $.tool_id: must be at least 1 character -->
+<!-- gate-case: {"name": "gateway.submit_feedback", "arguments": {"title": "short", "description": "x"}} => $.title: must be at least 8 characters -->
 <!-- gate-case: {"name": "gateway.catalog_search", "arguments": {"query": null}} => accepted -->
-<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": 0}}} => 0 is less than the minimum of 1 -->
-<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "poll_interval": NaN}}} => nan is not of type 'number', 'null' -->
+<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": 0}}} => $.task.ttl: must be greater than or equal to 1 -->
+<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "poll_interval": NaN}}} => $.task.poll_interval: must be of type number or null -->
 <!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": 300}}} => accepted -->
 
 An explicit `null` for any optional argument is now accepted; 28 arguments
@@ -981,7 +981,7 @@ accepts:
 
 and the shape it now refuses:
 
-<!-- snippet: tools-call-rejected reason="1 is not of type 'boolean'" path="task.enabled" -->
+<!-- snippet: tools-call-rejected reason="$.task.enabled: must be of type boolean" path="task.enabled" -->
 ```json
 {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": 1, "ttl": 300}}}
 ```
@@ -1001,8 +1001,8 @@ or use a downstream server that supports MCP tasks.
 and at most 9,007,199,254,740 (so the milliseconds pmcp sends stay within
 2^53−1; see the next section). Zero,
 negative values, `NaN` and `±Infinity` are refused at the gate:
-`Input validation error: 0 is less than the minimum of 1`, or
-`nan is not of type 'number', 'null'`. Both transports can deliver `NaN` and
+`Input validation error: $.task.ttl: must be greater than or equal to 1`, or
+`$.task.poll_interval: must be of type number or null`. Both transports can deliver `NaN` and
 `Infinity`, and the gate treats them as non-numbers for every numeric
 argument. pmcp no longer sends a downstream anything that is not strict JSON:
 a request whose `arguments` contain `NaN` fails with `outbound frame is not
@@ -1020,9 +1020,9 @@ something unusable". A `null` `ttl` that is *not* listed there still means
 **How to verify.** A task call with `"ttl": 300` is accepted, one with
 `"ttl": 0` returns `isError` with `Input validation error`, and one with
 `"ttl": 9007199254741` returns
-`Input validation error: 9007199254741 is greater than the maximum of 9007199254740`.
+`Input validation error: $.task.ttl: must be less than or equal to 9007199254740`.
 
-<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": 9007199254741}}} => 9007199254741 is greater than the maximum of 9007199254740 -->
+<!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": 9007199254741}}} => $.task.ttl: must be less than or equal to 9007199254740 -->
 
 ### Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire
 

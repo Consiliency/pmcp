@@ -13,7 +13,6 @@ from pathlib import Path
 import random
 import re
 import signal
-import traceback
 import string
 import time
 from collections import deque
@@ -29,10 +28,18 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
 from pydantic import ValidationError
 
+from pmcp.argument_errors import (
+    describe_value,
+    exception_text,
+    jsonrpc_envelope_problem,
+    safe_traceback_text,
+    install_log_scrubber,
+)
 from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
 from pmcp.env_store import bind_project_root, sanitized_subprocess_env
 from pmcp.manifest.installer import _operator_safe, _render_install_argv
+from pmcp.parsing import load_json
 from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
     resolve_remote_headers_for_tenant,
@@ -75,6 +82,9 @@ except ImportError:
     HAS_RESOURCE = False
 
 logger = logging.getLogger(__name__)
+# The SDK logs rejected frames with a traceback (Consiliency/pmcp#297); every
+# record is scrubbed at creation (`install_log_scrubber`).
+install_log_scrubber()
 
 
 def _lazy_log_name(config: ResolvedServerConfig) -> str:
@@ -154,7 +164,9 @@ def describe_exception(exc: BaseException) -> str:
 
     shown = leaves[:_MAX_DESCRIBED_LEAVES]
     rendered = "; ".join(
-        f"{type(leaf).__name__}: {leaf}" if str(leaf) else type(leaf).__name__
+        f"{type(leaf).__name__}: {exception_text(leaf)}"
+        if str(leaf)
+        else type(leaf).__name__
         for leaf in shown
     )
     if len(leaves) > len(shown):
@@ -279,9 +291,7 @@ def _log_abandoned_owner_failure(name: str, task: asyncio.Future[Any]) -> None:
         return
     # Formatted and sanitised rather than passed as `exc_info=`: `exc_info`
     # appends the unredacted exception tree after the sanitised message.
-    traceback_text = "".join(
-        traceback.format_exception(type(exc), exc, exc.__traceback__)
-    )
+    traceback_text = safe_traceback_text(exc)
     logger.warning(
         f"[{name}] remote transport failed to unwind after our caller's "
         f"cancellation: {describe_exception(exc)}\n"
@@ -391,15 +401,154 @@ class DownstreamError(Exception):
         self.data = data
 
 
+#: JSON-RPC's parse-error code. The SDK's HTTP transports synthesise it for a
+#: downstream frame their models reject, with `f"Failed to parse ...: {exc}"`
+#: -- pydantic's text, rejected value included -- as the message
+#: (`mcp/client/streamable_http.py:188,407`); it reaches pmcp as a plain
+#: string, where `exception_text` cannot recognise it (Consiliency/pmcp#297).
+_PARSE_ERROR = -32700
+_PARSE_ERROR_MESSAGE = "downstream sent a response that could not be parsed"
+_MALFORMED_ERROR_MESSAGE = "downstream sent a malformed JSON-RPC error"
+
+
 def _downstream_error(error: Any) -> DownstreamError:
-    """Build a `DownstreamError` from a JSON-RPC `error` member."""
+    """Build a `DownstreamError` from a JSON-RPC `error` member.
+
+    A parse error's message is replaced by fixed text, whoever wrote it: the
+    SDK's carries the rejected frame, and a downstream's own parse-error
+    prose describes our request, not its failure. So is a malformed `error`
+    (not an object, or a non-string `message`). Every other error keeps the
+    downstream's own message string, returned by design.
+    """
     if not isinstance(error, dict):
-        return DownstreamError(str(error))
-    return DownstreamError(
-        str(error.get("message", "Unknown error")),
-        code=error.get("code"),
-        data=error.get("data"),
+        return DownstreamError(_MALFORMED_ERROR_MESSAGE)
+    code = error.get("code")
+    if code == _PARSE_ERROR:
+        return DownstreamError(_PARSE_ERROR_MESSAGE, code=code)
+    message = error.get("message", "Unknown error")
+    if not isinstance(message, str):
+        # JSON-RPC requires a string: anything else is a malformed frame,
+        # whose content is not the downstream's message (the SDK's transports
+        # reject it outright; stdio is parsed without a model).
+        return DownstreamError(_MALFORMED_ERROR_MESSAGE, code=code)
+    from pmcp.sdk_rejections import sdk_built_message, sdk_message_phrase
+
+    if sdk_built_message(message, code):
+        # The MCP SDK's client transport answered for the downstream, with
+        # text it formats from the response (`Unexpected content type:
+        # <type>`): its code's fixed phrase, and no `data` (rev 26).
+        return DownstreamError(sdk_message_phrase(code), code=code)
+    return DownstreamError(message, code=code, data=error.get("data"))
+
+
+#: Each task field's wire names, for `_usable_task_raw`.
+_TASK_WIRE_KEYS: dict[str, tuple[str, ...]] = {
+    "status": ("status",),
+    "created_at": ("createdAt", "created_at"),
+    "updated_at": ("updatedAt", "updated_at", "lastUpdatedAt", "last_updated_at"),
+    "ttl": ("ttl",),
+    "poll_interval": ("pollInterval", "poll_interval"),
+}
+
+
+def _usable_task_raw(payload: dict[str, Any]) -> dict[str, Any]:
+    """A downstream task payload as `raw`, without the values pmcp found
+    unusable (Consiliency/pmcp#297 on Consiliency/pmcp#298's drop rule).
+
+    The model drops an unusable hint and names the field in
+    `unusable_fields`; the payload it came from is returned to the caller
+    as `raw` by every `gateway.tasks_*` tool, so the rejected value went back
+    out there. A `null` is kept (`ttl: null` means unlimited), and so is
+    every member pmcp does not read."""
+    unusable = {
+        key
+        for name, keys in _TASK_WIRE_KEYS.items()
+        for key in keys
+        if key in payload
+        and payload[key] is not None
+        and not task_hint_is_usable(name, payload[key])
+    }
+    for key in ("statusMessage", "status_message"):
+        if key in payload and not isinstance(payload[key], (str, type(None))):
+            unusable.add(key)
+    return {key: value for key, value in payload.items() if key not in unusable}
+
+
+def effective_task_mode(
+    tool_info: ToolInfo, task: TaskMetadataInput | dict[str, Any] | None
+) -> bool:
+    """Whether a call runs as an MCP task (the tool requires it, or it was
+    requested and not `enabled: false`): the one derivation for `call_tool`
+    and `gateway.invoke` (rev 17). Otherwise the answer is opaque data."""
+    support = (tool_info.execution or {}).get("taskSupport")
+    if support == "required":
+        return True
+    if task is None:
+        return False
+    parsed = (
+        task
+        if isinstance(task, TaskMetadataInput)
+        else TaskMetadataInput.model_validate(task)
     )
+    return parsed.enabled
+
+
+def _task_candidate(result: Any) -> dict[str, Any] | None:
+    """Where a downstream answer would carry a task: its nested `task`
+    object if it has one, else the answer itself (flat)."""
+    if not isinstance(result, dict):
+        return None
+    task = result.get("task")
+    return task if isinstance(task, dict) else result
+
+
+def _names_a_task(result: Any) -> bool:
+    """Main's condition for not polling `tasks/get` after `tasks/result`,
+    kept exactly. It decides only that poll (rev 15)."""
+    return isinstance(result, dict) and (
+        isinstance(result.get("task"), dict) or isinstance(result.get("taskId"), str)
+    )
+
+
+def task_answer_of(result: Any) -> tuple[dict[str, Any], McpTaskInfo] | None:
+    """The task a downstream answer carries, and its parse -- or None. The
+    one recogniser, and it is the parser (rev 15): the candidate is a task
+    only if `ClientManager._task_info_from_payload` parses it."""
+    payload = _task_candidate(result)
+    if payload is None:
+        return None
+    info = ClientManager._task_info_from_payload(payload)
+    if info is None:
+        return None
+    return payload, info
+
+
+def usable_task_response(result: Any) -> Any:
+    """`result` with its task replaced by that task's parse (`raw`, without
+    the values pmcp dropped), so a dropped hint is neither returned nor sized
+    (Consiliency/pmcp#297). It acts if and only if `task_answer_of` finds a
+    task; anything else is returned unchanged, as data."""
+    found = task_answer_of(result)
+    if found is None:
+        return result
+    payload, info = found
+    if payload is result:
+        return dict(info.raw)
+    return {**result, "task": dict(info.raw)}
+
+
+def parse_request_id(request_id: str) -> tuple[str, int] | None:
+    """`server_name::local_id` as `gateway.cancel` takes it, or None when the
+    id does not have that format (no `::`, or a local id that is not an
+    integer). The handler uses the same parse, so a rejected id is never
+    copied into the response or the audit event (rev 13, round-12 B1)."""
+    if "::" not in request_id:
+        return None
+    server_name, local_id_str = request_id.rsplit("::", 1)
+    try:
+        return server_name, int(local_id_str)
+    except ValueError:
+        return None
 
 
 class _ManagerAbandoned(Exception):
@@ -914,7 +1063,11 @@ def _entry_label(entry: Any, key: str = "name") -> str:
         identifier = entry.get(key)
         if isinstance(identifier, str) and identifier:
             return repr(identifier)
-    return repr(entry)[:120]
+        # No usable identifier: describe the entry's structure, never its
+        # content -- the downstream's data that failed validation
+        # (Consiliency/pmcp#297, rev 10; it was `repr(entry)[:120]`).
+        return f"(an entry with {len(entry)} key{'' if len(entry) == 1 else 's'})"
+    return f"(a {type(entry).__name__} entry)"
 
 
 def _required_identity(entry: Any, key: str) -> str:
@@ -1513,7 +1666,9 @@ class ClientManager:
         errors: list[str] = []
         for config, result in zip(configs, results):
             if isinstance(result, Exception):
-                error_msg = f"Failed to connect to {config.name}: {result}"
+                error_msg = (
+                    f"Failed to connect to {config.name}: {exception_text(result)}"
+                )
                 logger.error(error_msg)
                 errors.append(error_msg)
 
@@ -2125,15 +2280,8 @@ class ClientManager:
             payload["task"] = {"requestorContext": requestor_context}
         return payload
 
-    def _extract_task_payload(self, result: dict[str, Any]) -> dict[str, Any] | None:
-        task = result.get("task")
-        if isinstance(task, dict):
-            return task
-        if isinstance(result.get("taskId"), str):
-            return result
-        return None
-
-    def _task_info_from_payload(self, payload: dict[str, Any]) -> McpTaskInfo | None:
+    @staticmethod
+    def _task_info_from_payload(payload: dict[str, Any]) -> McpTaskInfo | None:
         task_id = payload.get("taskId") or payload.get("task_id")
         if not isinstance(task_id, str) or not task_id:
             return None
@@ -2187,10 +2335,11 @@ class ClientManager:
             created_at=created_at,
             updated_at=updated_at,
             # MCP's milliseconds become pmcp's seconds here, and only here;
-            # `raw` keeps the downstream's own units (Consiliency/pmcp#330).
+            # `raw` keeps the downstream's own units (Consiliency/pmcp#330),
+            # without the values pmcp dropped as unusable (Consiliency/pmcp#297).
             ttl=task_duration_from_wire("ttl", payload.get("ttl")),
             poll_interval=task_duration_from_wire("poll_interval", poll_interval),
-            raw=payload,
+            raw=_usable_task_raw(payload),
         )
 
     def _record_task(
@@ -2588,7 +2737,9 @@ class ClientManager:
             ("prompts", listing_results[2]),
         ):
             if isinstance(result, BaseException):
-                logger.debug(f"Server {name} doesn't support {kind}: {result}")
+                logger.debug(
+                    f"Server {name} doesn't support {kind}: {exception_text(result)}"
+                )
                 listings[kind] = None
             else:
                 listings[kind] = result
@@ -2677,14 +2828,15 @@ class ClientManager:
             if not isinstance(raw_cursor, str) or not raw_cursor:
                 logger.warning(
                     f"[{managed.config.name}] {kind}/list returned an unusable "
-                    f"cursor ({raw_cursor!r}); treating as unreadable rather "
-                    f"than as the end of the listing"
+                    f"cursor ({describe_value(raw_cursor)}); treating as "
+                    f"unreadable rather than as the end of the listing"
                 )
                 return None
             if raw_cursor in seen_cursors:
                 logger.warning(
-                    f"[{managed.config.name}] {kind}/list repeated cursor "
-                    f"{raw_cursor!r}; treating as unreadable rather than looping"
+                    f"[{managed.config.name}] {kind}/list repeated a cursor "
+                    f"({describe_value(raw_cursor)}); treating as unreadable "
+                    f"rather than looping"
                 )
                 return None
             seen_cursors.add(raw_cursor)
@@ -3578,12 +3730,16 @@ class ClientManager:
                     f"[{name}] downstream sent undecodable bytes on stdout; "
                     "the line was decoded with replacement characters"
                 )
-            message = json.loads(text)
-        except json.JSONDecodeError:
-            # Non-JSON output already counted as a heartbeat by the caller.
-            logger.debug(
-                f"[{name}] Non-JSON output: {line.decode(errors='replace').strip()}"
-            )
+            message = load_json(text, source="downstream stdio frame")
+        except json.JSONDecodeError as error:
+            # Already counted as a heartbeat by the caller. A line that is not
+            # a JSON-RPC message is never shown, whatever it holds: a banner,
+            # a log line, or part of a frame the downstream broke across lines
+            # (Consiliency/pmcp#297, rev 12). MCP's stdio transport allows only
+            # newline-delimited messages on stdout; a server's own log belongs
+            # on stderr, which is logged as before. The record is fixed text
+            # plus the parser's value-free description.
+            logger.debug(f"[{name}] non-protocol stdout line: {exception_text(error)}")
             return
         except (ValueError, RecursionError) as e:
             # Parses as neither JSON nor a JSONDecodeError: an integer over
@@ -3621,34 +3777,32 @@ class ClientManager:
     ) -> None:
         """Classify one frame and act on it. See `_dispatch_downstream_frame`.
 
-        Each guard below exists because a later access depends on it, and each
-        drops the frame with a value-free debug log, as a non-JSON line is
-        dropped:
+        A frame that is not a JSON-RPC 2.0 message (`jsonrpc_envelope_problem`)
+        is dropped with a value-free record, like a line that is not JSON
+        (Consiliency/pmcp#297, rev 13). Before, the guards here were only the
+        ones a later access depended on, so `{"jsonrpc": "1.0", "id": 8,
+        "error": {...}}`, a frame with no `jsonrpc`, one with both `result`
+        and `error`, or one whose `error.code` was an object resolved pending
+        request 8, and its `message` reached the caller's log as the
+        downstream's error. A malformed frame carrying a pending request's id
+        does not settle that request: nothing in a frame that is not a message
+        is acted on, its id included, so the request is answered by a valid
+        frame or times out (idle timeout; `tools/call`'s ceiling). The
+        alternative, failing it with fixed text, would let any line that
+        parses with a colliding id end a caller's request.
 
-        - `frame.get` / `"method" in frame` / `frame["error"]` need a JSON
-          object: `[]`, `42`, `"x"`, `null`, `true` all parse but are not one.
-        - `msg_id in managed.pending_requests` needs a hashable id, and must not
-          match one of our int ids by numeric equality: `True == 1` and
-          `1.0 == 1` both hash equal, so a bool or float id would resolve
-          request 1. JSON-RPC ids are strings, integers or null.
-        - `set_result` / `set_exception` raise `InvalidStateError` on a future
-          that is already settled (a caller cancelled it, and the response
-          raced its `finally` pop).
+        The envelope rules also give the dispatcher what its accesses need: a
+        JSON object; an id that is a string or an integer, so a bool or float
+        cannot resolve request 1 by numeric equality. `set_result` /
+        `set_exception` still raise `InvalidStateError` on a future that is
+        already settled (a caller cancelled it, and the response raced its
+        `finally` pop), which is checked below.
         """
-        if not isinstance(frame, dict):
-            logger.debug(
-                f"[{name}] dropped invalid frame: not a JSON object "
-                f"({type(frame).__name__})"
-            )
+        problem = jsonrpc_envelope_problem(frame)
+        if problem is not None:
+            logger.debug(f"[{name}] dropped invalid frame: {problem}")
             return
         msg_id = frame.get("id")
-        if msg_id is not None and (
-            isinstance(msg_id, bool) or not isinstance(msg_id, (str, int))
-        ):
-            logger.debug(
-                f"[{name}] dropped invalid frame: id of type {type(msg_id).__name__}"
-            )
-            return
         method = frame.get("method")
         # Classify by `method` FIRST (C-01). A frame carrying a `method` can
         # never resolve a pending future, so this both handles server->client
@@ -3657,20 +3811,12 @@ class ClientManager:
         # mistaken for that response.
         if isinstance(method, str):
             if msg_id is None:
-                # Notification: no id, nothing to resolve.
+                # Notification: no id (or `id: null`, which main and the MCP
+                # SDK read as a notification; rev 15), nothing to resolve.
                 self._handle_downstream_notification(name, managed, method)
             else:
                 # Server->client request: reply (ping -> {} else -32601).
                 self._reply_to_downstream_request(name, managed, msg_id, method)
-        elif "method" in frame:
-            # A `method` that is present but not a string is not a valid
-            # JSON-RPC request -- and it is not a response either, so it must
-            # not fall through to the pending lookup, where an id colliding with
-            # one of ours would resolve that future.
-            logger.debug(
-                f"[{name}] dropped invalid frame: non-string method "
-                f"({type(method).__name__})"
-            )
         elif msg_id is not None and msg_id in managed.pending_requests:
             pending = managed.pending_requests.pop(msg_id)
 
@@ -4718,12 +4864,10 @@ class ClientManager:
             )
 
         support = self._tool_task_support(tool_info)
-        task_requested = task is not None
-        if support == "required":
-            task_requested = True
-        if task_requested and support == "forbidden":
+        asked = task is not None or support == "required"
+        if asked and support == "forbidden":
             raise RuntimeError(f"Tool {tool_id} does not support MCP task execution")
-        if task_requested and not self._server_supports_tasks(managed):
+        if asked and not self._server_supports_tasks(managed):
             raise RuntimeError(
                 f"Server {tool_info.server_name} does not advertise MCP task support"
             )
@@ -4733,17 +4877,15 @@ class ClientManager:
         if trace_meta:
             params["_meta"] = {**params.get("_meta", {}), **trace_meta}
         requestor_context: dict[str, Any] | None = None
+        task_requested = effective_task_mode(tool_info, task)
         if task_requested:
             parsed_task = (
                 task
                 if isinstance(task, TaskMetadataInput)
                 else TaskMetadataInput.model_validate(task or {})
             )
-            if not parsed_task.enabled and support != "required":
-                task_requested = False
-            else:
-                params["task"] = self._task_wire_metadata(parsed_task)
-                requestor_context = parsed_task.requestor_context
+            params["task"] = self._task_wire_metadata(parsed_task)
+            requestor_context = parsed_task.requestor_context
 
         # Send tool call with metadata for health monitoring
         result = await self._send_request(
@@ -4755,17 +4897,18 @@ class ClientManager:
         )
         built: McpTaskRecord | None = None
         if task_requested and isinstance(result, dict):
-            task_payload = self._extract_task_payload(result)
-            if task_payload is not None:
-                task_info = self._task_info_from_payload(task_payload)
-                if task_info is not None:
-                    built = self._record_task(
-                        tool_info.server_name,
-                        task_info,
-                        tool_id=tool_id,
-                        requestor_context=requestor_context,
-                        connection=managed,
-                    )
+            found = task_answer_of(result)
+            if found is not None:
+                built = self._record_task(
+                    tool_info.server_name,
+                    found[1],
+                    tool_id=tool_id,
+                    requestor_context=requestor_context,
+                    connection=managed,
+                )
+            # A task call returns, and is sized from, the answer reduced to
+            # what pmcp could use (Consiliency/pmcp#297 rev 14/17).
+            result = usable_task_response(result)
 
         return TaskReply(result, built)
 
@@ -4961,13 +5104,12 @@ class ClientManager:
             "tasks/get",
             self._task_request_params(task_id=task_id, requestor_context=sent_context),
         )
-        payload = self._extract_task_payload(result) or result
-        task_info = self._task_info_from_payload(payload)
-        if task_info is None:
+        found = task_answer_of(result)
+        if found is None:
             raise KeyError(f"Task not found: {server_name}::{task_id}")
         return self._record_task(
             server_name,
-            task_info,
+            found[1],
             requestor_context=None,  # a reply supplies no context
             connection=managed,
         )
@@ -5007,17 +5149,19 @@ class ClientManager:
             self._task_request_params(task_id=task_id, requestor_context=context),
         )
         built: McpTaskRecord | None = None
-        task_payload = self._extract_task_payload(result)
-        if task_payload is not None:
-            task_info = self._task_info_from_payload(task_payload)
-            if task_info is not None:
-                built = self._record_task(
-                    server_name,
-                    task_info,
-                    requestor_context=None,  # a reply supplies no context
-                    connection=managed,
-                )
-        elif self._owns(server_name, managed):
+        # The parser is the only task recogniser (Consiliency/pmcp#297 rev
+        # 15): a reply carries a task only if it parses. The `tasks/get`
+        # fallback keeps main's condition exactly -- the reply names no task
+        # at all -- and Consiliency/pmcp#338's connection rule.
+        found = task_answer_of(result)
+        if found is not None:
+            built = self._record_task(
+                server_name,
+                found[1],
+                requestor_context=None,  # a reply supplies no context
+                connection=managed,
+            )
+        elif not _names_a_task(result) and self._owns(server_name, managed):
             # The fallback continues this request on the connection it started
             # on, never one resolved again by name (rev 7). If that connection
             # was replaced during `tasks/result`, there is nothing to continue
@@ -5029,10 +5173,11 @@ class ClientManager:
                 connection=managed,
             )
         # A reply about a different task is recorded, but it is not this
-        # task's record.
+        # task's record. The reply is returned reduced to what pmcp could use
+        # (Consiliency/pmcp#297).
         if built is not None and built.task_id != task_id:
             built = None
-        return TaskReply(result, built)
+        return TaskReply(usable_task_response(result), built)
 
     @_pins_task
     async def cancel_task(
@@ -5077,14 +5222,18 @@ class ClientManager:
         )
         params["force"] = force
         result = await self._send_request(managed, "tasks/cancel", params)
-        payload = self._extract_task_payload(result) or result
-        task_info = self._task_info_from_payload(payload)
-        if task_info is None:
+        found = task_answer_of(result)
+        if found is not None:
+            task_info = found[1]
+        else:
+            # The answer carries no task pmcp can parse, so nothing in it was
+            # read: `raw` stays empty rather than holding the whole answer
+            # (rev 15, round-14 claude F001: an unparseable task's `ttl` went
+            # back out through `gateway.tasks_cancel`).
             task_info = McpTaskInfo(
                 task_id=task_id,
                 status="cancelled",
                 updated_at=time.time(),
-                raw=result,
             )
         return self._record_task(
             server_name,
@@ -5385,16 +5534,20 @@ class ClientManager:
         if "::" not in request_id:
             return (
                 "not_found",
-                f"Invalid request_id format: {request_id}",
+                "Invalid request_id format: expected server_name::local_id "
+                f"({describe_value(request_id)})",
                 False,
                 None,
             )
-
-        server_name, local_id_str = request_id.rsplit("::", 1)
-        try:
-            local_id = int(local_id_str)
-        except ValueError:
-            return ("not_found", f"Invalid local_id: {local_id_str}", False, None)
+        parsed_id = parse_request_id(request_id)
+        if parsed_id is None:
+            return (
+                "not_found",
+                "Invalid local_id: expected an integer (a string)",
+                False,
+                None,
+            )
+        server_name, local_id = parsed_id
 
         managed = self._clients.get(server_name)
         if not managed:

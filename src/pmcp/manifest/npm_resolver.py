@@ -62,6 +62,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from pmcp.argument_errors import exception_text
+from pmcp.parsing import load_json
 
 from pmcp.env_store import child_process_env
 
@@ -177,7 +179,7 @@ def _has_local_prefix(cwd: str | None) -> str | None:
     try:
         start = Path(cwd).resolve() if cwd else Path.cwd()
     except OSError as exc:  # pragma: no cover - unreadable cwd
-        return f"cannot resolve the effective cwd: {exc}"
+        return f"cannot resolve the effective cwd: {exception_text(exc)}"
     for directory in (start, *start.parents):
         if (directory / "package.json").exists() or (
             directory / "node_modules"
@@ -357,7 +359,7 @@ class NpmResolver:
         except FileNotFoundError as exc:
             # node is not installed. This is the ONE spawn failure that learns
             # nothing about npm, so it is the one that falls back to the tables.
-            return _unavailable(f"node is not installed: {exc}")
+            return _unavailable(f"node is not installed: {exception_text(exc)}")
         except OSError as exc:
             # node IS on PATH but could not be executed: permission denied, a
             # resource limit, ETXTBSY, a bad interpreter. None of these is
@@ -366,7 +368,9 @@ class NpmResolver:
             # resolved `npx --registry https://private.invalid probe` to
             # `probe` (board review on the diff).
             self._spawn_failure_is_durable = False
-            return _refused(f"node is present but could not be spawned: {exc}")
+            return _refused(
+                f"node is present but could not be spawned: {exception_text(exc)}"
+            )
         self.spawn_count += 1
         self._generation += 1
         self._proc = proc
@@ -377,7 +381,7 @@ class NpmResolver:
             self._terminate()
             return _refused("child produced no handshake")
         try:
-            handshake = json.loads(line)
+            handshake = load_json(line, source="npm resolver handshake")
         except ValueError:
             self._terminate()
             return _refused("child handshake was not JSON")
@@ -501,7 +505,9 @@ class NpmResolver:
             proc.stdin.flush()
         except (BrokenPipeError, ValueError, OSError) as exc:
             self._terminate()
-            return _refused(f"npm resolver child died before the query: {exc}")
+            return _refused(
+                f"npm resolver child died before the query: {exception_text(exc)}"
+            )
 
         line = reader.read(_QUERY_TIMEOUT)
         if line is None:
@@ -511,7 +517,7 @@ class NpmResolver:
             self._terminate()
             return _refused("npm resolver child timed out or died")
         try:
-            response = json.loads(line)
+            response = load_json(line, source="npm resolver response")
         except ValueError:
             self._terminate()
             return _refused("npm resolver child sent malformed JSON")

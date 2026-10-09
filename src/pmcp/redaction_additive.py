@@ -26,10 +26,11 @@ Three guarantees, each tested (`tests/test_redaction_additive.py`):
 from __future__ import annotations
 
 import bisect
-import json
 import re
 from collections.abc import Callable, Iterator
 from urllib.parse import unquote
+
+from pmcp.parsing import load_json
 
 #: Test-only work counter. None in production; the complexity tests set it to
 #: `[0]`, and every loop and string build below adds what it iterates over
@@ -1356,7 +1357,7 @@ def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
     if head not in ("{", "[", '"') or not spans:
         return spans
     try:
-        json.loads(text)
+        load_json(text, source="redaction candidate")
     except (ValueError, RecursionError):
         return spans
     work(3 * len(text))

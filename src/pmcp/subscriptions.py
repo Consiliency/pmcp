@@ -48,6 +48,8 @@ from mcp.shared.subscriptions import (
     ToolsListChanged,
 )
 
+from pmcp.argument_errors import safe_exc_info
+
 __all__ = ["CatalogEventSink", "BusCatalogEventSink"]
 
 logger = logging.getLogger(__name__)
@@ -187,8 +189,11 @@ class BusCatalogEventSink:
     async def _publish(self, kind: _CatalogEventClass) -> None:
         try:
             await self._bus.publish(kind())
-        except Exception:
+        except Exception as exc:
             # Isolate a raising bus from the drain, matching
             # `InMemorySubscriptionBus.publish`'s own listener-isolation
             # contract -- one bad publish must not stop the next drain.
-            logger.exception("subscription bus publish raised; catalog event dropped")
+            logger.error(
+                "subscription bus publish raised; catalog event dropped",
+                exc_info=safe_exc_info(exc),
+            )

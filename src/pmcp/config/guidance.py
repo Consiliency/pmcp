@@ -13,6 +13,8 @@ import yaml
 
 from pmcp.home_identity import home_path, optional_home_path
 from pydantic import BaseModel, Field
+from pmcp.argument_errors import exception_text
+from pmcp.parsing import load_yaml
 
 
 class GuidanceLayers(BaseModel):
@@ -174,7 +176,7 @@ def load_guidance_config(config_path: Path | None = None) -> GuidanceConfig:
 
     try:
         with open(config_path) as f:
-            data = yaml.safe_load(f)
+            data = load_yaml(f, source="guidance config")
 
         if not data or "guidance" not in data:
             return GuidanceConfig()
@@ -182,7 +184,9 @@ def load_guidance_config(config_path: Path | None = None) -> GuidanceConfig:
         return GuidanceConfig(**data["guidance"])
     except Exception as e:
         # If config is invalid, log warning and use defaults
-        print(f"Warning: Failed to load guidance config from {config_path}: {e}")
+        print(
+            f"Warning: Failed to load guidance config from {config_path}: {exception_text(e)}"
+        )
         print("Using default guidance config (minimal mode)")
         return GuidanceConfig()
 
@@ -239,7 +243,7 @@ def set_telemetry_enabled(
     data: dict[str, object] = {}
     if config_path.exists():
         try:
-            loaded = yaml.safe_load(config_path.read_text())
+            loaded = load_yaml(config_path.read_text(), source="guidance config")
             if isinstance(loaded, dict):
                 data = loaded
         except Exception:
@@ -279,7 +283,7 @@ def set_feedback_submission_enabled(
     data: dict[str, object] = {}
     if config_path.exists():
         try:
-            loaded = yaml.safe_load(config_path.read_text())
+            loaded = load_yaml(config_path.read_text(), source="guidance config")
             if isinstance(loaded, dict):
                 data = loaded
         except Exception:

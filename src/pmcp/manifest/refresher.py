@@ -14,8 +14,10 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
+import anyio
 import yaml
 
+from pmcp.argument_errors import exception_text
 from pmcp.env_store import child_process_env
 from pmcp.manifest.loader import (
     credential_lookup_keys,
@@ -28,6 +30,7 @@ from pmcp.manifest.version_checker import (
     detect_package_type,
     get_package_version,
 )
+from pmcp.parsing import load_yaml
 from pmcp.types import (
     DescriptionsCache,
     GeneratedServerDescriptions,
@@ -35,6 +38,11 @@ from pmcp.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: The SDK session's per-request read timeout, and the bound on one server's
+#: whole refresh (connect, `initialize`, `tools/list`), in seconds.
+REFRESH_READ_TIMEOUT_SECONDS = 30.0
+REFRESH_TIMEOUT_SECONDS = 120.0
 
 # Gateway version for cache metadata
 GATEWAY_VERSION = "1.0.0"
@@ -63,7 +71,7 @@ def load_descriptions_cache(cache_path: Path | None = None) -> DescriptionsCache
 
     try:
         with open(cache_path, "r") as f:
-            data = yaml.safe_load(f)
+            data = load_yaml(f, source="descriptions cache")
 
         if not data:
             return None
@@ -90,7 +98,7 @@ def load_descriptions_cache(cache_path: Path | None = None) -> DescriptionsCache
         )
 
     except Exception as e:
-        logger.warning(f"Failed to load descriptions cache: {e}")
+        logger.warning(f"Failed to load descriptions cache: {exception_text(e)}")
         return None
 
 
@@ -354,54 +362,62 @@ async def refresh_server(
             env=child_process_env(base=get_default_environment()),
         )
 
-        # Connect and fetch tools
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
+        # Connect and fetch tools. Bounded (Consiliency/pmcp#297, round-13
+        # claude N2): a reply the strict envelope check drops is never
+        # answered, and this path had no timeout, so a downstream sending one
+        # hung `pmcp refresh` and the startup cache generation. Each request
+        # waits at most the read timeout; the whole refresh at most the
+        # overall bound.
+        with anyio.fail_after(REFRESH_TIMEOUT_SECONDS):
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(
+                    read, write, read_timeout_seconds=REFRESH_READ_TIMEOUT_SECONDS
+                ) as session:
+                    await session.initialize()
 
-                # List tools
-                tools_result = await session.list_tools()
-                tools = tools_result.tools
+                    # List tools
+                    tools_result = await session.list_tools()
+                    tools = tools_result.tools
 
-                logger.info(f"Found {len(tools)} tools for {server_name}")
+                    logger.info(f"Found {len(tools)} tools for {server_name}")
 
-                # Convert to PrebuiltToolInfo
-                prebuilt_tools = []
-                for tool in tools:
-                    name = tool.name
-                    description = tool.description or ""
-                    short_desc = (
-                        description[:100] + "..."
-                        if len(description) > 100
-                        else description
-                    )
-
-                    prebuilt_tools.append(
-                        PrebuiltToolInfo(
-                            name=name,
-                            description=description,
-                            short_description=short_desc,
-                            tags=_extract_tags(name, description),
-                            risk_hint=_infer_risk(name, description),
+                    # Convert to PrebuiltToolInfo
+                    prebuilt_tools = []
+                    for tool in tools:
+                        name = tool.name
+                        description = tool.description or ""
+                        short_desc = (
+                            description[:100] + "..."
+                            if len(description) > 100
+                            else description
                         )
+
+                        prebuilt_tools.append(
+                            PrebuiltToolInfo(
+                                name=name,
+                                description=description,
+                                short_description=short_desc,
+                                tags=_extract_tags(name, description),
+                                risk_hint=_infer_risk(name, description),
+                            )
+                        )
+
+                    # Generate capability summary
+                    capability_summary = await _generate_capability_summary(
+                        server_name, prebuilt_tools
                     )
 
-                # Generate capability summary
-                capability_summary = await _generate_capability_summary(
-                    server_name, prebuilt_tools
-                )
-
-                return GeneratedServerDescriptions(
-                    package=pkg_name,
-                    package_type=pkg_type,
-                    version=version,
-                    generated_at=datetime.now(timezone.utc).isoformat(),
-                    capability_summary=capability_summary,
-                    tools=prebuilt_tools,
-                )
+                    return GeneratedServerDescriptions(
+                        package=pkg_name,
+                        package_type=pkg_type,
+                        version=version,
+                        generated_at=datetime.now(timezone.utc).isoformat(),
+                        capability_summary=capability_summary,
+                        tools=prebuilt_tools,
+                    )
 
     except Exception as e:
-        logger.error(f"Failed to refresh {server_name}: {e}")
+        logger.error(f"Failed to refresh {server_name}: {exception_text(e)}")
         return None
 
 
@@ -499,7 +515,7 @@ async def refresh_all(
                 # Keep existing if refresh failed
                 return name, existing
         except Exception as e:
-            logger.error(f"Error refreshing {name}: {e}")
+            logger.error(f"Error refreshing {name}: {exception_text(e)}")
             if existing:
                 return name, existing
         return name, None

@@ -15,6 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
+from pmcp.argument_errors import exception_text
 from pmcp.atomic_write import PlainFileRefused, check_plain_file, open_plain_file
 from pmcp.types import LocalMcpServerConfig
 
@@ -371,7 +372,8 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
             )
         else:
             logger.warning(
-                f"Refusing the singleton lock directory {lock_dir}: {e.strerror}"
+                f"Refusing the singleton lock directory {lock_dir}: "
+                f"{os.strerror(e.errno) if e.errno else type(e).__name__}"
             )
         return False
     lock_file = lock_dir / _LOCK_NAME
@@ -415,7 +417,9 @@ def _attempt_acquire(
     try:
         directory_seen = _directory_at(lock_dir, directory)
     except OSError as e:
-        logger.warning(f"Refusing the singleton lock directory {lock_dir}: {e}")
+        logger.warning(
+            f"Refusing the singleton lock directory {lock_dir}: {exception_text(e)}"
+        )
         return False
     if directory_seen is None:
         return None
@@ -433,10 +437,14 @@ def _attempt_acquire(
     except FileExistsError:
         return None  # lost a creation race: start again
     except PlainFileRefused as e:
-        logger.warning(f"Refusing the singleton lock file {lock_file}: {e}")
+        logger.warning(
+            f"Refusing the singleton lock file {lock_file}: {exception_text(e)}"
+        )
         return False
     except OSError as e:
-        logger.warning(f"Could not open singleton lock file {lock_file}: {e}")
+        logger.warning(
+            f"Could not open singleton lock file {lock_file}: {exception_text(e)}"
+        )
         return False
     fd = os.fdopen(raw, "r+")
 
@@ -452,7 +460,8 @@ def _attempt_acquire(
         except Exception:
             pass
         logger.warning(
-            f"Another gateway instance is running ({pid_info} lock: {lock_file}): {e}"
+            f"Another gateway instance is running ({pid_info} lock: {lock_file}): "
+            f"{exception_text(e)}"
         )
         fd.close()
         return False
@@ -462,7 +471,8 @@ def _attempt_acquire(
         # single-instance protection rather than re-introducing the #84
         # import-crash class.
         logger.warning(
-            f"Singleton lock primitive unavailable ({e}); proceeding without "
+            f"Singleton lock primitive unavailable ({exception_text(e)}); "
+            "proceeding without "
             "single-instance protection."
         )
         fd.close()

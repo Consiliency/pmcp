@@ -599,6 +599,16 @@ def _gate_error(call: dict[str, Any]) -> jsonschema.ValidationError | None:
     return gate_error_for(call["arguments"], tool.input_schema)
 
 
+def _described(call: dict[str, Any], error: jsonschema.ValidationError) -> str:
+    """What the server says after `Input validation error: ` for `error`: its
+    structural description, never jsonschema's message (Consiliency/pmcp#297)."""
+    from pmcp.argument_errors import describe_schema_error
+    from pmcp.tools.handlers import get_gateway_tool_definitions
+
+    tool = next(t for t in get_gateway_tool_definitions() if t.name == call["name"])
+    return describe_schema_error(error, tool.input_schema, call["arguments"])
+
+
 def _check_gate(text: str) -> list[str]:
     problems = []
     cases = re.findall(r"<!-- gate-case: (\{.*?\}) => (.*?) -->", text)
@@ -607,8 +617,9 @@ def _check_gate(text: str) -> list[str]:
     prose = _norm(_prose(text))
     outcomes = set()
     for raw, expected in cases:
-        error = _gate_error(json.loads(raw))
-        got = "accepted" if error is None else error.message
+        call = json.loads(raw)
+        error = _gate_error(call)
+        got = "accepted" if error is None else _described(call, error)
         outcomes.add(got)
         if got != expected:
             problems.append(
@@ -805,17 +816,17 @@ def _check_snippet(
         elif kind == "tools-call-accepted":
             refusal = _gate_error(json.loads(body))
             if refusal is not None:
-                return [
-                    f"call the guide says is accepted is refused: {refusal.message}"
-                ]
+                return ["call the guide says is accepted is refused"]
         elif kind == "tools-call-rejected":
-            refusal = _gate_error(json.loads(body))
+            call = json.loads(body)
+            refusal = _gate_error(call)
             if refusal is None:
                 return ["call the guide says is refused is accepted"]
             path = ".".join(str(p) for p in refusal.absolute_path)
-            if refusal.message != attrs.get("reason") or path != attrs.get("path"):
+            reason = _described(call, refusal)
+            if reason != attrs.get("reason") or path != attrs.get("path"):
                 return [
-                    f"refused for {refusal.message!r} at {path!r}, the guide says "
+                    f"refused for {reason!r} at {path!r}, the guide says "
                     f"{attrs.get('reason')!r} at {attrs.get('path')!r}"
                 ]
             if attrs["reason"] not in _norm(_prose(text)):

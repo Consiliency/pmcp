@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.env_store import (
     credential_value,
     resolve_scope_path,
@@ -236,12 +237,12 @@ class JobManager:
 
         except FileNotFoundError as e:
             job.status = "failed"
-            job.error = f"Command not found: {e}"
+            job.error = f"Command not found: {exception_text(e)}"
             logger.error(f"Install job {job_id} failed: {job.error}")
 
         except Exception as e:
             job.status = "failed"
-            job.error = str(e)[:300]
+            job.error = exception_text(e)[:300]
             logger.error(f"Install job {job_id} failed: {job.error}")
 
         return job_id
@@ -251,10 +252,12 @@ class JobManager:
         try:
             exc = task.exception()
             if exc:
-                logger.error(f"Install job {job.id} task crashed: {exc}")
+                logger.error(
+                    f"Install job {job.id} task crashed: {exception_text(exc)}"
+                )
                 if job.status == "installing":
                     job.status = "failed"
-                    job.error = f"Monitor task crashed: {exc}"
+                    job.error = f"Monitor task crashed: {exception_text(exc)}"
                 # Kill subprocess if still running (but NOT if server_ready - it's being handed off)
                 if (
                     job.status != "server_ready"
@@ -264,7 +267,7 @@ class JobManager:
                     try:
                         job.process.kill()
                     except Exception as e:
-                        logger.debug(f"task cleanup error: {e}")
+                        logger.debug(f"task cleanup error: {exception_text(e)}")
         except asyncio.CancelledError:
             # Task was cancelled, not an error
             pass
@@ -300,7 +303,7 @@ class JobManager:
                 line = await stream.readline()
                 return (name, line)
             except Exception as e:
-                logger.debug(f"stream reader error: {e}")
+                logger.debug(f"stream reader error: {exception_text(e)}")
                 return (name, None)
 
         try:
@@ -426,7 +429,7 @@ class JobManager:
                                         return
                                 except Exception as e:
                                     logger.warning(
-                                        f"Install {job.id}: Error in server detection: {e}"
+                                        f"Install {job.id}: Error in server detection: {exception_text(e)}"
                                     )
 
                 except asyncio.CancelledError:
@@ -463,9 +466,12 @@ class JobManager:
             job.error = "Installation cancelled"
 
         except Exception as e:
-            logger.error(f"Install job {job.id} monitor error: {e}", exc_info=True)
+            logger.error(
+                f"Install job {job.id} monitor error: {exception_text(e)}",
+                exc_info=safe_exc_info(e),
+            )
             job.status = "failed"
-            job.error = str(e)
+            job.error = exception_text(e)
             # Try to clean up process
             await self._safe_terminate_process(process, job.id, force=True)
 
@@ -500,7 +506,9 @@ class JobManager:
                     except asyncio.TimeoutError:
                         logger.error(f"Install {job_id}: Process won't die!")
         except Exception as e:
-            logger.warning(f"Install {job_id}: Error terminating process: {e}")
+            logger.warning(
+                f"Install {job_id}: Error terminating process: {exception_text(e)}"
+            )
 
     def _parse_progress(self, line: str, current: int) -> int:
         """Try to parse progress percentage from output line."""
@@ -738,7 +746,11 @@ async def install_server(
             f"Installation of {server_config.name} timed out after {timeout}s"
         )
     except FileNotFoundError as e:
-        raise InstallError(f"Command not found for {server_config.name}: {e}")
+        not_found: str | None = exception_text(e)
+    else:
+        not_found = None
+    if not_found is not None:
+        raise InstallError(f"Command not found for {server_config.name}: {not_found}")
 
 
 async def verify_installation(
