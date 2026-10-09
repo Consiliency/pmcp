@@ -63,6 +63,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from pmcp.env_store import child_process_env
+
 logger = logging.getLogger(__name__)
 
 _HELPER = Path(__file__).with_name("_npm_resolve.js")
@@ -344,6 +346,7 @@ class NpmResolver:
         try:
             proc = subprocess.Popen(
                 ["node", str(self._helper)],
+                env=child_process_env(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,

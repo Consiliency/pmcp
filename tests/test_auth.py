@@ -205,9 +205,13 @@ def test_remote_header_env_lookup_reads_process_project_and_user_stores(
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PROCESS_TOKEN", "process-secret")
     write_env_file(
-        home / ".config" / "pmcp" / "pmcp.env", {"USER_TOKEN": "user-secret"}
+        home / ".config" / "pmcp" / "pmcp.env",
+        {"USER_TOKEN": "user-secret"},
+        confine_to=None,
     )
-    write_env_file(project / ".env.pmcp", {"PROJECT_TOKEN": "project-secret"})
+    write_env_file(
+        project / ".env.pmcp", {"PROJECT_TOKEN": "project-secret"}, confine_to=None
+    )
 
     lookup = build_remote_header_env_lookup(project)
 
@@ -230,25 +234,29 @@ def test_tenant_code_mode_env_lookup_precedence(
             "TENANT_CODE_MODE_MCP_TOKEN": "user-secret",
             "TENANT_CODE_MODE_TENANT_ID": "user-tenant",
         },
+        confine_to=None,
     )
     write_env_file(
         project / ".env.pmcp",
         {
             "TENANT_CODE_MODE_TENANT_ID": "project-tenant",
         },
+        confine_to=None,
     )
 
     lookup = build_remote_header_env_lookup(project)
 
+    # One documented order (Consiliency/pmcp#367): the process environment,
+    # then the user store, then the project store.
     assert lookup("TENANT_CODE_MODE_MCP_TOKEN") == "process-secret"
-    assert lookup("TENANT_CODE_MODE_TENANT_ID") == "project-tenant"
+    assert lookup("TENANT_CODE_MODE_TENANT_ID") == "user-tenant"
 
 
 def test_remote_headers_for_tenant_reads_only_tenant_scope(tmp_path: Path) -> None:
     tenant_a = tmp_path / ".pmcp" / "tenants" / "tenant-a" / "pmcp.env"
     tenant_b = tmp_path / ".pmcp" / "tenants" / "tenant-b" / "pmcp.env"
-    write_env_file(tenant_a, {"REMOTE_TOKEN": "tenant-a-secret"})
-    write_env_file(tenant_b, {"REMOTE_TOKEN": "tenant-b-secret"})
+    write_env_file(tenant_a, {"REMOTE_TOKEN": "tenant-a-secret"}, confine_to=None)
+    write_env_file(tenant_b, {"REMOTE_TOKEN": "tenant-b-secret"}, confine_to=None)
 
     resolution = resolve_remote_headers_for_tenant(
         {"Authorization": "Bearer ${REMOTE_TOKEN}"},
@@ -268,6 +276,7 @@ def test_remote_headers_for_tenant_missing_does_not_fallback_to_other_tenant(
     write_env_file(
         tmp_path / ".pmcp" / "tenants" / "tenant-b" / "pmcp.env",
         {"REMOTE_TOKEN": "tenant-b-secret"},
+        confine_to=None,
     )
 
     resolution = resolve_remote_headers_for_tenant(
@@ -1177,7 +1186,7 @@ def test_env_store_round_trips_shell_significant_values(tmp_path: Path) -> None:
         "EQUALS": "token=value",
     }
 
-    write_env_file(env_path, values)
+    write_env_file(env_path, values, confine_to=None)
 
     assert read_env_file(env_path) == values
     assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
@@ -1187,9 +1196,9 @@ def test_env_store_rejects_injection_before_write(tmp_path: Path) -> None:
     env_path = tmp_path / "pmcp.env"
 
     with pytest.raises(ValueError):
-        write_env_file(env_path, {"GOOD": "first\nINJECTED=second"})
+        write_env_file(env_path, {"GOOD": "first\nINJECTED=second"}, confine_to=None)
     with pytest.raises(ValueError):
-        write_env_file(env_path, {"GOOD=bad": "secret"})
+        write_env_file(env_path, {"GOOD=bad": "secret"}, confine_to=None)
 
     assert not env_path.exists()
 

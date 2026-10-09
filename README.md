@@ -46,6 +46,15 @@ pip install pmcp
 
 ```
 
+### Upgrading from 2.x
+
+3.0.0 refuses several things 2.7.3 accepted. Most importantly, a repository's
+`.mcp.json`, `.pmcp/manifest.yaml` and `.mcp-gateway-policy.yaml` are ignored
+until you approve them with `pmcp trust approve <absolute path>`.
+[MIGRATING.md](MIGRATING.md) has an upgrade checklist, a section for each
+breaking change (with a check, the fix and how to verify it), and how to roll
+back. To stay on 2.x for now, pin `pmcp<3`.
+
 > **Capability matching is built-in** — no API key needed. `gateway.request_capability`
 > uses a pure-Python matcher that can return direct CLI guidance for installed
 > native tools, MCP server candidates, or registry search guidance.
@@ -1183,8 +1192,10 @@ PMCP discovers MCP servers from:
 
 1. **Project config**: `.mcp.json` in project root (highest priority). The
    project root is `--project` when given, otherwise the nearest ancestor of
-   the working directory holding a `.mcp.json`, `.git`, `package.json` or
-   `pyproject.toml`, stopping before `$HOME`. A project `.mcp.json` is ignored
+   the working directory holding a `.mcp.json`, `.git`, `package.json`,
+   `pyproject.toml` or `.pmcp/manifest.yaml`, stopping before `$HOME`. Every
+   project input -- this file, the manifest overlay, the project policy and the
+   project's credentials -- comes from that one project root. A project `.mcp.json` is ignored
    until you run `pmcp trust approve <path>` (see
    [Security](#security)).
 2. **User config**: `~/.mcp.json` or `~/.claude/.mcp.json`
@@ -1209,8 +1220,10 @@ server name; a same-named entry is replaced whole, not deep-merged):
 
 1. **Shipped manifest** (base)
 2. **User**: `~/.pmcp/manifest.yaml`
-3. **Project**: `<project>/.pmcp/manifest.yaml` (nearest ancestor of the cwd,
-   below `$HOME`; ignored until you run `pmcp trust approve <path>`)
+3. **Project**: `<project>/.pmcp/manifest.yaml` at the served project root --
+   `--project` when given, otherwise the project root found from the working
+   directory (see the project config above); never `$HOME`'s, which is the user
+   overlay; ignored until you run `pmcp trust approve <path>`
 4. **Explicit**: `PMCP_MANIFEST_PATH` env var (wins over all; honoured only when
    exported, not when set by a `.env` file)
 
@@ -1259,12 +1272,29 @@ relaxer is ignored, and an unset, empty, or unexpanded `${VAR}` value fails
 closed: the credential stays required.
 
 Overlay loading is **fail-soft**: a missing file is skipped silently, and a
-malformed file or a single bad entry logs a warning and is skipped without
-crashing the gateway — the shipped manifest always still loads. pmcp re-reads
+malformed file logs a warning and is skipped; so does a single entry that pmcp
+could not use: a field some part of pmcp would fail on, such as `keywords: [1]`,
+an `args` list holding a number, a `command` or `transport` that is not a
+string, or a CLI alternative with an empty `check_command`. Fields pmcp stores
+but never reads (`status`), or reads only as true or false (`auto_start`,
+`requires_api_key`), are accepted whatever their value, as before. A
+`transport` string without a `url` is accepted as before, whatever the string;
+with a `url` it must be one of pmcp's transport names (`local`, `remote`,
+`sse`, `http`, `streamable-http`). The warning names the field, not
+its value, and does not show the entry's name unless pmcp ships it. A blank field
+(`description:` with nothing after it) means "not set". None of this crashes the
+gateway — the shipped manifest always still loads. pmcp re-reads
 overlay files on every manifest load, so edits apply without a restart, and
 logs each warning once per change rather than on every load — except that a
 file that cannot be read or parsed is reported on every load until it is
 fixed.
+
+An overlay's servers are found by their own keywords. Sharing a keyword with
+another server, or replacing a shipped server, never hides another server from
+`gateway.catalog_search` or `gateway.request_capability` (within the result
+limit; ties rank by name; a query that names a server resolves to it). A CLI an
+overlay adds or replaces is recommended only when no server matches, and is listed
+after pmcp's own CLIs.
 
 > **Security:** a manifest entry can specify an arbitrary `command`/`args` to
 > run when provisioned — treat an overlay file with the same trust as your own
@@ -1549,7 +1579,13 @@ Tenant runs use the existing task broker. Submit long-running work with
 `gateway.invoke` and non-secret `task.metadata`, `task.ttl`,
 `task.poll_interval`, `task.requestor_context`, and trace keys such as
 `_meta.traceparent`; PMCP forwards those fields to the downstream server only
-when the server and tool advertise task support. The returned downstream MCP
+when the server and tool advertise task support. `task.ttl` and
+`task.poll_interval` are in seconds, at most 9,007,199,254,740. PMCP sends them
+downstream in milliseconds, which is the unit MCP 2025-11-25 uses (`ttl: 300`
+reaches the server as `ttl: 300000`). The `ttl` and `poll_interval` of every
+task PMCP returns are converted back from the server's milliseconds to seconds,
+and may be fractional (`1500` ms is reported as `1.5`). A task's `raw` object
+keeps the values exactly as the server sent them. The returned downstream MCP
 task ID is then used with `gateway.tasks_list`, `gateway.tasks_get`,
 `gateway.tasks_result`, and `gateway.tasks_cancel`. Do not use PMCP request IDs
 from `gateway.list_pending` or `gateway.cancel` for tenant task operations.
@@ -1578,6 +1614,19 @@ pmcp secrets sync --from-scope user --to-scope project --overwrite
 # Copy project-scoped secrets into user scope
 pmcp secrets sync --from-scope project --to-scope user --overwrite
 ```
+
+Copying out of a project copies credentials only. A project `.env.pmcp` is the
+repository's, and your user store loads into pmcp's environment at every start
+(and `pmcp upgrade` runs uv or pip in it), so `sync` copies a name only if it
+is credential-shaped (`*_TOKEN`, `*_KEY`, `*_SECRET(S)`, `*_PASSWORD`,
+`*_CREDENTIAL(S)`, `*_PAT`, `*_DSN`, `*_AUTH`) or a server in the manifest
+declares it as its credential (`POSTGRES_URL`, say). Everything else --
+`UV_INDEX_URL`, `PIP_CONFIG_FILE`, `DATABASE_URL`, anything named `PMCP_*`, proxies,
+`LD_*`/`NODE_*`/`NPM_CONFIG_*` and the like, even when credential-shaped -- is
+skipped, as is any value containing `${` or spanning more than one line. Each
+skipped name prints one `pmcp: Not copying <NAME> from .env.pmcp: ...` line and
+is listed under `"refused"`; the other keys still sync. Set one yourself with
+`pmcp secrets set <NAME> --scope user` if you mean it.
 
 Passing the value on the command line (`pmcp secrets set API_TOKEN your-token`)
 still works but exposes it in `ps` output and shell history. `pmcp secrets check`
@@ -1633,8 +1682,9 @@ Besides `servers`, `tools` (`server::tool`), `packages`, `limits` and
 
 PMCP looks for the policy at `~/.claude/gateway-policy.yaml` or
 `~/.claude/gateway-policy.json`, and for a project policy at
-`.mcp-gateway-policy.yaml` or `.mcp-gateway-policy.json` in the gateway's
-working directory; a project policy is
+`.mcp-gateway-policy.yaml` or `.mcp-gateway-policy.json` at the project root
+(`--project` when given, otherwise the project root found from the working
+directory -- the same root as every other project input); a project policy is
 ignored until approved with `pmcp trust approve`, and can only narrow the
 operator's policy. `--policy` / `PMCP_POLICY` names one explicitly.
 
@@ -1799,7 +1849,9 @@ For hosted tenant auth, keep credentials in PMCP env storage or tenant-scoped
 project storage and reference only placeholders from config:
 `${TENANT_CODE_MODE_MCP_TOKEN}` and `${TENANT_CODE_MODE_TENANT_ID}`. Use
 `pmcp secrets set ... --scope project` or `gateway.auth_connect` to populate
-env-store values; the gateway does not select a per-tenant env file itself
+env-store values (a key also in your user store wins over the project's; see
+[MIGRATING.md](MIGRATING.md#a-project-file-supplies-credentials-only)); the
+gateway does not select a per-tenant env file itself
 (see [Auth And Elicitation](#auth-and-elicitation)). PMCP diagnostics report missing
 field or env-var names such as
 `TENANT_CODE_MODE_MCP_TOKEN`; they must not print token values.
@@ -1809,7 +1861,13 @@ Hosted operators should require Bearer auth on `/mcp`, tune `--rate-limit` or
 network controls. `gateway.refresh`, `gateway.disconnect_server`, and
 `gateway.restart_server` can disrupt in-flight downstream work unless forced by
 policy; use downstream task IDs with `gateway.tasks_cancel` for tenant run
-cancellation. PMCP task records are transient. Durable sandbox logs, artifacts,
+cancellation. PMCP task records are transient, and bounded: at most 100 per
+server and 1000 in total. To cancel a task pmcp no longer tracks, call
+`gateway.tasks_get` first, which tracks it again. A forced disconnect,
+restart or refresh cancels only the tasks pmcp still tracks when it starts.
+On a remote tenant server, a task that was evicted before then keeps running
+after the disconnect. Cancel it explicitly first, with `gateway.tasks_get`
+and then `gateway.tasks_cancel`. Durable sandbox logs, artifacts,
 tenant authorization, and artifact retention remain responsibilities of the
 companion tenant server and its deployment controls.
 
@@ -1931,7 +1989,7 @@ Other environment variables:
 
 Use `pmcp doctor` to diagnose common PMCP startup and connectivity issues. It checks:
 
-- `lock`: detects singleton lock state and stale lock collisions at `~/.pmcp/gateway.lock`
+- `lock`: reports whether a gateway holds the singleton lock at `~/.pmcp/gateway.lock` (the file itself stays between runs and is harmless when nothing holds it)
 - `mode`: detects local command-mode MCP config conflicts when a shared PMCP system service is running
 - `http`: probes the unauthenticated `/health` endpoint derived from `PMCP_GATEWAY_URL` or `http://127.0.0.1:3344/mcp`
 - `remote`: detects unresolved remote downstream header environment references
@@ -1947,7 +2005,7 @@ If any checks fail, follow the command in the output and rerun `pmcp doctor`.
 
 ### Singleton Lock
 
-By default, PMCP uses a global lock at `~/.pmcp/gateway.lock` to ensure only one gateway runs per user. This prevents multiple gateway instances from spawning duplicate downstream servers.
+By default, PMCP uses a global lock at `~/.pmcp/gateway.lock` to ensure only one gateway runs per user. The lock is held by the running gateway and released when it exits (or dies); the file itself is never removed, so a leftover file never blocks a start and never needs deleting. The lock file must be a plain regular file, and a link at its name is refused. The default `~/.pmcp` may be your own symlink (for example into a dotfiles repository): it follows exactly the rule `~/.config/pmcp` follows for the trust store -- accepted wherever it leads, except into a checkout being judged (the project pmcp serves, or the one it was started in). An explicit `--lock-dir` / `PMCP_LOCK_DIR` that is itself a symlink is refused, since a repository can supply that path. This prevents multiple gateway instances from spawning duplicate downstream servers.
 
 **Override the lock directory:**
 

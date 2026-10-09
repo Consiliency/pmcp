@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
+
+from pmcp.home_identity import home_path, optional_home_path
 from pydantic import BaseModel, Field
 
 
@@ -159,7 +161,12 @@ def load_guidance_config(config_path: Path | None = None) -> GuidanceConfig:
         GuidanceConfig instance with loaded or default settings
     """
     if config_path is None:
-        config_path = Path.home() / ".claude" / "gateway-guidance.yaml"
+        # Only while the home directory is the operator's (Consiliency/pmcp#372
+        # round 22); otherwise the defaults.
+        found = optional_home_path(".claude", "gateway-guidance.yaml")
+        if found is None:
+            return GuidanceConfig()
+        config_path = found
 
     if not config_path.exists():
         # Return default config (minimal mode)
@@ -191,7 +198,7 @@ def create_default_guidance_config(output_path: Path | None = None) -> Path:
         Path where the config was written
     """
     if output_path is None:
-        output_path = Path.home() / ".claude" / "gateway-guidance.yaml"
+        output_path = home_path(".claude", "gateway-guidance.yaml")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -225,7 +232,7 @@ def set_telemetry_enabled(
 ) -> tuple[GuidanceConfig, Path]:
     """Persist telemetry setting in guidance config and return updated config/path."""
     if config_path is None:
-        config_path = Path.home() / ".claude" / "gateway-guidance.yaml"
+        config_path = home_path(".claude", "gateway-guidance.yaml")
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -265,7 +272,7 @@ def set_feedback_submission_enabled(
     checkout, so a repository cannot ship its own consent (Consiliency/pmcp#230).
     """
     if config_path is None:
-        config_path = Path.home() / ".claude" / "gateway-guidance.yaml"
+        config_path = home_path(".claude", "gateway-guidance.yaml")
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
 

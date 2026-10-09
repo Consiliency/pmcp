@@ -89,6 +89,15 @@ DEFAULT_AUTH_STATE_SEMANTICS: dict[AuthState, AuthStateSemanticsInfo] = {
 #: the upper bound on numeric task hints pmcp forwards downstream.
 MAX_FORWARDED_TASK_NUMBER = 2**53 - 1
 
+#: MCP 2025-11-25 carries `TaskMetadata.ttl`, `Task.ttl` and `Task.pollInterval`
+#: in milliseconds; pmcp's own interface uses seconds (Consiliency/pmcp#330).
+MS_PER_SECOND = 1000
+
+#: The largest `task.ttl` / `task.poll_interval` a caller may send, in seconds:
+#: times `MS_PER_SECOND`, it is still at most `MAX_FORWARDED_TASK_NUMBER` ms
+#: (Consiliency/pmcp#298 bound, restated for Consiliency/pmcp#330).
+MAX_TASK_SECONDS = MAX_FORWARDED_TASK_NUMBER // MS_PER_SECOND
+
 
 class GatewayArguments(BaseModel):
     """Base for every model that parses arguments an agent sends to a gateway
@@ -539,13 +548,28 @@ UNUSABLE_TASK_VALUE: Any = object()
 _UNUSABLE = UNUSABLE_TASK_VALUE
 
 
-def _usable_task_ttl(value: Any) -> Any:
-    """A non-bool integer in [0, int64], or a finite whole-number float there
-    (``300000.0``: JSON Schema calls it an integer too)."""
+def _usable_wire_task_ttl(value: Any) -> Any:
+    """A downstream ``ttl`` in milliseconds: a non-bool integer in [0, int64],
+    or a finite whole-number float there (``300000.0``: JSON Schema calls it an
+    integer too)."""
     if type(value) is float and math.isfinite(value) and value.is_integer():
         value = int(value)
     if type(value) is int and 0 <= value <= _INT64_MAX:
         return value
+    return _UNUSABLE
+
+
+def _usable_task_ttl(value: Any) -> Any:
+    """A ``ttl`` in seconds, as pmcp holds it: a non-bool, finite number in
+    [0, int64 / 1000] -- any value the wire check above accepts, divided by
+    1000 (Consiliency/pmcp#330)."""
+    if type(value) in (int, float):
+        try:
+            number = float(value)
+        except OverflowError:
+            return _UNUSABLE
+        if math.isfinite(number) and 0 <= number <= _INT64_MAX / MS_PER_SECOND:
+            return number
     return _UNUSABLE
 
 
@@ -609,10 +633,62 @@ _TASK_HINT_CHECKS: dict[str, Any] = {
 }
 
 
+#: The checks a downstream value gets AS SENT, before any conversion: the
+#: durations are checked in the wire's milliseconds (Consiliency/pmcp#330).
+_WIRE_TASK_HINT_CHECKS: dict[str, Any] = {
+    **_TASK_HINT_CHECKS,
+    "ttl": _usable_wire_task_ttl,
+}
+
+
+#: Task fields MCP carries in milliseconds and pmcp holds in seconds.
+_TASK_DURATIONS = frozenset({"ttl", "poll_interval"})
+
+
+def _wire_duration_seconds(name: str, value: Any) -> Any:
+    """A downstream duration in milliseconds as seconds, or ``None`` (not sent)
+    or ``_UNUSABLE``. Checked twice: in milliseconds as sent (the
+    Consiliency/pmcp#298 rule), then in seconds after division, so a value
+    that underflows to 0 s is unusable here, not later (Consiliency/pmcp#330)."""
+    if value is None:
+        return None
+    usable = _WIRE_TASK_HINT_CHECKS[name](value)
+    if usable is _UNUSABLE:
+        return _UNUSABLE
+    return _TASK_HINT_CHECKS[name](usable / MS_PER_SECOND)
+
+
 def task_hint_is_usable(name: str, value: Any) -> bool:
-    """Whether ``value`` passes the check for task field ``name`` -- for the
-    downstream parser choosing among a field's wire aliases."""
-    return value is not None and _TASK_HINT_CHECKS[name](value) is not _UNUSABLE
+    """Whether wire value ``value`` passes the check for task field ``name`` --
+    for the downstream parser choosing among a field's wire aliases. A duration
+    is judged as pmcp will hold it, in seconds after conversion, so an alias
+    that underflows to 0 s does not hide a usable one (Consiliency/pmcp#330)."""
+    if value is None:
+        return False
+    if name in _TASK_DURATIONS:
+        seconds = _wire_duration_seconds(name, value)
+        return seconds is not None and seconds is not _UNUSABLE
+    return _WIRE_TASK_HINT_CHECKS[name](value) is not _UNUSABLE
+
+
+def task_seconds_to_wire(seconds: int | float) -> int | float:
+    """The one outbound conversion (Consiliency/pmcp#330): a caller's
+    ``task.ttl`` / ``task.poll_interval`` in seconds, as the milliseconds MCP
+    2025-11-25 puts on the wire. Exact for an integer ``ttl``; the caller-side
+    bound (``MAX_TASK_SECONDS``) keeps the result within I-JSON."""
+    return seconds * MS_PER_SECOND
+
+
+def task_duration_from_wire(name: str, value: Any) -> Any:
+    """The one inbound conversion (Consiliency/pmcp#330): a downstream
+    ``ttl`` / ``pollInterval`` / ``poll_interval`` in milliseconds, checked in
+    milliseconds (the Consiliency/pmcp#298 rule), as float seconds.
+
+    ``None`` (not sent; for ``ttl`` also a sent ``null``, MCP's "unlimited")
+    stays ``None``. A value the wire check refuses, one that divides to a value
+    the seconds check refuses, and the parser's ``UNUSABLE_TASK_VALUE`` come
+    back as ``UNUSABLE_TASK_VALUE`` for the model to report as unusable."""
+    return _wire_duration_seconds(name, value)
 
 
 class McpTaskInfo(BaseModel):
@@ -631,7 +707,10 @@ class McpTaskInfo(BaseModel):
     status_message: str | None = None
     created_at: float | None = None
     updated_at: float | None = None
-    ttl: int | None = None
+    #: Seconds. The downstream sends milliseconds; ``raw`` keeps them as sent
+    #: (Consiliency/pmcp#330).
+    ttl: float | None = None
+    #: Seconds, as ``ttl``.
     poll_interval: float | None = None
     unusable_fields: list[str] = Field(default_factory=list)
     raw: dict[str, Any] = Field(default_factory=dict)
@@ -676,6 +755,11 @@ class McpTaskRecord(McpTaskInfo):
     #: eviction key. pmcp's own sequence, so neither a downstream's clock nor
     #: pmcp's wall clock can reorder it (Consiliency/pmcp#298, R3-N4).
     _recorded_order: int = PrivateAttr(default=0)
+    #: The `ManagedClient.connection_id` of the connection this record came
+    #: from (not public). A task request derived from the record is sent only
+    #: on that same connection (Consiliency/pmcp#338, rev 5). None for a
+    #: record no connection made (tests that seed the registry directly).
+    _connection_id: int | None = PrivateAttr(default=None)
 
 
 class TaskMetadataInput(GatewayArguments):
@@ -694,10 +778,14 @@ class TaskMetadataInput(GatewayArguments):
         # `TaskMetadata.ttl` integer, which a JavaScript peer reads as a double
         # -- above 2**53 - 1 it is no longer the integer the caller sent. The
         # bound also keeps the gate and the model agreeing on floats outside
-        # int64 (Consiliency/pmcp#236).
+        # int64 (Consiliency/pmcp#236). Seconds, sent downstream as
+        # milliseconds, so the bound is 2**53 - 1 ms (Consiliency/pmcp#330).
         ge=1,
-        le=MAX_FORWARDED_TASK_NUMBER,
-        description="Requested task TTL in seconds",
+        le=MAX_TASK_SECONDS,
+        description=(
+            "Requested task TTL in seconds (sent to the downstream server in "
+            "milliseconds)"
+        ),
     )
     poll_interval: float | None = Field(
         default=None,
@@ -706,10 +794,14 @@ class TaskMetadataInput(GatewayArguments):
         # integer of |n| >= 2**1024 - 2**970 past the gate to a model that
         # cannot hold it. `allow_inf_nan` is not projected into the schema;
         # the gate's validator refuses non-finite numbers itself.
+        # Seconds, sent downstream as milliseconds (Consiliency/pmcp#330).
         gt=0,
-        le=MAX_FORWARDED_TASK_NUMBER,
+        le=MAX_TASK_SECONDS,
         allow_inf_nan=False,
-        description="Seconds between task status polls",
+        description=(
+            "Seconds between task status polls (sent to the downstream server "
+            "in milliseconds)"
+        ),
     )
     requestor_context: dict[str, Any] | None = Field(
         default=None, description="Opaque requestor context forwarded downstream"

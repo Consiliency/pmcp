@@ -167,7 +167,9 @@ class TestHelperFunctions:
         other = tmp_path / "other"
         project.mkdir()
         other.mkdir()
-        write_env_file(project / ".env.pmcp", {"REMOTE_TOKEN": "project-token"})
+        write_env_file(
+            project / ".env.pmcp", {"REMOTE_TOKEN": "project-token"}, confine_to=None
+        )
         monkeypatch.chdir(other)
         monkeypatch.delenv("REMOTE_TOKEN", raising=False)
 
@@ -186,7 +188,9 @@ class TestHelperFunctions:
     def test_remote_headers_process_env_precedence_with_project_root(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        write_env_file(tmp_path / ".env.pmcp", {"REMOTE_TOKEN": "project-token"})
+        write_env_file(
+            tmp_path / ".env.pmcp", {"REMOTE_TOKEN": "project-token"}, confine_to=None
+        )
         monkeypatch.setenv("REMOTE_TOKEN", "process-token")
 
         headers = _remote_headers(
@@ -1365,11 +1369,15 @@ class TestRemoteConnectSseHeaders:
     async def test_connect_streamable_http_interpolates_headers_from_project_store(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        manager = ClientManager()
         credential = r'token with spaces # "quotes" and \ slash = value'
-        write_env_file(tmp_path / ".env.pmcp", {"PMCP_TEST_TOKEN": credential})
+        write_env_file(
+            tmp_path / ".env.pmcp", {"SOAK_TEST_TOKEN": credential}, confine_to=None
+        )
+        # The manager binds its project when it is built (Consiliency/pmcp#372
+        # round 16), so the working directory is set first.
         monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv("PMCP_TEST_TOKEN", raising=False)
+        manager = ClientManager()
+        monkeypatch.delenv("SOAK_TEST_TOKEN", raising=False)
 
         config = ResolvedServerConfig(
             name="remote-http",
@@ -1377,7 +1385,7 @@ class TestRemoteConnectSseHeaders:
             config=RemoteMcpServerConfig(
                 type="streamable-http",
                 url="https://example.com/mcp",
-                headers={"Authorization": "Bearer ${PMCP_TEST_TOKEN}"},
+                headers={"Authorization": "Bearer ${SOAK_TEST_TOKEN}"},
             ),
         )
         captured_headers: dict[str, str] = {}
@@ -1670,8 +1678,8 @@ class TestCallTool:
                 "task": {
                     "task_id": "tenant-run-1",
                     "status": "working",
-                    "ttl": 300,
-                    "poll_interval": 2.5,
+                    "ttl": 300000,
+                    "poll_interval": 2500,
                     "diagnostics": {"summary": "queued"},
                 }
             }
@@ -1705,8 +1713,8 @@ class TestCallTool:
             },
             "task": {
                 "metadata": {"run_kind": "smoke"},
-                "ttl": 300,
-                "pollInterval": 2.5,
+                "ttl": 300000,
+                "pollInterval": 2500.0,
                 "requestorContext": {"client": "mobile"},
             },
         }
@@ -1807,8 +1815,8 @@ class TestCallTool:
                             "statusMessage": "needs approval",
                             "createdAt": "2026-01-02T03:04:05Z",
                             "lastUpdatedAt": "2026-01-02T03:04:06Z",
-                            "ttl": 300,
-                            "pollInterval": 2,
+                            "ttl": 300000,
+                            "pollInterval": 2000,
                             "metadata": {"unknown": "kept"},
                         },
                         {
@@ -1816,8 +1824,8 @@ class TestCallTool:
                             "status": "host_custom_waiting",
                             "created_at": 1760000000,
                             "last_updated_at": 1760000001.5,
-                            "ttl": 120,
-                            "poll_interval": 0.5,
+                            "ttl": 120000,
+                            "poll_interval": 500,
                         },
                     ]
                 },
@@ -1900,6 +1908,8 @@ class TestCallTool:
             manager_with_tool._task_info_from_payload(
                 {"taskId": "done", "status": "completed"}
             ),
+            requestor_context=None,
+            connection=None,
         )
 
         ok, returned, message = await manager_with_tool.cancel_task("test", "done")
@@ -1909,14 +1919,17 @@ class TestCallTool:
         assert "already terminal" in message
 
     def test_terminal_task_records_are_evicted_past_cap(self) -> None:
-        """Terminal task records are pruned past the cap; active ones survive."""
+        """The per-server cap counts every record; finished ones are evicted
+        first, so the active one survives (Consiliency/pmcp#338)."""
         manager = ClientManager()
-        manager._max_terminal_tasks = 5
+        manager._tasks.per_server = 5
 
-        # An active (non-terminal) record must never be evicted.
+        # Finished records go before an active (non-terminal) one.
         manager._record_task(
             "srv",
             McpTaskInfo(task_id="active", status="working", updated_at=0.0),
+            requestor_context=None,
+            connection=None,
         )
 
         # Record many terminal tasks with increasing updated_at timestamps.
@@ -1926,15 +1939,17 @@ class TestCallTool:
                 McpTaskInfo(
                     task_id=f"done-{i}", status="completed", updated_at=float(i + 1)
                 ),
+                requestor_context=None,
+                connection=None,
             )
 
         terminal = [
             t for t in manager.get_tracked_tasks("srv") if manager._terminal_task(t)
         ]
-        assert len(terminal) == 5
+        assert len(terminal) == 4
         # Oldest terminal records were dropped; newest survive.
         surviving = {t.task_id for t in terminal}
-        assert surviving == {f"done-{i}" for i in range(15, 20)}
+        assert surviving == {f"done-{i}" for i in range(16, 20)}
         # The active task is untouched.
         assert manager.get_task_record("srv", "active") is not None
 
@@ -3990,9 +4005,14 @@ class TestTerminateProcessTree:
         process.returncode = None
         process.wait = AsyncMock(return_value=0)
 
-        # Must not raise; must use the cross-platform single-process path.
+        # Must not raise; must use the cross-platform single-process path --
+        # also with a retained group id passed in (Consiliency/pmcp#324: the
+        # id is never used where groups do not exist; every other kill path
+        # is covered in tests/test_cancel_teardown.py).
         await _terminate_process_tree(process, "browser")
         process.terminate.assert_called_once()
+        await _terminate_process_tree(process, "browser", group_pgid=4321)
+        assert process.terminate.call_count == 2
 
 
 class TestReadStdoutFailureSurfacing:
@@ -4498,7 +4518,7 @@ class TestDownstreamReconcileScheduler:
             task_id="t-1",
             status="working",
         )
-        manager._tasks[("srv", "t-1")] = record
+        manager._tasks.put(record)
 
         manager._handle_downstream_notification(
             "srv", managed, "notifications/tools/list_changed"

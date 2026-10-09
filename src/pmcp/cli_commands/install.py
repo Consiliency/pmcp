@@ -28,7 +28,9 @@ def _uv_tool_dir() -> Path:
     if env:
         return Path(env).expanduser().resolve()
     xdg = os.environ.get("XDG_DATA_HOME")
-    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+    from pmcp.home_identity import home_path
+
+    base = Path(xdg).expanduser() if xdg else home_path(".local", "share")
     return (base / "uv" / "tools").resolve()
 
 

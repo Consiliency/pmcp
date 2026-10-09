@@ -13,13 +13,13 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv
 from pmcp import package_approvals, trust_store
+from pmcp.atomic_write import atomic_write, is_absent
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
 from pmcp.cli_commands.install import (
@@ -37,9 +37,18 @@ from pmcp.config.loader import (
     set_startup_policy,
 )
 from pmcp.env_store import (
+    child_process_env,
+    credential_value,
     describe_ignored_trust_env_var,
     env_key_is_operator_supplied,
     record_dotenv_keys,
+    load_discovered_dotenv,
+    load_store,
+    mark_startup_loaded,
+    pin_user_store_path,
+    ensure_served_project_root,
+    resolve_project_root,
+    serve_project_root,
     record_pmcp_introduced_keys,
 )
 from pmcp.validation import is_valid_package_version, parse_package_spec
@@ -104,6 +113,21 @@ def setup_logging(
         except Exception:
             # If we can't write logs, continue without file logging
             pass
+
+
+def _manifest_for(project_root: Path | None) -> Any:
+    """``load_manifest`` for ``project_root``; ``None`` is the served project.
+
+    The project overlay follows the same root as the credentials
+    (Consiliency/pmcp#372 round 12). With no project the call stays
+    ``load_manifest()``, which reads the served project's overlay. Imported at
+    call time, as ``run_init`` always did, so a patched loader is the one used.
+    """
+    from pmcp.manifest.loader import load_manifest as _load_manifest
+
+    if project_root is None:
+        return _load_manifest()
+    return _load_manifest(project_root=project_root)
 
 
 def parse_args() -> argparse.Namespace:
@@ -403,6 +427,9 @@ Environment overrides:
         "-p",
         "--project",
         type=Path,
+        # Only when given: the top-level --project then stands (one meaning
+        # for both flag positions, Consiliency/pmcp#372 round 14).
+        default=argparse.SUPPRESS,
         help="Project root directory (for .mcp.json discovery)",
     )
     status_parser.add_argument(
@@ -465,6 +492,9 @@ Environment overrides:
         "--project",
         "-p",
         type=Path,
+        # Only when given: the top-level --project then stands (one meaning
+        # for both flag positions, Consiliency/pmcp#372 round 14).
+        default=argparse.SUPPRESS,
         help="Project directory (default: current directory)",
     )
     init_parser.add_argument(
@@ -598,6 +628,9 @@ Environment overrides:
         "-p",
         "--project",
         type=Path,
+        # Only when given: the top-level --project then stands (one meaning
+        # for both flag positions, Consiliency/pmcp#372 round 14).
+        default=argparse.SUPPRESS,
         help="Project root directory (defaults to auto-discovery)",
     )
     doctor_parser.add_argument(
@@ -687,6 +720,9 @@ Environment overrides:
     secrets_set_parser.add_argument(
         "--project",
         type=Path,
+        # Only when given: the top-level --project then stands (one meaning
+        # for both flag positions, Consiliency/pmcp#372 round 14).
+        default=argparse.SUPPRESS,
         help="Project root directory (for project scope)",
     )
 
@@ -714,6 +750,9 @@ Environment overrides:
     secrets_sync_parser.add_argument(
         "--project",
         type=Path,
+        # Only when given: the top-level --project then stands (one meaning
+        # for both flag positions, Consiliency/pmcp#372 round 14).
+        default=argparse.SUPPRESS,
         help="Project root directory (for project scope)",
     )
 
@@ -724,6 +763,9 @@ Environment overrides:
     secrets_check_parser.add_argument(
         "--project",
         type=Path,
+        # Only when given: the top-level --project then stands (one meaning
+        # for both flag positions, Consiliency/pmcp#372 round 14).
+        default=argparse.SUPPRESS,
         help="Project root directory (for project scope)",
     )
 
@@ -977,7 +1019,9 @@ async def run_update(args: argparse.Namespace) -> None:
         sys.exit(2)
 
     policy_path = args.policy if hasattr(args, "policy") else None
-    policy_manager = PolicyManager(policy_path)
+    policy_manager = PolicyManager(
+        policy_path, project_root=getattr(args, "project", None)
+    )
     client_manager = ClientManager(
         max_tools_per_server=policy_manager.get_max_tools_per_server()
     )
@@ -1268,7 +1312,9 @@ async def run_status(args: argparse.Namespace) -> None:
 
     # Initialize components
     policy_path = args.policy if hasattr(args, "policy") else None
-    policy_manager = PolicyManager(policy_path)
+    policy_manager = PolicyManager(
+        policy_path, project_root=getattr(args, "project", None)
+    )
     client_manager = ClientManager(
         max_tools_per_server=policy_manager.get_max_tools_per_server()
     )
@@ -1653,9 +1699,9 @@ async def run_init(args: argparse.Namespace) -> None:
     """Initialize PMCP configuration."""
     import json
 
-    from pmcp.manifest.loader import load_manifest
-
-    project_dir = args.project or Path.cwd()
+    # The project named, else the one this process serves (Consiliency/pmcp#372
+    # round 12): a project-scoped output follows the same root as every input.
+    project_dir = resolve_project_root(args.project)
     config_path = project_dir / ".mcp.json"
 
     # Check if config already exists
@@ -1668,7 +1714,7 @@ async def run_init(args: argparse.Namespace) -> None:
 
     # Load manifest to get available servers
     try:
-        manifest = load_manifest()
+        manifest = _manifest_for(project_dir)
         available_servers = list(manifest.servers.keys())
     except Exception:
         manifest = None
@@ -1732,7 +1778,7 @@ async def run_init(args: argparse.Namespace) -> None:
                         (
                             k
                             for k in credential_lookup_keys(server)
-                            if os.environ.get(k)
+                            if credential_value(k, root=project_dir)
                         ),
                         None,
                     )
@@ -1845,7 +1891,11 @@ def _setup_profile_options(args: argparse.Namespace) -> tuple[str, bool, bool]:
 
 def _get_setup_target_path(client: str) -> Path:
     """Get the destination config path for a supported client."""
-    home = Path.home()
+    # Home-scoped (Consiliency/pmcp#372 round 22): refused while a checkout
+    # controls the home directory.
+    from pmcp.home_identity import home_path
+
+    home = home_path()
     if client == "claude":
         return home / ".mcp.json"
     return home / ".config" / "opencode" / "opencode.json"
@@ -1867,15 +1917,21 @@ def _merge_setup_config(existing: dict, generated: dict) -> dict:
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
-    """Atomically write JSON data to path."""
+    """Atomically write JSON data to path, at 0600, through a symlinked config.
+
+    A client config kept in a dotfiles repository and symlinked into place is
+    written to its target, the link left intact (``pmcp.atomic_write``). This is
+    not the startup-policy editor's ``.mcp.json`` write, which refuses a link
+    (``symlinked_config``) because it records trust against the file's identity;
+    ``pmcp setup`` records no trust.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", dir=path.parent, delete=False, encoding="utf-8"
-    ) as tmp_file:
-        json.dump(data, tmp_file, indent=2)
-        tmp_file.write("\n")
-        tmp_path = Path(tmp_file.name)
-    tmp_path.replace(path)
+    text = json.dumps(data, indent=2) + "\n"
+    # confine_to=None: the target is ~/.mcp.json or ~/.config/opencode/opencode.json,
+    # fixed under the operator's home; no checkout chooses it.
+    atomic_write(
+        path, text.encode("utf-8"), confine_to=None, mode=0o600, prefix=".pmcp-setup-"
+    )
 
 
 def run_setup(args: argparse.Namespace) -> None:
@@ -1894,7 +1950,9 @@ def run_setup(args: argparse.Namespace) -> None:
 
     target_path = _get_setup_target_path(args.client)
     existing: dict = {}
-    if target_path.exists():
+    # Only ENOENT/ENOTDIR is "no config yet"; a config the system refuses to
+    # look up (ELOOP, EACCES) must not be read as empty and then replaced.
+    if not is_absent(target_path):
         try:
             parsed = json.loads(target_path.read_text())
             if isinstance(parsed, dict):
@@ -1916,7 +1974,8 @@ def run_setup(args: argparse.Namespace) -> None:
 def run_config(args: argparse.Namespace) -> None:
     """Run local config administration commands."""
     command = getattr(args, "config_command", None)
-    configs = load_configs()
+    # `pmcp config` takes no --project: the served project, said explicitly.
+    configs = load_configs(project_root=getattr(args, "project", None))
     manifest = load_manifest().servers
     known_names = {config.name for config in configs} | set(manifest)
     if command == "startup-policy":
@@ -1998,6 +2057,7 @@ def _is_pmcp_system_service_active() -> bool | None:
             capture_output=True,
             text=True,
             check=False,
+            env=child_process_env(),
         )
     except OSError:
         return None
@@ -2007,9 +2067,8 @@ def _is_pmcp_system_service_active() -> bool | None:
 
 def _load_local_mcp_json(project_root: Path | None) -> tuple[Path, dict | None]:
     """Load local .mcp.json, if present and valid JSON."""
-    from pmcp.config.loader import find_project_root
-
-    base_dir = project_root or find_project_root(Path.cwd()) or Path.cwd()
+    # The served project, or the one named (Consiliency/pmcp#372 round 12).
+    base_dir = resolve_project_root(project_root)
     config_path = base_dir / ".mcp.json"
     if not config_path.exists():
         return config_path, None
@@ -2133,13 +2192,43 @@ async def run_doctor(args: argparse.Namespace) -> None:
 
     checks: list[tuple[str, str, str]] = []
 
-    lock_path = Path.home() / ".pmcp" / "gateway.lock"
-    if lock_path.exists():
+    from pmcp.home_identity import optional_home_path
+    from pmcp.identity import singleton_lock_held
+
+    # The lock file persists between runs (Consiliency/pmcp#372 round 32): what
+    # matters is whether a gateway HOLDS it, not whether it exists.
+    lock_dir = optional_home_path(".pmcp")
+    state = (
+        singleton_lock_held(lock_dir, home_scoped=True)
+        if lock_dir is not None
+        else "absent"
+    )
+    if state == "held":
         checks.append(
             (
                 "lock",
                 "warn",
-                "Lock file exists at ~/.pmcp/gateway.lock. If no gateway is running, remove stale lock: rm ~/.pmcp/gateway.lock",
+                "A gateway holds the singleton lock (~/.pmcp/gateway.lock): another "
+                "local launch will not start. Use the running gateway, or stop it first.",
+            )
+        )
+    elif state == "unusable":
+        checks.append(
+            (
+                "lock",
+                "warn",
+                "~/.pmcp/gateway.lock is not a plain regular file (a link, a fifo, a "
+                "directory or a file with other names); a gateway refuses it. Remove "
+                "it: rm ~/.pmcp/gateway.lock",
+            )
+        )
+    elif state == "free":
+        checks.append(
+            (
+                "lock",
+                "ok",
+                "No gateway holds the singleton lock (the lock file is left between "
+                "runs and is harmless).",
             )
         )
     else:
@@ -2200,7 +2289,9 @@ async def run_doctor(args: argparse.Namespace) -> None:
             )
         )
 
-    remote_checks = collect_remote_header_diagnostics(config_data)
+    remote_checks = collect_remote_header_diagnostics(
+        config_data, args.project if hasattr(args, "project") else None
+    )
     if remote_checks:
         checks.extend(remote_checks)
     else:
@@ -2245,17 +2336,26 @@ def _restart_local_pmcp_service() -> None:
             ["systemctl", "--user", "is-active", "pmcp.service"],
             capture_output=True,
             text=True,
+            env=child_process_env(),
         )
         if probe.returncode != 0:
             print("No active pmcp systemd user service found — skipping restart.")
             return
         print("Restarting pmcp systemd user service...")
-        subprocess.run(["systemctl", "--user", "restart", "pmcp.service"], check=False)
+        subprocess.run(
+            ["systemctl", "--user", "restart", "pmcp.service"],
+            check=False,
+            env=child_process_env(),
+        )
         return
     if sys.platform == "darwin" and shutil.which("launchctl"):
         label = f"gui/{os.getuid()}/com.user.pmcp"
         print(f"Kickstarting launchd {label}...")
-        subprocess.run(["launchctl", "kickstart", "-k", label], check=False)
+        subprocess.run(
+            ["launchctl", "kickstart", "-k", label],
+            check=False,
+            env=child_process_env(),
+        )
         return
     print("No supported service manager detected — skipping restart.")
 
@@ -2299,7 +2399,7 @@ async def run_upgrade(args: argparse.Namespace) -> None:
 
     print(f"Upgrading pmcp via {method}: {' '.join(cmd)}")
     try:
-        result = subprocess.run(cmd, check=False)
+        result = subprocess.run(cmd, check=False, env=child_process_env())
     except FileNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -2801,7 +2901,9 @@ def _build_gateway_auth_client(args: argparse.Namespace) -> tuple[Any, Any]:
     setup_logging(args.log_level)
 
     policy_path = args.policy if hasattr(args, "policy") else None
-    policy_manager = PolicyManager(policy_path)
+    policy_manager = PolicyManager(
+        policy_path, project_root=getattr(args, "project", None)
+    )
     client_manager = ClientManager(
         max_tools_per_server=policy_manager.get_max_tools_per_server()
     )
@@ -3047,7 +3149,9 @@ async def async_main(args: argparse.Namespace) -> None:
         await run_server(args)
 
 
-def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
+def load_startup_env(
+    dotenv_path: str | os.PathLike[str] | None = None, *, choose_root: bool = True
+) -> None:
     """Load the startup env files, recording what the plain ``.env`` introduced.
 
     These are the loads that used to sit inline in ``main()``. ``load_dotenv``
@@ -3086,26 +3190,95 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     spawned child -- so recording the stores there would change what downstream
     servers inherit, which is behaviour outside this change.
 
-    ``dotenv_path`` is a test seam, and ``None`` -- the production call -- is
-    identical to the bare ``load_dotenv()`` this replaced: ``find_dotenv``
-    resolves the path by walking up from THIS module's directory either way. It
-    exists because that frame-based discovery cannot be pointed at a ``tmp_path``
-    (``monkeypatch.chdir`` has no effect on it), and the end-to-end proof of
-    #229 has to run this production function rather than call ``load_dotenv``
-    itself. ``tests/test_env_leak_229.py`` asserts ``main()`` still passes
-    nothing.
+    ``dotenv_path`` is a test seam, and ``None`` -- the production call --
+    discovers the file as the bare ``load_dotenv()`` this replaced did:
+    ``find_dotenv`` walks up from THIS module's directory. It exists because that
+    frame-based discovery cannot be pointed at a ``tmp_path`` (``monkeypatch.chdir``
+    has no effect on it), and the end-to-end proof of #229 has to run this
+    production function rather than call ``load_dotenv`` itself.
+    ``tests/test_env_leak_229.py`` asserts ``main()`` still passes nothing.
+
+    The discovered file is classified by WHERE it is
+    (``env_store.load_discovered_dotenv``, Consiliency/pmcp#367). The walk starts
+    where pmcp is installed, and that can be inside a checkout -- a ``.venv``
+    that ``uv run``, ``pip install -e`` or ``pip install -r`` created there -- so
+    the ``.env`` it reaches can be the repository's. Only a file in the home
+    directory or an ancestor of it is the operator's (``~/.env`` for a ``uv
+    tool`` or ``pip --user`` install, which MIGRATING.md documents as loaded) and
+    loads as before; any other is read confined, and its values go to the
+    credential map, never into the process environment.
+
+    The user store's path is pinned FIRST (``env_store.pin_user_store_path``),
+    before any other file is loaded, so nothing loaded later can move it. No
+    repository-controlled file reaches ``os.environ`` (``env_store.load_store``),
+    so none can set ``HOME``, a proxy, ``LD_PRELOAD`` or any other variable pmcp,
+    its libraries or its children read (Consiliency/pmcp#372 rounds 1-3).
     """
+    pin_user_store_path()
+    mark_startup_loaded()
+    # An unqualified credential lookup answers for the project this process
+    # serves. Loading the environment never CHOOSES it: a root already served
+    # (`serve_project_root(B)` in library use, before a lazy load) is kept;
+    # only an unset one is discovered from the working directory -- the root
+    # the gateway loads `.mcp.json` from. main() moves it to `--project` once
+    # the arguments are parsed (Consiliency/pmcp#372 rounds 9 and 14).
+    # ``choose_root=False`` is the LAZY load a library process runs on its
+    # first credential lookup (env_store.ensure_startup_load): it loads the
+    # project the process would serve now but fixes nothing, so a library
+    # caller that has served no root keeps discovering one from its working
+    # directory (Consiliency/pmcp#372 round 15).
+    served = ensure_served_project_root() if choose_root else resolve_project_root()
     before = set(os.environ)
-    load_dotenv(dotenv_path)
+    found = dotenv_path if dotenv_path is not None else find_dotenv()
+    if found:
+        load_discovered_dotenv(Path(os.path.abspath(found)))
     record_dotenv_keys(set(os.environ) - before)
     # Load PMCP credential stores written by auth_connect (don't override already-set
     # vars) and record what they introduced. ``override=False`` is what makes the
     # delta correct: a variable the operator exported is already in ``before``, so it
     # is never recorded and never refused.
     before = set(os.environ)
-    load_dotenv(Path.home() / ".config" / "pmcp" / "pmcp.env", override=False)
-    load_dotenv(Path.cwd() / ".env.pmcp", override=False)
+    load_store("user")
+    _load_project_store_at_startup(served / ".env.pmcp")
     record_pmcp_introduced_keys(set(os.environ) - before)
+
+
+def _load_project_store_at_startup(path: Path) -> None:
+    """Load the served project's ``.env.pmcp`` through the confined reader, or skip it with a warning.
+
+    The project store is repository-controlled: a clone can ship it as a symlink
+    out of the project, as a fifo, or as a socket. This load runs in ``main()``
+    BEFORE any subcommand -- including ``pmcp secrets set``/``sync`` and
+    ``pmcp auth connect``, which rewrite or report on that store -- so it must
+    not follow a link those commands would refuse, nor block on a fifo. It reads
+    through :func:`pmcp.atomic_write.read_confined` (the write's own walk): a
+    symlinked store of any kind, a non-regular file, an unreadable or non-UTF-8
+    store are each skipped with one value-free line on stderr, and the command
+    goes on. A regular store loads exactly as ``load_dotenv(path,
+    override=False)`` did (same parser, interpolation and precedence, from the
+    same bytes).
+
+    Every other reader of a repository-controlled store reads it the same way
+    (``env_store.read_store``, Consiliency/pmcp#367).
+    """
+    # Confined to the store's own directory (env_store.cwd_store_confinement):
+    # a project `.env.pmcp` that is a symlink of any kind is refused. A refusal
+    # is one `pmcp: refusing to load .env.pmcp: ...` line on stderr.
+    load_store("project", path=path, verb="load")
+
+
+def serve_project(project: Path | None) -> None:
+    """Serve ``--project``: every unqualified credential lookup answers for it.
+
+    The startup load ran before the arguments were parsed and served the root
+    discovered from the working directory. A ``--project`` moves the served
+    root there and loads that root's ``.env.pmcp`` the same way, so a gateway
+    started from inside project A to serve project B spawns, gates and checks
+    B's servers with B's credentials (Consiliency/pmcp#372 round 9).
+    """
+    if project is None:
+        return
+    _load_project_store_at_startup(serve_project_root(project) / ".env.pmcp")
 
 
 def main() -> None:
@@ -3116,6 +3289,7 @@ def main() -> None:
     load_startup_env()
 
     args = parse_args()
+    serve_project(getattr(args, "project", None))
 
     # Resolve the `secrets set` value here (not in async_main) so it is never
     # required on argv, while async_main stays a pure dispatcher over args.

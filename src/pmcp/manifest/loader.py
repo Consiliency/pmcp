@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
-import logging
 import os
 import pickle
 import re
-import tempfile
 import threading
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
@@ -18,6 +17,9 @@ from typing import Any, Literal, cast
 
 import yaml
 
+from pmcp.home_identity import optional_home_path, spelled_home
+
+from pmcp.manifest.attribution import attribution_pass, quiet_during_attribution
 from pmcp.project_consent import log_refusal, read_and_gate
 from pmcp.validation import (
     NPM_FILE_TYPE_RE,
@@ -25,7 +27,7 @@ from pmcp.validation import (
     parse_package_spec,
 )
 
-logger = logging.getLogger(__name__)
+logger = quiet_during_attribution(__name__)
 
 
 _SHIPPED_MANIFEST_PATH = Path(__file__).parent / "manifest.yaml"
@@ -89,6 +91,48 @@ def _shipped_manifest_entries() -> dict[str, dict[str, Any]]:
         for name, entry in servers.items()
         if isinstance(name, str) and isinstance(entry, dict)
     }
+
+
+def entry_log_name(name: object, *, manifest_derived: bool) -> str:
+    """How a log line names a server that may come from an overlay.
+
+    A ``.mcp.json`` entry is the operator's own config and is named as before;
+    a manifest-derived one is named only if pmcp ships that name
+    (``_server_label``), because an overlay key may be anything an operator
+    pasted (Consiliency/pmcp#342, D9).
+    """
+    if manifest_derived:
+        return _server_label(name)
+    return f"'{name}'"
+
+
+def shipped_env_var(name: object, env_var: object) -> str | None:
+    """``env_var`` if it is the variable pmcp's own entry for ``name`` declares.
+
+    A log line may print a credential variable's NAME only when pmcp wrote it;
+    an overlay's ``env_var`` is free text (Consiliency/pmcp#342, D9).
+    """
+    if not isinstance(name, str) or not isinstance(env_var, str):
+        return None
+    entry = _shipped_manifest_entries().get(name) or {}
+    return env_var if entry.get("env_var") == env_var else None
+
+
+def yaml_error_text(exc: BaseException) -> str:
+    """A YAML error as text with no value from the document in it.
+
+    PyYAML's message quotes the offending source line and token (a value an
+    operator may have pasted, a tag, an escape), so only the error class and
+    the 1-based line and column of its mark are kept (Consiliency/pmcp#342
+    rev 5). Used for every YAML error from overlay or manifest input.
+    """
+    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+    where = ""
+    line = getattr(mark, "line", None)
+    column = getattr(mark, "column", None)
+    if isinstance(line, int) and isinstance(column, int):
+        where = f" at line {line + 1}, column {column + 1}"
+    return f"{type(exc).__name__}{where}"
 
 
 def _server_label(name: object) -> str:
@@ -195,7 +239,7 @@ ServerTransport = Literal["local", "remote", "sse", "http", "streamable-http"]
 # DEFAULT_USER_CONFIG_PATHS). The user path is recomputed from Path.home() at
 # call time in _overlay_manifest_paths() so HOME monkeypatching works in tests;
 # this constant documents the default location.
-DEFAULT_USER_MANIFEST_PATHS = [Path.home() / ".pmcp" / "manifest.yaml"]
+DEFAULT_USER_MANIFEST_PATHS = [spelled_home() / ".pmcp" / "manifest.yaml"]
 
 
 @dataclass
@@ -415,6 +459,44 @@ def requires_credential(
     return credential_requirement(server, child_env=child_env).required
 
 
+def _category_keyword_norms(server: ServerConfig) -> list[str]:
+    """``server``'s normalized keywords, or none if they are unusable.
+
+    One replaced category server with bad keywords must not take down
+    ``request_capability``'s category tier for every query
+    (Consiliency/pmcp#342).
+    """
+    try:
+        return [
+            kw.lower().replace("-", " ").replace("_", " ") for kw in server.keywords
+        ]
+    except Exception as exc:
+        logger.warning(
+            f"request_capability: skipping unusable keywords "
+            f"({_server_label(server.name)}): {type(exc).__name__}"
+        )
+        return []
+
+
+def category_keyword_index(
+    servers: Mapping[str, ServerConfig],
+) -> dict[str, list[list[str]]]:
+    """For each ``_CATEGORY_MAP`` category, each mapped server's keyword norms.
+
+    The one input of the category tier's statistics (span and score). Built
+    from the base manifest by ``_build_manifest`` (Consiliency/pmcp#342 rev 4).
+    """
+    index: dict[str, list[list[str]]] = {}
+    for cat_name, server_names in _CATEGORY_MAP.items():
+        per_server: list[list[str]] = []
+        for sname in server_names:
+            server = servers.get(sname)
+            if server is not None:
+                per_server.append(_category_keyword_norms(server))
+        index[cat_name] = per_server
+    return index
+
+
 # Category taxonomy used by Manifest.get_category_summary() and get_servers_in_category()
 _CATEGORY_MAP: dict[str, list[str]] = {
     "browser automation": [
@@ -512,6 +594,33 @@ class Manifest:
     cli_alternatives: dict[str, CLIAlternative]
     servers: dict[str, ServerConfig]
     discovery_queue_path: str
+    # Keyword weights of the BASE manifest only -- the shipped document, or the
+    # explicit path -- computed before any overlay is merged
+    # (Consiliency/pmcp#342). Discovery scores a keyword by how many servers
+    # share it; counted over the merged manifest, an overlay server that
+    # shares a keyword halved its weight for every other server and pushed
+    # them all below the match threshold, so approving a project overlay hid
+    # shipped and user servers from `catalog_search`. ``None`` for a Manifest
+    # built by hand, whose weights come from its own servers.
+    base_keyword_weights: dict[str, float] | None = field(
+        default=None, compare=False, repr=False
+    )
+    # The category tier's statistics, from the BASE manifest only, for the same
+    # reason (Consiliency/pmcp#342 rev 4): for each `_CATEGORY_MAP` category, the
+    # normalized keywords of each mapped base server. Counted over the merged
+    # manifest, an overlay that REPLACED a mapped server with other keywords
+    # moved a keyword's category span (2 -> 3 categories, weight 0.7 -> 0.3) and
+    # emptied `request_capability`'s category tier for other servers. ``None``
+    # for a hand-built Manifest, which is scored from its own servers.
+    base_category_keywords: dict[str, list[list[str]]] | None = field(
+        default=None, compare=False, repr=False
+    )
+    # CLI alternatives an overlay added or replaced (rev 5). An overlay CLI
+    # answers `request_capability` only when no server tier would: it may add a
+    # resolution, never hide the servers a query already finds.
+    overlay_cli_names: frozenset[str] = field(
+        default=frozenset(), compare=False, repr=False
+    )
 
     def get_auto_start_servers(self) -> list[ServerConfig]:
         """Get servers configured for auto-start."""
@@ -566,14 +675,18 @@ class Manifest:
         # Build keyword → set-of-categories map for IDF discounting.
         # A keyword that appears in servers across many different categories is
         # considered generic; one confined to a single category is specific.
+        # Every statistic here comes from the base manifest when there is one
+        # (Consiliency/pmcp#342 rev 4), so an overlay never moves a category's
+        # score or a keyword's span.
+        category_keywords = (
+            self.base_category_keywords
+            if self.base_category_keywords is not None
+            else category_keyword_index(self.servers)
+        )
         kw_cats: dict[str, set[str]] = {}
-        for cat_name, server_names in _CATEGORY_MAP.items():
-            for sname in server_names:
-                server = self.servers.get(sname)
-                if not server:
-                    continue
-                for kw in server.keywords:
-                    kw_norm = kw.lower().replace("-", " ").replace("_", " ")
+        for cat_name, per_server in category_keywords.items():
+            for norms in per_server:
+                for kw_norm in norms:
                     kw_cats.setdefault(kw_norm, set()).add(cat_name)
 
         def _kw_weight(kw_norm: str) -> float:
@@ -597,12 +710,8 @@ class Manifest:
             score += len(cat_words & query_words) * 2.0
 
             # Score: keyword hits across servers in this category, category-span weighted
-            for sname in server_names:
-                server = self.servers.get(sname)
-                if not server:
-                    continue
-                for kw in server.keywords:
-                    kw_norm = kw.lower().replace("-", " ").replace("_", " ")
+            for norms in category_keywords.get(cat_name, []):
+                for kw_norm in norms:
                     if set(kw_norm.split()).issubset(query_words):
                         score += _kw_weight(kw_norm)
 
@@ -642,8 +751,458 @@ class Manifest:
         return matching_clis, matching_servers
 
 
+def keyword_weights(servers: Iterable[ServerConfig]) -> dict[str, float]:
+    """Inverse document frequency of each normalized keyword, floored at 0.5.
+
+    A keyword one server declares weighs 1.0; one that N servers share weighs
+    max(1/N, 0.5). A keyword repeated verbatim within one server counts once;
+    two spellings that normalise alike (``alpha-beta``, ``alpha_beta``) count
+    twice. That is main's counting, kept exactly: the function moved here from
+    ``matcher.py`` unchanged apart from the per-server guard (Consiliency/pmcp#342).
+    """
+    frequencies: dict[str, int] = {}
+    for server in servers:
+        # A server whose keywords are unusable contributes none, rather than
+        # costing every other server its weights (Consiliency/pmcp#342).
+        try:
+            norms = [
+                keyword.lower().replace("-", " ").replace("_", " ")
+                for keyword in set(server.keywords)
+            ]
+        except Exception:
+            continue
+        for keyword_norm in norms:
+            frequencies[keyword_norm] = frequencies.get(keyword_norm, 0) + 1
+    return {
+        keyword: max(1.0 / frequency, 0.5) for keyword, frequency in frequencies.items()
+    }
+
+
+class _EntryRejected(ValueError):
+    """An overlay entry a consumer would reject. Its message names fields and
+    types only, never a value or the entry's name."""
+
+
+def _without_nulls(data: Any) -> dict[str, Any]:
+    """``data`` without its ``null`` fields, so each takes its default."""
+    if not isinstance(data, dict):
+        raise _EntryRejected(f"the entry is a {type(data).__name__}, not a mapping")
+    return {key: value for key, value in data.items() if value is not None}
+
+
+def manifest_candidate_fields(server: ServerConfig) -> dict[str, Any]:
+    """The fields a manifest ``CapabilityCandidate`` copies from ``server``.
+
+    ``_manifest_candidates_for_query`` builds its candidates from this, and the
+    overlay check (``_canonical_server``) builds one from it too, so
+    a field added to the candidate is checked at parse time without a list to
+    keep in step (Consiliency/pmcp#342).
+    """
+    return {
+        "reasoning": server.description,
+        "transport": server.transport,
+        "url": server.url,
+        "package": server.package,
+        "server_card_url": server.server_card_url,
+        "declared_scopes": server.declared_scopes,
+        "declared_capabilities": server.declared_capabilities,
+    }
+
+
+def cli_hint_fields(cli: CLIAlternative) -> dict[str, Any]:
+    """The fields a ``CLIHint`` copies from ``cli`` (shared like the above)."""
+    return {
+        "name": cli.name,
+        "description": cli.description,
+        "check_command": cli.check_command,
+        "help_command": cli.help_command,
+        "examples": cli.examples,
+        "prefer_mcp_for": cli.prefer_mcp_for,
+    }
+
+
+def normalized_server_name(name: str) -> str:
+    """How discovery compares a server name with a query window.
+
+    ``catalog_search``'s name match and ``request_capability``'s name tier both
+    use this, and so does the overlay check, so a key they cannot normalise is
+    skipped at parse time.
+    """
+    return name.lower().replace("-", "").replace("_", "").replace(" ", "")
+
+
+# The keys an overlay entry is read for: exactly the keys `_parse_server_config`
+# and `_parse_cli_alternative` read (a test derives them from those functions'
+# source and checks these sets). Anything else is ignored, as on main.
+_SERVER_SCHEMA_KEYS = frozenset(
+    {
+        "description",
+        "keywords",
+        "install",
+        "command",
+        "args",
+        "requires_api_key",
+        "env_var",
+        "secret_key",
+        "env_instructions",
+        "extra_env",
+        "api_key_optional_when",
+        "auto_start",
+        "transport",
+        "url",
+        "headers",
+        "protected_resource_metadata_url",
+        "authorization_server_metadata_url",
+        "oidc_issuer_url",
+        "oidc_discovery_url",
+        "client_id_metadata_document_url",
+        "declared_scopes",
+        "supports_url_elicitation",
+        "package",
+        "server_card_url",
+        "declared_capabilities",
+        "discovery_diagnostics",
+        "discovery_metadata",
+        "status",
+        "source",
+        "replacement",
+        "version",
+    }
+)
+_CLI_SCHEMA_KEYS = frozenset(
+    {
+        "keywords",
+        "check_command",
+        "help_command",
+        "description",
+        "examples",
+        "prefer_mcp_for",
+    }
+)
+# Schema keys pmcp parses and stores but no consumer reads (derived: the plan's
+# consumer table; `sync_registry_to_manifest`, the only reader of
+# status/source/replacement, has no in-tree caller). A non-JSON value here is
+# dropped to the default instead of costing the entry, as main never failed on it.
+_STORED_ONLY_KEYS = frozenset(
+    {"discovery_diagnostics", "discovery_metadata", "status", "source", "replacement"}
+)
+# Schema keys every consumer reads only for truth (`if server.auto_start`,
+# `bool(server.requires_api_key)`; derived by a test over every read in
+# src/pmcp). A value YAML types beyond JSON (a date, `!!binary`, `!!set`) keeps
+# main's meaning as `bool(value)` instead of costing the entry
+# (Consiliency/pmcp#375 board round 2, F002).
+_TRUTH_ONLY_KEYS = frozenset({"auto_start", "requires_api_key"})
+
+
+def _is_json_native(value: Any) -> bool:
+    """Whether ``value`` is JSON-native all the way down.
+
+    str, int, finite float, bool, null, lists, and mappings with string keys --
+    the value space of a ``.mcp.json`` entry. Iterative, not recursive: a deeply
+    aliased overlay (thousands of chained anchors) loads on main. A shared
+    (aliased) node is checked once.
+    """
+    stack: list[Any] = [value]
+    seen: set[int] = set()
+    while stack:
+        node = stack.pop()
+        if node is None or isinstance(node, (str, bool, int)):
+            continue
+        if isinstance(node, float):
+            if node != node or node in (float("inf"), float("-inf")):
+                return False
+            continue
+        if isinstance(node, (list, dict)):
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            if isinstance(node, list):
+                stack.extend(node)
+                continue
+            if not all(isinstance(key, str) for key in node):
+                return False
+            stack.extend(node.values())
+            continue
+        return False
+    return True
+
+
+def _schema_fields(data: Any, schema: frozenset[str]) -> dict[str, Any]:
+    """The schema fields of an overlay entry, JSON-native; unknown keys dropped.
+
+    YAML can produce bytes (``!!binary``), datetimes, sets, pairs and
+    non-finite floats; no consumer is written for them, and a ``!!binary``
+    command kept raw broke ``filter_self_references`` for every config
+    (Consiliency/pmcp#342 rev 5). Rev 6: only the keys pmcp reads are looked
+    at -- an unknown key (`added: 2026-10-04`) is ignored, as on main -- and a
+    rejection names the schema field, never a key or value from the overlay.
+    """
+    if not isinstance(data, dict):
+        raise _EntryRejected(f"the entry is a {type(data).__name__}, not a mapping")
+    kept: dict[str, Any] = {}
+    for field_name in sorted(schema):
+        if field_name not in data:
+            continue
+        value = data[field_name]
+        if _is_json_native(value):
+            kept[field_name] = value
+        elif field_name in _STORED_ONLY_KEYS:
+            continue  # stored, never read: the default, and the entry is kept
+        elif field_name in _TRUTH_ONLY_KEYS:
+            kept[field_name] = bool(value)  # read only for truth, as on main
+        else:
+            # The loader's own parser sees it first, as on main: several map a
+            # value of the wrong type to their default (`extra_env`,
+            # `api_key_optional_when`, `version`). `_json_native_entry` then
+            # checks what the parser KEPT, which is what consumers read.
+            kept[field_name] = value
+    return kept
+
+
+def _json_native_entry(entry: Any) -> Any:
+    """``entry`` if every field the parser kept is JSON-native; else rejected.
+
+    Checks the parsed entry, not the overlay's raw value (Consiliency/pmcp#375
+    board round 2): a field the parser already maps to its default loads as on
+    main, and no consumer ever reads a non-JSON value. Names the field only.
+    """
+    for item in dataclasses.fields(entry):
+        if not _is_json_native(getattr(entry, item.name)):
+            raise _EntryRejected(f"'{item.name}' holds a value that is not JSON")
+    return entry
+
+
+_METADATA_PLACEHOLDER_URL = "https://metadata-check.invalid/"
+
+
+def _canonical_server(server: ServerConfig) -> ServerConfig:
+    """``server`` as every consumer will see it: validated, converted, typed.
+
+    Parse, don't validate (Consiliency/pmcp#342 rev 5). Each consumer's own
+    model is built from the entry, and the entry that is KEPT carries that
+    model's validated values, so no consumer ever reads a raw value another
+    consumer only validated in passing. Raises if any consumer would fail:
+
+    * the name and keyword scoring every discovery path runs on every server
+      (``normalized_server_name``, ``matcher._keyword_match_score``);
+    * the credential lookups every candidate runs (``requires_credential``,
+      and an environment read of each ``credential_lookup_keys`` key);
+    * the ``CapabilityCandidate`` that ``catalog_search`` builds, from the same
+      ``manifest_candidate_fields`` the handler uses -> description, url,
+      package, server_card_url, declared_*, env_var, env_instructions;
+    * the remote auth view (``RemoteMcpServerConfig``) for EVERY entry, since
+      ``pmcp secrets`` and ``_auth_metadata_for_server`` read the metadata URLs,
+      ``headers``, ``declared_scopes`` and ``supports_url_elicitation``
+      whatever the transport (rev 5, claude N1) -> those fields;
+    * the startup / refresh / provisioning conversion
+      (``config.loader._manifest_server_to_config``, no env value used);
+    * configured-default inheritance (``config.loader._merge_manifest_defaults``)
+      for a command-less ``.mcp.json`` entry of the same name, validated as the
+      ``LocalMcpServerConfig`` startup consumes -> command, args;
+    * ``pmcp secrets``' per-server read (``manifest_secret_metadata``) needs no
+      call of its own: every field it reads (the metadata URLs, ``headers``,
+      ``declared_scopes``, ``supports_url_elicitation``) is the auth view's
+      validated value above (rev 5; a mutant removing the call survived).
+
+    The consumer list is derived (the plan's consumer table), not chosen.
+    """
+    from pmcp.config.loader import _manifest_server_to_config, _merge_manifest_defaults
+    from pmcp.manifest.matcher import _keyword_match_score
+    from pmcp.types import (
+        CapabilityCandidate,
+        LocalMcpServerConfig,
+        RemoteMcpServerConfig,
+    )
+
+    normalized_server_name(server.name)
+    _keyword_match_score("probe", server.keywords)
+    requires_credential(server)
+    for key in credential_lookup_keys(server):
+        os.environ.get(key)
+    candidate = CapabilityCandidate(
+        name=server.name,
+        candidate_type="server",
+        relevance_score=0.0,
+        env_var=server.env_var,
+        env_instructions=server.env_instructions,
+        **manifest_candidate_fields(server),
+    )
+    auth_view = RemoteMcpServerConfig(
+        url=server.url if isinstance(server.url, str) else _METADATA_PLACEHOLDER_URL,
+        headers=server.headers,
+        protected_resource_metadata_url=server.protected_resource_metadata_url,
+        authorization_server_metadata_url=server.authorization_server_metadata_url,
+        oidc_issuer_url=server.oidc_issuer_url,
+        oidc_discovery_url=server.oidc_discovery_url,
+        client_id_metadata_document_url=server.client_id_metadata_document_url,
+        declared_scopes=server.declared_scopes,
+        supports_url_elicitation=server.supports_url_elicitation,
+    )
+    canonical = replace(
+        server,
+        description=candidate.reasoning,
+        url=candidate.url,
+        package=candidate.package,
+        server_card_url=candidate.server_card_url,
+        declared_scopes=list(candidate.declared_scopes),
+        declared_capabilities=list(candidate.declared_capabilities),
+        env_var=candidate.env_var,
+        env_instructions=candidate.env_instructions,
+        headers=dict(auth_view.headers) if auth_view.headers is not None else None,
+        protected_resource_metadata_url=auth_view.protected_resource_metadata_url,
+        authorization_server_metadata_url=auth_view.authorization_server_metadata_url,
+        oidc_issuer_url=auth_view.oidc_issuer_url,
+        oidc_discovery_url=auth_view.oidc_discovery_url,
+        client_id_metadata_document_url=auth_view.client_id_metadata_document_url,
+        supports_url_elicitation=auth_view.supports_url_elicitation,
+    )
+    # The real conversion first, on the entry's own args/command: inheritance
+    # below would read a `str` args as characters, which startup would not.
+    _manifest_server_to_config(canonical, lambda _key: None)
+    inherited = _merge_manifest_defaults(
+        canonical.name,
+        LocalMcpServerConfig(command="", args=[]),
+        {canonical.name: canonical},
+        lambda _key: None,
+    )
+    if inherited is not None:
+        # warnings=False: pydantic's serializer warning quotes the value.
+        local = LocalMcpServerConfig.model_validate(
+            inherited.model_dump(warnings=False)
+        )
+        canonical = replace(canonical, command=local.command, args=list(local.args))
+        _manifest_server_to_config(canonical, lambda _key: None)
+    return canonical
+
+
+def _canonical_cli(cli: CLIAlternative) -> CLIAlternative:
+    """``cli`` as its consumers will see it (see ``_canonical_server``).
+
+    ``rank_cli_hints`` scores every CLI on every query and builds a ``CLIHint``
+    through ``_rank_one_cli``; the kept entry carries that hint's validated
+    values. ``probe_clis`` runs ``check_command`` and needs a program in slot 0.
+    """
+    from pmcp.manifest.matcher import _rank_one_cli
+
+    match = _rank_one_cli(
+        "probe",
+        "probe",
+        {"probe"},
+        cli.name,
+        cli,
+        is_available=False,
+        detected_infos={},
+        include_suppressed=True,
+        min_score=-1.0,
+    )
+    if match is None:  # pragma: no cover - min_score=-1 always yields a match
+        raise _EntryRejected("the entry could not be scored")
+    hint = match.hint
+    if not hint.check_command:
+        raise _EntryRejected("'check_command' names no program")
+    return replace(
+        cli,
+        description=hint.description,
+        check_command=list(hint.check_command),
+        help_command=list(hint.help_command),
+        examples=list(hint.examples),
+        prefer_mcp_for=list(hint.prefer_mcp_for),
+    )
+
+
+def _error_kind(exc: BaseException) -> str:
+    """An exception's kind, never its text: pydantic's error types, or the class."""
+    from pydantic import ValidationError
+
+    if isinstance(exc, ValidationError):
+        kinds = sorted(
+            {str(e.get("type", "invalid")) for e in exc.errors(include_url=False)}
+        )
+        return ", ".join(kinds) or "invalid"
+    return type(exc).__name__
+
+
+def _checked_entry(build: Any, kept: dict[str, Any]) -> Any:
+    """``build(kept)``; if it raises, an ``_EntryRejected`` naming the field.
+
+    ``build`` is the whole parse-time check for one overlay entry (parse, the
+    JSON check, and every consumer's own model and scoring), so an entry is
+    rejected before any consumer runs on it. A consumer's error names its own
+    model's field or nothing (``'reasoning'`` for a bad ``description``,
+    ``AttributeError`` for ``keywords: [1]``), so the overlay field is found by
+    the check itself: the fields whose removal makes the entry pass, else the
+    fields that fail on their own (Consiliency/pmcp#375 board round 2, grok
+    F001). Names and kinds only, never a value.
+    """
+    try:
+        return build(kept)
+    except _EntryRejected:
+        raise
+    except Exception as exc:
+        kind = _error_kind(exc)
+
+    def fails(data: dict[str, Any]) -> bool:
+        with attribution_pass():
+            try:
+                build(data)
+            except Exception:
+                return True
+        return False
+
+    fields = sorted(kept)
+    culprits = [
+        f for f in fields if not fails({k: v for k, v in kept.items() if k != f})
+    ]
+    if not culprits:
+        culprits = [f for f in fields if fails({f: kept[f]})]
+    if not culprits:
+        raise _EntryRejected(f"its fields together ({kind})")
+    raise _EntryRejected(", ".join(f"'{f}'" for f in culprits) + f" {kind}")
+
+
+def _rejection_reason(exc: BaseException) -> str:
+    """Why an entry was skipped, without any value or name from the entry.
+
+    A pydantic error's text quotes the input, so only the field (the first
+    location element, a model attribute name) and the error type are kept.
+    """
+    from pydantic import ValidationError
+
+    if isinstance(exc, _EntryRejected):
+        return str(exc)
+    if isinstance(exc, ValidationError):
+        parts = []
+        for error in exc.errors(include_url=False, include_input=False):
+            loc = error.get("loc") or ("entry",)
+            head = str(loc[0])
+            if not re.fullmatch(r"[a-z_]{1,64}", head):
+                head = "entry"
+            parts.append(f"'{head}' {error.get('type', 'invalid')}")
+        return "; ".join(sorted(set(parts))) or "invalid"
+    return f"{type(exc).__name__} while parsing"
+
+
+@functools.lru_cache(maxsize=1)
+def _shipped_cli_names() -> frozenset[str]:
+    """Names of pmcp's own shipped CLI alternatives (see ``_server_label``)."""
+    try:
+        data = _parse_trusted_yaml(_SHIPPED_MANIFEST_PATH.read_bytes()) or {}
+        clis = data.get("cli_alternatives") or {}
+    except (OSError, yaml.YAMLError, AttributeError):
+        return frozenset()
+    return frozenset(name for name in clis if isinstance(name, str))
+
+
+def _cli_label(name: object) -> str:
+    """How a log line names a CLI alternative: shipped names only."""
+    if isinstance(name, str) and name in _shipped_cli_names():
+        return f"cli_alternative '{name}'"
+    return "an overlay cli_alternative (name not shown)"
+
+
 def _parse_cli_alternative(name: str, data: dict[str, Any]) -> CLIAlternative:
-    """Parse a CLI alternative from raw YAML data."""
+    """Parse a CLI alternative from raw YAML data (``null`` means absent)."""
+    data = _without_nulls(data)
     return CLIAlternative(
         name=name,
         keywords=data.get("keywords", []),
@@ -671,14 +1230,16 @@ def _parse_extra_env(
     if raw is None:
         return {}
     if not isinstance(raw, dict):
-        logger.warning(f"Ignoring '{field_label}' for server '{name}': not a mapping")
+        logger.warning(
+            f"Ignoring '{field_label}' for {_server_label(name)}: not a mapping"
+        )
         return {}
 
     parsed: dict[str, str] = {}
     for key, value in raw.items():
         if not isinstance(key, str) or not key:
             logger.warning(
-                f"Skipping non-string '{field_label}' key for server '{name}'"
+                f"Skipping non-string '{field_label}' key for {_server_label(name)}"
             )
             continue
         if isinstance(value, bool):
@@ -687,7 +1248,7 @@ def _parse_extra_env(
             parsed[key] = str(value)
         else:
             logger.warning(
-                f"Skipping '{field_label}' key '{key}' for server '{name}': "
+                f"Skipping a '{field_label}' key for {_server_label(name)}: "
                 f"unsupported value type {type(value).__name__}"
             )
     return parsed
@@ -708,7 +1269,7 @@ def _parse_api_key_optional_when(
         return []
     if not isinstance(raw, list):
         logger.warning(
-            f"Ignoring 'api_key_optional_when' for server '{name}': not a list"
+            f"Ignoring 'api_key_optional_when' for {_server_label(name)}: not a list"
         )
         return []
 
@@ -716,13 +1277,14 @@ def _parse_api_key_optional_when(
     for item in raw:
         if not isinstance(item, str) or not item:
             logger.warning(
-                f"Skipping non-string 'api_key_optional_when' entry for server '{name}'"
+                f"Skipping non-string 'api_key_optional_when' entry for "
+                f"{_server_label(name)}"
             )
             continue
         if item == env_var or item == secret_key:
             logger.warning(
-                f"Server '{name}' names its own credential variable "
-                f"('{item}') in 'api_key_optional_when'; ignoring — a "
+                f"The entry for {_server_label(name)} names its own credential "
+                f"variable in 'api_key_optional_when'; ignoring it — a "
                 f"credential cannot relax itself"
             )
             continue
@@ -994,7 +1556,14 @@ def _materialize_version_pin_soft(server: ServerConfig) -> ServerConfig:
 
 
 def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
-    """Parse a server config from raw YAML data."""
+    """Parse a server config from raw YAML data.
+
+    A YAML ``null`` means the field is absent and takes its default, for every
+    field (Consiliency/pmcp#342): a blank ``description:`` must not cost an
+    override its entry. Types are not checked here; an overlay entry is checked
+    against its consumers by ``_canonical_server``.
+    """
+    data = _without_nulls(data)
     install_data = data.get("install", {})
     install: dict[Platform, list[str]] = {}
 
@@ -1057,61 +1626,50 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
     )
 
 
-def _find_project_manifest() -> Path | None:
-    """Walk up from cwd for the nearest ancestor containing .pmcp/manifest.yaml.
+def _find_project_manifest(project_root: Path | None = None) -> Path | None:
+    """The project overlay: ``<project>/.pmcp/manifest.yaml``, if it is there.
 
-    Replicates config.loader.find_project_root's marker-based walk locally to
-    avoid a circular import (config/loader imports load_manifest). Stops at the
-    filesystem root; at the temp directory, so test fixtures under tempdir do not
-    accidentally pick up an unrelated overlay; and at $HOME, whose
-    `.pmcp/manifest.yaml` is the user-scoped overlay rather than a project one.
+    The project is ``project_root`` when given, else the project this process
+    SERVES (``env_store.project_scope_root``) -- the same root its credentials
+    come from, so a server's endpoint and its credential are always one
+    project's (Consiliency/pmcp#372 round 12, board round 11 codex F001: this
+    walked up from the working directory, so ``pmcp --project B`` started
+    inside A paired A's overlay endpoint with B's token). ``None`` when the
+    root is the home directory, whose ``.pmcp/manifest.yaml`` is the
+    user-scoped overlay already loaded as such (#243).
 
-    Keep these stopping conditions in step with `find_project_root`. This docstring
-    once listed only the first two, and the code had drifted the same way: the
-    replica lost the $HOME stop its original has, which is what #243 fixes.
+    An overlay a symlink points outside the project is not followed.
     """
+    from pmcp.env_store import project_scope_root
+
     try:
-        current = Path.cwd().resolve()
-    except OSError:
+        root = project_scope_root(project_root)
+        if root is None:
+            return None
+        current = root.resolve()
+    except (OSError, RuntimeError):  # RuntimeError: a link loop, before 3.13
         return None
-    temp_root = Path(tempfile.gettempdir()).resolve()
-    home_root = Path.home().resolve()
+    from pmcp.atomic_write import same_directory_as_kernel
 
-    while current != current.parent:
-        if current == temp_root:
-            return None
-        # $HOME's `.pmcp/manifest.yaml` IS the user-scoped overlay, already loaded
-        # (ungated) by `_overlay_manifest_paths`. Treating home as a project root
-        # double-attributes it -- and since CONSENT gates project sources, every
-        # startup from a subdirectory of $HOME with no closer overlay logged a
-        # refusal telling the operator to `pmcp trust approve` their OWN home
-        # config. That is the most common setup there is, and a false approval
-        # prompt trains operators to approve reflexively, which is the one habit
-        # consent depends on them not having.
-        #
-        # This walk replicates `config.loader.find_project_root` locally to avoid
-        # an import cycle, and that function already stops here with the same
-        # reason; the replica had dropped the guard. Keep the two in step.
-        if current == home_root:
-            return None
-        candidate = current / ".pmcp" / "manifest.yaml"
-        if candidate.exists():
-            # Don't follow an overlay that a symlink points outside this tree:
-            # resolve the candidate and require it to stay within the ancestor
-            # directory that contains it.
-            try:
-                resolved = candidate.resolve()
-            except OSError:
-                resolved = None
-            if resolved is not None and resolved.is_relative_to(current):
-                return candidate
-        current = current.parent
-
+    # An explicit project root is spelled by the operator: the directory
+    # resolve() names must be the one the system opens for that spelling
+    # (Consiliency/pmcp#372 round 39; resolve() collapses `file/..`).
+    if not same_directory_as_kernel(root, current):
+        return None
+    candidate = current / ".pmcp" / "manifest.yaml"
+    if candidate.exists():
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = None
+        if resolved is not None and resolved.is_relative_to(current):
+            return candidate
     return None
 
 
 def _overlay_manifest_paths(
     notices: list[str] | None = None,
+    project_root: Path | None = None,
 ) -> list[tuple[str, Path]]:
     """Return existing overlay manifest paths in precedence order (low → high).
 
@@ -1124,11 +1682,13 @@ def _overlay_manifest_paths(
     """
     paths: list[tuple[str, Path]] = []
 
-    user_path = Path.home() / ".pmcp" / "manifest.yaml"
-    if user_path.exists():
+    # Only while the home directory is the operator's (Consiliency/pmcp#372
+    # round 22): a home a checkout controls supplies no user overlay.
+    user_path = optional_home_path(".pmcp", "manifest.yaml")
+    if user_path is not None and user_path.exists():
         paths.append(("user", user_path))
 
-    project_path = _find_project_manifest()
+    project_path = _find_project_manifest(project_root)
     if project_path is not None:
         paths.append(("project", project_path))
 
@@ -1198,8 +1758,14 @@ def _parse_overlay_document(
     """
     try:
         data = yaml.safe_load(content)
-    except yaml.YAMLError as exc:
-        logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
+    except Exception as exc:
+        # Every exception, not only YAMLError: PyYAML's constructors raise
+        # ValueError (`!!int x`), KeyError (`!!bool x`) or AttributeError
+        # (`!!timestamp x`), whose text quotes the value, and one escaping here
+        # stopped the shipped manifest from loading (Consiliency/pmcp#342 rev 6).
+        logger.warning(
+            f"Skipping unreadable manifest overlay {path}: {yaml_error_text(exc)}"
+        )
         if failures is not None:
             failures.append("parse")
         return {}, {}, {}, {}
@@ -1217,11 +1783,19 @@ def _parse_overlay_document(
     if isinstance(raw_servers, dict):
         for name, server_data in raw_servers.items():
             try:
-                servers[name] = _parse_server_config(name, server_data)
+                server = _checked_entry(
+                    lambda data: _canonical_server(
+                        _json_native_entry(_parse_server_config(name, data))
+                    ),
+                    _schema_fields(server_data, _SERVER_SCHEMA_KEYS),
+                )
             except Exception as exc:
                 logger.warning(
-                    f"Skipping invalid server entry '{name}' in overlay {path}: {exc}"
+                    f"Skipping invalid server entry ({_server_label(name)}) in "
+                    f"overlay {path}: {_rejection_reason(exc)}"
                 )
+                continue
+            servers[name] = server
     elif raw_servers:
         logger.warning(f"Skipping 'servers' in overlay {path}: not a mapping")
 
@@ -1230,12 +1804,19 @@ def _parse_overlay_document(
     if isinstance(raw_clis, dict):
         for name, cli_data in raw_clis.items():
             try:
-                cli_alternatives[name] = _parse_cli_alternative(name, cli_data)
+                cli = _checked_entry(
+                    lambda data: _canonical_cli(
+                        _json_native_entry(_parse_cli_alternative(name, data))
+                    ),
+                    _schema_fields(cli_data, _CLI_SCHEMA_KEYS),
+                )
             except Exception as exc:
                 logger.warning(
-                    f"Skipping invalid cli_alternative '{name}' in overlay "
-                    f"{path}: {exc}"
+                    f"Skipping invalid cli_alternative ({_cli_label(name)}) in "
+                    f"overlay {path}: {_rejection_reason(exc)}"
                 )
+                continue
+            cli_alternatives[name] = cli
     elif raw_clis:
         logger.warning(f"Skipping 'cli_alternatives' in overlay {path}: not a mapping")
 
@@ -1292,7 +1873,7 @@ _manifest_cache_lock = threading.RLock()
 # again with the same bytes -- warns exactly as main does. Separate slots keep
 # an explicit-path caller (or two) from turning every load into a transition.
 # Bounded like the cache: the oldest explicit-path slot goes first.
-_last_served_keys: dict[str | None, tuple[Any, ...]] = {}
+_last_served_keys: dict[str | tuple[str, str], tuple[Any, ...]] = {}
 # Whether this process has already said, at WARNING, that the cache could not
 # store or read back a result for a reason other than recursion depth.
 _cache_failure_reported = False
@@ -1368,7 +1949,9 @@ class _OverlaySource:
     gated_digest: str | None = None
 
 
-def _gather_overlay_sources(notices: list[str]) -> list[_OverlaySource]:
+def _gather_overlay_sources(
+    notices: list[str], project_root: Path | None = None
+) -> list[_OverlaySource]:
     """Read every overlay source ONCE, in precedence order.
 
     The bytes read here are both the cache key and what gets parsed: a source is
@@ -1376,7 +1959,7 @@ def _gather_overlay_sources(notices: list[str]) -> list[_OverlaySource]:
     bytes in the cache under another version's key.
     """
     sources: list[_OverlaySource] = []
-    for label, overlay_path in _overlay_manifest_paths(notices):
+    for label, overlay_path in _overlay_manifest_paths(notices, project_root):
         if label == "project":
             # A repository-supplied overlay is gated: unapproved, it must
             # contribute nothing at all -- not a replacement, not an
@@ -1385,7 +1968,12 @@ def _gather_overlay_sources(notices: list[str]) -> list[_OverlaySource]:
             # tools/handlers.py, still answers None for it. User and env
             # scope are the operator's own files and stay ungated. The gate
             # reads the file once; its bytes are the ones keyed and parsed.
-            content, decision = read_and_gate(overlay_path, "project_manifest")
+            # <project>/.pmcp/manifest.yaml: judged with its project's root.
+            content, decision = read_and_gate(
+                overlay_path,
+                "project_manifest",
+                project_root=overlay_path.parent.parent,
+            )
             sources.append(
                 _OverlaySource(
                     label,
@@ -1436,7 +2024,9 @@ def _source_key(source: _OverlaySource) -> tuple[Any, ...]:
     )
 
 
-def load_manifest(manifest_path: Path | None = None) -> Manifest:
+def load_manifest(
+    manifest_path: Path | None = None, project_root: Path | None = None
+) -> Manifest:
     """Load and parse the manifest.yaml file.
 
     When called with no ``manifest_path`` (all internal callers), private/custom
@@ -1460,7 +2050,8 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
     base_path = _SHIPPED_MANIFEST_PATH if manifest_path is None else manifest_path
     base = base_path.read_bytes()
     notices: list[str] = []
-    overlays = _gather_overlay_sources(notices) if apply_overlays else []
+    # The project overlay is ``project_root``'s, else the served project's.
+    overlays = _gather_overlay_sources(notices, project_root) if apply_overlays else []
     key = (
         str(base_path),
         apply_overlays,
@@ -1469,15 +2060,25 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
         tuple(notices),
         _on_windows(),
     )
+    # One slot per caller stream: the overlaid load for each project root,
+    # and each explicit path (keyed as given). Two different roots or paths
+    # alternating are two steady states, not a transition on every call (a
+    # gateway's tools load for their bound root while other callers load for
+    # the served one; Consiliency/pmcp#372).
+    slot: str | tuple[str, str] = str(base_path)
+    if apply_overlays:
+        from pmcp.env_store import resolve_project_root
+
+        slot = ("overlays", os.fspath(resolve_project_root(project_root)))
     with _manifest_cache_lock:
-        # One slot per caller stream: the default load, and each explicit path
-        # (keyed as given). Two different explicit paths alternating are two
-        # steady states, not a transition on every call.
-        slot = None if apply_overlays else str(base_path)
         steady = key == _last_served_keys.get(slot)
         _last_served_keys[slot] = key
         while len(_last_served_keys) > _MANIFEST_CACHE_SLOTS:
-            oldest = next(k for k in _last_served_keys if k is not None)
+            # Explicit paths go first; an overlaid stream only when none is left.
+            oldest = next(
+                (k for k in _last_served_keys if isinstance(k, str) and k != slot),
+                None,
+            ) or next(k for k in _last_served_keys if k != slot)
             del _last_served_keys[oldest]
         blob = _manifest_cache.get(key)
         if blob is not None and steady:
@@ -1525,6 +2126,13 @@ def _build_manifest(
     for name, server_data in data.get("servers", {}).items():
         servers[name] = _parse_server_config(name, server_data)
 
+    # Weights come from the base alone, before any overlay
+    # (Consiliency/pmcp#342): an overlay may add or replace servers, but it
+    # never changes how much another server's keyword counts.
+    base_weights = keyword_weights(servers.values())
+    base_categories = category_keyword_index(servers)
+    overlay_cli_names: set[str] = set()
+
     # Merge private/custom overlays over the shipped manifest (default path only).
     if apply_overlays:
         for source in overlays:
@@ -1534,7 +2142,7 @@ def _build_manifest(
                     # One WARNING for one refusal: returning before the parser
                     # runs keeps an unreadable overlay from also logging
                     # "Skipping unreadable manifest overlay".
-                    log_refusal(source.decision, logger)
+                    log_refusal(source.decision, logger.logger)
                 else:
                     logger.warning(
                         f"Skipping unreadable manifest overlay {overlay_path}: "
@@ -1572,10 +2180,11 @@ def _build_manifest(
                 if name in servers:
                     logger.warning(
                         f"Manifest overlay ({label}) from {overlay_path} overrides "
-                        f"existing server '{name}'"
+                        f"existing {_server_label(name)}"
                     )
             servers.update(overlay_servers)
             cli_alternatives.update(overlay_clis)
+            overlay_cli_names.update(overlay_clis)
 
             # Applied AFTER this source's whole-entry replaces, so a patch can
             # refine an entry the same overlay just replaced. Patching merges
@@ -1585,7 +2194,8 @@ def _build_manifest(
                 if existing is None:
                     logger.warning(
                         f"Manifest overlay ({label}) from {overlay_path} has a "
-                        f"'server_env' patch for unknown server '{name}': skipped"
+                        f"'server_env' patch for an unknown server "
+                        f"({_server_label(name)}): skipped"
                     )
                     continue
                 servers[name] = replace(
@@ -1619,6 +2229,9 @@ def _build_manifest(
         discovery_queue_path=data.get(
             "discovery_queue_path", ".mcp-gateway/discovery_queue.json"
         ),
+        base_keyword_weights=base_weights,
+        base_category_keywords=base_categories,
+        overlay_cli_names=frozenset(overlay_cli_names),
     )
 
     logger.info(

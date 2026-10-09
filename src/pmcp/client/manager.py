@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, ExitStack, contextmanager
+import functools
+import itertools
 import json
 import logging
 import os
@@ -18,7 +20,7 @@ from collections import deque
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, Iterator, TypeVar
+from typing import NamedTuple, Any, Iterator, TypeVar
 
 import httpx2
 import mcp.types as mcp_types
@@ -29,18 +31,21 @@ from pydantic import ValidationError
 
 from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
-from pmcp.env_store import sanitized_subprocess_env
+from pmcp.env_store import bind_project_root, sanitized_subprocess_env
 from pmcp.manifest.installer import _operator_safe, _render_install_argv
 from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
     resolve_remote_headers_for_tenant,
 )
+from pmcp.client.task_registry import TaskCustody, TaskRegistry, task_is_terminal
 from pmcp.subscriptions import CatalogEventSink
 from pmcp.validation import normalized_executable_name
 from pmcp.types import (
     LocalMcpServerConfig,
     UNUSABLE_TASK_VALUE,
+    task_duration_from_wire,
     task_hint_is_usable,
+    task_seconds_to_wire,
     McpTaskInfo,
     McpTaskRecord,
     PromptArgumentInfo,
@@ -57,6 +62,7 @@ from pmcp.types import (
     ToolInfo,
     TraceContextInfo,
 )
+from pmcp.waits import bounded_wait
 
 resource_module: ModuleType | None
 
@@ -69,6 +75,21 @@ except ImportError:
     HAS_RESOURCE = False
 
 logger = logging.getLogger(__name__)
+
+
+def _lazy_log_name(config: ResolvedServerConfig) -> str:
+    """A lazily registered server's name in a log line (Consiliency/pmcp#342).
+
+    A manifest-derived server is named only if pmcp ships that name; an
+    overlay key may be anything an operator pasted. A ``.mcp.json`` entry is
+    the operator's own config and is named as before.
+    """
+    from pmcp.manifest.loader import entry_log_name
+
+    return entry_log_name(
+        config.name, manifest_derived=getattr(config, "source", None) == "manifest"
+    )
+
 
 #: Executables that fetch and run the package they are given at spawn time,
 #: by NORMALIZED name (`normalized_executable_name`), so ``UVX.EXE``,
@@ -145,6 +166,136 @@ def describe_exception(exc: BaseException) -> str:
 
 
 _TaskT = TypeVar("_TaskT", bound=asyncio.Task[Any])
+
+
+# --- Cancellation during teardown (Consiliency/pmcp#324) -----------------------
+#
+# The rule every teardown below follows:
+#
+# * Waits for a child task the teardown cancelled go through `asyncio.wait`,
+#   which never raises the child's outcome. So a `CancelledError` out of any
+#   teardown await is the CALLER's -- never ambiguous with the child's -- and
+#   nothing in a teardown catches a `CancelledError` in order to absorb it.
+# * When the caller is cancelled mid-teardown, the teardown switches to a
+#   synchronous path (`ClientManager._abandon_client_io`) that does only what
+#   cannot be interrupted: SIGKILL the process tree, cancel the client's tasks
+#   without awaiting them, drop it from the registries. Then it re-raises.
+#   That path has no `await`, so nothing in it can be cancelled before it
+#   runs, hang, or hold a lock across a suspension.
+# * The non-cancelled path keeps the graceful behaviour (SIGTERM grace,
+#   graceful remote close).
+
+
+def _retrieve_outcome(task: asyncio.Future[Any]) -> None:
+    """Done-callback for a task that was cancelled and is not awaited: mark
+    its outcome retrieved (no "exception was never retrieved"), and log a
+    genuine failure by type only."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug(f"abandoned task ended with {type(exc).__name__}")
+
+
+def _cancel_without_waiting(task: asyncio.Future[Any] | None) -> None:
+    if task is not None and not task.done():
+        task.cancel()
+        task.add_done_callback(_retrieve_outcome)
+
+
+# How often an abandoned transport owner is re-cancelled until it ends.
+_OWNER_RECANCEL_S = 0.5
+
+
+def _abandon_owner(
+    task: asyncio.Future[Any] | None,
+    shutdown: asyncio.Event | None,
+    on_done: Callable[[asyncio.Future[Any]], None] = _retrieve_outcome,
+) -> None:
+    """Abandon a remote transport owner without awaiting it.
+
+    Signal its shutdown and cancel it now (an owner still entering its
+    transport ends at once), then cancel it again from loop callbacks -- on
+    the next iteration, after the owner has woken from `shutdown.wait()` and
+    entered its transport's `__aexit__`, then every `_OWNER_RECANCEL_S` until
+    it ends. The immediate cancel alone is consumed while the owner is parked
+    on `shutdown.wait()`, and a dead peer's `__aexit__` would then block
+    uncancelled (measured). Callbacks only, no task: nothing here
+    can be cancelled before it runs or hold its caller (Consiliency/pmcp#324).
+    """
+    if task is None or task.done():
+        return
+    if shutdown is not None:
+        shutdown.set()
+    task.add_done_callback(on_done)
+    loop = asyncio.get_running_loop()
+
+    def kick() -> None:
+        if not task.done():
+            task.cancel()
+            loop.call_later(_OWNER_RECANCEL_S, kick)
+
+    task.cancel()  # ends an owner still entering its transport at once
+    loop.call_soon(kick)
+
+
+async def _reap_child(
+    task: asyncio.Future[Any] | None, *, timeout: float | None = None
+) -> None:
+    """Cancel a child task this teardown owns and wait (bounded by
+    ``timeout``) for it to end.
+
+    `asyncio.wait` never raises the child's outcome, so the child's own
+    ``CancelledError`` is not seen here at all, and a ``CancelledError`` out
+    of this await can only be the caller's -- it propagates. This is what
+    lets the teardowns below tell the two apart without a private task.
+    """
+    if task is None:
+        return
+    if not isinstance(task, asyncio.Future):
+        # A test double, not a task: cancel it unless done and move on, as
+        # the old `shield` + `except Exception` path effectively did.
+        # `asyncio.wait` on such an object would wait forever on 3.11+.
+        if not task.done():
+            task.cancel()
+        return
+    if not task.done():
+        task.cancel()
+        await asyncio.wait({task}, timeout=timeout)
+    if task.done():
+        _retrieve_outcome(task)
+    else:
+        task.add_done_callback(_retrieve_outcome)
+
+
+def _log_abandoned_owner_failure(name: str, task: asyncio.Future[Any]) -> None:
+    """Done-callback for a transport owner a cancelled caller escalated and
+    did not wait for: log a genuine unwind failure (sanitised traceback, as
+    `_close_remote_transport` always has) rather than drop it."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        return
+    # Formatted and sanitised rather than passed as `exc_info=`: `exc_info`
+    # appends the unredacted exception tree after the sanitised message.
+    traceback_text = "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__)
+    )
+    logger.warning(
+        f"[{name}] remote transport failed to unwind after our caller's "
+        f"cancellation: {describe_exception(exc)}\n"
+        f"{sanitize_auth_diagnostic(traceback_text, max_length=None)}"
+    )
+
+
+def _handshake_error(exc: BaseException) -> str:
+    """`last_error` for a failed handshake. A cancellation renders as an
+    empty string through `describe_exception`, so name it."""
+    if isinstance(exc, asyncio.CancelledError):
+        return "Connection cancelled"
+    return describe_exception(exc)
+
 
 # The three catalog kinds, in the order reconciliation fetches and applies them.
 # Iterating this rather than three hand-written branches is what keeps
@@ -251,6 +402,12 @@ def _downstream_error(error: Any) -> DownstreamError:
     )
 
 
+class _ManagerAbandoned(Exception):
+    """A connect refused because `ClientManager.abandon_all_now()` ran: the
+    gateway is shutting down, and nothing may spawn or register a client
+    after it (Consiliency/pmcp#324, codex round 1 on the implementation)."""
+
+
 class _NullCatalogEventSink:
     """No-op `CatalogEventSink` used when `ClientManager` is constructed with
     no `catalog_events` (IF-0-P3B-2's default). Keeps every pre-P3B
@@ -270,8 +427,126 @@ class _NullCatalogEventSink:
         pass
 
 
+def _process_groups_supported() -> bool:
+    """Whether this platform has POSIX process groups to signal. Windows has
+    neither `os.killpg` nor `os.getpgid`: there every group path is skipped
+    and teardown uses the single-process `terminate()`/`kill()` fallback, as
+    on main (codex round 7: a retained id reached `os.killpg` there and the
+    `AttributeError` failed `disconnect_server`). Read at call time, so a
+    test that removes the APIs sees it."""
+    return hasattr(os, "killpg") and hasattr(os, "getpgid")
+
+
+def _spawned_group_pgid(process: asyncio.subprocess.Process) -> int | None:
+    """The group id of a process pmcp spawned with `start_new_session=True`:
+    its pid (the spawn contract), or `None` where groups do not exist."""
+    return process.pid if _process_groups_supported() else None
+
+
+def _own_group_pgid(process: asyncio.subprocess.Process | None) -> int | None:
+    """The process group an *adopted* downstream leads, read while it is
+    still ours (spawned servers take it from the spawn contract instead).
+
+    stdio servers are spawned with ``start_new_session=True``, so the child
+    calls ``setsid()`` before ``exec`` and its pgid equals its pid; an adopted
+    process may or may not lead a group. Read once, when the client is
+    created -- the leader is then alive or an unreaped zombie, and
+    ``os.getpgid`` answers for both -- so the group can still be killed
+    after asyncio has reaped the leader (codex round 5: a grandchild that
+    outlived its leader survived every teardown). ``None`` when the process
+    does not lead its own group, so the gateway's own group is never kept.
+    """
+    if process is None or process.returncode is not None:
+        return None
+    pid = process.pid
+    if not isinstance(pid, int) or not _process_groups_supported():
+        return None
+    try:
+        return pid if os.getpgid(pid) == pid else None
+    except (ProcessLookupError, PermissionError, OSError):
+        return None
+
+
+def _kill_retained_group(group_pgid: int | None) -> None:
+    """SIGKILL a group whose leader asyncio has already reaped, synchronously.
+
+    Only while (1) the group still has a member (``killpg(pgid, 0)``) and (2)
+    no process holds the leader's pid (``kill(pgid, 0)`` fails with
+    ``ProcessLookupError``). While any member of our group lives, the kernel
+    keeps the id in use, so it cannot have been handed to a new process; a
+    process holding that pid therefore means the id was reused after our
+    group emptied, and the group is left alone. Residual: the id is reused
+    by a new session leader that then exits while its own children live, all
+    between our reap and this call -- the pid space must cycle in that window.
+    """
+    if group_pgid is None or not _process_groups_supported():
+        return
+    try:
+        os.killpg(group_pgid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return  # no member left (or not ours to signal)
+    try:
+        os.kill(group_pgid, 0)
+        return  # a live process holds the leader's pid: the id was reused
+    except ProcessLookupError:
+        pass
+    except (PermissionError, OSError):
+        return
+    try:
+        os.killpg(group_pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _kill_process_tree_now(
+    process: asyncio.subprocess.Process | None,
+    *,
+    group_pgid: int | None = None,
+) -> None:
+    """SIGKILL a downstream process and its group, synchronously.
+
+    The uninterruptible step of a cancelled teardown (Consiliency/pmcp#324):
+    no await, so nothing can cancel or skip it. The leader is signalled only
+    while ``process.returncode is None`` -- once asyncio has reaped it, its
+    pid may be reused. Its group is signalled when the leader leads it (taken
+    from ``os.getpgid`` while the leader is unreaped) or when ``group_pgid``
+    was cached earlier by `_terminate_process_tree` and the group is still
+    alive.
+    """
+    if not _process_groups_supported():
+        group_pgid = None
+    if process is None:
+        _kill_retained_group(group_pgid)
+        return
+    pid = process.pid
+    if process.returncode is not None:
+        # The leader is reaped: never signal its pid; the group only through
+        # the retained, checked id (codex round 5).
+        _kill_retained_group(group_pgid)
+        return
+    if isinstance(pid, int):
+        if group_pgid is None and hasattr(os, "getpgid"):
+            try:
+                if os.getpgid(pid) == pid:
+                    group_pgid = pid
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+    if group_pgid is not None and hasattr(os, "killpg"):
+        try:
+            os.killpg(group_pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
 async def _terminate_process_tree(
-    process: asyncio.subprocess.Process | None, name: str
+    process: asyncio.subprocess.Process | None,
+    name: str,
+    *,
+    group_pgid: int | None = None,
 ) -> None:
     """Terminate a downstream process and its whole process group.
 
@@ -285,7 +560,11 @@ async def _terminate_process_tree(
     never accidentally signals an unrelated group such as the gateway's own.
     """
     if process is None or process.returncode is not None:
+        # Already reaped: a grandchild may still hold the group (codex round
+        # 5). Kill it through the id retained at spawn, never the pid.
+        _kill_retained_group(group_pgid)
         return
+    retained_pgid = group_pgid if _process_groups_supported() else None
 
     def _signal(kill: bool) -> None:
         # Process-group signalling is POSIX-only. On Windows os.getpgid/os.killpg
@@ -318,9 +597,14 @@ async def _terminate_process_tree(
     # Cache the process group up front: once the leader exits, os.getpgid(pid)
     # fails, so we could no longer find the group to escalate against. Only set
     # when this process leads its own group (POSIX, start_new_session=True).
-    group_pgid: int | None = None
+    group_pgid = retained_pgid
     pid = process.pid
-    if isinstance(pid, int) and hasattr(os, "getpgid") and hasattr(os, "killpg"):
+    if (
+        group_pgid is None
+        and isinstance(pid, int)
+        and hasattr(os, "getpgid")
+        and hasattr(os, "killpg")
+    ):
         try:
             if os.getpgid(pid) == pid:
                 group_pgid = pid
@@ -338,39 +622,46 @@ async def _terminate_process_tree(
 
     _signal(kill=False)
     try:
-        await asyncio.wait_for(process.wait(), timeout=5.0)
-        leader_exited = True
-    except asyncio.TimeoutError:
-        leader_exited = False
-
-    # If the leader is still alive, SIGKILL it (and, when it leads a group, the
-    # whole group). The leader exiting is NOT sufficient: a grandchild (e.g. a
-    # SIGTERM-ignoring browser) can outlive the leader inside the group and keep
-    # the profile SingletonLock — so we still escalate to a group SIGKILL below.
-    if not leader_exited:
-        _signal(kill=True)
         try:
-            await asyncio.wait_for(process.wait(), timeout=3.0)
+            await bounded_wait(process.wait(), timeout=5.0)
+            leader_exited = True
         except asyncio.TimeoutError:
-            logger.warning(
-                f"[{name}] Process PID={process.pid} did not exit after SIGKILL "
-                "(possible D-state / uninterruptible I/O wait)"
-            )
+            leader_exited = False
 
-    if _group_alive():
-        try:
-            os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-        for _ in range(30):  # up to ~3s for the OS to reap the group
-            if not _group_alive():
-                break
-            await asyncio.sleep(0.1)
-        else:
-            logger.warning(
-                f"[{name}] process group {group_pgid} survived SIGKILL "
-                "(possible orphaned grandchild / D-state)"
-            )
+        # If the leader is still alive, SIGKILL it (and, when it leads a group, the
+        # whole group). The leader exiting is NOT sufficient: a grandchild (e.g. a
+        # SIGTERM-ignoring browser) can outlive the leader inside the group and keep
+        # the profile SingletonLock — so we still escalate to a group SIGKILL below.
+        if not leader_exited:
+            _signal(kill=True)
+            try:
+                await bounded_wait(process.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[{name}] Process PID={process.pid} did not exit after SIGKILL "
+                    "(possible D-state / uninterruptible I/O wait)"
+                )
+
+        if _group_alive():
+            try:
+                os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            for _ in range(30):  # up to ~3s for the OS to reap the group
+                if not _group_alive():
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                logger.warning(
+                    f"[{name}] process group {group_pgid} survived SIGKILL "
+                    "(possible orphaned grandchild / D-state)"
+                )
+    except asyncio.CancelledError:
+        # Whoever cancelled this wait -- a caller, or loop shutdown cancelling
+        # every task -- the tree is SIGKILLed synchronously before the
+        # cancellation propagates (Consiliency/pmcp#324).
+        _kill_process_tree_now(process, group_pgid=group_pgid)
+        raise
 
 
 # Heartbeat thresholds for health monitoring
@@ -1011,6 +1302,42 @@ class PendingRequest:
     method: str = ""
 
 
+#: Source of `ManagedClient.connection_id`: unique for the process lifetime,
+#: unlike `id()`, which a later object can reuse.
+_CONNECTION_IDS = itertools.count(1)
+
+
+def _pins_task(method: Any) -> Any:
+    """Pin `(server_name, task_id)` -- a method's first two arguments -- for
+    the whole call (Consiliency/pmcp#338, rev 9): the record the request reads
+    at its start cannot be evicted before its reply lands."""
+
+    @functools.wraps(method)
+    async def pinned(
+        self: Any, server_name: str, task_id: str, *a: Any, **k: Any
+    ) -> Any:
+        with self._pinned([(server_name, task_id)]):
+            return await method(self, server_name, task_id, *a, **k)
+
+    return pinned
+
+
+class TaskReply(NamedTuple):
+    """A downstream reply, and the task record pmcp built from *this* reply
+    (Consiliency/pmcp#338, rev 6).
+
+    `task` is built from the reply alone, on the connection the request went
+    out on, whether or not it was stored (a reply from a replaced connection
+    is not). A caller uses it instead of looking the task up by
+    `(server, task_id)` after the await: by then the registry may hold another
+    connection's task under the same id. None when the reply carries no task
+    pmcp records (no task requested, no task payload, or a reply about a
+    different task than the one asked for)."""
+
+    result: Any
+    task: McpTaskRecord | None
+
+
 @dataclass
 class ManagedClient:
     """A managed connection to a downstream MCP server."""
@@ -1062,6 +1389,18 @@ class ManagedClient:
     # drains the queue, recreated on demand when the previous one is done.
     outbound: asyncio.Queue[dict[str, Any]] | None = None
     outbound_writer: asyncio.Task[None] | None = None
+    # The process group the downstream leads, so every kill path can reach a
+    # grandchild after asyncio has reaped the leader (codex rounds 5 and 6,
+    # Consiliency/pmcp#324). Set by the creator from the spawn contract
+    # (`start_new_session=True` makes the pgid the pid), never looked up
+    # afterwards: a leader that exits at once can be reaped before
+    # `create_subprocess_exec` even returns.
+    group_pgid: int | None = None
+    # Which connection this is. A reconnect under the same name makes a new
+    # ManagedClient with a new id, so a task record (or a teardown snapshot)
+    # from the old connection can be told apart from the replacement
+    # (Consiliency/pmcp#338, rev 5).
+    connection_id: int = field(default_factory=lambda: next(_CONNECTION_IDS))
 
 
 class ClientManager:
@@ -1094,9 +1433,18 @@ class ClientManager:
         self._revision_id: str = _generate_revision_id()
         self._last_refresh_ts: float = time.time()
         self._max_tools_per_server = max_tools_per_server
-        self._project_root = project_root
+        # The project this object serves, BOUND at construction: the explicit
+        # root, else the served one, else the one discovered from the working
+        # directory NOW. Everything it loads (configs, endpoints) and every
+        # credential it looks up use this one root, so a later chdir cannot
+        # pair this project's endpoint with another project's credential
+        # (Consiliency/pmcp#372 round 16, board round 15 claude F001).
+        self._project_root: Path = bind_project_root(project_root)
         self._spawn_semaphore = asyncio.Semaphore(max_concurrent_spawns)
         self._lifecycle_lock = asyncio.Lock()
+        # Set once by `abandon_all_now()` and never cleared: see
+        # `_connect_server`.
+        self._abandoned = False
         self._connect_tasks: dict[str, asyncio.Task[None]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._background_task_servers: dict[asyncio.Task[Any], str | None] = {}
@@ -1111,14 +1459,10 @@ class ClientManager:
         # by server so a reconcile of A never swallows a genuine publish for B.
         self._catalog_suppressed: dict[str, int] = {}
         self._request_counters: dict[str, int] = {}
-        self._tasks: dict[tuple[str, str], McpTaskRecord] = {}
-        # Cap on retained terminal (completed/failed/cancelled) task records.
-        # Active records are never evicted; only terminal ones are pruned oldest
-        # first once this many accumulate, so the registry can't grow unbounded
-        # between full teardowns.
-        self._max_terminal_tasks = 100
-        # Increments on every `_record_task`: the terminal-eviction order.
-        self._record_order = 0
+        # Every tracked downstream task. Read-only mapping: `_record_task` is
+        # the one writer (`TaskRegistry.put`), and `put` applies the per-server
+        # and total caps (Consiliency/pmcp#338).
+        self._tasks = TaskRegistry()
 
     async def connect_all(
         self, configs: list[ResolvedServerConfig], retry: bool = True
@@ -1143,6 +1487,11 @@ class ClientManager:
     ) -> list[str]:
         """Connect to all configured servers while caller owns lifecycle lock."""
         if not configs:
+            return []
+        if self._abandoned:
+            # A refresh that held the lock across `abandon_all_now()` ends
+            # here rather than logging one refused connect per server.
+            logger.info("Not connecting: the client manager was abandoned")
             return []
 
         # Connect to all servers concurrently, sharing work for duplicate names.
@@ -1216,11 +1565,38 @@ class ClientManager:
         # task: a connect/reconnect task scoped to this server name must never
         # cancel a gather() containing itself (that self-cancel recurses until
         # RecursionError and leaves the server stuck in ERROR).
+        tasks = self._background_tasks_for(server_name=server_name, exclude=exclude)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            # `asyncio.wait`, not `gather`: a cancelled `gather` still waits for
+            # every child to finish, so a cancelled caller would wait out a
+            # child that ignores cancellation (Consiliency/pmcp#324).
+            await asyncio.wait(tasks)
+            for task in tasks:
+                _retrieve_outcome(task)
+        self._background_tasks.difference_update(task for task in tasks if task.done())
+        for task in tasks:
+            if task.done():
+                self._background_task_servers.pop(task, None)
+
+    def _cancel_background_tasks_now(self, *, server_name: str | None = None) -> None:
+        """`_cancel_background_tasks` without the wait: for a cancelled
+        teardown, which must not await (Consiliency/pmcp#324)."""
+        for task in self._background_tasks_for(server_name=server_name):
+            _cancel_without_waiting(task)
+
+    def _background_tasks_for(
+        self,
+        *,
+        server_name: str | None = None,
+        exclude: set[asyncio.Task[Any]] | None = None,
+    ) -> list[asyncio.Task[Any]]:
         exclude = set(exclude) if exclude else set()
         current = asyncio.current_task()
         if current is not None:
             exclude.add(current)
-        tasks = [
+        return [
             task
             for task in self._background_tasks
             if task not in exclude
@@ -1232,14 +1608,6 @@ class ClientManager:
                 or task is self._connect_tasks.get(server_name)
             )
         ]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._background_tasks.difference_update(task for task in tasks if task.done())
-        for task in tasks:
-            if task.done():
-                self._background_task_servers.pop(task, None)
 
     def _next_request_id(self, server_name: str) -> int:
         request_id = self._request_counters.get(server_name, 0) + 1
@@ -1269,7 +1637,7 @@ class ClientManager:
                 status=ServerStatusEnum.LAZY,
                 tool_count=0,
             )
-            logger.info(f"Registered lazy server: {name}")
+            logger.info(f"Registered lazy server: {_lazy_log_name(config)}")
 
     def prune_lazy_configs(self, keep_names: set[str]) -> None:
         """Drop on-demand (lazy) configs whose name is not in ``keep_names``.
@@ -1392,100 +1760,144 @@ class ClientManager:
             )
 
         cancelled = self.cancel_pending_requests(name) if pending_requests else 0
-        if active_tasks:
-            for task in active_tasks:
-                ok, _task, message = await self.cancel_task(
-                    name, task.task_id, force=True
+        # Every await before the lifecycle lock is held is part of the
+        # teardown too (Consiliency/pmcp#324, implementation addition): a
+        # forced disconnect sends `tasks/cancel` for each active MCP task and
+        # waits for the reply, and then waits for the lock. A caller cancelled
+        # at either await still gets the synchronous teardown, then the cancel.
+        # The tasks are cancelled through the one teardown helper
+        # (Consiliency/pmcp#338): it owes every active task tracked now, an
+        # eviction meanwhile included. It returns how many it cancelled or
+        # found finished, which this caller does not use. When its custody is
+        # released, a task it did not cancel goes back to the registry only if
+        # it is unfinished, on its server's current connection, and owed by no
+        # other running teardown (R4).
+        try:
+            if active_tasks:
+                await self._cancel_tracked_for_teardown([name])
+            await self._lifecycle_lock.acquire()
+        except asyncio.CancelledError:
+            before_lock = self._clients.get(name)
+            if before_lock is not None:
+                before_lock.status.status = ServerStatusEnum.OFFLINE
+                self._abandon_client_io(name, before_lock)
+                self._forget_disconnected(name, before_lock.config)
+            # Outside the `if`: a connect for this server may be in flight
+            # with no client registered yet (e.g. in its retry backoff,
+            # holding the lock). Cancel it either way, or its next attempt
+            # spawns after this disconnect. (Its `_connect_singleflight`
+            # drops the `_connect_tasks` entry as the cancel unwinds.)
+            self._cancel_background_tasks_now(server_name=name)
+            raise
+        try:
+            return await self._disconnect_server_locked(name, cancelled)
+        finally:
+            self._lifecycle_lock.release()
+
+    async def _disconnect_server_locked(
+        self, name: str, cancelled: int
+    ) -> tuple[bool, int, str | None]:
+        """`disconnect_server`'s teardown, with the lifecycle lock held."""
+        managed = self._clients.get(name)
+        # Re-cancel inside the lock: requests may have been queued in the
+        # window between the pre-lock inspection above and acquiring the
+        # lock, which would otherwise leave orphaned pending futures.
+        if managed is not None and managed.pending_requests:
+            cancelled += self.cancel_pending_requests(name)
+        if not managed:
+            status = self._servers.get(name)
+            if status is not None:
+                status.status = (
+                    ServerStatusEnum.LAZY
+                    if name in self._lazy_configs
+                    else ServerStatusEnum.OFFLINE
                 )
-                if not ok:
-                    return (False, cancelled, message)
+                status.tool_count = 0
+                status.resource_count = 0
+                status.prompt_count = 0
+                status.pending_request_count = 0
+            return (True, cancelled, None)
 
-        async with self._lifecycle_lock:
-            managed = self._clients.get(name)
-            # Re-cancel inside the lock: requests may have been queued in the
-            # window between the pre-lock inspection above and acquiring the
-            # lock, which would otherwise leave orphaned pending futures.
-            if managed is not None and managed.pending_requests:
-                cancelled += self.cancel_pending_requests(name)
-            if not managed:
-                status = self._servers.get(name)
-                if status is not None:
-                    status.status = (
-                        ServerStatusEnum.LAZY
-                        if name in self._lazy_configs
-                        else ServerStatusEnum.OFFLINE
-                    )
-                    status.tool_count = 0
-                    status.resource_count = 0
-                    status.prompt_count = 0
-                    status.pending_request_count = 0
-                return (True, cancelled, None)
+        config = managed.config
+        managed.status.status = ServerStatusEnum.OFFLINE
+        managed.status.pending_request_count = 0
 
-            config = managed.config
-            managed.status.status = ServerStatusEnum.OFFLINE
-            managed.status.pending_request_count = 0
-
-            if managed.read_task and not managed.read_task.done():
-                managed.read_task.cancel()
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(managed.read_task), timeout=1.0
-                    )
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
-                except Exception:
-                    pass
-
+        try:
+            await _reap_child(managed.read_task, timeout=1.0)
             # Cancel the outbound writer explicitly (in addition to the
             # server-name sweep below), so teardown of this path does not
             # depend on that sweep also matching it -- and reset
             # `outbound`/`outbound_writer`, the same postcondition
             # `_cleanup_client` holds (Consiliency/pmcp#287).
             await self._teardown_outbound(managed, timeout=1.0)
-
-            try:
-                if managed.is_remote:
-                    # _close_remote_transport never swallows a genuine
-                    # transport-exit failure -- that's deliberate, so it can
-                    # still reach the `except Exception` below and return
-                    # (False, cancelled, str(e)) rather than reporting a
-                    # broken teardown as a successful disconnect. A timeout
-                    # that escalates to cancel is logged there and returns
-                    # normally: the transport is closed either way, and
-                    # `False` here would make a dead-peer disconnect look
-                    # like a refusal to the caller.
-                    await self._close_remote_transport(name, managed)
-                else:
-                    await _terminate_process_tree(managed.process, name)
-            except Exception as e:
-                described = describe_exception(e)
-                logger.warning(f"Error disconnecting from {name}: {described}")
-                return (False, cancelled, described)
-
+            closed = await self._close_or_terminate(name, managed)
+            if closed is not None:
+                return (False, cancelled, closed)
             await self._cancel_background_tasks(server_name=name)
-            self._connect_tasks.pop(name, None)
-            self._reconnect_tasks.pop(name, None)
-            # A reconcile cancelled before it ever started never runs its own
-            # `finally`, so clear its bookkeeping here too. The catalog removal
-            # below supersedes whatever it would have published.
-            self._reconcile_tasks.pop(name, None)
-            self._reconcile_reruns.discard(name)
-            self._catalog_suppressed.pop(name, None)
-            self._clients.pop(name, None)
-            self._remove_server_indexes(name)
-            if config is not None and config.source in {"project", "user", "custom"}:
-                self._lazy_configs[name] = config
-            self._servers[name] = ServerStatus(
-                name=name,
-                status=ServerStatusEnum.LAZY
-                if name in self._lazy_configs
-                else ServerStatusEnum.OFFLINE,
-                tool_count=0,
-            )
-            self._revision_id = _generate_revision_id()
-            self._last_refresh_ts = time.time()
-            # No flush() here, deliberately -- see _index_capabilities.
-            return (True, cancelled, None)
+        except asyncio.CancelledError:
+            # The caller was cancelled mid-disconnect: finish it
+            # synchronously, then re-raise (Consiliency/pmcp#324).
+            # `disconnect_server`'s `finally` releases the lifecycle lock
+            # without awaiting.
+            self._abandon_client_io(name, managed)
+            self._cancel_background_tasks_now(server_name=name)
+            self._forget_disconnected(name, config)
+            raise
+        self._forget_disconnected(name, config)
+        return (True, cancelled, None)
+
+    async def _close_or_terminate(
+        self, name: str, managed: ManagedClient
+    ) -> str | None:
+        """`disconnect_server`'s close step: None on success, else the
+        described failure. A cancellation propagates."""
+        try:
+            if managed.is_remote:
+                # _close_remote_transport never swallows a genuine
+                # transport-exit failure -- that's deliberate, so it can
+                # still reach the `except Exception` below and return
+                # (False, cancelled, str(e)) rather than reporting a
+                # broken teardown as a successful disconnect. A timeout
+                # that escalates to cancel is logged there and returns
+                # normally: the transport is closed either way, and
+                # `False` here would make a dead-peer disconnect look
+                # like a refusal to the caller.
+                await self._close_remote_transport(name, managed)
+            else:
+                await _terminate_process_tree(
+                    managed.process, name, group_pgid=managed.group_pgid
+                )
+        except Exception as e:
+            described = describe_exception(e)
+            logger.warning(f"Error disconnecting from {name}: {described}")
+            return described
+        return None
+
+    def _forget_disconnected(self, name: str, config: Any) -> None:
+        """`disconnect_server`'s registry bookkeeping. Synchronous, so the
+        cancelled path runs it too (Consiliency/pmcp#324)."""
+        self._connect_tasks.pop(name, None)
+        self._reconnect_tasks.pop(name, None)
+        # A reconcile cancelled before it ever started never runs its own
+        # `finally`, so clear its bookkeeping here too. The catalog removal
+        # below supersedes whatever it would have published.
+        self._reconcile_tasks.pop(name, None)
+        self._reconcile_reruns.discard(name)
+        self._catalog_suppressed.pop(name, None)
+        self._clients.pop(name, None)
+        self._remove_server_indexes(name)
+        if config is not None and config.source in {"project", "user", "custom"}:
+            self._lazy_configs[name] = config
+        self._servers[name] = ServerStatus(
+            name=name,
+            status=ServerStatusEnum.LAZY
+            if name in self._lazy_configs
+            else ServerStatusEnum.OFFLINE,
+            tool_count=0,
+        )
+        self._revision_id = _generate_revision_id()
+        self._last_refresh_ts = time.time()
+        # No flush() here, deliberately -- see _index_capabilities.
 
     async def restart_server(
         self, config: ResolvedServerConfig, force: bool = False
@@ -1516,6 +1928,8 @@ class ClientManager:
             try:
                 await self._connect_server(config)
                 return  # Success
+            except _ManagerAbandoned:
+                raise  # Not a failure to retry: the gateway is shutting down.
             except Exception as e:
                 last_error = e
                 if attempt < MAX_CONNECTION_RETRIES - 1:
@@ -1532,7 +1946,17 @@ class ClientManager:
             raise last_error
 
     async def _connect_server(self, config: ResolvedServerConfig) -> None:
-        """Connect to a single MCP server."""
+        """Connect to a single MCP server.
+
+        Every connect path -- startup, `connect_server`, `refresh`, lazy
+        start, reconnect -- ends here, so this one check is what stops an
+        operation that was already in flight when `abandon_all_now()` ran
+        (e.g. a `refresh` holding the lifecycle lock through shutdown) from
+        spawning a server afterwards (Consiliency/pmcp#324)."""
+        if self._abandoned:
+            raise _ManagerAbandoned(
+                f"Not connecting {config.name}: the client manager was abandoned"
+            )
         if isinstance(config.config, RemoteMcpServerConfig):
             if config.config.type in ("http", "streamable-http"):
                 await self._connect_streamable_http(config)
@@ -1610,8 +2034,10 @@ class ClientManager:
         """Remove catalog entries owned by one server.
 
         `drop_tasks=False` keeps the server's tracked `McpTaskRecord`s. Dropping
-        them is right for a disconnect, where the downstream's tasks died with
-        the connection, and wrong for a `list_changed` reconcile, where the
+        them is right for a disconnect, where pmcp can no longer reach those
+        tasks (a stdio server's die with its process; a remote server's keep
+        running, which is why a forced disconnect cancels them first), and
+        wrong for a `list_changed` reconcile, where the
         server is still up and its in-flight tasks are still running -- evicting
         them there would silently break `gateway.tasks_list`/`tasks_result`.
 
@@ -1641,9 +2067,7 @@ class ClientManager:
                     self._prompts.pop(prompt_id, None)
                     prompts_removed = True
         if drop_tasks:
-            for key in list(self._tasks):
-                if key[0] == name:
-                    self._tasks.pop(key, None)
+            self._tasks.drop_server(name)
         suppressed = self._catalog_publishing_suppressed(name)
         if tools_removed and not suppressed:
             self._catalog_events.note_tools_changed()
@@ -1675,10 +2099,12 @@ class ClientManager:
         payload: dict[str, Any] = {}
         if parsed.metadata:
             payload["metadata"] = parsed.metadata
+        # pmcp's seconds become MCP's milliseconds here, and only here
+        # (Consiliency/pmcp#330).
         if parsed.ttl is not None:
-            payload["ttl"] = parsed.ttl
+            payload["ttl"] = task_seconds_to_wire(parsed.ttl)
         if parsed.poll_interval is not None:
-            payload["pollInterval"] = parsed.poll_interval
+            payload["pollInterval"] = task_seconds_to_wire(parsed.poll_interval)
         if parsed.requestor_context:
             payload["requestorContext"] = parsed.requestor_context
         return payload
@@ -1760,8 +2186,10 @@ class ClientManager:
             status_message=status_message if isinstance(status_message, str) else None,
             created_at=created_at,
             updated_at=updated_at,
-            ttl=payload.get("ttl"),
-            poll_interval=poll_interval,
+            # MCP's milliseconds become pmcp's seconds here, and only here;
+            # `raw` keeps the downstream's own units (Consiliency/pmcp#330).
+            ttl=task_duration_from_wire("ttl", payload.get("ttl")),
+            poll_interval=task_duration_from_wire("poll_interval", poll_interval),
             raw=payload,
         )
 
@@ -1771,9 +2199,54 @@ class ClientManager:
         task_info: McpTaskInfo,
         *,
         tool_id: str | None = None,
-        requestor_context: dict[str, Any] | None = None,
+        requestor_context: dict[str, Any] | None,
+        connection: ManagedClient | None,
     ) -> McpTaskRecord:
-        existing = self._tasks.get((server_name, task_info.task_id))
+        """Build and store one record: the only way a record is made.
+
+        `requestor_context` is required, with no default (Consiliency/pmcp#338,
+        rev 5). Each caller passes the context it holds for this task, or an
+        explicit `None` it can justify; the structural tests list every call
+        and its value. The merge below keeps an existing record's context when
+        the caller passes none, but after an eviction there is no existing
+        record, so a caller that held a context and dropped it here would lose
+        it -- the class four panel rounds found one site at a time.
+
+        Precedence (rev 9): the context a caller supplies with this request
+        (`gateway.invoke`'s `task.requestor_context`) wins, as on main; else
+        the existing same-connection record's is kept. A reply supplies none,
+        so it never overrides. Rev 8's captured `fallback_context` is gone: a
+        request that captured a context pins its record (`_pinned`), so the
+        record is still there when the reply lands, and the existing record's
+        context -- the newest pmcp holds -- is what the merge keeps.
+
+        `connection` is required too (rev 5): the `ManagedClient` the task's
+        information came from. The record is bound to it, and a task request
+        derived from the record is sent only on that connection
+        (`_task_client(..., bound_to=record)`). If that connection is no
+        longer the server's -- it was replaced or removed while the request
+        was in flight -- the record is built and returned but *not stored*: a
+        reply from the old connection must not become state of the new one.
+        `None` (an unbound record) is for tests that seed the registry; every
+        call in `src/pmcp` passes the connection it used (structurally
+        pinned).
+        """
+        # Ownership first (rev 7): a reply from a connection that is no longer
+        # the server's is built from the reply alone -- never merged with what
+        # the registry holds now, which may be a replacement connection's
+        # same-id task -- and is not stored.
+        owned = connection is None or self._owns(server_name, connection)
+        key = (server_name, task_info.task_id)
+        # Evicted while a forced teardown owed it: its custody still holds it,
+        # and pmcp merges with what it holds (rev 11).
+        existing = (self._tasks.get(key) or self._tasks.held(key)) if owned else None
+        if (
+            existing is not None
+            and connection is not None
+            and existing._connection_id is not None
+            and existing._connection_id != connection.connection_id
+        ):
+            existing = None  # another connection's record: never merged
         now = time.time()
         # created_at: the first usable value pmcp saw (Consiliency/pmcp#298).
         created_at = (
@@ -1808,49 +2281,57 @@ class ClientManager:
             requestor_context=requestor_context
             or (existing.requestor_context if existing else None),
         )
-        self._record_order += 1
-        record._recorded_order = self._record_order
-        self._tasks[(server_name, task_info.task_id)] = record
-        self._evict_terminal_tasks()
+        if not owned:
+            return record  # the old connection's reply: not stored
+        if connection is not None:
+            record._connection_id = connection.connection_id
+        # The one way in: `put` applies the per-server and total caps
+        # (Consiliency/pmcp#338). It never evicts the record it just stored.
+        self._tasks.put(record)
         return record
 
-    def _evict_terminal_tasks(self) -> None:
-        """Prune oldest terminal task records past the retention cap.
-
-        Only completed/failed/cancelled records are candidates; active tasks are
-        left untouched. Eviction targets the records pmcp recorded least
-        recently (``_recorded_order``), so recently-seen tasks remain queryable.
-        """
-        terminal = [
-            (key, record)
-            for key, record in self._tasks.items()
-            if self._terminal_task(record)
-        ]
-        excess = len(terminal) - self._max_terminal_tasks
-        if excess <= 0:
-            return
-        # Least recently recorded by pmcp first. The downstream's own
-        # timestamps play no part: a far-future `lastUpdatedAt` cannot keep one
-        # server's records past another's, and an honest server whose clock
-        # runs behind cannot lose its records early (Consiliency/pmcp#298).
-        terminal.sort(key=lambda item: item[1]._recorded_order)
-        for key, _record in terminal[:excess]:
-            self._tasks.pop(key, None)
-
     def _terminal_task(self, task: McpTaskRecord) -> bool:
-        return task.status in {"completed", "failed", "cancelled"}
+        return task_is_terminal(task)
 
     def get_task_record(self, server_name: str, task_id: str) -> McpTaskRecord | None:
+        """The registry's record for one task. In `src/pmcp` it is read only
+        by a request that has pinned the key (rev 12, structurally pinned),
+        and pinning puts a record the cap had moved into a running teardown's
+        custody back in the registry first (`_pinned`): so every request sees
+        a task pmcp tracks, custody included, with its context."""
         return self._tasks.get((server_name, task_id))
 
     def get_tracked_tasks(self, server_name: str | None = None) -> list[McpTaskRecord]:
-        return sorted(
-            [
-                task
-                for (server, _), task in self._tasks.items()
-                if server_name is None or server == server_name
-            ],
-            key=lambda task: (task.server_name, task.task_id),
+        """Every task pmcp tracks, for one server or all: the one source every
+        reader of task state goes through (rev 12, round-11 F001).
+
+        That is the registry's records, plus the records a running forced
+        teardown owes that the cap moved into its custody
+        (`TaskRegistry.owed_records`): such a task is still running
+        downstream and still owed a `tasks/cancel`, so a second teardown must
+        owe it too, a non-forced disconnect must refuse on it, and a refresh
+        must count it. An owed record counts only while it belongs to its
+        server's current connection: one from a removed or replaced
+        connection is not this server's state any more (rev 5)."""
+        tracked = [
+            task
+            for (server, _), task in self._tasks.items()
+            if server_name is None or server == server_name
+        ]
+        tracked.extend(
+            task
+            for task in self._tasks.owed_records(server_name)
+            if self._on_current_connection(task)
+        )
+        return sorted(tracked, key=lambda task: (task.server_name, task.task_id))
+
+    def _on_current_connection(self, task: McpTaskRecord) -> bool:
+        """Whether `task` belongs to its server's current connection (an
+        unbound record, as tests seed, belongs to whichever is current)."""
+        managed = self._clients.get(task.server_name)
+        return managed is not None and task._connection_id in (
+            None,
+            managed.connection_id,
         )
 
     def get_active_tasks(self, server_name: str | None = None) -> list[McpTaskRecord]:
@@ -1863,17 +2344,99 @@ class ClientManager:
     async def cancel_active_tasks(
         self, server_name: str | None = None
     ) -> tuple[int, list[str]]:
+        servers = (
+            [server_name]
+            if server_name is not None
+            else sorted({task.server_name for task in self.get_active_tasks()})
+        )
+        cancelled = await self._cancel_tracked_for_teardown(servers)
+        return cancelled, []
+
+    async def _cancel_tracked_for_teardown(self, server_names: list[str]) -> int:
+        """Force-cancel every active task of each server in `server_names`.
+
+        The only place a teardown cancels tasks (Consiliency/pmcp#338).
+
+        What it owes is fixed when it is requested (rev 11): its first
+        statement, before any await, reads every active task of every named
+        server -- through `get_active_tasks`, so including what other running
+        teardowns owe and the cap moved into their custodies (rev 12,
+        round-11 F001): it cancels those now too, never leaves them to an
+        owner that may find the connection gone. Nothing that happens while it waits -- a cancel on another
+        server, a listing that floods this one -- can remove an entry from
+        that obligation (round 10: rev 10 read each server's snapshot only
+        when its turn came, so an eviction meanwhile silently dropped a task
+        and left it running).
+
+        The teardown does not pin what it owes (rev 11). It holds it in a
+        `TaskCustody`: the registry still evicts an owed record past the caps,
+        and hands it to the custody, so it is still cancelled, with the newest
+        context pmcp held for it. Since nothing a teardown owes counts against
+        the caps, overlapping teardowns cannot stack retention (round 9), and
+        no lock is needed to serialise them (rev 10's per-server lock is gone,
+        and with it round-10 N1, an unpruned lock per server, and N2, a forced
+        disconnect waiting behind a forced refresh's other servers). The one
+        record it pins is the entry whose `tasks/cancel` is in flight, as
+        `cancel_task` does: one request, one pin (rev 9).
+
+        An owed record the cap evicted before its turn is still cancelled:
+        its pin puts it back in the registry. While the custody is
+        registered, `_record_task` merges any record of that key with what
+        the custody holds, so a reply or a listing's re-track keeps the
+        context pmcp held for it.
+
+        Per entry, in snapshot order:
+        - the connection the snapshot came from cannot take a task request now
+          -- a concurrent disconnect removed it, a reconnect has the server
+          listed but not yet connected or replaced it, or it does not
+          advertise tasks: skipped, not counted, not an error (rev 5);
+        - the entry is pinned for its own request; a record the cap had moved
+          into a custody is put back in the registry by the pin (rev 12);
+        - finished meanwhile: counted, nothing sent;
+        - otherwise: `tasks/cancel` sent through `_send_task_cancel`, with the
+          record's context -- the newest pmcp holds: `_record_task` merges
+          with a custody's record whenever the registry no longer holds the
+          key.
+
+        Returns how many were cancelled or found finished. A downstream error
+        propagates, as it always has: a teardown that fails or is cancelled
+        ends its obligation with it, and its caller sees the failure.
+        """
+        snapshot = [
+            task
+            for server_name in sorted(set(server_names))
+            for task in self.get_active_tasks(server_name)
+        ]
         cancelled = 0
-        errors: list[str] = []
-        for task in list(self.get_active_tasks(server_name)):
-            ok, _record, message = await self.cancel_task(
-                task.server_name, task.task_id, force=True
-            )
-            if ok:
-                cancelled += 1
-            else:
-                errors.append(message)
-        return cancelled, errors
+        with self._custody(snapshot):
+            for snapped in snapshot:
+                server_name, task_id = snapped.server_name, snapped.task_id
+                if self._task_client_unavailable(server_name, bound_to=snapped):
+                    continue
+                # this entry's own tasks/cancel is a request in flight like
+                # any other: its key is pinned until the reply lands, and the
+                # pin puts the record back in the registry if the cap had
+                # moved it into a custody (rev 12)
+                with self._pinned([(server_name, task_id)]):
+                    current = self.get_task_record(server_name, task_id)
+                    if current is None:
+                        # Unreachable: the connection is the snapshot's, so
+                        # the record is in the registry or a custody, and the
+                        # pin has put it in the registry. An explicit skip,
+                        # not an `assert` (round-9 N1).
+                        continue
+                    if self._terminal_task(current):
+                        cancelled += 1
+                        continue
+                    await self._send_task_cancel(
+                        server_name,
+                        task_id,
+                        force=True,
+                        requestor_context=current.requestor_context,
+                        bound_to=snapped,
+                    )
+                    cancelled += 1
+        return cancelled
 
     def _index_tools(
         self,
@@ -2512,6 +3075,10 @@ class ClientManager:
             config=config,
             process=process,
             status=status,
+            # The spawn contract: `start_new_session=True` above makes the
+            # child a session and group leader, so its pgid IS its pid --
+            # true even if it has already exited and been reaped.
+            group_pgid=_spawned_group_pgid(process),
         )
         self._clients[name] = managed
 
@@ -2548,26 +3115,122 @@ class ClientManager:
                 f"{resource_count} resources, {prompt_count} prompts indexed"
             )
 
+        except asyncio.CancelledError as e:
+            # Cancelled DURING the handshake: no graceful teardown, the
+            # synchronous one (Consiliency/pmcp#324). On main this path ran
+            # no teardown at all and leaked the process and the entry.
+            status.status = ServerStatusEnum.ERROR
+            status.last_error = _handshake_error(e)
+            self._abandon_client_io(name, managed)
+            self._drop_client(name, managed)
+            raise
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
             status.last_error = describe_exception(e)
-            for task in (managed.read_task, managed.stderr_task):
-                if task and not task.done():
-                    task.cancel()
-                    try:
-                        await asyncio.shield(task)
-                    except (asyncio.CancelledError, Exception):
-                        pass
-            # A writer started before the handshake failed (e.g. a `ping`
-            # answered during `initialize`) must not survive this pop
-            # (Consiliency/pmcp#287).
-            await self._teardown_outbound(managed)
-            await _terminate_process_tree(process, name)
-            # Drop the stale ERROR client so it can't be found as a live
-            # connection on the next connect attempt (issue: stale entry + leak).
-            if self._clients.get(name) is managed:
-                self._clients.pop(name, None)
+            try:
+                await self._abort_stdio_handshake(name, managed, process)
+            except asyncio.CancelledError:
+                # Cancelled while tearing down a failed handshake.
+                self._abandon_client_io(name, managed)
+                raise
+            finally:
+                # Drop the stale ERROR client so it can't be found as a live
+                # connection on the next connect attempt (issue: stale entry +
+                # leak) -- also when a teardown step raises.
+                self._drop_client(name, managed)
             raise
+
+    async def _abort_stdio_handshake(
+        self,
+        name: str,
+        managed: ManagedClient,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        """The graceful teardown a failed stdio handshake owes. A caller
+        cancellation propagates out of any await here; the handler above
+        then finishes synchronously."""
+        await _reap_child(managed.read_task)
+        await _reap_child(managed.stderr_task)
+        # A writer started before the handshake failed (e.g. a `ping`
+        # answered during `initialize`) must not survive this pop
+        # (Consiliency/pmcp#287).
+        await self._teardown_outbound(managed)
+        await _terminate_process_tree(process, name, group_pgid=managed.group_pgid)
+
+    def _drop_client(self, name: str, managed: ManagedClient) -> None:
+        if self._clients.get(name) is managed:
+            self._clients.pop(name, None)
+
+    def abandon_all_now(self) -> None:
+        """Abandon every client synchronously, with no await: kill each
+        process tree (through its retained group), abandon each remote
+        owner, cancel the background tasks without waiting, and drop the
+        client and task registries (Consiliency/pmcp#324, codex round 6).
+
+        For a caller whose own teardown work runs in another task that can
+        be cancelled before its first instruction -- `GatewayServer.shutdown`
+        bounds `disconnect_all()` with `bounded_wait`, and loop shutdown can
+        cancel that task before it starts, so neither its workers' handlers
+        nor its parent fallback run. The caller's `except CancelledError`
+        calls this and re-raises. Repeating it for clients `disconnect_all`
+        already abandoned is harmless (see `_disconnect_all_unlocked`).
+        Catalogs are left to `disconnect_all` (the publisher-coverage guard
+        keeps catalog writes there); the process is exiting.
+
+        It is terminal: `_abandoned` stays set, so a lifecycle operation
+        already in flight (a `refresh` holding the lock) or queued behind
+        one cannot spawn a server afterwards (`_connect_server`)."""
+        self._abandoned = True
+        for name, managed in list(self._clients.items()):
+            self._abandon_client_io(name, managed)
+        self._cancel_background_tasks_now()
+        self._clients.clear()
+        self._connect_tasks.clear()
+        self._reconnect_tasks.clear()
+        self._reconcile_tasks.clear()
+
+    def _abandon_client_io(self, name: str, managed: ManagedClient) -> None:
+        """Everything a teardown must still do when its caller has been
+        cancelled -- synchronously, with no await (Consiliency/pmcp#324):
+
+        * cancel the client's reader, stderr and outbound-writer tasks
+          without awaiting them (each logs a genuine failure by type);
+        * stdio: SIGKILL the process tree (`_kill_process_tree_now`); no
+          SIGTERM grace for a cancelled caller;
+        * remote: signal the transport owner and cancel it from loop
+          callbacks (`_abandon_owner`) without awaiting it. The graceful
+          close is abandoned, so a streamable-HTTP
+          session-ending DELETE may not be sent; the server reaps the
+          session on its own timeout.
+
+        Never raises: a failure in one step is logged by type, and the
+        caller's cancellation is what propagates.
+
+        First, an ONLINE client is marked OFFLINE, before its reader is
+        cancelled: the reader's `finally` schedules an auto-reconnect for a
+        client it still sees ONLINE, and on this path nothing would cancel
+        that reconnect (claude round 4, F1: a `disconnect_all` cancelled
+        before its workers ran respawned every server 5 s later). One spot
+        for every synchronous abandon path -- handshakes, `_cleanup_client`,
+        `disconnect_server`, `_shutdown_one`, the `disconnect_all` fallback
+        and `adopt_process`.
+        """
+        if managed.status.status == ServerStatusEnum.ONLINE:
+            managed.status.status = ServerStatusEnum.OFFLINE
+        for task in (managed.read_task, managed.stderr_task, managed.outbound_writer):
+            _cancel_without_waiting(task)
+        managed.outbound = None
+        managed.outbound_writer = None
+        try:
+            if managed.is_remote:
+                _abandon_owner(managed.transport_owner_task, managed.transport_shutdown)
+            else:
+                _kill_process_tree_now(managed.process, group_pgid=managed.group_pgid)
+        except Exception as exc:
+            logger.warning(
+                f"[{name}] teardown step failed while abandoning a cancelled "
+                f"caller's client: {type(exc).__name__}"
+            )
 
     async def _connect_sse(self, config: ResolvedServerConfig) -> None:
         """Connect to a remote SSE MCP server."""
@@ -2713,67 +3376,40 @@ class ClientManager:
                     raise exc
             return
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout)
-        except asyncio.TimeoutError:
-            # The 5s budget bounds this graceful wait only, not the
-            # escalation below: awaiting the cancelled owner is itself
-            # unbounded, and an __aexit__ that ignores cancellation hangs
-            # there -- the same hang class as today's dead-peer teardown,
-            # neither introduced nor removed by this method. Timeout-as-
-            # success is deliberate (a dead peer must not read as "disconnect
-            # refused"), but that only covers the timeout itself -- a genuine
-            # failure surfacing *while* the owner unwinds under our cancel
-            # must still propagate, so only the CancelledError our own
-            # cancel() causes is swallowed below.
-            logger.warning(
-                f"[{name}] remote transport did not close within {timeout}s; cancelling"
-            )
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        except asyncio.CancelledError:
-            # NOT the same case as the timeout above. The shield keeps the
-            # owner alive, so a CancelledError here is *our caller* being
-            # cancelled, not the owner. Escalate to the owner so its stack
-            # still unwinds, then re-raise the caller's own cancellation --
-            # swallowing it would suppress cancellation of whatever task is
-            # running disconnect_server / _shutdown_one, which is the exact
-            # cancellation-correctness class this fix exists to fix. A
-            # genuine failure surfacing from the owner during this forced
-            # unwind can't also be raised (the caller's own CancelledError
-            # takes precedence, per the same reasoning), but is logged rather
-            # than silently dropped.
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                # The traceback, not just the message: this is by construction
-                # the hardest path here to reproduce (needs a caller cancelled
-                # *while* a forced owner unwind is independently failing), so
-                # the frames matter if it is ever seen again.
-                #
-                # Formatted and sanitised rather than passed as `exc_info=`.
-                # `exc_info` hands the raw exception to the logging machinery,
-                # which appends the unredacted exception tree *after* the
-                # sanitised message -- so a bearer token in a transport error
-                # reached the log in full despite the message above being
-                # clean. Redaction here is best-effort defence in depth
-                # (SECURITY.md), and it cannot be applied to text the logging
-                # framework formats on its own.
-                traceback_text = "".join(
-                    traceback.format_exception(type(exc), exc, exc.__traceback__)
-                )
+            # `asyncio.wait`, never `wait_for(shield(task))`: it does not
+            # raise the owner's outcome, so a CancelledError here is our
+            # caller's alone (Consiliency/pmcp#324).
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if not done:
+                # The budget bounds this graceful wait only, not the
+                # escalation: awaiting the cancelled owner is itself
+                # unbounded, and an __aexit__ that ignores cancellation hangs
+                # there -- the same hang class as a dead-peer teardown.
+                # Timeout-as-success is deliberate (a dead peer must not read
+                # as "disconnect refused"), but a genuine failure surfacing
+                # while the owner unwinds under our cancel still propagates.
                 logger.warning(
-                    f"[{name}] remote transport failed to unwind while "
-                    f"escalating our caller's cancellation: "
-                    f"{describe_exception(exc)}\n"
-                    f"{sanitize_auth_diagnostic(traceback_text, max_length=None)}"
+                    f"[{name}] remote transport did not close within {timeout}s; "
+                    "cancelling"
                 )
+                task.cancel()
+                await asyncio.wait({task})
+        except asyncio.CancelledError:
+            # Our caller was cancelled, during the graceful wait or the
+            # escalation. Escalate to the owner so its stack still unwinds,
+            # in the owner, but do not wait for it: an owner whose
+            # `__aexit__` blocks must not hold a cancelled caller -- or the
+            # lifecycle lock `disconnect_server` holds (Consiliency/pmcp#324).
+            # A genuine failure surfacing from that unwind is logged by the
+            # callback rather than dropped.
+            _abandon_owner(
+                task, shutdown, lambda t: _log_abandoned_owner_failure(name, t)
+            )
             raise
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                raise exc
         # NOTE: no `except Exception` here, deliberately. A transport exit
         # that genuinely fails must propagate, or disconnect_server's
         # `except Exception -> return (False, cancelled, str(e))` can never
@@ -2848,9 +3484,9 @@ class ClientManager:
             # signal-and-wait -- a cancelled caller must not linger, and the
             # peer reaps its own session on timeout. The owner's `async
             # with` unwinds in the owner, as always -- never touch its stack
-            # from this task.
-            owner_task.cancel()
-            await asyncio.gather(owner_task, return_exceptions=True)
+            # from this task. Not awaited either (Consiliency/pmcp#324): an
+            # owner whose enter ignores cancellation must not hold us.
+            _abandon_owner(owner_task, shutdown)
             raise
 
         try:
@@ -2876,30 +3512,41 @@ class ClientManager:
                 f"{resource_count} resources, {prompt_count} prompts indexed"
             )
 
+        except asyncio.CancelledError as e:
+            # As in `_connect_stdio` (Consiliency/pmcp#324).
+            status.status = ServerStatusEnum.ERROR
+            status.last_error = _handshake_error(e)
+            self._abandon_client_io(name, managed)
+            self._drop_client(name, managed)
+            raise
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
             status.last_error = describe_exception(e)
-            if managed.read_task and not managed.read_task.done():
-                managed.read_task.cancel()
-                try:
-                    await asyncio.shield(managed.read_task)
-                except (asyncio.CancelledError, Exception):
-                    pass
-            # Same as the stdio handshake path (Consiliency/pmcp#287).
-            await self._teardown_outbound(managed)
-            await self._close_remote_transport(name, managed)
-            # Drop the stale ERROR client so it can't be found as a live
-            # connection on the next connect attempt.
-            if self._clients.get(name) is managed:
-                self._clients.pop(name, None)
+            try:
+                await self._abort_remote_handshake(name, managed)
+            except asyncio.CancelledError:
+                self._abandon_client_io(name, managed)
+                raise
+            finally:
+                # Drop the stale ERROR client so it can't be found as a live
+                # connection on the next connect attempt.
+                self._drop_client(name, managed)
             raise
+
+    async def _abort_remote_handshake(self, name: str, managed: ManagedClient) -> None:
+        """The graceful teardown a failed remote handshake owes; see
+        `_abort_stdio_handshake`."""
+        await _reap_child(managed.read_task)
+        # Same as the stdio handshake path (Consiliency/pmcp#287).
+        await self._teardown_outbound(managed)
+        await self._close_remote_transport(name, managed)
 
     async def _read_stderr(self, name: str, stderr: asyncio.StreamReader) -> None:
         """Read stderr from a server process."""
         try:
             while True:
                 try:
-                    line = await asyncio.wait_for(stderr.readline(), timeout=120.0)
+                    line = await bounded_wait(stderr.readline(), timeout=120.0)
                 except asyncio.TimeoutError:
                     logger.debug(f"[{name}] stderr readline timed out, continuing")
                     continue
@@ -3356,16 +4003,10 @@ class ClientManager:
         writer = managed.outbound_writer
         managed.outbound = None
         managed.outbound_writer = None
-        if writer is None or writer.done():
-            return
-        writer.cancel()
-        try:
-            if timeout is None:
-                await asyncio.shield(writer)
-            else:
-                await asyncio.wait_for(asyncio.shield(writer), timeout=timeout)
-        except (asyncio.CancelledError, Exception):
-            pass
+        # `_reap_child`: the writer's own cancellation is never seen; a
+        # CancelledError out of here is the caller's and propagates
+        # (Consiliency/pmcp#324).
+        await _reap_child(writer, timeout=timeout)
 
     async def _drain_outbound(self, managed: ManagedClient) -> None:
         """The one writer task per client: drain the bounded outbound queue.
@@ -3585,7 +4226,7 @@ class ClientManager:
         slice_s = min(idle_timeout_s, IDLE_POLL_SLICE_S)
         while True:
             try:
-                return await asyncio.wait_for(asyncio.shield(future), timeout=slice_s)
+                return await bounded_wait(asyncio.shield(future), timeout=slice_s)
             except asyncio.TimeoutError:
                 if future.done():
                     return future.result()
@@ -3651,9 +4292,22 @@ class ClientManager:
             await managed.process.stdin.drain()
 
     async def disconnect_all(self) -> None:
-        """Disconnect from all servers."""
-        async with self._lifecycle_lock:
+        """Disconnect from all servers.
+
+        A cancel while waiting for the lifecycle lock -- another operation
+        holds it, and `GatewayServer.shutdown`'s budget runs out -- still
+        abandons every client synchronously before it propagates
+        (Consiliency/pmcp#324, implementation addition): the fallback inside
+        `_disconnect_all_unlocked` is only reached once the lock is held."""
+        try:
+            await self._lifecycle_lock.acquire()
+        except asyncio.CancelledError:
+            self.abandon_all_now()
+            raise
+        try:
             await self._disconnect_all_unlocked()
+        finally:
+            self._lifecycle_lock.release()
 
     async def _disconnect_all_unlocked(self) -> None:
         """Disconnect from all servers while caller owns the lifecycle boundary."""
@@ -3676,14 +4330,7 @@ class ClientManager:
                 managed.status.pending_request_count = 0
 
                 # Cancel read task
-                if managed.read_task:
-                    managed.read_task.cancel()
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.shield(managed.read_task), timeout=1.0
-                        )
-                    except (asyncio.TimeoutError, asyncio.CancelledError):
-                        pass
+                await _reap_child(managed.read_task, timeout=1.0)
 
                 # Close transport. _close_remote_transport itself never
                 # swallows a genuine transport-exit failure; the swallow
@@ -3694,7 +4341,16 @@ class ClientManager:
                 if managed.is_remote:
                     await self._close_remote_transport(name, managed)
                 else:
-                    await _terminate_process_tree(managed.process, name)
+                    await _terminate_process_tree(
+                        managed.process, name, group_pgid=managed.group_pgid
+                    )
+            except asyncio.CancelledError:
+                # disconnect_all was cancelled (e.g. the shutdown budget in
+                # server.py ran out): kill and abandon now, without awaiting,
+                # then re-raise; the gather re-raises it to disconnect_all's
+                # caller (Consiliency/pmcp#324).
+                self._abandon_client_io(name, managed)
+                raise
             except Exception as e:
                 logger.warning(
                     f"Error disconnecting from {name}: {describe_exception(e)}"
@@ -3702,57 +4358,80 @@ class ClientManager:
 
         # Reap servers concurrently: each _terminate_process_tree can cost up to
         # ~8s for a hung stdio server, and disconnect_all() runs under a bounded
-        # shutdown budget (server.py wraps it in wait_for). A sequential loop
+        # shutdown budget (server.py wraps it in bounded_wait). A sequential loop
         # would let two+ hung servers blow that budget and leave later groups
         # unsignalled — orphaning browsers (issue #79/1c) at shutdown. Concurrent
         # reaping makes total time ≈ the slowest single server.
         clients = list(self._clients.items())
-        if clients:
-            await asyncio.gather(
-                *(_shutdown_one(name, managed) for name, managed in clients),
-                return_exceptions=True,
-            )
-
         current = asyncio.current_task()
         exclude = {current} if current is not None else set()
-        await self._cancel_background_tasks(exclude=exclude)
-        self._connect_tasks.clear()
-        self._reconnect_tasks.clear()
-        self._reconcile_tasks.clear()
-        self._reconcile_reruns.clear()
-        self._catalog_suppressed.clear()
-        self._clients.clear()
-        # Capture non-empty immediately before each clear (not after — the
-        # clear must happen first for the dict to actually be empty
-        # afterward, but the check must be the pre-clear state) so a
-        # wholesale teardown still announces what it emptied. Without this,
-        # refresh([]) (disconnect-all + no reconnect) empties every catalog
-        # and publishes nothing — the listener-with-no-publishers failure
-        # this phase exists to prevent. Deliberately NOT routed through
-        # _remove_server_indexes: that method is per-server-name, this is a
-        # wholesale clear, and rewriting it as a loop over names would
-        # change shutdown semantics for no benefit.
-        had_tools = bool(self._tools)
-        had_resources = bool(self._resources)
-        had_prompts = bool(self._prompts)
-        self._tools.clear()
-        self._resources.clear()
-        self._prompts.clear()
-        self._tasks.clear()
-        self._servers.clear()
-        self._lazy_configs.clear()
-        if had_tools:
-            self._catalog_events.note_tools_changed()
-        if had_resources:
-            self._catalog_events.note_resources_changed()
-        if had_prompts:
-            self._catalog_events.note_prompts_changed()
+        try:
+            if clients:
+                await asyncio.gather(
+                    *(_shutdown_one(name, managed) for name, managed in clients),
+                    return_exceptions=True,
+                )
+            await self._cancel_background_tasks(exclude=exclude)
+        except asyncio.CancelledError:
+            # Parent-level fallback (Consiliency/pmcp#324): a cancel that lands
+            # before a `_shutdown_one` worker has run its first instruction
+            # never reaches that worker's own handler, so kill and abandon
+            # every client here, synchronously, whether or not its worker ran
+            # (repeating it for one that did is harmless), then drop the
+            # registries and re-raise.
+            for name, managed in clients:
+                self._abandon_client_io(name, managed)
+            self._cancel_background_tasks_now()
+            raise
+        finally:
+            # The registry clears are synchronous, so the cancelled path runs
+            # them too; they stay in this method, which the publisher-coverage
+            # AST guard (tests/runtime/test_publisher_coverage.py) requires.
+            #
+            # No client can be registered while this runs: every path that
+            # registers one -- the connect funnel and `adopt_process` -- holds
+            # the lifecycle lock, which this method's callers hold throughout
+            # (Consiliency/pmcp#324, rounds 5-6). So `clients` is all of them.
+            self._connect_tasks.clear()
+            self._reconnect_tasks.clear()
+            self._reconcile_tasks.clear()
+            self._reconcile_reruns.clear()
+            self._catalog_suppressed.clear()
+            self._clients.clear()
+            # Capture non-empty immediately before each clear (not after — the
+            # clear must happen first for the dict to actually be empty
+            # afterward, but the check must be the pre-clear state) so a
+            # wholesale teardown still announces what it emptied. Without this,
+            # refresh([]) (disconnect-all + no reconnect) empties every catalog
+            # and publishes nothing — the listener-with-no-publishers failure
+            # this phase exists to prevent. Deliberately NOT routed through
+            # _remove_server_indexes: that method is per-server-name, this is a
+            # wholesale clear, and rewriting it as a loop over names would
+            # change shutdown semantics for no benefit.
+            had_tools = bool(self._tools)
+            had_resources = bool(self._resources)
+            had_prompts = bool(self._prompts)
+            self._tools.clear()
+            self._resources.clear()
+            self._prompts.clear()
+            self._tasks.clear()
+            self._servers.clear()
+            self._lazy_configs.clear()
+            if had_tools:
+                self._catalog_events.note_tools_changed()
+            if had_resources:
+                self._catalog_events.note_resources_changed()
+            if had_prompts:
+                self._catalog_events.note_prompts_changed()
 
     async def _cleanup_client(self, name: str, managed: ManagedClient) -> None:
         """Cancel a client's read task, kill its process, and remove it from registries.
 
-        Safe to call on any managed client regardless of state. All exceptions are
-        suppressed so callers always complete successfully.
+        Safe to call on any managed client regardless of state. A remote close
+        failure is logged and suppressed; a terminate failure propagates after
+        the registries are cleared. A cancellation of the caller finishes the
+        teardown synchronously (`_abandon_client_io`) and then propagates
+        (Consiliency/pmcp#324).
 
         Cancels only *this* client's own read/stderr tasks — not every background
         task scoped to the server name. A reconnect runs its connect inside a task
@@ -3764,13 +4443,24 @@ class ClientManager:
         # `while True` writer is not a background-task sweep target on this path
         # (`_cleanup_client` deliberately does NOT call `_cancel_background_tasks`),
         # so without this it leaked one writer task per reconnect generation.
+        try:
+            await self._cleanup_client_io(name, managed)
+        except asyncio.CancelledError:
+            self._abandon_client_io(name, managed)
+            raise
+        finally:
+            self._forget_client(name)
+
+    def _forget_client(self, name: str) -> None:
+        self._clients.pop(name, None)
+        self._servers.pop(name, None)
+        self._remove_server_indexes(name)
+
+    async def _cleanup_client_io(self, name: str, managed: ManagedClient) -> None:
+        """`_cleanup_client`'s graceful teardown; a caller cancellation
+        propagates out of any await here."""
         for task in (managed.read_task, managed.stderr_task, managed.outbound_writer):
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await asyncio.shield(task)
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await _reap_child(task)
         # Reset the outbound path so nothing survives onto a next generation.
         # The writer was cancelled above, but the Queue -- and any reply /
         # notifications/cancelled frames the dead connection left buffered,
@@ -3803,10 +4493,9 @@ class ClientManager:
                     f"[{name}] Error closing remote transport: {describe_exception(e)}"
                 )
         else:
-            await _terminate_process_tree(managed.process, name)
-        self._clients.pop(name, None)
-        self._servers.pop(name, None)
-        self._remove_server_indexes(name)
+            await _terminate_process_tree(
+                managed.process, name, group_pgid=managed.group_pgid
+            )
 
     async def refresh(self, configs: list[ResolvedServerConfig]) -> list[str]:
         """Refresh connections (disconnect + reconnect)."""
@@ -3830,10 +4519,65 @@ class ClientManager:
             process: Running subprocess with stdin/stdout pipes
             config: Server configuration
 
+        Adoption registers a client, so it holds the lifecycle lock like
+        every other path that registers or tears one down: it waits for a
+        `disconnect_all`/`refresh`/`disconnect_server` in progress to finish,
+        and no teardown can be suspended while it registers
+        (Consiliency/pmcp#324, rounds 5-6).
+
+        A cancel while waiting for the lock kills the handed-over process
+        synchronously (`_kill_process_tree_now`, with the group read before
+        the wait: its group if it leads one, even after the leader exited,
+        else the leader only -- the installer does not start a new session)
+        and re-raises: nothing was registered, and the caller
+        (`_finalize_server_ready`) catches only `Exception`.
+
         Raises:
+            _ManagerAbandoned: If `abandon_all_now()` has run (the gateway is
+                shutting down); the process is left to the caller, which
+                kills it on any handoff failure (`_finalize_server_ready`)
             RuntimeError: If process is not running or missing pipes
             Exception: If MCP initialization fails
         """
+        self._refuse_adoption_if_abandoned(name)
+        # Read the group now, while the leader is alive (or an unreaped
+        # zombie): a leader that exits during the wait can then still have
+        # its descendants killed through the retained id (codex round 7).
+        group_pgid = _own_group_pgid(process)
+        try:
+            await self._lifecycle_lock.acquire()
+        except asyncio.CancelledError:
+            # The one synchronous kill path, with its safeguards: never
+            # signals a reaped leader's pid, checks a retained group for
+            # reuse, and never raises (so the cancel is what propagates).
+            _kill_process_tree_now(process, group_pgid=group_pgid)
+            raise
+        try:
+            await self._adopt_process_locked(name, process, config)
+        finally:
+            self._lifecycle_lock.release()
+
+    def _refuse_adoption_if_abandoned(self, name: str) -> None:
+        # Adoption registers a client without going through `_connect_server`,
+        # so it checks abandonment itself: nothing may register a client after
+        # `abandon_all_now()` (Consiliency/pmcp#324, codex round 2).
+        if self._abandoned:
+            raise _ManagerAbandoned(
+                f"Not adopting {name}: the client manager was abandoned"
+            )
+
+    async def _adopt_process_locked(
+        self,
+        name: str,
+        process: asyncio.subprocess.Process,
+        config: ResolvedServerConfig,
+    ) -> None:
+        """`adopt_process` with the lifecycle lock held."""
+        # Re-checked under the lock (abandonment may have run while this
+        # waited for it). No await between here and the registration below,
+        # so a client adopted before abandonment is in the set
+        # `abandon_all_now()` kills.
+        self._refuse_adoption_if_abandoned(name)
         # Validate process state
         if process.returncode is not None:
             raise RuntimeError(f"Process for {name} has already exited")
@@ -3876,6 +4620,10 @@ class ClientManager:
             config=config,
             process=process,
             status=status,
+            # Not spawned here, so there is no spawn contract: read the group
+            # now; `None` unless the process leads its own (it was validated
+            # as running above).
+            group_pgid=_own_group_pgid(process),
         )
         self._clients[name] = managed
 
@@ -3913,6 +4661,13 @@ class ClientManager:
 
             logger.info(f"Adopted {name}: {indexed} tools indexed")
 
+        except asyncio.CancelledError as e:
+            # As in `_connect_stdio` (Consiliency/pmcp#324).
+            status.status = ServerStatusEnum.ERROR
+            status.last_error = _handshake_error(e)
+            self._abandon_client_io(name, managed)
+            self._forget_client(name)
+            raise
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
             status.last_error = describe_exception(e)
@@ -3928,7 +4683,23 @@ class ClientManager:
         task: TaskMetadataInput | dict[str, Any] | None = None,
         trace_context: TraceContextInfo | dict[str, Any] | None = None,
     ) -> Any:
-        """Call a tool on a downstream server."""
+        """Call a tool on a downstream server; the reply only."""
+        reply = await self.call_tool_with_task(
+            tool_id, args, timeout_ms, task=task, trace_context=trace_context
+        )
+        return reply.result
+
+    async def call_tool_with_task(
+        self,
+        tool_id: str,
+        args: dict[str, Any],
+        timeout_ms: int = 30000,
+        *,
+        task: TaskMetadataInput | dict[str, Any] | None = None,
+        trace_context: TraceContextInfo | dict[str, Any] | None = None,
+    ) -> TaskReply:
+        """Call a tool on a downstream server: the reply, and the task record
+        built from it when a task was requested (rev 6)."""
         tool_info = self._tools.get(tool_id)
         if not tool_info:
             raise ValueError(f"Unknown tool: {tool_id}")
@@ -3982,33 +4753,135 @@ class ClientManager:
             tool_id=tool_id,
             timeout_ms=timeout_ms,
         )
+        built: McpTaskRecord | None = None
         if task_requested and isinstance(result, dict):
             task_payload = self._extract_task_payload(result)
             if task_payload is not None:
                 task_info = self._task_info_from_payload(task_payload)
                 if task_info is not None:
-                    self._record_task(
+                    built = self._record_task(
                         tool_info.server_name,
                         task_info,
                         tool_id=tool_id,
                         requestor_context=requestor_context,
+                        connection=managed,
                     )
 
-        return result
+        return TaskReply(result, built)
 
-    def _task_client(self, server_name: str) -> ManagedClient:
+    @contextmanager
+    def _pinned(self, keys: list[tuple[str, str]]) -> Iterator[None]:
+        """Pin `keys` in the registry for the duration of a request, and
+        release them however it ends -- reply, exception, cancellation or
+        timeout (rev 9). The only place pins are taken or released, and the
+        only place a custody's record is restored to the registry (rev 12)."""
+        with ExitStack() as release:
+            for key in keys:
+                self._tasks.pin(key)
+                # registered per key: every release runs even if one raises
+                # (round-9 N3), and a pin taken is released if a later one fails
+                release.callback(self._tasks.unpin, key)
+                # Rev 12 (round-11 codex F001): a key the cap moved into a
+                # running teardown's custody comes back into the registry,
+                # where this pin keeps it until the request ends -- however
+                # that teardown ends. Only a record of the server's current
+                # connection: another connection's is not this server's state.
+                if key not in self._tasks:
+                    held = self._tasks.held(key)
+                    if held is not None and self._on_current_connection(held):
+                        self._tasks.restore(held)
+            yield
+
+    @contextmanager
+    def _custody(self, records: list[McpTaskRecord]) -> Iterator[TaskCustody]:
+        """Register what a forced teardown owes for its whole run, and release
+        it however the teardown ends (rev 11). The only place `watch` and
+        `unwatch` are called.
+
+        Releasing does not itself discard a task that was not cancelled (rev
+        13, round-12 F001). An abort is not a discharge: a teardown can end before its
+        last `tasks/cancel` -- its caller cancelled, a downstream error, or a
+        forced disconnect of *another* server cancelling its in-flight
+        request. Each owed record the custody still holds that pmcp no longer
+        tracks otherwise (not in the registry, not owed by another running
+        teardown), that is unfinished, and that is on its server's current
+        connection, goes back into the registry: tracked and retriable again,
+        so a later forced teardown cancels it and a disconnect without
+        `force` refuses on it. Back in the registry it is an ordinary record,
+        under the caps like any other: returned oldest-owed first, each ranks
+        as the newest, so when the returned records and the server's own
+        exceed its cap, the cap evicts in its usual order (finished first,
+        then unfinished, each oldest first) whatever nothing pins: the
+        server's older tasks before the returned ones, and the oldest
+        returned ones if they still exceed it (round-13 N1). That
+        priority is intended: a task pmcp owed a cancel outranks newer tasks
+        it never owed (round-13 N2)."""
+        custody = self._tasks.watch(records)
+        try:
+            yield custody
+        finally:
+            self._tasks.unwatch(custody)
+            leftovers = sorted(
+                (
+                    record
+                    for key, record in custody.items()
+                    if key not in self._tasks
+                    and self._tasks.held(key) is None
+                    and not self._terminal_task(record)
+                    and self._on_current_connection(record)
+                ),
+                key=lambda record: record._recorded_order,
+            )
+            for record in leftovers:
+                self._tasks.restore(record)
+
+    def _owns(self, server_name: str, connection: ManagedClient) -> bool:
+        """Whether `connection` is still `server_name`'s connection. An identity
+        check against a connection a request captured, never a resolution by
+        name: the one way a request may look at `_clients` after its first
+        await (rev 7, structurally pinned)."""
+        return self._clients.get(server_name) is connection
+
+    def _task_client_unavailable(
+        self, server_name: str, *, bound_to: McpTaskRecord | None
+    ) -> str | None:
+        """Why no task request can be sent to `server_name` right now, or None
+        when one can. `_task_client` raises it; a forced teardown skips.
+
+        `bound_to` is the stored record the request is derived from, or None
+        for a request that uses no stored task state (rev 5). A record from a
+        previous connection of the server is refused: its task id and context
+        belong to that connection, and the replacement may be another URL or
+        tenant, where the same id can name an unrelated task."""
         managed = self._clients.get(server_name)
         if (
             not managed
             or (not managed.is_remote and managed.process is None)
             or (managed.is_remote and managed.write_stream is None)
         ):
-            raise RuntimeError(f"Server {server_name} is not connected")
+            return f"Server {server_name} is not connected"
         if not self._server_supports_tasks(managed):
-            raise RuntimeError(
-                f"Server {server_name} does not advertise MCP task support"
+            return f"Server {server_name} does not advertise MCP task support"
+        if (
+            bound_to is not None
+            and bound_to._connection_id is not None
+            and bound_to._connection_id != managed.connection_id
+        ):
+            return (
+                f"Server {server_name} was reconnected; this task belongs to "
+                "its previous connection"
             )
-        return managed
+        return None
+
+    def _task_client(
+        self, server_name: str, *, bound_to: McpTaskRecord | None
+    ) -> ManagedClient:
+        """The connection to send a task request on: the one funnel every
+        `tasks/*` send goes through (rev 5, structurally pinned)."""
+        reason = self._task_client_unavailable(server_name, bound_to=bound_to)
+        if reason is not None:
+            raise RuntimeError(reason)
+        return self._clients[server_name]
 
     async def list_tasks(
         self,
@@ -4022,7 +4895,9 @@ class ClientManager:
         all_tasks: list[dict[str, Any]] = []
         next_cursor: str | None = None
         for name in servers:
-            managed = self._task_client(name)
+            # bound to nothing: a listing is the caller's query, built from no
+            # stored task state
+            managed = self._task_client(name, bound_to=None)
             params = self._task_request_params(
                 cursor=cursor,
                 requestor_context=requestor_context,
@@ -4034,11 +4909,21 @@ class ClientManager:
                 task_info = self._task_info_from_payload(payload)
                 if task_info is None:
                     continue
-                record = self._record_task(name, task_info)
+                # None: a listing does not say which context a task belongs
+                # to (the caller's listing context scopes the query, not the
+                # task). A task pmcp tracks keeps its own via the merge; one it
+                # had evicted had already lost it (the stated residual).
+                record = self._record_task(
+                    name,
+                    task_info,
+                    requestor_context=None,
+                    connection=managed,
+                )
                 all_tasks.append(record.model_dump())
             next_cursor = result.get("nextCursor") or result.get("next_cursor")
         return {"tasks": all_tasks, "nextCursor": next_cursor}
 
+    @_pins_task
     async def get_task(
         self,
         server_name: str,
@@ -4047,22 +4932,45 @@ class ClientManager:
         requestor_context: dict[str, Any] | None = None,
     ) -> McpTaskInfo:
         """Proxy downstream tasks/get and update the transient task registry."""
-        managed = self._task_client(server_name)
         record = self.get_task_record(server_name, task_id)
+        # The one resolution of this request's connection (rev 7).
+        managed = self._task_client(server_name, bound_to=record)
+        return await self._fetch_task(
+            server_name,
+            task_id,
+            sent_context=requestor_context
+            or (record.requestor_context if record is not None else None),
+            connection=managed,
+        )
+
+    async def _fetch_task(
+        self,
+        server_name: str,
+        task_id: str,
+        *,
+        sent_context: dict[str, Any] | None,
+        connection: ManagedClient,
+    ) -> McpTaskRecord:
+        """Send `tasks/get` with `sent_context` on `connection`, the connection
+        the calling request resolved once at its entry (rev 7), and record the
+        reply. It resolves nothing by server name; the caller has pinned the
+        task's record (rev 9)."""
+        managed = connection
         result = await self._send_request(
             managed,
             "tasks/get",
-            self._task_request_params(
-                task_id=task_id,
-                requestor_context=requestor_context
-                or (record.requestor_context if record is not None else None),
-            ),
+            self._task_request_params(task_id=task_id, requestor_context=sent_context),
         )
         payload = self._extract_task_payload(result) or result
         task_info = self._task_info_from_payload(payload)
         if task_info is None:
             raise KeyError(f"Task not found: {server_name}::{task_id}")
-        return self._record_task(server_name, task_info)
+        return self._record_task(
+            server_name,
+            task_info,
+            requestor_context=None,  # a reply supplies no context
+            connection=managed,
+        )
 
     async def get_task_result(
         self,
@@ -4071,32 +4979,62 @@ class ClientManager:
         *,
         requestor_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Proxy downstream tasks/result and update task metadata when returned."""
-        managed = self._task_client(server_name)
+        """Proxy downstream tasks/result; the reply only."""
+        reply = await self.get_task_result_with_task(
+            server_name, task_id, requestor_context=requestor_context
+        )
+        result: dict[str, Any] = reply.result
+        return result
+
+    @_pins_task
+    async def get_task_result_with_task(
+        self,
+        server_name: str,
+        task_id: str,
+        *,
+        requestor_context: dict[str, Any] | None = None,
+    ) -> TaskReply:
+        """Proxy downstream tasks/result: the reply, and the record of
+        `task_id` built from it, or from the `tasks/get` fallback (rev 6)."""
         record = self.get_task_record(server_name, task_id)
+        managed = self._task_client(server_name, bound_to=record)
+        context = requestor_context or (
+            record.requestor_context if record is not None else None
+        )
         result = await self._send_request(
             managed,
             "tasks/result",
-            self._task_request_params(
-                task_id=task_id,
-                requestor_context=requestor_context
-                or (record.requestor_context if record is not None else None),
-            ),
+            self._task_request_params(task_id=task_id, requestor_context=context),
         )
+        built: McpTaskRecord | None = None
         task_payload = self._extract_task_payload(result)
         if task_payload is not None:
             task_info = self._task_info_from_payload(task_payload)
             if task_info is not None:
-                self._record_task(server_name, task_info)
-        else:
-            await self.get_task(
+                built = self._record_task(
+                    server_name,
+                    task_info,
+                    requestor_context=None,  # a reply supplies no context
+                    connection=managed,
+                )
+        elif self._owns(server_name, managed):
+            # The fallback continues this request on the connection it started
+            # on, never one resolved again by name (rev 7). If that connection
+            # was replaced during `tasks/result`, there is nothing to continue
+            # on: the result is returned without a task record.
+            built = await self._fetch_task(
                 server_name,
                 task_id,
-                requestor_context=requestor_context
-                or (record.requestor_context if record is not None else None),
+                sent_context=context,
+                connection=managed,
             )
-        return result
+        # A reply about a different task is recorded, but it is not this
+        # task's record.
+        if built is not None and built.task_id != task_id:
+            built = None
+        return TaskReply(result, built)
 
+    @_pins_task
     async def cancel_task(
         self,
         server_name: str,
@@ -4111,11 +5049,31 @@ class ClientManager:
             return (True, record, f"Task is already terminal: {record.status}")
         if record is None:
             return (False, None, f"Task not found: {server_name}::{task_id}")
-
-        managed = self._task_client(server_name)
-        params = self._task_request_params(
-            task_id=task_id,
+        cancelled = await self._send_task_cancel(
+            server_name,
+            task_id,
+            force=force,
             requestor_context=requestor_context or record.requestor_context,
+            bound_to=record,
+        )
+        return (True, cancelled, "Task cancelled")
+
+    async def _send_task_cancel(
+        self,
+        server_name: str,
+        task_id: str,
+        *,
+        force: bool,
+        requestor_context: dict[str, Any] | None,
+        bound_to: McpTaskRecord,
+    ) -> McpTaskRecord:
+        """Send `tasks/cancel` with `requestor_context` and record the reply:
+        the one sender, for `cancel_task` and the forced teardowns
+        (Consiliency/pmcp#338). Sent only on the connection `bound_to` came
+        from (rev 5); the caller has pinned the task's key (rev 9)."""
+        managed = self._task_client(server_name, bound_to=bound_to)
+        params = self._task_request_params(
+            task_id=task_id, requestor_context=requestor_context
         )
         params["force"] = force
         result = await self._send_request(managed, "tasks/cancel", params)
@@ -4128,7 +5086,12 @@ class ClientManager:
                 updated_at=time.time(),
                 raw=result,
             )
-        return (True, self._record_task(server_name, task_info), "Task cancelled")
+        return self._record_task(
+            server_name,
+            task_info,
+            requestor_context=None,  # a reply supplies no context
+            connection=managed,
+        )
 
     async def read_resource(self, resource_id: str, timeout_ms: int = 30000) -> Any:
         """Read a resource from a downstream server."""

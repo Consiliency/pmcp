@@ -46,7 +46,11 @@ class TestGatewayServerInit:
     def test_creates_with_defaults(self) -> None:
         """Test server creates with default values."""
         server = GatewayServer()
-        assert server._project_root is None
+        # Bound at construction (Consiliency/pmcp#372 round 16): with nothing
+        # named or served, the project found from the working directory now.
+        from pmcp.env_store import resolve_project_root
+
+        assert server._project_root == resolve_project_root(None)
         assert server._custom_config_path is None
         assert server._server is None
 

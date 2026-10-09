@@ -35,6 +35,7 @@ import pytest
 
 from pmcp.config.loader import (
     _manifest_server_to_config,
+    _credential_value_for,
     _merge_manifest_defaults,
     build_startup_observation_snapshot,
     find_project_root,
@@ -93,7 +94,9 @@ class TestConfiguredEntryCredentialInheritance:
         monkeypatch.setenv("BRIGHTDATA_API_TOKEN", "bd-secret")
         config = LocalMcpServerConfig(command="npx", args=["-y", "@brightdata/mcp"])
 
-        merged = _merge_manifest_defaults("brightdata", config, self._manifest())
+        merged = _merge_manifest_defaults(
+            "brightdata", config, self._manifest(), _credential_value_for(None)
+        )
 
         assert merged is not None
         assert merged.env == {"API_TOKEN": "bd-secret"}
@@ -105,7 +108,9 @@ class TestConfiguredEntryCredentialInheritance:
         monkeypatch.setenv("API_TOKEN", "legacy-secret")
         config = LocalMcpServerConfig(command="npx", args=["-y", "@brightdata/mcp"])
 
-        merged = _merge_manifest_defaults("brightdata", config, self._manifest())
+        merged = _merge_manifest_defaults(
+            "brightdata", config, self._manifest(), _credential_value_for(None)
+        )
 
         assert merged is not None
         assert merged.env == {"API_TOKEN": "legacy-secret"}
@@ -120,7 +125,9 @@ class TestConfiguredEntryCredentialInheritance:
             env={"API_TOKEN": "user-set"},
         )
 
-        merged = _merge_manifest_defaults("brightdata", config, self._manifest())
+        merged = _merge_manifest_defaults(
+            "brightdata", config, self._manifest(), _credential_value_for(None)
+        )
 
         assert merged is not None
         assert merged.env == {"API_TOKEN": "user-set"}
@@ -140,6 +147,7 @@ class TestConfiguredEntryCredentialInheritance:
             "brightdata",
             config,
             self._manifest(extra_env={"BASE_URL": "http://self-hosted.internal"}),
+            _credential_value_for(None),
         )
 
         assert merged is not None
@@ -163,6 +171,7 @@ class TestConfiguredEntryCredentialInheritance:
             "brightdata",
             config,
             self._manifest(extra_env={"BASE_URL": "http://self-hosted.internal"}),
+            _credential_value_for(None),
         )
 
         assert merged is not None
@@ -175,7 +184,9 @@ class TestConfiguredEntryCredentialInheritance:
         monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
         config = LocalMcpServerConfig(command="npx", args=["-y", "@brightdata/mcp"])
 
-        merged = _merge_manifest_defaults("brightdata", config, self._manifest())
+        merged = _merge_manifest_defaults(
+            "brightdata", config, self._manifest(), _credential_value_for(None)
+        )
 
         assert merged is not None
         assert not (merged.env or {}).get("API_TOKEN")
@@ -195,7 +206,9 @@ class TestConfiguredEntryCredentialInheritance:
             env={"API_TOKEN": "${API_TOKEN}"},
         )
 
-        merged = _merge_manifest_defaults("brightdata", config, self._manifest())
+        merged = _merge_manifest_defaults(
+            "brightdata", config, self._manifest(), _credential_value_for(None)
+        )
 
         assert merged is not None
         assert merged.env == {"API_TOKEN": "bd-secret"}
@@ -214,7 +227,9 @@ class TestConfiguredEntryCredentialInheritance:
             env={"API_TOKEN": "$API_TOKEN"},
         )
 
-        merged = _merge_manifest_defaults("brightdata", config, self._manifest())
+        merged = _merge_manifest_defaults(
+            "brightdata", config, self._manifest(), _credential_value_for(None)
+        )
 
         assert merged is not None
         assert merged.env == {"API_TOKEN": "bd-secret"}

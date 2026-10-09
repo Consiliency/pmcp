@@ -14,21 +14,16 @@ from pmcp.auth import (
 from pmcp.remote_auth import build_remote_header_env_lookup, resolve_remote_headers
 
 
-def _read_user_pmcp_env() -> dict[str, str]:
-    """Read user-scope PMCP env context from ~/.config/pmcp/pmcp.env."""
-    path = Path.home() / ".config" / "pmcp" / "pmcp.env"
-    if not path.exists():
-        return {}
-
-    from pmcp.env_store import read_env_file
-
-    return read_env_file(path)
-
-
 def collect_remote_header_diagnostics(
     config_data: dict | None,
+    project_root: Path | None = None,
 ) -> list[tuple[str, str, str]]:
-    """Validate remote server URL/header interpolation in local config."""
+    """Validate remote server URL/header interpolation in local config.
+
+    ``project_root`` is the project whose ``.mcp.json`` this is (``pmcp doctor
+    --project``); its headers are judged against that project's credentials,
+    never the launch directory's (Consiliency/pmcp#372 round 9, grok F001).
+    """
     checks: list[tuple[str, str, str]] = []
 
     if not isinstance(config_data, dict):
@@ -38,7 +33,7 @@ def collect_remote_header_diagnostics(
     if not isinstance(servers, dict):
         return checks
 
-    env_lookup = build_remote_header_env_lookup()
+    env_lookup = build_remote_header_env_lookup(project_root)
 
     for server_name, server_cfg in servers.items():
         if not isinstance(server_cfg, dict):

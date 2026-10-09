@@ -33,7 +33,6 @@ import contextlib
 import json
 import logging
 import os
-import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,7 +40,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 
-from pmcp.trust_store import TrustStoreError, trust_store_path
+from pmcp import atomic_write as _atomic_write_module
+from pmcp.atomic_write import (
+    atomic_write,
+    falls_back_to_pathname,
+    is_absent,
+    make_store_dirs,
+    open_final_directory,
+    resolve_write_target,
+)
+from pmcp.trust_store import (
+    TrustStoreError,
+    refuse_checkout_resident,
+    trust_store_path,
+)
 from pmcp.validation import (
     is_valid_package_name,
     is_valid_package_version,
@@ -87,9 +99,51 @@ class PackageApproval:
     recorded_at: datetime
 
 
-def package_approvals_path() -> Path:
-    """Where the store lives. Raises ``TrustStoreError`` if checkout-resident."""
-    return trust_store_path().parent / PACKAGE_APPROVALS_FILENAME
+def package_approvals_path(*, project_root: Path | None = None) -> Path:
+    """Where the store lives. Raises ``TrustStoreError`` if checkout-resident.
+
+    The directory is the trust store's, whose residency ``trust_store_path``
+    checks. Writes follow a symlinked store's final link chain
+    (``pmcp.atomic_write``), and reads always did, so where that chain lands is
+    checked too -- found by the writer's own chain follower, judged by file
+    identity -- or a ``package_approvals.json`` linked into a judged checkout
+    would be a checkout-resident store reached through its final component.
+    """
+    # Residency is judged against the reader's bound project too
+    # (Consiliency/pmcp#372 round 17), never the working directory alone.
+    also = (Path(project_root),) if project_root is not None else ()
+    path = trust_store_path(also=also).parent / PACKAGE_APPROVALS_FILENAME
+    try:
+        if is_absent(path.parent):
+            # A fresh install: no store, no link to follow. Judge where it will
+            # be created (the residency walk steps up across plain names).
+            fd, target = None, os.fspath(path)
+        else:
+            fd = None
+            if _atomic_write_module._DIR_FD_SUPPORTED:
+                # The directory the writer will actually write in, reached hop
+                # by hop (no pathname grows), judged by identity from its
+                # descriptor -- unless the shared rule says to go by pathname
+                # (no O_PATH and a directory that may be searched, not listed).
+                try:
+                    fd, _name = open_final_directory(path)
+                except OSError as exc:
+                    if not falls_back_to_pathname(exc):
+                        raise
+            if fd is None:
+                target = resolve_write_target(path)
+    except OSError as exc:
+        raise TrustStoreError(
+            f"Cannot resolve {path.name}: {os.strerror(exc.errno) if exc.errno else exc}"
+        ) from exc
+    try:
+        refuse_checkout_resident(
+            target if fd is None else path, "Package approvals", dir_fd=fd, also=also
+        )
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return path
 
 
 def _require_identity_fields(registry: Any, name: Any, version: Any) -> None:
@@ -164,7 +218,7 @@ def _read_store_and_stale(
     path: Path,
 ) -> tuple[list[PackageApproval], list[tuple[str, str]]]:
     """``_read_store``, plus the ``(name, version)`` of each stale record left out."""
-    if not path.exists():
+    if is_absent(path):  # only ENOENT/ENOTDIR; ELOOP, EACCES ... are raised
         return [], []
     try:
         raw = path.read_text(encoding="utf-8")
@@ -240,18 +294,14 @@ def _ensure_store_dir(parent: Path) -> None:
     which another account in the group can plant a forged store. A directory
     that already exists is never tightened -- it is the operator's.
     """
-    missing: list[Path] = []
-    probe = parent
-    while not probe.exists():
-        missing.append(probe)
-        if probe.parent == probe:
-            break
-        probe = probe.parent
-    for component in reversed(missing):
-        component.mkdir(mode=0o700, exist_ok=True)
+    # Walked as the kernel would; only the plain tail of directories that do
+    # not exist yet is created, each at 0o700 (restrictive AT CREATION),
+    # relative to the last directory the walk reached. Never treated as absent
+    # and created when the path cannot be resolved for another reason.
+    for created in make_store_dirs(parent):
         with contextlib.suppress(OSError):
             # Only for a umask that stripped owner bits; never loosens.
-            os.chmod(component, 0o700)
+            os.chmod(created, 0o700)
 
 
 def _write_store(path: Path, records: list[PackageApproval]) -> None:
@@ -273,36 +323,46 @@ def _write_store(path: Path, records: list[PackageApproval]) -> None:
     parent = path.parent
     _ensure_store_dir(parent)
 
-    fd, tmp_name = tempfile.mkstemp(
-        dir=parent, prefix=".package-approvals-", suffix=".tmp"
+    # Atomic, mode 0600, through a symlinked store rather than over it, with the
+    # directory fsync-ed best effort: a crash after a revoke must not resurrect
+    # the withdrawn approval, but a platform that cannot fsync a directory must
+    # not turn a completed write into an error (pmcp.atomic_write).
+    text = json.dumps(payload, indent=2) + "\n"
+    # confine_to=None: beside the trust store, resolved and refused if
+    # checkout-resident by package_approvals_path().
+    atomic_write(
+        path,
+        text.encode("utf-8"),
+        confine_to=None,
+        mode=0o600,
+        prefix=".package-approvals-",
     )
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as store_file:
-            json.dump(payload, store_file, indent=2)
-            store_file.write("\n")
-            store_file.flush()
-            os.fsync(store_file.fileno())
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
 
-    # Make the rename durable, best effort. A crash after a revoke must not
-    # resurrect the withdrawn approval -- but the replace has already landed, so
-    # a platform that cannot fsync a directory (macOS EINVAL, some network and
-    # overlay mounts, Windows) must not turn a completed write into an error.
-    try:
-        dir_fd = os.open(parent, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
-    finally:
-        os.close(dir_fd)
+
+def _open_sidecar_lock(path: Path) -> int:
+    """The store's ``.lock`` sidecar: opened, or created only if absent and
+    exclusively, never through a link (Consiliency/pmcp#372 round 34: an
+    ``O_RDWR|O_CREAT`` open followed a planted link and created its target)."""
+    from pmcp.atomic_write import PlainFileRefused, open_plain_file
+
+    flags = (
+        os.O_RDWR
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    for _attempt in range(5):
+        try:
+            return open_plain_file(
+                path.name + ".lock", parent=str(path.parent), dir_fd=None, flags=flags
+            )
+        except FileExistsError:
+            continue  # lost a creation race: open what is there now
+        except PlainFileRefused as exc:
+            raise TrustStoreError(
+                f"{path.name}.lock is not a plain regular file; refusing it"
+            ) from exc
+    raise TrustStoreError(f"{path.name}.lock kept changing; refusing it")
 
 
 @contextlib.contextmanager
@@ -319,7 +379,7 @@ def _store_lock(path: Path) -> Iterator[None]:
     except ImportError:  # pragma: no cover - non-POSIX
         yield
         return
-    fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fd = _open_sidecar_lock(path)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
@@ -364,7 +424,9 @@ def approve_package(identity: PackageIdentity) -> PackageApproval:
     return entry
 
 
-def is_package_approved(identity: PackageIdentity) -> bool:
+def is_package_approved(
+    identity: PackageIdentity, *, project_root: Path | None = None
+) -> bool:
     """Has an operator approved exactly this identity?
 
     ``True`` only for an ``"approved"`` record with the same registry, name and
@@ -379,7 +441,7 @@ def is_package_approved(identity: PackageIdentity) -> bool:
     """
     try:
         target = _key(identity.registry, identity.name, identity.resolved_version)
-        for rec in _read_store(package_approvals_path()):
+        for rec in _read_store(package_approvals_path(project_root=project_root)):
             if _key(rec.registry, rec.name, rec.resolved_version) != target:
                 continue
             if rec.decision != APPROVED:

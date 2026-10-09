@@ -564,17 +564,22 @@ async def test_a_missing_store_still_allows_an_operator_exported_token(
 async def test_a_dangling_symlink_store_reads_as_absent_not_as_unreadable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """F2, the boundary the `exists()` check has to land on the right side of.
+    """F2, the boundary the absence check has to land on the right side of.
 
-    A symlink whose target is gone is a store that is **not there**, and `Path.exists()`
-    follows the link and says so. Ordering the check as "absent first, then not a
-    regular file" is what keeps this an allow; `is_file()` alone is false for both a
-    dangling symlink and a directory and would refuse this legitimate operator.
+    For the operator's USER store a symlink whose target is gone is a store that
+    is **not there** -- a dotfiles link on a fresh machine -- and must stay an
+    allow. A PROJECT store that is a symlink of any kind is refused since
+    Consiliency/pmcp#366 round 9 (Consiliency/pmcp#367 reads it the same way),
+    so the strict gate fails closed on it: covered by
+    tests/test_store_readers_confined.py.
     """
     monkeypatch.setenv(_TOKEN_VAR, _EXPORTED_TOKEN)
+    home = tmp_path / "home"
+    (home / ".config" / "pmcp").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    (home / ".config" / "pmcp" / "pmcp.env").symlink_to(home / "absent-target")
     project = tmp_path / "project"
     project.mkdir()
-    (project / ".env.pmcp").symlink_to(project / "absent-target")
 
     def _open(request: Any, *args: Any, **kwargs: Any) -> Any:
         return _Response(201, _created_body(number=6))

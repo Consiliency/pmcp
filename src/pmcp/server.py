@@ -37,10 +37,11 @@ from mcp.types import (
     Tool,
 )
 
+from pmcp.env_store import bind_project_root, credential_value
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
 from pmcp.config.loader import (
-    StartupSkipReason,
+    startup_skip_message,
     build_startup_observation_snapshot,
     is_legacy_manifest_auto_start_enabled,
     load_configs,
@@ -70,7 +71,7 @@ from pmcp.scoped_advisor_audit import (
 from pmcp.subscriptions import BusCatalogEventSink
 from pmcp.summary import generate_capability_summary
 from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
-from pmcp.tools.schema import GATE_VALIDATOR
+from pmcp.tools.schema import validate_at_gate
 from pmcp.types import (
     DescriptionsCache,
     GatewayDiagnosticsInfo,
@@ -78,6 +79,7 @@ from pmcp.types import (
     LocalMcpServerConfig,
     ResolvedServerConfig,
 )
+from pmcp.waits import bounded_wait
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +99,18 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
         return max(minimum, int(raw))
     except ValueError:
         return default
+
+
+def _manifest_for(project_root: Path | None) -> Any:
+    """``load_manifest`` for ``project_root``; ``None`` is the served project.
+
+    The project overlay follows the same root as the credentials
+    (Consiliency/pmcp#372 round 12). With no project the call stays
+    ``load_manifest()``, which reads the served project's overlay.
+    """
+    if project_root is None:
+        return load_manifest()
+    return load_manifest(project_root=project_root)
 
 
 class GatewayServer:
@@ -124,7 +138,13 @@ class GatewayServer:
         required_scopes: list[str] | None = None,
         allowed_origins: list[str] | None = None,
     ) -> None:
-        self._project_root = project_root
+        # The project this object serves, BOUND at construction: the explicit
+        # root, else the served one, else the one discovered from the working
+        # directory NOW. Everything it loads (configs, endpoints) and every
+        # credential it looks up use this one root, so a later chdir cannot
+        # pair this project's endpoint with another project's credential
+        # (Consiliency/pmcp#372 round 16, board round 15 claude F001).
+        self._project_root: Path = bind_project_root(project_root)
         self._custom_config_path = custom_config_path
         self._cache_dir = cache_dir or Path(".mcp-gateway")
         self._descriptions_cache_path = get_cache_path(self._cache_dir)
@@ -144,7 +164,9 @@ class GatewayServer:
         self._lock_dir: Path | None = Path(lock_dir) if lock_dir else None
 
         # Initialize policy manager
-        self._policy_manager = PolicyManager(policy_path)
+        self._policy_manager = PolicyManager(
+            policy_path, project_root=self._project_root
+        )
         self._scoped_advisor_audit: ScopedAdvisorAudit | None = None
         self._audit_jsonl = Path(audit_jsonl) if audit_jsonl is not None else None
         if audit_jsonl is not None:
@@ -176,7 +198,7 @@ class GatewayServer:
         self._client_manager = ClientManager(
             max_tools_per_server=self._policy_manager.get_max_tools_per_server(),
             max_concurrent_spawns=self._max_concurrent_spawns,
-            project_root=project_root,
+            project_root=self._project_root,
             catalog_events=self._catalog_events,
         )
 
@@ -184,7 +206,7 @@ class GatewayServer:
         self._gateway_tools = GatewayTools(
             client_manager=self._client_manager,
             policy_manager=self._policy_manager,
-            project_root=project_root,
+            project_root=self._project_root,
             custom_config_path=custom_config_path,
             guidance_config=self._guidance_config,
             descriptions_cache_path=self._descriptions_cache_path,
@@ -311,9 +333,7 @@ class GatewayServer:
         audited_arguments: dict[str, Any] | None = None
         if tool is not None and allowed:
             try:
-                jsonschema.validate(
-                    instance=arguments, schema=tool.input_schema, cls=GATE_VALIDATOR
-                )
+                validate_at_gate(arguments, tool.input_schema)
             except jsonschema.ValidationError as e:
                 try:
                     if self._scoped_advisor_audit is not None:
@@ -733,10 +753,13 @@ class GatewayServer:
         manifest = None
         manifest_servers = {}
         try:
-            manifest = load_manifest()
+            manifest = _manifest_for(self._project_root)
             manifest_servers = manifest.servers
         except Exception as e:
-            logger.warning(f"Failed to load manifest startup configs: {e}")
+            # Class only: an error's text can quote overlay input (Consiliency/pmcp#342).
+            logger.warning(
+                f"Failed to load manifest startup configs: {type(e).__name__}"
+            )
 
         enabled_auto_start = load_enabled_auto_start(
             project_root=self._project_root,
@@ -753,8 +776,11 @@ class GatewayServer:
             enabled_auto_start=enabled_auto_start,
             disabled_auto_start=disabled_auto_start,
             is_server_allowed=self._policy_manager.is_server_allowed,
-            is_auth_available=lambda env_var: bool(os.environ.get(env_var)),
+            is_auth_available=lambda env_var: bool(
+                credential_value(env_var, root=self._project_root)
+            ),
             legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
+            project_root=self._project_root,
         )
         self._gateway_tools.set_startup_observations(
             build_startup_observation_snapshot(resolution)
@@ -769,21 +795,7 @@ class GatewayServer:
             f"unknown_auto_start={counts['unknown_auto_start']}"
         )
         for skipped in resolution.skipped:
-            if skipped.reason == StartupSkipReason.MISSING_AUTH:
-                logger.info(
-                    f"Skipping startup entry '{skipped.name}' from {skipped.source}: "
-                    f"missing_auth; set {skipped.env_var} to enable eager startup"
-                )
-            elif skipped.reason == StartupSkipReason.UNKNOWN_AUTO_START:
-                logger.info(
-                    f"Skipping startup entry '{skipped.name}' from {skipped.source}: "
-                    "unknown_auto_start; add a matching mcpServers entry or remove it from autoStart"
-                )
-            else:
-                logger.info(
-                    f"Skipping startup entry '{skipped.name}' from {skipped.source}: "
-                    f"{skipped.reason.value}"
-                )
+            logger.info(startup_skip_message("startup", skipped))
 
         # Kill any orphan processes from a previous PMCP crash before registering servers
         self._kill_orphan_processes(resolution.lazy_configs + resolution.eager_configs)
@@ -1017,9 +1029,20 @@ class GatewayServer:
         # deterministically in-process instead (test_listen_registration.py).
         self._listen_handler.close()
         try:
-            await asyncio.wait_for(self._client_manager.disconnect_all(), timeout=10.0)
+            await bounded_wait(self._client_manager.disconnect_all(), timeout=10.0)
+        except asyncio.CancelledError:
+            # `disconnect_all` runs in its own task, which loop shutdown can
+            # cancel before its first instruction -- then neither its
+            # handlers nor its fallback run. Kill and abandon here,
+            # synchronously, and re-raise (Consiliency/pmcp#324, codex round 6).
+            self._client_manager.abandon_all_now()
+            raise
         except asyncio.TimeoutError:
+            # The budget ran out (e.g. another operation held the lifecycle
+            # lock): finish synchronously rather than only log, as on a
+            # cancel (Consiliency/pmcp#324, implementation addition).
             logger.warning("Shutdown timed out, forcing disconnect")
+            self._client_manager.abandon_all_now()
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
         finally:

@@ -249,11 +249,36 @@ class TestSetupLogging:
 class TestMain:
     """Tests for main entry point."""
 
-    def test_main_loads_dotenv(self) -> None:
-        """Test that main loads .env file."""
+    def test_main_loads_dotenv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test that main loads .env file.
+
+        Run from a directory holding a regular ``.env.pmcp``: the project store is
+        loaded only when present, through the confined reader, as a stream
+        (Consiliency/pmcp#366 round 4).
+        """
         from pmcp.cli import main
 
-        with patch("pmcp.cli.load_dotenv") as mock_dotenv:
+        (tmp_path / ".env.pmcp").write_text("R4_MAIN_PROBE=1\n", encoding="utf-8")
+        # The user store, too, is read through the one store reader and loaded
+        # as a stream only when present (Consiliency/pmcp#367).
+        home = tmp_path / "home"
+        (home / ".config" / "pmcp").mkdir(parents=True)
+        (home / ".config" / "pmcp" / "pmcp.env").write_text(
+            "R4_MAIN_USER_PROBE=1\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.chdir(tmp_path)
+        # The discovered `.env` is read through the store reader as well, and
+        # only when one is found (Consiliency/pmcp#367 board round 1, F001).
+        (tmp_path / ".env").write_text("R4_MAIN_ENV_PROBE=1\n", encoding="utf-8")
+        monkeypatch.setattr("pmcp.cli.find_dotenv", lambda: str(tmp_path / ".env"))
+
+        with (
+            patch("pmcp.cli.load_store") as mock_load,
+            patch("pmcp.cli.load_discovered_dotenv") as mock_discovered,
+        ):
             with patch("pmcp.cli.parse_args") as mock_parse:
                 mock_parse.return_value = argparse.Namespace(
                     command=None,
@@ -270,14 +295,23 @@ class TestMain:
 
                     main()
 
-            # main() loads .env, then two pmcp env stores — 3 calls total
-            assert mock_dotenv.call_count == 3
+            # main() loads the discovered .env, then the two pmcp env stores,
+            # each through the one store loader with its scope: the checkout
+            # files as "project" (confined), the user store as "user"; the
+            # discovered .env is classified by where it is.
+            mock_discovered.assert_called_once_with(tmp_path / ".env")
+            assert [
+                (c.args, c.kwargs.get("path")) for c in mock_load.call_args_list
+            ] == [
+                (("user",), None),
+                (("project",), tmp_path / ".env.pmcp"),
+            ]
 
     def test_main_handles_keyboard_interrupt(self) -> None:
         """Test that main handles KeyboardInterrupt gracefully."""
         from pmcp.cli import main
 
-        with patch("pmcp.cli.load_dotenv"):
+        with patch("pmcp.cli.load_store"), patch("pmcp.cli.load_discovered_dotenv"):
             with patch("pmcp.cli.parse_args") as mock_parse:
                 mock_parse.return_value = argparse.Namespace(
                     command=None,
@@ -299,7 +333,7 @@ class TestMain:
         """Test that main exits with code 1 on error."""
         from pmcp.cli import main
 
-        with patch("pmcp.cli.load_dotenv"):
+        with patch("pmcp.cli.load_store"), patch("pmcp.cli.load_discovered_dotenv"):
             with patch("pmcp.cli.parse_args") as mock_parse:
                 mock_parse.return_value = argparse.Namespace(
                     command=None,
@@ -545,7 +579,7 @@ class TestRunStatus:
                     "startup_policy": "skipped",
                     "startup_source": "manifest",
                     "startup_skip_reason": "missing_auth",
-                    "startup_env_var": "PMCP_TEST_KEY",
+                    "startup_env_var": "SOAK_TEST_KEY",
                     "auth_state": "missing_auth",
                     "auth_event": "missing_credential",
                     "next_step": "gateway.auth_connect(server_name='needs-key')",
@@ -1450,7 +1484,7 @@ class TestRunDoctor:
 
         with patch.dict("os.environ", {}, clear=True):
             with patch("pmcp.cli.Path.home", return_value=tmp_path):
-                with patch("pmcp.cli_commands.doctor.Path.home", return_value=tmp_path):
+                with patch("pmcp.env_store.Path.home", return_value=tmp_path):
                     with patch(
                         "pmcp.cli._is_pmcp_system_service_active",
                         return_value=False,
@@ -1506,7 +1540,7 @@ class TestRunDoctor:
 
         with patch.dict("os.environ", {}, clear=True):
             with patch("pmcp.cli.Path.home", return_value=tmp_path):
-                with patch("pmcp.cli_commands.doctor.Path.home", return_value=tmp_path):
+                with patch("pmcp.env_store.Path.home", return_value=tmp_path):
                     with patch(
                         "pmcp.cli._is_pmcp_system_service_active",
                         return_value=False,

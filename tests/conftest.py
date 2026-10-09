@@ -57,8 +57,16 @@ from pmcp import trust_store
 from pmcp.manifest import npm_resolver, package_identity, registry, version_checker
 from pmcp.manifest import loader as manifest_loader
 from pmcp.transport import http as transport_http
-from pmcp.env_store import reset_dotenv_keys, reset_pmcp_introduced_keys
+from pmcp.env_store import (
+    reset_dotenv_keys,
+    reset_pmcp_introduced_keys,
+    reset_repo_credentials,
+    reset_startup_load,
+    reset_store_warnings,
+    reset_user_store_pin,
+)
 from pmcp.policy.policy import PolicyManager
+from tests.task_reply_double import TaskReplyDouble
 from pmcp.types import (
     LocalMcpServerConfig,
     ResolvedServerConfig,
@@ -177,7 +185,20 @@ def isolate_trust_store(
             f"could write the real store under {_REAL_HOME}."
         )
 
+    # The launch directory is captured at the first residency judgement; the
+    # check above was one, made from wherever pytest runs. Forget it, so each
+    # test's own first judgement captures the directory the test launched in
+    # (Consiliency/pmcp#372 round 18).
+    trust_store.reset_launch_directory()
+    # The home refusal is reported once per process; each test sees its own.
+    from pmcp.home_identity import forget_home_verdicts, reset_home_warning
+
+    reset_home_warning()
+    forget_home_verdicts()
     yield fake_home
+    trust_store.reset_launch_directory()
+    reset_home_warning()
+    forget_home_verdicts()
 
 
 @pytest.fixture(autouse=True)
@@ -320,8 +341,16 @@ def _reset_dotenv_provenance() -> Iterator[None]:
     have nothing to do with #229.
     """
     reset_dotenv_keys()
+    reset_store_warnings()
+    reset_user_store_pin()
+    reset_repo_credentials()
+    reset_startup_load()
     yield
     reset_dotenv_keys()
+    reset_store_warnings()
+    reset_user_store_pin()
+    reset_repo_credentials()
+    reset_startup_load()
 
 
 @pytest.fixture(autouse=True)
@@ -573,7 +602,7 @@ def sample_server_configs() -> list[ResolvedServerConfig]:
 # === Mock Client Manager ===
 
 
-class MockClientManager:
+class MockClientManager(TaskReplyDouble):
     """Mock client manager for testing gateway tools."""
 
     def __init__(

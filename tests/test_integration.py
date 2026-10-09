@@ -19,6 +19,7 @@ from pmcp.summary.template_fallback import template_summary
 from pmcp.server import GatewayServer
 from pmcp.tools.handlers import GatewayTools
 from pmcp.types import McpTaskRecord, RiskHint, ServerStatus, ServerStatusEnum, ToolInfo
+from tests.task_reply_double import TaskReplyDouble
 
 
 def get_available_servers() -> list:
@@ -54,7 +55,7 @@ skip_no_servers = pytest.mark.skipif(
 )
 
 
-class DeterministicTenantTaskManager:
+class DeterministicTenantTaskManager(TaskReplyDouble):
     def __init__(self) -> None:
         self.tasks: dict[tuple[str, str], McpTaskRecord] = {}
         self._tools = {

@@ -271,8 +271,8 @@ def test_the_parsed_bytes_are_the_gated_bytes_not_a_second_read(
 
     real_read_and_gate = loader_module.read_and_gate
 
-    def rewrite_behind_the_gate(path: Path, kind: str) -> object:
-        result = real_read_and_gate(path, kind)  # type: ignore[arg-type]
+    def rewrite_behind_the_gate(path: Path, kind: str, **kwargs: object) -> object:
+        result = real_read_and_gate(path, kind, **kwargs)  # type: ignore[arg-type]
         overlay.write_text(_replacement_yaml(name, SENTINEL_COMMAND))
         return result
 

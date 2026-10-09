@@ -132,8 +132,8 @@ def _tenant_gateway(policy_manager: PolicyManager | None = None) -> GatewayTools
                 else "queued",
                 "createdAt": "2026-01-02T03:04:05Z",
                 "lastUpdatedAt": "2026-01-02T03:04:06Z",
-                "ttl": 300,
-                "pollInterval": 0.1,
+                "ttl": 300000,
+                "pollInterval": 100,
             }
             return {"task": tasks[task_id]}
         if method == "tasks/list":
@@ -178,7 +178,9 @@ async def test_hostsoak_discovers_describes_invokes_and_tracks_tenant_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """PMCP brokers hosted tenant code-mode tasks without local CLI execution."""
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", _tenant_manifest)
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_manifest", lambda *_a, **_k: _tenant_manifest()
+    )
     monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
     gateway = _tenant_gateway()
 

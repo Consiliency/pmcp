@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Upgrade notes
 Things 2.7.3 accepted that 3.0.0 refuses, and defaults or output that changed. This is a major release because of them: upgrading can stop a project's servers from loading until you approve its files (first item below).
 Each is described in full in the section named at the end of the line.
+[MIGRATING.md](MIGRATING.md) covers each one: how to tell whether you are affected, what
+to do, how to verify it, and how to roll back to 2.7.3.
 
 - **Project files need approval.** A repository's `.pmcp/manifest.yaml`, `.mcp.json`
   and `.mcp-gateway-policy.yaml` are ignored (with a WARNING naming the command) until
@@ -22,8 +24,97 @@ Each is described in full in the section named at the end of the line.
   shell.** A value that came from `.env`, `.env.pmcp` or `~/.config/pmcp/pmcp.env` is
   ignored as if unset. *Security*
 - **Spawned servers no longer inherit the keys pmcp loaded from `.env`**, except a
-  server's own declared `env_var`. Shell-exported variables are still inherited.
+  server's own declared `env_var`. Shell-exported variables are still inherited. An
+  install spawn under `pmcp --project <dir>` run from another directory no longer
+  inherits a credential stored in `<dir>/.env.pmcp`. *Security*
+- **A symlinked project `.env.pmcp` is refused.** pmcp no longer follows a symlink in a
+  project's credential store at all, wherever it points. `pmcp secrets set`, `pmcp
+  secrets sync --to-scope project` and `gateway.auth_connect` with `scope="project"`
+  report `refusing to write .env.pmcp: it is a symlink` and write nothing; 2.7.3 wrote the
+  secrets wherever the link pointed, which a cloned repository chooses. Every `pmcp`
+  command also stops LOADING such a store at startup: run from that directory, it prints
+  `pmcp: refusing to load .env.pmcp: it is a symlink` on stderr and goes on without those
+  keys, where 2.7.3 loaded whatever the link pointed at — this includes the gateway. Keep
+  linked credentials in the user store `~/.config/pmcp/pmcp.env`, which still follows its
+  link. A project `.env.pmcp`
+  that is not a regular file (a fifo, a socket, a device) is refused rather than read (at
+  startup: skipped with a warning), and any other failure to read or write the store (a
+  directory at the path, no permission, bytes that are not UTF-8, a value with a newline,
+  a `--project` path the system cannot resolve) is reported the same way instead of
+  crashing the command. A source store that `pmcp secrets sync` only reads is reported as
+  `refusing to read …`. Every other reader of a
+  repository-controlled store reads it the same confined way — remote-header
+  `${VAR}` resolution, a tenant `.pmcp/tenants/<id>/pmcp.env`, the gateway's
+  credential check, spawn-time env stripping, `pmcp secrets check`, and the `.env`
+  pmcp finds at startup by walking up from where it is installed (inside a checkout
+  when it runs from that checkout's `.venv`) — and treats a refused store as empty,
+  printing `pmcp: refusing to read .env.pmcp: …` once per store per configuration
+  load; the feedback gate refuses to submit instead. A tenant id made only of dots
+  (`.`, `..`) is refused. A store behind a directory pmcp cannot search counts as
+  unreadable, not absent: a reader that only looks warns and reads it as empty (the
+  user store too, so pmcp still starts), and one that decides — the feedback gate, a
+  rewrite — refuses. *Security*
+- **A project file supplies credentials only.** A checkout's `.env.pmcp`, the `.env`
+  in the directory the gateway runs from (or that pmcp finds when it is installed in a
+  checkout's `.venv` -- any `.env` its startup walk finds outside your home directory and
+  its ancestors), and a tenant `pmcp.env` no longer put anything
+  into pmcp's own environment. Their values are credentials: a server's declared
+  credential, a remote `${VAR}` header, the credential checks and the `pmcp secrets`
+  commands still find them. Nothing else does — not pmcp's own settings
+  (`PMCP_LOG_LEVEL`, `PMCP_PORT`, …), not `HOME`, a proxy or a CA bundle, and not a
+  child process pmcp starts. Such a variable prints `pmcp: Ignoring <VAR> in .env.pmcp:
+  a project file supplies credentials only, …` and is left unset; in 2.7.3 it applied.
+  Any other non-credential variable in such a file is ignored without a line. A value
+  is expanded only from keys defined earlier in the same file: `LEAK=${GITHUB_TOKEN}`,
+  which 2.7.3 filled from your environment, is ignored with `pmcp: Ignoring LEAK in
+  .env.pmcp: its value refers to a variable the file does not define, …`. Your shell
+  and `~/.config/pmcp/pmcp.env` now win over a project file for every lookup, and every
+  reader -- runtime and diagnostics alike -- goes through the same lookup, which reads a
+  project's own `.env` before its `.env.pmcp`, never another project's, and rereads a
+  project file that changed. The project is the one pmcp serves -- `--project` when
+  given, otherwise the project root found from the working directory (the root
+  `.mcp.json` is loaded from) -- so `pmcp --project B` started inside project A spawns,
+  gates and checks B's servers with B's credentials. Every project input follows that
+  same project: its `.mcp.json`, its `.pmcp/manifest.yaml` overlay (found at the
+  project root, no longer by walking up from the working directory; a directory with an
+  overlay is a project root) and its `.mcp-gateway-policy.yaml` (no longer read from the
+  working directory), so a server's endpoint and its credential always come from one
+  project. `pmcp init` without `--project` writes the served project's `.mcp.json`.
+  Started from a subdirectory of a
+  project, pmcp reads the root's `.env.pmcp`, the one `pmcp secrets set --scope project`
+  writes, where 2.7.3 loaded the working directory's (a tenant
+  lookup checks the tenant store before the project store), where in 2.7.3 a checkout's
+  `.env` won over the user store and `pmcp secrets check` preferred a project
+  `.env.pmcp` (a per-project override of a user-store key, such as a tenant id, does not
+  apply), and a variable your shell exports as empty stays
+  unavailable rather than being filled from a project file. A `~/.env` (or one in an
+  ancestor of your home directory) still loads as before. A server pmcp spawns
+  keeps every variable you exported: a project `.env.pmcp` that lists a name, such as
+  `NO_PROXY` or `SSL_CERT_FILE`, no longer removes your value of it from the child's
+  environment, as 2.7.3 did. Only the names in your user store and the credentials pmcp
+  itself put into its environment (`auth_connect`, a `~/.env`) are withheld from other
+  servers. A tenant or project store located without `--project` is the served
+  project's. `pmcp secrets sync
+  --from-scope project --to-scope user` copies credentials only -- a credential-shaped
+  name or one a manifest server declares (`POSTGRES_URL`) -- and skips every other
+  name (`UV_INDEX_URL`, `DATABASE_URL`, anything named `PMCP_*`, proxies, code-loading and
+  package-manager names) and any value containing `${` or spanning lines, with `pmcp:
+  Not copying <NAME> from .env.pmcp: …`, where 2.7.3 copied every key into the store
+  pmcp loads into its environment at each start; `gateway.auth_connect` refuses the
+  same names and a credential containing `${`. `pmcp secrets check` answers what the
+  runtime would: an exported variable counts as available, an exported empty one as
+  missing, where it used to look at the stores alone.
   *Security*
+- **HOME must be a plain absolute path.** pmcp uses the files under your home directory
+  -- user config and policy, guidance, the user manifest overlay, `~/.config/pmcp/pmcp.env`,
+  the trust and package-approval stores, the registry caches, the lock -- only while
+  `HOME` (`USERPROFILE` on Windows) is absolute, has no `.` or `..` component and
+  resolves, and no checkout lies above the home directory or holds a link on the way to
+  it. Otherwise pmcp prints `pmcp: Ignoring the operator's files under the home
+  directory: …` once, runs without those files, creates nothing there, and refuses every
+  trust and package-approval decision. A dotfiles repository at the home directory, your
+  own links (`/home -> /var/home`) and a filesystem or drive root holding a marker (a
+  container's `/package.json`) are fine. 2.7.3 used whatever `HOME` named. *Security*
 - **Discovered servers are default-deny.** `gateway.register_discovered_server` resolves
   and pins the package (and refuses one it cannot pin, or an `env_vars` name that is not
   credential-shaped); `provision`, `connect_server` and `restart_server` refuse it until
@@ -52,20 +143,36 @@ Each is described in full in the section named at the end of the line.
   unknown `kid` refetches the JWKS at most once per 10 s, and any JWKS failure, including
   a key set with no usable keys, is a `503` instead of a `500`. The metadata route's
   `resource` is `--oauth-audience`, or the metadata URL's origin plus `/mcp`, and no
-  longer the request `Host`. *Security*, *Fixed*
+  longer the request `Host`. A forged token pairing an algorithm with a key of
+  another type, and a non-ASCII `Authorization` header, get a `401` instead of a
+  `500`. *Security*, *Fixed*
 - **The `tools/call` gate enforces the schemas pmcp advertises.** Constraints the
   argument models always had are now rejected at the gate as an `isError`
   `Input validation error: …` result instead of an `{"error": true}` payload. Lax
   coercion (`1` for a boolean, `"5"` for an integer) on `invoke.task` is refused, and
   an explicit `null` for an optional argument is now accepted. Policy is judged before
   the schema, and gate rejections are recorded as `audit.rejection` events, which carry
-  no values taken from the call's arguments (a digest and type names instead). *Changed*
-- **Task numbers are bounded.** `invoke.task.ttl` must be an integer from 1 to 2^53−1,
-  and `invoke.task.poll_interval` a finite number above 0 and at most 2^53−1. `NaN` and
+  no values taken from the call's arguments: only the failing path and the JSON
+  Schema keyword, never the value or any digest of the arguments. An
+  `audit.invocation` record for a call refused by policy or made to an unregistered
+  name is `denied` with every argument-derived field (`run_correlation_id` and the
+  rest) `null`, and every other record reads only the top-level arguments the tool's
+  schema declares, so a correlation id passed to a tool that does not declare it is
+  no longer recorded. *Changed*
+- **Task numbers are bounded.** `invoke.task.ttl` must be an integer from 1 to
+  9,007,199,254,740 (seconds), and `invoke.task.poll_interval` a finite number above 0
+  and at most 9,007,199,254,740. `NaN` and
   `±Infinity` are refused for every numeric argument, and a request carrying a value
   that is not strict JSON fails with `outbound frame is not strict JSON`. A downstream
   task field pmcp cannot use is reported as `null` and named in `unusable_fields`.
-  *Changed*
+  Finished tasks past the 100-record cap are evicted in the order pmcp recorded
+  them, not by the downstream's timestamps. *Changed*
+- **Task `ttl` and `poll_interval` are seconds in pmcp and milliseconds on the wire.**
+  pmcp now converts both ways, as MCP 2025-11-25 requires. If you sent milliseconds
+  to work around the old pass-through, your values are now 1000× too long. A tenant
+  server built to the old seconds contract now receives milliseconds and must return
+  `ttl`/`pollInterval`/`poll_interval` in milliseconds. A task's `ttl` is now a
+  fractional number of seconds. *Changed*
 - **Redaction removes more.** `sanitize_auth_diagnostic`, `PolicyManager.redact_secrets`
   and `process_output` now also replace vendor token shapes, JWTs, PEM private keys,
   high-entropy runs, URL userinfo and secret query values with `[REDACTED]`. Existing
@@ -74,6 +181,14 @@ Each is described in full in the section named at the end of the line.
   `server_version:`, now pins an npx server to that exact version; an invalid pin is
   ignored with a warning. `gateway.update_server` does not move a pinned server, and
   `pmcp update` prints `[PINNED]` for it. *Added*
+- **An overlay entry pmcp cannot use is skipped.** A manifest overlay entry with a
+  field some part of pmcp would fail on (`keywords: [1]`, an `args` list holding a
+  number, a `command` or `transport` that is not a string, a `cli_alternatives`
+  entry with an empty `check_command`) is skipped
+  when the overlay is read, with a WARNING naming the field but not its value. 2.7.3
+  loaded it, and then `gateway.catalog_search` failed for every query, or startup and
+  `gateway.refresh` failed for every server. A CLI an overlay adds or replaces now
+  ranks after every server and after pmcp's own CLIs. *Fixed*
 - **Downstream servers see more from pmcp.** A server→client request now gets an
   answer (`ping` gets an empty result, anything else `-32601`), cancellation is sent as
   `notifications/cancelled`, and a malformed frame is dropped instead of ending the
@@ -81,8 +196,10 @@ Each is described in full in the section named at the end of the line.
 - **Logs.** Every install spawn, package-runner start and update probe logs a
   secret-safe command line at WARNING. A manifest's warnings are logged once each time
   its inputs change, not on every load. *Changed*
-- **Dependency floors.** `pyjwt[crypto]>=2.15.0` (was `>=2.10.0`) and
-  `aiohttp>=3.14.2` (was `>=3.9.0`). *Security*
+- **Dependency floors.** `pyjwt[crypto]>=2.15.0` (was `>=2.10.0`),
+  `aiohttp>=3.14.2` (was `>=3.9.0`), `python-dotenv>=1.2.2` (was `>=1.0.0`) and,
+  in the `http` extra, `starlette>=1.3.1` (was `>=0.27.0`); the `dev` extra needs
+  `pytest>=9.0.3` (was `>=7.0`) and adds `pytest-timeout>=2.3`. *Security*
 - **Agent-facing hints.** The `try/catch` code hint is now `try`, and the Playwright
   screenshot pattern and example name `browser_take_screenshot` with `filename`.
   *Changed*
@@ -96,10 +213,26 @@ Each is described in full in the section named at the end of the line.
   than `null` (as stdio servers already did; tracked as
   [Consiliency/pmcp#335](https://github.com/Consiliency/pmcp/issues/335)), and a
   `nextCursor` of `NaN` leaves the previous listing in place. *Changed*
-- **Error text names the real failure.** Status, `doctor` and connect/disconnect
-  errors from a remote transport now show the individual exceptions inside an
-  exception group instead of `unhandled errors in a TaskGroup`. Anything matching
-  the old string should match the underlying error instead. *Fixed*
+- **Error text names the real failure.** Status, `doctor`, health output and
+  connect/disconnect errors from a remote transport now show the individual
+  exceptions inside an exception group instead of `unhandled errors in a
+  TaskGroup`. One line still prints the old string: the batch-connect
+  `Failed to connect to <server>: …`, also shown as `pmcp`'s "cannot reach PMCP
+  gateway" error; the WARNING lines before it name the cause. Match on the
+  underlying error instead. A hung `gateway.update_server` probe on Python 3.10
+  reports `Update probe timed out after 60 seconds.` instead of an empty
+  `Failed to run update probe: `. *Fixed*
+- **A cancelled teardown kills stdio servers at once.** When the caller of a
+  disconnect, restart, refresh or shutdown is cancelled (or shutdown's 10 s budget
+  runs out), pmcp now SIGKILLs the server's whole process group instead of waiting
+  out its SIGTERM grace, so a server that needs a graceful flush on exit can lose
+  it in that case. An uncancelled teardown still sends SIGTERM first. *Fixed*
+- **Stop every running gateway before upgrading.** 3.0 never removes the singleton lock
+  file `~/.pmcp/gateway.lock` (a lock dies with its gateway), and refuses a lock path that
+  is a link or not a plain file, and an explicit `--lock-dir` that is itself a link (a symlinked `~/.pmcp` is judged like `~/.config/pmcp`: followed unless it leads into the project pmcp serves or was started in). 2.7.3 removes the file when it shuts down, so while an
+  older gateway still runs, its shutdown can delete a 3.0 gateway's live lock and a third
+  start can then run beside it. Until every running pmcp is upgraded the one-gateway
+  guarantee does not hold; stop them all first, and do the same before rolling back.
 - **Known issues in 3.0.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
   but the gateway reads `.mcp-gateway`; until that is fixed, run
   `pmcp refresh --cache-dir .mcp-gateway`
@@ -208,11 +341,11 @@ Each is described in full in the section named at the end of the line.
   same rules.
   Two properties are worth knowing before you rely on it. The store must live
   **outside** the checkout it judges — a store path that resolves inside the
-  current repository (or, under `pmcp serve --project`, the served project),
+  current repository (or, under `pmcp --project`, the served project),
   directly or through a symlink, is refused rather than
   read, and `pmcp trust approve` also refuses a store inside the checkout that
   contains the file being approved, so it never reports an approval that
-  `pmcp serve --project` would then refuse
+  `pmcp --project` would then refuse
   ([Consiliency/pmcp#252](https://github.com/Consiliency/pmcp/issues/252)),
   because a repository that ships its own approval record must not be
   believed. And every read failure is a refusal: a missing, unreadable or
@@ -253,6 +386,86 @@ Each is described in full in the section named at the end of the line.
   unchanged. See [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 
 ### Security
+- **No reader follows a repository-controlled credential store out of the project.**
+  Consiliency/pmcp#366 confined the startup load and every command that rewrites a
+  project `.env.pmcp`, but other readers still read through a link to a file outside
+  the project. The worst was remote-header auth: a `${VAR}` in a remote server's
+  `headers` was filled from the project store, so a cloned repository that shipped
+  `.env.pmcp` as a link to another file you own, plus a remote server pointing at a
+  host it chose, could put that file's values in an `Authorization` header to that
+  host — through the gateway's config load, a remote connection, `pmcp status` and
+  `pmcp doctor`. The same was true of a tenant store
+  `.pmcp/tenants/<id>/pmcp.env`, of the gateway's credential-availability check (which
+  loaded the linked file — and the checkout's `.env` — into the gateway's own
+  environment), of the feedback gate's planted-key check, of the spawn-time
+  credential checks and env stripping, and of `pmcp secrets check`. Every one of them
+  now reads through a single store reader that takes the store's scope: the user
+  store `~/.config/pmcp/pmcp.env` still follows its link (a dotfiles repository), and
+  every repository-controlled file — the project `.env.pmcp`, a tenant `pmcp.env`, and
+  the `.env` and `.env.pmcp` at the served project root, and the `.env` that
+  startup discovers by walking up from pmcp's installed files (which, for pmcp
+  installed in a checkout's `.venv` by `uv run` or `pip install -e`, is the
+  checkout's own `.env`) — is read only through the confined walk, which refuses a
+  symlink of any kind (Consiliency/pmcp#366). The discovery itself is kept: for a `uv tool` or `pip --user`
+  install the walk reaches `~/.env`, in the home directory, which is the operator's
+  own and loads as before; a `.env` the walk finds anywhere other than the home
+  directory or an ancestor of it is a repository's, whatever marker files the checkout
+  has. A symlinked store, or a file that is not regular, is read as empty with one
+  value-free line on stderr (`pmcp: refusing to read .env.pmcp: it is a symlink`, or
+  `refusing to load` for the startup `.env` and the credential check), once per store, reason and file identity in each configuration
+  load, so a store that changes, or is still refused at the next load, is reported
+  again; the feedback gate refuses to submit (`gate_error`) instead. A tenant id made
+  only of dots is refused: `..` and `.` named `.pmcp/pmcp.env` and
+  `.pmcp/tenants/pmcp.env`, which are no tenant's store.
+
+  Reading confined was not enough on its own. A regular project file could still
+  steer what pmcp did next by putting variables into its environment: with `HOME`
+  unset, a `.env.pmcp` that set `HOME` moved the user store onto a link the checkout
+  shipped; `Http_Proxy` (httpx takes any case) sent every outbound request, the
+  `Authorization` header included, through a proxy the repository named;
+  `SSLKEYLOGFILE` wrote TLS session keys to a file it chose; and `LD_PRELOAD`,
+  `NODE_OPTIONS`, `UV_INDEX_URL` or `PYTHONPATH` reached the children pmcp starts
+  without a filter — `systemctl` for `pmcp doctor` and `pmcp status`, the service
+  restart, `pmcp upgrade`, the CLI probes and the npm resolver — and `systemctl`
+  loaded the repository's library. A list of such variables can never be complete,
+  so there is none: a repository-controlled file never populates pmcp's environment.
+  Its values go to a separate credential map that only explicit credential lookups
+  consult (`env_store.credential_value`), and a name pmcp itself reads from its
+  environment, in any case, is never answered from it. The user store's path is fixed
+  before anything else loads. Every child pmcp starts takes its environment from one
+  builder (`env_store.child_process_env`, which the server-spawn filter builds on).
+
+  Absence is now only "no such file". A check that a store or its root exists used to
+  answer "no" when a directory above it could not be searched (`EACCES`), so a store
+  pmcp could not read counted as no store, and the feedback gate's strict check
+  allowed a submission; that lookup now raises, and the gate refuses (`gate_error`).
+  Readers that only look (startup, header lookup, the credential check, env
+  stripping, `pmcp secrets check`) warn once and read such a store, the user store
+  included, as empty.
+
+  Tests walk the source tree's syntax and fail if any function reads or loads a store
+  any other way, if a credential lookup reads `os.environ` by name instead of
+  `credential_value`, if any process is started without an `env=` from the builder,
+  if `atomic_write` or `env_store` asks a yes/no existence check, or if `src/pmcp`
+  reads an environment variable that is not classified as path-and-trust,
+  provenance-gated or operational, or if anything but `credential_value` reads the
+  credential map or a store's values. That classification inventory sees only pmcp's
+  own reads, not what httpx, ssl or a child process read; with repository files kept
+  out of the environment, that limit no longer matters for them.
+
+  The values a repository file supplies are expanded only within that file, never from
+  your environment or user store, so `LEAK=${PMCP_AUTH_TOKEN}` cannot copy a secret into
+  a name a repository-configured header then sends. Every lookup -- the startup map,
+  the project and tenant stores behind remote-header resolution, `pmcp secrets check` --
+  goes through the one gate, so a repository's `PMCP_AUTH_TOKEN`, `HTTP_PROXY` or
+  `SSLKEYLOGFILE` never fills a header either, and precedence is by presence: a
+  variable your shell exports, even as empty, is never filled from a project file. See
+  Consiliency/pmcp#367.
+- **Bumped `multidict` 6.7.0 → 6.9.1** to clear advisory `GHSA-54p9-h82j-f925`.
+  `multidict` is transitive (`aiohttp` → `multidict`, and `aiohttp` → `yarl` →
+  `multidict`), so this is lockfile-only, like the `anyio` bump: the repo floors
+  direct dependencies in `pyproject.toml` and locks transitive ones. The D-01
+  `pip-audit --strict` gate is green again.
 - **Unknown-`kid` tokens can no longer drive an outbound JWKS fetch per request.**
   A token whose `kid` is not in the cached key set forced a JWKS refresh every
   time, before rate limiting runs, so an unauthenticated caller sending random
@@ -334,7 +547,7 @@ Each is described in full in the section named at the end of the line.
   repository's. See [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 - **An install spawn now strips PMCP-managed credentials using the project root
   the gateway was given, not the directory it happens to be running in.** When a
-  gateway started with `pmcp serve --project X` ran from a different working
+  gateway started with `pmcp --project X` ran from a different working
   directory, the install child's environment was sanitized by walking up from the
   *working directory* to find the project credential store, while the credential
   was written from the gateway's own root `X` — so a project-scoped credential in
@@ -363,13 +576,13 @@ Each is described in full in the section named at the end of the line.
   gateway serves, not only the directory it was launched from.** A trust store
   that resolves inside a checkout is refused, because a repository must not ship
   its own approval record — but the guard discovered the checkout by walking up
-  from `Path.cwd()`, so `pmcp serve --project <checkout>` launched from any other
+  from `Path.cwd()`, so `pmcp --project <checkout>` launched from any other
   directory did not refuse a store planted inside that served checkout, and it
   would load that checkout's self-approved `.mcp.json`. The guard now judges
   residency against the served project root **and** the launch checkout (adding
   the served root, never replacing the cwd walk, so a store resident in a second
   checkout the operator launches from stays refused too). `pmcp status --project`
-  gets the same binding; the `pmcp trust` verbs and a bare `pmcp serve` keep
+  gets the same binding; the `pmcp trust` verbs and a bare `pmcp` (the gateway) keep
   the cwd-derived guard, and `pmcp trust approve` additionally refuses a store
   inside the approved file's checkout (see the trust-store entry under *Added*). See
   [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230), [Consiliency/pmcp#251](https://github.com/Consiliency/pmcp/issues/251).
@@ -575,6 +788,72 @@ Each is described in full in the section named at the end of the line.
   (D-01); see [Consiliency/pmcp#228](https://github.com/Consiliency/pmcp/pull/228).
 
 ### Fixed
+- **The singleton lock file is never removed.** Shutdown used to unlink `~/.pmcp/gateway.lock` after releasing it, so a second gateway that locked the same file in between lost its lock to a third that created a fresh file: two gateways ran at once. The file now stays; a lock is held only by a running gateway and dies with it, so a leftover file never blocks a start. A gateway that locks a file the path no longer names (unlinked or replaced) retries. `pmcp doctor` reports whether a gateway holds the lock rather than whether the file exists. See Consiliency/pmcp#367.
+- **An overlay no longer hides other servers from discovery, and one bad overlay entry
+  no longer takes down the others.** Discovery weighs a keyword by how many servers
+  declare it, and it counted over the merged manifest. So an approved project overlay
+  (or a user or `PMCP_MANIFEST_PATH` overlay) whose server shared a keyword pushed
+  every server with that keyword below the match threshold. `gateway.catalog_search`
+  then returned no candidate, not even the shipped or user server. Keyword weights now
+  come from the shipped manifest alone, so an overlay can add candidates and never
+  removes one, within the result limit.
+
+  Separately, a wrongly typed field in one overlay entry made `catalog_search` fail
+  for every query (`keywords: null`, which now means no keywords; a bad
+  `cli_alternatives` entry) or for every
+  query that matched the entry (a non-string `transport`), or stopped gateway startup
+  and `gateway.refresh` for every server (an int in `args`). An overlay entry that any part of pmcp would reject is now
+  skipped when the overlay is read; an entry nothing would fail on still loads as
+  before. The warning names the field, never its value, and shows an overlay entry's
+  name only when pmcp ships that name. Loading, discovery, CLI probing and the startup
+  and refresh skip lines no longer log an overlay entry's name (unless pmcp ships it)
+  or values either, including values a
+  `.mcp.json` entry inherits from an overlay (the self-reference warning now names the
+  field, not the command). A blank (`null`) field now means "not set" and takes its
+  default, instead of dropping the entry. One overlay entry also no longer stops other
+  `.mcp.json` servers from loading when one of them inherits its defaults, or makes
+  `pmcp secrets` drop other servers' auth metadata. An overlay that replaces a shipped
+  server no longer changes how `gateway.request_capability` picks a category for
+  anything else, and a CLI an overlay adds or replaces is recommended only when no
+  server matches and is listed after pmcp's own CLIs in `cli_hints`. See
+  [Consiliency/pmcp#342](https://github.com/Consiliency/pmcp/issues/342).
+- **A cancelled caller keeps its cancellation through every server teardown,
+  and the teardown still completes.** A caller cancelled while a server
+  connection is being torn down -- a failed or cancelled handshake,
+  `disconnect_server`, a reconnect's cleanup, `disconnect_all`, shutdown --
+  keeps its cancellation and returns at once; the server's process tree is
+  SIGKILLed (through the process group recorded at spawn, so a grandchild
+  that outlived its leader dies too) and the client dropped synchronously,
+  and a remote transport is abandoned without its graceful close. A stdio
+  server is SIGKILLed even when its termination is cancelled, including by
+  event-loop shutdown, and shutdown also kills and drops every server when
+  its 10 s budget runs out (for example while another operation holds the
+  lifecycle lock) or when its `disconnect_all` is cancelled before it starts.
+  A forced `disconnect_server` cancelled while waiting for a `tasks/cancel`
+  reply, or for the lifecycle lock, finishes its teardown too. A cancelled
+  `disconnect_all()`/`refresh()` does not respawn the servers it was
+  removing. Once shutdown has abandoned every client, nothing connects,
+  reconnects or adopts a server process any more (a `refresh` that was
+  mid-flight returns without reconnecting), and a cancelled forced
+  `disconnect_server` also stops a connect of that server sitting in its
+  retry backoff. Adopting a provisioned server process now waits for a
+  disconnect, `disconnect_all` or `refresh` in progress to finish, so it can
+  no longer be dropped from the registry with its process still running, or
+  respawned by a reconnect a few seconds after `disconnect_all` returned; a
+  provisioning handoff cancelled while it waits kills the process it was
+  handing over. Every bounded wait in `src/pmcp` now uses `pmcp.waits.bounded_wait`
+  instead of `asyncio.wait_for`, which on Python 3.10/3.11 could drop a
+  cancel that landed as the awaited work finished. Where process groups do
+  not exist (Windows) the single-process fallback is used, as before. Known
+  limits, tracked separately: a cancelled *reconnect* can still be revived by
+  auto-reconnect
+  ([Consiliency/pmcp#336](https://github.com/Consiliency/pmcp/issues/336)),
+  and a cancel while the spawn itself is completing can leave a grandchild
+  ([Consiliency/pmcp#344](https://github.com/Consiliency/pmcp/issues/344)),
+  and a connect of a server requested *before* a cancelled forced disconnect
+  can still run afterwards
+  ([Consiliency/pmcp#359](https://github.com/Consiliency/pmcp/issues/359)).
+  See [Consiliency/pmcp#324](https://github.com/Consiliency/pmcp/issues/324).
 - **An auth URL's host is checked as the HTTP client will read it.** A JWKS
   URL, a protected-resource metadata URL or a URL-mode elicitation URL whose
   host was not plain ASCII passed as a "name", but aiohttp (yarl) and
@@ -668,6 +947,7 @@ Each is described in full in the section named at the end of the line.
 - **The operator's policy locations are resolved when a `PolicyManager` is built, not when the module is imported.** `~/.claude/gateway-policy.{yaml,json}` were joined to `Path.home()` at import, so a `HOME` changed afterwards — the test suite's isolation, or a re-homed process — was ignored and the discovery search list could not follow it. They are now resolved at call time, while a monkeypatched `USER_POLICY_PATHS` / `DEFAULT_POLICY_PATHS` is still honoured verbatim, so the ungated-vs-gated decision is unchanged. See [Consiliency/pmcp#262](https://github.com/Consiliency/pmcp/issues/262).
 - **A hung `gateway.update_server` probe is reported as a timeout again on Python 3.10.** `_run_update_probe_command` bounds the probe with `asyncio.wait_for`, whose `asyncio.TimeoutError` is not the builtin `TimeoutError` and not a subclass of it before 3.11 — so the caller's handler never fired and a real 60-second hang surfaced through the generic branch as `Failed to run update probe: ` with an empty reason. The helper now normalises to the builtin before the exception reaches a caller (the contract `ClientManager._send_request` already provides), and the caller accepts either class. See [Consiliency/pmcp#269](https://github.com/Consiliency/pmcp/issues/269).
 - **The credential store is written atomically** (temp file → `fsync` → `os.replace`), so an interrupted `write_env_file` no longer truncates the file and loses its other entries. See [Consiliency/pmcp#248](https://github.com/Consiliency/pmcp/issues/248).
+- **A symlinked `pmcp.env` is written through, as in 2.7.3 — the atomic write in this release no longer replaces it.** Renaming the temp file over the path swapped a `~/.config/pmcp/pmcp.env` symlinked from a dotfiles repository for a regular file, so `pmcp secrets set` and `gateway.auth_connect` stopped updating the dotfiles copy and the two drifted apart silently. Every whole-file rewrite of a user-owned PMCP file — `pmcp.env`, `trust.json`, `package_approvals.json`, the registry cache, and the client config `pmcp setup --write` emits — now goes through one helper that first asks the system to look the whole path up, so its own verdicts come first — the 40-link limit counted across the entire lookup, permissions, a non-directory on the way — and only a file not created yet lets the write go on; it then follows the final link chain (a chain, or a relative link) hop by hop through open directory handles, with no normalisation and no pathname longer than one link's own text, to find the name to replace (by joined pathname only where the platform has no directory handles, whose limit is then the system's maximum path length, or where, without `O_PATH`, a directory may be searched and written but not listed — every store reader, writer and residency check applies that one rule); it writes the temp file beside the **target** and replaces the target atomically at mode 0600, leaving the link untouched. A dangling link creates its target file when the target's directory exists; the helper never creates a missing target directory, though the directory of `trust.json` and `package_approvals.json` is created at 0700 as before; both stores are located the way the helper writes them, never by a lexical `Path.resolve()` (a link through `missing/..` names nothing, as the system says; see Consiliency/pmcp#374). A link loop and a target ending in `/` are refused. A project `.env.pmcp` is a path the repository controls, so pmcp follows no symlink there at all: the store, and every directory between the project root and it, is opened without following links and must not be one, and the store must be a regular file or absent; the write happens in the directory that walk opened, so the path checked is the path written (on Windows the same rules run over pathnames). A `--project` path is kept as given and resolved by the system at each use; one that does not exist yet may only be a plain tail of new directories, which are then created, and any other unresolvable `--project` is refused. These guarantees are about what a repository ships — links, directories and file types present before the command runs. A process already running as you and rewriting the store's directory while the command runs is out of scope (it can write your files directly); against it, a read checks that the file it opened is the one it checked, and the temporary file's name is re-checked before the rename, as a best-effort narrowing only. Every READ of a project `.env.pmcp` on the way to a rewrite goes through that walk too: `pmcp secrets set`, `pmcp secrets sync` (its source and its target) and `gateway.auth_connect`, and the load of the served project's `.env.pmcp` that every `pmcp` command runs at startup, before the subcommand; a symlinked or non-regular store is refused before anything is read (at startup: skipped with one `pmcp: refusing to load .env.pmcp: …` line on stderr). A store that is not UTF-8, or holds a value with a newline, is reported as `"ok": false` by `secrets set` and `sync` instead of raising. Every other reader of a project `.env.pmcp` — a running gateway's spawn-time credential checks and env stripping, remote-header auth, and `pmcp secrets check` — reads it through the same walk and never blocks on a fifo: a refused store reads as empty; the startup load of a plain `.env` found outside your home directory is read the same way (Consiliency/pmcp#367). A `package_approvals.json` whose link chain lands inside the checkout being judged is refused, as `trust.json` already was; both checks compare file identity, not path strings, walking up from the store's directory by open directory handles (on Windows, by the strictly resolved directory's parents), skip a served project root that does not exist yet, and refuse the store when residency cannot be established. A store the system refuses to look up (too many links in one lookup, no permission) is an error on every read and write path, never an empty store; the temporary file is created in the directory the system resolves for the target, never one a library normalised. The startup-policy editor still refuses a symlinked project `.mcp.json`. See [Consiliency/pmcp#248](https://github.com/Consiliency/pmcp/issues/248).
 - **The npm version-check User-Agent now names `github.com/Consiliency/pmcp`** instead of the pre-rename `ViperJuice/pmcp`. See [Consiliency/pmcp#247](https://github.com/Consiliency/pmcp/issues/247).
 - **The default feedback repository was `ViperJuice/pmcp`, a repository this
   project does not own.** Every unconfigured gateway that submitted feedback — or
@@ -720,16 +1000,18 @@ Each is described in full in the section named at the end of the line.
   [Consiliency/pmcp#224](https://github.com/Consiliency/pmcp/issues/224).
 
 ### Changed
-- **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree ([Consiliency/pmcp#236](https://github.com/Consiliency/pmcp/issues/236)).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` and `invoke.task.poll_interval` are now range-checked at the gate; the ranges are given in the [Consiliency/pmcp#298](https://github.com/Consiliency/pmcp/issues/298) entry below. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. Inputs the gate now rejects that previously reached the handler were recorded in the scoped-advisor audit as `failure`; they are now recorded as `audit.rejection` events with `terminal_status: "invalid_arguments"` (see the [Consiliency/pmcp#296](https://github.com/Consiliency/pmcp/issues/296) entry below). Unknown keys are still accepted and ignored, as before; forbidding them is tracked on [Consiliency/pmcp#236](https://github.com/Consiliency/pmcp/issues/236). Argument descriptions agents already saw were unchanged by this entry, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description. (Several more descriptions are corrected later in this release; see the agent-visible text entry under Changed.)
+- **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree ([Consiliency/pmcp#236](https://github.com/Consiliency/pmcp/issues/236)).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `anyOf: [X, {"type": "null"}]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. `null` is never an `enum` value or part of a `type` array, because host schema converters do not carry those over: OpenCode's Google provider turns an `enum` value `null` into the string `"null"` and drops the `null` from a type array. That provider sends the `anyOf` form to Gemini as `{"type": X, "nullable": true}`; Claude Code and Codex pass it through unchanged. A client that reads a single flat `type` per argument now finds `anyOf` on these arguments ([Consiliency/pmcp#369](https://github.com/Consiliency/pmcp/issues/369)). The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` and `invoke.task.poll_interval` are now range-checked at the gate; the ranges are given in the [Consiliency/pmcp#298](https://github.com/Consiliency/pmcp/issues/298) entry below. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. Inputs the gate now rejects that previously reached the handler were recorded in the scoped-advisor audit as `failure`; they are now recorded as `audit.rejection` events with `terminal_status: "invalid_arguments"` (see the [Consiliency/pmcp#296](https://github.com/Consiliency/pmcp/issues/296) entry below). Unknown keys are still accepted and ignored, as before; forbidding them is tracked on [Consiliency/pmcp#236](https://github.com/Consiliency/pmcp/issues/236). Argument descriptions agents already saw were unchanged by this entry, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description. (Several more descriptions are corrected later in this release; see the agent-visible text entry under Changed.)
 - **`tools/call` input-schema rejections are now recorded in the scoped-advisor audit, without argument values ([Consiliency/pmcp#296](https://github.com/Consiliency/pmcp/issues/296)).** A call the transport gate rejects used to return `Input validation error: …` before the audit was reached, so an operator saw no attempt at all. It is now written as a new `audit.rejection` event (not an `audit.invocation`: nothing was invoked, and a reader that correlates invocations to a run skips it) with the tool name (for the scoped-advisor tools; any other tool is recorded with `gateway_tool: null` and a `gateway_tool_digest`), `terminal_status: "invalid_arguments"`, `rejected_argument_path`, the failing location as a JSON array (a key the schema declares, an array index, or `null` for a key the caller chose, since that key can itself be a secret), and `rejected_argument_validator`, the failing JSON Schema keyword (`type`, `pattern`, `required`, …). The record never contains the validation message, the rejected value, correlation IDs, or any digest of the arguments. The capability stays `scoped_advisor_audit.v1`; readers that dispatch on `event` are unaffected. Policy is now judged **before** the schema: a call to a policy-blocked gateway tool is refused with "Gateway tool blocked by policy" and recorded `denied` whatever its arguments, instead of getting an `Input validation error` that described the blocked tool's schema. If the audit sink has failed, a malformed call now gets "Scoped advisor audit channel failed" like every other call, instead of its validation error. The response to a rejected call from an allowed tool is unchanged. An `audit.invocation` record now reads nothing the schema gate did not vouch for: a call refused by policy, or made to an unregistered name, is recorded `denied` with every argument-derived field (`run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`, `evidence_label_digest`, `source_reference_hash`) `null`, a result digest that no longer covers the caller's tool name, and a `gateway_tool_digest` of the registered name (for an unregistered name, of nothing) — previously a correlation-shaped value or a public URL anywhere in such a call's arguments was copied or hashed into the audit. Every other invocation record reads only the top-level arguments the tool's schema declares, so a correlation-shaped key a tool does not declare (e.g. `run_correlation_id` on `gateway.describe`) is no longer recorded; `gateway.invoke` declares every field the record reads, so its records are unchanged.
 - **`gateway.invoke`'s `task.ttl` and `task.poll_interval` are bounded, and
   NaN/Infinity are refused at the gate (see [Consiliency/pmcp#298](https://github.com/Consiliency/pmcp/issues/298)).**
-  - `task.ttl` must be an integer from 1 to 2^53−1. Zero and negative values,
-    which were forwarded downstream unchanged, are now rejected with
-    `Input validation error: …`, and so is any value above 2^53−1.
+  - `task.ttl` must be an integer from 1 to 9,007,199,254,740 seconds, so that
+    it is at most 2^53−1 ms once [Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330) converts it (next
+    entry). Zero and negative values, which were forwarded downstream unchanged,
+    are now rejected with `Input validation error: …`, and so is any value above
+    the maximum.
   - `task.poll_interval` must be a finite number greater than 0 and at most
-    2^53−1. Zero, negative values, `NaN`, `Infinity` and `-Infinity` are now
-    rejected; they were previously accepted and forwarded.
+    9,007,199,254,740. Zero, negative values, `NaN`, `Infinity` and `-Infinity`
+    are now rejected; they were previously accepted and forwarded.
   - The transport gate now treats `NaN` and `±Infinity` as non-numbers for
     every numeric argument. Both transports can deliver them, even though they
     are not JSON. Until [Consiliency/pmcp#297](https://github.com/Consiliency/pmcp/issues/297) lands, a rejection message may
@@ -742,7 +1024,8 @@ Each is described in full in the section named at the end of the line.
     `updated_at`, `ttl`, `poll_interval`). "Cannot use" covers:
     - non-finite numbers and out-of-range values;
     - a boolean;
-    - a string where a number is expected;
+    - a string for `ttl` or `pollInterval` (a numeric or ISO 8601 string is
+      still accepted for `createdAt` and `lastUpdatedAt`/`updatedAt`);
     - a non-string or blank status;
     - a blank timestamp;
     - a `null` the downstream sent.
@@ -765,15 +1048,18 @@ Each is described in full in the section named at the end of the line.
     - **A `nextCursor` of `NaN` now makes that listing unreadable.** pmcp keeps
       the previous tools/resources/prompts and publishes no change, instead of
       treating page one as the whole listing.
-    - **A `NaN` inside a tool result now reaches the caller as a `NaN` token
-      instead of `null`.** Fixing that for every transport is tracked as
-      [Consiliency/pmcp#335](https://github.com/Consiliency/pmcp/issues/335).
+    - **A `NaN` in a downstream value that pmcp relays as sent now reaches the
+      caller as a `NaN` token instead of `null`.** That is a tool result
+      (`gateway.invoke`) and a task result (`gateway.tasks_result`), not only
+      the first. A task's `raw` still shows `null`, and resource and prompt
+      reads pass on only their text. Fixing that for every transport is
+      tracked as [Consiliency/pmcp#335](https://github.com/Consiliency/pmcp/issues/335).
   - Finished tasks past the 100-record cap are now evicted in the order pmcp
     last recorded them. A downstream's own timestamps play no part: a
     far-future `lastUpdatedAt` can no longer keep one server's tasks while
     another's are dropped, and a server whose clock runs behind no longer
-    loses its tasks first. (The cap is still shared across servers;
-    [Consiliency/pmcp#338](https://github.com/Consiliency/pmcp/issues/338).)
+    loses its tasks first. [Consiliency/pmcp#338](https://github.com/Consiliency/pmcp/issues/338) then made the cap per server
+    (next entry).
   - pmcp no longer sends a downstream server anything that is not strict JSON:
     `NaN`, `±Infinity`, or a value JSON cannot encode. A request whose
     `arguments` or task metadata contain one now fails with `outbound frame is
@@ -781,9 +1067,158 @@ Each is described in full in the section named at the end of the line.
     originates) that contains one is dropped and logged, never written. Before,
     stdio servers received a non-JSON `NaN` literal, and HTTP/SSE servers
     silently received `null`.
-  - **Known follow-up:** pmcp documents `ttl` and `poll_interval` in seconds,
-    but MCP defines both in milliseconds, and pmcp forwards them unchanged.
-    Tracked as [Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330).
+  - pmcp documented `ttl` and `poll_interval` in seconds, but MCP defines both
+    in milliseconds, and pmcp forwarded them unchanged. The next entry
+    ([Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330)) fixes that.
+- **Task `ttl` and `poll_interval` are now converted between pmcp's seconds and
+  MCP's milliseconds (see [Consiliency/pmcp#330](https://github.com/Consiliency/pmcp/issues/330)).** pmcp has always documented
+  `gateway.invoke`'s `task.ttl` and `task.poll_interval` in seconds. MCP
+  2025-11-25 defines `ttl` and `pollInterval` in milliseconds, and pmcp passed
+  the number through unchanged. So `task: {ttl: 300}`, meant as five minutes,
+  gave a spec-conforming server a 300 ms retention, and its task was gone
+  0.3 s later.
+  - **If you worked around this by sending milliseconds, your values are now
+    1000× too long.** `task: {ttl: 300000}` used to mean five minutes to a
+    spec-conforming server. It now asks for 300,000 seconds, about 3.5 days.
+    Send seconds instead: `ttl: 300`. The same applies to `poll_interval`.
+  - **If you run a tenant server built to pmcp's earlier tenant contract**,
+    which described `ttl` in seconds, it now receives milliseconds: a caller's
+    `ttl: 300` arrives as `ttl: 300000`. A server that reads that as seconds
+    keeps the task 1000× longer than asked. It must also return `ttl` and
+    `pollInterval` (or `poll_interval`) in milliseconds, or pmcp reports them
+    1000× too small: a returned `ttl: 300` is shown as `0.3` seconds. See
+    `specs/tenant-code-mode-host-contract.md`.
+  - Outbound: `task.ttl` is sent as `ttl` in milliseconds (seconds × 1000,
+    exact). `task.poll_interval` is sent as `pollInterval` × 1000. MCP's
+    `TaskMetadata` has no `pollInterval`, so a spec-conforming server ignores
+    it.
+  - Inbound: a downstream task's `ttl` and `pollInterval` are read in
+    milliseconds, and so is the snake_case `poll_interval` alias some servers
+    send. When both poll aliases are present, `pollInterval` wins if it is
+    usable after conversion to seconds; otherwise a usable `poll_interval`
+    does. pmcp reports and records them as `ttl` and `poll_interval`
+    in seconds, everywhere a task is returned: `gateway.invoke`'s `task`,
+    `gateway.tasks_list`, `gateway.tasks_get`, `gateway.tasks_result` and
+    `gateway.tasks_cancel`. A task that used to show `ttl: 300000` now shows
+    `ttl: 300.0`. `ttl` is now a number that may be fractional, not an
+    integer: `1500` ms is reported as `1.5`. A `ttl` of `null` still means
+    unlimited.
+  - Bounds: the caller's maximum for both fields is now 9,007,199,254,740
+    seconds, so that the milliseconds pmcp sends stay within 2^53−1. Larger
+    values, which the previous entry accepted up to 2^53−1, are rejected
+    with `Input validation error: …`. A downstream value is checked as sent,
+    in milliseconds, under the previous entry's rules: `ttl` must be an
+    integer from 0 to 2^63−1, and `pollInterval` a finite number greater than
+    0. Only then is it converted. A `pollInterval` so small that it divides to
+    0 seconds is reported as unusable.
+  - `gateway.invoke` now recognises a task the downstream returns at the top
+    level of its `tools/call` reply (`{"taskId": …}`), the same way pmcp
+    already recorded it. Before, `invoke` looked only for the wrapped
+    `{"task": …}` form, so for that shape it returned `task: null`, relayed the
+    reply as `result` in milliseconds, and skipped the default redaction
+    applied to task replies. A call that did not run as a task never reports a
+    task, even if its result has a `taskId`.
+  - Unchanged: a task's `raw` object, and the results pmcp relays as sent,
+    keep the downstream's own milliseconds.
+- **Tracked MCP tasks are capped per server, and the cap now covers
+  unfinished tasks (see [Consiliency/pmcp#338](https://github.com/Consiliency/pmcp/issues/338)).**
+  - pmcp tracks at most 100 tasks per downstream server, finished and
+    unfinished alike, and at most 1000 across all servers. Before, one
+    100-record cap was shared by every server and counted only finished
+    tasks. So a server whose tasks a caller listed could evict another
+    server's finished tasks, and a server could keep any number of records
+    alive by reporting them as `working`, or with a status pmcp cannot use.
+  - Past a server's cap, that server gives up its own records: finished ones
+    first, then unfinished ones, each in the order pmcp last recorded them.
+    Past the total, the server holding the most records gives one up.
+    Recording a task never evicts that same task, so `gateway.invoke` keeps
+    the record of the task it just started. A listing is recorded one task at
+    a time, so a `tasks/list` reply longer than the cap keeps only its last
+    100 tasks.
+  - Eviction forgets pmcp's record, not the downstream's task.
+    `gateway.tasks_get` and `gateway.tasks_result` still reach it and track
+    it again. Until then:
+    - `gateway.tasks_cancel` reports it as not found;
+    - it does not count as an active task;
+    - a disconnect neither waits for it nor cancels it. A stdio server's task
+      ends with its process. **A remote server's task keeps running** after
+      the disconnect, until the downstream ends it;
+    - a `requestor_context` pmcp stored with it is forgotten, so send it
+      again.
+  - `gateway.tasks_list` still returns every task the downstream listed,
+    even past the cap.
+  - A task that a request is working on is never evicted while that request
+    is in flight: `gateway.tasks_get`, `gateway.tasks_result`,
+    `gateway.tasks_cancel`, and the one `tasks/cancel` a forced teardown has
+    in flight. While such requests are in flight, a server may hold more than
+    100 records: at most one more than the requests in flight at that moment,
+    and it is back under its cap as soon as they finish. The 1000 total works
+    the same way.
+  - A forced `gateway.disconnect_server`, `gateway.restart_server` or
+    `gateway.refresh` cancels every task that was active on the server when
+    it was requested, with each task's newest `requestor_context`, so a
+    remote downstream still gets it. What it owes is fixed when it starts: a
+    task the cap evicts while the teardown works through the others is still
+    cancelled, and still with its context. Those tasks do not count against
+    the caps, so overlapping forced disconnects cannot keep growing a server
+    past its cap, but they still count as the server's active tasks: another
+    forced teardown cancels them too, a disconnect without `force` is refused
+    while any remains, and `gateway.refresh` counts them. A teardown that is
+    interrupted -- its caller cancelled, a downstream error, or a forced
+    disconnect of another server -- puts every task it did not cancel back
+    among the tracked ones, so a retry cancels them. They come back as the
+    server's newest tasks and under its cap again: when they and the
+    server's other tasks exceed it, the cap gives up, in its usual order,
+    the server's finished tasks, then its older unfinished ones, then the
+    oldest returned ones: a task pmcp owed a cancel outranks newer tasks it
+    never owed. A forced disconnect that is
+    itself interrupted still disconnects
+    ([Consiliency/pmcp#324](https://github.com/Consiliency/pmcp/issues/324)) without the
+    cancels it had not sent, so a remote server's remaining tasks keep
+    running. Eviction never fails the teardown.
+    One kind of snapshot task is skipped: one whose original connection
+    cannot take a task request at that moment. That covers four cases: a
+    concurrent disconnect removed the server, a reconnect has it listed but
+    not yet connected, a reconnect replaced it with a new connection, or it
+    does not advertise task support. No `tasks/cancel` is sent for such a
+    task, and it is not an error. On a
+    remote server that is reconnecting, the task is not cancelled.
+    `gateway.disconnect_server` and `gateway.restart_server` still include it
+    in `cancelled_task_count`. That field counts the active tasks pmcp no
+    longer tracks after the call (before minus after), as it always has.
+    Reporting the cancels actually sent is a separate change (see
+    [Consiliency/pmcp#349](https://github.com/Consiliency/pmcp/issues/349)).
+  - When pmcp records a downstream reply about a task (`tasks/get`,
+    `tasks/result`, `tasks/cancel`), the task keeps the `requestor_context`
+    pmcp holds for it. That is the newest one: if `gateway.invoke` supplied a
+    newer context for the same task while the request was in flight, the
+    reply keeps that one. A later cancel sends it. A reply that names a
+    different task does not take this task's context.
+  - Task state is bound to the connection it came from. A reconnect drops the
+    server's tracked tasks, as before. A reply that arrives on the old
+    connection after a reconnect is no longer recorded. pmcp never sends a
+    stored task id or `requestor_context` on a connection other than the one
+    the task came from, so a reconnect to another URL or tenant cannot
+    receive the old tenant's context, or cancel an unrelated task that has
+    the same id. For a record from a previous connection,
+    `gateway.tasks_get`, `gateway.tasks_result` and `gateway.tasks_cancel`
+    fail with `Server <name> was reconnected; this task belongs to its
+    previous connection`, and a forced teardown skips it. `gateway.invoke`,
+    `gateway.tasks_result` and `gateway.tasks_list` report the task the way
+    *this* reply describes it. They never report a same-id task that a new
+    connection tracks, which could belong to another tenant. They also never
+    merge its `created_at`, `tool_id` or `requestor_context`. Each request
+    uses one connection, captured when it starts. If that connection is
+    replaced while `tasks/result` is in flight, its `tasks/get` fallback is
+    not sent anywhere else: `gateway.tasks_result` returns the result with
+    no task. `gateway.invoke`
+    still redacts by default when the call requested a task and the reply
+    carries one.
+  - A forced `gateway.refresh` that cannot disconnect a server now says so.
+    It returns `ok: false` with
+    `Server '<name>' could not be disconnected: <reason>`. Before, it
+    reported success, and the server stayed connected even if it had been
+    removed from the config or denied by policy.
 - **`pmcp config set-startup-policy add|remove|set --source project --apply` now carries your prior trust approval forward when it rewrites `.mcp.json`; a symlinked `.mcp.json` is refused for every source (user, project and custom, apply or preview, CLI or `gateway.set_startup_policy`).** Setting the startup policy changes the file's bytes, and trust approval is content-keyed, so the edit used to silently invalidate your own `pmcp trust approve` of that file and the next startup refused it. When the pre-write bytes were approved, pmcp now re-records the approval for the exact bytes it writes — keyed on the opened descriptor's verified identity (the resolved key must name the same file the descriptor holds open), never re-approving a file that was not already approved, and never approving a substituted file. A target swapped or unlinked mid-operation is refused rather than mis-bound, and on POSIX a symlinked `.mcp.json` is refused up front. If re-recording ever fails because the trust store is unusable, the edit is still written and the failure is surfaced as a diagnostic rather than crashing (an unusable store also fails the approval check, so nothing is silently carried forward). See [Consiliency/pmcp#253](https://github.com/Consiliency/pmcp/issues/253).
 - **Every install spawn now logs the command it runs, at WARNING, before it
   runs.** `start_install`, the legacy `install_server` and `verify_installation`

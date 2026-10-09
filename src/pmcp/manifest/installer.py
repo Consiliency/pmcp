@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import shlex
 import time
 import uuid
@@ -12,7 +11,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from pmcp.env_store import resolve_scope_path, sanitized_subprocess_env
+from pmcp.env_store import (
+    credential_value,
+    resolve_scope_path,
+    sanitized_subprocess_env,
+)
 from pmcp.manifest.environment import Platform
 from pmcp.manifest.loader import (
     ServerConfig,
@@ -20,6 +23,7 @@ from pmcp.manifest.loader import (
     requires_credential,
 )
 from pmcp.validation import is_valid_package_version, parse_package_spec
+from pmcp.waits import bounded_wait
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +180,7 @@ class JobManager:
             Job ID for tracking progress
         """
         # Check API key first
-        await check_api_key(server_config)
+        await check_api_key(server_config, project_root)
 
         # Get platform-specific install command
         install_cmd = server_config.install.get(platform)
@@ -435,7 +439,7 @@ class JobManager:
 
             # Process finished - check return code
             try:
-                await asyncio.wait_for(process.wait(), timeout=5.0)
+                await bounded_wait(process.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 logger.warning(f"Install {job.id}: Process didn't exit cleanly")
                 await self._safe_terminate_process(process, job.id, force=True)
@@ -484,7 +488,7 @@ class JobManager:
                 process.terminate()
 
             try:
-                await asyncio.wait_for(process.wait(), timeout=5.0)
+                await bounded_wait(process.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 if not force:
                     logger.warning(
@@ -492,7 +496,7 @@ class JobManager:
                     )
                     process.kill()
                     try:
-                        await asyncio.wait_for(process.wait(), timeout=2.0)
+                        await bounded_wait(process.wait(), timeout=2.0)
                     except asyncio.TimeoutError:
                         logger.error(f"Install {job_id}: Process won't die!")
         except Exception as e:
@@ -554,7 +558,7 @@ class JobManager:
 
             # Give it a moment to terminate gracefully
             try:
-                await asyncio.wait_for(job.process.wait(), timeout=2.0)
+                await bounded_wait(job.process.wait(), timeout=2.0)
             except asyncio.TimeoutError:
                 job.process.kill()
                 await job.process.wait()
@@ -621,8 +625,10 @@ def build_install_child_env(
     own_env: dict[str, str] = dict(getattr(server_config, "extra_env", {}) or {})
     env_var = server_config.env_var
     if env_var:
+        # For the root the gateway serves, not the working directory
+        # (Consiliency/pmcp#372 round 9).
         for key in credential_lookup_keys(server_config):
-            value = os.environ.get(key)
+            value = credential_value(key, root=project_root)
             if value:
                 own_env[env_var] = value
                 break
@@ -631,8 +637,13 @@ def build_install_child_env(
     return sanitized_subprocess_env(own_env, project_root)
 
 
-async def check_api_key(server_config: ServerConfig) -> None:
-    """Check if required API key is set.
+async def check_api_key(
+    server_config: ServerConfig, project_root: Path | None = None
+) -> None:
+    """Check if required API key is set, for project ``project_root``.
+
+    ``project_root`` is the root the gateway serves (``None``: the served root,
+    ``env_store.serve_project_root``), as for :func:`build_install_child_env`.
 
     Raises:
         MissingApiKeyError: If API key is required but not set
@@ -649,8 +660,8 @@ async def check_api_key(server_config: ServerConfig) -> None:
     # a namespaced secret_key satisfies the provision gate. Checking only the raw
     # runtime env_var would wrongly raise for namespaced-only credentials.
     lookup_keys = credential_lookup_keys(server_config) or [env_var]
-    if not any(os.environ.get(key) for key in lookup_keys):
-        env_path = resolve_scope_path("project")
+    if not any(credential_value(key, root=project_root) for key in lookup_keys):
+        env_path = resolve_scope_path("project", project_root)
         raise MissingApiKeyError(
             env_var=env_var,
             env_instructions=server_config.env_instructions
@@ -680,7 +691,7 @@ async def install_server(
         MissingApiKeyError: If API key is required but not set
     """
     # Check API key first
-    await check_api_key(server_config)
+    await check_api_key(server_config, project_root)
 
     # Get platform-specific install command
     install_cmd = server_config.install.get(platform)
@@ -705,7 +716,7 @@ async def install_server(
             env=build_install_child_env(server_config, project_root),
         )
 
-        stdout, stderr = await asyncio.wait_for(
+        stdout, stderr = await bounded_wait(
             process.communicate(),
             timeout=timeout,
         )
@@ -758,7 +769,7 @@ async def verify_installation(
             env=build_install_child_env(server_config, project_root),
         )
 
-        await asyncio.wait_for(process.communicate(), timeout=5.0)
+        await bounded_wait(process.communicate(), timeout=5.0)
         return True
 
     except Exception:

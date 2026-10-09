@@ -5,12 +5,19 @@ from __future__ import annotations
 import argparse
 import re
 from pathlib import Path
+from typing import Any
 
 from pmcp.config.loader import load_configs
 from pmcp.env_store import (
-    read_env_file,
+    copyable_from_repository,
     resolve_project_root,
+    credential_lookup,
+    read_store,
+    read_store_for_update,
     resolve_scope_path,
+    scope_confinement,
+    scope_store_name,
+    store_refusal,
     set_env_value,
     validate_env_var_name,
     write_env_file,
@@ -35,6 +42,41 @@ def _mask(value: str) -> str:
     return "*" * min(8, len(value))
 
 
+def manifest_secret_metadata(server: Any) -> tuple[dict[str, object], set[str]]:
+    """A manifest server's auth metadata and remote-header env keys.
+
+    The per-server half of ``_extract_required_keys``, shared with the overlay
+    check so an entry it would fail on is skipped at parse time
+    (Consiliency/pmcp#342 rev 4).
+    """
+    metadata: dict[str, object] = {
+        key: value
+        for key, value in {
+            "protected_resource_metadata_url": server.protected_resource_metadata_url,
+            "authorization_server_metadata_url": server.authorization_server_metadata_url,
+            "oidc_issuer_url": server.oidc_issuer_url,
+            "oidc_discovery_url": server.oidc_discovery_url,
+            "client_id_metadata_document_url": server.client_id_metadata_document_url,
+            "declared_scopes": server.declared_scopes,
+            "supports_url_elicitation": server.supports_url_elicitation,
+        }.items()
+        if value
+    }
+    return metadata, set(collect_remote_header_env_vars(server.headers))
+
+
+def _manifest_for(project_root: Path | None) -> Any:
+    """``load_manifest`` for ``project_root``; ``None`` is the served project.
+
+    The project overlay follows the same root as the credentials
+    (Consiliency/pmcp#372 round 12). With no project the call stays
+    ``load_manifest()``, which reads the served project's overlay.
+    """
+    if project_root is None:
+        return load_manifest()
+    return load_manifest(project_root=project_root)
+
+
 def _extract_required_keys(
     project_root: Path,
 ) -> tuple[
@@ -50,7 +92,7 @@ def _extract_required_keys(
     configs = load_configs(project_root=project_root)
 
     try:
-        manifest_by_name = load_manifest().servers
+        manifest_by_name = _manifest_for(project_root).servers
     except Exception:
         manifest_by_name = {}
 
@@ -139,29 +181,21 @@ def _extract_required_keys(
             per_server[cfg.name] = server_keys
 
     try:
-        manifest = load_manifest()
-        for server in manifest.servers.values():
-            manifest_metadata: dict[str, object] = {
-                key: value
-                for key, value in {
-                    "protected_resource_metadata_url": server.protected_resource_metadata_url,
-                    "authorization_server_metadata_url": server.authorization_server_metadata_url,
-                    "oidc_issuer_url": server.oidc_issuer_url,
-                    "oidc_discovery_url": server.oidc_discovery_url,
-                    "client_id_metadata_document_url": server.client_id_metadata_document_url,
-                    "declared_scopes": server.declared_scopes,
-                    "supports_url_elicitation": server.supports_url_elicitation,
-                }.items()
-                if value
-            }
-            if manifest_metadata:
-                auth_metadata_by_server.setdefault(server.name, manifest_metadata)
-            server_keys = set(collect_remote_header_env_vars(server.headers))
-            if server_keys:
-                per_server.setdefault(server.name, set()).update(server_keys)
-                all_keys.update(server_keys)
+        manifest_servers = list(_manifest_for(project_root).servers.values())
     except Exception:
-        pass
+        manifest_servers = []
+    for server in manifest_servers:
+        # Per server: one entry must not drop every later server's metadata
+        # (Consiliency/pmcp#342 rev 4; the overlay check normally skips it first).
+        try:
+            manifest_metadata, header_keys = manifest_secret_metadata(server)
+        except Exception:
+            continue
+        if manifest_metadata:
+            auth_metadata_by_server.setdefault(server.name, manifest_metadata)
+        if header_keys:
+            per_server.setdefault(server.name, set()).update(header_keys)
+            all_keys.update(header_keys)
 
     server_required = {
         server_name: sorted(keys) for server_name, keys in per_server.items()
@@ -177,13 +211,26 @@ def _extract_required_keys(
 async def run_secrets_set(args: argparse.Namespace) -> dict[str, object]:
     """Set one secret in user or project PMCP env file."""
     project = getattr(args, "project", None)
-    path = resolve_scope_path(args.scope, project)
-    values = read_env_file(path)
-
-    existing_value = values.get(args.key)
-    changed = existing_value != args.value
-
-    path = set_env_value(args.scope, args.key, args.value, project)
+    path = Path(scope_store_name(args.scope))
+    # The read sits inside the same boundary as the write, and for the project
+    # store it goes through the write's confined walk: a link the write would
+    # refuse is refused before anything is read (read_store_for_update).
+    # ValueError too: a store that is not UTF-8, a value with a newline, an
+    # invalid key -- reported, never raised (store_refusal).
+    try:
+        # Resolving the project root can itself be refused (`missing/../x`).
+        path = resolve_scope_path(args.scope, project)
+        values = read_store_for_update(args.scope, path)
+        existing_value = values.get(args.key)
+        changed = existing_value != args.value
+        path = set_env_value(args.scope, args.key, args.value, project)
+    except (OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "command": "secrets.set",
+            "scope": args.scope,
+            "error": store_refusal(path, exc),
+        }
 
     return {
         "ok": True,
@@ -211,15 +258,60 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
             "to_scope": to_scope,
         }
 
-    source_path = resolve_scope_path(from_scope, project)
-    target_path = resolve_scope_path(to_scope, project)
+    source_path = Path(scope_store_name(from_scope))
+    target_path = Path(scope_store_name(to_scope))
+    try:
+        source_path = resolve_scope_path(from_scope, project)
+        target_path = resolve_scope_path(to_scope, project)
+    except (OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "command": "secrets.sync",
+            "from_scope": from_scope,
+            "to_scope": to_scope,
+            "error": store_refusal(
+                target_path if from_scope == "user" else source_path, exc
+            ),
+        }
 
-    source_values = read_env_file(source_path)
-    target_values = read_env_file(target_path)
-    for key in source_values:
-        validate_env_var_name(key)
-    for key in target_values:
-        validate_env_var_name(key)
+    # Both reads go through the confined walk for a project store and sit
+    # inside the reported-refusal boundary, so a leaving or non-regular store is
+    # refused before it is read, never raised.
+    # The SOURCE is only read, so its refusal says "read" (verb="read").
+    try:
+        source_values = read_store_for_update(from_scope, source_path, verb="read")
+        for key in source_values:
+            validate_env_var_name(key)
+    except (OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "command": "secrets.sync",
+            "from_scope": from_scope,
+            "to_scope": to_scope,
+            "error": store_refusal(source_path, exc, verb="read"),
+        }
+    try:
+        target_values = read_store_for_update(to_scope, target_path)
+        for key in target_values:
+            validate_env_var_name(key)
+    except (OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "command": "secrets.sync",
+            "from_scope": from_scope,
+            "to_scope": to_scope,
+            "error": store_refusal(target_path, exc),
+        }
+
+    # A project store is the repository's; what it may hand to another store --
+    # the user store, which loads into pmcp's environment at every start -- is
+    # decided by the same rule a lookup uses (env_store.copyable_from_repository,
+    # Consiliency/pmcp#372 round 5). Refused names are reported, never copied.
+    refused: list[str] = []
+    if from_scope == "project":
+        source_values, refused = copyable_from_repository(
+            source_values, source_path.name
+        )
 
     added: list[str] = []
     updated: list[str] = []
@@ -235,7 +327,20 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
         else:
             skipped.append(key)
 
-    write_env_file(target_path, target_values)
+    try:
+        write_env_file(
+            target_path,
+            target_values,
+            confine_to=scope_confinement(to_scope, target_path),
+        )
+    except (OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "command": "secrets.sync",
+            "from_scope": from_scope,
+            "to_scope": to_scope,
+            "error": store_refusal(target_path, exc),
+        }
 
     return {
         "ok": True,
@@ -248,6 +353,7 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
         "added": sorted(added),
         "updated": sorted(updated),
         "skipped": sorted(skipped),
+        "refused": sorted(refused),
         "target_key_count": len(target_values),
     }
 
@@ -258,11 +364,20 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
     user_path = resolve_scope_path("user")
     project_path = resolve_scope_path("project", project_root)
 
-    user_values = read_env_file(user_path)
-    project_values = read_env_file(project_path)
+    # The project store is confined to the project (Consiliency/pmcp#367): a
+    # link out of the checkout lists no keys and satisfies no requirement.
+    user_values = read_store("user")
+    project_values = read_store("project", project=project_root)
+    # The diagnostic answers what the runtime will do: the same lookup a running
+    # pmcp uses (env_store.credential_lookup) -- the environment first, an
+    # exported empty value "unavailable" -- not the stores alone
+    # (Consiliency/pmcp#372 round 5; tests/test_credential_parity.py).
+    # The root the runtime answers for: the --project given, else the startup
+    # load's directory -- not a re-derived project root.
+    lookup = credential_lookup(getattr(args, "project", None))
 
-    effective = dict(user_values)
-    effective.update(project_values)
+    def _available(key: str) -> bool:
+        return bool(lookup(key))
 
     (
         required_keys,
@@ -272,10 +387,10 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
     ) = _extract_required_keys(project_root)
 
     def _satisfied(key: str) -> bool:
-        if effective.get(key):
+        if _available(key):
             return True
         fallback = credential_fallbacks.get(key)
-        return bool(fallback and effective.get(fallback))
+        return bool(fallback and _available(fallback))
 
     missing_keys = sorted(key for key in required_keys if not _satisfied(key))
 
@@ -296,6 +411,12 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
         "required_keys": required_keys,
         "required_by_server": required_by_server,
         "auth_metadata_by_server": auth_metadata_by_server,
-        "available_keys": sorted(k for k, v in effective.items() if v),
+        # Every name the stores hold or a server requires, that the runtime's
+        # lookup would answer -- an exported credential counts.
+        "available_keys": sorted(
+            k
+            for k in set(user_values) | set(project_values) | set(required_keys)
+            if _available(k)
+        ),
         "missing_keys": missing_keys,
     }
