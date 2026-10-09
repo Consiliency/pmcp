@@ -316,22 +316,39 @@ def trust_store_path(*, also: tuple[Path, ...] = ()) -> Path:
     Symlinks are resolved *before* the comparison, which is the only reason a
     planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
+    return home_scoped_location(
+        ".config", "pmcp", "trust.json", label="Trust store", also=also
+    )
+
+
+def home_scoped_location(*parts: str, label: str, also: tuple[Path, ...] = ()) -> Path:
+    """THE rule for a home-scoped file pmcp keeps its own state in: the trust
+    store, and the singleton lock's default directory (Consiliency/pmcp#372
+    round 36: one rule, one code path -- whatever a dotfiles-linked
+    ``~/.config/pmcp`` is allowed, a dotfiles-linked ``~/.pmcp`` is too).
+
+    The HOME gate; then the path resolved as the WRITER resolves it; then
+    refused if it lands in a checkout being judged. HOME itself never counts
+    as one (a dotfiles repository at home, or ``~/.pmcp/manifest.yaml``, does
+    not make it a checkout). Raises ``TrustStoreError``.
+    """
+    name = parts[-1]
     # Home-scoped (Consiliency/pmcp#372 round 22): refused while a checkout
     # controls the home directory, or while HOME is not a plain absolute path
     # the system resolves (round 24: fail closed).
     # A trust decision never rests on a cached home verdict.
     forget_home_verdicts()
     try:
-        spelled = home_path(".config", "pmcp", "trust.json")
+        spelled = home_path(*parts)
     except HomeInsideCheckoutError as exc:
         if exc.strerror == HOME_NOT_PLAIN:
             raise TrustStoreError(
-                f"Trust store trust.json: {HOME_NOT_PLAIN}; refusing it."
+                f"{label} {name}: {HOME_NOT_PLAIN}; refusing it."
             ) from exc
         checkout = checkout_controlling_home()
         where = f"the checkout at {checkout}" if checkout is not None else "a checkout"
         raise TrustStoreError(
-            f"Trust store trust.json resolves inside {where}: the home directory "
+            f"{label} {name} resolves inside {where}: the home directory "
             "lies inside it. A store inside a project's checkout lets it approve "
             "its own content; move the home directory outside the repository."
         ) from exc
@@ -362,12 +379,12 @@ def trust_store_path(*, also: tuple[Path, ...] = ()) -> Path:
         if fd is not None:
             os.close(fd)
         raise TrustStoreError(
-            f"Cannot resolve trust.json: {os.strerror(exc.errno) if exc.errno else exc}"
+            f"Cannot resolve {name}: {os.strerror(exc.errno) if exc.errno else exc}"
         ) from exc
     try:
         # The chain's own pathname, also where a descriptor is judged: a
         # platform without directory descriptors judges the pathname.
-        refuse_checkout_resident(target, "Trust store", dir_fd=fd, also=also)
+        refuse_checkout_resident(target, label, dir_fd=fd, also=also)
     finally:
         if fd is not None:
             os.close(fd)

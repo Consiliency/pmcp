@@ -1074,6 +1074,9 @@ class _FakeKernel32:
         self.calls: list[tuple[int, int, int, int]] = []
         self.error = 0
         self.kinds: dict[int, tuple[int, int]] = {}  # handle -> (attributes, type)
+        self.reparse_tags: dict[int, int] = {}  # handle -> reparse tag
+        #: Real paths reported as tagged reparse points (cloud placeholders).
+        self.tagged_paths: dict[str, int] = {}
         self.invalid = ctypes.c_void_p(-1).value
         self.before_create_new: Any = None
 
@@ -1118,6 +1121,7 @@ class _FakeKernel32:
         if stat_module.S_ISLNK(seen.st_mode):
             fd = os.open(target, os.O_PATH | os.O_NOFOLLOW)
             self.kinds[fd] = (w.FILE_ATTRIBUTE_REPARSE_POINT, w.FILE_TYPE_DISK)
+            self.reparse_tags[fd] = 0xA000000C  # IO_REPARSE_TAG_SYMLINK
         elif stat_module.S_ISDIR(seen.st_mode):
             fd = os.open(target, os.O_RDONLY)
             self.kinds[fd] = (w.FILE_ATTRIBUTE_DIRECTORY, w.FILE_TYPE_DISK)
@@ -1127,8 +1131,24 @@ class _FakeKernel32:
         else:
             mode = os.O_RDWR if access & w.GENERIC_WRITE else os.O_RDONLY
             fd = os.open(target, mode)
-            self.kinds[fd] = (w.FILE_ATTRIBUTE_NORMAL, w.FILE_TYPE_DISK)
+            tag = self.tagged_paths.get(target)
+            attributes = w.FILE_ATTRIBUTE_NORMAL
+            if tag is not None:
+                attributes |= w.FILE_ATTRIBUTE_REPARSE_POINT
+                self.reparse_tags[fd] = tag
+            self.kinds[fd] = (attributes, w.FILE_TYPE_DISK)
         return fd
+
+    def GetFileInformationByHandleEx(  # noqa: N802
+        self, handle: int, info_class: int, info: Any, size: int
+    ) -> int:
+        from pmcp import atomic_write as w
+
+        assert info_class == w.FILE_ATTRIBUTE_TAG_INFO_CLASS
+        record = info._obj
+        record.FileAttributes = self.kinds[handle][0]
+        record.ReparseTag = self.reparse_tags.get(handle, 0)
+        return 1
 
     def GetFileInformationByHandle(self, handle: int, info: Any) -> int:  # noqa: N802
         record = info._obj
@@ -1141,6 +1161,7 @@ class _FakeKernel32:
 
     def CloseHandle(self, handle: int) -> int:  # noqa: N802
         self.kinds.pop(handle, None)
+        self.reparse_tags.pop(handle, None)
         os.close(handle)
         return 1
 
@@ -1368,29 +1389,6 @@ def test_an_operator_linked_dot_pmcp_holds_the_lock(
     assert identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "free"
 
 
-@pytest.mark.parametrize("into", ["a checkout", "a link a checkout holds"])
-def test_a_dot_pmcp_that_leads_into_a_checkout_is_refused(
-    into: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from pmcp import identity
-
-    home = _home(tmp_path, monkeypatch)
-    repo = home.parent / "repo"
-    (repo / ".git").mkdir(parents=True)
-    (repo / "state").mkdir()
-    if into == "a checkout":
-        (home / ".pmcp").symlink_to(repo / "state", target_is_directory=True)
-    else:
-        outside = home.parent / "outside"
-        outside.mkdir()
-        (repo / "out").symlink_to(outside, target_is_directory=True)
-        (home / ".pmcp").symlink_to(repo / "out", target_is_directory=True)
-    before = _tree(home.parent)
-    assert identity.acquire_singleton_lock() is False
-    assert _tree(home.parent) == before
-    assert identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "unusable"
-
-
 def test_an_explicit_lock_dir_that_is_a_link_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1429,3 +1427,230 @@ def test_windows_refuses_a_handle_before_it_becomes_a_descriptor(
         w._open_windows(layer, str(lock), "gateway.lock", write=True, create=True)
     assert converted == []
     assert kernel32.kinds == {}  # the handle was closed
+
+
+# --------------------------------------------------------------------------- #
+# Board round 35, codex F001 / claude N-1: the ~/.pmcp link was judged by a
+# rule of its own -- HOME counted its own ~/.pmcp/manifest.yaml as a checkout
+# marker, and a dotfiles repository behind ~/.pmcp was refused although the
+# same layout works for ~/.config/pmcp. The default lock directory is now
+# judged by the stores' own rule and code (trust_store.home_scoped_location).
+# claude N-2: only name-surrogate reparse points are links.
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_r35_f001_operator_pmcp_symlink_with_user_manifest(
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import patch
+
+    from pmcp import home_identity, identity
+
+    home = tmp_path / "home"
+    state = tmp_path / "state"
+    home.mkdir()
+    state.mkdir()
+    (home / ".pmcp").symlink_to(state, target_is_directory=True)
+    original_marker = home_identity.has_checkout_marker
+    ambient = set(tmp_path.resolve().parents)
+
+    def isolated_marker(directory: Any) -> bool:
+        return False if Path(directory) in ambient else original_marker(directory)
+
+    with (
+        patch.dict(os.environ, {"HOME": str(home)}),
+        patch.object(home_identity, "has_checkout_marker", isolated_marker),
+        patch.object(identity, "_LOCK_FD", None),
+        patch.object(identity, "_LOCK_FILE", None),
+    ):
+        home_identity.forget_home_verdicts()
+        try:
+            assert identity.acquire_singleton_lock() is True
+            identity.release_singleton_lock()
+            (state / "manifest.yaml").write_text("servers: {}\n")
+            assert home_identity.home_is_operators() is True
+            assert identity.acquire_singleton_lock() is True
+            assert (
+                identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "held"
+            )
+        finally:
+            identity.release_singleton_lock()
+            home_identity.forget_home_verdicts()
+
+
+def _state_shape(base: Path, shape: str) -> Path:
+    """The directory ~/.pmcp or ~/.config/pmcp leads to, built under ``base``
+    (``base / "home"`` is HOME); returns the link target, or ``None`` for a
+    real directory."""
+    repo = base / "dotfiles"
+    (repo / ".git").mkdir(parents=True, exist_ok=True)
+    if shape == "plain folder":
+        target = base / "state"
+        target.mkdir(exist_ok=True)
+    elif shape == "dotfiles repo, subfolder":
+        target = repo / "pmcp"
+        target.mkdir(exist_ok=True)
+    elif shape == "dotfiles repo, root":
+        target = repo
+    elif shape == "with manifest.yaml":
+        target = base / "state"
+        target.mkdir(exist_ok=True)
+        (target / "manifest.yaml").write_text("servers: {}\n")
+    elif shape == "through a link the repo holds":
+        outside = base / "outside"
+        outside.mkdir(exist_ok=True)
+        if not (repo / "out").is_symlink():
+            (repo / "out").symlink_to(outside, target_is_directory=True)
+        target = repo / "out"
+    else:
+        raise AssertionError(shape)
+    return target
+
+
+_STATE_SHAPES = [
+    "plain folder",
+    "dotfiles repo, subfolder",
+    "dotfiles repo, root",
+    "with manifest.yaml",
+    "through a link the repo holds",
+]
+
+
+@pytest.mark.parametrize("launched", ["outside", "inside the dotfiles repo"])
+@pytest.mark.parametrize("shape", _STATE_SHAPES)
+def test_the_lock_directory_follows_exactly_the_stores_rule(
+    shape: str, launched: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Differential: ~/.pmcp in each shape gets the verdict the trust store
+    gets for ~/.config/pmcp in the same shape -- and acquire and doctor
+    agree. Launched inside the dotfiles repository, that repository is a
+    checkout being judged, and a store (or lock) landing in it is refused."""
+    from pmcp import home_identity, identity, trust_store
+
+    base = tmp_path.resolve()
+    home = base / "home"
+    (home / ".config").mkdir(parents=True)
+    original_marker = home_identity.has_checkout_marker
+    ambient = set(base.parents)
+    monkeypatch.setattr(
+        home_identity,
+        "has_checkout_marker",
+        lambda d: False if Path(d) in ambient else original_marker(d),
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    monkeypatch.setattr(identity, "_LOCK_FILE", None)
+    monkeypatch.setattr(trust_store, "_active_project_root", None)
+    target = _state_shape(base, shape)
+    (home / ".pmcp").symlink_to(target, target_is_directory=True)
+    (home / ".config" / "pmcp").symlink_to(target, target_is_directory=True)
+    launch = base / "dotfiles" if launched != "outside" else base / "launch"
+    launch.mkdir(exist_ok=True)
+    monkeypatch.chdir(launch)
+    trust_store.reset_launch_directory()
+    home_identity.forget_home_verdicts()
+    try:
+        trust_store.trust_store_path()
+        store_accepts = True
+    except trust_store.TrustStoreError:
+        store_accepts = False
+    try:
+        lock_accepts = identity.acquire_singleton_lock()
+        probe = identity.singleton_lock_held(home / ".pmcp", home_scoped=True)
+    finally:
+        identity.release_singleton_lock()
+    assert lock_accepts is store_accepts
+    assert (probe != "unusable") is store_accepts
+    lands_in_repo = shape.startswith("dotfiles repo")
+    assert store_accepts is not (launched != "outside" and lands_in_repo)
+
+
+def test_the_operators_home_is_never_a_checkout_for_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Launched from HOME, whose ~/.pmcp holds the user overlay (a marker):
+    HOME stays the operator's, and the lock in a real ~/.pmcp is taken."""
+    from pmcp import home_identity, identity, trust_store
+
+    base = tmp_path.resolve()
+    home = base / "home"
+    (home / ".pmcp").mkdir(parents=True)
+    (home / ".pmcp" / "manifest.yaml").write_text("servers: {}\n")
+    original_marker = home_identity.has_checkout_marker
+    ambient = set(base.parents)
+    monkeypatch.setattr(
+        home_identity,
+        "has_checkout_marker",
+        lambda d: False if Path(d) in ambient else original_marker(d),
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    monkeypatch.setattr(trust_store, "_active_project_root", None)
+    monkeypatch.chdir(home)
+    trust_store.reset_launch_directory()
+    home_identity.forget_home_verdicts()
+    try:
+        assert identity.acquire_singleton_lock() is True
+        assert identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "held"
+    finally:
+        identity.release_singleton_lock()
+
+
+@pytest.mark.parametrize(
+    ("tag", "accepted"),
+    [
+        (0x9000601A, True),  # IO_REPARSE_TAG_CLOUD_6: a OneDrive placeholder
+        (0x80000013, True),  # IO_REPARSE_TAG_DEDUP
+        (0xA000000C, False),  # IO_REPARSE_TAG_SYMLINK: a name surrogate
+        (0xA0000003, False),  # IO_REPARSE_TAG_MOUNT_POINT: a name surrogate
+    ],
+)
+def test_windows_only_a_name_surrogate_reparse_point_is_a_link(
+    tag: int, accepted: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    kernel32 = _windows_layer(monkeypatch)
+    lock = tmp_path / "gateway.lock"
+    lock.write_text("")
+    kernel32.tagged_paths[str(lock)] = tag
+    try:
+        assert identity.acquire_singleton_lock(tmp_path) is accepted
+        assert identity.singleton_lock_held(tmp_path) == (
+            "held" if accepted else "unusable"
+        )
+    finally:
+        identity.release_singleton_lock()
+
+
+@pytest.mark.parametrize(("tag", "accepted"), [(0x9000601A, True), (0xA000000C, False)])
+def test_a_reparse_tag_at_the_lock_name_is_judged_by_its_surrogate_bit(
+    tag: int, accepted: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generic post-open check, as Windows' lstat reports a tag."""
+    from types import SimpleNamespace
+
+    from pmcp import atomic_write
+
+    lock = tmp_path / "gateway.lock"
+    lock.write_text("")
+    real_lstat = os.lstat
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        seen = real_lstat(path, *args, **kwargs)
+        if os.fspath(path) == str(lock):
+            fields = {n: getattr(seen, n) for n in dir(seen) if n.startswith("st_")}
+            fields["st_reparse_tag"] = tag
+            return SimpleNamespace(**fields)
+        return seen
+
+    monkeypatch.setattr(atomic_write.os, "lstat", lstat)
+    fd = os.open(lock, os.O_RDWR)
+    try:
+        if accepted:
+            atomic_write.check_plain_file(fd, "gateway.lock", str(tmp_path), None)
+        else:
+            with pytest.raises(atomic_write.PlainFileRefused):
+                atomic_write.check_plain_file(fd, "gateway.lock", str(tmp_path), None)
+    finally:
+        os.close(fd)

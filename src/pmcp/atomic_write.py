@@ -705,6 +705,10 @@ def _fsync_dir(dir_fd: int) -> None:
 # --------------------------------------------------------------------------- #
 
 
+#: The reparse-tag bit of a name surrogate (symlink, junction, mount point).
+IO_REPARSE_TAG_NAME_SURROGATE = 0x20000000
+
+
 class PlainFileRefused(OSError):
     """The name is not a plain regular file: a link, a reparse point, another
     file type, or a file with other names."""
@@ -728,7 +732,10 @@ def check_plain_file(fd: int, name: str, parent: str, dir_fd: int | None) -> Non
     except OSError as exc:
         raise PlainFileRefused(f"{name} changed while it was opened") from exc
     tag: int = getattr(entry, "st_reparse_tag", 0) or 0
-    if stat.S_ISLNK(entry.st_mode) or tag:
+    # Only a reparse point that NAMES another entry (a symlink, a junction, a
+    # mount point) is a link; a cloud-file placeholder or a dedup stub is the
+    # file itself (Consiliency/pmcp#372 round 36, as the HOME walk since 29).
+    if stat.S_ISLNK(entry.st_mode) or tag & IO_REPARSE_TAG_NAME_SURROGATE:
         raise PlainFileRefused(f"{name} is a link")
     if not _same_file(entry, held):
         raise PlainFileRefused(f"{name} changed while it was opened")
@@ -768,6 +775,7 @@ FILE_ATTRIBUTE_NORMAL = 0x80
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 FILE_TYPE_DISK = 0x1
+FILE_ATTRIBUTE_TAG_INFO_CLASS = 9  # FileAttributeTagInfo
 ERROR_FILE_NOT_FOUND = 2
 ERROR_FILE_EXISTS = 80
 ERROR_ALREADY_EXISTS = 183
@@ -796,6 +804,19 @@ def _by_handle_information() -> Any:
         ]
 
     return ByHandleFileInformation()
+
+
+def _attribute_tag_information() -> Any:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("FileAttributes", wintypes.DWORD),
+            ("ReparseTag", wintypes.DWORD),
+        ]
+
+    return FileAttributeTagInfo()
 
 
 def _windows_files() -> Any:
@@ -827,6 +848,13 @@ def _windows_files() -> Any:
             ctypes.c_void_p,
         ]
         kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+        kernel32.GetFileInformationByHandleEx.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
         kernel32.GetFileType.argtypes = [wintypes.HANDLE]
         kernel32.GetFileType.restype = wintypes.DWORD
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
@@ -877,12 +905,25 @@ def _open_windows(
         if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
             raise _windows_error(layer.get_last_error(), name)
         if (
-            info.dwFileAttributes
-            & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
+            info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY
             or kernel32.GetFileType(handle) != FILE_TYPE_DISK
             or info.nNumberOfLinks != 1
         ):
             raise PlainFileRefused(f"{name} is not a plain regular file")
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT:
+            # A reparse point opened as itself: refused only when it names
+            # another entry (symlink, junction, mount point) -- a cloud-file
+            # placeholder or a dedup stub is the file itself.
+            tagged = _attribute_tag_information()
+            if not kernel32.GetFileInformationByHandleEx(
+                handle,
+                FILE_ATTRIBUTE_TAG_INFO_CLASS,
+                ctypes.byref(tagged),
+                ctypes.sizeof(tagged),
+            ):
+                raise _windows_error(layer.get_last_error(), name)
+            if tagged.ReparseTag & IO_REPARSE_TAG_NAME_SURROGATE:
+                raise PlainFileRefused(f"{name} is a link")
         fd: int = layer.open_osfhandle(handle, os.O_RDWR if write else os.O_RDONLY)
     except BaseException:
         kernel32.CloseHandle(handle)

@@ -251,21 +251,23 @@ def _is_link(seen: os.stat_result) -> bool:
 def _physical_lock_dir(lock_dir: Path, home_scoped: bool) -> Path | None:
     """The directory the lock lives in. An explicit ``--lock-dir`` is used as
     spelled, and a link there is refused later (a repository can supply that
-    path). The default ``~/.pmcp`` may be the operator's own link (dotfiles):
-    it is followed only to where the HOME gate's rules say it physically is
-    -- no checkout holding a link on the way, none above the place it lands
-    (Consiliency/pmcp#372 round 35). ``None``: refused."""
+    path). The default ``~/.pmcp`` is judged by THE rule for home-scoped state
+    (``trust_store.home_scoped_location``, the trust store's own), so a
+    dotfiles-linked ``~/.pmcp`` is accepted exactly where a dotfiles-linked
+    ``~/.config/pmcp`` is (Consiliency/pmcp#372 round 36); the lock lives in
+    the physical directory that rule resolves to. ``None``: refused."""
     if not home_scoped:
         return lock_dir
+    from pmcp.trust_store import TrustStoreError, home_scoped_location
+
     try:
-        seen = os.lstat(lock_dir)
+        where = home_scoped_location(lock_dir.name, _LOCK_NAME, label="Singleton lock")
+    except TrustStoreError:
+        return None
+    try:
+        return Path(os.path.realpath(os.path.dirname(where), strict=True))
     except OSError:
         return None
-    if not _is_link(seen):
-        return lock_dir
-    from pmcp.home_identity import operator_location
-
-    return operator_location(lock_dir)
 
 
 def _directory_at(lock_dir: Path, directory: int | None) -> tuple[int, int] | None:
