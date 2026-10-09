@@ -1649,6 +1649,13 @@ def _find_project_manifest(project_root: Path | None = None) -> Path | None:
         current = root.resolve()
     except (OSError, RuntimeError):  # RuntimeError: a link loop, before 3.13
         return None
+    from pmcp.atomic_write import same_directory_as_kernel
+
+    # An explicit project root is spelled by the operator: the directory
+    # resolve() names must be the one the system opens for that spelling
+    # (Consiliency/pmcp#372 round 39; resolve() collapses `file/..`).
+    if not same_directory_as_kernel(root, current):
+        return None
     candidate = current / ".pmcp" / "manifest.yaml"
     if candidate.exists():
         try:

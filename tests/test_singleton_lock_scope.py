@@ -2028,3 +2028,189 @@ def test_a_write_and_search_only_dot_pmcp_still_holds_the_lock(
         identity.release_singleton_lock()
         os.chmod(home / ".pmcp", 0o700)
     assert (home / ".pmcp" / "gateway.lock").read_text() == str(os.getpid())
+
+
+# --------------------------------------------------------------------------- #
+# Board round 38, grok F001: os.path.realpath(strict=True) on 3.10-3.12
+# collapses a link whose text is `file/../secret` onto `secret`, while the
+# kernel refuses that spelling (ENOTDIR). The lock folder, the probe and the
+# stores' folder must be the directory the system opens for the operator's
+# own spelling: atomic_write.same_directory_as_kernel, refused otherwise.
+# --------------------------------------------------------------------------- #
+
+
+def test_grok_r38_f001_a_file_dotdot_lock_directory_is_not_the_collapsed_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity, identity, trust_store
+
+    base = tmp_path.resolve()
+    home = base / "home"
+    home.mkdir()
+    (home / "file").write_bytes(b"x")
+    secret = home / "secret"
+    secret.mkdir()
+    sentinel = b"ORIGINAL-SENTINEL\n"
+    (secret / "gateway.lock").write_bytes(sentinel)
+    (home / ".pmcp").symlink_to("file/../secret")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(home_identity, "has_checkout_marker", lambda _directory: False)
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    monkeypatch.setattr(identity, "_LOCK_FILE", None)
+    monkeypatch.setattr(trust_store, "_active_project_root", None)
+    launch = base / "launch"
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+    trust_store.reset_launch_directory()
+    home_identity.forget_home_verdicts()
+    with pytest.raises(NotADirectoryError):
+        os.open(home / ".pmcp", os.O_RDONLY | os.O_DIRECTORY)
+    assert identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "unusable"
+    assert (secret / "gateway.lock").read_bytes() == sentinel
+
+
+def _kernel_shape(home: Path, shape: str) -> str:
+    """Link text for ~/.pmcp or ~/.config/pmcp that the kernel refuses."""
+    (home / "file").write_bytes(b"x")
+    (home / "secret").mkdir(exist_ok=True)
+    if shape == "file/../secret":
+        return "file/../secret"
+    if shape == "a link to a file, then ..":
+        (home / "to-file").symlink_to(home / "file")
+        return "to-file/../secret"
+    if shape == "a loop":
+        (home / "loop-a").symlink_to(home / "loop-b")
+        (home / "loop-b").symlink_to(home / "loop-a")
+        return "loop-a"
+    raise AssertionError(shape)
+
+
+@pytest.mark.parametrize(
+    "shape", ["file/../secret", "a link to a file, then ..", "a loop"]
+)
+def test_a_lock_folder_the_kernel_refuses_is_refused(
+    shape: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    home, _outside = _audit_home(tmp_path, monkeypatch)
+    (home / ".pmcp").rmdir()
+    (home / ".pmcp").symlink_to(_kernel_shape(home, shape))
+    (home / "secret" / "gateway.lock").write_bytes(b"SENTINEL\n")
+    before = _tree(home)
+    assert identity.acquire_singleton_lock() is False
+    assert identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "unusable"
+    assert _tree(home) == before
+
+
+@pytest.mark.parametrize(
+    "shape", ["file/../secret", "a link to a file, then ..", "a loop"]
+)
+def test_a_store_folder_the_kernel_refuses_is_refused(
+    shape: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same spellings as ~/.config/pmcp: the trust store, the approvals
+    store and both sidecars refuse, and nothing is written."""
+    from pmcp import package_approvals, trust_store
+    from pmcp.manifest.package_identity import PackageIdentity
+    from pmcp.trust_store import TrustStoreError
+
+    home, _outside = _audit_home(tmp_path, monkeypatch)
+    (home / ".config" / "pmcp").rmdir()
+    (home / ".config" / "pmcp").symlink_to(
+        os.path.join("..", _kernel_shape(home, shape))
+    )
+    before = _tree(home)
+    with pytest.raises(TrustStoreError):
+        trust_store.trust_store_path()
+    with pytest.raises(TrustStoreError):
+        package_approvals.package_approvals_path()
+    project = tmp_path.resolve() / "project"
+    project.mkdir()
+    (project / ".mcp.json").write_bytes(b"{}")
+    with pytest.raises(TrustStoreError):
+        trust_store.record(
+            project / ".mcp.json",
+            b"{}",
+            trust_store.PROJECT_SCOPE,
+            trust_store.APPROVED,
+        )
+    with pytest.raises(TrustStoreError):
+        package_approvals.approve_package(
+            PackageIdentity("npm", "x-mcp", "1.0.0", None)
+        )
+    assert _tree(home) == before
+
+
+def test_a_dot_pmcp_that_is_a_file_is_refused_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity
+
+    home, _outside = _audit_home(tmp_path, monkeypatch)
+    (home / ".pmcp").rmdir()
+    (home / ".pmcp").write_bytes(b"not a folder\n")
+    assert identity.acquire_singleton_lock() is False
+    assert identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "unusable"
+    assert (home / ".pmcp").read_bytes() == b"not a folder\n"
+
+
+def test_an_explicit_project_root_the_kernel_refuses_supplies_no_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same divergence in the manifest overlay's project root: an
+    explicit `--project a/file/../b` is not read as `a/b`."""
+    from pmcp.manifest import loader
+
+    base = tmp_path.resolve()
+    (base / "a").mkdir()
+    (base / "a" / "file").write_bytes(b"x")
+    (base / "a" / "b" / ".pmcp").mkdir(parents=True)
+    (base / "a" / "b" / ".pmcp" / "manifest.yaml").write_text("servers: {}\n")
+    (base / "a" / "b" / ".git").mkdir()
+    spelled = base / "a" / "file" / ".." / "b"
+    assert loader._find_project_manifest(base / "a" / "b") is not None
+    assert loader._find_project_manifest(spelled) is None
+
+
+def test_a_resolver_that_names_another_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Agreement is by identity, not only by type: a resolver naming a
+    different, real directory than the system opens is refused."""
+    from pmcp import identity, trust_store
+
+    home, outside = _audit_home(tmp_path, monkeypatch)
+    real_realpath = os.path.realpath
+
+    def realpath(path: Any, *args: Any, **kwargs: Any) -> str:
+        if os.fspath(path) == str(home / ".pmcp"):
+            return str(outside)
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(trust_store.os.path, "realpath", realpath)
+    assert identity.acquire_singleton_lock() is False
+    assert not (outside / "gateway.lock").exists()
+
+
+def test_a_folder_swapped_between_its_check_and_its_open_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The descriptor the shared rule opens must still be the directory the
+    system opens for the operator's spelling."""
+    from pmcp import atomic_write, identity, trust_store
+
+    home, outside = _audit_home(tmp_path, monkeypatch)
+    if not atomic_write._DIR_FD_SUPPORTED:
+        pytest.skip("directory descriptors")
+    real_open_directory = trust_store.open_directory
+
+    def open_elsewhere(path: Any, **kwargs: Any) -> int:
+        if os.fspath(path) == os.path.realpath(home / ".pmcp"):
+            return real_open_directory(outside, **kwargs)
+        return real_open_directory(path, **kwargs)
+
+    monkeypatch.setattr(trust_store, "open_directory", open_elsewhere)
+    assert identity.acquire_singleton_lock() is False
+    assert not (outside / "gateway.lock").exists()

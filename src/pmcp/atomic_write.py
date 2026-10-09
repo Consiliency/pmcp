@@ -298,6 +298,23 @@ def open_directory(
     return os.open(path, flags, dir_fd=dir_fd)
 
 
+def same_directory_as_kernel(spelled: Path | str, resolved: Path | str) -> bool:
+    """Does the system, given the operator's own spelling, open the very
+    directory a resolver named? ``os.stat`` of ``spelled`` follows links the
+    way the kernel does -- including refusing ``file/..`` (ENOTDIR), which
+    ``os.path.realpath`` and ``Path.resolve`` collapse lexically on 3.10-3.12
+    -- and must land on a directory with ``resolved``'s ``(st_dev, st_ino)``.
+    Any error or mismatch: ``False``; the caller refuses
+    (Consiliency/pmcp#372 round 39, the rule the HOME walk keeps since 23).
+    """
+    try:
+        seen = os.stat(spelled)
+        named = os.stat(resolved)
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISDIR(seen.st_mode) and _same_file(seen, named)
+
+
 def falls_back_to_pathname(exc: BaseException) -> bool:
     """Should a walk that hit ``exc`` retry by pathname?
 

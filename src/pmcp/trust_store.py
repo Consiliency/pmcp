@@ -62,6 +62,7 @@ from pmcp.atomic_write import (
     open_directory,
     open_final_directory,
     resolve_write_target,
+    same_directory_as_kernel,
 )
 
 APPROVED = "approved"
@@ -376,13 +377,36 @@ def home_scoped_location(
         # shared fallback rule says so (Consiliency/pmcp#372 round 38).
         try:
             folder = os.path.realpath(spelled.parent, strict=True)
+            if not same_directory_as_kernel(spelled.parent, folder):
+                # The resolver collapsed a spelling the system refuses (or
+                # reaches elsewhere): never fall back to its answer.
+                raise NotADirectoryError(
+                    errno.ENOTDIR, "does not resolve as written", spelled.parent.name
+                )
             if _atomic_write_module._DIR_FD_SUPPORTED:
                 try:
                     fd = open_directory(folder)
                 except OSError as exc:
                     if not falls_back_to_pathname(exc):
                         raise
+                if fd is not None:
+                    # The descriptor must still be the directory the system
+                    # opens for the operator's spelling.
+                    held = os.fstat(fd)
+                    seen = os.stat(spelled.parent)
+                    if (held.st_dev, held.st_ino) != (seen.st_dev, seen.st_ino):
+                        os.close(fd)
+                        fd = None
+                        raise NotADirectoryError(
+                            errno.ENOTDIR, "changed while it was opened", name
+                        )
+        except RuntimeError as exc:  # a link loop, before 3.13
+            raise TrustStoreError(
+                f"Cannot resolve the folder of {name}: a link loop"
+            ) from exc
         except OSError as exc:
+            if fd is not None:
+                os.close(fd)
             raise TrustStoreError(
                 f"Cannot resolve the folder of {name}: "
                 f"{os.strerror(exc.errno) if exc.errno else exc}"

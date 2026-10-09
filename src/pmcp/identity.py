@@ -276,10 +276,10 @@ def _physical_lock_dir(lock_dir: Path, home_scoped: bool) -> Path | None:
         )
     except TrustStoreError:
         return None
-    try:
-        return Path(os.path.realpath(os.path.dirname(where), strict=True))
-    except OSError:
-        return None
+    # home_scoped_location has already required the folder it names to be the
+    # one the system opens for the operator's own spelling of ~/.pmcp (round
+    # 39: a lexically collapsed `file/../secret` is refused, never followed).
+    return Path(os.path.dirname(where))
 
 
 def _directory_at(lock_dir: Path, directory: int | None) -> tuple[int, int] | None:
@@ -358,7 +358,15 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
     elif isinstance(lock_dir, str):
         lock_dir = Path(lock_dir)
 
-    lock_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        # ~/.pmcp exists but is not a directory, or cannot be made: refused,
+        # value-free, like any other unusable lock path.
+        logger.warning(
+            f"Refusing the singleton lock directory {lock_dir}: {e.strerror}"
+        )
+        return False
     lock_file = lock_dir / _LOCK_NAME
     _LOCK_FILE = lock_file
     for _attempt in range(_ACQUIRE_ATTEMPTS):
