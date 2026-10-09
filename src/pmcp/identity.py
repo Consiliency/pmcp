@@ -230,11 +230,19 @@ def _unlock_fd(fd: TextIO) -> None:
 
 
 def _lock_dir_fd(lock_dir: Path) -> int | None:
-    """The lock directory, opened, where ``dir_fd`` opens are supported."""
-    if os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd:
+    """The lock directory, opened through THE directory helper
+    (``atomic_write.open_directory``: O_PATH where it exists, so a folder the
+    user may write and search but not list -- 0300, 0311 -- still opens), where
+    directory descriptors are supported (``atomic_write._DIR_FD_SUPPORTED``).
+    ``None`` -- the pathname form, every check made by path -- on Windows, on
+    a platform without descriptor operations, or when the open fails
+    (Consiliency/pmcp#372 round 38)."""
+    from pmcp import atomic_write
+
+    if not atomic_write._DIR_FD_SUPPORTED:
         return None
     try:
-        return os.open(lock_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        return atomic_write.open_directory(lock_dir)
     except OSError:
         return None
 

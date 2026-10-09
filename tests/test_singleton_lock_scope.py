@@ -1817,3 +1817,214 @@ def test_a_dotfiles_linked_store_file_is_written_through_by_design(
         )
         assert "linked-mcp" in target.read_text()
     assert link.is_symlink()
+
+
+# --------------------------------------------------------------------------- #
+# Board round 37 (grok, codex, gemini F001): home_scoped_location's new
+# folder-only branch opened the folder with a raw os.open -- which Windows
+# cannot do and a write+search-only (0300) folder refuses -- instead of THE
+# directory helper. Every directory open goes through
+# atomic_write.open_directory and its one fallback rule
+# (tests/test_store_path_resolution.py now scans identity.py too, and the
+# getattr(os, "O_DIRECTORY") spelling).
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_r37_f001_default_lock_without_directory_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import errno
+    from types import SimpleNamespace
+
+    from pmcp import atomic_write, home_identity, identity, trust_store
+
+    base = tmp_path.resolve()
+    home = base / "home"
+    lock_dir = home / ".pmcp"
+    lock_dir.mkdir(parents=True)
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    marker = home_identity.has_checkout_marker
+    ambient = set(base.parents)
+    monkeypatch.setattr(
+        home_identity,
+        "has_checkout_marker",
+        lambda p: False if Path(p) in ambient else marker(p),
+    )
+    seen = home.stat()
+    monkeypatch.setattr(
+        trust_store, "_LAUNCH_DIRECTORY", (home, (seen.st_dev, seen.st_ino))
+    )
+    monkeypatch.setattr(trust_store, "_active_project_root", None)
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    monkeypatch.setattr(identity, "_LOCK_FILE", None)
+    filesystem = SimpleNamespace(
+        **{k: v for k, v in vars(os).items() if k != "O_DIRECTORY"}
+    )
+    filesystem.supports_dir_fd = set()
+
+    def crt_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if os.path.isdir(path):
+            raise PermissionError(errno.EACCES, "directory open unavailable")
+        return os.open(path, flags, *args, **kwargs)
+
+    filesystem.open = crt_open
+    monkeypatch.setattr(trust_store, "os", filesystem)
+    monkeypatch.setattr(atomic_write, "_DIR_FD_SUPPORTED", False)
+    monkeypatch.setattr(identity, "_lock_dir_fd", lambda _path: None)
+    home_identity.forget_home_verdicts()
+    try:
+        assert trust_store.trust_store_path() == home / ".config/pmcp/trust.json"
+        assert identity.acquire_singleton_lock() is True
+        assert identity.singleton_lock_held(lock_dir, home_scoped=True) == "held"
+    finally:
+        identity.release_singleton_lock()
+        home_identity.forget_home_verdicts()
+
+
+def _gemini_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    import errno
+
+    from pmcp import home_identity, identity, trust_store
+
+    base = tmp_path.resolve()
+    home = base / "home"
+    (home / ".pmcp").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(home_identity, "has_checkout_marker", lambda d: False)
+    monkeypatch.setattr(trust_store, "_active_project_root", None)
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    monkeypatch.setattr(identity, "_LOCK_FILE", None)
+    home_identity.forget_home_verdicts()
+    real_open = os.open
+
+    def win32_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if os.path.isdir(path):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", win32_open)
+    return home
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "As filed, this models Windows' directory opens on top of Linux's full "
+        "descriptor capability set (O_PATH, dir_fd). Under that model the shared "
+        "rule -- falls_back_to_pathname: no pathname fallback where O_PATH exists "
+        "-- refuses the TRUST STORE too (see the companion test), and the lock "
+        "follows the stores' rule. Real Windows has neither O_DIRECTORY nor "
+        "dir_fd opens and takes the pathname form: see "
+        "test_codex_r37_f001_default_lock_without_directory_descriptors and "
+        "test_the_default_lock_works_on_a_windows_capability_model."
+    ),
+)
+def test_gemini_r37_f001_windows_singleton_lock_without_dir_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import home_identity, identity
+
+    _gemini_model(tmp_path, monkeypatch)
+    acquired = identity.acquire_singleton_lock()
+    try:
+        assert acquired is True
+    finally:
+        identity.release_singleton_lock()
+        home_identity.forget_home_verdicts()
+
+
+def test_under_the_gemini_model_the_lock_agrees_with_the_stores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import identity, trust_store
+
+    home = _gemini_model(tmp_path, monkeypatch)
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    try:
+        trust_store.trust_store_path()
+        stores = True
+    except trust_store.TrustStoreError:
+        stores = False
+    try:
+        lock = identity.acquire_singleton_lock()
+    finally:
+        identity.release_singleton_lock()
+    assert lock is stores
+
+
+def _windows_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows' capability set, consistently: no directory os.open, no
+    O_DIRECTORY / O_PATH, no dir_fd operations, no O_NOFOLLOW for files."""
+    import errno
+
+    from pmcp import atomic_write
+
+    real_open = os.open
+
+    def crt_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if "dir_fd" in kwargs:
+            raise NotImplementedError("dir_fd unavailable on this platform")
+        if os.path.isdir(path):
+            raise PermissionError(errno.EACCES, "directory open unavailable")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", crt_open)
+    for name in ("O_DIRECTORY", "O_PATH"):
+        monkeypatch.delattr(os, name, raising=False)
+    monkeypatch.setattr(os, "supports_dir_fd", set())
+    monkeypatch.setattr(atomic_write, "_DIR_FD_SUPPORTED", False)
+    monkeypatch.setattr(atomic_write, "_O_PATH", 0)
+
+
+def test_the_default_lock_works_on_a_windows_capability_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default lock, doctor's probe and both store sidecars work by pathname;
+    a leaf link at the lock is still refused."""
+    from pmcp import home_identity, identity, package_approvals, trust_store
+
+    home, outside = _audit_home(tmp_path, monkeypatch)
+    _windows_capabilities(monkeypatch)
+    home_identity.forget_home_verdicts()
+    try:
+        assert identity.acquire_singleton_lock() is True
+        assert identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "held"
+    finally:
+        identity.release_singleton_lock()
+    with trust_store._store_lock(trust_store.trust_store_path()):
+        pass
+    with package_approvals._store_lock(package_approvals.package_approvals_path()):
+        pass
+    victim = outside / "victim"
+    victim.write_bytes(b"keep\n")
+    (home / ".pmcp" / "gateway.lock").unlink()
+    (home / ".pmcp" / "gateway.lock").symlink_to(victim)
+    assert identity.acquire_singleton_lock() is False
+    assert victim.read_bytes() == b"keep\n"
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs POSIX permissions and a non-root process",
+)
+@pytest.mark.parametrize("o_path", [True, False], ids=["O_PATH", "no-O_PATH"])
+@pytest.mark.parametrize("mode", [0o300, 0o311])
+def test_a_write_and_search_only_dot_pmcp_still_holds_the_lock(
+    mode: int, o_path: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp import atomic_write, home_identity, identity
+
+    home, _outside = _audit_home(tmp_path, monkeypatch)
+    if not o_path:
+        monkeypatch.setattr(atomic_write, "_O_PATH", 0)
+    home_identity.forget_home_verdicts()
+    os.chmod(home / ".pmcp", mode)
+    try:
+        assert identity.acquire_singleton_lock() is True
+        assert identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "held"
+    finally:
+        identity.release_singleton_lock()
+        os.chmod(home / ".pmcp", 0o700)
+    assert (home / ".pmcp" / "gateway.lock").read_text() == str(os.getpid())

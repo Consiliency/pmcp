@@ -681,6 +681,9 @@ OPENER_MODULES = (
     "trust_store.py",
     "package_approvals.py",
     "env_store.py",
+    # The singleton lock (Consiliency/pmcp#372 round 38: its folder was opened
+    # with a raw os.open that Windows cannot do and a 0300 folder refuses).
+    "identity.py",
 )
 #: Functions allowed to open a directory directly, with the reason.
 OPENER_ALLOWED = {
@@ -697,6 +700,8 @@ def _directory_opens(tree: ast.AST) -> list[tuple[int, str]]:
         return any(
             (isinstance(n, ast.Attribute) and n.attr in DIRECTORY_FLAG_NAMES)
             or (isinstance(n, ast.Name) and n.id in DIRECTORY_FLAG_NAMES)
+            # getattr(os, "O_DIRECTORY", 0): the spelling round 37 slipped by.
+            or (isinstance(n, ast.Constant) and n.value in DIRECTORY_FLAG_NAMES)
             for n in ast.walk(node)
         )
 
@@ -738,8 +743,9 @@ def test_the_directory_open_scan_sees_each_form() -> None:
         "    os.open(p, _walk_flags(), dir_fd=fd)\n"
         "    os.open(p, flags)\n"
         "    os.open(p, os.O_PATH)\n"
+        "    os.open(p, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))\n"
     )
-    assert len(_directory_opens(tree)) == 3
+    assert len(_directory_opens(tree)) == 4
 
 
 def _approval_payload() -> bytes:

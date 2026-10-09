@@ -369,9 +369,19 @@ def home_scoped_location(
     # different file than the kernel would (see Consiliency/pmcp#374).
     fd: int | None = None
     if not resolve_leaf:
+        # The folder only: resolved by the system (strictly), opened through
+        # THE directory helper where descriptors are supported -- O_PATH, so a
+        # folder the user may search but not list (0300) still opens -- and
+        # judged by pathname otherwise (Windows, no dir_fd) or where the
+        # shared fallback rule says so (Consiliency/pmcp#372 round 38).
         try:
             folder = os.path.realpath(spelled.parent, strict=True)
-            fd = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            if _atomic_write_module._DIR_FD_SUPPORTED:
+                try:
+                    fd = open_directory(folder)
+                except OSError as exc:
+                    if not falls_back_to_pathname(exc):
+                        raise
         except OSError as exc:
             raise TrustStoreError(
                 f"Cannot resolve the folder of {name}: "
@@ -381,7 +391,8 @@ def home_scoped_location(
         try:
             refuse_checkout_resident(target, label, dir_fd=fd, also=also)
         finally:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
         return Path(target)
     try:
         if is_absent(spelled.parent):
