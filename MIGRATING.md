@@ -611,6 +611,12 @@ If your home directory lies inside a repository checkout, move it out.
 **How to verify.** `pmcp guidance` prints your settings and stderr has no `Ignoring the
 operator's files` line.
 
+**If your home directory is itself a checkout.** A dotfiles repository at your home
+directory is accepted because you chose it. Its files are then your home-scoped files,
+including `~/.config/pmcp/trust.json` and the package-approval store. Anything committed
+to that repository, or pulled into it, is trusted as yours. Don't point `HOME` at a
+checkout you didn't create.
+
 ### Discovered servers are default-deny
 
 **Am I affected?** You are if your agents use `gateway.search_registry` and
@@ -776,6 +782,12 @@ guidance:
 export the token, a confirmed call returns `"submitted": false` and a message
 naming `PMCP_FEEDBACK_TOKEN`. After you export it, the call reports
 `submission_outcome: "created"` and an `issue_url`.
+
+If the call is still refused with `untrusted_token` after you export the token, a file
+pmcp loads lists `PMCP_FEEDBACK_TOKEN`. The file might be the served checkout's `.env`
+or `.env.pmcp`, or `~/.config/pmcp/pmcp.env`. pmcp won't post under a name a loaded file
+could have supplied, even if you exported the value yourself, so a checkout that merely
+lists the key blocks submission. Remove the key from that file.
 
 ### Auth URLs must be canonical
 

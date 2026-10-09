@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [3.0.0] - 2026-10-04
+## [3.0.0] - 2026-10-09
 
 ### Upgrade notes
 Things 2.7.3 accepted that 3.0.0 refuses, and defaults or output that changed. This is a major release because of them: upgrading can stop a project's servers from loading until you approve its files (first item below).
