@@ -111,8 +111,10 @@ to do, how to verify it, and how to roll back to 2.7.3.
   `HOME` (`USERPROFILE` on Windows) is absolute, has no `.` or `..` component and
   resolves, and no checkout lies above the home directory or holds a link on the way to
   it. Otherwise pmcp prints `pmcp: Ignoring the operator's files under the home
-  directory: …` once, runs without those files, creates nothing there, and refuses every
-  trust and package-approval decision. A dotfiles repository at the home directory, your
+  directory: …` once, creates nothing there, and refuses every trust and
+  package-approval decision; the gateway does not start with its default lock under
+  `~/.pmcp` (it exits with status 1), and started with `--lock-dir` outside any checkout
+  it runs without those files. A dotfiles repository at the home directory, your
   own links (`/home -> /var/home`) and a filesystem or drive root holding a marker (a
   container's `/package.json`) are fine. 2.7.3 used whatever `HOME` named. *Security*
 - **Discovered servers are default-deny.** `gateway.register_discovered_server` resolves

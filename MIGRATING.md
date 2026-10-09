@@ -45,6 +45,7 @@ log is `~/.pmcp/logs/gateway.log`.
   [symlinked `.mcp.json`](#a-symlinked-mcpjson-is-no-longer-edited) ·
   [`NaN`](#nan-from-httpsse-servers) ·
   [error text](#error-text-names-the-real-failure) ·
+  [cancelled teardown](#a-cancelled-teardown-kills-stdio-servers-at-once) ·
   [stop gateways first](#stop-every-running-gateway-before-upgrading) ·
   [known issues](#known-issues-in-300)
 - [Other things you may notice](#other-things-you-may-notice)
@@ -593,9 +594,11 @@ stores, the registry caches and the singleton lock -- only while the home direct
 yours by the rule above. Otherwise it prints `pmcp: Ignoring the operator's files under
 the home directory: HOME is not a plain absolute path the system resolves; set HOME to a
 plain absolute path` (or `... the home directory lies inside a checkout`) once on
-stderr, runs without those files, creates nothing under that home, and refuses every
-trust and package-approval decision, so `pmcp trust approve` and `pmcp secrets set
---scope user` fail. 2.7.3 used whatever `HOME` named. Only you set `HOME`, so a
+stderr, creates nothing under that home, and refuses every trust and package-approval
+decision, so `pmcp trust approve` and `pmcp secrets set --scope user` fail. The gateway
+itself does not start with its default lock under `~/.pmcp`: it exits with status 1
+and `Fatal error: [Errno 1] …` repeating that reason. Started with `--lock-dir` (or
+`PMCP_LOCK_DIR`) naming a directory outside any checkout, it runs without those files. 2.7.3 used whatever `HOME` named. Only you set `HOME`, so a
 spelling pmcp cannot judge exactly is refused rather than guessed at.
 
 **What to do.** Set `HOME` to the absolute path of your home directory, with no `.` or
@@ -783,11 +786,12 @@ export the token, a confirmed call returns `"submitted": false` and a message
 naming `PMCP_FEEDBACK_TOKEN`. After you export it, the call reports
 `submission_outcome: "created"` and an `issue_url`.
 
-If the call is still refused with `untrusted_token` after you export the token, a file
-pmcp loads lists `PMCP_FEEDBACK_TOKEN`. The file might be the served checkout's `.env`
-or `.env.pmcp`, or `~/.config/pmcp/pmcp.env`. pmcp won't post under a name a loaded file
-could have supplied, even if you exported the value yourself, so a checkout that merely
-lists the key blocks submission. Remove the key from that file.
+If the call is still refused with `untrusted_token` after you export the token, one
+of pmcp's stores lists `PMCP_FEEDBACK_TOKEN`: the served checkout's `.env.pmcp` or
+`~/.config/pmcp/pmcp.env`. pmcp won't post under a name a store could have supplied,
+even if you exported the value yourself, so a checkout whose `.env.pmcp` merely lists
+the key blocks submission. Remove the key from that file. A plain `.env` never
+supplies it and doesn't block.
 
 ### Auth URLs must be canonical
 
