@@ -281,8 +281,16 @@ jobs:
       # unpinned tool fetched at run time is the same supply-chain shape #217
       # closed for actions. The advisory DATA is still fetched fresh, which is
       # the part that must not be pinned.
-      - name: pip-audit (resolved environment)
-        run: uv run --locked --with pip-audit==2.9.0 pip-audit --progress-spinner off --strict
+      # Audit the locked dependency set, not the project itself: with --strict,
+      # pip-audit fails on any package it cannot find on PyPI, and on a release
+      # PR the project's new version is not published yet (3.0.0 hit this;
+      # --skip-editable is also an error under --strict). The exported set is
+      # exactly what `uv sync --locked --all-extras --dev` installs, minus the
+      # project, with hashes, so pip itself is not needed.
+      - name: pip-audit (locked dependencies)
+        run: |
+          uv export --locked --all-extras --dev --no-emit-project --format requirements-txt -o "$RUNNER_TEMP/requirements.txt"
+          uv run --locked --with pip-audit==2.9.0 pip-audit --progress-spinner off --strict --disable-pip -r "$RUNNER_TEMP/requirements.txt"
 
   # 2.0.1 and 2.1.0 both merged feature PRs against an empty [Unreleased]
   # block, so the maintainer had to hand-backfill CHANGELOG.md at release
