@@ -255,13 +255,17 @@ def _physical_lock_dir(lock_dir: Path, home_scoped: bool) -> Path | None:
     (``trust_store.home_scoped_location``, the trust store's own), so a
     dotfiles-linked ``~/.pmcp`` is accepted exactly where a dotfiles-linked
     ``~/.config/pmcp`` is (Consiliency/pmcp#372 round 36); the lock lives in
-    the physical directory that rule resolves to. ``None``: refused."""
+    the physical FOLDER that rule resolves to. The leaf ``gateway.lock`` is
+    never resolved: it is opened in that folder without following a link
+    (round 37). ``None``: refused."""
     if not home_scoped:
         return lock_dir
     from pmcp.trust_store import TrustStoreError, home_scoped_location
 
     try:
-        where = home_scoped_location(lock_dir.name, _LOCK_NAME, label="Singleton lock")
+        where = home_scoped_location(
+            lock_dir.name, _LOCK_NAME, label="Singleton lock", resolve_leaf=False
+        )
     except TrustStoreError:
         return None
     try:

@@ -321,7 +321,12 @@ def trust_store_path(*, also: tuple[Path, ...] = ()) -> Path:
     )
 
 
-def home_scoped_location(*parts: str, label: str, also: tuple[Path, ...] = ()) -> Path:
+def home_scoped_location(
+    *parts: str,
+    label: str,
+    also: tuple[Path, ...] = (),
+    resolve_leaf: bool = True,
+) -> Path:
     """THE rule for a home-scoped file pmcp keeps its own state in: the trust
     store, and the singleton lock's default directory (Consiliency/pmcp#372
     round 36: one rule, one code path -- whatever a dotfiles-linked
@@ -331,6 +336,12 @@ def home_scoped_location(*parts: str, label: str, also: tuple[Path, ...] = ()) -
     refused if it lands in a checkout being judged. HOME itself never counts
     as one (a dotfiles repository at home, or ``~/.pmcp/manifest.yaml``, does
     not make it a checkout). Raises ``TrustStoreError``.
+
+    ``resolve_leaf``: the stores' files follow a final link (a dotfiles-linked
+    ``trust.json`` is written through, Consiliency/pmcp#248), so the place
+    judged is where it leads. ``False`` (the singleton lock): only the FOLDER
+    is resolved and judged; the leaf is never looked through -- the caller
+    opens it without following a link (Consiliency/pmcp#372 round 37).
     """
     name = parts[-1]
     # Home-scoped (Consiliency/pmcp#372 round 22): refused while a checkout
@@ -357,6 +368,21 @@ def home_scoped_location(*parts: str, label: str, also: tuple[Path, ...] = ()) -
     # never Path.resolve(), whose lexical `missing/..` collapse once named a
     # different file than the kernel would (see Consiliency/pmcp#374).
     fd: int | None = None
+    if not resolve_leaf:
+        try:
+            folder = os.path.realpath(spelled.parent, strict=True)
+            fd = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        except OSError as exc:
+            raise TrustStoreError(
+                f"Cannot resolve the folder of {name}: "
+                f"{os.strerror(exc.errno) if exc.errno else exc}"
+            ) from exc
+        target = os.path.join(folder, spelled.name)
+        try:
+            refuse_checkout_resident(target, label, dir_fd=fd, also=also)
+        finally:
+            os.close(fd)
+        return Path(target)
     try:
         if is_absent(spelled.parent):
             # A fresh install: no store, no link to follow. Judge where it will

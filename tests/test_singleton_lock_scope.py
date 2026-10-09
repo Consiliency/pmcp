@@ -1654,3 +1654,166 @@ def test_a_reparse_tag_at_the_lock_name_is_judged_by_its_surrogate_bit(
                 atomic_write.check_plain_file(fd, "gateway.lock", str(tmp_path), None)
     finally:
         os.close(fd)
+
+
+# --------------------------------------------------------------------------- #
+# Board round 36, codex F001: the default lock resolved its LEAF through the
+# shared rule, so ~/.pmcp/gateway.lock -> elsewhere was followed and the PID
+# written into the target. The shared rule now resolves and judges only the
+# lock's folder; gateway.lock is opened in it without following a link.
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_r36_f001_default_lock_refuses_final_symlink(tmp_path: Path) -> None:
+    from unittest.mock import patch
+
+    from pmcp import home_identity, identity, trust_store
+
+    base = tmp_path.resolve()
+    home = base / "home"
+    lock_dir = home / ".pmcp"
+    lock_dir.mkdir(parents=True)
+    outside = base / "outside"
+    outside.mkdir()
+    victim = outside / "gateway.lock"
+    original = b"must not be overwritten\n"
+    victim.write_bytes(original)
+    (lock_dir / "gateway.lock").symlink_to(victim)
+    real_marker = home_identity.has_checkout_marker
+    ambient = set(base.parents)
+
+    def isolated_marker(directory: Any) -> bool:
+        return False if Path(directory) in ambient else real_marker(directory)
+
+    seen = home.stat()
+    with (
+        patch.dict(os.environ, {"HOME": str(home)}),
+        patch.object(home_identity, "has_checkout_marker", isolated_marker),
+        patch.object(trust_store, "_active_project_root", None),
+        patch.object(
+            trust_store, "_LAUNCH_DIRECTORY", (home, (seen.st_dev, seen.st_ino))
+        ),
+        patch.object(identity, "_LOCK_FD", None),
+        patch.object(identity, "_LOCK_FILE", None),
+    ):
+        home_identity.forget_home_verdicts()
+        try:
+            acquired = identity.acquire_singleton_lock()
+            probe = identity.singleton_lock_held(lock_dir, home_scoped=True)
+            assert (acquired, probe, victim.read_bytes()) == (
+                False,
+                "unusable",
+                original,
+            )
+        finally:
+            identity.release_singleton_lock()
+            home_identity.forget_home_verdicts()
+
+
+def _audit_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    from pmcp import home_identity, identity, trust_store
+
+    base = tmp_path.resolve()
+    home = base / "home"
+    (home / ".pmcp").mkdir(parents=True)
+    (home / ".config" / "pmcp").mkdir(parents=True)
+    original_marker = home_identity.has_checkout_marker
+    ambient = set(base.parents)
+    monkeypatch.setattr(
+        home_identity,
+        "has_checkout_marker",
+        lambda d: False if Path(d) in ambient else original_marker(d),
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(identity, "_LOCK_FD", None)
+    monkeypatch.setattr(identity, "_LOCK_FILE", None)
+    monkeypatch.setattr(trust_store, "_active_project_root", None)
+    launch = base / "launch"
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+    trust_store.reset_launch_directory()
+    home_identity.forget_home_verdicts()
+    outside = base / "outside"
+    outside.mkdir()
+    return home, outside
+
+
+@pytest.mark.parametrize("target", ["outside", "dangling"])
+@pytest.mark.parametrize(
+    "leaf",
+    [
+        ".pmcp/gateway.lock",
+        ".config/pmcp/trust.json.lock",
+        ".config/pmcp/package_approvals.json.lock",
+    ],
+)
+def test_a_leaf_link_at_a_lock_file_is_never_followed(
+    leaf: str, target: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lock and both store sidecars: a link at the leaf is refused, never
+    followed for a write, and its target is left as it was."""
+    from pmcp import identity, package_approvals, trust_store
+    from pmcp.trust_store import TrustStoreError
+
+    home, outside = _audit_home(tmp_path, monkeypatch)
+    victim = outside / "victim"
+    if target == "outside":
+        victim.write_bytes(b"keep me\n")
+    (home / leaf).symlink_to(victim)
+    if leaf == ".pmcp/gateway.lock":
+        assert identity.acquire_singleton_lock() is False
+        assert (
+            identity.singleton_lock_held(home / ".pmcp", home_scoped=True) == "unusable"
+        )
+    else:
+        store = home / leaf.removesuffix(".lock")
+        lock = (
+            trust_store._store_lock
+            if "trust" in leaf
+            else package_approvals._store_lock
+        )
+        with pytest.raises(TrustStoreError), lock(store):
+            pass
+    if target == "outside":
+        assert victim.read_bytes() == b"keep me\n"
+    else:
+        assert not victim.exists()
+    assert (home / leaf).is_symlink()
+
+
+@pytest.mark.parametrize("store", ["trust.json", "package_approvals.json"])
+def test_a_dotfiles_linked_store_file_is_written_through_by_design(
+    store: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stores' files, by contrast, follow a final link on read and write
+    -- Consiliency/pmcp#248: a dotfiles-linked store is written THROUGH, the
+    target replaced atomically and the link kept -- after the target's folder
+    is judged (refused inside a checkout being judged; see
+    test_atomic_write_symlinks)."""
+    import json
+
+    from pmcp import package_approvals, trust_store
+
+    home, outside = _audit_home(tmp_path, monkeypatch)
+    target = outside / store
+    target.write_text(json.dumps({"version": 1, "records": []}))
+    link = home / ".config" / "pmcp" / store
+    link.symlink_to(target)
+    project = tmp_path.resolve() / "project"
+    project.mkdir()
+    config = project / ".mcp.json"
+    config.write_bytes(b"{}")
+    if store == "trust.json":
+        trust_store.record(
+            config, b"{}", trust_store.PROJECT_SCOPE, trust_store.APPROVED
+        )
+        assert trust_store.trust_store_path() == target
+        assert str(config) in target.read_text()
+    else:
+        from pmcp.manifest.package_identity import PackageIdentity
+
+        package_approvals.approve_package(
+            PackageIdentity("npm", "linked-mcp", "1.0.0", None)
+        )
+        assert "linked-mcp" in target.read_text()
+    assert link.is_symlink()
