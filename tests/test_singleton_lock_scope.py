@@ -2086,15 +2086,21 @@ def _kernel_shape(home: Path, shape: str) -> str:
     raise AssertionError(shape)
 
 
+@pytest.mark.parametrize("dir_fd", [True, False], ids=["dir_fd", "pathname"])
 @pytest.mark.parametrize(
     "shape", ["file/../secret", "a link to a file, then ..", "a loop"]
 )
 def test_a_lock_folder_the_kernel_refuses_is_refused(
-    shape: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    shape: str, dir_fd: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from pmcp import identity
+    """On both routes: with directory descriptors, and by pathname (Windows,
+    where only the kernel-agreement check stands between the resolver's
+    answer and the lock)."""
+    from pmcp import atomic_write, identity
 
     home, _outside = _audit_home(tmp_path, monkeypatch)
+    if not dir_fd:
+        monkeypatch.setattr(atomic_write, "_DIR_FD_SUPPORTED", False)
     (home / ".pmcp").rmdir()
     (home / ".pmcp").symlink_to(_kernel_shape(home, shape))
     (home / "secret" / "gateway.lock").write_bytes(b"SENTINEL\n")
@@ -2174,14 +2180,18 @@ def test_an_explicit_project_root_the_kernel_refuses_supplies_no_overlay(
     assert loader._find_project_manifest(spelled) is None
 
 
+@pytest.mark.parametrize("dir_fd", [True, False], ids=["dir_fd", "pathname"])
 def test_a_resolver_that_names_another_directory_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    dir_fd: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Agreement is by identity, not only by type: a resolver naming a
-    different, real directory than the system opens is refused."""
-    from pmcp import identity, trust_store
+    different, real directory than the system opens is refused, on both
+    routes."""
+    from pmcp import atomic_write, identity, trust_store
 
     home, outside = _audit_home(tmp_path, monkeypatch)
+    if not dir_fd:
+        monkeypatch.setattr(atomic_write, "_DIR_FD_SUPPORTED", False)
     real_realpath = os.path.realpath
 
     def realpath(path: Any, *args: Any, **kwargs: Any) -> str:
