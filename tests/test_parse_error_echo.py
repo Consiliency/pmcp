@@ -3299,3 +3299,69 @@ def test_a_followed_redirect_to_a_refusing_target_is_not_logged(
         if any(f in v for f in _forbidden_any_case(s))
     }
     assert not leaked, leaked
+
+
+# --- readers main gained before the merge (Consiliency/pmcp#297 implementation)
+
+
+def test_validation_error_kinds_names_only_declared_fields_and_known_codes() -> None:
+    """`validation_error_kinds`, which #342's overlay rejections read a
+    ValidationError through: a top-level location that is not a field pmcp
+    declares reads `entry`, and an error type that is neither pydantic's own
+    code nor pmcp's reads `invalid`."""
+    from pydantic import TypeAdapter, ValidationError
+    from pydantic_core import InitErrorDetails, PydanticCustomError
+
+    from pmcp.argument_errors import validation_error_kinds
+    from pmcp.types import McpTaskInfo
+
+    s = _GRID_S
+    with pytest.raises(ValidationError) as keyed:
+        TypeAdapter(dict[str, int]).validate_python({s: "x"})
+    assert validation_error_kinds(keyed.value) == [("entry", "int_parsing")]
+    custom = ValidationError.from_exception_data(
+        "Probe",
+        [
+            InitErrorDetails(
+                type=PydanticCustomError(s, "a message"), loc=("task_id",), input={}
+            )
+        ],
+    )
+    assert validation_error_kinds(custom) == [("task_id", "invalid")]
+    with pytest.raises(ValidationError) as declared:
+        McpTaskInfo.model_validate({})
+    kinds = validation_error_kinds(declared.value)
+    assert kinds and all(field != "entry" for field, _kind in kinds), kinds
+    assert validation_error_kinds(ValueError(s)) is None
+
+
+def test_a_store_refusal_never_quotes_a_chained_value() -> None:
+    """`store_refusal` (Consiliency/pmcp#372's report of a credential-store
+    failure) renders a `ValueError` through the registry: one that chains a
+    validation error quotes nothing of it."""
+    from pathlib import Path
+
+    from pmcp.env_store import store_refusal
+
+    s = _GRID_S
+    try:
+        try:
+            raise _validation_error_with(s)
+        except Exception as inner:
+            raise ValueError(f"bad value {inner}") from inner
+    except ValueError as error:
+        text = store_refusal(Path(".env.pmcp"), error)
+    assert s not in text, text
+    assert text.startswith("refusing to write .env.pmcp"), text
+
+
+def _validation_error_with(s: str) -> Exception:
+    from pydantic import ValidationError
+
+    from pmcp.types import McpTaskInfo
+
+    try:
+        McpTaskInfo.model_validate({"task_id": {"nested": s}})
+    except ValidationError as error:
+        return error
+    raise AssertionError("not raised")
