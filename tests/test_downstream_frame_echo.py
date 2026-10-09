@@ -210,7 +210,11 @@ _DOWNSTREAM_LOGIC = textwrap.dedent(
             frame = {"jsonrpc": s, "id": rid, "result": {}}
         elif state["shape"] == "json-deep":
             head = '{"jsonrpc":"2.0","id":%s,"error":{"message":"m","data":' % json.dumps(rid)
-            return (head + "[" * 1500 + "0" + "]" * 1500 + ',"code":%s}}' % json.dumps(s)).encode()
+            # Deep enough that every supported interpreter rejects it: 3.12's
+            # json parses 1500 levels (3.10 and 3.11 do not), and then the
+            # frame is a valid one and never reaches the stdout-line record.
+            # Inline: this function runs as the downstream script's source.
+            return (head + "[" * 100_000 + "0" + "]" * 100_000 + ',"code":%s}}' % json.dumps(s)).encode()
         elif state["shape"] == "json-bigint":
             head = '{"jsonrpc":"2.0","id":%s,"error":{"message":"m","data":' % json.dumps(rid)
             return (head + "7" * 5000 + ',"code":%s}}' % json.dumps(s)).encode()
