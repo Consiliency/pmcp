@@ -45,6 +45,7 @@ log is `~/.pmcp/logs/gateway.log`.
   [symlinked `.mcp.json`](#a-symlinked-mcpjson-is-no-longer-edited) ·
   [`NaN`](#nan-from-httpsse-servers) ·
   [error text](#error-text-names-the-real-failure) ·
+  [cancelled teardown](#a-cancelled-teardown-kills-stdio-servers-at-once) ·
   [stop gateways first](#stop-every-running-gateway-before-upgrading) ·
   [known issues](#known-issues-in-300)
 - [Other things you may notice](#other-things-you-may-notice)
@@ -593,9 +594,11 @@ stores, the registry caches and the singleton lock -- only while the home direct
 yours by the rule above. Otherwise it prints `pmcp: Ignoring the operator's files under
 the home directory: HOME is not a plain absolute path the system resolves; set HOME to a
 plain absolute path` (or `... the home directory lies inside a checkout`) once on
-stderr, runs without those files, creates nothing under that home, and refuses every
-trust and package-approval decision, so `pmcp trust approve` and `pmcp secrets set
---scope user` fail. 2.7.3 used whatever `HOME` named. Only you set `HOME`, so a
+stderr, creates nothing under that home, and refuses every trust and package-approval
+decision, so `pmcp trust approve` and `pmcp secrets set --scope user` fail. The gateway
+itself does not start with its default lock under `~/.pmcp`: it exits with status 1
+and `Fatal error: [Errno 1] …` repeating that reason. Started with `--lock-dir` (or
+`PMCP_LOCK_DIR`) naming a directory outside any checkout, it runs without those files. 2.7.3 used whatever `HOME` named. Only you set `HOME`, so a
 spelling pmcp cannot judge exactly is refused rather than guessed at.
 
 **What to do.** Set `HOME` to the absolute path of your home directory, with no `.` or
@@ -610,6 +613,12 @@ If your home directory lies inside a repository checkout, move it out.
 
 **How to verify.** `pmcp guidance` prints your settings and stderr has no `Ignoring the
 operator's files` line.
+
+**If your home directory is itself a checkout.** A dotfiles repository at your home
+directory is accepted because you chose it. Its files are then your home-scoped files,
+including `~/.config/pmcp/trust.json` and the package-approval store. Anything committed
+to that repository, or pulled into it, is trusted as yours. Don't point `HOME` at a
+checkout you didn't create.
 
 ### Discovered servers are default-deny
 
@@ -776,6 +785,25 @@ guidance:
 export the token, a confirmed call returns `"submitted": false` and a message
 naming `PMCP_FEEDBACK_TOKEN`. After you export it, the call reports
 `submission_outcome: "created"` and an `issue_url`.
+
+If the call is refused with `untrusted_token`, pmcp has found that one of its files lists
+the key or supplied the value:
+
+- the served checkout's `.env.pmcp` or `~/.config/pmcp/pmcp.env` lists
+  `PMCP_FEEDBACK_TOKEN`. Either file blocks whenever it lists the key, even if you
+  exported the value yourself;
+- the `.env` pmcp loads at startup from your home directory or one of its ancestors
+  (`~/.env` for a `uv tool` or `pip --user` install) supplied the value. This happens
+  only when the process that started the gateway, often your MCP client rather than
+  your shell, did not have the token exported.
+
+To fix either case:
+1. Remove the key from `.env.pmcp` and `pmcp.env`.
+2. Export the token in the environment that starts pmcp.
+3. Restart the gateway. A running gateway remembers which names its files supplied and
+   keeps refusing until it restarts.
+
+A checkout's plain `.env` never supplies the key and doesn't block.
 
 ### Auth URLs must be canonical
 

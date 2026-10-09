@@ -1210,9 +1210,10 @@ def test_the_changelog_and_contract_state_the_units_for_tenant_servers() -> None
     """#330 board F001: the release note warns tenant servers built to the old
     seconds contract, and both docs give the unit of the snake_case alias."""
     text = (ROOT / "CHANGELOG.md").read_text()
-    unreleased = text.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-    start = unreleased.index("converted between pmcp's seconds")
-    entry = unreleased[start:].split("\n- **", 1)[0]
+    # The entry lives under [Unreleased] until a release is cut, then under that
+    # release's heading; find it wherever it is rather than in one section.
+    start = text.index("converted between pmcp's seconds")
+    entry = text[start:].split("\n- **", 1)[0]
     assert "tenant server" in entry.lower(), entry
     assert "`poll_interval`" in entry and "milliseconds" in entry
     contract = (ROOT / "specs" / "tenant-code-mode-host-contract.md").read_text()
