@@ -786,13 +786,21 @@ export the token, a confirmed call returns `"submitted": false` and a message
 naming `PMCP_FEEDBACK_TOKEN`. After you export it, the call reports
 `submission_outcome: "created"` and an `issue_url`.
 
-If the call is still refused with `untrusted_token` after you export the token, a file
-pmcp loads lists `PMCP_FEEDBACK_TOKEN`. It is one of the served checkout's `.env.pmcp`,
-`~/.config/pmcp/pmcp.env`, or the `.env` pmcp loads at startup from your home directory
-or one of its ancestors (`~/.env` for a `uv tool` or `pip --user` install). pmcp won't
-post under a name such a file could have supplied, even if you exported the value
-yourself, so a checkout whose `.env.pmcp` merely lists the key blocks submission. Remove
-the key from that file. A checkout's plain `.env` never supplies it and doesn't block.
+If the call is refused with `untrusted_token`, a file pmcp loads is involved, in one of
+two ways:
+
+- **A pmcp store lists the key.** The served checkout's `.env.pmcp` or
+  `~/.config/pmcp/pmcp.env` names `PMCP_FEEDBACK_TOKEN`. Either one blocks whenever it
+  lists the key, even if you exported the value yourself, so a checkout whose
+  `.env.pmcp` merely lists it blocks submission. Remove the key from that file.
+- **Your startup `.env` supplied the value.** pmcp loads a `.env` at startup from your
+  home directory or one of its ancestors (`~/.env` for a `uv tool` or `pip --user`
+  install), and never overrides a variable that is already set. That file blocks only
+  when the process that started the gateway, often your MCP client rather than your
+  shell, did not have the token exported, so the value came from the file. Export it in
+  the environment that starts pmcp and restart, or remove it from that file.
+
+A checkout's plain `.env` never supplies the key and doesn't block.
 
 ### Auth URLs must be canonical
 
