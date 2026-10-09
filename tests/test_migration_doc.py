@@ -106,7 +106,9 @@ _FACTS_273: tuple[tuple[str, str], ...] = (
     ),
     (
         "Spawned servers no longer inherit the keys pmcp loaded from `.env`",
-        "pmcp still loads `.env` into its own environment, but it now strips every key it loaded that way",
+        # Consiliency/pmcp#372: only a `~/.env` (or an ancestor's) enters the
+        # environment now; a project's `.env` stays in the credential map.
+        "still loads into pmcp's own environment, and pmcp now strips every key it loaded",
     ),
 )
 
@@ -1062,6 +1064,11 @@ _REVERSE_STEPS: dict[str, tuple[str, ...]] = {
         "run `pmcp guidance --telemetry off` before you restart on 2.7.3",
         "unset `PMCP_FEEDBACK_TOKEN` and `GITHUB_TOKEN`",
         "keep `gh` off the gateway's `PATH`",
+    ),
+    "A project file supplies credentials only": (
+        "2.7.3 started from that subdirectory reads only that subdirectory's `.env.pmcp`",
+        "copy the entries back into the subdirectory's `.env.pmcp`",
+        "start pmcp from the project root (`cd` to it first)",
     ),
     "Auth responses changed": ("must match the 2.7.3 texts and `500`s again",),
     "The `tools/call` gate enforces the schemas pmcp advertises": (

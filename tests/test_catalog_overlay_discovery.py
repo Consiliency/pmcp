@@ -155,15 +155,19 @@ def _one_manifest_parse() -> Any:
     from unittest.mock import patch as _patch
 
     real = loader.load_manifest
-    shared: dict[str, Any] = {}
+    shared: dict[Any, Any] = {}
+    fingerprints: dict[Any, bytes] = {}
 
     def load(*args: Any, **kwargs: Any) -> Any:
-        if args or kwargs:
+        # The tools bind their project root (Consiliency/pmcp#372) and ask
+        # for that root's manifest: shared per root, like the no-argument load.
+        if args or set(kwargs) - {"project_root"}:
             return real(*args, **kwargs)
-        if "manifest" not in shared:
-            shared["manifest"] = real()
-            shared["fingerprint"] = pickle.dumps(shared["manifest"])
-        return shared["manifest"]
+        root = kwargs.get("project_root")
+        if root not in shared:
+            shared[root] = real(**kwargs)
+            fingerprints[root] = pickle.dumps(shared[root])
+        return shared[root]
 
     with (
         _patch.object(loader, "load_manifest", load),
@@ -171,8 +175,8 @@ def _one_manifest_parse() -> Any:
         _patch("pmcp.cli_commands.secrets.load_manifest", load),
     ):
         yield
-    if "manifest" in shared:
-        assert pickle.dumps(shared["manifest"]) == shared["fingerprint"], (
+    for root, manifest in shared.items():
+        assert pickle.dumps(manifest) == fingerprints[root], (
             "a consumer mutated the manifest load_manifest() returned"
         )
 
@@ -844,7 +848,7 @@ def test_guard_refresh_survives_an_unusable_server(
 ) -> None:
     tools = _refresh_tools(monkeypatch)
     manifest = _with({"bad": _bad_server(command=5)})
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
     assert asyncio.run(tools.refresh({"reason": "test"})).ok is True
 
 
@@ -946,7 +950,7 @@ def test_the_marked_entries_load_when_no_consumer_is_stricter() -> None:
 
 
 def _request(monkeypatch: pytest.MonkeyPatch, manifest: Manifest, query: str) -> Any:
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
     return asyncio.run(_gateway().request_capability({"query": query}))
 
 
@@ -1459,7 +1463,7 @@ def test_guard_configured_default_inheritance_contains_one_entry(
     """The second line: a manifest that bypassed the overlay check."""
     bad = _bad_server(name="remote-bad", args=5, url="https://example.invalid/mcp")
     manifest = _with({"remote-bad": bad})
-    monkeypatch.setattr("pmcp.manifest.loader.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.manifest.loader.load_manifest", lambda **_k: manifest)
     config = _write(
         tmp_path / "cfg.json",
         json.dumps(
@@ -1488,7 +1492,9 @@ def test_guard_secrets_contains_one_entry(monkeypatch: pytest.MonkeyPatch) -> No
         oidc_issuer_url="https://issuer.invalid",
     )
     manifest = _with({"aaa-bad": bad, "zz-good-remote": good})
-    monkeypatch.setattr("pmcp.cli_commands.secrets.load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        "pmcp.cli_commands.secrets.load_manifest", lambda **_k: manifest
+    )
     _, _, auth_metadata, _ = _extract_required_keys(Path.cwd())
     assert "zz-good-remote" in auth_metadata
 
@@ -2849,7 +2855,11 @@ def test_codex_r6_f002_falsifier_an_inherited_argument_reaches_no_log(
 ) -> None:
     """Round 6, codex F002, verbatim in substance: a partial `.mcp.json` entry
     inherits `command: pmcp` and an argument only the overlay holds."""
-    from pmcp.config.loader import _merge_manifest_defaults, parse_config_bytes
+    from pmcp.config.loader import (
+        _credential_value_for,
+        _merge_manifest_defaults,
+        parse_config_bytes,
+    )
     from pmcp.types import ResolvedServerConfig
 
     secret = "sk-review-overlay-only-61d"
@@ -2864,7 +2874,9 @@ def test_codex_r6_f002_falsifier_an_inherited_argument_reaches_no_log(
     assert configured is not None
     partial = configured.mcpServers["puppeteer"]
     assert secret not in repr(partial)
-    inherited = _merge_manifest_defaults("puppeteer", partial, servers)  # type: ignore[arg-type]
+    inherited = _merge_manifest_defaults(
+        "puppeteer", partial, servers, _credential_value_for(None)
+    )  # type: ignore[arg-type]
     assert inherited is not None and secret in inherited.args
     resolved = ResolvedServerConfig(name="puppeteer", source="user", config=inherited)
     with caplog.at_level(logging.DEBUG):

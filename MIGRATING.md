@@ -25,6 +25,8 @@ log is `~/.pmcp/logs/gateway.log`.
   [exported `PMCP_*` variables](#pmcp_manifest_path-pmcp_config-and-pmcp_policy-must-be-exported-in-your-shell) ·
   [`.env` keys](#spawned-servers-no-longer-inherit-the-keys-pmcp-loaded-from-env) ·
   [symlinked `.env.pmcp`](#a-symlinked-project-envpmcp-is-refused) ·
+  [project files supply credentials only](#a-project-file-supplies-credentials-only) ·
+  [plain `HOME`](#home-must-be-a-plain-absolute-path) ·
   [discovered servers](#discovered-servers-are-default-deny) ·
   [`packages:` policy](#new-packages-policy-section) ·
   [feedback](#feedback-submission-is-off-by-default) ·
@@ -43,6 +45,7 @@ log is `~/.pmcp/logs/gateway.log`.
   [symlinked `.mcp.json`](#a-symlinked-mcpjson-is-no-longer-edited) ·
   [`NaN`](#nan-from-httpsse-servers) ·
   [error text](#error-text-names-the-real-failure) ·
+  [stop gateways first](#stop-every-running-gateway-before-upgrading) ·
   [known issues](#known-issues-in-300)
 - [Other things you may notice](#other-things-you-may-notice)
 - [Rolling back to 2.7.3](#rolling-back-to-273)
@@ -253,6 +256,10 @@ environment. A value loaded from `.env`, `.env.pmcp` or
 `~/.config/pmcp/pmcp.env` is ignored, so a checkout cannot redirect pmcp
 through a dotenv file.
 
+A checkout's `.env` or `.env.pmcp` no longer sets any variable at all in
+pmcp's environment; see [A project file supplies credentials
+only](#a-project-file-supplies-credentials-only).
+
 **What to do.** Export them in the environment that starts pmcp, or pass
 the equivalent flags:
 
@@ -287,8 +294,9 @@ involved:
   *installed* in. For a `uv tool` or `pip --user` install this is usually
   `~/.env`. For an editable install from a checkout it is that checkout's
   `.env`;
-- the `.env` in the gateway's working directory, which pmcp reads when it
-  checks whether a server's credential is available.
+- the `.env` at the project root (`--project`, else the root found from the
+  working directory), which pmcp reads -- into its credential map, never its
+  environment -- when it looks up a credential for that project.
 
 ```bash
 ls -l ~/.env "$PWD/.env" 2>/dev/null
@@ -297,9 +305,16 @@ ls -l ~/.env "$PWD/.env" 2>/dev/null
 Symptoms after upgrading: a server that worked now fails with an
 authentication or "missing variable" error, even though the key is in `.env`.
 
-**What changed.** pmcp still loads `.env` into its own environment, but it now
-strips every key it loaded that way from the environment of the servers it
-spawns. A server still gets **its own declared `env_var`**: the variable a
+**What changed.** A `~/.env` (in your home directory or an ancestor of it, when no
+checkout encloses that directory -- a checkout above your home owns its `.env`; and
+while `HOME` is not [a plain absolute path](#home-must-be-a-plain-absolute-path) outside
+every checkout, pmcp uses none of your home-scoped files and says so once) still
+loads into pmcp's own environment, and pmcp now strips every key it loaded that
+way from the environment of the servers it spawns. Any other `.env` -- a
+project's, or a checkout's that the install walk reaches -- never enters pmcp's
+environment at all: its values stay in pmcp's credential map, where only a
+credential lookup for that project reads them, so no spawned server inherits
+them. A server still gets **its own declared `env_var`**: the variable a
 manifest entry names as its credential, resolved from `.env` if necessary.
 Variables you export in your shell are still inherited, deliberately.
 Credentials stored with `pmcp secrets set` or `gateway.auth_connect` reach only
@@ -379,10 +394,13 @@ target, inside the project or out of it), a fifo or a socket, and you either
 run `pmcp` (any command, the gateway included) from that project's directory
 or store project credentials with `pmcp secrets set`,
 `pmcp secrets sync --to-scope project` or `gateway.auth_connect` with
-`scope="project"`:
+`scope="project"`. The same goes for a tenant store
+`.pmcp/tenants/<id>/pmcp.env`, for a `.env` in the directory the gateway
+runs from, and for a checkout's `.env` when pmcp is installed in that
+checkout's `.venv` (`uv run pmcp`, `pip install -e .`):
 
 ```bash
-ls -l .env.pmcp
+ls -l .env.pmcp .env .pmcp/tenants/*/pmcp.env
 ```
 
 **What changed.** pmcp no longer follows a symlink in a project's credential
@@ -390,7 +408,9 @@ store at all. These commands refuse a `.env.pmcp` that is a symlink, or that
 sits below a symlinked directory, before reading or writing it, and report
 `refusing to write .env.pmcp: it is a symlink`. 2.7.3 wrote your secrets
 wherever the link pointed, and in a cloned repository the repository chooses
-that target. Every `pmcp` command also loads `<cwd>/.env.pmcp` at startup; it
+that target. Every `pmcp` command also loads the served project's `.env.pmcp`
+(`--project`, else the project root found from the working directory) at
+startup; it
 now skips such a store, prints `pmcp: refusing to load .env.pmcp: it is a
 symlink` on stderr and carries on without those keys, where 2.7.3 loaded
 whatever the link pointed at. A `.env.pmcp` that is not a regular file is
@@ -400,11 +420,20 @@ or write the store, including bytes that are not UTF-8 and a `--project` path
 the system cannot resolve, comes back as `"ok": false` instead of crashing the
 command; when `pmcp secrets sync` only reads the project store, the refusal
 says `refusing to read`. The user store `~/.config/pmcp/pmcp.env` still follows
-its link. Six other readers still follow a project link (Consiliency/pmcp#367):
-remote-header auth, the tenant store, the gateway's credential-availability
-check, env stripping, the feedback gate's planted-key check and
-`pmcp secrets check`. See [Known issues](#known-issues-in-300) for what each
-reads and what that exposes. None of them hangs on a fifo. These protections
+its link.
+Every other reader of a file the repository controls reads it the same way
+(Consiliency/pmcp#367): remote-header `${VAR}` resolution (the gateway,
+`pmcp status`, `pmcp doctor`), a tenant `.pmcp/tenants/<id>/pmcp.env`, the
+gateway's credential check (which also reads the checkout's `.env`), spawn-time
+env stripping, `pmcp secrets check`, and a `.env` pmcp finds at startup by
+walking up from where it is installed, unless that file is in your home
+directory or above it. A store any of them refuses counts as empty, so a
+`${VAR}` header it used to fill is reported missing, and pmcp prints
+`pmcp: refusing to read .env.pmcp: it is a symlink` once per store in each
+configuration load; feedback submission is refused instead. A tenant id made
+only of dots (`.`, `..`) is refused. A store behind a directory pmcp cannot
+search is unreadable, not absent: pmcp warns and goes on without it, and
+feedback submission and `pmcp secrets set` refuse. These protections
 are about what a repository ships; a process already running as you that
 rewrites the store's directory while a command runs is out of scope.
 
@@ -423,6 +452,164 @@ there.
 **How to verify.** `pmcp secrets set <KEY> --scope project` stores the value
 and reports success, or the key shows up under `--scope user`. `ls -l
 .env.pmcp` shows a regular file, or nothing.
+
+### A project file supplies credentials only
+
+**Am I affected?** You are if a checkout's `.env.pmcp`, the `.env` in the
+directory pmcp runs from, or a tenant `pmcp.env` sets anything other than a
+credential a server or a remote header uses — for example `PMCP_LOG_LEVEL`,
+`PMCP_PORT`, a proxy, `NODE_OPTIONS` — or if you relied on a project file
+winning over `~/.config/pmcp/pmcp.env`:
+
+```bash
+grep -nE '^(export )?[A-Za-z_][A-Za-z0-9_]*=' .env.pmcp .env 2>/dev/null | cut -d= -f1
+```
+
+pmcp prints a line like this, without the value, for each variable it reads
+from its own environment that such a file sets:
+
+```text
+pmcp: Ignoring PMCP_LOG_LEVEL in .env.pmcp: a project file supplies credentials only, and this variable decides what pmcp or a program it starts loads, trusts or connects to, so export it in the shell that starts pmcp (or set it in ~/.config/pmcp/pmcp.env).
+```
+
+**What changed.** Values from those files never enter pmcp's environment
+(Consiliency/pmcp#367). They are credentials: a server's declared credential,
+a remote server's `${VAR}` header, the credential checks and `pmcp secrets`
+still find them. pmcp's own settings, `HOME`, `XDG_*`, `PATH`, proxy and CA
+variables in them are ignored, and no child process pmcp starts — a server,
+an installer, `systemctl`, `pmcp upgrade` — sees any of their values unless
+it is that server's own declared credential. A value in such a file is
+expanded only from keys defined earlier in the same file: `X=${GITHUB_TOKEN}`
+is ignored with `pmcp: Ignoring X in .env.pmcp: its value refers to a
+variable the file does not define, ...`. A variable your shell exported, or
+`~/.config/pmcp/pmcp.env` sets, now wins over the same name in a project
+file, for every lookup. Every lookup follows one order, by presence: your
+environment, your user store, then the project files -- a checkout `.env`
+that pmcp's startup walk found before `.env.pmcp`; a tenant lookup checks the
+tenant store before the project files, and with `include_process_env` off
+reads the tenant store alone. Every reader -- the gateway, the provision
+check, a server's credential, `pmcp secrets check`, `pmcp doctor` -- reads
+the same values through the same lookup, so the diagnostics answer what the
+gateway will do. Project files are read per project: a lookup for one
+project never uses another project's `.env` or `.env.pmcp`, and a changed
+project file is read again on the next lookup (your user store, which is in
+the environment, is read at startup). The project is the one pmcp serves:
+`--project` when given, otherwise the project root found from the working
+directory -- the root `.mcp.json` is loaded from. So `pmcp --project B` started
+inside project A gives B's servers B's credentials -- and B's `.mcp.json`,
+`.pmcp/manifest.yaml` overlay and `.mcp-gateway-policy.yaml`: every project
+input follows the same project, so an endpoint and its credential always come
+from one project. A project overlay is found at the project root, no longer by
+walking up from the working directory (a directory holding one counts as a
+project root), and the project policy is read from the project root, no longer
+from the working directory; `pmcp init` without `--project` writes the served
+project's `.mcp.json`. One exception, unchanged from 2.7.3: a local server
+starts in pmcp's own working directory unless its config sets `cwd`, so with
+`--project B` started from A, B's servers start in A and see A's `./.env`,
+`.npmrc` and `node_modules`. Set `cwd` in B's server configs, or start pmcp
+from B, until that changes. And pmcp started from a
+subdirectory of a project reads the root's `.env.pmcp` (the file `pmcp secrets
+set --scope project` writes) where 2.7.3 loaded the working directory's. If you
+kept a `.env.pmcp` in a subdirectory you start pmcp from, move its entries to
+the project root's `.env.pmcp`, or pass that subdirectory as `--project`. A
+server pmcp spawns keeps every variable you exported: a project `.env.pmcp`
+that lists a name such as `NO_PROXY` no longer removes your value of it from
+the server's environment; only your user store's names, and credentials pmcp
+itself put into its environment, are withheld from other servers. In 2.7.3 a checkout's `.env` won over the user
+store, and `pmcp secrets check` preferred a project `.env.pmcp`. (Remote
+`${VAR}` headers in the gateway, `pmcp status` and `pmcp doctor` already
+preferred your user store, which those load first.) So a per-project override
+of a key that is also in your user store -- a `TENANT_CODE_MODE_TENANT_ID` set
+with `pmcp secrets set --scope project` in each project, say -- does not
+override it. A variable your shell exports as empty stays unavailable.
+
+`pmcp secrets sync --from-scope project --to-scope user` now copies
+credentials only: a credential-shaped name (`*_TOKEN`, `*_KEY`, `*_SECRET`,
+`*_PASSWORD` and the like) or one a manifest server declares as its
+credential (`POSTGRES_URL`). Any other name -- `UV_INDEX_URL`, `DATABASE_URL`,
+anything named `PMCP_*`, proxies, code-loading and package-manager names -- and
+any value containing `${` or spanning lines is skipped with
+`pmcp: Not copying <NAME> from .env.pmcp: ...` and listed under `"refused"`;
+the rest still sync. If you meant one, set it yourself:
+`pmcp secrets set DATABASE_URL --scope user`. `gateway.auth_connect` accepts
+only a server's declared credential or a credential-shaped name, never one of
+those names, and refuses a credential containing `${`. `pmcp secrets check`
+now answers what a running pmcp would do: a variable your shell exports
+counts as available, and one it exports as empty counts as missing even when
+a store has it. Lookups that hand a
+project value only to the server the project configured -- a remote header,
+a server's declared credential -- keep the narrower rule: they refuse
+pmcp's own, proxy, code-loading and package-manager names. A `.env` that pmcp's startup walk
+finds in your home directory or an ancestor of it, such as `~/.env` for a
+`uv tool` install, is yours and loads as before; one anywhere else, such as
+a checkout with pmcp in its `.venv`, is a project file. A local server's `env` in `.mcp.json` is passed
+as written, as before: `${VAR}` there was never expanded.
+
+**What to do.** Export pmcp's own settings in the shell or service that
+starts pmcp, or put them in your user store:
+
+```bash
+pmcp secrets set PMCP_LOG_LEVEL --scope user
+```
+
+If you relied on a project file overriding a user-store key, keep that key
+only in the project stores (remove it from the user store), or export the
+per-project value in the shell that starts pmcp for that project:
+
+```bash
+grep -nE '^(export )?TENANT_CODE_MODE_TENANT_ID=' ~/.config/pmcp/pmcp.env
+```
+
+Keep credentials in the project file if you like; servers still get them. A
+variable a server needs that is not its declared credential belongs in that
+server's `env` block in `.mcp.json`.
+
+**How to verify.** Run the grep above: every name it lists is either a
+credential a server or a header uses, or one you have moved to your shell or
+user store. pmcp prints an `Ignoring` line only for its own variables and for
+values it will not expand; any other non-credential variable in a project
+file is ignored without one. `pmcp secrets check` lists the project keys you
+expect.
+
+### HOME must be a plain absolute path
+
+**Am I affected?** You are if `HOME` (on Windows, `USERPROFILE`) is relative, has a
+`.` or `..` component, or names a directory that does not exist or that you cannot
+search; or if a checkout lies above your home directory, or holds a link on the way to
+it. A checkout is a directory holding `.git`, `.mcp.json`, `package.json`,
+`pyproject.toml` or `.pmcp/manifest.yaml`; a filesystem or drive root never counts, so a
+container image built with `COPY . /` and `HOME=/root` is not affected. A dotfiles
+repository AT your home directory, and links you made yourself such as
+`/home -> /var/home`, are fine.
+
+```bash
+printf '%s\n' "$HOME"; ls -ld "$HOME"
+```
+
+**What changed.** pmcp uses the files under your home directory -- `~/.mcp.json`,
+`~/.claude/gateway-policy.yaml`, `~/.claude/gateway-guidance.yaml`,
+`~/.pmcp/manifest.yaml`, `~/.config/pmcp/pmcp.env`, the trust and package-approval
+stores, the registry caches and the singleton lock -- only while the home directory is
+yours by the rule above. Otherwise it prints `pmcp: Ignoring the operator's files under
+the home directory: HOME is not a plain absolute path the system resolves; set HOME to a
+plain absolute path` (or `... the home directory lies inside a checkout`) once on
+stderr, runs without those files, creates nothing under that home, and refuses every
+trust and package-approval decision, so `pmcp trust approve` and `pmcp secrets set
+--scope user` fail. 2.7.3 used whatever `HOME` named. Only you set `HOME`, so a
+spelling pmcp cannot judge exactly is refused rather than guessed at.
+
+**What to do.** Set `HOME` to the absolute path of your home directory, with no `.` or
+`..`, in the environment that starts pmcp -- your shell, a systemd unit, a container
+image:
+
+```bash
+export HOME=/home/alice
+```
+
+If your home directory lies inside a repository checkout, move it out.
+
+**How to verify.** `pmcp guidance` prints your settings and stderr has no `Ignoring the
+operator's files` line.
 
 ### Discovered servers are default-deny
 
@@ -1186,6 +1373,41 @@ timeout longer than the gateway's 10-second shutdown budget.
 SIGTERM no longer outlives a cancelled disconnect or a timed-out shutdown
 (`ps` shows no leftover process group).
 
+### Stop every running gateway before upgrading
+
+**Am I affected?** You are if a pmcp gateway is running while you upgrade -- a
+system service, a client that started `pmcp` itself, or one left in a terminal:
+
+```bash
+pmcp doctor
+```
+
+`[WARN] lock: A gateway holds the singleton lock` means one is running.
+
+**What changed.** 3.0 never removes the singleton lock file `~/.pmcp/gateway.lock`:
+a lock is held only by a running gateway and dies with it, so a leftover file is
+harmless and never blocks a start. 3.0 also refuses a lock path that is a link, a
+fifo, a directory or a file with other names. A symlinked `~/.pmcp` (dotfiles) is
+judged like `~/.config/pmcp`: used unless it leads into the project pmcp serves or
+was started in; an explicit `--lock-dir` that is itself a symlink is refused. 2.7.3 removed the file when it shut
+down. While a 2.7.3 gateway still runs beside a 3.0 one, its shutdown can delete
+the 3.0 gateway's live lock file, and a third start then creates a fresh file and
+runs as well -- two gateways at once. The guarantee holds again once every running
+pmcp is 3.0.
+
+**What to do.** Stop every running gateway -- the service, and any client that
+started its own -- upgrade, then start one:
+
+```bash
+systemctl --user stop pmcp
+pmcp upgrade
+systemctl --user start pmcp
+```
+
+**How to verify.** `pmcp doctor` shows `[WARN] lock: A gateway holds the singleton
+lock` for the one gateway you started, and a second `pmcp` started by hand exits
+saying another gateway instance is running.
+
 ### Known issues in 3.0.0
 
 - **`pmcp refresh` writes to the wrong cache directory.** By default it
@@ -1200,33 +1422,6 @@ SIGTERM no longer outlives a cancelled disconnect or a timed-out shutdown
 
   How to verify: `ls -l .mcp-gateway/descriptions.yaml` shows a fresh
   timestamp.
-- **Six readers still follow a project `.env.pmcp` that links out of the
-  project** ([Consiliency/pmcp#367](https://github.com/Consiliency/pmcp/issues/367)).
-  The commands that rewrite the store, and the startup load, refuse such a
-  link; these do not:
-  - remote-header auth: a `${VAR}` in a remote server's `headers` is resolved
-    from the user and project stores when the gateway resolves its startup
-    configs, connects a remote server or checks its auth, and by
-    `pmcp status` and `pmcp doctor`;
-  - the tenant store `.pmcp/tenants/<id>/pmcp.env`, resolved the same way per
-    tenant (no production caller passes a tenant yet; see the next item);
-  - the gateway's credential-availability check, which loads `<cwd>/.env`,
-    `<cwd>/.env.pmcp` and the user store into the gateway's own environment;
-  - env stripping, which reads the stores' key names at every server spawn;
-  - the feedback gate's planted-key check, which reads the same key names;
-  - `pmcp secrets check`.
-
-  So a repository can still link its `.env.pmcp` to another file of yours,
-  and through remote-header auth or the gateway's credential-availability
-  check that file's values can be sent as a header to a remote server the
-  repository configures. None of these readers hangs on a fifo. Until it is
-  fixed, check `ls -l .env.pmcp` in repositories you clone and delete a link
-  you didn't create.
-
-  Separately, the startup load of a plain `.env` finds that file by walking up
-  from where pmcp is installed. When pmcp is installed in a virtualenv inside
-  a checkout, that walk reaches the checkout's `.env` and follows its link
-  too.
 - **Tenant-aware header resolution for remote servers is not wired yet**
   ([Consiliency/pmcp#353](https://github.com/Consiliency/pmcp/issues/353)).
   pmcp never reads per-tenant credentials from `.pmcp/tenants/<id>/pmcp.env`,
@@ -1312,6 +1507,8 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
 | [`PMCP_MANIFEST_PATH`, `PMCP_CONFIG` and `PMCP_POLICY` must be exported in your shell](#pmcp_manifest_path-pmcp_config-and-pmcp_policy-must-be-exported-in-your-shell) | Safe on 2.7.3: it honours an exported variable and the `--config`/`--policy` flags. |
 | [Spawned servers no longer inherit the keys pmcp loaded from `.env`](#spawned-servers-no-longer-inherit-the-keys-pmcp-loaded-from-env) | Safe on 2.7.3: shell exports are inherited, a server's `env` block in `~/.mcp.json` is passed as written,† and `pmcp secrets set` works the same. |
 | [A symlinked project `.env.pmcp` is refused](#a-symlinked-project-envpmcp-is-refused) | Safe on 2.7.3: a regular `.env.pmcp` and your user store work the same. 2.7.3 follows a symlinked `.env.pmcp` again, for writes and at startup, wherever it points, and hangs on a fifo `.env.pmcp`, so check `ls -l .env.pmcp` in repositories you clone. |
+| [A project file supplies credentials only](#a-project-file-supplies-credentials-only) | Reverse: if you moved entries from a subdirectory's `.env.pmcp` into the project root's `.env.pmcp`, 2.7.3 started from that subdirectory reads only that subdirectory's `.env.pmcp` and does not see them: copy the entries back into the subdirectory's `.env.pmcp`, or start pmcp from the project root (`cd` to it first). Otherwise 2.7.3 loads a project `.env.pmcp` and `.env` into its own environment again, so settings in them apply, a checkout's `.env` wins over your user store, and `pmcp secrets check` again prefers a project `.env.pmcp`, and `pmcp secrets sync --from-scope project --to-scope user` again copies every key, `UV_INDEX_URL` and the like included; credentials keep working. Re-check your user store after any such sync on 2.7.3. |
+| [HOME must be a plain absolute path](#home-must-be-a-plain-absolute-path) | Safe on 2.7.3: a plain absolute `HOME` works the same there. 2.7.3 does not check `HOME` at all and uses the files under whatever it names. |
 | [Discovered servers are default-deny](#discovered-servers-are-default-deny) | Safe on 2.7.3: package approvals are ignored and discovered packages provision without one. A `packages.allowlist` must go, as for the next row. |
 | [New `packages:` policy section](#new-packages-policy-section) | Reverse: remove every `packages:` section (step 1 above), or 2.7.3 refuses to start.† |
 | [Feedback submission is off by default](#feedback-submission-is-off-by-default) | Reverse: 2.7.3 ignores `enable_feedback_submission`† and posts on `confirm_submission=true` through the first of these that works: `PMCP_FEEDBACK_TOKEN`, then `GITHUB_TOKEN` (each exported, or loaded from a `.env`, a checkout's `.env.pmcp` or `~/.config/pmcp/pmcp.env`), then a `gh` CLI on the gateway's `PATH` using its stored login.† It posts to `ViperJuice/pmcp`, the project's former name, which GitHub redirects to `Consiliency/pmcp`, unless `PMCP_FEEDBACK_REPO` names another.† To stop every channel, run `pmcp guidance --telemetry off` before you restart on 2.7.3; the call then refuses before it reads any token.† 3.0 honours the same setting. Otherwise unset `PMCP_FEEDBACK_TOKEN` and `GITHUB_TOKEN`, delete them from those files, and keep `gh` off the gateway's `PATH`.† `GH_TOKEN` alone posts nothing without `gh`.† |
@@ -1331,5 +1528,6 @@ you must undo that step. Rows marked † were checked by running 2.7.3.
 | [`NaN` from HTTP/SSE servers](#nan-from-httpsse-servers) | Safe on 2.7.3: a lenient parser also reads the `null` 2.7.3 sends. |
 | [Error text names the real failure](#error-text-names-the-real-failure) | Reverse: 2.7.3 logs only `unhandled errors in a TaskGroup (1 sub-exception)`, without the cause,† so a matcher on `ConnectError` finds nothing. Match both. |
 | [A cancelled teardown kills stdio servers at once](#a-cancelled-teardown-kills-stdio-servers-at-once) | Safe on 2.7.3: an uncancelled `gateway.disconnect_server` and a longer stop timeout work the same. |
+| [Stop every running gateway before upgrading](#stop-every-running-gateway-before-upgrading) | Safe on 2.7.3: stop every running gateway before you downgrade too -- 2.7.3 removes the lock file at shutdown, so a mix of versions can briefly run two gateways. The leftover `~/.pmcp/gateway.lock` is harmless to it. |
 
 Prefer holding at `pmcp<3` for a short time over running 2.7.3 for long.

@@ -2119,6 +2119,16 @@ def test_loop_shutdown_kills_the_process_tree(phase: str, tmp_path: Path) -> Non
 
 # (module, enclosing function, "reraises" | "absorbs") -> (count, why).
 _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
+    ("atomic_write.py", "_open_windows", "reraises"): (
+        1,
+        "closes the Windows handle not yet converted to a descriptor "
+        "(synchronous), then re-raises -- Consiliency/pmcp#372 round 35",
+    ),
+    ("atomic_write.py", "open_plain_file", "reraises"): (
+        1,
+        "closes the refused file's descriptor (synchronous), then re-raises -- "
+        "Consiliency/pmcp#372 round 34",
+    ),
     ("cli.py", "run_server", "absorbs"): (1, "task root: logs, then the process exits"),
     ("waits.py", "bounded_wait", "reraises"): (
         2,

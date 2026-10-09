@@ -332,9 +332,9 @@ def test_every_writer_caller_has_a_missing_dotdot_driver() -> None:
 
 
 #: Writer callers whose `missing/../x` behaviour is a tracked known issue.
-KNOWN_ISSUES = {
-    ("trust_store.py", "_write_store"): "Consiliency/pmcp#374",
-}
+#: Empty: trust_store_path resolves as the writer does since Consiliency/pmcp#372
+#: round 23 (see Consiliency/pmcp#374).
+KNOWN_ISSUES: dict[tuple[str, str], str] = {}
 
 
 @pytest.mark.parametrize(
@@ -525,7 +525,7 @@ def test_a_deep_checkout_cannot_host_package_approvals_either(
     store.parent.mkdir(parents=True)
     os.symlink(planted, store)
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (checkout,))
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda *_a: (checkout,))
     with pytest.raises(TrustStoreError, match="inside the checkout"):
         package_approvals.package_approvals_path()
 
@@ -548,7 +548,9 @@ def test_residency_that_cannot_be_established_is_a_refusal(
             raise OSError(errno.ENAMETOOLONG, "File name too long")
         return real_open(p, flags, *a, **kw)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (base / "checkout",))
+    monkeypatch.setattr(
+        trust_store, "_checkout_roots", lambda *_a: (base / "checkout",)
+    )
     monkeypatch.setattr(os, "open", failing_open)
     with pytest.raises(TrustStoreError, match="cannot establish"):
         trust_store.refuse_checkout_resident(store, "Trust store")
@@ -612,7 +614,7 @@ def test_the_windows_residency_fallback_refuses_a_planted_store(
     (home / ".config" / "pmcp").mkdir(parents=True)
     os.symlink(planted, home / ".config" / "pmcp" / "trust.json")
     monkeypatch.setattr(Path, "home", lambda: home)
-    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (checkout,))
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda *_a: (checkout,))
     monkeypatch.setattr(trust_store, "os", _windows_os())
     assert not trust_store.is_approved(checkout / ".mcp.json", content)
 
@@ -636,7 +638,9 @@ def test_the_windows_residency_fallback_refuses_on_any_error(
         return real_stat(p, *a, **kw)  # type: ignore[arg-type]
 
     windows.stat = failing_stat
-    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (base / "checkout",))
+    monkeypatch.setattr(
+        trust_store, "_checkout_roots", lambda *_a: (base / "checkout",)
+    )
     monkeypatch.setattr(trust_store, "os", windows)
     with pytest.raises(TrustStoreError, match="cannot establish"):
         trust_store.refuse_checkout_resident(store, "Trust store")
@@ -654,7 +658,7 @@ def test_a_served_root_that_does_not_exist_yet_refuses_nothing(
     (home / ".config" / "pmcp").mkdir(parents=True)
     monkeypatch.setattr(Path, "home", lambda: home)
     monkeypatch.setattr(
-        trust_store, "_checkout_roots", lambda: (base / "not-created-yet",)
+        trust_store, "_checkout_roots", lambda *_a: (base / "not-created-yet",)
     )
     if walk == "windows fallback":
         monkeypatch.setattr(trust_store, "os", _windows_os())
@@ -677,6 +681,9 @@ OPENER_MODULES = (
     "trust_store.py",
     "package_approvals.py",
     "env_store.py",
+    # The singleton lock (Consiliency/pmcp#372 round 38: its folder was opened
+    # with a raw os.open that Windows cannot do and a 0300 folder refuses).
+    "identity.py",
 )
 #: Functions allowed to open a directory directly, with the reason.
 OPENER_ALLOWED = {
@@ -693,6 +700,8 @@ def _directory_opens(tree: ast.AST) -> list[tuple[int, str]]:
         return any(
             (isinstance(n, ast.Attribute) and n.attr in DIRECTORY_FLAG_NAMES)
             or (isinstance(n, ast.Name) and n.id in DIRECTORY_FLAG_NAMES)
+            # getattr(os, "O_DIRECTORY", 0): the spelling round 37 slipped by.
+            or (isinstance(n, ast.Constant) and n.value in DIRECTORY_FLAG_NAMES)
             for n in ast.walk(node)
         )
 
@@ -734,8 +743,9 @@ def test_the_directory_open_scan_sees_each_form() -> None:
         "    os.open(p, _walk_flags(), dir_fd=fd)\n"
         "    os.open(p, flags)\n"
         "    os.open(p, os.O_PATH)\n"
+        "    os.open(p, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))\n"
     )
-    assert len(_directory_opens(tree)) == 3
+    assert len(_directory_opens(tree)) == 4
 
 
 def _approval_payload() -> bytes:
@@ -800,7 +810,7 @@ def test_approval_reads_writes_and_residency_through_a_search_only_directory(
     trust_target.write_text('{"version": 1, "records": []}\n', encoding="utf-8")
     os.symlink(trust_target, home / ".config" / "pmcp" / "trust.json")
     monkeypatch.setattr(Path, "home", lambda: home)
-    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (checkout,))
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda *_a: (checkout,))
     identity = PackageIdentity(
         registry="npm", name="example-mcp", resolved_version="1.2.3", integrity=None
     )
@@ -852,7 +862,7 @@ def test_the_pathname_fallback_still_refuses_a_planted_store(
         vault / "approvals.json", home / ".config" / "pmcp" / "package_approvals.json"
     )
     monkeypatch.setattr(Path, "home", lambda: home)
-    monkeypatch.setattr(trust_store, "_checkout_roots", lambda: (checkout,))
+    monkeypatch.setattr(trust_store, "_checkout_roots", lambda *_a: (checkout,))
     os.chmod(vault, 0o311)
     try:
         with pytest.raises(TrustStoreError, match="inside the checkout"):

@@ -37,6 +37,7 @@ from mcp.types import (
     Tool,
 )
 
+from pmcp.env_store import bind_project_root, credential_value
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
 from pmcp.config.loader import (
@@ -100,6 +101,18 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
         return default
 
 
+def _manifest_for(project_root: Path | None) -> Any:
+    """``load_manifest`` for ``project_root``; ``None`` is the served project.
+
+    The project overlay follows the same root as the credentials
+    (Consiliency/pmcp#372 round 12). With no project the call stays
+    ``load_manifest()``, which reads the served project's overlay.
+    """
+    if project_root is None:
+        return load_manifest()
+    return load_manifest(project_root=project_root)
+
+
 class GatewayServer:
     """MCP Gateway Server."""
 
@@ -125,7 +138,13 @@ class GatewayServer:
         required_scopes: list[str] | None = None,
         allowed_origins: list[str] | None = None,
     ) -> None:
-        self._project_root = project_root
+        # The project this object serves, BOUND at construction: the explicit
+        # root, else the served one, else the one discovered from the working
+        # directory NOW. Everything it loads (configs, endpoints) and every
+        # credential it looks up use this one root, so a later chdir cannot
+        # pair this project's endpoint with another project's credential
+        # (Consiliency/pmcp#372 round 16, board round 15 claude F001).
+        self._project_root: Path = bind_project_root(project_root)
         self._custom_config_path = custom_config_path
         self._cache_dir = cache_dir or Path(".mcp-gateway")
         self._descriptions_cache_path = get_cache_path(self._cache_dir)
@@ -145,7 +164,9 @@ class GatewayServer:
         self._lock_dir: Path | None = Path(lock_dir) if lock_dir else None
 
         # Initialize policy manager
-        self._policy_manager = PolicyManager(policy_path)
+        self._policy_manager = PolicyManager(
+            policy_path, project_root=self._project_root
+        )
         self._scoped_advisor_audit: ScopedAdvisorAudit | None = None
         self._audit_jsonl = Path(audit_jsonl) if audit_jsonl is not None else None
         if audit_jsonl is not None:
@@ -177,7 +198,7 @@ class GatewayServer:
         self._client_manager = ClientManager(
             max_tools_per_server=self._policy_manager.get_max_tools_per_server(),
             max_concurrent_spawns=self._max_concurrent_spawns,
-            project_root=project_root,
+            project_root=self._project_root,
             catalog_events=self._catalog_events,
         )
 
@@ -185,7 +206,7 @@ class GatewayServer:
         self._gateway_tools = GatewayTools(
             client_manager=self._client_manager,
             policy_manager=self._policy_manager,
-            project_root=project_root,
+            project_root=self._project_root,
             custom_config_path=custom_config_path,
             guidance_config=self._guidance_config,
             descriptions_cache_path=self._descriptions_cache_path,
@@ -732,7 +753,7 @@ class GatewayServer:
         manifest = None
         manifest_servers = {}
         try:
-            manifest = load_manifest()
+            manifest = _manifest_for(self._project_root)
             manifest_servers = manifest.servers
         except Exception as e:
             # Class only: an error's text can quote overlay input (Consiliency/pmcp#342).
@@ -755,8 +776,11 @@ class GatewayServer:
             enabled_auto_start=enabled_auto_start,
             disabled_auto_start=disabled_auto_start,
             is_server_allowed=self._policy_manager.is_server_allowed,
-            is_auth_available=lambda env_var: bool(os.environ.get(env_var)),
+            is_auth_available=lambda env_var: bool(
+                credential_value(env_var, root=self._project_root)
+            ),
             legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
+            project_root=self._project_root,
         )
         self._gateway_tools.set_startup_observations(
             build_startup_observation_snapshot(resolution)

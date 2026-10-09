@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import shlex
 import time
 import uuid
@@ -12,7 +11,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from pmcp.env_store import resolve_scope_path, sanitized_subprocess_env
+from pmcp.env_store import (
+    credential_value,
+    resolve_scope_path,
+    sanitized_subprocess_env,
+)
 from pmcp.manifest.environment import Platform
 from pmcp.manifest.loader import (
     ServerConfig,
@@ -177,7 +180,7 @@ class JobManager:
             Job ID for tracking progress
         """
         # Check API key first
-        await check_api_key(server_config)
+        await check_api_key(server_config, project_root)
 
         # Get platform-specific install command
         install_cmd = server_config.install.get(platform)
@@ -622,8 +625,10 @@ def build_install_child_env(
     own_env: dict[str, str] = dict(getattr(server_config, "extra_env", {}) or {})
     env_var = server_config.env_var
     if env_var:
+        # For the root the gateway serves, not the working directory
+        # (Consiliency/pmcp#372 round 9).
         for key in credential_lookup_keys(server_config):
-            value = os.environ.get(key)
+            value = credential_value(key, root=project_root)
             if value:
                 own_env[env_var] = value
                 break
@@ -632,8 +637,13 @@ def build_install_child_env(
     return sanitized_subprocess_env(own_env, project_root)
 
 
-async def check_api_key(server_config: ServerConfig) -> None:
-    """Check if required API key is set.
+async def check_api_key(
+    server_config: ServerConfig, project_root: Path | None = None
+) -> None:
+    """Check if required API key is set, for project ``project_root``.
+
+    ``project_root`` is the root the gateway serves (``None``: the served root,
+    ``env_store.serve_project_root``), as for :func:`build_install_child_env`.
 
     Raises:
         MissingApiKeyError: If API key is required but not set
@@ -650,8 +660,8 @@ async def check_api_key(server_config: ServerConfig) -> None:
     # a namespaced secret_key satisfies the provision gate. Checking only the raw
     # runtime env_var would wrongly raise for namespaced-only credentials.
     lookup_keys = credential_lookup_keys(server_config) or [env_var]
-    if not any(os.environ.get(key) for key in lookup_keys):
-        env_path = resolve_scope_path("project")
+    if not any(credential_value(key, root=project_root) for key in lookup_keys):
+        env_path = resolve_scope_path("project", project_root)
         raise MissingApiKeyError(
             env_var=env_var,
             env_instructions=server_config.env_instructions
@@ -681,7 +691,7 @@ async def install_server(
         MissingApiKeyError: If API key is required but not set
     """
     # Check API key first
-    await check_api_key(server_config)
+    await check_api_key(server_config, project_root)
 
     # Get platform-specific install command
     install_cmd = server_config.install.get(platform)

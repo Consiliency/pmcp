@@ -1192,8 +1192,10 @@ PMCP discovers MCP servers from:
 
 1. **Project config**: `.mcp.json` in project root (highest priority). The
    project root is `--project` when given, otherwise the nearest ancestor of
-   the working directory holding a `.mcp.json`, `.git`, `package.json` or
-   `pyproject.toml`, stopping before `$HOME`. A project `.mcp.json` is ignored
+   the working directory holding a `.mcp.json`, `.git`, `package.json`,
+   `pyproject.toml` or `.pmcp/manifest.yaml`, stopping before `$HOME`. Every
+   project input -- this file, the manifest overlay, the project policy and the
+   project's credentials -- comes from that one project root. A project `.mcp.json` is ignored
    until you run `pmcp trust approve <path>` (see
    [Security](#security)).
 2. **User config**: `~/.mcp.json` or `~/.claude/.mcp.json`
@@ -1218,8 +1220,10 @@ server name; a same-named entry is replaced whole, not deep-merged):
 
 1. **Shipped manifest** (base)
 2. **User**: `~/.pmcp/manifest.yaml`
-3. **Project**: `<project>/.pmcp/manifest.yaml` (nearest ancestor of the cwd,
-   below `$HOME`; ignored until you run `pmcp trust approve <path>`)
+3. **Project**: `<project>/.pmcp/manifest.yaml` at the served project root --
+   `--project` when given, otherwise the project root found from the working
+   directory (see the project config above); never `$HOME`'s, which is the user
+   overlay; ignored until you run `pmcp trust approve <path>`
 4. **Explicit**: `PMCP_MANIFEST_PATH` env var (wins over all; honoured only when
    exported, not when set by a `.env` file)
 
@@ -1611,6 +1615,19 @@ pmcp secrets sync --from-scope user --to-scope project --overwrite
 pmcp secrets sync --from-scope project --to-scope user --overwrite
 ```
 
+Copying out of a project copies credentials only. A project `.env.pmcp` is the
+repository's, and your user store loads into pmcp's environment at every start
+(and `pmcp upgrade` runs uv or pip in it), so `sync` copies a name only if it
+is credential-shaped (`*_TOKEN`, `*_KEY`, `*_SECRET(S)`, `*_PASSWORD`,
+`*_CREDENTIAL(S)`, `*_PAT`, `*_DSN`, `*_AUTH`) or a server in the manifest
+declares it as its credential (`POSTGRES_URL`, say). Everything else --
+`UV_INDEX_URL`, `PIP_CONFIG_FILE`, `DATABASE_URL`, anything named `PMCP_*`, proxies,
+`LD_*`/`NODE_*`/`NPM_CONFIG_*` and the like, even when credential-shaped -- is
+skipped, as is any value containing `${` or spanning more than one line. Each
+skipped name prints one `pmcp: Not copying <NAME> from .env.pmcp: ...` line and
+is listed under `"refused"`; the other keys still sync. Set one yourself with
+`pmcp secrets set <NAME> --scope user` if you mean it.
+
 Passing the value on the command line (`pmcp secrets set API_TOKEN your-token`)
 still works but exposes it in `ps` output and shell history. `pmcp secrets check`
 prints, as JSON, the keys your configured servers require and which are present.
@@ -1665,8 +1682,9 @@ Besides `servers`, `tools` (`server::tool`), `packages`, `limits` and
 
 PMCP looks for the policy at `~/.claude/gateway-policy.yaml` or
 `~/.claude/gateway-policy.json`, and for a project policy at
-`.mcp-gateway-policy.yaml` or `.mcp-gateway-policy.json` in the gateway's
-working directory; a project policy is
+`.mcp-gateway-policy.yaml` or `.mcp-gateway-policy.json` at the project root
+(`--project` when given, otherwise the project root found from the working
+directory -- the same root as every other project input); a project policy is
 ignored until approved with `pmcp trust approve`, and can only narrow the
 operator's policy. `--policy` / `PMCP_POLICY` names one explicitly.
 
@@ -1831,7 +1849,9 @@ For hosted tenant auth, keep credentials in PMCP env storage or tenant-scoped
 project storage and reference only placeholders from config:
 `${TENANT_CODE_MODE_MCP_TOKEN}` and `${TENANT_CODE_MODE_TENANT_ID}`. Use
 `pmcp secrets set ... --scope project` or `gateway.auth_connect` to populate
-env-store values; the gateway does not select a per-tenant env file itself
+env-store values (a key also in your user store wins over the project's; see
+[MIGRATING.md](MIGRATING.md#a-project-file-supplies-credentials-only)); the
+gateway does not select a per-tenant env file itself
 (see [Auth And Elicitation](#auth-and-elicitation)). PMCP diagnostics report missing
 field or env-var names such as
 `TENANT_CODE_MODE_MCP_TOKEN`; they must not print token values.
@@ -1969,7 +1989,7 @@ Other environment variables:
 
 Use `pmcp doctor` to diagnose common PMCP startup and connectivity issues. It checks:
 
-- `lock`: detects singleton lock state and stale lock collisions at `~/.pmcp/gateway.lock`
+- `lock`: reports whether a gateway holds the singleton lock at `~/.pmcp/gateway.lock` (the file itself stays between runs and is harmless when nothing holds it)
 - `mode`: detects local command-mode MCP config conflicts when a shared PMCP system service is running
 - `http`: probes the unauthenticated `/health` endpoint derived from `PMCP_GATEWAY_URL` or `http://127.0.0.1:3344/mcp`
 - `remote`: detects unresolved remote downstream header environment references
@@ -1985,7 +2005,7 @@ If any checks fail, follow the command in the output and rerun `pmcp doctor`.
 
 ### Singleton Lock
 
-By default, PMCP uses a global lock at `~/.pmcp/gateway.lock` to ensure only one gateway runs per user. This prevents multiple gateway instances from spawning duplicate downstream servers.
+By default, PMCP uses a global lock at `~/.pmcp/gateway.lock` to ensure only one gateway runs per user. The lock is held by the running gateway and released when it exits (or dies); the file itself is never removed, so a leftover file never blocks a start and never needs deleting. The lock file must be a plain regular file, and a link at its name is refused. The default `~/.pmcp` may be your own symlink (for example into a dotfiles repository): it follows exactly the rule `~/.config/pmcp` follows for the trust store -- accepted wherever it leads, except into a checkout being judged (the project pmcp serves, or the one it was started in). An explicit `--lock-dir` / `PMCP_LOCK_DIR` that is itself a symlink is refused, since a repository can supply that path. This prevents multiple gateway instances from spawning duplicate downstream servers.
 
 **Override the lock directory:**
 

@@ -28,6 +28,7 @@ from pmcp.types import (
     StartupPolicyPreview,
     StartupPolicySource,
 )
+from pmcp.home_identity import optional_operator_home, spelled_home
 from pmcp.project_consent import ConsentDecision, log_refusal, read_and_gate
 from pmcp.remote_auth import build_remote_header_env_lookup, resolve_remote_headers
 
@@ -71,17 +72,22 @@ def _env_pmcp_config_path() -> str | None:
 # default_user_config_paths() instead, which resolves Path.home() at call time
 # (mirrors manifest/loader.py's overlay path handling).
 DEFAULT_USER_CONFIG_PATHS = [
-    Path.home() / ".mcp.json",
-    Path.home() / ".claude" / ".mcp.json",
+    spelled_home() / ".mcp.json",
+    spelled_home() / ".claude" / ".mcp.json",
 ]
 
 
 def default_user_config_paths() -> list[Path]:
-    """User-level config paths, resolved from Path.home() at call time."""
-    return [
-        Path.home() / ".mcp.json",
-        Path.home() / ".claude" / ".mcp.json",
-    ]
+    """User-level config paths, resolved at call time.
+
+    None while the home directory is not the operator's (a checkout controls
+    it): those files would be the repository's, read as the operator's, ungated
+    (Consiliency/pmcp#372 round 22). pmcp then runs without user config.
+    """
+    home = optional_operator_home()
+    if home is None:
+        return []
+    return [home / ".mcp.json", home / ".claude" / ".mcp.json"]
 
 
 class StartupSkipReason(str, Enum):
@@ -246,23 +252,32 @@ def _coerce_server_entry(config: object) -> dict[str, Any] | None:
 
 def find_project_root(start_dir: Path) -> Path | None:
     """Find project root by looking for .mcp.json or common project markers."""
+    from pmcp.home_identity import is_home
+
     current = start_dir.resolve()
     temp_root = Path(tempfile.gettempdir()).resolve()
-    home_root = Path.home().resolve()
 
     while current != current.parent:
         if current == temp_root:
             return None
         # $HOME is already covered by the user config source; treating it as a
         # project root would double-attribute ~/.mcp.json (project + user).
-        if current == home_root:
+        # Home is never a project -- while it is the operator's. A home a
+        # checkout controls is not, and must not end discovery early
+        # (Consiliency/pmcp#372 round 22): is_home answers only for the
+        # operator's home (round 23).
+        if is_home(current):
             return None
         # Check for .mcp.json
         if (current / ".mcp.json").exists():
             return current
-        # Check for common project markers
+        # Check for common project markers -- and a project overlay, which
+        # makes its directory a pmcp project whatever else it holds
+        # (Consiliency/pmcp#372 round 12: the overlay is found at the project
+        # root every other project input follows, so its directory is one).
         if (
-            (current / ".git").exists()
+            (current / ".pmcp" / "manifest.yaml").exists()
+            or (current / ".git").exists()
             or (current / "package.json").exists()
             or (current / "pyproject.toml").exists()
         ):
@@ -326,7 +341,9 @@ def _iter_config_source_paths(
     custom_config_path: Path | None = None,
 ) -> list[tuple[ConfigSourceName, Path]]:
     paths: list[tuple[ConfigSourceName, Path]] = []
-    resolved_project_root = project_root or find_project_root(Path.cwd())
+    # The served project, or the caller's (Consiliency/pmcp#372 round 12):
+    # never the working directory's when they differ.
+    resolved_project_root = _project_scope_root(project_root)
     if resolved_project_root:
         paths.append(("project", resolved_project_root / ".mcp.json"))
 
@@ -403,7 +420,10 @@ def _gate_project_config(path: Path) -> tuple[bytes | None, ConsentDecision | No
     """
     if not path.exists():
         return None, None
-    content, decision = read_and_gate(path, "project_mcp_json")
+    # The project is the directory holding the .mcp.json being judged.
+    content, decision = read_and_gate(
+        path, "project_mcp_json", project_root=path.parent
+    )
     if not decision.allowed:
         log_refusal(decision, logger)
         return None, decision
@@ -910,7 +930,7 @@ def set_startup_policy(
     # approved? Keyed verbatim on the pinned canonical path -- never re-resolved,
     # so a swap of `target.path` cannot redirect the lookup to another file.
     was_approved = input_bytes is not None and trust_store.is_approved_resolved(
-        pinned_key, input_bytes
+        pinned_key, input_bytes, project_root=project_root
     )
 
     names = sorted({name for name in operation.names if name})
@@ -1023,6 +1043,7 @@ def _merge_manifest_defaults(
     name: str,
     config: LocalMcpServerConfig,
     manifest_servers: dict[str, "ManifestServerConfig"] | None,
+    env_lookup: Callable[[str], str | None],
 ) -> LocalMcpServerConfig | None:
     """Merge a partial config with manifest defaults when possible.
 
@@ -1087,7 +1108,10 @@ def _merge_manifest_defaults(
         )
         if not existing or is_placeholder:
             for lookup_key in credential_lookup_keys(manifest_server):
-                value = os.environ.get(lookup_key)
+                # ``env_lookup``: the credential lookup of the project this
+                # config is loaded for (Consiliency/pmcp#372 round 9), as
+                # _manifest_server_to_config takes one.
+                value = env_lookup(lookup_key)
                 if value:
                     if merged is config:
                         merged = config.model_copy(deep=True)
@@ -1146,7 +1170,13 @@ def load_configs(
     try:
         from pmcp.manifest.loader import load_manifest
 
-        manifest_servers = load_manifest().servers
+        # The project overlay of this load's project (Consiliency/pmcp#372
+        # round 12); with none, the served project's.
+        manifest_servers = (
+            load_manifest()
+            if project_root is None
+            else load_manifest(project_root=project_root)
+        ).servers
     except Exception as e:
         # Class only: an error's text can quote overlay input
         # (Consiliency/pmcp#342 rev 5).
@@ -1171,14 +1201,16 @@ def load_configs(
             # entry long before this point.
             try:
                 local_merged = _merge_manifest_defaults(
-                    name, normalized, manifest_servers
+                    name, normalized, manifest_servers, credentials
                 )
             except Exception as exc:
                 logger.warning(
                     f"Configured server '{name}': ignoring its manifest defaults "
                     f"({type(exc).__name__})"
                 )
-                local_merged = _merge_manifest_defaults(name, normalized, None)
+                local_merged = _merge_manifest_defaults(
+                    name, normalized, None, credentials
+                )
             if not local_merged:
                 return None
             resolved_config = local_merged
@@ -1189,7 +1221,18 @@ def load_configs(
         )
 
     # 1. Load project config (highest priority)
-    resolved_project_root = project_root or find_project_root(Path.cwd())
+    # The served project, or the caller's (Consiliency/pmcp#372 round 12):
+    # never the working directory's when they differ.
+    resolved_project_root = _project_scope_root(project_root)
+    # Credentials come from the project the CALLER asked for -- ``project_root``
+    # as given, ``None`` meaning the served one -- never from the source
+    # classification above. ``_project_scope_root`` answers "is there a
+    # project config source here", and says ``None`` for the home directory
+    # (whose .mcp.json is the user source); fed to the credential lookup, that
+    # ``None`` meant "the served project", so an explicitly named home project
+    # got another project's credential (Consiliency/pmcp#372 round 13, board
+    # round 12 codex F001). Two questions, two values.
+    credentials = _credential_value_for(project_root)
     if resolved_project_root:
         project_config_path = resolved_project_root / ".mcp.json"
         project_config = _parse_project_config_or_warn(project_config_path)
@@ -1275,7 +1318,9 @@ def load_disabled_auto_start(
 
     # Check project config -- gated: a repository must not be able to switch
     # off the operator's auto-start just by shipping a file.
-    resolved_project_root = project_root or find_project_root(Path.cwd())
+    # The served project, or the caller's (Consiliency/pmcp#372 round 12):
+    # never the working directory's when they differ.
+    resolved_project_root = _project_scope_root(project_root)
     if resolved_project_root:
         project_config = _parse_gated_project_config(
             resolved_project_root / ".mcp.json"
@@ -1322,7 +1367,9 @@ def load_enabled_auto_start(
 
     # Check project config -- gated: auto-start is the difference between a
     # declared server and a server the operator's shell actually launches.
-    resolved_project_root = project_root or find_project_root(Path.cwd())
+    # The served project, or the caller's (Consiliency/pmcp#372 round 12):
+    # never the working directory's when they differ.
+    resolved_project_root = _project_scope_root(project_root)
     if resolved_project_root:
         project_config = _parse_gated_project_config(
             resolved_project_root / ".mcp.json"
@@ -1410,6 +1457,32 @@ def _coerce_manifest_servers(
     return {server.name: server for server in manifest_servers}
 
 
+def _project_scope_root(project_root: Path | None) -> Path | None:
+    """``env_store.project_scope_root``, imported late (env_store imports this module)."""
+    from pmcp.env_store import project_scope_root
+
+    return project_scope_root(project_root)
+
+
+def _credential_value_for(root: Path | None) -> Callable[[str], str | None]:
+    """``env_store.credential_value`` for project ``root`` (``None``: the served root).
+
+    Imported late (env_store imports this module). The root is resolved on
+    the first lookup and kept for the rest: one config build reads one
+    project, and resolving it per key re-discovered it for every server.
+    """
+    from pmcp.env_store import credential_value, resolve_project_root
+
+    resolved: list[Path] = []
+
+    def lookup(key: str) -> str | None:
+        if not resolved:
+            resolved.append(resolve_project_root(root))
+        return credential_value(key, root=resolved[0])
+
+    return lookup
+
+
 def _manifest_server_to_config(
     server: "ManifestServerConfig",
     env_lookup: Callable[[str], str | None],
@@ -1471,16 +1544,21 @@ def _manifest_server_to_config(
     )
 
 
-def manifest_server_to_config(server: "ManifestServerConfig") -> ResolvedServerConfig:
+def manifest_server_to_config(
+    server: "ManifestServerConfig", project_root: Path | None = None
+) -> ResolvedServerConfig:
     """Convert a manifest ServerConfig to a ResolvedServerConfig.
 
     Args:
         server: Server configuration from manifest.yaml
+        project_root: The project whose credentials the config carries -- a
+            gateway's own ``project_root``; ``None`` is the served project root
+            (``env_store.serve_project_root``, Consiliency/pmcp#372 round 10).
 
     Returns:
         ResolvedServerConfig compatible with ClientManager
     """
-    return _manifest_server_to_config(server, os.environ.get)
+    return _manifest_server_to_config(server, _credential_value_for(project_root))
 
 
 def _local_env(config: ResolvedServerConfig) -> dict[str, str] | None:
@@ -1552,6 +1630,11 @@ def resolve_startup_configs(
 
     configured_names: set[str] = set()
     classified_names: set[str] = set()
+    # A new load cycle: a store that is still refused is reported again
+    # (Consiliency/pmcp#367), once, however many lookups follow.
+    from pmcp.env_store import begin_store_read_cycle
+
+    begin_store_read_cycle()
     remote_header_env_lookup = build_remote_header_env_lookup(project_root)
 
     def add_config(
@@ -1683,7 +1766,9 @@ def resolve_startup_configs(
         # every server (Consiliency/pmcp#342). The loader already skips an
         # overlay entry this conversion would reject; this is the second line.
         try:
-            config = _manifest_server_to_config(server, os.environ.get)
+            config = _manifest_server_to_config(
+                server, _credential_value_for(project_root)
+            )
             add_config(config, eager=eager, source=source, manifest_server=server)
         except Exception as exc:
             from pmcp.manifest.loader import _server_label

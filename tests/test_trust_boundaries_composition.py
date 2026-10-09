@@ -79,6 +79,7 @@ from typing import Any, cast
 
 import pytest
 
+from tests._shipped_approvals import ship_approval, ship_package_approval
 from pmcp import package_approvals, trust_store
 from pmcp.config.loader import load_configs
 from pmcp.env_store import reset_pmcp_introduced_keys
@@ -619,10 +620,11 @@ def _ship_an_approval_inside(
     """
     home = checkout / "home"
     home.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("HOME", str(home))
     monkeypatch.chdir(outside)
-    trust_store.record(target, target.read_bytes(), "project", trust_store.APPROVED)
-    store = trust_store.trust_store_path()
+    # Shipped bytes (round 22: pmcp no longer writes a store a checkout
+    # controls), then HOME inside the checkout.
+    store = ship_approval(target, home).resolve()
+    monkeypatch.setenv("HOME", str(home))
     assert store.is_relative_to(checkout.resolve())
     return store
 
@@ -644,6 +646,9 @@ def test_a_trust_store_shipped_inside_the_checkout_is_refused(
     store = _ship_an_approval_inside(checkout, config, outside, monkeypatch)
 
     monkeypatch.chdir(checkout)
+    # pmcp is LAUNCHED here: the launch directory is captured once
+    # (Consiliency/pmcp#372 round 18), so model a fresh process.
+    trust_store.reset_launch_directory()
 
     with pytest.raises(TrustStoreError) as raised:
         trust_store.trust_store_path()
@@ -703,6 +708,9 @@ def test_a_checkout_resident_store_is_refused_through_a_symlink(
     assert (vendored / "trust.json").exists()
 
     monkeypatch.chdir(checkout)
+    # pmcp is LAUNCHED here: the launch directory is captured once
+    # (Consiliency/pmcp#372 round 18), so model a fresh process.
+    trust_store.reset_launch_directory()
     with pytest.raises(TrustStoreError) as raised:
         trust_store.trust_store_path()
     assert str(checkout.resolve()) in str(raised.value)
@@ -716,7 +724,10 @@ def test_a_checkout_resident_store_is_refused_through_a_symlink(
     shutil.copytree(vendored, elsewhere)
     (home / ".config" / "pmcp").unlink()
     (home / ".config" / "pmcp").symlink_to(elsewhere, target_is_directory=True)
-    assert trust_store.trust_store_path().is_relative_to(elsewhere.resolve())
+    # The store path is the writer's own (the final link chain, see
+    # Consiliency/pmcp#374); the kernel resolves its directories at use.
+    store = Path(os.path.realpath(trust_store.trust_store_path()))
+    assert store.is_relative_to(elsewhere.resolve())
     granted = [
         c.name for c in load_configs(project_root=checkout, user_config_paths=[])
     ]
@@ -745,10 +756,15 @@ async def test_an_approval_in_a_checkout_resident_store_grants_nothing(
     # ... and a package approval, in the store beside it, for the same package
     # the overlay runs. `approve_package` resolves its path through
     # `trust_store_path`, so it is written from outside the checkout too.
-    approve_package(_npm_identity(ADDED_PACKAGE, ADDED_VERSION))
+    ship_package_approval(
+        _npm_identity(ADDED_PACKAGE, ADDED_VERSION), checkout / "home"
+    )
     assert (checkout / "home" / ".config" / "pmcp" / "package_approvals.json").exists()
 
     monkeypatch.chdir(checkout)
+    # pmcp is LAUNCHED here: the launch directory is captured once
+    # (Consiliency/pmcp#372 round 18), so model a fresh process.
+    trust_store.reset_launch_directory()
     with pytest.raises(TrustStoreError):
         trust_store.trust_store_path()
 

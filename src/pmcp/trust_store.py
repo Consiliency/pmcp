@@ -43,13 +43,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from pmcp.home_identity import (
+    HOME_NOT_PLAIN,
+    HomeInsideCheckoutError,
+    checkout_controlling_home,
+    enclosing_checkouts,
+    forget_home_verdicts,
+    has_checkout_marker,
+    is_operator_owned,
+    home_path,
+)
+from pmcp import atomic_write as _atomic_write_module
 from pmcp.atomic_write import (
     atomic_write,
     falls_back_to_pathname,
     is_absent,
     make_store_dirs,
     open_directory,
+    open_final_directory,
     resolve_write_target,
+    same_directory_as_kernel,
 )
 
 APPROVED = "approved"
@@ -104,6 +117,62 @@ class TrustRecord:
 _active_project_root: Path | None = None
 
 
+#: The directory pmcp was LAUNCHED in, captured once -- at import, or at the
+#: first residency judgement after the test-only reset -- as ``(absolute path,
+#: (st_dev, st_ino))``, and never re-read from the working directory
+#: (Consiliency/pmcp#372 round 18, board round 17 codex F001: re-reading the
+#: cwd on every call let a later ``chdir`` drop the launch checkout from the
+#: guard, so approvals stored inside it started granting the served project's
+#: config and packages).
+_LAUNCH_DIRECTORY: tuple[Path, tuple[int, int] | None] | None = None
+
+
+def _capture_launch_directory() -> tuple[Path, tuple[int, int] | None]:
+    global _LAUNCH_DIRECTORY
+    if _LAUNCH_DIRECTORY is None:
+        try:
+            where = Path(os.getcwd())
+            status = os.stat(where)
+            _LAUNCH_DIRECTORY = (where, (status.st_dev, status.st_ino))
+        except OSError:
+            _LAUNCH_DIRECTORY = (Path(os.path.abspath(os.curdir)), None)
+    return _LAUNCH_DIRECTORY
+
+
+def reset_launch_directory() -> None:
+    """Forget the captured launch directory. **Test-only seam.**"""
+    global _LAUNCH_DIRECTORY
+    _LAUNCH_DIRECTORY = None
+
+
+def _is_checkout(root: Path) -> bool:
+    """Does ``root`` carry a checkout marker?"""
+    return has_checkout_marker(root)
+
+
+def _boundaries(root: Path) -> list[Path]:
+    """The residency boundaries one root contributes -- the same rule for every root.
+
+    Every checkout enclosing ``root`` (``root`` itself included when it carries
+    a marker). With none, ``root`` itself -- a plain directory pmcp reads a
+    project from is that project's boundary -- unless it is the home directory
+    or an ancestor of it, where the operator's own store lives (Consiliency/pmcp
+    #372 round 18, board round 17 grok F001: a markerless bound root added
+    nothing, so a store linked into it approved its own packages and policy,
+    while ``--project`` on the same directory refused it).
+    """
+    enclosing = list(_enclosing_checkouts(root))
+    if enclosing:
+        return enclosing
+    # By FILE IDENTITY (pmcp.home_identity), never path spelling: home and its
+    # physical ancestors, plus the default store's own real directories
+    # (home's .config and .config/pmcp), are the operator's (Consiliency/pmcp
+    # #372 round 19, board round 18 codex F001 and claude N-1).
+    if is_operator_owned(root):
+        return []
+    return [root]
+
+
 def set_active_project_root(root: Path | None) -> None:
     """Bind the residency check to the project the gateway is SERVING.
 
@@ -126,37 +195,27 @@ def set_active_project_root(root: Path | None) -> None:
 
 
 def _enclosing_checkouts(start: Path) -> Iterator[Path]:
-    """Every checkout at or above ``start``, resolved, nearest first.
+    """Every checkout at or above ``start``, resolved, nearest first -- up to ``/``.
 
-    Walks up from ``start`` via ``find_project_root``, then chains
-    ``root.parent`` upward so an intermediate marker -- a subdirectory's own
-    ``.mcp.json`` -- cannot stop the walk short of the real checkout. Terminates
-    when ``find_project_root`` returns ``None`` (its temp/home guards) or at the
-    filesystem root (``parent == enclosing``). Shared by ``_checkout_roots`` (the
-    residency guard's served and cwd arms) and by
-    ``assert_store_outside_path_checkout`` (the approve verb's guard -- the
-    checkout enclosing the path being approved, Consiliency/pmcp#252) so the walk
-    cannot drift between them. ``record`` itself stays unguarded, so a store a
-    repository *ships* can still be planted in tests and shown refused.
+    The RESIDENCY walk, deliberately not project discovery
+    (Consiliency/pmcp#372 round 20, boards round 19 grok/codex F001):
+    ``find_project_root`` stops at the home directory and the temp root, so a
+    checkout that ENCLOSES the home directory was invisible here -- with HOME
+    at ``<checkout>/home``, a repository-shipped ``HOME/.config/pmcp/
+    trust.json`` approved ``HOME/app/.mcp.json``. This walk goes all the way to
+    ``/``, through and above home, on the kernel-resolved path. The one
+    directory it never counts is the home directory ITSELF (by identity): a
+    home kept under version control -- a dotfiles repository -- is the
+    operator's, and counting it would refuse every operator store. Shared by
+    ``_checkout_roots`` and ``assert_store_outside_path_checkout`` so the walk
+    cannot drift between them.
     """
-    # Imported here, not at module scope, to break an import cycle introduced
-    # when CONSENT landed: pmcp.config.loader now imports pmcp.project_consent,
-    # which imports this module. At module scope that made `import
-    # pmcp.config.loader` fail outright in a clean interpreter. The residency
-    # check only needs the project root at call time.
-    from pmcp.config.loader import find_project_root
-
-    current: Path | None = start
-    while current is not None:
-        enclosing = find_project_root(current)
-        if enclosing is None:
-            return
-        yield enclosing.resolve()
-        parent = enclosing.parent
-        current = parent if parent != enclosing else None
+    # The walk lives in pmcp.home_identity (Consiliency/pmcp#372 round 21),
+    # where operator ownership is decided with it.
+    yield from enclosing_checkouts(start)
 
 
-def _checkout_roots() -> tuple[Path, ...]:
+def _checkout_roots(also: tuple[Path, ...] = ()) -> tuple[Path, ...]:
     """Resolved checkout roots the store's residency is judged against.
 
     The store is refused if it resolves inside **any** of these. They are the
@@ -167,7 +226,12 @@ def _checkout_roots() -> tuple[Path, ...]:
       *verbatim* -- a store resident in a served directory that lies inside no
       checkout must still be refused;
     * every checkout ENCLOSING the served root; and
-    * every checkout ENCLOSING ``Path.cwd()``.
+    * every checkout ENCLOSING the directory pmcp was LAUNCHED in (captured
+      once; Consiliency/pmcp#372 round 18); and
+    * the file being approved and the reader's bound project (``also``).
+
+    Every root follows one rule (``_boundaries``): its enclosing checkouts, else
+    the root itself unless it is the home directory or above.
 
     Both the served root and cwd are walked UP to the enclosing checkout, not
     judged against the single directory they name. ``find_project_root`` stops at
@@ -207,6 +271,8 @@ def _checkout_roots() -> tuple[Path, ...]:
     inside a checkout keeps working (its store lives in the operator's home,
     outside the checkout).
     """
+    # A trust decision never rests on a cached home verdict.
+    forget_home_verdicts()
     roots: list[Path] = []
 
     def _add(candidate: Path | None) -> None:
@@ -216,25 +282,32 @@ def _checkout_roots() -> tuple[Path, ...]:
         if resolved not in roots:
             roots.append(resolved)
 
+    # ONE rule for every root the guard receives (``_boundaries``): its
+    # enclosing checkouts, else the root itself unless it is the home
+    # directory or above it (Consiliency/pmcp#372 round 18).
+    #
+    # The served root, and the checkouts enclosing it. Walking UP matters: a
+    # subdirectory of a checkout normally carries its own `.mcp.json`, so a
+    # single lookup would stop there and never reach the real checkout.
     if _active_project_root is not None:
-        # The served root itself is always a boundary (a served dir inside no
-        # checkout must still be refused); then every checkout enclosing it,
-        # walked from the PARENT so the served dir's own `.mcp.json` cannot stop
-        # the walk at the served root.
-        _add(_active_project_root)
-        for enclosing in _enclosing_checkouts(_active_project_root.parent):
-            _add(enclosing)
-
-    # The cwd arm walks up too: cwd may itself be a checkout subdirectory
-    # carrying the payload `.mcp.json`, so a single lookup would stop there and
-    # miss the enclosing checkout (the bare `pmcp serve` and `pmcp trust` verb
-    # case, EC-TRUST-5 cwd-subdirectory).
-    for enclosing in _enclosing_checkouts(Path.cwd()):
-        _add(enclosing)
+        for boundary in _boundaries(_active_project_root):
+            _add(boundary)
+    # The LAUNCH directory, captured once and never re-read from the cwd
+    # (EC-TRUST-5 cwd-subdirectory; round 18 codex F001).
+    for boundary in _boundaries(_capture_launch_directory()[0]):
+        _add(boundary)
+    # The roots pmcp is reading project inputs from for THIS judgement
+    # (round 17, board round 16 F001): the directory of the file being
+    # approved and the project root its reader is bound to. A gateway built in
+    # A that later runs with its cwd in B still judges A's files against A.
+    # Adding roots only refuses more.
+    for root in also:
+        for boundary in _boundaries(root):
+            _add(boundary)
     return tuple(roots)
 
 
-def trust_store_path() -> Path:
+def trust_store_path(*, also: tuple[Path, ...] = ()) -> Path:
     """Resolved path of the user-scoped trust store.
 
     Raises ``TrustStoreError`` if the store would land inside a checkout being
@@ -244,13 +317,147 @@ def trust_store_path() -> Path:
     Symlinks are resolved *before* the comparison, which is the only reason a
     planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
-    path = (Path.home() / ".config" / "pmcp" / "trust.json").resolve()
-    refuse_checkout_resident(path, "Trust store")
-    return path
+    return home_scoped_location(
+        ".config", "pmcp", "trust.json", label="Trust store", also=also
+    )
+
+
+def home_scoped_location(
+    *parts: str,
+    label: str,
+    also: tuple[Path, ...] = (),
+    resolve_leaf: bool = True,
+) -> Path:
+    """THE rule for a home-scoped file pmcp keeps its own state in: the trust
+    store, and the singleton lock's default directory (Consiliency/pmcp#372
+    round 36: one rule, one code path -- whatever a dotfiles-linked
+    ``~/.config/pmcp`` is allowed, a dotfiles-linked ``~/.pmcp`` is too).
+
+    The HOME gate; then the path resolved as the WRITER resolves it; then
+    refused if it lands in a checkout being judged. HOME itself never counts
+    as one (a dotfiles repository at home, or ``~/.pmcp/manifest.yaml``, does
+    not make it a checkout). Raises ``TrustStoreError``.
+
+    ``resolve_leaf``: the stores' files follow a final link (a dotfiles-linked
+    ``trust.json`` is written through, Consiliency/pmcp#248), so the place
+    judged is where it leads. ``False`` (the singleton lock): only the FOLDER
+    is resolved and judged; the leaf is never looked through -- the caller
+    opens it without following a link (Consiliency/pmcp#372 round 37).
+    """
+    name = parts[-1]
+    # Home-scoped (Consiliency/pmcp#372 round 22): refused while a checkout
+    # controls the home directory, or while HOME is not a plain absolute path
+    # the system resolves (round 24: fail closed).
+    # A trust decision never rests on a cached home verdict.
+    forget_home_verdicts()
+    try:
+        spelled = home_path(*parts)
+    except HomeInsideCheckoutError as exc:
+        if exc.strerror == HOME_NOT_PLAIN:
+            raise TrustStoreError(
+                f"{label} {name}: {HOME_NOT_PLAIN}; refusing it."
+            ) from exc
+        checkout = checkout_controlling_home()
+        where = f"the checkout at {checkout}" if checkout is not None else "a checkout"
+        raise TrustStoreError(
+            f"{label} {name} resolves inside {where}: the home directory "
+            "lies inside it. A store inside a project's checkout lets it approve "
+            "its own content; move the home directory outside the repository."
+        ) from exc
+    # Resolved as the WRITER resolves it -- the kernel's own verdict on the
+    # whole path, then the final link chain hop by hop through descriptors --
+    # never Path.resolve(), whose lexical `missing/..` collapse once named a
+    # different file than the kernel would (see Consiliency/pmcp#374).
+    fd: int | None = None
+    if not resolve_leaf:
+        # The folder only: resolved by the system (strictly), opened through
+        # THE directory helper where descriptors are supported -- O_PATH, so a
+        # folder the user may search but not list (0300) still opens -- and
+        # judged by pathname otherwise (Windows, no dir_fd) or where the
+        # shared fallback rule says so (Consiliency/pmcp#372 round 38).
+        try:
+            folder = os.path.realpath(spelled.parent, strict=True)
+            if not same_directory_as_kernel(spelled.parent, folder):
+                # The resolver collapsed a spelling the system refuses (or
+                # reaches elsewhere): never fall back to its answer.
+                raise NotADirectoryError(
+                    errno.ENOTDIR, "does not resolve as written", spelled.parent.name
+                )
+            if _atomic_write_module._DIR_FD_SUPPORTED:
+                try:
+                    fd = open_directory(folder)
+                except OSError as exc:
+                    if not falls_back_to_pathname(exc):
+                        raise
+                if fd is not None:
+                    # The descriptor must still be the directory the system
+                    # opens for the operator's spelling.
+                    held = os.fstat(fd)
+                    seen = os.stat(spelled.parent)
+                    if (held.st_dev, held.st_ino) != (seen.st_dev, seen.st_ino):
+                        os.close(fd)
+                        fd = None
+                        raise NotADirectoryError(
+                            errno.ENOTDIR, "changed while it was opened", name
+                        )
+        except RuntimeError as exc:  # a link loop, before 3.13
+            raise TrustStoreError(
+                f"Cannot resolve the folder of {name}: a link loop"
+            ) from exc
+        except OSError as exc:
+            if fd is not None:
+                os.close(fd)
+            raise TrustStoreError(
+                f"Cannot resolve the folder of {name}: "
+                f"{os.strerror(exc.errno) if exc.errno else exc}"
+            ) from exc
+        target = os.path.join(folder, spelled.name)
+        try:
+            refuse_checkout_resident(target, label, dir_fd=fd, also=also)
+        finally:
+            if fd is not None:
+                os.close(fd)
+        return Path(target)
+    try:
+        if is_absent(spelled.parent):
+            # A fresh install: no store, no link to follow. Judge where it will
+            # be created (the residency walk steps up across plain names).
+            target = os.fspath(spelled)
+        else:
+            if _atomic_write_module._DIR_FD_SUPPORTED:
+                try:
+                    fd, _name = open_final_directory(spelled)
+                except FileNotFoundError:
+                    # The link's directory does not exist yet: judged by its
+                    # nearest existing directory, stepping only across plain
+                    # names (a `missing/..` is refused there).
+                    fd = None
+                except OSError as exc:
+                    if not falls_back_to_pathname(exc):
+                        raise
+            target = resolve_write_target(spelled)
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+        raise TrustStoreError(
+            f"Cannot resolve {name}: {os.strerror(exc.errno) if exc.errno else exc}"
+        ) from exc
+    try:
+        # The chain's own pathname, also where a descriptor is judged: a
+        # platform without directory descriptors judges the pathname.
+        refuse_checkout_resident(target, label, dir_fd=fd, also=also)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return Path(target)
 
 
 def refuse_checkout_resident(
-    path: Path | str, label: str, *, dir_fd: int | None = None
+    path: Path | str,
+    label: str,
+    *,
+    dir_fd: int | None = None,
+    also: tuple[Path, ...] = (),
 ) -> None:
     """Raise ``TrustStoreError`` if ``path``'s directory lies inside a judged checkout.
 
@@ -262,7 +469,7 @@ def refuse_checkout_resident(
     """
     name = os.path.basename(os.fspath(path))
     try:
-        checkout = _resident_checkout(path, _checkout_roots(), dir_fd=dir_fd)
+        checkout = _resident_checkout(path, _checkout_roots(also), dir_fd=dir_fd)
     except OSError as exc:
         raise TrustStoreError(
             f"{label} {name}: cannot establish that it lies outside every "
@@ -270,10 +477,13 @@ def refuse_checkout_resident(
             "refusing it."
         ) from exc
     if checkout is not None:
+        # A boundary is a checkout when it carries a project marker; otherwise
+        # it is a plain directory pmcp reads a project from (round 18).
+        kind = "checkout" if _is_checkout(checkout) else "directory"
         raise TrustStoreError(
-            f"{label} {name} resolves inside the checkout at {checkout}. "
-            "A checkout-resident store lets a repository approve its own "
-            "content; move it under a home directory outside the repository."
+            f"{label} {name} resolves inside the {kind} at {checkout}. "
+            f"A store inside a project's {kind} lets it approve its own "
+            "content; move it under a home directory outside the project."
         )
 
 
@@ -511,6 +721,32 @@ def _ensure_store_dir(parent: Path) -> None:
             os.chmod(created, 0o700)
 
 
+def _open_sidecar_lock(path: Path) -> int:
+    """The store's ``.lock`` sidecar: opened, or created only if absent and
+    exclusively, never through a link (Consiliency/pmcp#372 round 34: an
+    ``O_RDWR|O_CREAT`` open followed a planted link and created its target)."""
+    from pmcp.atomic_write import PlainFileRefused, open_plain_file
+
+    flags = (
+        os.O_RDWR
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    for _attempt in range(5):
+        try:
+            return open_plain_file(
+                path.name + ".lock", parent=str(path.parent), dir_fd=None, flags=flags
+            )
+        except FileExistsError:
+            continue  # lost a creation race: open what is there now
+        except PlainFileRefused as exc:
+            raise TrustStoreError(
+                f"{path.name}.lock is not a plain regular file; refusing it"
+            ) from exc
+    raise TrustStoreError(f"{path.name}.lock kept changing; refusing it")
+
+
 @contextlib.contextmanager
 def _store_lock(path: Path) -> Iterator[None]:
     """Hold an exclusive lock for one read-modify-write of the store.
@@ -533,7 +769,7 @@ def _store_lock(path: Path) -> Iterator[None]:
     except ImportError:  # pragma: no cover - non-POSIX
         yield
         return
-    fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fd = _open_sidecar_lock(path)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
@@ -543,7 +779,22 @@ def _store_lock(path: Path) -> Iterator[None]:
         os.close(fd)
 
 
-def is_approved(path: Path, content: bytes) -> bool:
+def judged_roots(target: Path, project_root: Path | None) -> tuple[Path, ...]:
+    """The roots a judgement of ``target`` adds to the residency guard.
+
+    The directory of the file being approved, and the project root its reader
+    is bound to (``None``: none beyond the file's own). See
+    :func:`_checkout_roots`.
+    """
+    roots = [target.parent]
+    if project_root is not None:
+        roots.append(Path(project_root))
+    return tuple(roots)
+
+
+def is_approved(
+    path: Path, content: bytes, *, project_root: Path | None = None
+) -> bool:
     """Is ``content`` approved to be applied as ``path``?
 
     ``content`` is the bytes the caller is about to use, not a promise about
@@ -557,12 +808,16 @@ def is_approved(path: Path, content: bytes) -> bool:
     trust by a corrupt file.
     """
     try:
-        return is_approved_resolved(Path(path).resolve(), content)
+        return is_approved_resolved(
+            Path(path).resolve(), content, project_root=project_root
+        )
     except Exception:  # noqa: BLE001 -- fail closed; see docstring
         return False
 
 
-def is_approved_resolved(resolved_path: Path, content: bytes) -> bool:
+def is_approved_resolved(
+    resolved_path: Path, content: bytes, *, project_root: Path | None = None
+) -> bool:
     """Is ``content`` approved for the ALREADY-RESOLVED canonical ``resolved_path``?
 
     Identical to ``is_approved`` except that ``resolved_path`` is used as the
@@ -577,7 +832,11 @@ def is_approved_resolved(resolved_path: Path, content: bytes) -> bool:
     Never raises, for the same fail-closed reason as ``is_approved``.
     """
     try:
-        records = _read_store(trust_store_path())
+        # Residency is judged against the approved file's own checkout and the
+        # reader's bound project too, never the working directory alone.
+        records = _read_store(
+            trust_store_path(also=judged_roots(resolved_path, project_root))
+        )
         digest = hashlib.sha256(content).hexdigest()
         for rec in records:
             if rec.absolute_path == resolved_path:
@@ -697,3 +956,7 @@ def list_records() -> list[TrustRecord]:
     permission by anything.
     """
     return _read_store(trust_store_path())
+
+
+# The launch directory, captured at import (see _LAUNCH_DIRECTORY).
+_capture_launch_directory()

@@ -421,7 +421,9 @@ def _evaluate(
         return _deny("unpinned_configured_argv", _unpinned_remedy(identity), identity)
 
     # (5) The operator approved this exact identity.
-    if is_package_approved(identity):
+    # Residency judged against the gateway's bound project too (the policy
+    # manager's; Consiliency/pmcp#372 round 17).
+    if is_package_approved(identity, project_root=policy.project_root):
         return _allow("package_approved", identity)
 
     # (6) The policy names it. Only the exact verdict "allowed" grants.

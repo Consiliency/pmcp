@@ -146,7 +146,7 @@ def _gateway(
     )
     jobs = _JobManager()
     manager = _ClientManager()
-    monkeypatch.setattr(handlers_module, "load_manifest", lambda: manifest)
+    monkeypatch.setattr(handlers_module, "load_manifest", lambda **_k: manifest)
     monkeypatch.setattr(handlers_module, "load_configs", lambda **_: [])
     monkeypatch.setattr(handlers_module, "get_job_manager", lambda: jobs)
     gateway = GatewayTools(client_manager=cast(Any, manager), policy_manager=policy)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pmcp.env_store import child_process_env
 from pmcp.waits import bounded_wait
 import logging
 import os
@@ -79,6 +80,7 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
             *check_command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_process_env(),
         )
         stdout, stderr = await bounded_wait(process.communicate(), timeout=5.0)
 
@@ -108,6 +110,7 @@ async def get_cli_help(
             *help_command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_process_env(),
         )
         stdout, stderr = await bounded_wait(process.communicate(), timeout=10.0)
 

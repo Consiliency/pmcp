@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import logging
 import os
 import re
-import io
 import json
 import asyncio
 import time
@@ -19,7 +18,6 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any, Literal, cast, NamedTuple
 
 import anyio
-from dotenv import load_dotenv
 from mcp.types import Tool
 from pydantic import BaseModel
 from pmcp import __version__ as PMCP_VERSION
@@ -58,9 +56,14 @@ from pmcp.config.loader import (
     summarize_startup_resolution,
 )
 from pmcp.errors import ErrorCode, GatewayException, make_error
+from pmcp.home_identity import home_path
 from pmcp.env_store import (
+    bind_project_root,
     record_dotenv_keys,
-    read_env_text,
+    child_process_env,
+    credential_value,
+    load_store,
+    repository_may_supply,
     record_pmcp_introduced_keys,
     sanitized_subprocess_env,
     scope_store_name,
@@ -366,8 +369,23 @@ def _refresh_config_unchanged(
     return False
 
 
+def _manifest_for(project_root: Path | None) -> Manifest:
+    """``load_manifest`` for ``project_root``; ``None`` is the served project.
+
+    The project overlay follows the same root as the credentials
+    (Consiliency/pmcp#372 round 12). With no project the call stays
+    ``load_manifest()``, which reads the served project's overlay.
+    """
+    if project_root is None:
+        return load_manifest()
+    return load_manifest(project_root=project_root)
+
+
 def _materialised_pin(
-    server_name: str, resolved: ResolvedServerConfig, pinned_to: str
+    server_name: str,
+    resolved: ResolvedServerConfig,
+    pinned_to: str,
+    project_root: Path | None = None,
 ) -> str | None:
     """The manifest pin pmcp materialised, if it is what this config runs.
 
@@ -387,7 +405,7 @@ def _materialised_pin(
         return None
     if config.cwd or npm_env_may_redirect(server_name, (config.env or {}).keys()):
         return None
-    manifest_server = load_manifest().get_server(server_name)
+    manifest_server = _manifest_for(project_root).get_server(server_name)
     if manifest_server is None or manifest_server.version is None:
         return None
     if [config.command, *config.args] != [
@@ -866,6 +884,12 @@ class _CapabilityRequest:
 class GatewayTools:
     """Gateway tool handler implementations."""
 
+    #: The project this gateway serves; ``None`` means the served project root
+    #: (``env_store.serve_project_root``). Every credential lookup here answers
+    #: for it (Consiliency/pmcp#372 round 9). A class default so that an
+    #: instance made without ``__init__`` reads the served root.
+    _project_root: Path | None = None
+
     def __init__(
         self,
         client_manager: ClientManager,
@@ -878,7 +902,13 @@ class GatewayTools:
     ) -> None:
         self._client_manager = client_manager
         self._policy_manager = policy_manager
-        self._project_root = project_root
+        # The project this object serves, BOUND at construction: the explicit
+        # root, else the served one, else the one discovered from the working
+        # directory NOW. Everything it loads (configs, endpoints) and every
+        # credential it looks up use this one root, so a later chdir cannot
+        # pair this project's endpoint with another project's credential
+        # (Consiliency/pmcp#372 round 16, board round 15 claude F001).
+        self._project_root: Path = bind_project_root(project_root)
         self._custom_config_path = custom_config_path
         self._guidance_config = guidance_config
         self._descriptions_cache = descriptions_cache
@@ -1085,11 +1115,16 @@ class GatewayTools:
 
     @property
     def _provisioned_registry_path(self) -> Path:
-        return Path.home() / ".config" / "pmcp" / "provisioned.json"
+        # Home-scoped: only while HOME is the operator's (Consiliency/pmcp#372
+        # round 22); otherwise reading it fails like an unreadable file.
+        return home_path(".config", "pmcp", "provisioned.json")
 
     def _load_provisioned_registry(self) -> dict[str, str | None]:
         """Load the persisted provisioned-server registry from disk."""
-        path = self._provisioned_registry_path
+        try:
+            path = self._provisioned_registry_path
+        except OSError:
+            return {}  # a home a checkout controls: no registry (round 22)
         if not path.exists():
             return {}
         try:
@@ -1294,7 +1329,7 @@ class GatewayTools:
         scoped_advisor = self._policy_manager.scoped_advisor_active is True
         query = parsed.query.strip() if parsed.query else ""
         if query and not scoped_advisor:
-            manifest = load_manifest()
+            manifest = _manifest_for(self._project_root)
             detected_clis, detected_cli_infos = await self._resolve_cli_availability(
                 manifest
             )
@@ -1402,7 +1437,7 @@ class GatewayTools:
         if parsed.include_offline and parsed.query and not scoped_advisor:
             manifest_candidates = self._manifest_candidates_for_query(
                 parsed.query,
-                manifest=load_manifest(),
+                manifest=_manifest_for(self._project_root),
                 configured_servers=self._load_configured_servers(),
                 exclude_servers=represented_servers,
                 limit=min(5, parsed.limit),
@@ -1997,7 +2032,7 @@ class GatewayTools:
 
             manifest_servers = {}
             try:
-                manifest = load_manifest()
+                manifest = _manifest_for(self._project_root)
                 manifest_servers = manifest.servers
             except Exception as e:
                 # Class only: an error's text can quote overlay input
@@ -2422,7 +2457,7 @@ class GatewayTools:
             project_root=self._project_root,
             custom_config_path=self._custom_config_path,
         )
-        manifest = load_manifest().servers
+        manifest = _manifest_for(self._project_root).servers
         provisioned = self._load_provisioned_registry()
         discovered = self._discovered_server_configs
         enabled = load_enabled_auto_start(
@@ -2440,7 +2475,9 @@ class GatewayTools:
             disabled_auto_start=disabled,
             provisioned_server_names=provisioned,
             is_server_allowed=self._policy_manager.is_server_allowed,
-            is_auth_available=lambda env_var: bool(os.environ.get(env_var)),
+            is_auth_available=lambda env_var: bool(
+                credential_value(env_var, root=self._project_root)
+            ),
             legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
             project_root=self._project_root,
         )
@@ -2515,7 +2552,7 @@ class GatewayTools:
             project_root=self._project_root,
             custom_config_path=self._custom_config_path,
         )
-        manifest = load_manifest().servers
+        manifest = _manifest_for(self._project_root).servers
         known_names = {config.name for config in configured} | set(manifest)
         return get_startup_policy(
             project_root=self._project_root,
@@ -2729,26 +2766,22 @@ class GatewayTools:
         if not env_var:
             return False
 
-        # Check live environment first (fast path)
-        if os.environ.get(env_var):
+        # The process environment, then credentials repository files supplied
+        # (env_store.credential_value) -- fast path.
+        if credential_value(env_var, root=self._project_root):
             return True
 
-        # Check all env stores in priority order: project-local .env, then pmcp files
-        for env_path in [
-            Path.cwd() / ".env",
-            Path.cwd() / ".env.pmcp",
-            Path.home() / ".config" / "pmcp" / "pmcp.env",
-        ]:
-            # read_env_text: a fifo (or any non-regular file) a repository ships
-            # at one of these paths reads as absent instead of freezing the
-            # gateway; same parser, interpolation and precedence as before.
-            text = read_env_text(env_path)
-            if text is not None:
-                before = set(os.environ)
-                load_dotenv(stream=io.StringIO(text))
-                record_dotenv_keys(set(os.environ) - before)
-                if os.environ.get(env_var):
-                    return True
+        # The project's files need no load of their own: the lookup above
+        # builds the served (or given) project's entry with the one builder
+        # (env_store._build_root_entry), confined and outside the gateway's
+        # environment (Consiliency/pmcp#367, #372 rounds 2 and 12). What may
+        # still be missing is the user store, which follows its link and loads
+        # into the environment.
+        before = set(os.environ)
+        load_store("user")
+        record_dotenv_keys(set(os.environ) - before)
+        if credential_value(env_var, root=self._project_root):
+            return True
 
         return False
 
@@ -2764,7 +2797,7 @@ class GatewayTools:
         correct after a credential is migrated to the namespaced key.
         """
         options: list[str] = []
-        manifest_server = load_manifest().get_server(server_name)
+        manifest_server = _manifest_for(self._project_root).get_server(server_name)
         for key in credential_lookup_keys(manifest_server):
             if key not in options:
                 options.append(key)
@@ -2797,7 +2830,7 @@ class GatewayTools:
         `(manifest_server, auth_env_options)` when the credential is still
         required and unavailable, else `None`.
         """
-        manifest_server = load_manifest().get_server(server_name)
+        manifest_server = _manifest_for(self._project_root).get_server(server_name)
         if not manifest_server or not manifest_server.env_var:
             return None
 
@@ -3193,7 +3226,7 @@ class GatewayTools:
                 )
             return (configured, None, "configured")
 
-        manifest = load_manifest()
+        manifest = _manifest_for(self._project_root)
         server_config = manifest.get_server(server_name)
         # As in `provision`: the gate's source is which lookup matched.
         source: ProvisionSource = "manifest"
@@ -3285,7 +3318,7 @@ class GatewayTools:
                         source,
                     )
 
-            resolved = manifest_server_to_config(server_config)
+            resolved = manifest_server_to_config(server_config, self._project_root)
             missing_env_vars = self._missing_remote_header_env_vars(resolved)
             if missing_env_vars:
                 return (
@@ -3471,7 +3504,7 @@ class GatewayTools:
 
     def _get_server_config_for_update(self, server_name: str) -> ServerConfig | None:
         """Resolve server config from manifest or discovered candidates."""
-        manifest = load_manifest()
+        manifest = _manifest_for(self._project_root)
         server_config = manifest.get_server(server_name)
         if server_config:
             return server_config
@@ -3504,7 +3537,7 @@ class GatewayTools:
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=env,
+            env=child_process_env(base=env),
             start_new_session=True,
         )
         # The spawn contract: `start_new_session=True` makes the probe a group
@@ -3706,7 +3739,7 @@ class GatewayTools:
         self._record_feedback_event("capability_request", {"query": parsed.query})
 
         # Load manifest
-        manifest = load_manifest()
+        manifest = _manifest_for(self._project_root)
         configured_servers = self._load_configured_servers()
 
         merged_manifest = self._build_manifest_with_config_servers(
@@ -4243,7 +4276,7 @@ class GatewayTools:
             )
 
         # Load manifest
-        manifest = load_manifest()
+        manifest = _manifest_for(self._project_root)
         server_config = manifest.get_server(server_name)
         # The gate's `source` is WHICH LOOKUP found the config -- never a field
         # on it, since a discovered config is composed from agent input.
@@ -4322,7 +4355,9 @@ class GatewayTools:
         # Remote manifest entries do not install packages; connect them directly.
         if server_config.url:
             try:
-                resolved_config = manifest_server_to_config(server_config)
+                resolved_config = manifest_server_to_config(
+                    server_config, self._project_root
+                )
                 missing_env_vars = self._missing_remote_header_env_vars(resolved_config)
                 if missing_env_vars:
                     env_names = ", ".join(missing_env_vars)
@@ -4681,7 +4716,7 @@ class GatewayTools:
                 auth_state="missing_auth",
             )
 
-        manifest = load_manifest()
+        manifest = _manifest_for(self._project_root)
         server_config = manifest.get_server(server_name)
         # Resolve the server's declared credential variable from both the
         # manifest and the discovered-server registry: discovered servers
@@ -4754,8 +4789,16 @@ class GatewayTools:
         # declared name any credential-shaped override passed -- including
         # NPM_CONFIG__AUTH, which the pinned `npx -y` spawn would then read
         # (Consiliency/pmcp#230).
-        if not env_var_allowed(env_var, declared_storage_key) or (
-            from_discovered and not discovered_env_var_allowed(env_var)
+        #
+        # The same rule a repository file is held to (env_store.
+        # repository_may_supply) applies on top: the value lands in a store pmcp
+        # loads into its own environment, so pmcp's own variables, `*_proxy` in
+        # any case and the package-manager families are refused here too
+        # (Consiliency/pmcp#372 round 5).
+        if (
+            not env_var_allowed(env_var, declared_storage_key)
+            or (from_discovered and not discovered_env_var_allowed(env_var))
+            or not repository_may_supply(env_var)
         ):
             self._audit(
                 method="gateway.auth_connect",
@@ -4777,6 +4820,32 @@ class GatewayTools:
                     f"Env var '{env_var}' is not permitted for server "
                     f"'{server_name}'.{expected} Refusing to store it."
                 ),
+                auth_state="missing_auth",
+                env_var=env_var,
+            )
+
+        if "${" in parsed.credential:
+            # The store is loaded with python-dotenv's expansion, so a stored
+            # `${GITHUB_TOKEN}` would become the operator's secret under this
+            # server's name at the next start. Value-free refusal.
+            message = (
+                f"Refusing to store {env_var}: the value contains '${{', which "
+                "pmcp would expand from your environment when it loads the store."
+            )
+            self._audit(
+                method="gateway.auth_connect",
+                action="auth_connect",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=server_name,
+                auth_state="missing_auth",
+                auth_event="policy_denied",
+                error=message,
+            )
+            return AuthConnectOutput(
+                ok=False,
+                server=server_name,
+                message=message,
                 auth_state="missing_auth",
                 env_var=env_var,
             )
@@ -5233,7 +5302,7 @@ class GatewayTools:
                 package_type=package_type,
                 package_name=package_name,
                 pinned_version=_materialised_pin(
-                    server_name, resolved_config, pinned_to
+                    server_name, resolved_config, pinned_to, self._project_root
                 ),
                 message=(
                     f"'{server_name}' is pinned to '{pinned_to}' in {source_desc} "
@@ -5917,12 +5986,14 @@ class GatewayTools:
 
         try:
             # Build config from manifest
-            manifest = load_manifest()
+            manifest = _manifest_for(self._project_root)
             server_config = manifest.get_server(job_server_name)
             if not server_config:
                 raise ValueError(f"Server '{job_server_name}' not found in manifest")
 
-            resolved_config = manifest_server_to_config(server_config)
+            resolved_config = manifest_server_to_config(
+                server_config, self._project_root
+            )
 
             # Adopt the process into ClientManager
             await self._client_manager.adopt_process(
@@ -6102,7 +6173,7 @@ class GatewayTools:
         else:
             platform = detect_platform()
 
-        manifest = load_manifest()
+        manifest = _manifest_for(self._project_root)
 
         # Use provided or probe CLIs
         if parsed.detected_clis:

@@ -34,15 +34,85 @@ to do, how to verify it, and how to roll back to 2.7.3.
   `pmcp: refusing to load .env.pmcp: it is a symlink` on stderr and goes on without those
   keys, where 2.7.3 loaded whatever the link pointed at — this includes the gateway. Keep
   linked credentials in the user store `~/.config/pmcp/pmcp.env`, which still follows its
-  link. Six other readers still follow a project link, among them remote-header auth,
-  whose values can be sent as a header to a remote server the repository configures
-  (Consiliency/pmcp#367; the full list is in the migration guide). A project `.env.pmcp`
+  link. A project `.env.pmcp`
   that is not a regular file (a fifo, a socket, a device) is refused rather than read (at
   startup: skipped with a warning), and any other failure to read or write the store (a
   directory at the path, no permission, bytes that are not UTF-8, a value with a newline,
   a `--project` path the system cannot resolve) is reported the same way instead of
   crashing the command. A source store that `pmcp secrets sync` only reads is reported as
-  `refusing to read …`. *Security*
+  `refusing to read …`. Every other reader of a
+  repository-controlled store reads it the same confined way — remote-header
+  `${VAR}` resolution, a tenant `.pmcp/tenants/<id>/pmcp.env`, the gateway's
+  credential check, spawn-time env stripping, `pmcp secrets check`, and the `.env`
+  pmcp finds at startup by walking up from where it is installed (inside a checkout
+  when it runs from that checkout's `.venv`) — and treats a refused store as empty,
+  printing `pmcp: refusing to read .env.pmcp: …` once per store per configuration
+  load; the feedback gate refuses to submit instead. A tenant id made only of dots
+  (`.`, `..`) is refused. A store behind a directory pmcp cannot search counts as
+  unreadable, not absent: a reader that only looks warns and reads it as empty (the
+  user store too, so pmcp still starts), and one that decides — the feedback gate, a
+  rewrite — refuses. *Security*
+- **A project file supplies credentials only.** A checkout's `.env.pmcp`, the `.env`
+  in the directory the gateway runs from (or that pmcp finds when it is installed in a
+  checkout's `.venv` -- any `.env` its startup walk finds outside your home directory and
+  its ancestors), and a tenant `pmcp.env` no longer put anything
+  into pmcp's own environment. Their values are credentials: a server's declared
+  credential, a remote `${VAR}` header, the credential checks and the `pmcp secrets`
+  commands still find them. Nothing else does — not pmcp's own settings
+  (`PMCP_LOG_LEVEL`, `PMCP_PORT`, …), not `HOME`, a proxy or a CA bundle, and not a
+  child process pmcp starts. Such a variable prints `pmcp: Ignoring <VAR> in .env.pmcp:
+  a project file supplies credentials only, …` and is left unset; in 2.7.3 it applied.
+  Any other non-credential variable in such a file is ignored without a line. A value
+  is expanded only from keys defined earlier in the same file: `LEAK=${GITHUB_TOKEN}`,
+  which 2.7.3 filled from your environment, is ignored with `pmcp: Ignoring LEAK in
+  .env.pmcp: its value refers to a variable the file does not define, …`. Your shell
+  and `~/.config/pmcp/pmcp.env` now win over a project file for every lookup, and every
+  reader -- runtime and diagnostics alike -- goes through the same lookup, which reads a
+  project's own `.env` before its `.env.pmcp`, never another project's, and rereads a
+  project file that changed. The project is the one pmcp serves -- `--project` when
+  given, otherwise the project root found from the working directory (the root
+  `.mcp.json` is loaded from) -- so `pmcp --project B` started inside project A spawns,
+  gates and checks B's servers with B's credentials. Every project input follows that
+  same project: its `.mcp.json`, its `.pmcp/manifest.yaml` overlay (found at the
+  project root, no longer by walking up from the working directory; a directory with an
+  overlay is a project root) and its `.mcp-gateway-policy.yaml` (no longer read from the
+  working directory), so a server's endpoint and its credential always come from one
+  project. `pmcp init` without `--project` writes the served project's `.mcp.json`.
+  Started from a subdirectory of a
+  project, pmcp reads the root's `.env.pmcp`, the one `pmcp secrets set --scope project`
+  writes, where 2.7.3 loaded the working directory's (a tenant
+  lookup checks the tenant store before the project store), where in 2.7.3 a checkout's
+  `.env` won over the user store and `pmcp secrets check` preferred a project
+  `.env.pmcp` (a per-project override of a user-store key, such as a tenant id, does not
+  apply), and a variable your shell exports as empty stays
+  unavailable rather than being filled from a project file. A `~/.env` (or one in an
+  ancestor of your home directory) still loads as before. A server pmcp spawns
+  keeps every variable you exported: a project `.env.pmcp` that lists a name, such as
+  `NO_PROXY` or `SSL_CERT_FILE`, no longer removes your value of it from the child's
+  environment, as 2.7.3 did. Only the names in your user store and the credentials pmcp
+  itself put into its environment (`auth_connect`, a `~/.env`) are withheld from other
+  servers. A tenant or project store located without `--project` is the served
+  project's. `pmcp secrets sync
+  --from-scope project --to-scope user` copies credentials only -- a credential-shaped
+  name or one a manifest server declares (`POSTGRES_URL`) -- and skips every other
+  name (`UV_INDEX_URL`, `DATABASE_URL`, anything named `PMCP_*`, proxies, code-loading and
+  package-manager names) and any value containing `${` or spanning lines, with `pmcp:
+  Not copying <NAME> from .env.pmcp: …`, where 2.7.3 copied every key into the store
+  pmcp loads into its environment at each start; `gateway.auth_connect` refuses the
+  same names and a credential containing `${`. `pmcp secrets check` answers what the
+  runtime would: an exported variable counts as available, an exported empty one as
+  missing, where it used to look at the stores alone.
+  *Security*
+- **HOME must be a plain absolute path.** pmcp uses the files under your home directory
+  -- user config and policy, guidance, the user manifest overlay, `~/.config/pmcp/pmcp.env`,
+  the trust and package-approval stores, the registry caches, the lock -- only while
+  `HOME` (`USERPROFILE` on Windows) is absolute, has no `.` or `..` component and
+  resolves, and no checkout lies above the home directory or holds a link on the way to
+  it. Otherwise pmcp prints `pmcp: Ignoring the operator's files under the home
+  directory: …` once, runs without those files, creates nothing there, and refuses every
+  trust and package-approval decision. A dotfiles repository at the home directory, your
+  own links (`/home -> /var/home`) and a filesystem or drive root holding a marker (a
+  container's `/package.json`) are fine. 2.7.3 used whatever `HOME` named. *Security*
 - **Discovered servers are default-deny.** `gateway.register_discovered_server` resolves
   and pins the package (and refuses one it cannot pin, or an `env_vars` name that is not
   credential-shaped); `provision`, `connect_server` and `restart_server` refuse it until
@@ -155,6 +225,12 @@ to do, how to verify it, and how to roll back to 2.7.3.
   runs out), pmcp now SIGKILLs the server's whole process group instead of waiting
   out its SIGTERM grace, so a server that needs a graceful flush on exit can lose
   it in that case. An uncancelled teardown still sends SIGTERM first. *Fixed*
+- **Stop every running gateway before upgrading.** 3.0 never removes the singleton lock
+  file `~/.pmcp/gateway.lock` (a lock dies with its gateway), and refuses a lock path that
+  is a link or not a plain file, and an explicit `--lock-dir` that is itself a link (a symlinked `~/.pmcp` is judged like `~/.config/pmcp`: followed unless it leads into the project pmcp serves or was started in). 2.7.3 removes the file when it shuts down, so while an
+  older gateway still runs, its shutdown can delete a 3.0 gateway's live lock and a third
+  start can then run beside it. Until every running pmcp is upgraded the one-gateway
+  guarantee does not hold; stop them all first, and do the same before rolling back.
 - **Known issues in 3.0.0.** `pmcp refresh` writes its cache to `.pmcp` by default,
   but the gateway reads `.mcp-gateway`; until that is fixed, run
   `pmcp refresh --cache-dir .mcp-gateway`
@@ -308,6 +384,81 @@ to do, how to verify it, and how to roll back to 2.7.3.
   unchanged. See [Consiliency/pmcp#230](https://github.com/Consiliency/pmcp/issues/230).
 
 ### Security
+- **No reader follows a repository-controlled credential store out of the project.**
+  Consiliency/pmcp#366 confined the startup load and every command that rewrites a
+  project `.env.pmcp`, but other readers still read through a link to a file outside
+  the project. The worst was remote-header auth: a `${VAR}` in a remote server's
+  `headers` was filled from the project store, so a cloned repository that shipped
+  `.env.pmcp` as a link to another file you own, plus a remote server pointing at a
+  host it chose, could put that file's values in an `Authorization` header to that
+  host — through the gateway's config load, a remote connection, `pmcp status` and
+  `pmcp doctor`. The same was true of a tenant store
+  `.pmcp/tenants/<id>/pmcp.env`, of the gateway's credential-availability check (which
+  loaded the linked file — and the checkout's `.env` — into the gateway's own
+  environment), of the feedback gate's planted-key check, of the spawn-time
+  credential checks and env stripping, and of `pmcp secrets check`. Every one of them
+  now reads through a single store reader that takes the store's scope: the user
+  store `~/.config/pmcp/pmcp.env` still follows its link (a dotfiles repository), and
+  every repository-controlled file — the project `.env.pmcp`, a tenant `pmcp.env`, and
+  the `.env` and `.env.pmcp` at the served project root, and the `.env` that
+  startup discovers by walking up from pmcp's installed files (which, for pmcp
+  installed in a checkout's `.venv` by `uv run` or `pip install -e`, is the
+  checkout's own `.env`) — is read only through the confined walk, which refuses a
+  symlink of any kind (Consiliency/pmcp#366). The discovery itself is kept: for a `uv tool` or `pip --user`
+  install the walk reaches `~/.env`, in the home directory, which is the operator's
+  own and loads as before; a `.env` the walk finds anywhere other than the home
+  directory or an ancestor of it is a repository's, whatever marker files the checkout
+  has. A symlinked store, or a file that is not regular, is read as empty with one
+  value-free line on stderr (`pmcp: refusing to read .env.pmcp: it is a symlink`, or
+  `refusing to load` for the startup `.env` and the credential check), once per store, reason and file identity in each configuration
+  load, so a store that changes, or is still refused at the next load, is reported
+  again; the feedback gate refuses to submit (`gate_error`) instead. A tenant id made
+  only of dots is refused: `..` and `.` named `.pmcp/pmcp.env` and
+  `.pmcp/tenants/pmcp.env`, which are no tenant's store.
+
+  Reading confined was not enough on its own. A regular project file could still
+  steer what pmcp did next by putting variables into its environment: with `HOME`
+  unset, a `.env.pmcp` that set `HOME` moved the user store onto a link the checkout
+  shipped; `Http_Proxy` (httpx takes any case) sent every outbound request, the
+  `Authorization` header included, through a proxy the repository named;
+  `SSLKEYLOGFILE` wrote TLS session keys to a file it chose; and `LD_PRELOAD`,
+  `NODE_OPTIONS`, `UV_INDEX_URL` or `PYTHONPATH` reached the children pmcp starts
+  without a filter — `systemctl` for `pmcp doctor` and `pmcp status`, the service
+  restart, `pmcp upgrade`, the CLI probes and the npm resolver — and `systemctl`
+  loaded the repository's library. A list of such variables can never be complete,
+  so there is none: a repository-controlled file never populates pmcp's environment.
+  Its values go to a separate credential map that only explicit credential lookups
+  consult (`env_store.credential_value`), and a name pmcp itself reads from its
+  environment, in any case, is never answered from it. The user store's path is fixed
+  before anything else loads. Every child pmcp starts takes its environment from one
+  builder (`env_store.child_process_env`, which the server-spawn filter builds on).
+
+  Absence is now only "no such file". A check that a store or its root exists used to
+  answer "no" when a directory above it could not be searched (`EACCES`), so a store
+  pmcp could not read counted as no store, and the feedback gate's strict check
+  allowed a submission; that lookup now raises, and the gate refuses (`gate_error`).
+  Readers that only look (startup, header lookup, the credential check, env
+  stripping, `pmcp secrets check`) warn once and read such a store, the user store
+  included, as empty.
+
+  Tests walk the source tree's syntax and fail if any function reads or loads a store
+  any other way, if a credential lookup reads `os.environ` by name instead of
+  `credential_value`, if any process is started without an `env=` from the builder,
+  if `atomic_write` or `env_store` asks a yes/no existence check, or if `src/pmcp`
+  reads an environment variable that is not classified as path-and-trust,
+  provenance-gated or operational, or if anything but `credential_value` reads the
+  credential map or a store's values. That classification inventory sees only pmcp's
+  own reads, not what httpx, ssl or a child process read; with repository files kept
+  out of the environment, that limit no longer matters for them.
+
+  The values a repository file supplies are expanded only within that file, never from
+  your environment or user store, so `LEAK=${PMCP_AUTH_TOKEN}` cannot copy a secret into
+  a name a repository-configured header then sends. Every lookup -- the startup map,
+  the project and tenant stores behind remote-header resolution, `pmcp secrets check` --
+  goes through the one gate, so a repository's `PMCP_AUTH_TOKEN`, `HTTP_PROXY` or
+  `SSLKEYLOGFILE` never fills a header either, and precedence is by presence: a
+  variable your shell exports, even as empty, is never filled from a project file. See
+  Consiliency/pmcp#367.
 - **Bumped `multidict` 6.7.0 → 6.9.1** to clear advisory `GHSA-54p9-h82j-f925`.
   `multidict` is transitive (`aiohttp` → `multidict`, and `aiohttp` → `yarl` →
   `multidict`), so this is lockfile-only, like the `anyio` bump: the repo floors
@@ -635,6 +786,7 @@ to do, how to verify it, and how to roll back to 2.7.3.
   (D-01); see [Consiliency/pmcp#228](https://github.com/Consiliency/pmcp/pull/228).
 
 ### Fixed
+- **The singleton lock file is never removed.** Shutdown used to unlink `~/.pmcp/gateway.lock` after releasing it, so a second gateway that locked the same file in between lost its lock to a third that created a fresh file: two gateways ran at once. The file now stays; a lock is held only by a running gateway and dies with it, so a leftover file never blocks a start. A gateway that locks a file the path no longer names (unlinked or replaced) retries. `pmcp doctor` reports whether a gateway holds the lock rather than whether the file exists. See Consiliency/pmcp#367.
 - **An overlay no longer hides other servers from discovery, and one bad overlay entry
   no longer takes down the others.** Discovery weighs a keyword by how many servers
   declare it, and it counted over the merged manifest. So an approved project overlay
@@ -793,7 +945,7 @@ to do, how to verify it, and how to roll back to 2.7.3.
 - **The operator's policy locations are resolved when a `PolicyManager` is built, not when the module is imported.** `~/.claude/gateway-policy.{yaml,json}` were joined to `Path.home()` at import, so a `HOME` changed afterwards — the test suite's isolation, or a re-homed process — was ignored and the discovery search list could not follow it. They are now resolved at call time, while a monkeypatched `USER_POLICY_PATHS` / `DEFAULT_POLICY_PATHS` is still honoured verbatim, so the ungated-vs-gated decision is unchanged. See [Consiliency/pmcp#262](https://github.com/Consiliency/pmcp/issues/262).
 - **A hung `gateway.update_server` probe is reported as a timeout again on Python 3.10.** `_run_update_probe_command` bounds the probe with `asyncio.wait_for`, whose `asyncio.TimeoutError` is not the builtin `TimeoutError` and not a subclass of it before 3.11 — so the caller's handler never fired and a real 60-second hang surfaced through the generic branch as `Failed to run update probe: ` with an empty reason. The helper now normalises to the builtin before the exception reaches a caller (the contract `ClientManager._send_request` already provides), and the caller accepts either class. See [Consiliency/pmcp#269](https://github.com/Consiliency/pmcp/issues/269).
 - **The credential store is written atomically** (temp file → `fsync` → `os.replace`), so an interrupted `write_env_file` no longer truncates the file and loses its other entries. See [Consiliency/pmcp#248](https://github.com/Consiliency/pmcp/issues/248).
-- **A symlinked `pmcp.env` is written through, as in 2.7.3 — the atomic write in this release no longer replaces it.** Renaming the temp file over the path swapped a `~/.config/pmcp/pmcp.env` symlinked from a dotfiles repository for a regular file, so `pmcp secrets set` and `gateway.auth_connect` stopped updating the dotfiles copy and the two drifted apart silently. Every whole-file rewrite of a user-owned PMCP file — `pmcp.env`, `trust.json`, `package_approvals.json`, the registry cache, and the client config `pmcp setup --write` emits — now goes through one helper that first asks the system to look the whole path up, so its own verdicts come first — the 40-link limit counted across the entire lookup, permissions, a non-directory on the way — and only a file not created yet lets the write go on; it then follows the final link chain (a chain, or a relative link) hop by hop through open directory handles, with no normalisation and no pathname longer than one link's own text, to find the name to replace (by joined pathname only where the platform has no directory handles, whose limit is then the system's maximum path length, or where, without `O_PATH`, a directory may be searched and written but not listed — every store reader, writer and residency check applies that one rule); it writes the temp file beside the **target** and replaces the target atomically at mode 0600, leaving the link untouched. A dangling link creates its target file when the target's directory exists; the helper never creates a missing target directory, though `trust.json` and `package_approvals.json` are located with `Path.resolve()` and their directory is created at 0700 as before (a `trust.json` linked through a missing directory is Consiliency/pmcp#374). A link loop and a target ending in `/` are refused. A project `.env.pmcp` is a path the repository controls, so pmcp follows no symlink there at all: the store, and every directory between the project root and it, is opened without following links and must not be one, and the store must be a regular file or absent; the write happens in the directory that walk opened, so the path checked is the path written (on Windows the same rules run over pathnames). A `--project` path is kept as given and resolved by the system at each use; one that does not exist yet may only be a plain tail of new directories, which are then created, and any other unresolvable `--project` is refused. These guarantees are about what a repository ships — links, directories and file types present before the command runs. A process already running as you and rewriting the store's directory while the command runs is out of scope (it can write your files directly); against it, a read checks that the file it opened is the one it checked, and the temporary file's name is re-checked before the rename, as a best-effort narrowing only. Every READ of a project `.env.pmcp` on the way to a rewrite goes through that walk too: `pmcp secrets set`, `pmcp secrets sync` (its source and its target) and `gateway.auth_connect`, and the load of `<cwd>/.env.pmcp` that every `pmcp` command runs at startup, before the subcommand; a symlinked or non-regular store is refused before anything is read (at startup: skipped with one `pmcp: refusing to load .env.pmcp: …` line on stderr). A store that is not UTF-8, or holds a value with a newline, is reported as `"ok": false` by `secrets set` and `sync` instead of raising. Six readers of a project `.env.pmcp` still follow its link (Consiliency/pmcp#367, which stays open): remote-header auth — a `${VAR}` in a remote server's `headers`, resolved from the user and project stores when the gateway resolves its startup configs, connects a remote server or checks its auth, and by `pmcp status` and `pmcp doctor`; the tenant store `.pmcp/tenants/<id>/pmcp.env`, resolved the same way per tenant (no production caller passes a tenant yet, Consiliency/pmcp#353); the gateway's credential-availability check, which loads `<cwd>/.env`, `<cwd>/.env.pmcp` and the user store into the gateway's own environment; env stripping, which reads the stores' key names at every server spawn; the feedback gate's planted-key check, which reads the same key names; and `pmcp secrets check`. So a repository can still link its `.env.pmcp` to another file of yours, and through remote-header auth or the gateway's credential-availability check that file's values can be sent as a header to a remote server the repository configures. None of these readers blocks on a fifo any more: a store that is not a regular file reads as empty. Separately, the startup load of a plain `.env` finds it by walking up from where pmcp is installed; with pmcp installed in a virtualenv inside a checkout, it reaches the checkout's `.env` and follows its link too. A `package_approvals.json` whose link chain lands inside the checkout being judged is refused, as `trust.json` already was; both checks compare file identity, not path strings, walking up from the store's directory by open directory handles (on Windows, by the strictly resolved directory's parents), skip a served project root that does not exist yet, and refuse the store when residency cannot be established. A store the system refuses to look up (too many links in one lookup, no permission) is an error on every read and write path, never an empty store; the temporary file is created in the directory the system resolves for the target, never one a library normalised. The startup-policy editor still refuses a symlinked project `.mcp.json`. See [Consiliency/pmcp#248](https://github.com/Consiliency/pmcp/issues/248).
+- **A symlinked `pmcp.env` is written through, as in 2.7.3 — the atomic write in this release no longer replaces it.** Renaming the temp file over the path swapped a `~/.config/pmcp/pmcp.env` symlinked from a dotfiles repository for a regular file, so `pmcp secrets set` and `gateway.auth_connect` stopped updating the dotfiles copy and the two drifted apart silently. Every whole-file rewrite of a user-owned PMCP file — `pmcp.env`, `trust.json`, `package_approvals.json`, the registry cache, and the client config `pmcp setup --write` emits — now goes through one helper that first asks the system to look the whole path up, so its own verdicts come first — the 40-link limit counted across the entire lookup, permissions, a non-directory on the way — and only a file not created yet lets the write go on; it then follows the final link chain (a chain, or a relative link) hop by hop through open directory handles, with no normalisation and no pathname longer than one link's own text, to find the name to replace (by joined pathname only where the platform has no directory handles, whose limit is then the system's maximum path length, or where, without `O_PATH`, a directory may be searched and written but not listed — every store reader, writer and residency check applies that one rule); it writes the temp file beside the **target** and replaces the target atomically at mode 0600, leaving the link untouched. A dangling link creates its target file when the target's directory exists; the helper never creates a missing target directory, though the directory of `trust.json` and `package_approvals.json` is created at 0700 as before; both stores are located the way the helper writes them, never by a lexical `Path.resolve()` (a link through `missing/..` names nothing, as the system says; see Consiliency/pmcp#374). A link loop and a target ending in `/` are refused. A project `.env.pmcp` is a path the repository controls, so pmcp follows no symlink there at all: the store, and every directory between the project root and it, is opened without following links and must not be one, and the store must be a regular file or absent; the write happens in the directory that walk opened, so the path checked is the path written (on Windows the same rules run over pathnames). A `--project` path is kept as given and resolved by the system at each use; one that does not exist yet may only be a plain tail of new directories, which are then created, and any other unresolvable `--project` is refused. These guarantees are about what a repository ships — links, directories and file types present before the command runs. A process already running as you and rewriting the store's directory while the command runs is out of scope (it can write your files directly); against it, a read checks that the file it opened is the one it checked, and the temporary file's name is re-checked before the rename, as a best-effort narrowing only. Every READ of a project `.env.pmcp` on the way to a rewrite goes through that walk too: `pmcp secrets set`, `pmcp secrets sync` (its source and its target) and `gateway.auth_connect`, and the load of the served project's `.env.pmcp` that every `pmcp` command runs at startup, before the subcommand; a symlinked or non-regular store is refused before anything is read (at startup: skipped with one `pmcp: refusing to load .env.pmcp: …` line on stderr). A store that is not UTF-8, or holds a value with a newline, is reported as `"ok": false` by `secrets set` and `sync` instead of raising. Every other reader of a project `.env.pmcp` — a running gateway's spawn-time credential checks and env stripping, remote-header auth, and `pmcp secrets check` — reads it through the same walk and never blocks on a fifo: a refused store reads as empty; the startup load of a plain `.env` found outside your home directory is read the same way (Consiliency/pmcp#367). A `package_approvals.json` whose link chain lands inside the checkout being judged is refused, as `trust.json` already was; both checks compare file identity, not path strings, walking up from the store's directory by open directory handles (on Windows, by the strictly resolved directory's parents), skip a served project root that does not exist yet, and refuse the store when residency cannot be established. A store the system refuses to look up (too many links in one lookup, no permission) is an error on every read and write path, never an empty store; the temporary file is created in the directory the system resolves for the target, never one a library normalised. The startup-policy editor still refuses a symlinked project `.mcp.json`. See [Consiliency/pmcp#248](https://github.com/Consiliency/pmcp/issues/248).
 - **The npm version-check User-Agent now names `github.com/Consiliency/pmcp`** instead of the pre-rename `ViperJuice/pmcp`. See [Consiliency/pmcp#247](https://github.com/Consiliency/pmcp/issues/247).
 - **The default feedback repository was `ViperJuice/pmcp`, a repository this
   project does not own.** Every unconfigured gateway that submitted feedback — or

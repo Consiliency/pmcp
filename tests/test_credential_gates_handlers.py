@@ -106,11 +106,11 @@ def _gateway_tools_with_configured(
         client_manager=client_manager,  # type: ignore[arg-type]
         policy_manager=policy_manager,
     )
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
     monkeypatch.setattr(
         "pmcp.tools.handlers.load_configs", lambda **_: configured_configs
     )
-    monkeypatch.setattr("pmcp.tools.handlers.load_dotenv", lambda *a, **kw: False)
+    monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
     return tools
 
 

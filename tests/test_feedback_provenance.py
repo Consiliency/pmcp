@@ -166,14 +166,16 @@ def _raise_on_project_store(
     on the uid the suite runs as -- root reads a mode-000 file. The real-file
     comparison is `test_an_unreadable_project_store_file_separates_the_lookups`.
     """
-    real_read = env_store.read_env_file
+    # The project store is read through the confined walk (Consiliency/pmcp#367),
+    # so the failure is injected at `read_confined`, the one call that reads it.
+    real_read = env_store.read_confined
 
-    def _read(path: Path) -> dict[str, str]:
-        if path == project_store:
+    def _read(path: Path, *args: object, **kwargs: object) -> bytes | None:
+        if path.resolve() == project_store.resolve():
             raise PermissionError(13, "Permission denied", str(path))
-        return real_read(path)
+        return real_read(path, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(env_store, "read_env_file", _read)
+    monkeypatch.setattr(env_store, "read_confined", _read)
 
 
 def test_a_key_pmcp_wrote_at_runtime_is_recorded(
@@ -251,14 +253,16 @@ def test_the_strict_lookup_raises_where_the_lenient_one_swallows(
     with pytest.raises(OSError):
         managed_secret_keys_strict(project)
 
-    # The user half is already unguarded in both, so fail-closed is reachable
-    # there today; only the project half failed open.
-    def _read_nothing(path: Path) -> dict[str, str]:
+    # The user half: the lenient lookup warns and reads it as empty (startup
+    # and every spawn must not crash on an unreadable user store); the strict
+    # one still raises, so the gate fails closed (Consiliency/pmcp#367).
+    def _read_nothing(path: Path) -> str | None:
         raise PermissionError(13, "Permission denied", str(path))
 
-    monkeypatch.setattr(env_store, "read_env_file", _read_nothing)
+    monkeypatch.setattr(env_store, "read_env_text", _read_nothing)
+    assert OTHER not in managed_secret_keys(project)
     with pytest.raises(OSError):
-        managed_secret_keys(project)
+        managed_secret_keys_strict(project)
 
 
 def test_the_lenient_lookup_keeps_its_existing_caller_behaviour(
@@ -283,7 +287,9 @@ def test_the_lenient_lookup_keeps_its_existing_caller_behaviour(
     assert env["PATH"] == "/usr/bin", "non-secret ambient vars survive"
 
     called = _called_names_in("sanitized_subprocess_env")
-    assert "managed_secret_keys" in called
+    # The user store's names only since Consiliency/pmcp#372 round 11: a
+    # repository's store names nothing a spawn strips.
+    assert "operator_managed_secret_keys" in called
     assert "managed_secret_keys_strict" not in called, (
         "the strict lookup belongs to the gate; routing the sanitiser through "
         "it would turn an unreadable project store into a failed server spawn"
@@ -320,15 +326,17 @@ def test_the_submission_outcome_field_defaults_to_none() -> None:
         SubmitFeedbackOutput(**required, submission_outcome="submitted")
 
 
-def test_the_new_registry_does_not_widen_the_dotenv_strip(
+def test_a_key_pmcp_put_into_its_environment_is_stripped_from_children(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The two registries are separate, and only one of them strips.
+    """The strip is by provenance (Consiliency/pmcp#372 round 11).
 
-    `dotenv_sourced_keys` has a merged consumer -- `sanitized_subprocess_env`
-    removes its keys from every spawned child (#229) -- so recording into the
-    new registry must not remove anything from a child's environment. The new
-    registry is read only by this phase's gate.
+    ``auth_connect`` sets the credential in pmcp's environment and records it
+    here; that record is what removes it from every other server's child
+    environment, now that a project store's NAMES strip nothing (board round 10
+    grok F001). Before, this registry deliberately stripped nothing and the
+    project store's names did the work -- including the operator's own exports
+    of any name a checkout listed.
     """
     home = tmp_path / "home"
     _write_user_store(home, "")
@@ -338,9 +346,7 @@ def test_the_new_registry_does_not_widen_the_dotenv_strip(
     record_pmcp_introduced_keys({PLANTED})
 
     assert PLANTED not in dotenv_sourced_keys()
-    assert sanitized_subprocess_env(project=tmp_path / "project")[PLANTED] == (
-        "planted-through-auth-connect"
-    )
+    assert PLANTED not in sanitized_subprocess_env(project=tmp_path / "project")
 
 
 def test_the_test_only_reset_seam_clears_the_registry() -> None:

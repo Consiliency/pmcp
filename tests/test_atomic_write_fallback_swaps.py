@@ -230,9 +230,12 @@ def test_a_temp_swapped_before_the_rename_is_refused_not_moved_into_place(
     assert tree["store"].read_bytes() == b"LOCAL=1\n"
     assert not tree["store"].is_symlink()
     assert tree["outside"].read_bytes() == OUTSIDE
-    assert [
-        p.name for p in tree["project"].iterdir() if p.name.startswith(".pmcp-")
-    ] == []
+    # The cleanup removes only the temp this write created; the entry swapped
+    # in at its name is someone else's and is left alone, never followed
+    # (Consiliency/pmcp#372 round 31).
+    left = [p for p in tree["project"].iterdir() if p.name.startswith(".pmcp-")]
+    assert [p.name for p in left] == swapped
+    assert all(p.is_symlink() for p in left)
 
 
 @pytest.mark.skipif(not writer._DIR_FD_SUPPORTED, reason="dir_fd walk")
@@ -294,3 +297,24 @@ def test_a_temp_swapped_after_its_last_check_is_out_of_scope_but_writes_nothing_
     assert tree["outside"].read_bytes() == OUTSIDE
     # The documented residual: the swapped-in entry was moved into place.
     assert tree["store"].is_symlink()
+
+
+@pytest.mark.parametrize("path_kind", ["dir_fd write", "no-dir_fd write"])
+def test_a_failed_commit_removes_the_temp_it_created(
+    path_kind: str, tree: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The identity check never keeps a write's own temp behind."""
+    if path_kind == "dir_fd write" and not writer._DIR_FD_SUPPORTED:
+        pytest.skip("dir_fd walk")
+    if path_kind == "no-dir_fd write":
+        monkeypatch.setattr(writer, "_DIR_FD_SUPPORTED", False)
+
+    def refuse(*_a: object, **_k: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    with pytest.raises(OSError):
+        atomic_write(tree["store"], b"NEW=1\n", confine_to=tree["project"])
+    monkeypatch.undo()
+    assert tree["store"].read_bytes() == b"LOCAL=1\n"
+    assert [p for p in tree["project"].iterdir() if p.name.startswith(".pmcp-")] == []

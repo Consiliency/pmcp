@@ -254,12 +254,14 @@ class TestProvisionStatusHandoff:
         monkeypatch.setattr(
             handlers_module,
             "load_manifest",
-            lambda: SimpleNamespace(
+            lambda **_k: SimpleNamespace(
                 get_server=lambda _n: SimpleNamespace(env_var=None)
             ),
         )
         monkeypatch.setattr(
-            handlers_module, "manifest_server_to_config", lambda cfg: cfg
+            handlers_module,
+            "manifest_server_to_config",
+            lambda cfg, _project_root=None: cfg,
         )
         gateway._register_provisioned_server = MagicMock()  # type: ignore[method-assign]
 

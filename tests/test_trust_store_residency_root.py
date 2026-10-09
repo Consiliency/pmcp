@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from tests._shipped_approvals import ship_approval
 from pmcp import cli, trust_store
 from pmcp.config.loader import load_configs
 from pmcp.trust_store import TrustStoreError
@@ -88,10 +89,11 @@ def _ship_an_approval_inside(
     """
     home = checkout / "home"
     home.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("HOME", str(home))
     monkeypatch.chdir(outside)
-    trust_store.record(target, target.read_bytes(), "project", trust_store.APPROVED)
-    store = trust_store.trust_store_path()
+    # Shipped bytes (round 22: pmcp no longer writes a store a checkout
+    # controls), then HOME inside the checkout.
+    store = ship_approval(target, home).resolve()
+    monkeypatch.setenv("HOME", str(home))
     assert store.is_relative_to(checkout.resolve())
     return store
 
@@ -199,15 +201,16 @@ def test_serving_one_project_still_refuses_a_store_resident_in_the_launch_checko
     # The served checkout's config, approved by a store that lives in the
     # LAUNCH checkout (written from outside, with no root bound).
     served_config = _repo_mcp_json(served)
-    monkeypatch.setenv("HOME", str(launch_home))
     monkeypatch.chdir(outside)
-    trust_store.record(
-        served_config, served_config.read_bytes(), "project", trust_store.APPROVED
-    )
-    assert trust_store.trust_store_path().is_relative_to(launch.resolve())
+    shipped = ship_approval(served_config, launch_home)
+    monkeypatch.setenv("HOME", str(launch_home))
+    assert shipped.resolve().is_relative_to(launch.resolve())
 
     # Launched from inside the launch checkout, serving the other one.
     monkeypatch.chdir(launch)
+    # pmcp is LAUNCHED here: the launch directory is captured once
+    # (Consiliency/pmcp#372 round 18), so model a fresh process.
+    trust_store.reset_launch_directory()
     trust_store.set_active_project_root(served)
 
     with pytest.raises(TrustStoreError) as raised:
@@ -301,6 +304,9 @@ def test_a_bare_serve_from_a_subdirectory_refuses_a_store_in_the_enclosing_check
 
     # No served root bound; the process simply runs from the subdirectory.
     monkeypatch.chdir(app)
+    # pmcp is LAUNCHED here: the launch directory is captured once
+    # (Consiliency/pmcp#372 round 18), so model a fresh process.
+    trust_store.reset_launch_directory()
     assert trust_store._active_project_root is None
 
     with pytest.raises(TrustStoreError) as raised:

@@ -25,7 +25,7 @@ class TestInstallApiKeyDiagnostics:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv("PMCP_TEST_KEY", raising=False)
+        monkeypatch.delenv("SOAK_TEST_KEY", raising=False)
         server = ServerConfig(
             name="needs-key",
             description="Needs a key",
@@ -34,7 +34,7 @@ class TestInstallApiKeyDiagnostics:
             command="npx",
             args=["needs-key"],
             requires_api_key=True,
-            env_var="PMCP_TEST_KEY",
+            env_var="SOAK_TEST_KEY",
         )
 
         with pytest.raises(MissingApiKeyError) as exc_info:

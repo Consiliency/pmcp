@@ -40,7 +40,12 @@ _PROBE_MAIN = (
     "import json, os, sys\n"
     "import pmcp.cli as cli\n"
     "async def _report(args):\n"
-    f"    print(json.dumps({{'probe': os.environ.get({PROBE!r})}}))\n"
+    # Since Consiliency/pmcp#372 a project store's values are credentials,
+    # held apart from the process environment: what startup loaded is what a
+    # credential lookup answers, and the environment never has it.
+    "    from pmcp.env_store import credential_value\n"
+    f"    assert {PROBE!r} not in os.environ\n"
+    f"    print(json.dumps({{'probe': credential_value({PROBE!r})}}))\n"
     "cli.async_main = _report\n"
     "sys.argv = ['pmcp', 'secrets', 'set', '--scope', 'project', 'K', 'v']\n"
     "cli.main()\n"
@@ -345,15 +350,21 @@ def _run_in(
 def test_a_subdirectory_link_to_the_project_store_is_not_followed(
     layout: dict[str, Path],
 ) -> None:
-    """Round 8: even a link to the project's own store is a link, so it is skipped."""
+    """From a subdirectory pmcp serves the project root, so the link is never opened.
+
+    Round 8 skipped this link when startup read the working directory's
+    ``.env.pmcp``. Since Consiliency/pmcp#372 round 9 startup serves the root
+    discovered from the working directory and loads THAT root's store -- here
+    a regular file -- so the probe sees the root's value and nothing is refused.
+    """
     project = layout["project"]
     (project / ".env.pmcp").write_text(f"{PROBE}=root\n", encoding="utf-8")
     sub = project / "packages" / "app"
     sub.mkdir(parents=True)
     os.symlink("../../.env.pmcp", sub / ".env.pmcp")
     proc = _run_in(layout, sub, SET, code=_PROBE_MAIN)
-    assert _json(proc) == {"probe": None}
-    assert LOAD_REFUSAL in proc.stderr
+    assert _json(proc) == {"probe": "root"}
+    assert LOAD_REFUSAL not in proc.stderr
 
 
 def test_a_link_outside_any_project_is_skipped_the_same_way(
@@ -368,8 +379,10 @@ def test_a_link_outside_any_project_is_skipped_the_same_way(
 
 
 # --------------------------------------------------------------------------- #
-# Round 5 N-B: the readers that still follow a link (Consiliency/pmcp#367) no
-# longer block on a fifo.
+# Round 5 N-B: the other readers never block on a fifo. Since
+# Consiliency/pmcp#367 they read the project store through the confined walk
+# too (env_store.read_store; tests/test_store_readers_confined.py), so the fifo
+# is refused there as it is at startup.
 # --------------------------------------------------------------------------- #
 
 
@@ -403,7 +416,7 @@ def test_the_spawn_time_readers_do_not_hang_on_a_non_regular_store(
         results.append(managed_secret_keys(layout["project"]))
         results.append(
             GatewayTools._check_api_key_available(
-                object(),  # type: ignore[arg-type]
+                GatewayTools.__new__(GatewayTools),
                 "R4_ABSENT_VAR",
             )
         )

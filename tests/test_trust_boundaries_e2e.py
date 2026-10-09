@@ -362,7 +362,7 @@ def _gateway(
     )
     jobs = _RecordingJobManager()
     manager = _RecordingClientManager()
-    monkeypatch.setattr(handlers_module, "load_manifest", lambda: manifest)
+    monkeypatch.setattr(handlers_module, "load_manifest", lambda **_k: manifest)
     monkeypatch.setattr(handlers_module, "load_configs", lambda **_: [])
     monkeypatch.setattr(handlers_module, "get_job_manager", lambda: jobs)
     gateway = GatewayTools(
@@ -905,8 +905,8 @@ def test_s03_the_parsed_bytes_are_the_gated_bytes_at_every_loader(
         seen: list[Path] = []
         real = module.read_and_gate
 
-        def wrapper(path: Path, kind: str) -> Any:
-            result = real(path, kind)
+        def wrapper(path: Path, kind: str, **kwargs: Any) -> Any:
+            result = real(path, kind, **kwargs)
             if Path(path).resolve() == target.resolve():
                 seen.append(Path(path))
                 target.write_text(hostile)
@@ -1283,12 +1283,15 @@ async def test_s04_a_checkout_supplied_token_or_repository_is_refused(
     (token_checkout / ".env").write_text(f"{_TOKEN_VAR}=ghp-planted-by-a-checkout\n")
     monkeypatch.chdir(token_checkout)
     cli.load_startup_env(token_checkout / ".env")
-    assert os.environ[_TOKEN_VAR] == "ghp-planted-by-a-checkout"
+    # Since Consiliency/pmcp#372 a checkout's `.env` never reaches the
+    # environment at all; the refusal below must still hold.
+    assert _TOKEN_VAR not in os.environ
 
     refused = await _submit(_feedback_gateway(monkeypatch, token_checkout))
 
     assert transport.calls == [], "pmcp posted under a token a checkout supplied"
-    assert refused.ok is False
+    # No token reaches the gate (never in the environment): the ordinary
+    # no-token answer, never a post.
     assert refused.submitted is False
     assert _SPAWN_ATTEMPTS == []
 
@@ -1301,17 +1304,15 @@ async def test_s04_a_checkout_supplied_token_or_repository_is_refused(
     )
     monkeypatch.chdir(repo_checkout)
     cli.load_startup_env(repo_checkout / ".env")
-    assert os.environ[_REPO_VAR] == hostile
+    assert _REPO_VAR not in os.environ
 
     redirected = await _submit(_feedback_gateway(monkeypatch, repo_checkout))
 
     assert transport.calls == []
-    assert redirected.ok is False
     assert redirected.submitted is False
     # The destination is resolved FIRST, so no attacker-chosen value reaches any
     # output -- not the repository field, and not the browser URL door 4 renders.
     assert redirected.repository == feedback_egress.PACKAGED_FEEDBACK_REPOSITORY
-    assert redirected.issue_url is None
     assert hostile not in (redirected.issue_url or "")
     assert _NETWORK_ATTEMPTS == []
 

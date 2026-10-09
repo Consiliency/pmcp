@@ -78,7 +78,7 @@ async def test_clisoak_request_capability_one_call_returns_direct_cli_guidance(
         discovery_queue_path=".mcp-gateway/discovery_queue.json",
     )
 
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
     monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
     gateway = GatewayTools(
@@ -156,7 +156,7 @@ async def test_clisoak_catalog_search_one_call_returns_direct_cli_hint(
     )
     manager._servers["github"] = github_status
 
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
 
     gateway = GatewayTools(
         client_manager=manager,
@@ -395,7 +395,7 @@ async def test_auth_soak_local_api_key_provision_connect_retry_smoke(
                 command="needs-key",
                 args=[],
                 requires_api_key=True,
-                env_var="PMCP_TEST_KEY",
+                env_var="SOAK_TEST_KEY",
             )
         },
         discovery_queue_path=".mcp-gateway/discovery_queue.json",
@@ -407,11 +407,11 @@ async def test_auth_soak_local_api_key_provision_connect_retry_smoke(
 
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.chdir(project)
-    monkeypatch.delenv("PMCP_TEST_KEY", raising=False)
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.delenv("SOAK_TEST_KEY", raising=False)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
     monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
     monkeypatch.setattr("pmcp.tools.handlers.get_job_manager", lambda: FakeJobManager())
-    monkeypatch.setattr("pmcp.tools.handlers.load_dotenv", lambda *a, **kw: False)
+    monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
     gateway = GatewayTools(
         client_manager=ClientManager(),
         policy_manager=PolicyManager(),
@@ -437,7 +437,7 @@ async def test_auth_soak_local_api_key_provision_connect_retry_smoke(
 
     assert missing.auth_state == "missing_auth"
     assert connected.ok is True
-    assert read_env_file(project / ".env.pmcp") == {"PMCP_TEST_KEY": credential}
+    assert read_env_file(project / ".env.pmcp") == {"SOAK_TEST_KEY": credential}
     assert retry.ok is True
     assert retry.job_id == "job-auth-soak"
     assert health.audit_events is not None
@@ -520,7 +520,9 @@ def test_phase4_setup_writes_opencode_sse_config(tmp_path: Path) -> None:
 
 
 def test_phase4_doctor_handles_stale_lock_gracefully(tmp_path: Path) -> None:
-    """pmcp doctor warns on lock file and keeps successful exit."""
+    """A leftover lock file nobody holds is reported as harmless, and doctor
+    keeps a successful exit (the file persists between runs;
+    Consiliency/pmcp#372 round 32)."""
     home = tmp_path / "home"
     project = tmp_path / "project"
     lock_file = home / ".pmcp" / "gateway.lock"
@@ -536,8 +538,30 @@ def test_phase4_doctor_handles_stale_lock_gracefully(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "PMCP Doctor" in result.stdout
-    assert "[WARN] lock:" in result.stdout
+    assert "[OK] lock: No gateway holds the singleton lock" in result.stdout
     assert "[FAIL]" not in result.stdout
+    assert lock_file.read_text() == "99999"  # doctor never takes or changes it
+
+
+def test_phase4_doctor_warns_when_a_gateway_holds_the_lock(tmp_path: Path) -> None:
+    from pmcp import identity
+
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir(parents=True)
+    lock_dir = home / ".pmcp"
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "gateway.lock").write_text("")
+    holder = open(lock_dir / "gateway.lock", "r+")
+    try:
+        identity._lock_fd_exclusive(holder)
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        result = _run_pmcp(["doctor", "--project", str(project)], env=env, cwd=project)
+        assert result.returncode == 0, result.stderr
+        assert "[WARN] lock: A gateway holds the singleton lock" in result.stdout
+    finally:
+        holder.close()
 
 
 def test_phase4_doctor_warns_for_unreachable_http_health(tmp_path: Path) -> None:

@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 REMOTE_HEADER_ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-TENANT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 @dataclass(frozen=True)
@@ -81,41 +79,18 @@ def resolve_remote_headers(
 def build_remote_header_env_lookup(
     project_root: Path | None = None,
 ) -> Callable[[str], str | None]:
-    """Build a lookup over process env plus PMCP user/project env stores."""
-    from pmcp.env_store import read_env_file, resolve_scope_path
+    """Build a lookup over process env plus PMCP user/project env stores.
 
-    user_values = read_env_file(resolve_scope_path("user"))
-    project_values = read_env_file(resolve_scope_path("project", project_root))
+    The project store is read confined to the project (``read_store``): a
+    ``.env.pmcp`` linked out of the checkout contributes nothing, so a file the
+    repository points at can never fill a ``${VAR}`` header (Consiliency/pmcp#367).
+    """
+    from pmcp.env_store import credential_lookup
 
-    def lookup(env_var: str) -> str | None:
-        value = os.environ.get(env_var)
-        if value:
-            return value
-        value = project_values.get(env_var)
-        if value:
-            return value
-        value = user_values.get(env_var)
-        if value:
-            return value
-        return None
-
-    return lookup
-
-
-def _tenant_env_path(project_root: Path | None, tenant_id: str) -> Path:
-    if not TENANT_ID_PATTERN.fullmatch(tenant_id):
-        raise ValueError(
-            "Tenant id may only contain letters, numbers, dot, underscore, or dash."
-        )
-    from pmcp.env_store import resolve_project_root
-
-    return (
-        resolve_project_root(project_root)
-        / ".pmcp"
-        / "tenants"
-        / tenant_id
-        / "pmcp.env"
-    )
+    # The one runtime lookup (env_store.credential_lookup): the process
+    # environment, the user store, then the project store -- by membership, and
+    # never a name a repository may not supply from a repository source.
+    return credential_lookup(project_root)
 
 
 def resolve_remote_headers_for_tenant(
@@ -132,15 +107,34 @@ def resolve_remote_headers_for_tenant(
             headers, build_remote_header_env_lookup(project_root)
         )
 
-    from pmcp.env_store import read_env_file
+    from pmcp.env_store import (
+        credential_value,
+        repository_values,
+        resolve_project_root,
+    )
 
-    tenant_values = read_env_file(_tenant_env_path(project_root, tenant_id))
+    # Repository-controlled: confined to the project root (Consiliency/pmcp#367),
+    # expanded within the file only, read through the one gate. The order, by
+    # presence: the environment, the user store, the tenant store, then the
+    # project store's credentials loaded at startup -- or, with
+    # include_process_env=False, the tenant store alone.
+    tenant_values = repository_values(
+        "tenant", project=project_root, tenant_id=tenant_id
+    )
+    root = None if project_root is None else resolve_project_root(project_root)
+    # The one gate (env_store.credential_value) runs the startup load itself,
+    # so the user store is in the environment before any answer.
 
     def lookup(env_var: str) -> str | None:
-        if include_process_env:
-            value = os.environ.get(env_var)
-            if value:
-                return value
-        return tenant_values.get(env_var) or None
+        # Non-default arguments, deliberately: a caller that asks for tenant
+        # isolation (include_process_env=False) gets the tenant store alone --
+        # no environment, no user store, no startup project credentials.
+        return credential_value(
+            env_var,
+            environ=include_process_env,
+            startup_files=include_process_env,
+            repository=tenant_values,
+            root=root,
+        )
 
     return resolve_remote_headers(headers, lookup)

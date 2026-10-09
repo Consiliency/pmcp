@@ -8,7 +8,6 @@ import hashlib
 import os
 import pickle
 import re
-import tempfile
 import threading
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
@@ -17,6 +16,8 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import yaml
+
+from pmcp.home_identity import optional_home_path, spelled_home
 
 from pmcp.manifest.attribution import attribution_pass, quiet_during_attribution
 from pmcp.project_consent import log_refusal, read_and_gate
@@ -238,7 +239,7 @@ ServerTransport = Literal["local", "remote", "sse", "http", "streamable-http"]
 # DEFAULT_USER_CONFIG_PATHS). The user path is recomputed from Path.home() at
 # call time in _overlay_manifest_paths() so HOME monkeypatching works in tests;
 # this constant documents the default location.
-DEFAULT_USER_MANIFEST_PATHS = [Path.home() / ".pmcp" / "manifest.yaml"]
+DEFAULT_USER_MANIFEST_PATHS = [spelled_home() / ".pmcp" / "manifest.yaml"]
 
 
 @dataclass
@@ -1062,6 +1063,7 @@ def _canonical_server(server: ServerConfig) -> ServerConfig:
         canonical.name,
         LocalMcpServerConfig(command="", args=[]),
         {canonical.name: canonical},
+        lambda _key: None,
     )
     if inherited is not None:
         # warnings=False: pydantic's serializer warning quotes the value.
@@ -1624,61 +1626,50 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
     )
 
 
-def _find_project_manifest() -> Path | None:
-    """Walk up from cwd for the nearest ancestor containing .pmcp/manifest.yaml.
+def _find_project_manifest(project_root: Path | None = None) -> Path | None:
+    """The project overlay: ``<project>/.pmcp/manifest.yaml``, if it is there.
 
-    Replicates config.loader.find_project_root's marker-based walk locally to
-    avoid a circular import (config/loader imports load_manifest). Stops at the
-    filesystem root; at the temp directory, so test fixtures under tempdir do not
-    accidentally pick up an unrelated overlay; and at $HOME, whose
-    `.pmcp/manifest.yaml` is the user-scoped overlay rather than a project one.
+    The project is ``project_root`` when given, else the project this process
+    SERVES (``env_store.project_scope_root``) -- the same root its credentials
+    come from, so a server's endpoint and its credential are always one
+    project's (Consiliency/pmcp#372 round 12, board round 11 codex F001: this
+    walked up from the working directory, so ``pmcp --project B`` started
+    inside A paired A's overlay endpoint with B's token). ``None`` when the
+    root is the home directory, whose ``.pmcp/manifest.yaml`` is the
+    user-scoped overlay already loaded as such (#243).
 
-    Keep these stopping conditions in step with `find_project_root`. This docstring
-    once listed only the first two, and the code had drifted the same way: the
-    replica lost the $HOME stop its original has, which is what #243 fixes.
+    An overlay a symlink points outside the project is not followed.
     """
+    from pmcp.env_store import project_scope_root
+
     try:
-        current = Path.cwd().resolve()
-    except OSError:
+        root = project_scope_root(project_root)
+        if root is None:
+            return None
+        current = root.resolve()
+    except (OSError, RuntimeError):  # RuntimeError: a link loop, before 3.13
         return None
-    temp_root = Path(tempfile.gettempdir()).resolve()
-    home_root = Path.home().resolve()
+    from pmcp.atomic_write import same_directory_as_kernel
 
-    while current != current.parent:
-        if current == temp_root:
-            return None
-        # $HOME's `.pmcp/manifest.yaml` IS the user-scoped overlay, already loaded
-        # (ungated) by `_overlay_manifest_paths`. Treating home as a project root
-        # double-attributes it -- and since CONSENT gates project sources, every
-        # startup from a subdirectory of $HOME with no closer overlay logged a
-        # refusal telling the operator to `pmcp trust approve` their OWN home
-        # config. That is the most common setup there is, and a false approval
-        # prompt trains operators to approve reflexively, which is the one habit
-        # consent depends on them not having.
-        #
-        # This walk replicates `config.loader.find_project_root` locally to avoid
-        # an import cycle, and that function already stops here with the same
-        # reason; the replica had dropped the guard. Keep the two in step.
-        if current == home_root:
-            return None
-        candidate = current / ".pmcp" / "manifest.yaml"
-        if candidate.exists():
-            # Don't follow an overlay that a symlink points outside this tree:
-            # resolve the candidate and require it to stay within the ancestor
-            # directory that contains it.
-            try:
-                resolved = candidate.resolve()
-            except OSError:
-                resolved = None
-            if resolved is not None and resolved.is_relative_to(current):
-                return candidate
-        current = current.parent
-
+    # An explicit project root is spelled by the operator: the directory
+    # resolve() names must be the one the system opens for that spelling
+    # (Consiliency/pmcp#372 round 39; resolve() collapses `file/..`).
+    if not same_directory_as_kernel(root, current):
+        return None
+    candidate = current / ".pmcp" / "manifest.yaml"
+    if candidate.exists():
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = None
+        if resolved is not None and resolved.is_relative_to(current):
+            return candidate
     return None
 
 
 def _overlay_manifest_paths(
     notices: list[str] | None = None,
+    project_root: Path | None = None,
 ) -> list[tuple[str, Path]]:
     """Return existing overlay manifest paths in precedence order (low → high).
 
@@ -1691,11 +1682,13 @@ def _overlay_manifest_paths(
     """
     paths: list[tuple[str, Path]] = []
 
-    user_path = Path.home() / ".pmcp" / "manifest.yaml"
-    if user_path.exists():
+    # Only while the home directory is the operator's (Consiliency/pmcp#372
+    # round 22): a home a checkout controls supplies no user overlay.
+    user_path = optional_home_path(".pmcp", "manifest.yaml")
+    if user_path is not None and user_path.exists():
         paths.append(("user", user_path))
 
-    project_path = _find_project_manifest()
+    project_path = _find_project_manifest(project_root)
     if project_path is not None:
         paths.append(("project", project_path))
 
@@ -1880,7 +1873,7 @@ _manifest_cache_lock = threading.RLock()
 # again with the same bytes -- warns exactly as main does. Separate slots keep
 # an explicit-path caller (or two) from turning every load into a transition.
 # Bounded like the cache: the oldest explicit-path slot goes first.
-_last_served_keys: dict[str | None, tuple[Any, ...]] = {}
+_last_served_keys: dict[str | tuple[str, str], tuple[Any, ...]] = {}
 # Whether this process has already said, at WARNING, that the cache could not
 # store or read back a result for a reason other than recursion depth.
 _cache_failure_reported = False
@@ -1956,7 +1949,9 @@ class _OverlaySource:
     gated_digest: str | None = None
 
 
-def _gather_overlay_sources(notices: list[str]) -> list[_OverlaySource]:
+def _gather_overlay_sources(
+    notices: list[str], project_root: Path | None = None
+) -> list[_OverlaySource]:
     """Read every overlay source ONCE, in precedence order.
 
     The bytes read here are both the cache key and what gets parsed: a source is
@@ -1964,7 +1959,7 @@ def _gather_overlay_sources(notices: list[str]) -> list[_OverlaySource]:
     bytes in the cache under another version's key.
     """
     sources: list[_OverlaySource] = []
-    for label, overlay_path in _overlay_manifest_paths(notices):
+    for label, overlay_path in _overlay_manifest_paths(notices, project_root):
         if label == "project":
             # A repository-supplied overlay is gated: unapproved, it must
             # contribute nothing at all -- not a replacement, not an
@@ -1973,7 +1968,12 @@ def _gather_overlay_sources(notices: list[str]) -> list[_OverlaySource]:
             # tools/handlers.py, still answers None for it. User and env
             # scope are the operator's own files and stay ungated. The gate
             # reads the file once; its bytes are the ones keyed and parsed.
-            content, decision = read_and_gate(overlay_path, "project_manifest")
+            # <project>/.pmcp/manifest.yaml: judged with its project's root.
+            content, decision = read_and_gate(
+                overlay_path,
+                "project_manifest",
+                project_root=overlay_path.parent.parent,
+            )
             sources.append(
                 _OverlaySource(
                     label,
@@ -2024,7 +2024,9 @@ def _source_key(source: _OverlaySource) -> tuple[Any, ...]:
     )
 
 
-def load_manifest(manifest_path: Path | None = None) -> Manifest:
+def load_manifest(
+    manifest_path: Path | None = None, project_root: Path | None = None
+) -> Manifest:
     """Load and parse the manifest.yaml file.
 
     When called with no ``manifest_path`` (all internal callers), private/custom
@@ -2048,7 +2050,8 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
     base_path = _SHIPPED_MANIFEST_PATH if manifest_path is None else manifest_path
     base = base_path.read_bytes()
     notices: list[str] = []
-    overlays = _gather_overlay_sources(notices) if apply_overlays else []
+    # The project overlay is ``project_root``'s, else the served project's.
+    overlays = _gather_overlay_sources(notices, project_root) if apply_overlays else []
     key = (
         str(base_path),
         apply_overlays,
@@ -2057,15 +2060,25 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
         tuple(notices),
         _on_windows(),
     )
+    # One slot per caller stream: the overlaid load for each project root,
+    # and each explicit path (keyed as given). Two different roots or paths
+    # alternating are two steady states, not a transition on every call (a
+    # gateway's tools load for their bound root while other callers load for
+    # the served one; Consiliency/pmcp#372).
+    slot: str | tuple[str, str] = str(base_path)
+    if apply_overlays:
+        from pmcp.env_store import resolve_project_root
+
+        slot = ("overlays", os.fspath(resolve_project_root(project_root)))
     with _manifest_cache_lock:
-        # One slot per caller stream: the default load, and each explicit path
-        # (keyed as given). Two different explicit paths alternating are two
-        # steady states, not a transition on every call.
-        slot = None if apply_overlays else str(base_path)
         steady = key == _last_served_keys.get(slot)
         _last_served_keys[slot] = key
         while len(_last_served_keys) > _MANIFEST_CACHE_SLOTS:
-            oldest = next(k for k in _last_served_keys if k is not None)
+            # Explicit paths go first; an overlaid stream only when none is left.
+            oldest = next(
+                (k for k in _last_served_keys if isinstance(k, str) and k != slot),
+                None,
+            ) or next(k for k in _last_served_keys if k != slot)
             del _last_served_keys[oldest]
         blob = _manifest_cache.get(key)
         if blob is not None and steady:

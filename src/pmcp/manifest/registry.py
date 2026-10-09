@@ -111,7 +111,11 @@ def _string_list(value: Any) -> list[str]:
 def default_registry_cache_path() -> Path:
     """Return PMCP's stable registry cache path, independent of Path.cwd()."""
     cache_home = os.environ.get("XDG_CACHE_HOME")
-    base = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
+    # Home-scoped (Consiliency/pmcp#372 round 22): refused while a checkout
+    # controls the home directory.
+    from pmcp.home_identity import home_path
+
+    base = Path(cache_home).expanduser() if cache_home else home_path(".cache")
     return base / "pmcp" / "registry-cache.json"
 
 

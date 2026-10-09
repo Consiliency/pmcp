@@ -215,7 +215,7 @@ def _gateway(
         discovery_queue_path=".mcp-gateway/discovery_queue.json",
     )
     jobs = _RecordingJobManager()
-    monkeypatch.setattr(handlers_module, "load_manifest", lambda: manifest)
+    monkeypatch.setattr(handlers_module, "load_manifest", lambda **_k: manifest)
     monkeypatch.setattr(handlers_module, "load_configs", lambda **_: [])
     monkeypatch.setattr(handlers_module, "get_job_manager", lambda: jobs)
     gateway = GatewayTools(
@@ -258,6 +258,10 @@ class _StubPolicy:
 
     def __init__(self, verdict: str) -> None:
         self.verdict = verdict
+        #: The project a real PolicyManager is bound to (Consiliency/pmcp#372
+        #: round 17): the provision gate judges package-approval residency
+        #: against it.
+        self.project_root = None
 
     def evaluate_package_policy(self, identity: PackageIdentity | None) -> str:
         return "unspecified" if identity is None else self.verdict
@@ -824,7 +828,7 @@ def test_every_combination_follows_the_frozen_decision_order(
         ("denied", "allowed", "unspecified"),
     ):
         monkeypatch.setattr(
-            "pmcp.provision_gate.is_package_approved", lambda _i, a=approved: a
+            "pmcp.provision_gate.is_package_approved", lambda _i, a=approved, **_k: a
         )
         args = ["-y", "example-mcp@1.2.3"] if pinned else ["-y", "example-mcp"]
         decision = evaluate_provision(
