@@ -8,9 +8,17 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The full suite with coverage outgrew 20 minutes: the v3.0.0 tag's build was
+    # cancelled at 54% of the tests, so nothing was published (see
+    # Consiliency/pmcp#383, which tracks parallelising the suite).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history and every tag: tests/test_migration_doc.py asserts the
+          # previous release is tagged whenever tags exist, and a tag push's
+          # default shallow checkout carries only the tag being built.
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
