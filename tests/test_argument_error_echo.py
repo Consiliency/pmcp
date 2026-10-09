@@ -2025,7 +2025,7 @@ async def test_a_value_rejected_by_hand_is_described(
         },
         discovery_queue_path=".mcp-gateway/discovery_queue.json",
     )
-    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_kwargs: manifest)
     monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
@@ -2084,6 +2084,11 @@ _COPIED_INPUT_TRIAGE: dict[tuple[str, str], str] = {
     ("auth_connect", "AuthConnectOutput.server"): _LOOKUP,
     ("auth_connect", "GatewayAuditEvent.server_name"): _LOOKUP,
     ("auth_connect", "AuthConnectOutput.url_elicitation"): _ACCEPTED,
+    # Consiliency/pmcp#372: a store refusal names the store's file from the
+    # requested scope (a fixed set); any other error is rendered through the
+    # registry (merged for the implementation, Consiliency/pmcp#297).
+    ("auth_connect", "AuthConnectOutput.message"): _DERIVED,
+    ("auth_connect", "GatewayAuditEvent.error"): _DERIVED,
     ("auth_connect", "UrlElicitationInfo.elicitation_id"): _ACCEPTED,
     ("auth_connect", "UrlElicitationInfo.next_step"): _ACCEPTED,
     ("auth_connect", "UrlElicitationInfo.url"): _ACCEPTED,
@@ -2111,21 +2116,9 @@ _COPIED_INPUT_TRIAGE: dict[tuple[str, str], str] = {
     ("register_discovered_server", "ServerConfig.env_var"): _ACCEPTED,
     ("register_discovered_server", "ServerConfig.name"): _ACCEPTED,
     ("register_discovered_server", "ServerConfig.package"): _ACCEPTED,
-    ("request_capability", "CapabilityResolution.candidates"): _DERIVED,
-    **{
-        ("request_capability", f"CLIResolution.{field}"): _DERIVED
-        for field in (
-            "available",
-            "check_command",
-            "description",
-            "examples",
-            "help_command",
-            "name",
-            "path",
-            "prefer_mcp_for",
-            "reason",
-        )
-    },
+    # Consiliency/pmcp#342 split `request_capability` into its tiers
+    # (`_capability_tier_*`), which build CLIResolution and the candidates
+    # from manifest hints, not from the caller's input: no longer copies.
     ("search_registry", "SearchRegistryOutput.query"): _NEVER,
     ("submit_feedback", "SubmitFeedbackOutput.issue_title"): (
         "never rejected; a refusal is of the destination or credential, and "

@@ -42,6 +42,7 @@ import json
 import logging
 import sys
 import traceback
+import weakref
 from collections.abc import Callable, Iterable, Iterator
 from types import ModuleType
 from typing import Any, NamedTuple
@@ -1463,9 +1464,25 @@ def scrub_record(record: logging.LogRecord) -> logging.LogRecord:
             record.args = None
             record.exc_info = None
             record.exc_text = None
+        _SCRUBBED[record] = _scrub_state(record)
     except Exception:
         pass  # a log call must never fail because of the scrub
     return record
+
+
+#: What was scrubbed, per record (kept off the record, so no handler or
+#: formatter sees it): the identities of its message, arguments and
+#: traceback after the scrub. `Logger.handle` scrubs again only when one of
+#: them was replaced since -- a record built by `logging.makeLogRecord`,
+#: whose fields are set after the factory ran -- since a second scrub of an
+#: SDK record would mask its rendered text again.
+_SCRUBBED: weakref.WeakKeyDictionary[logging.LogRecord, tuple[int, int, int]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _scrub_state(record: logging.LogRecord) -> tuple[int, int, int]:
+    return (id(record.msg), id(record.args), id(record.exc_info))
 
 
 def _scrubbing_factory(previous: Any) -> Any:
@@ -1750,7 +1767,8 @@ def _install_handle_scrubbing() -> None:
                 mask_extras,
             )
 
-            scrub_record(record)
+            if _SCRUBBED.get(record) != _scrub_state(record):
+                scrub_record(record)
             if is_sdk_logger(record.name):
                 mask_extras(record)
             else:
