@@ -798,7 +798,8 @@ two ways:
   install), and never overrides a variable that is already set. That file blocks only
   when the process that started the gateway, often your MCP client rather than your
   shell, did not have the token exported, so the value came from the file. Export it in
-  the environment that starts pmcp and restart, or remove it from that file.
+  the environment that starts pmcp and restart the gateway. Editing the file does not
+  help a gateway that is already running, which keeps refusing until it restarts.
 
 A checkout's plain `.env` never supplies the key and doesn't block.
 
