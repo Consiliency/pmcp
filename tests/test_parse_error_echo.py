@@ -3353,7 +3353,10 @@ def test_a_store_refusal_never_quotes_a_chained_value() -> None:
             raise ValueError(f"bad value {inner}") from inner
     except ValueError as error:
         text = store_refusal(Path(".env.pmcp"), error)
-    assert s not in text, text
+    # Every form, not only `s` itself: pydantic truncates a long
+    # `input_value` to its head and tail.
+    assert not any(form in text for form in _forbidden(s)), text
+    assert "input_value" not in text, text
     assert text.startswith("refusing to write .env.pmcp"), text
 
 

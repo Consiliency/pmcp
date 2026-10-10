@@ -492,6 +492,28 @@ def test_a_directly_built_record_is_scrubbed_when_handled(
     assert not any(form in _record_text(record) for form in _forbidden(s))
 
 
+@pytest.mark.parametrize("name", ["pmcp.server", "mcp.client.session", "httpx"])
+def test_extra_fields_are_scrubbed_when_the_record_is_made(name: str) -> None:
+    """``extra=`` fields are scrubbed by ``Logger.makeRecord`` itself, not
+    only when a logger handles the record: a record made there and handed
+    straight to a handler (a queue listener, a test harness) never reaches
+    ``Logger.handle``. A masked logger's text field reads ``<text>``; any
+    other logger's registered error is described (Consiliency/pmcp#297)."""
+    import pmcp  # noqa: F401 - installs the scrubbers
+
+    s = _FAMILIES["hex"][1]
+    extra: dict[str, Any] = {"carried": _validation_error(s), "count": 3}
+    if name != "pmcp.server":
+        # Only a masked logger masks plain text; pmcp's own text is its own.
+        extra["text"] = s
+    record = logging.getLogger(name).makeRecord(
+        name, logging.WARNING, __file__, 1, "failed", (), None, extra=extra
+    )
+    assert not any(form in _record_text(record) for form in _forbidden(s))
+    assert not any(form in repr(vars(record)) for form in _forbidden(s))
+    assert record.count == 3  # a value-free field is kept
+
+
 def test_the_logger_hooks_are_installed_once() -> None:
     """`Logger.makeRecord` and `Logger.handle` are each wrapped once, however
     often the scrubber is installed."""
