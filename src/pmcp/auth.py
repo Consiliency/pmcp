@@ -1434,18 +1434,19 @@ def normalize_auth_metadata(
     )
 
 
+#: The object :func:`_embedded_object_text` finds. Anchored at a line's
+#: start, so each line is scanned once: unanchored, ``(\{.*\})`` restarts at
+#: every ``{`` and is quadratic on a peer's text of many ``{`` and no ``}``.
+_EMBEDDED_OBJECT_RE = re.compile(r"(?m)^[^{\n]*(\{[^\n]*\})")
+
+
 def _embedded_object_text(text: str) -> str | None:
-    """What ``re.search(r"(\{.*\})", text)`` finds -- on the first line
+    r"""What ``re.search(r"(\{.*\})", text)`` finds -- on the first line
     holding a ``{`` with a ``}`` after it, from that ``{`` to the line's last
-    ``}`` -- in linear time. The regex is quadratic on a peer's text of many
-    ``{`` and no ``}`` (round 1 codex F001's audit: 368 s at 1 MiB)."""
-    for line in text.split("\n"):
-        start = line.find("{")
-        if start >= 0:
-            end = line.rfind("}")
-            if end > start:
-                return line[start : end + 1]
-    return None
+    ``}`` -- in linear time (round 1 codex F001's audit: the unanchored regex
+    took 368 s at 1 MiB)."""
+    found = _EMBEDDED_OBJECT_RE.search(text)
+    return found.group(1) if found else None
 
 
 def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:

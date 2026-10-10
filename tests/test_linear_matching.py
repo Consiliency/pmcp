@@ -163,7 +163,7 @@ def test_the_elicitation_payload_object_is_found_as_the_regex_found_it() -> None
             assert _embedded_object_text(text) == (found.group(1) if found else None)
 
 
-@pytest.mark.parametrize("unit", ["{", "{a", "{\n"])
+@pytest.mark.parametrize("unit", ["{", "{a", "{\n", "}\n", "a{\n"])
 def test_the_elicitation_payload_object_is_found_in_bounded_time(unit: str) -> None:
     from pmcp.auth import _embedded_object_text, parse_url_elicitation_error
 
