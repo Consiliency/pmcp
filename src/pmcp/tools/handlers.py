@@ -3645,8 +3645,12 @@ class GatewayTools:
     def _scrub_sensitive_text(self, text: str) -> str:
         """Remove obvious secrets and personal identifiers from feedback text."""
         scrubbed = self._policy_manager.redact_secrets(text)
+        # Starts only where a local part can start: without the lookbehind
+        # every position of a long run of local-part characters is tried, each
+        # to the run's end -- quadratic in a caller's text (round 1 codex
+        # F001's audit: ~1000 s at 1 MiB). It matches the same spans.
         return re.sub(
-            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
             "[REDACTED_EMAIL]",
             scrubbed,
         )

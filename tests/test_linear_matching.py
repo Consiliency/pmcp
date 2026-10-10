@@ -143,3 +143,53 @@ def test_a_message_over_the_cap_is_never_read_as_reviewed_or_relayed() -> None:
     sr.scrub_sdk_record(record)
     assert record.msg != masked
     assert filler not in str(record.msg)
+
+
+# --- every other pattern the audit found superlinear on a peer's text ---------
+
+
+def test_the_elicitation_payload_object_is_found_as_the_regex_found_it() -> None:
+    """``_embedded_object_text`` returns what ``re.search(r"(\\{.*\\})")``
+    did, on every short text over the characters that matter."""
+    import itertools
+    import re
+
+    from pmcp.auth import _embedded_object_text
+
+    for size in range(7):
+        for chars in itertools.product("{}a\n", repeat=size):
+            text = "".join(chars)
+            found = re.search(r"(\{.*\})", text)
+            assert _embedded_object_text(text) == (found.group(1) if found else None)
+
+
+@pytest.mark.parametrize("unit", ["{", "{a", "{\n"])
+def test_the_elicitation_payload_object_is_found_in_bounded_time(unit: str) -> None:
+    from pmcp.auth import _embedded_object_text, parse_url_elicitation_error
+
+    for size in (64 << 10, 1 << 20):  # the small size first: fail fast
+        text = unit * (size // len(unit))
+        assert _elapsed(_embedded_object_text, text) < _BUDGET_S
+        assert _elapsed(parse_url_elicitation_error, text) < _BUDGET_S * 4
+
+
+@pytest.mark.parametrize("unit", ["+.", "a", "a@", "a@a.", "-"])
+def test_feedback_email_scrubbing_is_linear(unit: str) -> None:
+    from pmcp.tools.handlers import GatewayTools
+
+    text = unit * ((1 << 20) // len(unit))
+    scrub = GatewayTools._scrub_sensitive_text
+
+    class _Policy:
+        @staticmethod
+        def redact_secrets(value: str) -> str:
+            return value
+
+    class _Self:
+        _policy_manager = _Policy()
+
+    for size in (64 << 10, 1 << 20):  # the small size first: fail fast
+        assert _elapsed(scrub, _Self(), text[:size]) < _BUDGET_S * 4
+    assert scrub(_Self(), "write to dev.null+x@example.org now") == (
+        "write to [REDACTED_EMAIL] now"
+    )
