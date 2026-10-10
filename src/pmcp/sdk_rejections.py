@@ -163,6 +163,21 @@ def _mcp_root() -> Path:
     return Path(mcp.__file__).parent
 
 
+@functools.cache
+def _mcp_trees() -> tuple[tuple[Path, ast.Module], ...]:
+    """Every module of the installed ``mcp`` package, parsed once per
+    process: each registry below reads the same trees (they were parsed five
+    times, ~0.8 s per process; CI time, Consiliency/pmcp#388 round 1). The
+    trees are read, never changed."""
+    trees: list[tuple[Path, ast.Module]] = []
+    for path in sorted(_mcp_root().rglob("*.py")):
+        try:
+            trees.append((path, ast.parse(path.read_text(encoding="utf-8"))))
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+    return tuple(trees)
+
+
 _LOGGER_FACTORIES = ("getLogger", "get_logger")
 
 
@@ -182,11 +197,7 @@ def sdk_logger_names() -> tuple[str, ...]:
     (``__name__`` in every module) and each literal name it passes to a
     logger factory (rev 26)."""
     names = set(SDK_LOGGERS)
-    for path in sorted(_mcp_root().rglob("*.py")):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, UnicodeDecodeError):
-            continue
+    for path, tree in _mcp_trees():
         for argument in logger_name_arguments(tree):
             if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
                 names.add(argument.value)
@@ -357,11 +368,7 @@ def _message_registry() -> tuple[
     literals: set[str] = set()
     patterns: list[tuple[int, re.Pattern[str]]] = []
     root = _mcp_root()
-    for path in sorted(root.rglob("*.py")):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, UnicodeDecodeError):
-            continue
+    for path, tree in _mcp_trees():
         module = None
         for argument in message_arguments(tree):
             if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
@@ -589,11 +596,7 @@ def _sdk_message_texts() -> tuple[frozenset[str], tuple[LiteralTemplate, ...]]:
     for every message it formats, from the installed package's source."""
     literals: set[str] = set()
     patterns: list[LiteralTemplate] = []
-    for path in sorted(_mcp_root().rglob("*.py")):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, UnicodeDecodeError):
-            continue
+    for path, tree in _mcp_trees():
         for _name, argument in error_message_arguments(tree):
             if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
                 literals.add(argument.value)
@@ -734,11 +737,7 @@ def _log_literals() -> frozenset[str]:
     template's is masked whole -- `logger.error(error_msg)` logged a
     pre-built `Endpoint origin does not match connection origin: <url>`."""
     literals: set[str] = set()
-    for path in sorted(_mcp_root().rglob("*.py")):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, UnicodeDecodeError):
-            continue
+    for path, tree in _mcp_trees():
         for message in log_messages(tree):
             if isinstance(message, ast.Constant) and isinstance(message.value, str):
                 literals.add(message.value)
@@ -767,13 +766,8 @@ def log_templates(tree: ast.AST) -> list[ast.JoinedStr]:
 def _log_patterns() -> tuple[tuple[LiteralTemplate, str], ...]:
     """(pattern, the message with each placeholder as ``<...>``) for every
     f-string log message anywhere in the SDK (rev 26: the client too)."""
-    root = _mcp_root()
     out: list[tuple[LiteralTemplate, str]] = []
-    for path in sorted(root.rglob("*.py")):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, UnicodeDecodeError):
-            continue
+    for path, tree in _mcp_trees():
         for template in log_templates(tree):
             masked = "".join(
                 value.value

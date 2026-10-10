@@ -136,19 +136,28 @@ _TRANSPORTS = ("http-json", "http-sse", "legacy-sse", "stdio")
 _FRAME_FAMILIES = ("hex", "alpha", "unicode")
 
 
-def _rotated_family(transport: str, method: str, shape_index: int) -> str:
-    """The sentinel family one (transport, method, shape) case uses.
+def _indices(transport: str, method: str) -> tuple[int, int]:
+    return _TRANSPORTS.index(transport), _METHODS.index(method)
 
-    The families vary only the sentinel's characters, which reach pmcp's
-    renderers, not its transports. Rotating them -- by the cell's index plus
-    the shape's -- runs every family on every (transport, method), every
-    (transport, shape) and every (method, shape) pair
-    (:func:`test_the_family_rotation_covers_every_pair`), at a third of the
-    full cross-product's cases (CI time, Consiliency/pmcp#388 round 1). The
-    two-sentinel pair differential is unchanged.
-    """
-    cell = _TRANSPORTS.index(transport) * len(_METHODS) + _METHODS.index(method)
-    return _FRAME_FAMILIES[(cell + shape_index) % len(_FRAME_FAMILIES)]
+
+def _runs_shape(transport: str, method: str, shape_index: int) -> bool:
+    """Whether the (transport, method) case runs this shape: every third
+    shape, offset by the case, so every (transport, shape) pair runs with
+    three or four methods and every (method, shape) pair with one or two
+    transports -- a third of the full grid's cases (CI time,
+    Consiliency/pmcp#388 round 1; :func:`test_the_rotation_covers_every_pair`)."""
+    t, m = _indices(transport, method)
+    return (shape_index + t + m) % 3 == 0
+
+
+def _rotated_family(transport: str, method: str, shape_index: int) -> str:
+    """The sentinel family a case uses. The families vary only the
+    sentinel's characters, which reach pmcp's renderers, not its
+    transports; the rotation runs all three on every transport, method and
+    shape, and on every (transport, method) pair. The two-sentinel pair
+    differential is unchanged."""
+    t, m = _indices(transport, method)
+    return _FRAME_FAMILIES[(shape_index // 3 + t + 2 * m) % len(_FRAME_FAMILIES)]
 
 
 #: The downstream's logic, shared by the HTTP handler and the stdio script:
@@ -510,24 +519,31 @@ def _only_pytests_log_handlers() -> Any:
 
 
 @pytest.mark.asyncio
-def test_the_family_rotation_covers_every_pair() -> None:
-    for left, right in (
-        ("transport", "method"),
-        ("transport", "shape"),
-        ("method", "shape"),
-    ):
-        families: dict[tuple[object, object], set[str]] = {}
-        for transport in _TRANSPORTS:
-            for method in _METHODS:
-                for index, shape in enumerate(_SHAPES):
-                    cell = {"transport": transport, "method": method, "shape": shape}
-                    families.setdefault((cell[left], cell[right]), set()).add(
-                        _rotated_family(transport, method, index)
-                    )
-        assert all(found == set(_FRAME_FAMILIES) for found in families.values()), (
-            left,
-            right,
-        )
+def test_the_rotation_covers_every_pair() -> None:
+    cells = [
+        (transport, method, shape, _rotated_family(transport, method, index))
+        for transport in _TRANSPORTS
+        for method in _METHODS
+        for index, shape in enumerate(_SHAPES)
+        if _runs_shape(transport, method, index)
+    ]
+    assert len(cells) <= len(_TRANSPORTS) * len(_METHODS) * len(_SHAPES) // 2
+    axes = {"transport": _TRANSPORTS, "method": _METHODS, "shape": _SHAPES}
+    names = list(axes)
+    for left in range(3):
+        for right in range(left + 1, 3):
+            pairs = {(cell[left], cell[right]) for cell in cells}
+            assert len(pairs) == len(axes[names[left]]) * len(axes[names[right]]), (
+                names[left],
+                names[right],
+            )
+        for value in axes[names[left]]:
+            families = {cell[3] for cell in cells if cell[left] == value}
+            assert families == set(_FRAME_FAMILIES), (names[left], value)
+    for transport in _TRANSPORTS:
+        for method in _METHODS:
+            families = {cell[3] for cell in cells if cell[:2] == (transport, method)}
+            assert families == set(_FRAME_FAMILIES), (transport, method)
 
 
 @pytest.mark.parametrize("method", _METHODS)
@@ -560,6 +576,8 @@ async def test_no_malformed_frame_value_reaches_pmcps_output(
     try:
         for _ in (method,):
             for shape_index, shape in enumerate(_SHAPES):
+                if not _runs_shape(transport, method, shape_index):
+                    continue
                 for family in (_rotated_family(transport, method, shape_index),):
                     seen: list[tuple[str, ...]] = []
                     for s in _FAMILIES[family]:
@@ -638,7 +656,9 @@ async def test_no_malformed_frame_value_reaches_pmcps_output(
                         seen.append(pair_view)
                     assert seen[0] == seen[1], (transport, method, shape, family, seen)
                     cases += 1
-        assert cases == len(_SHAPES)
+        assert cases == sum(
+            _runs_shape(transport, method, index) for index in range(len(_SHAPES))
+        )
         # No vacuous pass: the downstream did answer the targeted method.
         seen_methods = set(downstream.seen)
         if transport == "stdio":
