@@ -44,6 +44,7 @@ import functools
 import logging
 import re
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any
 
 #: Set on every exception ``pmcp.server._described_errors`` lets escape: an
@@ -215,15 +216,66 @@ def message_arguments(tree: ast.AST) -> list[ast.expr]:
     return found
 
 
-def _template_pattern(node: ast.JoinedStr) -> re.Pattern[str]:
+#: The longest text pmcp matches against an SDK template or reviewed
+#: message, in characters (round 1 codex F001). Every message the SDK
+#: formats from its own vocabulary is far shorter; a peer's text longer than
+#: this is never recognised as one, and is treated as unreviewed -- replaced
+#: by its code's fixed phrase, or masked whole in a log -- without being
+#: matched at all.
+MAX_CLASSIFIED_LENGTH = 4096
+
+
+def classifiable(text: str) -> bool:
+    """Whether ``text`` is short enough to match against SDK messages."""
+    return len(text) <= MAX_CLASSIFIED_LENGTH
+
+
+class LiteralTemplate:
+    """A message template: literal parts, each pair separated by a
+    placeholder that matches any text. :meth:`fullmatch` is linear in the
+    text -- a prefix, a suffix, and each middle part found left to right
+    with ``str.find`` -- where the equivalent regex of lazy wildcards
+    backtracks polynomially on a peer's text that repeats a prefix without
+    its suffix (round 1 codex F001). Leftmost matching is exact here: a
+    placeholder matches anything, so taking each middle part at its first
+    occurrence never rules out a match a later one would allow."""
+
+    __slots__ = ("parts", "pattern")
+
+    def __init__(self, parts: Iterable[str]) -> None:
+        self.parts: tuple[str, ...] = tuple(parts)
+        #: The equivalent regular expression, for display and length checks.
+        self.pattern = "(.*?)".join(re.escape(part) for part in self.parts)
+
+    def fullmatch(self, text: str) -> bool:
+        parts = self.parts
+        if len(parts) == 1:
+            return text == parts[0]
+        first, last = parts[0], parts[-1]
+        end = len(text) - len(last)
+        if end < len(first) or not text.startswith(first) or not text.endswith(last):
+            return False
+        position = len(first)
+        for middle in parts[1:-1]:
+            found = text.find(middle, position, end)
+            if found < 0:
+                return False
+            position = found + len(middle)
+        return True
+
+    def __repr__(self) -> str:
+        return f"LiteralTemplate({self.parts!r})"
+
+
+def _template_pattern(node: ast.JoinedStr) -> LiteralTemplate:
     """A template with every placeholder matching anything (for logs)."""
-    parts: list[str] = []
+    parts: list[str] = [""]
     for value in node.values:
         if isinstance(value, ast.Constant) and isinstance(value.value, str):
-            parts.append(re.escape(value.value))
+            parts[-1] += value.value
         else:
-            parts.append("(.*?)")
-    return re.compile("".join(parts), re.DOTALL)
+            parts.append("")
+    return LiteralTemplate(parts)
 
 
 def _converted(value: Any, conversion: int) -> str:
@@ -332,7 +384,7 @@ def _message_registry() -> tuple[
 
 
 def _reviewed_message(message: Any, code: Any = None) -> bool:
-    if not isinstance(message, str):
+    if not isinstance(message, str) or not classifiable(message):
         return False
     literals, patterns = _message_registry()
     return message in literals or any(
@@ -501,7 +553,7 @@ def error_message_arguments(tree: ast.AST) -> list[tuple[str, ast.expr]]:
     return found
 
 
-def _message_pattern(node: ast.expr) -> re.Pattern[str] | None:
+def _message_pattern(node: ast.expr) -> LiteralTemplate | None:
     """A pattern for a message the SDK formats: an f-string, a ``%``-format
     or a ``.format`` of a literal, each placeholder matching anything."""
     if isinstance(node, ast.JoinedStr):
@@ -528,16 +580,15 @@ def _message_pattern(node: ast.expr) -> re.Pattern[str] | None:
         literal, placeholder = node.func.value.value, re.compile(r"\{[^{}]*\}")
     if literal is None or placeholder is None:
         return None
-    parts = placeholder.split(literal)
-    return re.compile("(.*?)".join(re.escape(part) for part in parts), re.DOTALL)
+    return LiteralTemplate(placeholder.split(literal))
 
 
 @functools.cache
-def _sdk_message_texts() -> tuple[frozenset[str], tuple[re.Pattern[str], ...]]:
+def _sdk_message_texts() -> tuple[frozenset[str], tuple[LiteralTemplate, ...]]:
     """Every literal message the SDK raises or answers with, and a pattern
     for every message it formats, from the installed package's source."""
     literals: set[str] = set()
-    patterns: list[re.Pattern[str]] = []
+    patterns: list[LiteralTemplate] = []
     for path in sorted(_mcp_root().rglob("*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -612,8 +663,8 @@ def withheld_sdk_error(error: BaseException) -> bool:
 _MIN_TEMPLATE_LITERAL = 8
 
 
-def _literal_length(pattern: re.Pattern[str]) -> int:
-    return len(re.sub(r"\\(.)", r"\1", pattern.pattern.replace("(.*?)", "")))
+def _literal_length(pattern: LiteralTemplate) -> int:
+    return sum(len(part) for part in pattern.parts)
 
 
 def sdk_built_message(message: Any, code: Any = None) -> bool:
@@ -621,7 +672,13 @@ def sdk_built_message(message: Any, code: Any = None) -> bool:
     itself and pmcp has not reviewed: the SDK's client transport answers a
     request with its own `ErrorData` (`Unexpected content type: <type>`,
     round-24 claude F001), which reaches pmcp as if the downstream sent it."""
-    if not isinstance(message, str) or _reviewed_message(message, code):
+    if not isinstance(message, str):
+        return False
+    if not classifiable(message):
+        # Too long to be one the SDK formats from its own words, and never
+        # matched: treated as SDK-built, so its code's phrase is shown.
+        return True
+    if _reviewed_message(message, code):
         return False
     _literals, patterns = _sdk_message_texts()
     return any(
@@ -707,11 +764,11 @@ def log_templates(tree: ast.AST) -> list[ast.JoinedStr]:
 
 
 @functools.cache
-def _log_patterns() -> tuple[tuple[re.Pattern[str], str], ...]:
+def _log_patterns() -> tuple[tuple[LiteralTemplate, str], ...]:
     """(pattern, the message with each placeholder as ``<...>``) for every
     f-string log message anywhere in the SDK (rev 26: the client too)."""
     root = _mcp_root()
-    out: list[tuple[re.Pattern[str], str]] = []
+    out: list[tuple[LiteralTemplate, str]] = []
     for path in sorted(root.rglob("*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -830,7 +887,7 @@ def scrub_sdk_record(record: logging.LogRecord) -> None:
             return
         if record.msg in _log_literals():
             return
-        if not args:
+        if not args and classifiable(record.msg):
             for pattern, masked in _log_patterns():
                 if pattern.fullmatch(record.msg):
                     record.msg = masked
