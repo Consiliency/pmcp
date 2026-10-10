@@ -2635,8 +2635,14 @@ def test_no_sdk_transport_rejection_reaches_any_output(
     before = len(_GRID_REQUESTS)
     try:
         try:
+            # A rejected `endpoint` leaves the SSE connect waiting for one
+            # that never comes: everything is logged within the first second,
+            # so the wait is cut there, not at 25 s (CI time,
+            # Consiliency/pmcp#388 round 1).
             errors, last = asyncio.run(
-                asyncio.wait_for(_drive_remote(transport, 0), 25)
+                asyncio.wait_for(
+                    _drive_remote(transport, 0), 5 if kind == "sse-endpoint" else 25
+                )
             )
             outcome = json.dumps([errors, last], default=str)
         except Exception as error:  # noqa: BLE001 -- inspected
@@ -2656,6 +2662,12 @@ def test_no_sdk_transport_rejection_reaches_any_output(
         if any(form in text for form in _forbidden_any_case(s))
     }
     assert not leaked, leaked
+    if kind == "sse-endpoint":
+        # No vacuous pass within the shorter wait: the SDK rejected it.
+        assert any(
+            record.name == "mcp.client.sse" and record.levelno >= logging.ERROR
+            for record in caplog.records
+        ), "the endpoint was never rejected"
 
 
 def _raised_at(site: str, error: BaseException) -> BaseException:
