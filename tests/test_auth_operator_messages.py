@@ -1079,8 +1079,13 @@ def test_no_redacting_log_hook_in_the_source() -> None:
     ]
     # Consiliency/pmcp#297's record scrubber is a record factory, but it only
     # rewrites a record that carries a validation or parse error; the sink
-    # test above shows every auth message passes through it intact.
-    assert hits == ["argument_errors.py: setLogRecordFactory("]
+    # test above shows every auth message passes through it intact. Its
+    # `logging.Filterer.filter` wrap (round 1 N-2 of Consiliency/pmcp#388)
+    # scrubs again, the same way, after a filter passes a record.
+    assert hits == [
+        "argument_errors.py: logging.Filter",
+        "argument_errors.py: setLogRecordFactory(",
+    ]
 
 
 # --- pyjwt's fixed texts, kept verbatim by `_FIXED_TEXT_CLAIM_ERRORS` ----------
