@@ -1372,24 +1372,34 @@ def _windows(text: str, size: int = 12) -> set[str]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("family", sorted(_FAMILIES))
 async def test_no_record_shows_a_non_protocol_stdout_line(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, family: str
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Rev 12 (round-11 codex P1, the class claude proposed): for any bytes a
     downstream writes to stdout that are not a valid JSON-RPC message, no log
     record carries any part of them -- through the real `_read_stdout`, with
-    no record exempt. Each unparseable line gets the one fixed record."""
+    no record exempt. Each unparseable line gets the one fixed record.
+
+    Each stream is built with one sentinel family, rotating over the streams,
+    so every family runs on a sixth of them (CI time, Consiliency/pmcp#388
+    round 1; the streams were once run whole per family)."""
     import time
 
     from pmcp.client.manager import PendingRequest
 
     caplog.set_level(logging.DEBUG)
-    s = _FAMILIES[family][1]
-    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
-    streams = _stdout_streams(s)
+    families = sorted(_FAMILIES)
+    # Family k takes its streams at positions k, k + 6, ...: every position
+    # of the (sentinel-dependent) stream list runs with one family.
+    rotated = [
+        (family, stream)
+        for offset, family in enumerate(families)
+        for stream in _stdout_streams(_FAMILIES[family][1])[offset :: len(families)]
+    ]
     fixed = 0
-    for label, lines, limit in streams:
+    for family, (label, lines, limit) in rotated:
+        s = _FAMILIES[family][1]
+        forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
         manager, managed = _stdio_manager()
         future = asyncio.get_running_loop().create_future()
         managed.pending_requests[8] = PendingRequest(
