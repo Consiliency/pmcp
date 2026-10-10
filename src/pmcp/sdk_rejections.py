@@ -44,7 +44,7 @@ import functools
 import logging
 import re
 from pathlib import Path
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 #: Set on every exception ``pmcp.server._described_errors`` lets escape: an
@@ -163,19 +163,16 @@ def _mcp_root() -> Path:
     return Path(mcp.__file__).parent
 
 
-@functools.cache
-def _mcp_trees() -> tuple[tuple[Path, ast.Module], ...]:
-    """Every module of the installed ``mcp`` package, parsed once per
-    process: each registry below reads the same trees (they were parsed five
-    times, ~0.8 s per process; CI time, Consiliency/pmcp#388 round 1). The
-    trees are read, never changed."""
-    trees: list[tuple[Path, ast.Module]] = []
+def _mcp_trees() -> Iterator[tuple[Path, ast.Module]]:
+    """Every module of the installed ``mcp`` package, parsed. Not kept: the
+    registries built from them are cached instead, and holding every tree
+    (~64 MB of nodes) made each full garbage collection of the process
+    slower (measured: CI time, Consiliency/pmcp#388 round 1)."""
     for path in sorted(_mcp_root().rglob("*.py")):
         try:
-            trees.append((path, ast.parse(path.read_text(encoding="utf-8"))))
+            yield path, ast.parse(path.read_text(encoding="utf-8"))
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue
-    return tuple(trees)
 
 
 _LOGGER_FACTORIES = ("getLogger", "get_logger")

@@ -52,6 +52,8 @@ import jsonschema
 from pydantic import ValidationError
 from pydantic_core import PydanticCustomError
 
+from pmcp import sdk_rejections as _sdk
+
 #: Stands in for a path segment the caller chose.
 REDACTED_SEGMENT = "*"
 
@@ -1410,6 +1412,13 @@ def _render_session_message(self: Any) -> str:
 _ATOMS = frozenset({str, bytes, int, float, bool, type(None)})
 
 
+def _atoms_only(args: Any) -> bool:
+    """Whether a record's ``args`` are empty or a tuple of :data:`_ATOMS`."""
+    if not args:
+        return True
+    return type(args) is tuple and all(type(item) in _ATOMS for item in args)
+
+
 def _scrubbed(value: Any, depth: int = 0) -> Any:
     """`value` with every exception whose chain holds a validation error
     replaced by its :func:`exception_text`, and every JSON-RPC message (an
@@ -1455,11 +1464,20 @@ def scrub_record(record: logging.LogRecord) -> logging.LogRecord:
     an exception's text. Every other record is returned unchanged.
     """
     try:
+        masked = _sdk.is_sdk_logger(record.name)
+        if (
+            not masked
+            and record.exc_info is None
+            and type(record.msg) is str
+            and _atoms_only(record.args)
+        ):
+            # Nothing a record of an unmasked logger carries can hold a
+            # value here: a text message, plain arguments, no traceback (the
+            # common record, every time; CI time, Consiliency/pmcp#388).
+            return record
         # The MCP SDK's server-side loggers and sse_starlette log request
         # content as text (rev 20): masked before anything else.
-        from pmcp.sdk_rejections import scrub_sdk_record
-
-        scrub_sdk_record(record)
+        _sdk.scrub_sdk_record(record)
         if isinstance(record.msg, BaseException):
             record.msg = _scrubbed(record.msg)
         if record.args:
@@ -1493,7 +1511,9 @@ def scrub_record(record: logging.LogRecord) -> logging.LogRecord:
             record.args = None
             record.exc_info = None
             record.exc_text = None
-        _SCRUBBED[record] = _scrub_state(record)
+        if masked:
+            # Read only for a masked logger's record (`_rescrub`).
+            _SCRUBBED[record] = _scrub_state(record)
     except Exception:
         pass  # a log call must never fail because of the scrub
     return record
@@ -1779,9 +1799,7 @@ def _install_extra_scrubbing() -> None:
 def _rescrub(record: logging.LogRecord) -> None:
     """Scrub ``record`` again, its `extra=`-style fields included. Never raises."""
     try:
-        from pmcp.sdk_rejections import RECORD_ATTRIBUTES, is_sdk_logger, mask_extras
-
-        masked = is_sdk_logger(record.name)
+        masked = _sdk.is_sdk_logger(record.name)
         # Every record of pmcp's own or another non-masked logger is scrubbed
         # again: a handler or filter may have changed its `msg`, `args` or
         # `exc_info` in place since it was made (round 1 N-2), and the scrub
@@ -1791,10 +1809,10 @@ def _rescrub(record: logging.LogRecord) -> None:
         if not masked or _SCRUBBED.get(record) != _scrub_state(record):
             scrub_record(record)
         if masked:
-            mask_extras(record)
+            _sdk.mask_extras(record)
         else:
             fields = vars(record)
-            for key in fields.keys() - RECORD_ATTRIBUTES:
+            for key in fields.keys() - _sdk.RECORD_ATTRIBUTES:
                 setattr(record, key, _scrubbed(fields[key]))
     except Exception:  # noqa: BLE001 -- a log call must never fail here
         pass

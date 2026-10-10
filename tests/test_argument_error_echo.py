@@ -2308,6 +2308,33 @@ def test_every_field_that_copies_a_caller_input_is_triaged() -> None:
     )
 
 
+def _runs_dropped_case(wrap: int, call: int, position: int) -> bool:
+    """Whether a task shape (``wrap``) runs this (call, position) case: half
+    of them, by parity, so every (shape, call), (shape, position) and (call,
+    position) pair still runs (CI time, Consiliency/pmcp#388 round 1;
+    :func:`test_the_dropped_hint_rotation_covers_every_pair`)."""
+    return (wrap + call + position) % 2 == 0
+
+
+def test_the_dropped_hint_rotation_covers_every_pair() -> None:
+    """For any number of dropped positions the parser may report (2 to 30)."""
+    wraps, calls = len(_TASK_WRAPS), len(_task_calls())
+    for positions in range(2, 31):
+        cells = [
+            (w, c, p)
+            for w in range(wraps)
+            for c in range(calls)
+            for p in range(positions)
+            if _runs_dropped_case(w, c, p)
+        ]
+        for left, right, size in (
+            (0, 1, wraps * calls),
+            (0, 2, wraps * positions),
+            (1, 2, calls * positions),
+        ):
+            assert len({(cell[left], cell[right]) for cell in cells}) == size
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("wrap", sorted(_TASK_WRAPS))
 async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
@@ -2343,9 +2370,12 @@ async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
     ran: set[str] = set()
     eligible: set[str] = set()
     cell = 0
-    for name, arguments, method in _task_calls():
-        for key, shape in dropped:
-            cell += 1
+    wrap_index = sorted(_TASK_WRAPS).index(wrap)
+    for call_index, (name, arguments, method) in enumerate(_task_calls()):
+        for position_index, (key, shape) in enumerate(dropped):
+            if not _runs_dropped_case(wrap_index, call_index, position_index):
+                continue
+            cell += 1  # counts run cases, so the family rotation steps by one
 
             def dropped_here(family: str) -> bool:
                 # A value the parser accepts (a digits-only `createdAt` is a
@@ -2399,8 +2429,8 @@ async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
                 )
                 cases += 1
     await server.shutdown()
-    # One rotated family per (call, position), offset per wrap.
-    assert cases >= 5 * len(dropped), cases
+    # One rotated family per run (call, position), offset per wrap.
+    assert cases >= 5 * len(dropped) // 2, cases
     assert ran == eligible, (ran, eligible)
 
 
