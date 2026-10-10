@@ -1588,7 +1588,9 @@ _GRID_TOKEN: list[str] = ["none"]
 _GRID_URL: list[str] = ["http://127.0.0.1:9/none"]
 
 
-def _serve_once_per_connection(payload: bytes) -> tuple[Any, int]:
+def _serve_once_per_connection(payload: bytes | list[bytes]) -> tuple[Any, int]:
+    """A listener answering each connection with ``payload`` -- or, given a
+    one-item list, with whatever the list holds when the connection comes."""
     import socket
     import threading
 
@@ -1608,7 +1610,7 @@ def _serve_once_per_connection(payload: bytes) -> tuple[Any, int]:
                     _GRID_REQUESTS.append(conn.recv(65536))
                 except OSError:
                     pass
-                conn.sendall(payload)
+                conn.sendall(payload[0] if isinstance(payload, list) else payload)
             except OSError:
                 pass
             finally:
@@ -1975,26 +1977,28 @@ def test_every_urllib_opener_takes_the_environment_proxy(
     )
 
 
-@pytest.mark.parametrize("status", _PROXY_STATUSES)
 @pytest.mark.parametrize("scheme", ["https", "http"])
 def test_no_proxy_refusal_reaches_any_output(
     scheme: str,
-    status: int,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Every site that takes a proxy, through a proxy that refuses with the
-    sentinel as its reason phrase: the grid's oracle."""
+    sentinel as its reason phrase: the grid's oracle. The refusal's status
+    rotates over the drivers (offset per scheme), so every status meets every
+    scheme and every third driver, at a third of the full grid's requests
+    (CI time, Consiliency/pmcp#388 round 1)."""
     import pmcp  # noqa: F401 - installs the scrubbers
     from pmcp.argument_errors import exception_text, safe_traceback_text
 
     s = _GRID_S
     caplog.set_level(logging.DEBUG)
     monkeypatch.setenv("HOME", str(tmp_path))
-    listener, port = _serve_once_per_connection(
-        f"HTTP/1.1 {status} {s}\r\nContent-Length: 0\r\n\r\n".encode()
-    )
+    refusal = [b""]
+    listener, port = _serve_once_per_connection(refusal)
+    statuses: set[int] = set()
+    rotation = 0 if scheme == "https" else 1
     proxy = f"http://127.0.0.1:{port}"
     for name in ("NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"):
         monkeypatch.delenv(name, raising=False)
@@ -2008,6 +2012,12 @@ def test_no_proxy_refusal_reaches_any_output(
             if site not in _proxied_sites():
                 continue
             for driver in drivers:
+                status = _PROXY_STATUSES[rotation % len(_PROXY_STATUSES)]
+                rotation += 1
+                statuses.add(status)
+                refusal[0] = (
+                    f"HTTP/1.1 {status} {s}\r\nContent-Length: 0\r\n\r\n".encode()
+                )
                 caplog.clear()
                 token = f"proxy{len(_GRID_REQUESTS)}x{abs(hash(site)) % 10**8}"
                 _GRID_TOKEN[0] = token
@@ -2025,6 +2035,7 @@ def test_no_proxy_refusal_reaches_any_output(
     finally:
         listener.close()
     assert not failures, failures
+    assert statuses == set(_PROXY_STATUSES), statuses
 
 
 # --- the links beneath a registered error (rev 24, round-22 claude N1) --------
