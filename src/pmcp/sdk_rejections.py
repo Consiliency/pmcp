@@ -197,7 +197,17 @@ def sdk_logger_names() -> tuple[str, ...]:
     (``__name__`` in every module) and each literal name it passes to a
     logger factory (rev 26)."""
     names = set(SDK_LOGGERS)
-    for path, tree in _mcp_trees():
+    # Only a module whose text names a factory can call one by that name, so
+    # only those are parsed: the first record of any process asks, and the
+    # whole package took ~0.4 s (CI time, Consiliency/pmcp#388 round 1).
+    for path in sorted(_mcp_root().rglob("*.py")):
+        try:
+            text = path.read_text(encoding="utf-8")
+            if not any(factory in text for factory in _LOGGER_FACTORIES):
+                continue
+            tree = ast.parse(text)
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
         for argument in logger_name_arguments(tree):
             if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
                 names.add(argument.value)
