@@ -135,6 +135,22 @@ _TRANSPORTS = ("http-json", "http-sse", "legacy-sse", "stdio")
 #: sweep's; here the transports and envelope positions are.
 _FRAME_FAMILIES = ("hex", "alpha", "unicode")
 
+
+def _rotated_family(transport: str, method: str, shape_index: int) -> str:
+    """The sentinel family one (transport, method, shape) case uses.
+
+    The families vary only the sentinel's characters, which reach pmcp's
+    renderers, not its transports. Rotating them -- by the cell's index plus
+    the shape's -- runs every family on every (transport, method), every
+    (transport, shape) and every (method, shape) pair
+    (:func:`test_the_family_rotation_covers_every_pair`), at a third of the
+    full cross-product's cases (CI time, Consiliency/pmcp#388 round 1). The
+    two-sentinel pair differential is unchanged.
+    """
+    cell = _TRANSPORTS.index(transport) * len(_METHODS) + _METHODS.index(method)
+    return _FRAME_FAMILIES[(cell + shape_index) % len(_FRAME_FAMILIES)]
+
+
 #: The downstream's logic, shared by the HTTP handler and the stdio script:
 #: answer `request` normally, unless it is the targeted method.
 _DOWNSTREAM_LOGIC = textwrap.dedent(
@@ -494,6 +510,26 @@ def _only_pytests_log_handlers() -> Any:
 
 
 @pytest.mark.asyncio
+def test_the_family_rotation_covers_every_pair() -> None:
+    for left, right in (
+        ("transport", "method"),
+        ("transport", "shape"),
+        ("method", "shape"),
+    ):
+        families: dict[tuple[object, object], set[str]] = {}
+        for transport in _TRANSPORTS:
+            for method in _METHODS:
+                for index, shape in enumerate(_SHAPES):
+                    cell = {"transport": transport, "method": method, "shape": shape}
+                    families.setdefault((cell[left], cell[right]), set()).add(
+                        _rotated_family(transport, method, index)
+                    )
+        assert all(found == set(_FRAME_FAMILIES) for found in families.values()), (
+            left,
+            right,
+        )
+
+
 @pytest.mark.parametrize("method", _METHODS)
 @pytest.mark.parametrize("transport", _TRANSPORTS)
 async def test_no_malformed_frame_value_reaches_pmcps_output(
@@ -523,8 +559,8 @@ async def test_no_malformed_frame_value_reaches_pmcps_output(
     cases = 0
     try:
         for _ in (method,):
-            for shape in _SHAPES:
-                for family in _FRAME_FAMILIES:
+            for shape_index, shape in enumerate(_SHAPES):
+                for family in (_rotated_family(transport, method, shape_index),):
                     seen: list[tuple[str, ...]] = []
                     for s in _FAMILIES[family]:
                         state = {
@@ -602,7 +638,7 @@ async def test_no_malformed_frame_value_reaches_pmcps_output(
                         seen.append(pair_view)
                     assert seen[0] == seen[1], (transport, method, shape, family, seen)
                     cases += 1
-        assert cases == len(_SHAPES) * len(_FRAME_FAMILIES)
+        assert cases == len(_SHAPES)
         # No vacuous pass: the downstream did answer the targeted method.
         seen_methods = set(downstream.seen)
         if transport == "stdio":

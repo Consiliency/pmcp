@@ -822,8 +822,9 @@ RECORD_ATTRIBUTES = frozenset(
 
 def mask_extras(record: logging.LogRecord) -> None:
     """Mask every `extra=` field of ``record`` by the same allowlist."""
-    for key, value in list(vars(record).items()):
-        if key not in RECORD_ATTRIBUTES and not _value_free_argument(value):
+    fields = vars(record)
+    for key in fields.keys() - RECORD_ATTRIBUTES:
+        if not _value_free_argument(fields[key]):
             setattr(record, key, _TEXT)
 
 
@@ -834,6 +835,15 @@ def _under(name: Any, prefixes: tuple[str, ...]) -> bool:
 
 
 def is_sdk_logger(name: Any) -> bool:
+    if not isinstance(name, str):
+        return False
+    return _is_sdk_logger_name(name)
+
+
+@functools.lru_cache(maxsize=4096)
+def _is_sdk_logger_name(name: str) -> bool:
+    """:func:`is_sdk_logger` for a name, remembered: every record asks, and
+    a process logs under a few hundred names at most."""
     return _under(name, sdk_logger_names()) or _under(name, HTTP_CLIENT_LOGGERS)
 
 

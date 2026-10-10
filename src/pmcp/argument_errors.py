@@ -1405,12 +1405,21 @@ def _render_session_message(self: Any) -> str:
         return "SessionMessage(<JSON-RPC message>)"
 
 
+#: Types `_scrubbed` returns as they are, by exact type: no exception or
+#: JSON-RPC message can be one.
+_ATOMS = frozenset({str, bytes, int, float, bool, type(None)})
+
+
 def _scrubbed(value: Any, depth: int = 0) -> Any:
     """`value` with every exception whose chain holds a validation error
     replaced by its :func:`exception_text`, and every JSON-RPC message (an
     SDK object or a dict shaped like one) by
     :func:`describe_jsonrpc_message`, looking inside tuples, lists, sets and
     dicts (keys and values)."""
+    if type(value) in _ATOMS:
+        return value
+    if isinstance(value, tuple) and all(type(item) in _ATOMS for item in value):
+        return value  # the usual `%`-arguments: nothing to replace
     if isinstance(value, BaseException):
         return exception_text(value) if safe_exc_info(value) is None else value
     if _message_fields(value) is not None:
@@ -1784,9 +1793,9 @@ def _rescrub(record: logging.LogRecord) -> None:
         if masked:
             mask_extras(record)
         else:
-            for key, value in list(vars(record).items()):
-                if key not in RECORD_ATTRIBUTES:
-                    setattr(record, key, _scrubbed(value))
+            fields = vars(record)
+            for key in fields.keys() - RECORD_ATTRIBUTES:
+                setattr(record, key, _scrubbed(fields[key]))
     except Exception:  # noqa: BLE001 -- a log call must never fail here
         pass
 

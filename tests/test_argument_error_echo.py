@@ -41,6 +41,7 @@ import logging
 import traceback
 import typing
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, cast
 
 import jsonschema
@@ -98,6 +99,28 @@ _FAMILIES: dict[str, tuple[str, str]] = {
 }
 #: The hex pair, for the tests that need one family.
 _SENTINELS = _FAMILIES["hex"]
+
+
+def _rotated_families(
+    index: int,
+    eligible: Callable[[str], bool] = lambda _family: True,
+    *,
+    skip: str = "",
+) -> list[tuple[str, tuple[str, str]]]:
+    """The one sentinel family a sweep's case ``index`` uses: the first
+    eligible family from position ``index`` in a fixed rotation (``skip``
+    left out). The families vary only the sentinel's characters; rotating
+    them over a sweep's cases runs every family across each sweep at a
+    fraction of the full cross-product's cases (CI time,
+    Consiliency/pmcp#388 round 1). Each sweep asserts every eligible family
+    still ran."""
+    names = [name for name in _FAMILIES if name != skip]
+    for step in range(len(names)):
+        family = names[(index + step) % len(names)]
+        if eligible(family):
+            return [(family, _FAMILIES[family])]
+    return []
+
 
 _GATE_PREFIX = "Input validation error: $"
 _MODEL_PREFIX = "Invalid arguments: $"
@@ -724,8 +747,14 @@ async def test_no_rejected_argument_value_reaches_a_response_log_or_audit(
     caplog.set_level(logging.DEBUG)
     server, audit_path = _server(tmp_path, audited=audited)
     tap = _Tap(server, audit_path, caplog, capfd, recwarn)
-    for family, sentinels in _FAMILIES.items():
-        for case in _CASES:
+    # Every case with hex, whose rejection is also checked for usefulness,
+    # and with one more family in rotation (offset per audit mode, so each
+    # case meets two of the others over the two modes).
+    ran: set[str] = set()
+    for index, case in enumerate(_CASES):
+        rotated = _rotated_families(index + (3 if audited else 0), skip="hex")
+        for family, sentinels in [("hex", _FAMILIES["hex"]), *rotated]:
+            ran.add(family)
             seen = []
             for sentinel in sentinels:
                 mark = tap.start()
@@ -740,6 +769,7 @@ async def test_no_rejected_argument_value_reaches_a_response_log_or_audit(
             assert seen[0].stable() == seen[1].stable(), (family, case.label)
             assert _event_shape(seen[0].events) == _event_shape(seen[1].events)
     await server.shutdown()
+    assert ran == set(_FAMILIES), ran
     # The audit oracle is live, not empty by accident.
     if audit_path is not None:
         assert '"audit.rejection"' in audit_path.read_text()
@@ -1733,14 +1763,24 @@ async def test_no_downstream_value_reaches_a_response_log_or_audit(
         return _task_outcome(parser, payload) is not None
 
     rejected = expected = 0
+    ran: set[str] = set()
+    eligible: set[str] = set()
+    cell = 0
     for name, arguments, method in _task_calls():
         for key, shape in positions:
-            for family, sentinels in _FAMILIES.items():
-                # A value the parser accepts (a digits-only `createdAt` is a
-                # number) is downstream data pmcp returns by design, not a
-                # rejection; only rejected values are this sweep's subject.
-                if not all(rejects(key, _bad_values(s)[shape]) for s in sentinels):
-                    continue
+            cell += 1
+
+            def rejected_here(family: str) -> bool:
+                return all(
+                    rejects(key, _bad_values(s)[shape]) for s in _FAMILIES[family]
+                )
+
+            # A value the parser accepts (a digits-only `createdAt` is a
+            # number) is downstream data pmcp returns by design, not a
+            # rejection; only rejected values are this sweep's subject.
+            eligible |= {family for family in _FAMILIES if rejected_here(family)}
+            for family, sentinels in _rotated_families(cell, rejected_here):
+                ran.add(family)
                 expected += 1
                 seen = []
                 for s in sentinels:
@@ -1787,10 +1827,12 @@ async def test_no_downstream_value_reaches_a_response_log_or_audit(
                 )
                 assert _event_shape(seen[0].events) == _event_shape(seen[1].events)
                 rejected += 1
-    assert rejected == expected > len(_task_calls()) * len(positions), (
+    # One rotated family per (call, position): most positions reject some.
+    assert rejected == expected > len(_task_calls()) * len(positions) // 2, (
         rejected,
         expected,
     )
+    assert ran == eligible, (ran, eligible)
     # What `gateway.health` exposes (the audit-event buffer, among the rest).
     health = "".join(
         block.text for block in (await _call(server, "gateway.health", {})).content
@@ -2298,12 +2340,17 @@ async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
     ]
     assert dropped, "no dropped position"
     cases = 0
+    ran: set[str] = set()
+    eligible: set[str] = set()
+    cell = 0
     for name, arguments, method in _task_calls():
         for key, shape in dropped:
-            for family, sentinels in _FAMILIES.items():
+            cell += 1
+
+            def dropped_here(family: str) -> bool:
                 # A value the parser accepts (a digits-only `createdAt` is a
                 # number) is data pmcp returns by design, not a dropped hint.
-                if not all(
+                return all(
                     _task_outcome(
                         parser,
                         {
@@ -2313,9 +2360,14 @@ async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
                         },
                     )
                     == "dropped"
-                    for s in sentinels
-                ):
-                    continue
+                    for s in _FAMILIES[family]
+                )
+
+            eligible |= {family for family in _FAMILIES if dropped_here(family)}
+            for family, sentinels in _rotated_families(
+                cell + sorted(_TASK_WRAPS).index(wrap), dropped_here
+            ):
+                ran.add(family)
                 seen = []
                 for s in sentinels:
                     state["payload"] = {
@@ -2347,7 +2399,9 @@ async def test_no_dropped_task_hint_reaches_the_answer_in_any_task_shape(
                 )
                 cases += 1
     await server.shutdown()
-    assert cases >= 5 * len(dropped) * (len(_FAMILIES) - 1), cases
+    # One rotated family per (call, position), offset per wrap.
+    assert cases >= 5 * len(dropped), cases
+    assert ran == eligible, (ran, eligible)
 
 
 # ---------------------------------------------------------------------------
