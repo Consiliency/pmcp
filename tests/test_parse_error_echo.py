@@ -36,7 +36,7 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -646,13 +646,27 @@ def test_a_failing_log_handler_prints_no_input(
 def _helper_yaml_inputs(s: str) -> list[str]:
     return [
         *(bad for bad in _yaml_bads(s) if _rejects("yaml", bad)),
-        # Twice the depth any supported interpreter needs (500 already raises
-        # on 3.10-3.12), not 3000: each extra level costs parse time (CI
-        # time, Consiliency/pmcp#388 round 1).
+        # Under the interpreter's default limit (pinned by the test: another
+        # test may raise it), 500 levels already raise; 1000, not 3000, keeps
+        # the parse short (CI time, Consiliency/pmcp#388 round 1).
         "[" * 1000 + s + "]" * 1000,  # RecursionError
     ]
 
 
+@pytest.fixture
+def _default_recursion_limit() -> Iterator[None]:
+    """The interpreter's default limit for one test, whatever an earlier test
+    raised it to: the deep input must raise RecursionError
+    (`_helper_yaml_inputs`)."""
+    previous = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(previous)
+
+
+@pytest.mark.usefixtures("_default_recursion_limit")
 @pytest.mark.parametrize("family", sorted(_FAMILIES))
 def test_load_yaml_classifies_every_failure_by_origin(family: str) -> None:
     import yaml
