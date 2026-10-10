@@ -1434,6 +1434,20 @@ def normalize_auth_metadata(
     )
 
 
+def _embedded_object_text(text: str) -> str | None:
+    """What ``re.search(r"(\{.*\})", text)`` finds -- on the first line
+    holding a ``{`` with a ``}`` after it, from that ``{`` to the line's last
+    ``}`` -- in linear time. The regex is quadratic on a peer's text of many
+    ``{`` and no ``}`` (round 1 codex F001's audit: 368 s at 1 MiB)."""
+    for line in text.split("\n"):
+        start = line.find("{")
+        if start >= 0:
+            end = line.rfind("}")
+            if end > start:
+                return line[start : end + 1]
+    return None
+
+
 def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
     """Parse JSON-RPC URLElicitationRequiredError payloads.
 
@@ -1451,11 +1465,11 @@ def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
         try:
             payload = load_json(payload_text, source="URL elicitation payload")
         except json.JSONDecodeError:
-            match = re.search(r"(\{.*\})", payload_text)
-            if not match:
+            embedded = _embedded_object_text(payload_text)
+            if embedded is None:
                 return []
             try:
-                payload = load_json(match.group(1), source="URL elicitation payload")
+                payload = load_json(embedded, source="URL elicitation payload")
             except json.JSONDecodeError:
                 return []
     if not isinstance(payload, Mapping):
