@@ -646,7 +646,10 @@ def test_a_failing_log_handler_prints_no_input(
 def _helper_yaml_inputs(s: str) -> list[str]:
     return [
         *(bad for bad in _yaml_bads(s) if _rejects("yaml", bad)),
-        "[" * 3000 + s + "]" * 3000,  # RecursionError
+        # Twice the depth any supported interpreter needs (500 already raises
+        # on 3.10-3.12), not 3000: each extra level costs parse time (CI
+        # time, Consiliency/pmcp#388 round 1).
+        "[" * 1000 + s + "]" * 1000,  # RecursionError
     ]
 
 
