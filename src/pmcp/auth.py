@@ -20,7 +20,9 @@ import aiohttp
 import jwt
 from jwt import PyJWKSet
 
+from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
+from pmcp.parsing import load_json
 from pmcp.redaction_additive import redact_additive
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
@@ -302,6 +304,12 @@ def pyjwt_text(exc: BaseException) -> PyJwtText:
     if not isinstance(exc, _FIXED_TEXT_CLAIM_ERRORS):
         raise TypeError(
             f"pyjwt_text() takes a fixed-text pyjwt error, not {type(exc).__name__}"
+        )
+    if safe_exc_info(exc) is None:
+        # Its chain holds a registered value-bearing error: never read
+        # (Consiliency/pmcp#297 rev 20).
+        raise TypeError(
+            "pyjwt_text() takes a pyjwt error that chains no rejected value"
         )
     return PyJwtText(str(exc), _mint=_PYJWT_MINT)
 
@@ -773,8 +781,10 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> 
         parsed = urlparse(url)
         hostname = parsed.hostname
         _ = parsed.port
-    except ValueError as exc:
-        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_INVALID)) from exc
+    except ValueError:
+        # `from None`: urllib's text quotes the rejected port, and a chained
+        # cause reaches any traceback (Consiliency/pmcp#297).
+        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_INVALID)) from None
 
     if not _is_absolute_http(parsed) or not hostname:
         raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_NOT_ABSOLUTE))
@@ -988,10 +998,13 @@ class AsyncJWKS:
                 AuthMessage.JWKS_TOO_LARGE, url=self.url
             )
         try:
-            jwks = json.loads(content.decode("utf-8"))
+            jwks = load_json(content, source="JWKS response", encoding="utf-8")
         except (ValueError, RecursionError) as exc:
             # ValueError covers JSONDecodeError and UnicodeDecodeError; a
             # deeply nested body under the size cap raises RecursionError.
+            # (`load_json` already classifies all of them as a value-free
+            # `JSONParseError`, a ValueError; RecursionError stays listed for
+            # the reader.)
             raise ResourceServerJWKSUnavailable(
                 AuthMessage.JWKS_INVALID_JSON, url=self.url
             ) from exc
@@ -1140,7 +1153,11 @@ def validate_resource_server_token(
         ) from exc
 
     scopes = _claim_scopes(claims)
-    missing_scopes = sorted(set(required_scopes or []) - set(scopes))
+    # The operator's required scopes the token lacks: names from pmcp's
+    # configuration, never the token's (Consiliency/pmcp#297).
+    missing_scopes = sorted(
+        {scope for scope in required_scopes or [] if scope not in scopes}
+    )
     if missing_scopes:
         scope_names = " ".join(missing_scopes)
         raise ResourceServerAuthError(
@@ -1202,7 +1219,10 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> 
     can only replace more of it with the marker (Consiliency/pmcp#234). The
     cut is taken last, as before.
     """
-    text = redact_additive(_sanitize_base(str(value)))
+    # An exception goes through `exception_text`: a validation error's own
+    # text carries the rejected value (Consiliency/pmcp#297).
+    raw = exception_text(value) if isinstance(value, BaseException) else str(value)
+    text = redact_additive(_sanitize_base(raw))
     return text if max_length is None else text[:max_length]
 
 
@@ -1415,19 +1435,27 @@ def normalize_auth_metadata(
 
 
 def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
-    """Parse JSON-RPC URLElicitationRequiredError payloads."""
+    """Parse JSON-RPC URLElicitationRequiredError payloads.
+
+    An exception whose chain holds a registered value-bearing error yields
+    nothing: an elicitation comes from the SDK or a downstream, never from
+    validation, and the rejected value must not be read back as an
+    elicitation id or URL (Consiliency/pmcp#297 rev 20, round-18 codex F001).
+    """
     if isinstance(payload, BaseException):
+        if safe_exc_info(payload) is None:
+            return []
         payload = payload.args[0] if payload.args else str(payload)
     if isinstance(payload, str):
         payload_text = payload
         try:
-            payload = json.loads(payload_text)
+            payload = load_json(payload_text, source="URL elicitation payload")
         except json.JSONDecodeError:
             match = re.search(r"(\{.*\})", payload_text)
             if not match:
                 return []
             try:
-                payload = json.loads(match.group(1))
+                payload = load_json(match.group(1), source="URL elicitation payload")
             except json.JSONDecodeError:
                 return []
     if not isinstance(payload, Mapping):
@@ -1515,7 +1543,7 @@ def fetch_json_metadata(
             body = response.read(1024 * 256)
         if "json" not in content_type.lower():
             return None, f"{safe_url} returned non-JSON content"
-        data = json.loads(body.decode("utf-8"))
+        data = load_json(body, source="auth metadata response", encoding="utf-8")
         if not isinstance(data, dict):
             return None, f"{safe_url} returned JSON that was not an object"
         return data, None

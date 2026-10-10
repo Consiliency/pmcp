@@ -32,7 +32,9 @@ ENV_VAR_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def validate_env_var_name(name: str) -> str:
     """Validate and return a shell-compatible env var name."""
     if not ENV_VAR_NAME_PATTERN.fullmatch(name):
-        raise ValueError(f"Env var name must match ^[A-Za-z_][A-Za-z0-9_]*$: {name!r}")
+        # The rejected name is not quoted: through `gateway.auth_connect` it is
+        # a caller's value (Consiliency/pmcp#297, rev 12).
+        raise ValueError("Env var name must match ^[A-Za-z_][A-Za-z0-9_]*$")
     return name
 
 
@@ -1408,12 +1410,16 @@ def store_refusal(
     """
     from pmcp.atomic_write import ConfinedWriteError, refusing
 
+    from pmcp.argument_errors import exception_text
+
     if isinstance(exc, ConfinedWriteError):
-        return str(exc)
+        return exception_text(exc)
     if isinstance(exc, UnicodeDecodeError):
         return f"{refusing(verb)} {store_path.name}: it is not valid UTF-8"
     if isinstance(exc, ValueError):
-        return f"{refusing(verb)} {store_path.name}: {exc}"
+        # Through the registry (Consiliency/pmcp#297): a validation or parse
+        # error chained here is described, never quoted.
+        return f"{refusing(verb)} {store_path.name}: {exception_text(exc)}"
     reason = os.strerror(exc.errno) if exc.errno else "the write failed"
     return f"{refusing(verb)} {store_path.name}: {reason}"
 

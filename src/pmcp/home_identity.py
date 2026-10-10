@@ -494,7 +494,17 @@ _WARNED_HOME = False
 
 class HomeInsideCheckoutError(PermissionError):
     """HOME is not the operator's: a checkout controls it, or it is not plain.
-    ``strerror`` says which."""
+    ``strerror`` says which, and so does ``reason``, the same pmcp-written
+    text as a field of this class (Consiliency/pmcp#297: a reader decides on
+    pmcp's own field, never on a library exception's text)."""
+
+    def __init__(self, *args: object) -> None:
+        # OSError's own signature: copies, pickles and subclass reductions
+        # rebuild it from `args`.
+        super().__init__(*args)
+        self.reason: str | None = (
+            args[1] if len(args) > 1 and isinstance(args[1], str) else None
+        )
 
 
 def _refusal(spelled: str | None = None) -> str | None:

@@ -270,7 +270,9 @@ async def test_registration_refuses_the_panel_reproduction(
 
     assert registered.ok is False
     assert registered.registered is False
-    assert "npm_config_registry" in registered.message
+    # rev 12 (Consiliency/pmcp#297): the rule is named, never the name.
+    assert "NPM_CONFIG_* family" in registered.message
+    assert "npm_config_registry" not in registered.message
     assert "Nothing was registered" in registered.message
     assert "legit2" not in gateway._discovered_server_configs
     assert "legit2" not in gateway._discovered_server_identities
@@ -326,7 +328,10 @@ async def test_a_hostile_declared_name_is_rendered_inert_in_the_refusal(
 
     assert registered.registered is False
     assert registered.message.isprintable()
-    assert "'X$(touch CANARY)\\x1b[2J_TOKEN'" in registered.message
+    # rev 12 (Consiliency/pmcp#297): the refused name is not echoed at all,
+    # only the rule it broke.
+    assert "CANARY" not in registered.message
+    assert "1 not credential-shaped" in registered.message
 
 
 @pytest.mark.asyncio

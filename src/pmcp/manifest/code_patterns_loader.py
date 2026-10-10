@@ -9,7 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import yaml
+from pmcp.argument_errors import exception_text
+from pmcp.parsing import load_yaml
 
 
 class CodePatternsLoader:
@@ -40,7 +41,7 @@ class CodePatternsLoader:
 
         try:
             with open(self._patterns_path) as f:
-                data = yaml.safe_load(f)
+                data = load_yaml(f, source="code patterns file")
 
             if not data:
                 return
@@ -64,7 +65,7 @@ class CodePatternsLoader:
         except Exception as e:
             # If loading fails, log warning but continue with empty patterns
             print(
-                f"Warning: Failed to load code patterns from {self._patterns_path}: {e}"
+                f"Warning: Failed to load code patterns from {self._patterns_path}: {exception_text(e)}"
             )
 
     def get_hint_for_tool(

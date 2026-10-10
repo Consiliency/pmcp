@@ -42,6 +42,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from pmcp.argument_errors import exception_text
+from pmcp.parsing import load_json, parse_timestamp
 
 from pmcp.home_identity import (
     HOME_NOT_PLAIN,
@@ -353,7 +355,7 @@ def home_scoped_location(
     try:
         spelled = home_path(*parts)
     except HomeInsideCheckoutError as exc:
-        if exc.strerror == HOME_NOT_PLAIN:
+        if exc.reason == HOME_NOT_PLAIN:
             raise TrustStoreError(
                 f"{label} {name}: {HOME_NOT_PLAIN}; refusing it."
             ) from exc
@@ -409,7 +411,7 @@ def home_scoped_location(
                 os.close(fd)
             raise TrustStoreError(
                 f"Cannot resolve the folder of {name}: "
-                f"{os.strerror(exc.errno) if exc.errno else exc}"
+                f"{os.strerror(exc.errno) if exc.errno else type(exc).__name__}"
             ) from exc
         target = os.path.join(folder, spelled.name)
         try:
@@ -440,7 +442,8 @@ def home_scoped_location(
         if fd is not None:
             os.close(fd)
         raise TrustStoreError(
-            f"Cannot resolve {name}: {os.strerror(exc.errno) if exc.errno else exc}"
+            f"Cannot resolve {name}: "
+            f"{os.strerror(exc.errno) if exc.errno else type(exc).__name__}"
         ) from exc
     try:
         # The chain's own pathname, also where a descriptor is judged: a
@@ -473,7 +476,8 @@ def refuse_checkout_resident(
     except OSError as exc:
         raise TrustStoreError(
             f"{label} {name}: cannot establish that it lies outside every "
-            f"checkout being judged ({os.strerror(exc.errno) if exc.errno else exc}); "
+            "checkout being judged "
+            f"({os.strerror(exc.errno) if exc.errno else type(exc).__name__}); "
             "refusing it."
         ) from exc
     if checkout is not None:
@@ -612,15 +616,25 @@ def _decode(entry: Any) -> TrustRecord:
         decision = entry["decision"]
         recorded_at = entry["recorded_at"]
     except KeyError as exc:
-        raise TrustStoreError(f"Trust store entry is missing {exc}") from exc
+        missing: str | None = exception_text(exc)
+    else:
+        missing = None
+    if missing is not None:
+        # Raised after the handler, chaining nothing (rev 19/21).
+        raise TrustStoreError(f"Trust store entry is missing {missing}")
 
     if decision not in DECISIONS:
         raise TrustStoreError(f"Unknown trust decision: {decision!r}")
 
+    # Raised outside the handler, chaining nothing, so the description shows
+    # (Consiliency/pmcp#297 rev 19).
+    failure: str | None = None
     try:
-        parsed_at = datetime.fromisoformat(str(recorded_at))
+        parsed_at = parse_timestamp(str(recorded_at), source="trust store record")
     except ValueError as exc:
-        raise TrustStoreError(f"Unparseable trust timestamp: {exc}") from exc
+        failure = exception_text(exc)
+    if failure is not None:
+        raise TrustStoreError(f"Unparseable trust timestamp: {failure}")
 
     return TrustRecord(
         absolute_path=Path(str(absolute_path)),
@@ -643,12 +657,20 @@ def _read_store(path: Path) -> list[TrustRecord]:
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise TrustStoreError(f"Cannot read trust store {path}: {exc}") from exc
+        unreadable: str | None = exception_text(exc)
+    else:
+        unreadable = None
+    if unreadable is not None:
+        raise TrustStoreError(f"Cannot read trust store {path}: {unreadable}")
 
+    failure: str | None = None
     try:
-        data = json.loads(raw)
+        data = load_json(raw, source="trust store")
     except ValueError as exc:
-        raise TrustStoreError(f"Cannot parse trust store {path}: {exc}") from exc
+        failure = exception_text(exc)
+    if failure is not None:
+        # Outside the handler: chains nothing (Consiliency/pmcp#297 rev 19).
+        raise TrustStoreError(f"Cannot parse trust store {path}: {failure}")
 
     if not isinstance(data, dict):
         raise TrustStoreError(f"Trust store {path} is not a JSON object")

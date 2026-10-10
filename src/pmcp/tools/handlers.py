@@ -20,6 +20,7 @@ from typing import Any, Literal, cast, NamedTuple
 import anyio
 from mcp.types import Tool
 from pydantic import BaseModel
+from pmcp.argument_errors import describe_value, exception_text, safe_exc_info
 from pmcp import __version__ as PMCP_VERSION
 from pmcp.auth import (
     UNVERIFIED_URL_CAVEAT,
@@ -36,6 +37,7 @@ from pmcp.client.manager import (
     _kill_process_tree_now,
     _spawned_group_pgid,
     _terminate_process_tree,
+    parse_request_id,
 )
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import (
@@ -79,6 +81,7 @@ from pmcp.feedback_egress import (
 )
 from pmcp.validation import (
     discovered_env_var_allowed,
+    discovered_env_var_refusal_reason,
     env_var_allowed,
     is_valid_package_name,
     is_valid_package_version,
@@ -222,6 +225,7 @@ from pmcp.manifest.loader import (
     is_usable_credential_value,
     requires_credential,
 )
+from pmcp.parsing import load_json, load_json_file
 from pmcp.waits import bounded_wait
 
 logger = logging.getLogger(__name__)
@@ -1129,10 +1133,10 @@ class GatewayTools:
             return {}
         try:
             with open(path) as f:
-                data = json.load(f)
+                data = load_json_file(f, source="provisioned registry")
             return {k: v for k, v in data.items() if isinstance(k, str)}
         except Exception as e:
-            logger.warning(f"Could not load provisioned registry: {e}")
+            logger.warning(f"Could not load provisioned registry: {exception_text(e)}")
             return {}
 
     def _save_provisioned_registry(self) -> None:
@@ -1143,7 +1147,7 @@ class GatewayTools:
             with open(path, "w") as f:
                 json.dump(self._provisioned_registry, f)
         except Exception as e:
-            logger.warning(f"Could not save provisioned registry: {e}")
+            logger.warning(f"Could not save provisioned registry: {exception_text(e)}")
 
     def _register_provisioned_server(
         self, server_name: str, env_var: str | None
@@ -1782,11 +1786,13 @@ class GatewayTools:
 
             # The task this reply carries: the record the manager built from
             # this reply, on this connection, and only when this call ran as a
-            # task (Consiliency/pmcp#338, rev 6) -- the manager applies
-            # Consiliency/pmcp#330's rule (wrapped `{task}` or top level; a
-            # task was requested) and records it in seconds. Never a lookup
-            # by key after the await: a reconnect may have put another
-            # connection's same-id task there.
+            # task (Consiliency/pmcp#338, rev 6). Never a lookup by key after
+            # the await: a reconnect may have put another connection's same-id
+            # task there. The manager decides the call's effective task mode
+            # (`effective_task_mode`, Consiliency/pmcp#297 rev 17): a call
+            # that is not a task gets its answer back as opaque data; a task
+            # call gets it reduced to what pmcp could use
+            # (`usable_task_response`), and it is sized in that form.
             result = reply.result
             task_info = reply.task
 
@@ -1874,7 +1880,10 @@ class GatewayTools:
             )
 
         except ConnectionError as e:
-            auth_challenge = self._auth_challenge_from_message(str(e))
+            # `exception_text`: a ConnectionError built from a rejected value
+            # is read as its description, never parsed for a challenge
+            # (rev 21, round-19 codex F001).
+            auth_challenge = self._auth_challenge_from_message(exception_text(e))
             auth_state = "none"
             if auth_challenge:
                 auth_state = (
@@ -1957,7 +1966,7 @@ class GatewayTools:
                     next_step=url_elicitations[0].next_step,
                     feedback_hint=self._feedback_hint(),
                 )
-            auth_challenge = self._auth_challenge_from_message(str(e))
+            auth_challenge = self._auth_challenge_from_message(exception_text(e))
             auth_state = "none"
             if auth_challenge:
                 auth_state = (
@@ -2045,7 +2054,9 @@ class GatewayTools:
             try:
                 provisioned = self._load_provisioned_registry()
             except Exception as e:
-                logger.warning(f"Failed to restore provisioned servers: {e}")
+                logger.warning(
+                    f"Failed to restore provisioned servers: {exception_text(e)}"
+                )
 
             enabled_auto_start = load_enabled_auto_start(
                 project_root=self._project_root,
@@ -2290,7 +2301,7 @@ class GatewayTools:
                 action="refresh",
                 outcome="failure",
                 started_at=audit_started_at,
-                error=str(e),
+                error=exception_text(e),
             )
             return RefreshOutput(
                 ok=False,
@@ -2298,7 +2309,7 @@ class GatewayTools:
                 servers_online=0,
                 tools_indexed=0,
                 revision_id="error",
-                errors=[str(e)],
+                errors=[exception_text(e)],
                 pending_requests_seen=pending_seen,
                 pending_requests_cancelled=pending_cancelled,
                 mcp_tasks_seen=active_tasks_seen,
@@ -4489,7 +4500,9 @@ class GatewayTools:
                         url_elicitations=url_elicitations,
                         feedback_hint=self._feedback_hint(),
                     )
-                logger.error(f"Failed to connect remote server {server_name}: {e}")
+                logger.error(
+                    f"Failed to connect remote server {server_name}: {exception_text(e)}"
+                )
                 self._record_feedback_event(
                     "provision_failure",
                     {
@@ -4571,7 +4584,9 @@ class GatewayTools:
             )
 
         except Exception as e:
-            logger.error(f"Failed to start provisioning {server_name}: {e}")
+            logger.error(
+                f"Failed to start provisioning {server_name}: {exception_text(e)}"
+            )
             self._record_feedback_event(
                 "provision_failure",
                 {
@@ -4659,12 +4674,12 @@ class GatewayTools:
                         server_name=server_name,
                         auth_state="elicitation_required",
                         auth_event="url_elicitation_required",
-                        error=str(e),
+                        error=exception_text(e),
                     )
                     return AuthConnectOutput(
                         ok=False,
                         server=server_name,
-                        message=str(e),
+                        message=exception_text(e),
                         auth_state="elicitation_required",
                     )
                 retry_step = f"Retry gateway.provision(server_name='{server_name}') or gateway.invoke."
@@ -4808,7 +4823,10 @@ class GatewayTools:
                 server_name=server_name,
                 auth_state="missing_auth",
                 auth_event="policy_denied",
-                error=f"Env var '{env_var}' is not permitted for this server.",
+                error=(
+                    f"Env var ({describe_value(env_var)}) is not permitted for "
+                    "this server."
+                ),
             )
             expected = (
                 f" Expected '{declared_storage_key}'." if declared_storage_key else ""
@@ -4817,11 +4835,12 @@ class GatewayTools:
                 ok=False,
                 server=server_name,
                 message=(
-                    f"Env var '{env_var}' is not permitted for server "
-                    f"'{server_name}'.{expected} Refusing to store it."
+                    f"Env var ({describe_value(env_var)}) is not permitted for "
+                    f"server '{server_name}'.{expected} Refusing to store it."
                 ),
                 auth_state="missing_auth",
-                env_var=env_var,
+                # Not echoed: the caller's rejected value (rev 12).
+                env_var=None,
             )
 
         if "${" in parsed.credential:
@@ -4865,7 +4884,7 @@ class GatewayTools:
                 # raise the very error being reported.
                 store_refusal(Path(scope_store_name(parsed.scope)), exc)
                 if isinstance(exc, (OSError, UnicodeDecodeError))
-                else str(exc)
+                else exception_text(exc)
             )
             self._audit(
                 method="gateway.auth_connect",
@@ -4882,7 +4901,8 @@ class GatewayTools:
                 server=server_name,
                 message=message,
                 auth_state="missing_auth",
-                env_var=env_var,
+                # Not echoed: the caller's rejected value (rev 12).
+                env_var=None,
             )
         os.environ[env_var] = parsed.credential
         # Recorded in the SAME statement group as the write, with no await between:
@@ -5084,7 +5104,7 @@ class GatewayTools:
             # A transport that raises instead of returning an outcome is a bug, not a
             # second door. Give up the same way, so the worker can never afterwards be
             # granted permission to send.
-            logger.warning("Feedback submission raised: %s", exc)
+            logger.warning("Feedback submission raised: %s", exception_text(exc))
             result = progress.abandon()
 
         # FeedbackProgress is constructed with no destination, so the snapshots IT
@@ -5358,7 +5378,7 @@ class GatewayTools:
                 server=server_name,
                 package_type=package_type,
                 package_name=package_name,
-                message=f"Failed to run update probe: {e}",
+                message=f"Failed to run update probe: {exception_text(e)}",
             )
 
         if not ok:
@@ -5588,7 +5608,7 @@ class GatewayTools:
                             # reported result to failed.
                             logger.warning(
                                 f"Failed to persist descriptions cache after updating "
-                                f"'{server_name}': {e}"
+                                f"'{server_name}': {exception_text(e)}"
                             )
 
             message = (
@@ -5712,7 +5732,7 @@ class GatewayTools:
                 registered=False,
                 message=(
                     f"Refused to register '{server_name}': "
-                    f"unsafe package identifier {package!r}."
+                    f"unsafe package identifier ({describe_value(package)})."
                 ),
             )
 
@@ -5727,7 +5747,14 @@ class GatewayTools:
             name for name in parsed.env_vars if not discovered_env_var_allowed(name)
         ]
         if disallowed:
-            names = ", ".join(operator_safe(name) for name in disallowed)
+            reasons: dict[str, int] = {}
+            for name in disallowed:
+                reason = discovered_env_var_refusal_reason(name)
+                reasons[reason] = reasons.get(reason, 0) + 1
+            # The rule each name broke, never the name (rev 12, §14).
+            names = "; ".join(
+                f"{count} {reason}" for reason, count in sorted(reasons.items())
+            )
             return RegisterDiscoveredServerOutput(
                 ok=False,
                 server_name=server_name,
@@ -5757,7 +5784,11 @@ class GatewayTools:
         except TimeoutError:
             timed_out = True
         except Exception as exc:  # resolution fails closed; see package_identity
-            logger.warning("Package identity lookup raised for %r: %s", package, exc)
+            logger.warning(
+                "Package identity lookup raised for %r: %s",
+                package,
+                exception_text(exc),
+            )
 
         if resolved is None:
             reason = (
@@ -5874,10 +5905,12 @@ class GatewayTools:
         """gateway.provision_status - Check status of a running installation."""
         import time
 
+        # Outside the `try`: its arm logs a traceback and renders `str(e)`,
+        # and a `ValidationError`'s text carries the rejected value. Raised,
+        # it is described without it (Consiliency/pmcp#297).
+        parsed = ProvisionStatusInput.model_validate(input_data)
+        job_id = parsed.job_id
         try:
-            parsed = ProvisionStatusInput.model_validate(input_data)
-            job_id = parsed.job_id
-
             job_manager = get_job_manager()
             job = job_manager.get_job(job_id)
 
@@ -5945,10 +5978,13 @@ class GatewayTools:
             )
 
         except Exception as e:
-            logger.error(f"provision_status handler failed: {e}", exc_info=True)
+            logger.error(
+                f"provision_status handler failed: {exception_text(e)}",
+                exc_info=safe_exc_info(e),
+            )
             # Return a safe error response instead of crashing
             return ProvisionJobStatus(
-                job_id=input_data.get("job_id", "unknown"),
+                job_id=job_id,
                 server="unknown",
                 status="failed",
                 progress=0,
@@ -6041,9 +6077,12 @@ class GatewayTools:
             )
 
         except Exception as e:
-            logger.error(f"Handoff failed for {job_server_name}: {e}", exc_info=True)
+            logger.error(
+                f"Handoff failed for {job_server_name}: {exception_text(e)}",
+                exc_info=safe_exc_info(e),
+            )
             job.status = "failed"
-            job.error = f"Handoff failed: {e}"
+            job.error = f"Handoff failed: {exception_text(e)}"
             # Kill the orphaned process
             if process and process.returncode is None:
                 try:
@@ -6087,7 +6126,7 @@ class GatewayTools:
                 if t.server_name == job_server_name
             ]
         except Exception as e:
-            logger.error(f"Failed to refresh after install: {e}")
+            logger.error(f"Failed to refresh after install: {exception_text(e)}")
             refresh_error = self._sanitize_error(e)
 
         message = f"Server '{job_server_name}' installed"
@@ -6313,7 +6352,7 @@ class GatewayTools:
                 outcome="failure",
                 started_at=audit_started_at,
                 server_name=parsed.server_name,
-                error=str(e),
+                error=exception_text(e),
             )
             return TasksListOutput(ok=False, errors=[self._sanitize_error(e)])
 
@@ -6357,7 +6396,7 @@ class GatewayTools:
                 started_at=audit_started_at,
                 server_name=parsed.server_name,
                 task_id=parsed.task_id,
-                error=str(e),
+                error=exception_text(e),
             )
             return TasksGetOutput(ok=False, errors=[self._sanitize_error(e)])
 
@@ -6394,7 +6433,9 @@ class GatewayTools:
             if isinstance(result_payload, str):
                 for _ in range(2):
                     try:
-                        decoded = json.loads(result_payload)
+                        decoded = load_json(
+                            result_payload, source="tool result payload"
+                        )
                     except json.JSONDecodeError:
                         break
                     result_payload = decoded
@@ -6432,7 +6473,7 @@ class GatewayTools:
                 started_at=audit_started_at,
                 server_name=parsed.server_name,
                 task_id=parsed.task_id,
-                error=str(e),
+                error=exception_text(e),
             )
             return TasksResultOutput(ok=False, errors=[self._sanitize_error(e)])
 
@@ -6536,9 +6577,13 @@ class GatewayTools:
             outcome = "refused"
         else:
             outcome = "failure"
-        server_name = (
-            parsed.request_id.rsplit("::", 1)[0] if "::" in parsed.request_id else None
-        )
+        # A request id `cancel_request` rejected for its format is the
+        # caller's rejected value: neither the response nor the audit event
+        # copies it, or any part of it (rev 13, round-12 B1; the auth_connect
+        # rule of rev 12). A well-formed id is accepted; a lookup that then
+        # misses names it, as every lookup miss does (Consiliency/pmcp#315).
+        parsed_id = parse_request_id(parsed.request_id)
+        server_name = parsed_id[0] if parsed_id is not None else None
         self._audit(
             method="gateway.cancel",
             action="cancel",
@@ -6549,7 +6594,7 @@ class GatewayTools:
         )
 
         return CancelOutput(
-            request_id=parsed.request_id,
+            request_id=parsed.request_id if parsed_id is not None else None,
             status=status,
             message=message,
             was_stalled=was_stalled,

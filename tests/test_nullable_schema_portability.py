@@ -859,7 +859,9 @@ async def test_server_message_for_a_wrongly_typed_nullable_argument() -> None:
         ),
     )
     text = " ".join(getattr(c, "text", "") for c in result.content)
-    assert text == "Input validation error: '5' is not of type 'integer', 'null'"
+    # The structural description (Consiliency/pmcp#297): the path and X's own
+    # constraint, or null; never the rejected value.
+    assert text == "Input validation error: $.task.ttl: must be of type integer or null"
 
 
 @pytest.mark.asyncio

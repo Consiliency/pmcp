@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import jsonschema
+import pydantic
 from mcp.server import Server
 from mcp.server.context import ServerRequestContext
 from mcp.server.subscriptions import InMemorySubscriptionBus, ListenHandler
@@ -37,6 +38,13 @@ from mcp.types import (
     Tool,
 )
 
+from pmcp.argument_errors import (
+    describe_model_error,
+    describe_schema_error,
+    exception_text,
+    install_log_scrubber,
+    safe_exc_info,
+)
 from pmcp.env_store import bind_project_root, credential_value
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
@@ -70,7 +78,12 @@ from pmcp.scoped_advisor_audit import (
 )
 from pmcp.subscriptions import BusCatalogEventSink
 from pmcp.summary import generate_capability_summary
-from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
+from pmcp.sdk_rejections import PMCP_HANDLER_MARK
+from pmcp.tools.handlers import (
+    GATEWAY_TOOL_INPUT_MODELS,
+    GatewayTools,
+    get_gateway_tool_definitions,
+)
 from pmcp.tools.schema import validate_at_gate
 from pmcp.types import (
     DescriptionsCache,
@@ -113,6 +126,69 @@ def _manifest_for(project_root: Path | None) -> Any:
     return load_manifest(project_root=project_root)
 
 
+def _described_errors(handler: Any) -> Any:
+    """Wrap a request handler so an exception it lets escape never carries a
+    validation or parse error's text to the caller (Consiliency/pmcp#297,
+    rev 10; codes kept in rev 11).
+
+    The SDK maps an escaping exception to the wire
+    (`mcp/shared/jsonrpc_dispatcher.py` `handler_exception_to_error_data`):
+    an `MCPError` carries its own `ErrorData`; a bare pydantic
+    `ValidationError` becomes `-32602 "Invalid request parameters"` with no
+    text; anything else becomes `code=0, message=str(e)`, which is where a
+    wrapper such as `ValueError(f"... {e}") from e` sends the value. When
+    the chain holds a validation or parse error, the replacement keeps that
+    mapping's code and changes only the text:
+    - an `MCPError` keeps its code, with the structural description as its
+      message and no `data` (rev 23);
+    - a bare `ValidationError` keeps `-32602`, now with the structural
+      description;
+    - anything else is a `ValueError` of its description (the SDK's
+      `code=0`).
+
+    The replacement is raised outside the `except`, so it chains nothing.
+    Every other exception passes unchanged.
+    """
+    import functools
+    import inspect
+
+    from mcp.shared.exceptions import MCPError
+    from mcp.types import INVALID_PARAMS
+    from pydantic import ValidationError
+
+    if inspect.isasyncgenfunction(handler):
+        return handler
+
+    @functools.wraps(handler)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        replacement: Exception | None = None
+        try:
+            return await handler(*args, **kwargs)
+        except Exception as error:
+            # pmcp's handler's own error: the SDK-side rewrite
+            # (`pmcp.sdk_rejections`) passes it unchanged (rev 20).
+            setattr(error, PMCP_HANDLER_MARK, True)
+            if safe_exc_info(error) is not None:
+                raise
+            described = exception_text(error)
+            if isinstance(error, MCPError):
+                # Keep the code. The message and `data` are the wrapper's own,
+                # and an exception that chains a value-bearing error is never
+                # rendered from them (rev 18's rule, applied to `MCPError` in
+                # rev 23, round-21 claude N1): rev 12 kept them unless they
+                # matched what was rejected, which a short or reformatted copy
+                # passed.
+                replacement = MCPError(error.code, described)
+            elif isinstance(error, ValidationError):
+                replacement = MCPError(INVALID_PARAMS, described)
+            else:
+                replacement = ValueError(described)
+        setattr(replacement, PMCP_HANDLER_MARK, True)
+        raise replacement
+
+    return wrapper
+
+
 class GatewayServer:
     """MCP Gateway Server."""
 
@@ -138,6 +214,9 @@ class GatewayServer:
         required_scopes: list[str] | None = None,
         allowed_origins: list[str] | None = None,
     ) -> None:
+        # Idempotent; again here in case a record factory was replaced since
+        # import (Consiliency/pmcp#297).
+        install_log_scrubber()
         # The project this object serves, BOUND at construction: the explicit
         # root, else the served one, else the one discovered from the working
         # directory NOW. Everything it loads (configs, endpoints) and every
@@ -244,12 +323,14 @@ class GatewayServer:
         self._server = Server(
             "mcp-gateway",
             instructions=instructions,
-            on_list_tools=self._handle_list_tools,
-            on_call_tool=self._handle_call_tool,
-            on_list_resources=self._handle_list_resources,
-            on_read_resource=self._handle_read_resource,
-            on_list_prompts=self._handle_list_prompts,
-            on_get_prompt=self._handle_get_prompt,
+            on_list_tools=_described_errors(self._handle_list_tools),
+            on_call_tool=_described_errors(self._handle_call_tool),
+            on_list_resources=_described_errors(self._handle_list_resources),
+            on_read_resource=_described_errors(self._handle_read_resource),
+            on_list_prompts=_described_errors(self._handle_list_prompts),
+            on_get_prompt=_described_errors(self._handle_get_prompt),
+            # A `ListenHandler` object the SDK drives as a stream, not a
+            # coroutine; it renders its own failures (Consiliency/pmcp#287).
             on_subscriptions_listen=self._listen_handler,
         )
 
@@ -358,11 +439,15 @@ class GatewayServer:
                             )
                         ]
                     )
+                # Never `e.message`: for `type`, `pattern`, `enum` and length
+                # errors it quotes the rejected value (Consiliency/pmcp#297).
                 return CallToolResult(
                     is_error=True,
                     content=[
                         TextContent(
-                            type="text", text=f"Input validation error: {e.message}"
+                            type="text",
+                            text="Input validation error: "
+                            + describe_schema_error(e, tool.input_schema, arguments),
                         )
                     ],
                 )
@@ -500,7 +585,41 @@ class GatewayServer:
                     )
                 ]
             except Exception as e:
-                logger.error(f"Tool execution error: {e}")
+                # A `ValidationError`'s text renders the rejected value
+                # (pydantic's `input_value=...`, a validator's own message,
+                # jsonschema's `message`), so it is described from its
+                # structure instead, in the log, the response and the audit
+                # (Consiliency/pmcp#297). The tool's own argument model
+                # rejecting the call is described against the tool's schema;
+                # anything else goes through `exception_text`, which is
+                # `str(e)` for every exception that is not (and does not
+                # embed) a validation error.
+                input_model = GATEWAY_TOOL_INPUT_MODELS.get(audited_name or "")
+                rejected_by_model = (
+                    isinstance(e, pydantic.ValidationError)
+                    and input_model is not None
+                    and e.title == input_model.__name__
+                )
+                if (
+                    isinstance(e, pydantic.ValidationError)
+                    and rejected_by_model
+                    and tool is not None
+                ):
+                    reason = describe_model_error(e, tool.input_schema, arguments)
+                    described = f"Invalid arguments: {reason}"
+                    logger.error(
+                        "Tool execution error: invalid arguments for %s: %s",
+                        audited_name,
+                        reason,
+                    )
+                elif tool is None:
+                    # Only an unregistered name raises here; it is the
+                    # caller's string, so it is not logged (Consiliency/pmcp#297).
+                    described = exception_text(e)
+                    logger.error("Tool execution error: unknown gateway tool")
+                else:
+                    described = exception_text(e)
+                    logger.error(f"Tool execution error: {described}")
                 try:
                     failure_status = (
                         "denied"
@@ -508,12 +627,24 @@ class GatewayServer:
                         and e.code == ErrorCode.E402_TOOL_DENIED
                         else "failure"
                     )
-                    self._record_scoped_invocation(
-                        gateway_tool=audited_name,
-                        terminal_status=failure_status,
-                        arguments=audited_arguments,
-                        result={"error_type": type(e).__name__},
-                    )
+                    if rejected_by_model and tool is not None:
+                        # Like a gate rejection: an `audit.rejection` (tool,
+                        # path, nothing the caller sent), not an invocation
+                        # whose correlations nothing vouched for.
+                        if self._scoped_advisor_audit is not None:
+                            self._scoped_advisor_audit.record_rejected_arguments(
+                                gateway_tool=tool.name,
+                                error=e,
+                                schema=tool.input_schema,
+                                arguments=arguments,
+                            )
+                    else:
+                        self._record_scoped_invocation(
+                            gateway_tool=audited_name,
+                            terminal_status=failure_status,
+                            arguments=audited_arguments,
+                            result={"error_type": type(e).__name__},
+                        )
                 except ScopedAdvisorAuditError:
                     logger.error("Scoped advisor audit channel failed")
                     return [
@@ -530,7 +661,12 @@ class GatewayServer:
                 return [
                     TextContent(
                         type="text",
-                        text=json.dumps({"error": True, "message": str(e)[:400]}),
+                        text=json.dumps(
+                            {
+                                "error": True,
+                                "message": described[:400],
+                            }
+                        ),
                     )
                 ]
 
@@ -867,7 +1003,7 @@ class GatewayServer:
                     f"Cached descriptions for {len(self._descriptions_cache.servers)} servers"
                 )
             except Exception as e:
-                logger.warning(f"Failed to auto-generate cache: {e}")
+                logger.warning(f"Failed to auto-generate cache: {exception_text(e)}")
 
         logger.debug("Capability summary:\n%s", self._capability_summary)
 
@@ -1044,7 +1180,7 @@ class GatewayServer:
             logger.warning("Shutdown timed out, forcing disconnect")
             self._client_manager.abandon_all_now()
         except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
+            logger.error(f"Error during shutdown: {exception_text(e)}")
         finally:
             # Always release singleton lock
             release_singleton_lock()

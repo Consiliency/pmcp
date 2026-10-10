@@ -46,6 +46,8 @@ from pmcp.auth import (
     sanitize_public_auth_url,
     validate_resource_server_token,
 )
+from pmcp.argument_errors import exception_text
+from pmcp.parsing import load_json
 from pmcp.types import GatewayDiagnosticsInfo
 from pmcp.waits import bounded_wait
 
@@ -276,13 +278,163 @@ def _split_host_port(value: str, default_port: str) -> tuple[str, str]:
 
 
 def _origin_host_port(origin: str) -> tuple[str, str] | None:
-    """Return (hostname, port) for an Origin header value, or None if unparseable."""
-    parsed = urlparse(origin)
-    if not parsed.scheme or not parsed.hostname:
+    """Return (hostname, port) for an Origin header value, or None if unparseable.
+
+    ``urlparse`` and ``.port`` raise ``ValueError`` on a malformed authority
+    (``Port could not be cast to integer value as '<port>'``), quoting the
+    caller's header; an unparseable Origin is a rejected one, never a 500
+    (Consiliency/pmcp#297).
+    """
+    try:
+        parsed = urlparse(origin)
+        hostname = parsed.hostname
+        explicit_port = parsed.port
+    except ValueError:
+        return None
+    if not parsed.scheme or not hostname:
         return None
     default_port = "443" if parsed.scheme == "https" else "80"
-    port = str(parsed.port) if parsed.port is not None else default_port
-    return parsed.hostname, port
+    port = str(explicit_port) if explicit_port is not None else default_port
+    return hostname, port
+
+
+# --- the SDK's out-of-session rejections, value-free (Consiliency/pmcp#297) ----
+#
+# Every JSON-RPC error the SDK answers *inside* a session or exchange -- the
+# id-bearing ones, on every transport -- is rebuilt where it is made
+# (`pmcp.sdk_rejections`, rev 20). What reaches here is the rest: a body the
+# streamable-HTTP transport writes before any request is dispatched, with
+# `id: null`. Two of those are built from the request itself (round-17 grok
+# F001): `"Parse error: {str(e)}"`, the parser's text, and `"Validation error:
+# {str(e)}"`, pydantic's text with every `input_value`. They are rewritten
+# with pmcp's structural description of the body; every other out-of-session
+# body goes through the same reviewed-message rule as the write side.
+# `tests/test_http_transport.py` enumerates the SDK's out-of-session writers.
+
+
+def _envelope_problem(request_body: bytes) -> str:
+    """Why `request_body` is not a JSON-RPC message, from its structure: the
+    parse error's format, position and class, or the validation error's
+    paths and phrases -- never the body's text."""
+    from mcp_types import jsonrpc_message_adapter
+    from pydantic import ValidationError
+
+    try:
+        raw = load_json(request_body, source="request body")
+    except ValueError as error:
+        return exception_text(error)
+    try:
+        jsonrpc_message_adapter.validate_python(raw, by_name=False)
+    except ValidationError as error:
+        return exception_text(error)
+    return "the request is not a JSON-RPC message"
+
+
+def value_free_rejection(body: bytes, request_body: bytes | None) -> bytes:
+    """`body`, when it is a JSON-RPC error with `id: null` (one the SDK wrote
+    outside any exchange), rebuilt value-free: a parse or envelope rejection
+    reads its structural description; any other has the reviewed-message rule
+    of `pmcp.sdk_rejections`. Any other body is returned unchanged."""
+    from mcp_types import INVALID_PARAMS, PARSE_ERROR
+
+    from pmcp.sdk_rejections import value_free_error_data
+
+    try:
+        payload = load_json(body, source="transport rejection")
+    except ValueError:
+        return body
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict) or payload.get("id") is not None:
+        return body
+    code = error.get("code")
+    if code == PARSE_ERROR:
+        changed: dict[str, Any] = {
+            "code": code,
+            "message": "Parse error: "
+            + (
+                _envelope_problem(request_body)
+                if request_body is not None
+                else "the request body is not JSON"
+            ),
+        }
+    elif code == INVALID_PARAMS:
+        changed = {
+            "code": code,
+            "message": "Validation error: "
+            + (
+                _envelope_problem(request_body)
+                if request_body is not None
+                else "the request is not a JSON-RPC message"
+            ),
+        }
+    else:
+        from types import SimpleNamespace
+
+        raw = SimpleNamespace(
+            code=code, message=error.get("message"), data=error.get("data")
+        )
+        changed = value_free_error_data(raw).model_dump(
+            by_alias=True, exclude_none=True
+        )
+    if changed == error:
+        return body
+    payload = {**payload, "error": changed}
+    return json.dumps(payload, separators=(",", ":")).encode()
+
+
+#: The HTTP methods the entry log names; any other reads `other` (rev 29).
+_LOGGED_METHODS = frozenset({"GET", "POST", "DELETE", "HEAD", "OPTIONS"})
+#: Request header names the entry log names; any other reads `other`, since a
+#: header's name is the caller's choice too (rev 29).
+_KNOWN_HEADER_NAMES = frozenset(
+    {
+        "accept",
+        "accept-encoding",
+        "authorization",
+        "baggage",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "last-event-id",
+        "mcp-method",
+        "mcp-name",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "origin",
+        "traceparent",
+        "tracestate",
+        "transfer-encoding",
+        "user-agent",
+    }
+)
+
+
+def _method_class(method: str) -> str:
+    return method if method in _LOGGED_METHODS else "other"
+
+
+def _accept_class(accept: str) -> str:
+    """How an Accept header classifies, never its text: which of the two
+    media types the transport negotiates it offers."""
+    offered = {part.split(";", 1)[0].strip().lower() for part in accept.split(",")}
+    json_ok = bool(offered & {"application/json", "application/*", "*/*"})
+    sse_ok = bool(offered & {"text/event-stream", "text/*", "*/*"})
+    if json_ok and sse_ok:
+        return "json+sse"
+    if json_ok:
+        return "json"
+    if sse_ok:
+        return "sse"
+    return "absent" if not accept.strip() else "other"
+
+
+def _header_names(request: Any) -> set[str]:
+    """The request's header names, each a known name or ``other``."""
+    return {
+        name if name in _KNOWN_HEADER_NAMES else "other"
+        for name in (key.lower() for key in request.headers.keys())
+    }
 
 
 def create_http_app(
@@ -467,14 +619,16 @@ def create_http_app(
         return ""
 
     def _auth_headers(
-        request: Request | None = None,
         *,
+        for_request: bool = False,
         error: str | None = None,
         scope: str | None = None,
     ) -> dict[str, str]:
+        # Whether this answers a request, not the request itself: nothing of
+        # the request reaches the challenge (rev 30).
         parts: list[str] = []
         if not auth_metadata.protected_resource_metadata_url:
-            if request is not None and effective_auth_mode == "resource-server":
+            if for_request and effective_auth_mode == "resource-server":
                 parts.append(f'resource="{_resource_audience()}"')
         else:
             parts.append(
@@ -552,14 +706,17 @@ def create_http_app(
         request_id = uuid.uuid4().hex[:8]
         _inc("requests_total")
 
-        session_id_short = (request.headers.get("mcp-session-id") or "")[:8] or "<none>"
+        # Request metadata is caller content, like the body (rev 29,
+        # round-27 codex F001): the entry log carries its structure only --
+        # the HTTP method from a fixed set, whether a session header came,
+        # how the Accept header classifies, and the header names.
         logger.debug(
-            "handle_mcp [%s]: %s method=%s session=%s accept=%r",
+            "handle_mcp [%s]: method=%s session=%s accept=%s headers=%s",
             request_id,
-            request.url.path,
-            request.method,
-            session_id_short,
-            request.headers.get("accept", ""),
+            _method_class(request.method),
+            "present" if request.headers.get("mcp-session-id") else "absent",
+            _accept_class(request.headers.get("accept", "")),
+            ",".join(sorted(_header_names(request))),
         )
         request.scope["pmcp.trace_context"] = {
             key: value
@@ -593,14 +750,18 @@ def create_http_app(
             ):
                 logger.debug("handle_mcp [%s]: 401 unauthorized", request_id)
                 return _reject(
-                    401, AuthMessage.UNAUTHORIZED, headers=_auth_headers(request)
+                    401,
+                    AuthMessage.UNAUTHORIZED,
+                    headers=_auth_headers(for_request=True),
                 )
         elif effective_auth_mode == "resource-server":
             token = _bearer_token(request)
             if token is None:
                 logger.debug("handle_mcp [%s]: 401 missing bearer", request_id)
                 return _reject(
-                    401, AuthMessage.UNAUTHORIZED, headers=_auth_headers(request)
+                    401,
+                    AuthMessage.UNAUTHORIZED,
+                    headers=_auth_headers(for_request=True),
                 )
             try:
                 if resource_jwks is None:
@@ -627,7 +788,7 @@ def create_http_app(
                 return _reject(
                     503,
                     AuthMessage.SERVICE_UNAVAILABLE,
-                    headers=_auth_headers(request, error=exc.error),
+                    headers=_auth_headers(for_request=True, error=exc.error),
                 )
             except ResourceServerAuthError as exc:
                 if exc.error == "insufficient_scope":
@@ -636,13 +797,15 @@ def create_http_app(
                     return _reject(
                         403,
                         AuthMessage.FORBIDDEN,
-                        headers=_auth_headers(request, error=exc.error, scope=scope),
+                        headers=_auth_headers(
+                            for_request=True, error=exc.error, scope=scope
+                        ),
                     )
                 logger.debug("handle_mcp [%s]: 401 invalid token", request_id)
                 return _reject(
                     401,
                     AuthMessage.UNAUTHORIZED,
-                    headers=_auth_headers(request, error=exc.error),
+                    headers=_auth_headers(for_request=True, error=exc.error),
                 )
 
         # Per-IP rate limiting (optional — only when rate_limit_rpm > 0)
@@ -650,9 +813,9 @@ def create_http_app(
             client_ip = request.client.host if request.client else "unknown"
             if not await _check_rate_limit(client_ip, rate_limit_rpm):
                 _inc("requests_429")
-                logger.debug(
-                    "handle_mcp [%s]: 429 rate limited ip=%s", request_id, client_ip
-                )
+                # Not the address: behind a trusting proxy it is the caller's
+                # `X-Forwarded-For` (rev 29).
+                logger.debug("handle_mcp [%s]: 429 rate limited", request_id)
                 return Response("Too Many Requests", status_code=429)
 
         # Input size guard — fast-path reject when the advertised Content-Length
@@ -707,7 +870,7 @@ def create_http_app(
                 return Response("Payload Too Large", status_code=413)
 
             try:
-                body_method = json.loads(body_bytes).get("method")
+                body_method = load_json(body_bytes, source="request body").get("method")
             except Exception:
                 pass
 
@@ -749,11 +912,41 @@ def create_http_app(
 
         response_started = False
         original_send = request._send
+        request_body = body_bytes if request.method == "POST" else None
+        held_start: MutableMapping[str, Any] | None = None
+        held_body: list[bytes] = []
 
         async def tracking_send(message: MutableMapping[str, Any]) -> None:
-            nonlocal response_started
-            if message.get("type") == "http.response.start":
+            # A JSON response the SDK sends with an error status is held until
+            # complete and passed through `value_free_rejection` (rev 19).
+            nonlocal response_started, held_start
+            kind = message.get("type")
+            if kind == "http.response.start":
+                headers = dict(message.get("headers") or [])
+                if int(message.get("status", 200)) >= 400 and headers.get(
+                    b"content-type", b""
+                ).startswith(b"application/json"):
+                    held_start = message
+                    return
                 response_started = True
+            elif kind == "http.response.body" and held_start is not None:
+                held_body.append(message.get("body", b""))
+                if message.get("more_body", False):
+                    return
+                body = value_free_rejection(b"".join(held_body), request_body)
+                start = dict(held_start)
+                start["headers"] = [
+                    (key, value)
+                    for key, value in held_start.get("headers") or []
+                    if key.lower() != b"content-length"
+                ] + [(b"content-length", str(len(body)).encode())]
+                held_start = None
+                response_started = True
+                await original_send(start)
+                await original_send(
+                    {"type": "http.response.body", "body": body, "more_body": False}
+                )
+                return
             await original_send(message)
 
         # subscriptions/listen opens a long-lived stream by design (a

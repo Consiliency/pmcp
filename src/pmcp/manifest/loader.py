@@ -17,9 +17,11 @@ from typing import Any, Literal, cast
 
 import yaml
 
+from pmcp.argument_errors import exception_text
 from pmcp.home_identity import optional_home_path, spelled_home
 
 from pmcp.manifest.attribution import attribution_pass, quiet_during_attribution
+from pmcp.parsing import load_yaml, safe_yaml_loader
 from pmcp.project_consent import log_refusal, read_and_gate
 from pmcp.validation import (
     NPM_FILE_TYPE_RE,
@@ -43,12 +45,13 @@ def _trusted_yaml_loader() -> Any:
     tab after ``key:``, deep nesting), and a performance change must not change
     which overlays are accepted (Consiliency/pmcp#233).
     """
-    return getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
+    return safe_yaml_loader(fast=True)
 
 
 def _parse_trusted_yaml(content: bytes) -> Any:
     """Parse pmcp's OWN shipped manifest bytes, with libyaml when available."""
-    return yaml.load(content, Loader=_trusted_yaml_loader())  # noqa: S506 - safe loaders only
+    # Through the parse helper (Consiliency/pmcp#297): a failure is value-free.
+    return load_yaml(content, source="shipped manifest", loader=_trusted_yaml_loader())
 
 
 # The parsed shipped document, by sha256 of its bytes: a pure function of the
@@ -116,23 +119,6 @@ def shipped_env_var(name: object, env_var: object) -> str | None:
         return None
     entry = _shipped_manifest_entries().get(name) or {}
     return env_var if entry.get("env_var") == env_var else None
-
-
-def yaml_error_text(exc: BaseException) -> str:
-    """A YAML error as text with no value from the document in it.
-
-    PyYAML's message quotes the offending source line and token (a value an
-    operator may have pasted, a tag, an escape), so only the error class and
-    the 1-based line and column of its mark are kept (Consiliency/pmcp#342
-    rev 5). Used for every YAML error from overlay or manifest input.
-    """
-    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
-    where = ""
-    line = getattr(mark, "line", None)
-    column = getattr(mark, "column", None)
-    if isinstance(line, int) and isinstance(column, int):
-        where = f" at line {line + 1}, column {column + 1}"
-    return f"{type(exc).__name__}{where}"
 
 
 def _server_label(name: object) -> str:
@@ -1112,13 +1098,11 @@ def _canonical_cli(cli: CLIAlternative) -> CLIAlternative:
 
 def _error_kind(exc: BaseException) -> str:
     """An exception's kind, never its text: pydantic's error types, or the class."""
-    from pydantic import ValidationError
+    from pmcp.argument_errors import validation_error_kinds
 
-    if isinstance(exc, ValidationError):
-        kinds = sorted(
-            {str(e.get("type", "invalid")) for e in exc.errors(include_url=False)}
-        )
-        return ", ".join(kinds) or "invalid"
+    kinds = validation_error_kinds(exc)
+    if kinds is not None:
+        return ", ".join(sorted({kind for _field, kind in kinds})) or "invalid"
     return type(exc).__name__
 
 
@@ -1166,19 +1150,16 @@ def _rejection_reason(exc: BaseException) -> str:
     A pydantic error's text quotes the input, so only the field (the first
     location element, a model attribute name) and the error type are kept.
     """
-    from pydantic import ValidationError
+    from pmcp.argument_errors import exception_text, validation_error_kinds
 
     if isinstance(exc, _EntryRejected):
-        return str(exc)
-    if isinstance(exc, ValidationError):
-        parts = []
-        for error in exc.errors(include_url=False, include_input=False):
-            loc = error.get("loc") or ("entry",)
-            head = str(loc[0])
-            if not re.fullmatch(r"[a-z_]{1,64}", head):
-                head = "entry"
-            parts.append(f"'{head}' {error.get('type', 'invalid')}")
-        return "; ".join(sorted(set(parts))) or "invalid"
+        # pmcp's own message: fields and types only (rendered through the
+        # registry all the same, Consiliency/pmcp#297).
+        return exception_text(exc)
+    kinds = validation_error_kinds(exc)
+    if kinds is not None:
+        parts = {f"'{field}' {kind}" for field, kind in kinds}
+        return "; ".join(sorted(parts)) or "invalid"
     return f"{type(exc).__name__} while parsing"
 
 
@@ -1757,14 +1738,13 @@ def _parse_overlay_document(
     cannot create a server either (Consiliency/pmcp#294).
     """
     try:
-        data = yaml.safe_load(content)
+        data = load_yaml(content, source="manifest overlay")
     except Exception as exc:
-        # Every exception, not only YAMLError: PyYAML's constructors raise
-        # ValueError (`!!int x`), KeyError (`!!bool x`) or AttributeError
-        # (`!!timestamp x`), whose text quotes the value, and one escaping here
-        # stopped the shipped manifest from loading (Consiliency/pmcp#342 rev 6).
+        # Every exception, not only YAMLError (Consiliency/pmcp#342 rev 6):
+        # `load_yaml` describes every parse failure by origin, value-free
+        # (Consiliency/pmcp#297).
         logger.warning(
-            f"Skipping unreadable manifest overlay {path}: {yaml_error_text(exc)}"
+            f"Skipping unreadable manifest overlay {path}: {exception_text(exc)}"
         )
         if failures is not None:
             failures.append("parse")
@@ -1888,7 +1868,7 @@ def clear_manifest_cache() -> None:
         _cache_failure_reported = False
 
 
-def _report_cache_failure(what: str, exc: BaseException) -> None:
+def _report_cache_failure(what: str, kind: type[BaseException]) -> None:
     """Log a cache failure by exception class only, never a value.
 
     ``RecursionError`` is expected -- a deeply aliased overlay nests deeper
@@ -1897,8 +1877,9 @@ def _report_cache_failure(what: str, exc: BaseException) -> None:
     the first one in the process is a WARNING an operator can see.
     """
     global _cache_failure_reported
-    name = type(exc).__name__
-    if isinstance(exc, RecursionError) or _cache_failure_reported:
+    # The class only, never the exception (Consiliency/pmcp#297's sink rule).
+    name = kind.__name__
+    if issubclass(kind, RecursionError) or _cache_failure_reported:
         logger.debug("Manifest cache: %s failed (%s); not cached", what, name)
         return
     _cache_failure_reported = True
@@ -1921,7 +1902,7 @@ def _serialize(value: Any) -> bytes | None:
     try:
         return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
     except Exception as exc:  # noqa: BLE001 - any failure means "do not cache"
-        _report_cache_failure("storing a result", exc)
+        _report_cache_failure("storing a result", type(exc))
         return None
 
 
@@ -1930,7 +1911,7 @@ def _deserialize(blob: bytes) -> Any | None:
     try:
         return pickle.loads(blob)
     except Exception as exc:  # noqa: BLE001 - any failure means "rebuild"
-        _report_cache_failure("reading back a result", exc)
+        _report_cache_failure("reading back a result", type(exc))
         return None
 
 
@@ -1989,7 +1970,9 @@ def _gather_overlay_sources(
             content = overlay_path.read_bytes()
         except OSError as exc:
             sources.append(
-                _OverlaySource(label, overlay_path, None, "unreadable", error=str(exc))
+                _OverlaySource(
+                    label, overlay_path, None, "unreadable", error=exception_text(exc)
+                )
             )
             continue
         sources.append(_OverlaySource(label, overlay_path, content, "read"))
@@ -2114,7 +2097,9 @@ def _build_manifest(
     apply_overlays = trusted
     logger.info(f"Loading manifest from {manifest_path}")
 
-    data = _parse_trusted_document(base) if trusted else yaml.safe_load(base)
+    data = (
+        _parse_trusted_document(base) if trusted else load_yaml(base, source="manifest")
+    )
 
     # Parse CLI alternatives
     cli_alternatives: dict[str, CLIAlternative] = {}
