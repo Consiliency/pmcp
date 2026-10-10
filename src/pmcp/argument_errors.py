@@ -40,6 +40,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import re
 import sys
 import traceback
 import weakref
@@ -1236,6 +1237,25 @@ def _known_methods() -> frozenset[str]:
     return _KNOWN_METHODS
 
 
+#: A name pmcp may show as it is: ASCII letters, digits and underscores, not
+#: starting with a digit. Anything else -- a tab, a bell, an ANSI escape, a
+#: quote -- came from a file a repository can write.
+_PLAIN_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+#: What :func:`plain_name` shows instead of a name that is not plain.
+NOT_A_PLAIN_NAME = "a name that is not a plain identifier"
+
+
+def plain_name(name: object) -> str:
+    """A name read from a file pmcp does not own (``.env``, ``.env.pmcp``,
+    ``.mcp.json``, an overlay, a manifest), fit for any output: itself when
+    it is a plain identifier, else a fixed description, never its text
+    (Consiliency/pmcp#297 implementation, round 1 F001)."""
+    if isinstance(name, str) and _PLAIN_NAME.fullmatch(name):
+        return name
+    return NOT_A_PLAIN_NAME
+
+
 def describe_value(value: Any) -> str:
     """A rejected value's structure, never its content (rev 12): an object's
     key count, an array's length, or a scalar's type. A string is just "a
@@ -1699,6 +1719,7 @@ def install_log_scrubber() -> None:
         logging.setLogRecordFactory(_scrubbing_factory(current))
     _install_extra_scrubbing()
     _install_handle_scrubbing()
+    _install_filter_scrubbing()
     _install_excepthook()
     _install_threading_excepthook()
     _install_handle_error()
@@ -1746,37 +1767,70 @@ def _install_extra_scrubbing() -> None:
     logging.Logger.makeRecord = make_record  # type: ignore[method-assign]
 
 
+def _rescrub(record: logging.LogRecord) -> None:
+    """Scrub ``record`` again, its `extra=`-style fields included. Never raises."""
+    try:
+        from pmcp.sdk_rejections import RECORD_ATTRIBUTES, is_sdk_logger, mask_extras
+
+        masked = is_sdk_logger(record.name)
+        # Every record of pmcp's own or another non-masked logger is scrubbed
+        # again: a handler or filter may have changed its `msg`, `args` or
+        # `exc_info` in place since it was made (round 1 N-2), and the scrub
+        # is idempotent for them. A masked logger's record is scrubbed again
+        # only if one of them was replaced: its scrub masks text, so a second
+        # pass would mask the masked text.
+        if not masked or _SCRUBBED.get(record) != _scrub_state(record):
+            scrub_record(record)
+        if masked:
+            mask_extras(record)
+        else:
+            for key, value in list(vars(record).items()):
+                if key not in RECORD_ATTRIBUTES:
+                    setattr(record, key, _scrubbed(value))
+    except Exception:  # noqa: BLE001 -- a log call must never fail here
+        pass
+
+
+def _install_filter_scrubbing() -> None:
+    """Scrub a record again after a logger's or a handler's filters pass it
+    (round 1 N-2): a filter may add a field, or change ``msg``, ``args`` or
+    ``exc_info``, after ``Logger.handle`` scrubbed the record -- and a
+    handler's filters run after that. On Python 3.12+ a filter may return a
+    replacement record, which is the one scrubbed. A filterer with no
+    filters changes nothing and is not scrubbed again. Idempotent."""
+    current = logging.Filterer.filter
+    if getattr(current, "pmcp_filter_scrubber", False):
+        return
+
+    def filter(self: logging.Filterer, record: logging.LogRecord) -> Any:
+        result = current(self, record)
+        if result and self.filters:
+            _rescrub(result if isinstance(result, logging.LogRecord) else record)
+        return result
+
+    filter.pmcp_filter_scrubber = True  # type: ignore[attr-defined]
+    filter.original = current  # type: ignore[attr-defined]
+    logging.Filterer.filter = filter  # type: ignore[method-assign]
+
+
 def _install_handle_scrubbing() -> None:
     """Scrub a record again when a logger handles it (Consiliency/pmcp#297
     implementation, round-29 ruling): a record built directly --
     ``logging.LogRecord(...)``, or ``logging.makeLogRecord(d)``, which fills
     the record's fields after the factory has run -- reaches
     ``Logger.handle`` without passing the record factory or ``makeRecord``.
-    Scrubbing is idempotent, so a record that did pass them is unchanged.
-    Every `extra=`-style field is scrubbed too: masked by the value-free
-    allowlist for a masked logger, described for any other. Idempotent."""
+    Scrubbing is idempotent, so a record that did pass them is unchanged,
+    and a non-masked logger's record is scrubbed again every time: its
+    ``msg``, ``args`` or ``exc_info`` may have been changed in place since
+    (:func:`_rescrub`). Every `extra=`-style field is scrubbed too: masked by
+    the value-free allowlist for a masked logger, described for any other.
+    Idempotent."""
     current = logging.Logger.handle
     if getattr(current, "pmcp_handle_scrubber", False):
         return
 
     def handle(self: logging.Logger, record: logging.LogRecord) -> Any:
-        try:
-            from pmcp.sdk_rejections import (
-                RECORD_ATTRIBUTES,
-                is_sdk_logger,
-                mask_extras,
-            )
-
-            if _SCRUBBED.get(record) != _scrub_state(record):
-                scrub_record(record)
-            if is_sdk_logger(record.name):
-                mask_extras(record)
-            else:
-                for key, value in list(vars(record).items()):
-                    if key not in RECORD_ATTRIBUTES:
-                        setattr(record, key, _scrubbed(value))
-        except Exception:  # noqa: BLE001 -- a log call must never fail here
-            pass
+        _rescrub(record)
         return current(self, record)
 
     handle.pmcp_handle_scrubber = True  # type: ignore[attr-defined]

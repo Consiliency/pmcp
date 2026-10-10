@@ -514,6 +514,76 @@ def test_extra_fields_are_scrubbed_when_the_record_is_made(name: str) -> None:
     assert record.count == 3  # a value-free field is kept
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        "args-in-place",
+        "logger-filter-adds-a-field",
+        "handler-filter-sets-msg",
+        "handler-filter-returns-a-record",
+    ],
+)
+def test_a_record_changed_after_it_was_made_is_scrubbed_again(change: str) -> None:
+    """Round 1 N-2: a record changed after ``makeRecord`` scrubbed it -- its
+    ``args`` mapping mutated in place, a field a logger filter adds, a
+    ``msg`` a handler filter sets, or (3.12+) a replacement record a filter
+    returns -- is scrubbed before it is emitted."""
+    import io
+    import sys
+
+    import pmcp  # noqa: F401 - installs the scrubbers
+
+    if change == "handler-filter-returns-a-record" and sys.version_info < (3, 12):
+        pytest.skip("a filter returns a record only on 3.12+")
+    s = _FAMILIES["hex"][1]
+    error = _validation_error(s)
+    stream = io.StringIO()
+    name = f"pmcp.test.changed.{change}"
+    logger = logging.getLogger(name)
+    logger.propagate = False
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s %(carried)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    def add_field(record: logging.LogRecord) -> bool:
+        record.carried = error
+        return True
+
+    def set_msg(record: logging.LogRecord) -> bool:
+        record.msg, record.args = "bad %s", (error,)
+        record.carried = "-"
+        return True
+
+    def replace(record: logging.LogRecord) -> logging.LogRecord:
+        return logging.makeLogRecord(
+            {"name": name, "msg": "bad %s", "args": (error,), "carried": error}
+        )
+
+    try:
+        if change == "args-in-place":
+            record = logger.makeRecord(
+                name, logging.INFO, __file__, 1, "%(a)s", ({"a": "x"},), None
+            )
+            record.args["a"] = error  # type: ignore[index]
+            record.carried = "-"
+            logger.handle(record)
+        else:
+            if change == "logger-filter-adds-a-field":
+                logger.addFilter(add_field)
+            else:
+                handler.addFilter(
+                    set_msg if change == "handler-filter-sets-msg" else replace
+                )
+            logger.info("failed")
+    finally:
+        logger.removeHandler(handler)
+        logger.filters.clear()
+    text = stream.getvalue()
+    assert text, change
+    assert not any(form in text for form in _forbidden(s)), text
+
+
 def test_the_logger_hooks_are_installed_once() -> None:
     """`Logger.makeRecord` and `Logger.handle` are each wrapped once, however
     often the scrubber is installed."""

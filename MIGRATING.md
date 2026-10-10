@@ -933,6 +933,11 @@ with an `{"error": true, …}` JSON payload instead. Some cases checked on 3.0:
 | `gateway.submit_feedback` with a 5-character title | reached the handler | `Input validation error: $.title: must be at least 8 characters` (titles are 8–160 characters) |
 | `gateway.catalog_search` with `query: null` | `Input validation error: None is not of type 'string'` | accepted |
 
+pmcp 3.0.0 itself printed jsonschema's wording after `Input validation
+error:`, which quotes the value (`1 is not of type 'boolean'`); 3.0.1 and
+later print the form shown, which names the argument's path and never its
+value.
+
 <!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": 1}}} => $.task.enabled: must be of type boolean -->
 <!-- gate-case: {"name": "gateway.invoke", "arguments": {"tool_id": "github::search_repositories", "arguments": {}, "task": {"enabled": true, "ttl": "5"}}} => $.task.ttl: must be of type integer or null -->
 <!-- gate-case: {"name": "gateway.describe", "arguments": {"tool_id": ""}} => $.tool_id: must be at least 1 character -->

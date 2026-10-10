@@ -55,6 +55,7 @@ from pmcp.env_store import (
 from pmcp.validation import is_valid_package_version, parse_package_spec
 from pmcp.manifest.loader import load_manifest
 from pmcp.parsing import load_json, load_json_file
+from pmcp.provision_gate import operator_safe
 from pmcp.types import StartupPolicyOperation
 
 
@@ -2243,12 +2244,13 @@ async def run_doctor(args: argparse.Namespace) -> None:
     command_servers, _sse_endpoints = _extract_mode_signals(config_data)
 
     if service_active and command_servers:
-        joined = ", ".join(sorted(command_servers))
+        # `.mcp.json` keys, named through `operator_safe` (F001).
+        joined = ", ".join(sorted(operator_safe(str(n)) for n in command_servers))
         checks.append(
             (
                 "mode",
                 "fail",
-                f"Local config {config_path} uses command mode for [{joined}] while system service is active. Use remote URL instead of command (type: http, url: http://127.0.0.1:3344/mcp).",
+                f"Local config {operator_safe(str(config_path))} uses command mode for [{joined}] while system service is active. Use remote URL instead of command (type: http, url: http://127.0.0.1:3344/mcp).",
             )
         )
     elif service_active:
@@ -2776,7 +2778,7 @@ def _format_trust_record(rec: trust_store.TrustRecord) -> str:
     """One record as a line naming its decision, digest, time, and path."""
     return (
         f"{rec.decision:<8}  {rec.content_sha256[:12]}  "
-        f"{rec.recorded_at.isoformat()}  {rec.absolute_path}"
+        f"{rec.recorded_at.isoformat()}  {operator_safe(str(rec.absolute_path))}"
     )
 
 
