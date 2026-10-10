@@ -272,17 +272,24 @@ class _Walk:
                         if param in self.model.sinks[name] and self.taint(arg):
                             self.outputs.append((node.lineno, f"{name}({param})"))
 
-    def _nodes(self, root: ast.AST) -> Iterator[ast.AST]:
-        """``root``'s nodes, not descending into nested functions or classes."""
-        stack = list(ast.iter_child_nodes(root))
-        while stack:
-            node = stack.pop()
-            if isinstance(
-                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
-            ):
-                continue
-            yield node
-            stack.extend(ast.iter_child_nodes(node))
+    def _nodes(self, root: ast.AST) -> list[ast.AST]:
+        """``root``'s nodes, not descending into nested functions or classes
+        (listed once per function: every walk of it reads the same list)."""
+        found = _NODES.get(id(root))
+        if found is None:
+            found = []
+            stack = list(ast.iter_child_nodes(root))
+            while stack:
+                node = stack.pop()
+                if isinstance(
+                    node,
+                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+                ):
+                    continue
+                found.append(node)
+                stack.extend(ast.iter_child_nodes(node))
+            _NODES[id(root)] = found
+        return found
 
     @staticmethod
     def _names(target: ast.AST) -> Iterator[str]:
@@ -416,6 +423,9 @@ _PASS_THROUGH = frozenset(
         "read_text",
     }
 )
+
+#: Each function's nodes, by the id of its (kept-alive) definition node.
+_NODES: dict[int, list[ast.AST]] = {}
 
 _CONTAINER_STORES = frozenset(
     {"append", "extend", "add", "update", "insert", "setdefault", "appendleft"}

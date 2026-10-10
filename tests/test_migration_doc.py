@@ -590,23 +590,32 @@ def _matches_exact(message: str) -> bool:
 
 
 def _gate_error(call: dict[str, Any]) -> jsonschema.ValidationError | None:
-    from pmcp.tools.handlers import get_gateway_tool_definitions
     from pmcp.tools.schema import gate_error_for
 
-    tool = next(t for t in get_gateway_tool_definitions() if t.name == call["name"])
     # The error the server reports, not jsonschema's raw choice: a nullable
     # argument's refusal is folded first (Consiliency/pmcp#369).
-    return gate_error_for(call["arguments"], tool.input_schema)
+    return gate_error_for(call["arguments"], _gateway_input_schema(call["name"]))
 
 
 def _described(call: dict[str, Any], error: jsonschema.ValidationError) -> str:
     """What the server says after `Input validation error: ` for `error`: its
     structural description, never jsonschema's message (Consiliency/pmcp#297)."""
     from pmcp.argument_errors import describe_schema_error
+
+    return describe_schema_error(
+        error, _gateway_input_schema(call["name"]), call["arguments"]
+    )
+
+
+@functools.cache
+def _gateway_input_schema(name: str) -> Any:
+    """A gateway tool's input schema, built once per process: every seeded
+    guide checks the same gate cases (CI time, Consiliency/pmcp#388 round 1)."""
     from pmcp.tools.handlers import get_gateway_tool_definitions
 
-    tool = next(t for t in get_gateway_tool_definitions() if t.name == call["name"])
-    return describe_schema_error(error, tool.input_schema, call["arguments"])
+    return next(
+        t for t in get_gateway_tool_definitions() if t.name == name
+    ).input_schema
 
 
 def _check_gate(text: str) -> list[str]:
