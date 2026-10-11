@@ -583,8 +583,11 @@ async def drained_errlog(label: str, logger: logging.Logger) -> AsyncIterator[Te
             # a descendant, and it closes the read ends itself.
             with contextlib.suppress(OSError):
                 os.close(stop_write)
-            with anyio.CancelScope(shield=True), contextlib.suppress(Exception):
-                await anyio.to_thread.run_sync(thread.join, _DRAIN_JOIN_SECONDS)
+            # On Windows the stop wakes nothing (a blocking read): no second
+            # wait for a drain that only its descendant's exit can end.
+            if not _windows():
+                with anyio.CancelScope(shield=True), contextlib.suppress(Exception):
+                    await anyio.to_thread.run_sync(thread.join, _DRAIN_JOIN_SECONDS)
 
 
 def run_echoed(command: Sequence[str]) -> int:

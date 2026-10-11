@@ -691,8 +691,10 @@ async def _terminate_process_tree(
         # Process-group signalling is POSIX-only. On Windows os.getpgid/os.killpg
         # (and signal.SIGKILL) don't exist, so fall back to the cross-platform
         # process.terminate()/kill() — preserving the pre-process-group behavior.
-        # A kill there terminates the child's Job Object (round 7, claude N-A).
-        if kill and _child_output._windows():
+        # There both arms terminate the child's Job Object (round 7, claude
+        # N-A): TerminateProcess is no gentler than the job, and a leader that
+        # exits within the wait would otherwise leave its descendants running.
+        if _child_output._windows():
             kill_process_tree_now(process)
             return
         # The one kill rule (round 7, claude N-B): the group is signalled

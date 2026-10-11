@@ -1010,6 +1010,32 @@ def test_kill_tree_signals_no_group_once_the_child_is_reaped(
     assert [sig for _pgid, sig in signals if sig != 0] == []
 
 
+@pytest.mark.skipif(not hasattr(os, "waitid"), reason="POSIX waitid")
+def test_a_child_reaped_behind_returncode_is_not_signalled_as_a_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 7, claude N-B: `returncode` unset is not enough -- on 3.10/3.11
+    asyncio's watcher thread reaps before it is set. A child the kernel has
+    reaped (here by a raw `waitpid`) is not signalled as a group leader."""
+    from pmcp import child_output
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    os.waitpid(process.pid, 0)  # reaped behind Popen's back: returncode None
+    assert process.returncode is None
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals.append((pgid, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)  # the pid reused
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    child_output.kill_tree(process)
+    assert [sig for _pgid, sig in signals if sig != 0] == []
+
+
 # --- round 7: the one kill rule; Windows; the drain under cancellation -----------
 
 #: A leader that starts a grandchild holding its stdout and stderr, records
@@ -1329,6 +1355,8 @@ def test_windows_interrupt_and_kill_terminate_the_job_never_a_console_event(
     `GenerateConsoleCtrlEvent` (or `CTRL_BREAK_EVENT`)."""
     from pmcp import child_output
 
+    monkeypatch.setattr(child_output, "_JOBS", {})
+
     kernel32 = _FakeKernel32()
     monkeypatch.setattr(child_output, "_windows", lambda: True)
     monkeypatch.setattr(child_output, "_kernel32", lambda: kernel32)
@@ -1378,6 +1406,8 @@ def test_windows_without_a_job_kills_the_child_alone(
     back to the child alone."""
     from pmcp import child_output
 
+    monkeypatch.setattr(child_output, "_JOBS", {})
+
     class _Refusing(_FakeKernel32):
         def __getattr__(self, name: str) -> object:
             if name == "AssignProcessToJobObject":
@@ -1399,3 +1429,43 @@ def test_windows_without_a_job_kills_the_child_alone(
     child_output.track(process)
     child_output.kill_tree(process)
     assert process.killed
+
+
+@pytest.mark.asyncio
+async def test_windows_server_teardown_terminates_the_job_when_the_leader_exits_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ClientManager`'s teardown on Windows terminates the server's Job
+    Object at the first signal: a leader that exits within the wait no
+    longer leaves what it started running (round 7, claude N-A)."""
+    from pmcp import child_output
+    from pmcp.client import manager
+
+    kernel32 = _FakeKernel32()
+    monkeypatch.setattr(child_output, "_JOBS", {})
+    monkeypatch.setattr(child_output, "_windows", lambda: True)
+    monkeypatch.setattr(child_output, "_kernel32", lambda: kernel32)
+    # No real group may be reached from the double's pid.
+    monkeypatch.setattr(os, "getpgid", lambda pid: -1)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
+
+    class _Server:
+        pid = 4242
+        returncode: int | None = None
+        terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+    server = _Server()
+    child_output.track(server)
+    await manager._terminate_process_tree(server, "srv")  # type: ignore[arg-type]
+    assert "TerminateJobObject" in kernel32.calls
+    assert not server.terminated
