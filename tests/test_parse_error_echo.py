@@ -1207,6 +1207,8 @@ _NOT_HTTP_CLIENTS = frozenset(
         "uuid",
         # the record-scrub state, kept off the records (Consiliency/pmcp#297)
         "weakref",
+        # the stderr drain's stop pipe (Consiliency/pmcp#388 round 6)
+        "selectors",
         # Third-party, none of which pmcp uses to send a request: async
         # primitives, parsers and models, the server side, metrics.
         "anyio",

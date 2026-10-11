@@ -823,7 +823,10 @@ def test_ctrl_c_during_run_echoed_reaches_the_child_and_its_group(
     child = tmp_path / "family.py"
     child.write_text(_FAMILY)
     script = (
-        "import sys\n"
+        "import signal, sys\n"
+        # A test run in the background (`cmd &`) starts with SIGINT ignored;
+        # an operator's pmcp gets Python's own handler.
+        "signal.signal(signal.SIGINT, signal.default_int_handler)\n"
         "from pmcp.child_output import run_echoed\n"
         f"run_echoed([sys.executable, {str(child)!r}, {str(tmp_path)!r}])\n"
     )

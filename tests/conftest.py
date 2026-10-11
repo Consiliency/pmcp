@@ -134,7 +134,11 @@ def spawn_problems(locals_: dict[str, Any]) -> list[str]:
     """What is wrong with a POSIX ``Popen._execute_child`` call, by its
     resolved arguments."""
     problems = []
-    if not locals_.get("start_new_session") and locals_.get("process_group") is None:
+    # `process_group` (3.11+) defaults to -1; any other value also detaches.
+    if not locals_.get("start_new_session") and locals_.get("process_group", -1) in (
+        None,
+        -1,
+    ):
         problems.append("not detached (no new session)")
     if locals_.get("p2cread", -1) in (-1, 0):
         problems.append("stdin inherited")
