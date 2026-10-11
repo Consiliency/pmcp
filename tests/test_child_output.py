@@ -1061,6 +1061,26 @@ def _leader_exits_first(tmp_path: Path) -> list[str]:
     return [sys.executable, str(script), str(tmp_path)]
 
 
+def _grandchild_gone(tmp_path: Path, where: str) -> None:
+    """Assert the leader's grandchild is gone; if not, end it -- only after
+    confirming from its cmdline that the pid is still ours -- so a failing
+    test leaves nothing running."""
+    import contextlib
+    import signal
+
+    pid = int((tmp_path / "grandchild").read_text())
+    if _gone(pid):
+        return
+    try:
+        ours = b"time.sleep(60)" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        ours = False
+    if ours:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    raise AssertionError(f"{where}: the grandchild outlived the kill")
+
+
 def _short_waits(monkeypatch: pytest.MonkeyPatch, module: object) -> None:
     from pmcp import waits
 
@@ -1086,8 +1106,7 @@ async def test_a_timed_out_probe_whose_leader_exited_first_leaves_no_grandchild(
         await environment.check_cli("probe", command)
     else:
         await environment.get_cli_help("probe", command)
-    grandchild = int((tmp_path / "grandchild").read_text())
-    assert _gone(grandchild), f"{probe}: the grandchild outlived the timeout"
+    _grandchild_gone(tmp_path, probe)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
@@ -1110,8 +1129,7 @@ async def test_an_install_timeout_whose_leader_exited_first_leaves_no_grandchild
     )
     with pytest.raises(installer.InstallError):
         await installer.install_server(server, "linux", timeout=1.0)
-    grandchild = int((tmp_path / "grandchild").read_text())
-    assert _gone(grandchild), "the install's grandchild outlived its timeout"
+    _grandchild_gone(tmp_path, "install_server")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
@@ -1134,11 +1152,15 @@ async def test_a_stalled_install_whose_leader_exited_first_leaves_no_grandchild(
         stderr=asyncio.subprocess.PIPE,
         **detached(),
     )
-    await process.wait()  # the leader is gone; the grandchild holds the pipes
+    # The leader exits; the grandchild holds the pipes. `returncode` is set
+    # at the exit (`wait()` itself, on 3.11+, waits for the pipes to close).
+    deadline = asyncio.get_running_loop().time() + 10
+    while process.returncode is None:
+        assert asyncio.get_running_loop().time() < deadline, "the leader never exited"
+        await asyncio.sleep(0.02)
     _wait_for(tmp_path / "grandchild")
     await installer.JobManager()._safe_terminate_process(process, "job", force=True)
-    grandchild = int((tmp_path / "grandchild").read_text())
-    assert _gone(grandchild), "the stalled install's grandchild outlived it"
+    _grandchild_gone(tmp_path, "_safe_terminate_process")
 
 
 @pytest.mark.skipif(not Path("/proc/self/fd").exists(), reason="Linux /proc")
