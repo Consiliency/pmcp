@@ -40,6 +40,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pmcp.child_output import track
 from pmcp.client import manager as manager_mod
 from pmcp.client.manager import ClientManager, ManagedClient
 from pmcp.types import (
@@ -1368,6 +1369,9 @@ async def _reaped_leader_with_grandchild() -> tuple[ManagedClient, int]:
         stdout=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
+    # As `_connect_stdio` does: the group is trusted from the spawn
+    # (Consiliency/pmcp#388 round 8).
+    track(process)
     assert process.stdout is not None and process.stdin is not None
     grandchild = int(
         (await asyncio.wait_for(process.stdout.readline(), _HANG_GUARD_S)).strip()
@@ -1883,17 +1887,24 @@ async def test_a_forced_disconnect_cancelled_during_its_task_cancel_kills_the_tr
 def test_a_reused_group_id_is_not_signalled() -> None:
     """The guard on the retained id: when a live process holds the leader's
     pid, the id was reused after our group emptied, and nothing is sent."""
+    from pmcp import child_output
+
     sent: list[tuple[int, int]] = []
 
     def fake_killpg(pgid: int, sig: int) -> None:
         sent.append((pgid, sig))
 
-    with (
-        patch.object(manager_mod.os, "killpg", fake_killpg),
-        patch.object(manager_mod.os, "kill", lambda pid, sig: None),
-    ):
-        manager_mod._kill_retained_group(4242)
-    assert sent == [(4242, 0)], sent
+    owner = MagicMock()
+    child_output.trust_group(owner, 4242)
+    try:
+        with (
+            patch.object(manager_mod.os, "killpg", fake_killpg),
+            patch.object(manager_mod.os, "kill", lambda pid, sig: None),
+        ):
+            manager_mod._kill_retained_group(4242, owner=owner)
+        assert sent == [(4242, 0)], sent
+    finally:
+        child_output.forget_group(4242)
 
 
 async def test_connect_all_cancelled_before_its_workers_start_spawns_nothing(
@@ -2219,10 +2230,9 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "re-raise",
     ),
-    ("tools/handlers.py", "GatewayTools._run_update_probe_command", "reraises"): (
-        1,
-        "SIGKILLs the probe synchronously, then re-raises",
-    ),
+    # (`GatewayTools._run_update_probe_command` has no cancellation handler
+    # since Consiliency/pmcp#388 round 8: a `finally` SIGKILLs the probe
+    # synchronously on every exit, a cancellation included.)
 }
 
 # Handlers allowed to await: task roots whose own cancellation ends them.

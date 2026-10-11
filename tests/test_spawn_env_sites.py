@@ -21,7 +21,6 @@ import asyncio
 import os
 import subprocess
 import sys
-import types
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -132,14 +131,6 @@ async def _which_systemctl(monkeypatch: pytest.MonkeyPatch) -> None:
     cli._is_pmcp_system_service_active()
 
 
-async def _restart(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(
-        cli, "Path", lambda *a: types.SimpleNamespace(exists=lambda: True)
-    )
-    cli._restart_local_pmcp_service()
-
-
 async def _upgrade(monkeypatch: pytest.MonkeyPatch) -> None:
     await cli.run_upgrade(
         argparse.Namespace(log_level="warning", method="pip", dry_run=False)
@@ -195,8 +186,8 @@ async def _update_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 #: (module, function) -> how to reach that spawn through its real function.
 DRIVERS: dict[tuple[str, str], Callable[[pytest.MonkeyPatch], Awaitable[None]]] = {
-    ("pmcp.cli", "_is_pmcp_system_service_active"): _which_systemctl,
-    ("pmcp.cli", "_restart_local_pmcp_service"): _restart,
+    # The CLI's service checks, through the owned probe runner (round 8).
+    ("pmcp.child_output", "run_captured"): _which_systemctl,
     # `pmcp upgrade`'s installer, through the echoing runner (round 4).
     ("pmcp.child_output", "run_echoed"): _upgrade,
     ("pmcp.client.manager", "_connect_stdio"): _connect_stdio,

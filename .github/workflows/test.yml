@@ -56,6 +56,39 @@ jobs:
       - name: Check coverage threshold
         run: uv run coverage report --fail-under=60
 
+  # Windows had no CI, and Consiliency/pmcp#388 round 8 found `import pmcp`
+  # failing there: `signal.SIGKILL` in a default argument, evaluated at
+  # import, does not exist on Windows. This job installs on a real Windows
+  # runner, imports the package, runs the entry point, and runs the
+  # Windows-path unit tests (the Job Object and pipe-reader seams in
+  # tests/test_child_output.py, which also run there for real). Kept small:
+  # the full suite is POSIX-specific in many places.
+  windows-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --python 3.12
+
+      - name: Import the package and run the entry point
+        run: |
+          uv run --python 3.12 python -c "import pmcp, pmcp.child_output, pmcp.cli, pmcp.client.manager, pmcp.server, pmcp.manifest.installer"
+          uv run --python 3.12 pmcp --version
+          uv run --python 3.12 pmcp --help
+
+      - name: Windows-path unit tests
+        run: uv run --python 3.12 pytest tests/test_child_output.py -q --tb=short -p no:cacheprovider
+
   # Every other job installs via `uv sync`, which uses uv.lock — so they only
   # ever exercise the PINNED dependency versions. That hid a shipped break: an
   # unbounded `mcp>=1.0.0` let a real install resolve to mcp 2.0.0, which had

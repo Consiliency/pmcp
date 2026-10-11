@@ -1141,7 +1141,7 @@ async def test_a_stalled_install_whose_leader_exited_first_leaves_no_grandchild(
     `_safe_terminate_process`, which skipped an exited leader."""
     import asyncio
 
-    from pmcp.child_output import detached
+    from pmcp.child_output import detached, track
     from pmcp.manifest import installer
 
     command = _leader_exits_first(tmp_path)
@@ -1152,6 +1152,7 @@ async def test_a_stalled_install_whose_leader_exited_first_leaves_no_grandchild(
         stderr=asyncio.subprocess.PIPE,
         **detached(),
     )
+    track(process)  # as every spawn site does: its group is trusted
     # The leader exits; the grandchild holds the pipes. `returncode` is set
     # at the exit (`wait()` itself, on 3.11+, waits for the pipes to close).
     deadline = asyncio.get_running_loop().time() + 10
@@ -1256,6 +1257,21 @@ class _SocketsOnlySelector:
         pass
 
 
+def _posix_peek(fd: int) -> int | None:
+    """`PeekNamedPipe`'s answer, from a POSIX pipe: the bytes ready, or
+    `None` at the pipe's end (readable with nothing to read)."""
+    import fcntl
+    import select
+    import struct
+    import termios
+
+    ready, _, _ = select.select([fd], [], [], 0)
+    if not ready:
+        return 0
+    count = struct.unpack("i", fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0"))[0]
+    return count or None
+
+
 def _windows_drain(monkeypatch: pytest.MonkeyPatch) -> None:
     import selectors
 
@@ -1263,6 +1279,7 @@ def _windows_drain(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(child_output, "_windows", lambda: True)
     monkeypatch.setattr(selectors, "DefaultSelector", _SocketsOnlySelector)
+    monkeypatch.setattr(child_output, "_peek_pipe", _posix_peek)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the Windows seam, run on POSIX")
@@ -1297,12 +1314,12 @@ async def test_the_windows_drain_reads_a_pipe_select_rejects(
 
 @pytest.mark.skipif(not Path("/proc/self/fd").exists(), reason="Linux /proc")
 @pytest.mark.asyncio
-async def test_the_windows_drain_leak_is_bounded_by_the_descendant(
+async def test_the_windows_drain_stops_at_the_deadline_while_a_descendant_holds_the_pipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The documented bounded leak: a Windows drain cannot be stopped early,
-    so while a descendant holds the write end past the context its thread
-    and read end live -- and no longer than that descendant."""
+    """Round 8, codex F004: the Windows drain's lifetime is pmcp's, not the
+    downstream's. A descendant that never closes the write end does not keep
+    the drain thread or its descriptors past the context's deadline."""
     import logging
     import threading
     import time
@@ -1321,20 +1338,48 @@ async def test_the_windows_drain_leak_is_bounded_by_the_descendant(
             stderr=errlog,
             start_new_session=True,
         )
-
-    def drains() -> list[threading.Thread]:
-        return [t for t in threading.enumerate() if t.name == "pmcp-errlog-leak"]
-
     try:
-        assert drains(), "the Windows drain ended while the descendant held the pipe"
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and any(
+            t.name == "pmcp-errlog-leak" for t in threading.enumerate()
+        ):
+            time.sleep(0.02)
+        assert not any(t.name == "pmcp-errlog-leak" for t in threading.enumerate()), (
+            "the Windows drain outlived its deadline"
+        )
+        assert descendant.poll() is None  # the writer never closed
+        assert _open_fds() <= baseline
     finally:
         descendant.kill()
         descendant.wait()
-    deadline = time.monotonic() + 5
-    while drains() and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert not drains(), "the drain outlived the descendant"
-    assert _open_fds() <= baseline
+
+
+def test_the_windows_reader_ends_at_the_stop_with_a_writer_that_never_closes() -> None:
+    """The polling reader against a fake pipe whose writer never closes and
+    never writes: it ends within a poll of the stop, and reads what was
+    ready first."""
+    import threading
+
+    from pmcp import child_output
+
+    stop = threading.Event()
+    reader = child_output._PollingReader(-1, stop)
+    looks = {"n": 0}
+
+    def never_closing(fd: int) -> int:
+        looks["n"] += 1
+        if looks["n"] == 3:
+            stop.set()
+        return 0
+
+    original = child_output._peek_pipe
+    child_output._peek_pipe = never_closing  # type: ignore[assignment]
+    try:
+        assert reader.read1(1024) == b""
+        assert reader.read1(1024) == b""
+    finally:
+        child_output._peek_pipe = original  # type: ignore[assignment]
+    assert looks["n"] == 4  # three looks, the stop, one last look
 
 
 def test_the_last_bytes_are_read_when_data_and_the_stop_are_both_ready() -> None:
@@ -1526,3 +1571,264 @@ async def test_a_teardown_of_an_exited_process_signals_no_group(
     await manager._terminate_process_tree(exited, "srv", group_pgid=4242)  # type: ignore[arg-type]
     assert [sig for _pgid, sig in signals if sig != 0] == []
     assert not exited.signalled
+
+
+# --- round 8 ----------------------------------------------------------------------
+
+#: What Windows' `signal` and `os` lack: evaluated at import, any of them
+#: fails `import pmcp` there.
+_POSIX_ONLY = {
+    "SIGKILL", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGCHLD", "SIGPIPE",
+    "SIGALRM", "SIGSTOP", "SIGCONT", "killpg", "getpgid", "waitid", "WNOHANG",
+    "WEXITED", "WNOWAIT", "P_PID", "setsid", "getuid", "geteuid", "fork",
+}  # fmt: skip
+
+
+def _import_time_posix_names(tree: ast.AST) -> list[tuple[int, str]]:
+    """`signal.X`/`os.X` for a POSIX-only X, where it is evaluated at import:
+    module and class bodies, default arguments, decorators -- not function
+    bodies, which run only when called."""
+    found: list[tuple[int, str]] = []
+
+    def expressions(node: ast.AST) -> None:
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Attribute)
+                and sub.attr in _POSIX_ONLY
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id in ("signal", "os")
+            ):
+                found.append((sub.lineno, ast.unparse(sub)))
+
+    def body(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                for default in [*child.args.defaults, *child.args.kw_defaults]:
+                    if default is not None:
+                        expressions(default)
+                for decorator in getattr(child, "decorator_list", []):
+                    expressions(decorator)
+                continue
+            if isinstance(child, ast.expr):
+                expressions(child)
+            else:
+                body(child)
+
+    body(tree)
+    return found
+
+
+def test_no_posix_only_name_is_evaluated_when_pmcp_is_imported() -> None:
+    """Round 8, codex/grok F001: `signal.SIGKILL` in a default argument made
+    `import pmcp` raise `AttributeError` on Windows before any Windows code
+    ran. No module in `src/pmcp` evaluates a POSIX-only `signal`/`os` name
+    at import (the Windows CI job imports it for real)."""
+    root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
+    problems = [
+        f"{path.relative_to(root)}:{line}: {text}"
+        for path in sorted(root.rglob("*.py"))
+        for line, text in _import_time_posix_names(ast.parse(path.read_text()))
+    ]
+    assert problems == []
+
+
+def test_the_import_time_guard_sees_a_default_argument() -> None:
+    tree = ast.parse(
+        "import signal\n"
+        "def kill(sig=signal.SIGKILL): pass\n"
+        "def fine(): return signal.SIGKILL\n"
+        "class C:\n    S = signal.SIGHUP\n"
+    )
+    assert [text for _line, text in _import_time_posix_names(tree)] == [
+        "signal.SIGKILL",
+        "signal.SIGHUP",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_windows_teardown_terminates_job_when_leader_already_exited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 8, codex F002 = gemini F001 = grok F001 (gemini's falsifier): a
+    server whose leader already exited still has its Job Object terminated
+    at teardown, and the handle is released -- the POSIX retained-group path
+    (a no-op on Windows) no longer returns first."""
+    from pmcp import child_output
+    from pmcp.client import manager
+
+    kernel32 = _FakeKernel32()
+    monkeypatch.setattr(child_output, "_JOBS", {})
+    monkeypatch.setattr(child_output, "_windows", lambda: True)
+    monkeypatch.setattr(child_output, "_kernel32", lambda: kernel32)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
+
+    class _Exited:
+        pid = 4242
+        returncode: int | None = None
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> int:
+            return 0
+
+    server = _Exited()
+    child_output.track(server)
+    server.returncode = 0  # the leader exits first; a descendant lives on
+    await manager._terminate_process_tree(server, "srv", group_pgid=4242)  # type: ignore[arg-type]
+    assert "TerminateJobObject" in kernel32.calls
+    assert child_output._JOBS == {}  # the handle released
+    assert kernel32.calls.count("CloseHandle") >= 2  # the process's, then the job's
+
+
+_LEADER_STAYS = textwrap.dedent(
+    """
+    import os, subprocess, sys, time
+    out = sys.argv[1]
+    grandchild = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+    )
+    with open(os.path.join(out, "grandchild"), "w") as handle:
+        handle.write(str(grandchild.pid))
+    time.sleep(60)
+    """
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_a_verification_that_times_out_leaves_nothing_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 8, codex F003: `verify_installation` caught its own timeout and
+    returned False with the command and its grandchild still running."""
+    from pmcp.manifest import installer
+    from pmcp.manifest.loader import ServerConfig
+
+    _short_waits(monkeypatch, installer)
+    script = tmp_path / "leader.py"
+    script.write_text(_LEADER_STAYS)
+    server = ServerConfig(
+        name="memory",
+        description="memory",
+        keywords=["memory"],
+        install={"linux": [sys.executable]},
+        command=sys.executable,
+        args=[str(script)],
+        requires_api_key=False,
+    )
+    # `verify_installation` appends `--help`: the leader reads its out dir
+    # from argv[1], so point argv[1] at tmp_path through the script itself.
+    script.write_text(_LEADER_STAYS.replace("sys.argv[1]", repr(str(tmp_path))))
+    assert await installer.verify_installation(server) is False
+    _wait_for(tmp_path / "grandchild")
+    _grandchild_gone(tmp_path, "verify_installation")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_a_cancelled_install_leaves_nothing_running(tmp_path: Path) -> None:
+    """Round 8, codex F003: `install_server` had no cancellation cleanup; a
+    cancelled caller left the install and everything it started running."""
+    import asyncio
+
+    from pmcp.manifest import installer
+    from pmcp.manifest.loader import ServerConfig
+
+    script = tmp_path / "leader.py"
+    script.write_text(_LEADER_STAYS)
+    command = [sys.executable, str(script), str(tmp_path)]
+    server = ServerConfig(
+        name="memory",
+        description="memory",
+        keywords=["memory"],
+        install={"linux": command},
+        command=command[0],
+        args=command[1:],
+        requires_api_key=False,
+    )
+    task = asyncio.create_task(installer.install_server(server, "linux", timeout=60))
+    deadline = asyncio.get_running_loop().time() + 10
+    while not (tmp_path / "grandchild").exists():
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    _grandchild_gone(tmp_path, "install_server (cancelled)")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_a_group_observed_empty_is_never_signalled_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 8, claude N-A: a retained group id is forgotten the moment its
+    group is observed empty (`watch_group`, run for every stdio server), so
+    a later teardown cannot reach a foreign group that took the id after a
+    pid wrap -- even one whose leader has exited while members live, which
+    passes the reuse check."""
+    import asyncio
+
+    from pmcp import child_output
+    from pmcp.child_output import detached, track
+    from pmcp.client import manager
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "pass",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        **detached(),
+    )
+    track(process)
+    pgid = process.pid
+    assert child_output.group_trusted(pgid, process)
+    await asyncio.wait_for(child_output.watch_group(process, pgid), 10)
+    assert not child_output.group_trusted(pgid, process)  # forgotten when empty
+
+    # The id is handed to a foreign group: it has members, and its own
+    # leader has exited (so `kill(pgid, 0)` fails -- the reuse check passes).
+    sent: list[tuple[int, int]] = []
+
+    def foreign_killpg(target: int, sig: int) -> None:
+        sent.append((target, sig))
+
+    def no_leader(target: int, sig: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "killpg", foreign_killpg)
+    monkeypatch.setattr(os, "kill", no_leader)
+    await manager._terminate_process_tree(process, "srv", group_pgid=pgid)
+    manager._kill_retained_group(pgid)
+    child_output.kill_tree(process)
+    assert [s for _target, s in sent if s != 0] == []
+
+
+def test_a_trusted_group_vouches_only_for_its_own_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained id is tied to the process that leads it: a stale record of
+    another child never reaches it (round 8, claude N-A)."""
+    from pmcp import child_output
+
+    class _Owner:
+        pass
+
+    mine, other = _Owner(), _Owner()
+    sent: list[int] = []
+    monkeypatch.setattr(os, "killpg", lambda target, sig: sent.append(sig))
+    monkeypatch.setattr(
+        os, "kill", lambda target, sig: (_ for _ in ()).throw(ProcessLookupError)
+    )
+    child_output.trust_group(mine, 4343)
+    try:
+        child_output.signal_retained_group(4343, owner=other)
+        assert sent == []
+        child_output.signal_retained_group(4343, owner=mine)
+        assert sent and sent[-1] != 0
+    finally:
+        child_output.forget_group(4343)

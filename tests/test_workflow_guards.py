@@ -399,14 +399,16 @@ class TestShaPinning:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Spelled twice on purpose, like EXPECTED_USES: a new remote action is a
-        # deliberate event, and this guard is what makes it one. 31 in the
+        # deliberate event, and this guard is what makes it one. 33 in the
         # workflows + 1 in the composite.
         #
         # Was 30 until the `audit` job (pip-audit, see #224) added a checkout
-        # and a setup-uv. Raising this number is the deliberate step; the guard
+        # and a setup-uv; 32 until the `windows-smoke` job
+        # (Consiliency/pmcp#388 round 8) added the same two, already-pinned
+        # actions. Raising this number is the deliberate step; the guard
         # firing on an unreviewed addition is the point.
         monkeypatch.chdir(REPO_ROOT)
-        assert len(cw.remote_uses(cw.pin_scan_files())) == 32
+        assert len(cw.remote_uses(cw.pin_scan_files())) == 34
 
     def test_expected_uses_is_sha_form_without_comments(self) -> None:
         # yaml.safe_load strips comments before _collect_uses runs, so a value

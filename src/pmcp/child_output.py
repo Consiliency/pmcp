@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import threading
+import weakref
 from collections.abc import AsyncIterator, Iterator, Sequence
 from typing import IO, Any, TextIO
 
@@ -120,6 +121,13 @@ _INTERRUPT_GRACE_SECONDS = 5.0
 #   of a leader that exited first are still reached (round 7, codex F002).
 
 
+def _sigkill() -> int:
+    """SIGKILL, read at call time: Windows has no ``signal.SIGKILL``, and a
+    default argument evaluated at import made ``import pmcp`` fail there
+    (Consiliency/pmcp#388 round 8, codex/grok F001)."""
+    return int(getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
 def process_groups_supported() -> bool:
     """Whether this platform has POSIX process groups to signal. Read at
     call time, so a test that removes the APIs sees it."""
@@ -152,11 +160,69 @@ def leader_reserved(process: Any) -> bool:
     return True
 
 
-def signal_retained_group(group_pgid: int | None, sig: int = signal.SIGKILL) -> None:
+# --- trusted groups (round 8, claude N-A) ---------------------------------------
+#
+# A retained group id is signalled only while pmcp still trusts it: from the
+# spawn (or adoption) of the process that leads it until the group is first
+# observed empty. Once empty, the id is free and could be handed to a new
+# group after the pid space wraps (likely with pid_max 32768, in a
+# container); a later teardown must not reach that foreign group. Each id is
+# tied to the process object that owns it, held weakly, so a stale record of
+# one child never vouches for another child's group either.
+
+_TRUSTED_GROUPS: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
+
+
+def trust_group(process: Any, pgid: int | None) -> None:
+    """Record that ``process`` leads group ``pgid`` (verified by the caller:
+    the spawn contract, or ``getpgid`` while the process was ours)."""
+    if pgid is None or process is None:
+        return
+    with contextlib.suppress(TypeError):
+        _TRUSTED_GROUPS[pgid] = process
+
+
+def group_trusted(pgid: int | None, owner: Any = None) -> bool:
+    """Whether ``pgid`` is still trusted -- for ``owner`` when one is given."""
+    if pgid is None:
+        return False
+    held = _TRUSTED_GROUPS.get(pgid)
+    if held is None:
+        return False
+    return owner is None or held is owner
+
+
+def forget_group(pgid: int | None, owner: Any = None) -> None:
+    """Stop trusting ``pgid`` (for ``owner`` only, when one is given)."""
+    if pgid is not None and group_trusted(pgid, owner):
+        _TRUSTED_GROUPS.pop(pgid, None)
+
+
+def observe_group(pgid: int | None, owner: Any = None) -> bool:
+    """Probe a trusted group: ``True`` while it has a member. The first
+    probe that finds it empty forgets it, for good."""
+    if not group_trusted(pgid, owner) or not process_groups_supported():
+        return False
+    try:
+        os.killpg(pgid, 0)  # type: ignore[arg-type]
+    except ProcessLookupError:
+        forget_group(pgid, owner)
+        return False
+    except (PermissionError, OSError):
+        return False
+    return True
+
+
+def signal_retained_group(
+    group_pgid: int | None, sig: int | None = None, *, owner: Any = None
+) -> None:
     """Signal a group whose leader has been reaped, synchronously.
 
-    Only while (1) the group still has a member (``killpg(pgid, 0)``) and (2)
-    no process holds the leader's pid (``kill(pgid, 0)`` fails with
+    Only while (1) pmcp still trusts the id -- it has not been observed
+    empty since its leader was spawned, and it belongs to ``owner`` when one
+    is given (round 8, claude N-A) --, (2) the group still has a member
+    (``killpg(pgid, 0)``; finding none forgets the id), and (3) no process
+    holds the leader's pid (``kill(pgid, 0)`` fails with
     ``ProcessLookupError``). While any member of our group lives, the kernel
     keeps the id in use, so it cannot have been handed to a new process; a
     process holding that pid therefore means the id was reused after our
@@ -164,10 +230,8 @@ def signal_retained_group(group_pgid: int | None, sig: int = signal.SIGKILL) -> 
     """
     if group_pgid is None or not process_groups_supported():
         return
-    try:
-        os.killpg(group_pgid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
-        return  # no member left (or not ours to signal)
+    if not observe_group(group_pgid, owner):
+        return  # untrusted, or no member left (now forgotten)
     try:
         os.kill(group_pgid, 0)
         return  # a live process holds the leader's pid: the id was reused
@@ -176,11 +240,11 @@ def signal_retained_group(group_pgid: int | None, sig: int = signal.SIGKILL) -> 
     except (PermissionError, OSError):
         return
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-        os.killpg(group_pgid, sig)
+        os.killpg(group_pgid, _sigkill() if sig is None else sig)
 
 
 def kill_process_tree_now(
-    process: Any, *, group_pgid: int | None = None, sig: int = signal.SIGKILL
+    process: Any, *, group_pgid: int | None = None, sig: int | None = None
 ) -> None:
     """Signal a child and its group, synchronously (no await, so nothing can
     cancel or skip it). On Windows: terminate its Job Object, or the child
@@ -193,21 +257,29 @@ def kill_process_tree_now(
             with contextlib.suppress(Exception):
                 process.kill()
         return
+    if sig is None:
+        sig = _sigkill()
     if not process_groups_supported():
         group_pgid = None
     if process is None:
-        signal_retained_group(group_pgid, sig)
-        return
+        return  # no owner to vouch for a retained id (round 8, claude N-A)
     if not leader_reserved(process):
-        signal_retained_group(group_pgid, sig)
+        signal_retained_group(group_pgid, sig, owner=process)
         return
     pid = process.pid
-    if isinstance(pid, int) and group_pgid is None and hasattr(os, "getpgid"):
+    if isinstance(pid, int) and hasattr(os, "getpgid"):
+        # The leader is reserved (checked just above): its group is the one
+        # signalled directly -- a passed id only when it IS that group.
         try:
-            if os.getpgid(pid) == pid:
-                group_pgid = pid
+            own = os.getpgid(pid)
         except (ProcessLookupError, PermissionError, OSError):
-            pass
+            own = None
+        if group_pgid is None and own == pid:
+            group_pgid = pid
+        if group_pgid is not None and own != group_pgid:
+            group_pgid = None
+        if group_pgid is not None:
+            trust_group(process, group_pgid)
     # The group first, while the leader (checked just above) still reserves
     # its id: signalling the leader first lets asyncio's watcher thread reap
     # it before the group signal, and the id could be reused in that gap.
@@ -216,7 +288,7 @@ def kill_process_tree_now(
             os.killpg(group_pgid, sig)
     if isinstance(pid, int):
         with contextlib.suppress(Exception):  # never raises, whatever `process` is
-            if sig == signal.SIGKILL:
+            if sig == _sigkill():
                 process.kill()
             else:
                 process.send_signal(sig)
@@ -238,7 +310,7 @@ def kill_tree(process: Any, *, terminate: bool = False) -> None:
         with contextlib.suppress(ProcessLookupError, OSError, AttributeError):
             process.terminate() if terminate else process.kill()
         return
-    sig = signal.SIGTERM if terminate else signal.SIGKILL
+    sig = signal.SIGTERM if terminate else _sigkill()
     # The spawn contract: a detached child's pgid is its pid. While it is
     # reserved, it is confirmed; once reaped, the retained-group checks apply.
     group: int | None = process.pid
@@ -383,6 +455,10 @@ def track(process: Any) -> None:
     If assignment fails (a nested-job restriction on old Windows), the child
     is tracked by nothing and its kill falls back to the child alone."""
     if not _windows():
+        # The spawn contract: a detached child leads a group whose id is its
+        # pid. Trusted from here until the group is observed empty.
+        if _is_child(process) and process_groups_supported():
+            trust_group(process, process.pid)
         return
     _prune_jobs()
     import ctypes
@@ -494,35 +570,83 @@ class _StoppableReader:
             self._selector.close()
 
 
-class _BlockingReader:
-    """``read1`` by a plain blocking read, where a pipe cannot be waited on
-    with a selector -- Windows, where ``select`` takes sockets only (round 7,
-    codex F003). It drains normally and ends at the pipe's end. It cannot be
-    stopped early: if a descendant keeps the write end open past the
-    context, this daemon thread and its read end live until that descendant
-    closes it, and no longer -- the bounded leak documented in
-    ``tests/test_child_output.py``."""
+#: How often a Windows drain looks at its pipe and its stop event.
+_POLL_SECONDS = 0.05
 
-    def __init__(self, fd: int) -> None:
+
+def _peek_pipe(fd: int) -> int | None:  # pragma: no cover - Windows only
+    """Bytes ready in a Windows pipe, without blocking (``PeekNamedPipe``);
+    ``None`` at the pipe's end (every writer closed) or on any failure."""
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        handle = msvcrt.get_osfhandle(fd)  # type: ignore[attr-defined]
+        available = wintypes.DWORD(0)
+        ok = _kernel32().PeekNamedPipe(
+            wintypes.HANDLE(handle), None, 0, None, ctypes.byref(available), None
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if not ok:
+        return None
+    return int(available.value)
+
+
+class _PollingReader:
+    """``read1`` for Windows, where ``select`` takes sockets only (round 7,
+    codex F003): it reads only what :func:`_peek_pipe` reports ready, so it
+    never blocks in ``ReadFile``, and it checks the stop event between
+    looks. Its lifetime is pmcp's, not the downstream's (round 8, codex
+    F004): once stopped it reads what is already there once and ends,
+    within :data:`_POLL_SECONDS`, even while a descendant holds the write
+    end open forever."""
+
+    def __init__(self, fd: int, stop: threading.Event) -> None:
         self._fd = fd
+        self._stop = stop
+        self._stopping = False
 
     def read1(self, size: int) -> bytes:
-        return os.read(self._fd, size)
+        if self._stopping:
+            return b""
+        while True:
+            available = _peek_pipe(self._fd)
+            if available is None:
+                return b""  # the pipe's end
+            if available:
+                return os.read(self._fd, min(size, available))
+            if self._stop.is_set():
+                self._stopping = True
+                # One last look at what is already there, then the end.
+                available = _peek_pipe(self._fd)
+                if available:
+                    return os.read(self._fd, min(size, available))
+                return b""
+            self._stop.wait(_POLL_SECONDS)
 
     def close(self) -> None:
         pass
 
 
-def _drain_until_stopped(fd: int, stop_fd: int, emit: Any) -> None:
+def _drain_until_stopped(
+    fd: int, stop_fd: int, emit: Any, stop: threading.Event | None = None
+) -> None:
     """The drain thread: reads ``fd`` until its end or a stop signal, then
     closes both read ends itself -- the only closer of ``fd``, so no other
     thread can close a descriptor number this one is still reading."""
-    reader: _StoppableReader | _BlockingReader | None = None
+    reader: _StoppableReader | _PollingReader | None = None
     try:
         # POSIX: wait on the pipe and the stop pipe together. Windows: `select`
         # takes sockets only -- it accepts a pipe's registration and fails
-        # only when it waits -- so a blocking read (round 7, codex F003).
-        reader = _BlockingReader(fd) if _windows() else _StoppableReader(fd, stop_fd)
+        # only when it waits -- so a polling read that also watches the stop
+        # event (round 7, codex F003; round 8, codex F004).
+        reader = (
+            _PollingReader(fd, stop or threading.Event())
+            if _windows()
+            else _StoppableReader(fd, stop_fd)
+        )
         for raw, truncated in bounded_lines(reader):  # type: ignore[arg-type]
             emit(_render(raw, truncated))
     except Exception:  # noqa: BLE001 -- a drain must never raise
@@ -554,6 +678,7 @@ async def drained_errlog(label: str, logger: logging.Logger) -> AsyncIterator[Te
 
     read_fd, write_fd = os.pipe()
     stop_read, stop_write = os.pipe()
+    stop = threading.Event()
     writer = os.fdopen(write_fd, "w", encoding="utf-8", errors="replace")
 
     def emit(line: str) -> None:
@@ -561,7 +686,7 @@ async def drained_errlog(label: str, logger: logging.Logger) -> AsyncIterator[Te
 
     thread = threading.Thread(
         target=_drain_until_stopped,
-        args=(read_fd, stop_read, emit),
+        args=(read_fd, stop_read, emit, stop),
         name=f"pmcp-errlog-{label}",
         daemon=True,
     )
@@ -581,13 +706,77 @@ async def drained_errlog(label: str, logger: logging.Logger) -> AsyncIterator[Te
             # Always, cancellation included (round 7, codex F001): closing the
             # stop pipe's write end wakes the drain if it is still waiting on
             # a descendant, and it closes the read ends itself.
+            stop.set()
             with contextlib.suppress(OSError):
                 os.close(stop_write)
-            # On Windows the stop wakes nothing (a blocking read): no second
-            # wait for a drain that only its descendant's exit can end.
-            if not _windows():
-                with anyio.CancelScope(shield=True), contextlib.suppress(Exception):
-                    await anyio.to_thread.run_sync(thread.join, _DRAIN_JOIN_SECONDS)
+            with anyio.CancelScope(shield=True), contextlib.suppress(Exception):
+                await anyio.to_thread.run_sync(thread.join, _DRAIN_JOIN_SECONDS)
+
+
+#: How long :func:`owned` waits to reap a killed synchronous child.
+_REAP_SECONDS = 2.0
+
+
+@contextlib.contextmanager
+def owned(process: Any) -> Iterator[Any]:
+    """The owner's scope of a child pmcp spawned (round 8, codex F003): on
+    every exit from it -- return, error, timeout, cancellation -- the child
+    and everything it started are killed through the one kill rule
+    (:func:`kill_tree`), synchronously, so no await can skip it. A child
+    that already exited costs one probe of its group; a descendant it left
+    running is killed. A synchronous child is then reaped."""
+    try:
+        yield process
+    finally:
+        kill_tree(process)
+        if isinstance(process, subprocess.Popen) and process.returncode is None:
+            with contextlib.suppress(Exception):
+                process.wait(timeout=_REAP_SECONDS)
+
+
+def run_captured(
+    command: Sequence[str], *, timeout: float | None = None
+) -> subprocess.CompletedProcess[str]:
+    """``subprocess.run(command, capture_output=True, text=True)`` for a
+    short probe (a service check): detached, stdin closed, the environment
+    from the one spawn builder, and owned -- killed with its group on every
+    exit, a timeout or an interrupt included. Raises ``OSError`` as
+    ``subprocess.run`` does, and ``subprocess.TimeoutExpired``."""
+    from pmcp.env_store import child_process_env
+
+    process = subprocess.Popen(
+        list(command),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=child_process_env(),
+        **detached(),
+    )
+    track(process)
+    with owned(process):
+        stdout, stderr = process.communicate(timeout=timeout)
+    return subprocess.CompletedProcess(
+        list(command), int(process.returncode), stdout, stderr
+    )
+
+
+#: How often :func:`watch_group` probes a group its leader left behind.
+_WATCH_SECONDS = 0.5
+
+
+async def watch_group(process: Any, pgid: int | None) -> None:
+    """Forget a long-lived child's group as soon as it is empty (round 8,
+    claude N-A): once the leader is done, the group is probed every
+    :data:`_WATCH_SECONDS` until the first probe that finds no member, which
+    forgets the id -- so it is not trusted across a pid wrap. Ends at once
+    for an untrusted id; never raises."""
+    if not group_trusted(pgid, process):
+        return
+    with contextlib.suppress(Exception):
+        await process.wait()
+    while observe_group(pgid, process):
+        await asyncio.sleep(_WATCH_SECONDS)
 
 
 def run_echoed(command: Sequence[str]) -> int:
@@ -611,11 +800,12 @@ def run_echoed(command: Sequence[str]) -> int:
         **detached(),
     )
     track(process)
-    try:
-        output, _ = process.communicate()
-    except KeyboardInterrupt:
-        interrupt_tree(process)
-        raise
+    with owned(process):
+        try:
+            output, _ = process.communicate()
+        except KeyboardInterrupt:
+            interrupt_tree(process)
+            raise
     if isinstance(output, bytes) and output:
         import io
 

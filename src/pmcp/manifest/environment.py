@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from pmcp.child_output import detached, kill_tree, track
+from pmcp.child_output import detached, owned, track
 from pmcp.env_store import child_process_env
 from pmcp.waits import bounded_wait
 import logging
@@ -75,8 +75,6 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
     if not path:
         return None
 
-    process: asyncio.subprocess.Process | None = None
-    finished = False
     try:
         # Run version check command
         # Detached, stdin closed: a check command an overlay names cannot
@@ -90,8 +88,10 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
             **detached(),
         )
         track(process)  # its Job Object on Windows
-        stdout, stderr = await bounded_wait(process.communicate(), timeout=5.0)
-        finished = True
+        # Owned: killed with everything it started on every exit -- a timeout,
+        # a cancellation, or a descendant left behind (round 8, codex F003).
+        with owned(process):
+            stdout, stderr = await bounded_wait(process.communicate(), timeout=5.0)
 
         if process.returncode == 0:
             version = stdout.decode().strip() or stderr.decode().strip()
@@ -108,20 +108,12 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
     except Exception as e:
         logger.debug(f"Error checking CLI {_label(name)}: {type(e).__name__}")
         return None
-    finally:
-        # A check that timed out (or was cancelled) is killed with everything
-        # it started (round 6, claude N-B) -- also when it exited first and a
-        # descendant still holds its pipes (round 7, codex F002).
-        if process is not None and not finished:
-            kill_tree(process)
 
 
 async def get_cli_help(
     name: str, help_command: list[str], max_lines: int = 50
 ) -> str | None:
     """Get help output for a CLI."""
-    process: asyncio.subprocess.Process | None = None
-    finished = False
     try:
         process = await asyncio.create_subprocess_exec(
             *help_command,
@@ -132,8 +124,8 @@ async def get_cli_help(
             **detached(),
         )
         track(process)  # its Job Object on Windows
-        stdout, stderr = await bounded_wait(process.communicate(), timeout=10.0)
-        finished = True
+        with owned(process):
+            stdout, stderr = await bounded_wait(process.communicate(), timeout=10.0)
 
         output = stdout.decode() or stderr.decode()
         lines = output.strip().split("\n")[:max_lines]
@@ -145,9 +137,6 @@ async def get_cli_help(
     except Exception as e:
         logger.debug(f"Error getting help for {_label(name)}: {type(e).__name__}")
         return None
-    finally:
-        if process is not None and not finished:
-            kill_tree(process)
 
 
 async def probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:

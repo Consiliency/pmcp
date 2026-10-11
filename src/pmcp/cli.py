@@ -11,7 +11,7 @@ import logging
 import os
 import shutil
 import signal
-import subprocess
+import subprocess  # noqa: F401 -- tests patch `cli.subprocess`
 import sys
 from pathlib import Path
 from collections.abc import Callable
@@ -39,7 +39,6 @@ from pmcp.config.loader import (
     set_startup_policy,
 )
 from pmcp.env_store import (
-    child_process_env,
     credential_value,
     describe_ignored_trust_env_var,
     env_key_is_operator_supplied,
@@ -56,7 +55,7 @@ from pmcp.env_store import (
 from pmcp.validation import is_valid_package_version, parse_package_spec
 from pmcp.manifest.loader import load_manifest
 from pmcp.parsing import load_json, load_json_file
-from pmcp.child_output import detached, run_echoed
+from pmcp.child_output import run_captured, run_echoed
 from pmcp.provision_gate import operator_safe
 from pmcp.types import StartupPolicyOperation
 
@@ -2057,15 +2056,8 @@ def _is_pmcp_system_service_active() -> bool | None:
         return None
 
     try:
-        proc = subprocess.run(
-            ["systemctl", "--user", "is-active", "pmcp"],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=child_process_env(),
-            stdin=subprocess.DEVNULL,
-            **detached(),
-        )
+        # Owned: killed with its group on every exit (round 8, codex F003).
+        proc = run_captured(["systemctl", "--user", "is-active", "pmcp"])
     except OSError:
         return None
 
@@ -2340,14 +2332,7 @@ async def run_doctor(args: argparse.Namespace) -> None:
 def _restart_local_pmcp_service() -> None:
     """Best-effort restart of the local pmcp service (systemd user or launchd)."""
     if shutil.which("systemctl") and Path("/run/systemd/system").exists():
-        probe = subprocess.run(
-            ["systemctl", "--user", "is-active", "pmcp.service"],
-            capture_output=True,
-            text=True,
-            env=child_process_env(),
-            stdin=subprocess.DEVNULL,
-            **detached(),
-        )
+        probe = run_captured(["systemctl", "--user", "is-active", "pmcp.service"])
         if probe.returncode != 0:
             print("No active pmcp systemd user service found — skipping restart.")
             return

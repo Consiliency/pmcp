@@ -3563,13 +3563,6 @@ class GatewayTools:
         group_pgid = _spawned_group_pgid(process)
         try:
             stdout, stderr = await bounded_wait(process.communicate(), timeout=60.0)
-        except asyncio.CancelledError:
-            # Kill the tree before propagating; cancellation must not leak a
-            # process. Synchronously: an await here could itself be cancelled
-            # (loop shutdown) and skip the kill (Consiliency/pmcp#324).
-            # Re-raised unchanged -- a cancellation is not a timeout.
-            _kill_process_tree_now(process, group_pgid=group_pgid)
-            raise
         except (asyncio.TimeoutError, TimeoutError) as exc:
             # asyncio.TimeoutError is listed EXPLICITLY: it only became an alias
             # of the builtin TimeoutError in 3.11, and this project supports
@@ -3588,6 +3581,14 @@ class GatewayTools:
             # -- with an empty reason, because wait_for raises with no args
             # (Consiliency/pmcp#269).
             raise TimeoutError("update probe timed out after 60 seconds") from exc
+        finally:
+            # Every exit -- a cancellation (re-raised unchanged: it is not a
+            # timeout), an error, success: the probe and whatever it left
+            # running are killed before anything propagates. Synchronously:
+            # an await here could itself be cancelled (loop shutdown) and skip
+            # the kill (Consiliency/pmcp#324; round 8, codex F003). After the
+            # timeout path above it is a probe of an empty group.
+            _kill_process_tree_now(process, group_pgid=group_pgid)
         output = (
             stdout.decode("utf-8", errors="replace")
             + "\n"

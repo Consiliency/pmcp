@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from pmcp.child_output import detached, kill_tree, track
+from pmcp.child_output import detached, kill_tree, owned, track
 from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.env_store import (
     credential_value,
@@ -485,6 +485,9 @@ class JobManager:
         finally:
             # Only clear process if NOT server_ready (process needed for handoff)
             if job.status != "server_ready":
+                # Every exit but the handoff: whatever the install left
+                # running is killed, synchronously (round 8, codex F003).
+                kill_tree(process)
                 job.process = None  # Allow GC
 
     async def _safe_terminate_process(
@@ -737,10 +740,13 @@ async def install_server(
         )
         track(process)  # its Job Object on Windows
 
-        stdout, stderr = await bounded_wait(
-            process.communicate(),
-            timeout=timeout,
-        )
+        # Owned: killed with everything it started on every exit, a
+        # cancelled caller included (round 8, codex F003).
+        with owned(process):
+            stdout, stderr = await bounded_wait(
+                process.communicate(),
+                timeout=timeout,
+            )
 
         if process.returncode != 0:
             error_output = stderr.decode() or stdout.decode()
@@ -753,9 +759,8 @@ async def install_server(
     except asyncio.TimeoutError:
         # Kill the process on timeout
         if process:
-            # Also when it exited first and a descendant still holds its
-            # pipes, so communicate() timed out (round 7, codex F002).
-            kill_tree(process)
+            # Killed by `owned` above, also when it exited first and a
+            # descendant still held its pipes (round 7, codex F002); reaped.
             if process.returncode is None:
                 await process.wait()
         raise InstallError(
@@ -800,7 +805,10 @@ async def verify_installation(
         )
         track(process)  # its Job Object on Windows
 
-        await bounded_wait(process.communicate(), timeout=5.0)
+        # Owned: a verification that times out is killed with everything it
+        # started, not left running (round 8, codex F003).
+        with owned(process):
+            await bounded_wait(process.communicate(), timeout=5.0)
         return True
 
     except Exception:
