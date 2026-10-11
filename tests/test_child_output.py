@@ -722,43 +722,55 @@ async def test_the_drain_waits_off_the_event_loop(
 # --- round 6, claude N-C: the audit-hook backstop ---------------------------------
 
 
-def test_the_audit_backstop_records_an_undetached_spawn_from_pmcp_code() -> None:
-    """A spawn the static guard cannot see (here, behind `getattr`), from a
-    frame in pmcp's own source, is recorded by the session's audit hook --
-    and then removed, so this deliberate one does not fail the session."""
-    import pmcp
+def _run_probe(tmp_path: Path, source: str) -> list[tuple[str, str]]:
+    """Run ``source`` as if it were pmcp code: compiled under a root the
+    audit hook treats as pmcp's. Returns the violations it recorded, and
+    removes them so a deliberate one does not fail the session."""
     from tests import conftest
 
-    probe = Path(pmcp.__file__).parent / "_audit_probe_does_not_exist.py"
-    source = (
-        "import subprocess, sys\n"
-        "spawn = getattr(subprocess, 'run')\n"
-        "spawn([sys.executable, '-c', 'pass'])\n"
-    )
+    root = str(tmp_path) + os.sep
+    probe = tmp_path / "_audit_probe.py"
     before = len(conftest.SPAWN_VIOLATIONS)
-    exec(compile(source, str(probe), "exec"), {})  # noqa: S102 - the probe
+    conftest.SPAWN_AUDIT_EXTRA_ROOTS.append(root)
+    try:
+        exec(compile(source, str(probe), "exec"), {})  # noqa: S102 - the probe
+    finally:
+        conftest.SPAWN_AUDIT_EXTRA_ROOTS.remove(root)
     caught = conftest.SPAWN_VIOLATIONS[before:]
     del conftest.SPAWN_VIOLATIONS[before:]
+    return caught
+
+
+def test_the_audit_backstop_records_an_undetached_spawn_from_pmcp_code(
+    tmp_path: Path,
+) -> None:
+    """A spawn the static guard cannot see (here, behind `getattr`), from a
+    frame the hook treats as pmcp's own source, is recorded by the session's
+    audit hook. The probe lives in a temporary root, not `src/pmcp`:
+    coverage would report a file there."""
+    caught = _run_probe(
+        tmp_path,
+        "import subprocess, sys\n"
+        "spawn = getattr(subprocess, 'run')\n"
+        "spawn([sys.executable, '-c', 'pass'])\n",
+    )
     assert len(caught) == 1, caught
     where, problem = caught[0]
-    assert where.startswith("_audit_probe_does_not_exist.py:"), where
+    assert where.startswith("_audit_probe.py:"), where
     assert "not detached" in problem and "stdin inherited" in problem, problem
     assert "stdout inherited" in problem and "stderr inherited" in problem, problem
 
 
-def test_the_audit_backstop_passes_a_detached_spawn_from_pmcp_code() -> None:
-    import pmcp
-    from tests import conftest
-
-    probe = Path(pmcp.__file__).parent / "_audit_probe_does_not_exist.py"
-    source = (
+def test_the_audit_backstop_passes_a_detached_spawn_from_pmcp_code(
+    tmp_path: Path,
+) -> None:
+    caught = _run_probe(
+        tmp_path,
         "import subprocess, sys\n"
         "subprocess.run([sys.executable, '-c', 'pass'], stdin=subprocess.DEVNULL,\n"
-        "    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)\n"
+        "    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)\n",
     )
-    before = len(conftest.SPAWN_VIOLATIONS)
-    exec(compile(source, str(probe), "exec"), {})  # noqa: S102 - the probe
-    assert conftest.SPAWN_VIOLATIONS[before:] == []
+    assert caught == []
 
 
 # --- round 6: the drain releases everything; groups are killed whole ---------------
@@ -927,3 +939,54 @@ async def test_the_drain_releases_its_thread_and_fds_while_a_descendant_lives(
         for d in descendants:
             d.kill()
             d.wait()
+
+
+def test_kill_tree_signals_no_group_for_an_object_that_only_has_a_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A test double or adopted handle with a `pid` is killed through its
+    own `kill`, never `killpg`: in CI a double's `pid = 4321` named a real
+    process group, and the group kill ended the test run."""
+    from pmcp import child_output
+
+    groups: list[int] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: groups.append(pgid))
+
+    class _Double:
+        pid = os.getpid()
+        returncode = None
+        killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def terminate(self) -> None:
+            self.killed = True
+
+    double = _Double()
+    child_output.kill_tree(double)
+    child_output.kill_tree(double, terminate=True)
+    assert groups == []
+    assert double.killed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_kill_tree_signals_no_group_once_the_child_is_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once reaped, a child's pid can be reused as another group's id: no
+    group signal then (Consiliency/pmcp#324's rule)."""
+    from pmcp import child_output
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    process.wait()
+    groups: list[int] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: groups.append(pgid))
+    child_output.kill_tree(process)
+    assert groups == []

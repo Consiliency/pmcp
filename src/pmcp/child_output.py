@@ -15,6 +15,7 @@ pins that no spawn in ``src/pmcp`` inherits a stream.
 
 from __future__ import annotations
 
+import asyncio.subprocess
 import contextlib
 import logging
 import os
@@ -105,9 +106,20 @@ def kill_tree(process: Any, *, terminate: bool = False) -> None:
     started: on POSIX its whole process group (its pgid is its pid), so an
     npm lifecycle script or a node-gyp build it spawned does not run on
     (Consiliency/pmcp#388 round 6, claude N-B); elsewhere the child itself.
-    SIGTERM with ``terminate``, else SIGKILL. Never raises."""
+    SIGTERM with ``terminate``, else SIGKILL. Never raises.
+
+    Only a real child is signalled by group, and only a group it leads: an
+    object that merely has a ``pid`` (a test double, an adopted handle) is
+    signalled through its own ``kill``/``terminate``, never ``killpg`` -- a
+    group id taken from anything else could be another process's group."""
     pid = getattr(process, "pid", None)
-    if os.name != "nt" and isinstance(pid, int) and hasattr(os, "killpg"):
+    if (
+        os.name != "nt"
+        and hasattr(os, "killpg")
+        and isinstance(pid, int)
+        and isinstance(process, (subprocess.Popen, asyncio.subprocess.Process))
+        and _leads_its_group(process, pid)
+    ):
         sig = signal.SIGTERM if terminate else signal.SIGKILL
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(pid, sig)
@@ -116,22 +128,66 @@ def kill_tree(process: Any, *, terminate: bool = False) -> None:
         process.terminate() if terminate else process.kill()
 
 
+def _leads_its_group(process: Any, pid: int) -> bool:
+    """Whether ``pid`` is the group pmcp's child leads, and still names it:
+    only while the child has not been reaped -- alive, or a zombie its
+    parent has not waited for -- is its pid reserved, so a group signal
+    cannot reach another process's group (Consiliency/pmcp#324's rule)."""
+    if process.returncode is not None:
+        return False
+    try:
+        return os.getpgid(pid) == pid
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def _exited_unreaped(pid: int, within: float) -> bool:
+    """Wait up to ``within`` seconds for ``pid`` to exit WITHOUT reaping it
+    (``WNOWAIT``), so its pid -- and the group id it leads -- stays reserved
+    for the group signal that follows."""
+    import time
+
+    deadline = time.monotonic() + within
+    while True:
+        try:
+            info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            return True
+        if info is not None:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def interrupt_tree(process: subprocess.Popen[bytes]) -> None:
     """Forward an operator's Ctrl-C to a detached child's group, which no
     longer receives the terminal's SIGINT (round 6, claude N-A): SIGINT to
     the group (``CTRL_BREAK_EVENT`` to the child's process group on
     Windows), up to :data:`_INTERRUPT_GRACE_SECONDS` for it to exit, then
-    SIGKILL to whatever of the group is left. Never raises."""
-    if os.name == "nt":
+    SIGKILL to whatever of the group is left -- sent before the child is
+    reaped, so the group id still names its group. Never raises."""
+    if os.name == "nt" or not hasattr(os, "waitid"):
         with contextlib.suppress(Exception):
             process.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
-    else:
+        with contextlib.suppress(Exception):
+            process.wait(timeout=_INTERRUPT_GRACE_SECONDS)
+        kill_tree(process)
+        with contextlib.suppress(Exception):
+            process.wait(timeout=2.0)
+        return
+    pid = process.pid
+    leads = _leads_its_group(process, pid)
+    if leads:
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(process.pid, signal.SIGINT)
-    with contextlib.suppress(Exception):
-        process.wait(timeout=_INTERRUPT_GRACE_SECONDS)
-    # The leader may have exited and left children: the group, always.
-    kill_tree(process)
+            os.killpg(pid, signal.SIGINT)
+        _exited_unreaped(pid, _INTERRUPT_GRACE_SECONDS)
+        # The leader is alive or an unreaped zombie: its group id is still
+        # its own. Whatever of the group is left is killed.
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(pid, signal.SIGKILL)
+    else:
+        kill_tree(process)
     with contextlib.suppress(Exception):
         process.wait(timeout=2.0)
 

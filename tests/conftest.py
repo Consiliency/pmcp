@@ -119,13 +119,19 @@ def _pmcp_source() -> str:
     return _PMCP_SOURCE[0]
 
 
+#: Extra source roots the hook treats as pmcp's (its own tests' probes,
+#: which must not be written under `src/pmcp`: coverage would report them).
+SPAWN_AUDIT_EXTRA_ROOTS: list[str] = []
+
+
 def _pmcp_caller(frame: Any) -> str | None:
     """``path:line`` of the innermost frame in pmcp's own source, or None."""
-    root = _pmcp_source()
+    roots = (_pmcp_source(), *SPAWN_AUDIT_EXTRA_ROOTS)
     while frame is not None:
         filename = frame.f_code.co_filename
-        if filename.startswith(root):
-            return f"{filename[len(root) :]}:{frame.f_lineno}"
+        for root in roots:
+            if filename.startswith(root):
+                return f"{filename[len(root) :]}:{frame.f_lineno}"
         frame = frame.f_back
     return None
 
