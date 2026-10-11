@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pmcp.child_output import detached
 from pmcp.env_store import child_process_env
 from pmcp.waits import bounded_wait
 import logging
@@ -76,11 +77,15 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
 
     try:
         # Run version check command
+        # Detached, stdin closed: a check command an overlay names cannot
+        # reach the operator's terminal (Consiliency/pmcp#388 round 5).
         process = await asyncio.create_subprocess_exec(
             *check_command,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=child_process_env(),
+            **detached(),
         )
         stdout, stderr = await bounded_wait(process.communicate(), timeout=5.0)
 
@@ -108,9 +113,11 @@ async def get_cli_help(
     try:
         process = await asyncio.create_subprocess_exec(
             *help_command,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=child_process_env(),
+            **detached(),
         )
         stdout, stderr = await bounded_wait(process.communicate(), timeout=10.0)
 

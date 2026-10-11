@@ -372,56 +372,54 @@ async def refresh_server(
         # The child's stderr is piped and logged, escaped -- never the
         # operator's terminal (Consiliency/pmcp#388 round 4, grok F001: the
         # SDK's default `errlog` is `sys.stderr`, which the child inherited).
-        with (
-            drained_errlog(server_name, logger) as errlog,
-            anyio.fail_after(REFRESH_TIMEOUT_SECONDS),
-        ):
-            async with stdio_client(server_params, errlog=errlog) as (read, write):
-                async with ClientSession(
-                    read, write, read_timeout_seconds=REFRESH_READ_TIMEOUT_SECONDS
-                ) as session:
-                    await session.initialize()
+        async with drained_errlog(server_name, logger) as errlog:
+            with anyio.fail_after(REFRESH_TIMEOUT_SECONDS):
+                async with stdio_client(server_params, errlog=errlog) as (read, write):
+                    async with ClientSession(
+                        read, write, read_timeout_seconds=REFRESH_READ_TIMEOUT_SECONDS
+                    ) as session:
+                        await session.initialize()
 
-                    # List tools
-                    tools_result = await session.list_tools()
-                    tools = tools_result.tools
+                        # List tools
+                        tools_result = await session.list_tools()
+                        tools = tools_result.tools
 
-                    logger.info(f"Found {len(tools)} tools for {server_name}")
+                        logger.info(f"Found {len(tools)} tools for {server_name}")
 
-                    # Convert to PrebuiltToolInfo
-                    prebuilt_tools = []
-                    for tool in tools:
-                        name = tool.name
-                        description = tool.description or ""
-                        short_desc = (
-                            description[:100] + "..."
-                            if len(description) > 100
-                            else description
-                        )
-
-                        prebuilt_tools.append(
-                            PrebuiltToolInfo(
-                                name=name,
-                                description=description,
-                                short_description=short_desc,
-                                tags=_extract_tags(name, description),
-                                risk_hint=_infer_risk(name, description),
+                        # Convert to PrebuiltToolInfo
+                        prebuilt_tools = []
+                        for tool in tools:
+                            name = tool.name
+                            description = tool.description or ""
+                            short_desc = (
+                                description[:100] + "..."
+                                if len(description) > 100
+                                else description
                             )
+
+                            prebuilt_tools.append(
+                                PrebuiltToolInfo(
+                                    name=name,
+                                    description=description,
+                                    short_description=short_desc,
+                                    tags=_extract_tags(name, description),
+                                    risk_hint=_infer_risk(name, description),
+                                )
+                            )
+
+                        # Generate capability summary
+                        capability_summary = await _generate_capability_summary(
+                            server_name, prebuilt_tools
                         )
 
-                    # Generate capability summary
-                    capability_summary = await _generate_capability_summary(
-                        server_name, prebuilt_tools
-                    )
-
-                    return GeneratedServerDescriptions(
-                        package=pkg_name,
-                        package_type=pkg_type,
-                        version=version,
-                        generated_at=datetime.now(timezone.utc).isoformat(),
-                        capability_summary=capability_summary,
-                        tools=prebuilt_tools,
-                    )
+                        return GeneratedServerDescriptions(
+                            package=pkg_name,
+                            package_type=pkg_type,
+                            version=version,
+                            generated_at=datetime.now(timezone.utc).isoformat(),
+                            capability_summary=capability_summary,
+                            tools=prebuilt_tools,
+                        )
 
     except Exception as e:
         logger.error(f"Failed to refresh {server_name}: {exception_text(e)}")

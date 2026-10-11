@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from pmcp.child_output import detached
 from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.env_store import (
     credential_value,
@@ -221,6 +222,8 @@ class JobManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=build_install_child_env(server_config, project_root),
+                # No controlling terminal (Consiliency/pmcp#388 round 5).
+                **detached(),
             )
             job.process = process
             job.status = "installing"
@@ -720,9 +723,11 @@ async def install_server(
         )
         process = await asyncio.create_subprocess_exec(
             *install_cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=build_install_child_env(server_config, project_root),
+            **detached(),
         )
 
         stdout, stderr = await bounded_wait(
@@ -777,9 +782,11 @@ async def verify_installation(
         )
         process = await asyncio.create_subprocess_exec(
             *verify_cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=build_install_child_env(server_config, project_root),
+            **detached(),
         )
 
         await bounded_wait(process.communicate(), timeout=5.0)

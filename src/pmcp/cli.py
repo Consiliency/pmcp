@@ -56,7 +56,7 @@ from pmcp.env_store import (
 from pmcp.validation import is_valid_package_version, parse_package_spec
 from pmcp.manifest.loader import load_manifest
 from pmcp.parsing import load_json, load_json_file
-from pmcp.child_output import run_echoed
+from pmcp.child_output import detached, run_echoed
 from pmcp.provision_gate import operator_safe
 from pmcp.types import StartupPolicyOperation
 
@@ -2063,6 +2063,8 @@ def _is_pmcp_system_service_active() -> bool | None:
             text=True,
             check=False,
             env=child_process_env(),
+            stdin=subprocess.DEVNULL,
+            **detached(),
         )
     except OSError:
         return None
@@ -2343,6 +2345,8 @@ def _restart_local_pmcp_service() -> None:
             capture_output=True,
             text=True,
             env=child_process_env(),
+            stdin=subprocess.DEVNULL,
+            **detached(),
         )
         if probe.returncode != 0:
             print("No active pmcp systemd user service found — skipping restart.")

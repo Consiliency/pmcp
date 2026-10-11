@@ -78,16 +78,40 @@ def _spawn_calls() -> list[tuple[str, ast.Call, str]]:
     return found
 
 
+def _detached(call: ast.Call, keywords: dict[str, ast.expr]) -> bool:
+    """`start_new_session=True`, or the `**detached()` splat."""
+    session = keywords.get("start_new_session")
+    if isinstance(session, ast.Constant) and session.value is True:
+        return True
+    return any(
+        k.arg is None
+        and isinstance(k.value, ast.Call)
+        and getattr(k.value.func, "id", getattr(k.value.func, "attr", None))
+        == "detached"
+        for k in call.keywords
+    )
+
+
 def _streams_problem(call: ast.Call, kind: str) -> str | None:
-    """Why ``call`` lets a child write to pmcp's own streams, or None."""
+    """Why ``call``'s child can reach pmcp's terminal, or None: every spawn
+    is detached from the controlling terminal (round 5), takes stdin from
+    ``DEVNULL`` or a pipe it owns (round 5), and has stdout and stderr
+    piped or discarded (round 4)."""
     keywords = {k.arg: k.value for k in call.keywords if k.arg}
     if kind == "stdio_client":
+        # The SDK detaches the child and owns its stdin
+        # (`test_the_sdks_stdio_spawn_is_detached_with_a_piped_stdin`).
         errlog = keywords.get("errlog")
         if errlog is None or ast.unparse(errlog) in ("sys.stderr", "sys.stdout"):
             return "stdio_client without a piped errlog"
         return None
     if kind in ("os.system", "os.popen", "pty.spawn") or kind.startswith("os.exec"):
         return f"{kind} always shares the terminal"
+    if not _detached(call, keywords):
+        return "not detached from the controlling terminal"
+    stdin = keywords.get("stdin")
+    if not (isinstance(stdin, ast.Attribute) and stdin.attr in ("PIPE", "DEVNULL")):
+        return f"stdin={ast.unparse(stdin) if stdin is not None else 'inherited'}"
     if (
         isinstance(keywords.get("capture_output"), ast.Constant)
         and keywords["capture_output"].value is True
@@ -125,19 +149,36 @@ def test_the_spawn_guard_sees_each_shape() -> None:
         )
         return _streams_problem(call, kind)
 
-    assert problem("subprocess.run(['x'])") == "stdout=inherited"
-    assert (
-        problem("subprocess.run(['x'], stdout=subprocess.PIPE)") == "stderr=inherited"
+    ok = "stdin=subprocess.DEVNULL, **detached()"
+    assert problem(f"subprocess.run(['x'], capture_output=True, {ok})") is None
+    assert problem(
+        "subprocess.run(['x'], capture_output=True, stdin=subprocess.DEVNULL)"
+    ) == ("not detached from the controlling terminal")
+    assert problem("subprocess.run(['x'], capture_output=True, **detached())") == (
+        "stdin=inherited"
     )
-    assert problem("subprocess.run(['x'], capture_output=True)") is None
     assert (
-        problem("subprocess.run(['x'], stdout=subprocess.PIPE, stderr=sys.stderr)")
+        problem(
+            "subprocess.run(['x'], capture_output=True, stdin=subprocess.DEVNULL,"
+            " start_new_session=True)"
+        )
+        is None
+    )
+    assert problem(f"subprocess.run(['x'], {ok})") == "stdout=inherited"
+    assert problem(f"subprocess.run(['x'], stdout=subprocess.PIPE, {ok})") == (
+        "stderr=inherited"
+    )
+    assert (
+        problem(
+            f"subprocess.run(['x'], stdout=subprocess.PIPE, stderr=sys.stderr, {ok})"
+        )
         == "stderr=sys.stderr"
     )
     assert (
         problem(
-            "asyncio.create_subprocess_exec('x', stdout=asyncio.subprocess.PIPE,"
-            " stderr=asyncio.subprocess.DEVNULL)"
+            "asyncio.create_subprocess_exec('x', stdin=asyncio.subprocess.PIPE,"
+            " stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,"
+            " **detached())"
         )
         is None
     )
@@ -145,6 +186,33 @@ def test_the_spawn_guard_sees_each_shape() -> None:
     assert problem("stdio_client(params, errlog=sys.stderr)") is not None
     assert problem("stdio_client(params, errlog=errlog)") is None
     assert problem("os.system('x')") is not None
+
+
+def test_the_sdks_stdio_spawn_is_detached_with_a_piped_stdin() -> None:
+    """`stdio_client` (refresh) spawns through the SDK, which starts a new
+    session and pipes stdin on POSIX: read from the installed source."""
+    import mcp.client.stdio as stdio
+
+    source = Path(stdio.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    opens = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "open_process"
+    ]
+    assert opens, "the SDK no longer spawns through anyio.open_process"
+    for call in opens:
+        keywords = {k.arg: ast.unparse(k.value) for k in call.keywords}
+        assert keywords.get("start_new_session") == "True", keywords
+        # Not passed: anyio's own default, a pipe.
+        assert keywords.get("stdin", "PIPE").endswith("PIPE"), keywords
+    import inspect
+
+    import anyio
+
+    default = inspect.signature(anyio.open_process).parameters["stdin"].default
+    assert default == subprocess.PIPE
 
 
 def test_the_display_stream_hands_out_no_descriptor() -> None:
@@ -355,3 +423,235 @@ def test_an_exception_from_startup_is_escaped(
     err = capsys.readouterr().err
     assert "Fatal error" in err and "SENTINEL" in err, err
     assert not any(ch in err for ch in ("\x1b", "\x9b", "‮")), ascii(err)
+
+
+# --- round 5: the controlling terminal and stdin, under a real pty -------------
+
+#: The child: tries the controlling terminal (`/dev/tty`) and fd 0, writes
+#: ESC and U+009B to each, and records what it managed in a marker file.
+_TTY_CHILD = textwrap.dedent(
+    """
+    import os, sys
+    marker = sys.argv[1]
+    payload = "SENTINEL\\x1b[31m\\x9b2J\\u202e\\n".encode()
+    outcome = []
+    try:
+        fd = os.open("/dev/tty", os.O_WRONLY)
+        os.write(fd, payload)
+        os.close(fd)
+        outcome.append("tty-written")
+    except OSError:
+        outcome.append("no-tty")
+    outcome.append("fd0-is-a-tty" if os.isatty(0) else "fd0-not-a-tty")
+    try:
+        os.write(0, payload)  # /dev/null (DEVNULL is read-write) or a pipe
+    except OSError:
+        pass
+    with open(marker, "w") as handle:
+        handle.write(" ".join(outcome))
+    """
+)
+
+#: How each spawn site is driven from the parent, inside the pty session.
+_PTY_DRIVERS = {
+    "check_cli": (
+        "from pmcp.manifest import environment\n"
+        "asyncio.run(environment.check_cli('probe', CHILD))\n"
+    ),
+    "start_install": (
+        "from pmcp.manifest import installer\n"
+        "from pmcp.manifest.loader import ServerConfig\n"
+        "async def run():\n"
+        "    server = ServerConfig(name='memory', description='memory',\n"
+        "        keywords=['memory'], install={'linux': CHILD},\n"
+        "        command=CHILD[0], args=CHILD[1:], requires_api_key=False)\n"
+        "    await installer.JobManager().start_install(server, 'linux')\n"
+        "    for _ in range(100):\n"
+        "        if os.path.exists(MARKER):\n"
+        "            break\n"
+        "        await asyncio.sleep(0.05)\n"
+        "asyncio.run(run())\n"
+    ),
+    "run_echoed": ("from pmcp.child_output import run_echoed\nrun_echoed(CHILD)\n"),
+    "update_probe": (
+        "from pmcp.tools.handlers import GatewayTools\n"
+        "tools = GatewayTools.__new__(GatewayTools)\n"
+        "asyncio.run(tools._run_update_probe_command(CHILD, env=None))\n"
+    ),
+    "client_manager": (
+        "from pmcp.client.manager import ClientManager\n"
+        "from pmcp.config.loader import ResolvedServerConfig\n"
+        "from pmcp.types import LocalMcpServerConfig\n"
+        "async def run():\n"
+        "    config = ResolvedServerConfig(name='s388', source='custom',\n"
+        "        config=LocalMcpServerConfig(command=CHILD[0], args=CHILD[1:]))\n"
+        "    try:\n"
+        "        await asyncio.wait_for(ClientManager()._connect_stdio(config), 10)\n"
+        "    except BaseException:\n"
+        "        pass\n"
+        "asyncio.run(run())\n"
+    ),
+}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pty")
+@pytest.mark.parametrize("site", sorted(_PTY_DRIVERS))
+def test_a_child_reaches_neither_the_controlling_terminal_nor_stdin(
+    site: str, tmp_path: Path
+) -> None:
+    """The parent runs a spawn site with a pty as its controlling terminal
+    and its stdin, stdout and stderr; the child tries `/dev/tty` and fd 0.
+    Nothing it writes reaches the pty (round 5, grok and codex F001)."""
+    import fcntl
+    import pty  # noqa: F401 - POSIX only
+    import select
+    import termios
+
+    child = tmp_path / "child.py"
+    child.write_text(_TTY_CHILD)
+    marker = tmp_path / "marker"
+    script = (
+        "import asyncio, os, sys\n"
+        f"CHILD = [sys.executable, {str(child)!r}, {str(marker)!r}]\n"
+        f"MARKER = {str(marker)!r}\n" + _PTY_DRIVERS[site]
+    )
+    master, slave = os.openpty()
+
+    def controlling_terminal() -> None:
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PMCP_")}
+    env.update(PYTHONPATH=str(SRC.parent), HOME=str(tmp_path))
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        cwd=tmp_path,
+        env=env,
+        preexec_fn=controlling_terminal,  # noqa: PLW1509 - the test's own pty
+    )
+    os.close(slave)
+    seen = bytearray()
+    try:
+        while True:
+            ready, _, _ = select.select([master], [], [], 0.2)
+            if ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                seen += data
+            elif process.poll() is not None:
+                break
+        process.wait(timeout=60)
+    finally:
+        os.close(master)
+    assert marker.exists(), (site, bytes(seen[-2000:]))
+    outcome = marker.read_text()
+    assert outcome.split() == ["no-tty", "fd0-not-a-tty"], (site, outcome)
+    assert b"SENTINEL" not in seen and b"\x1b[31m" not in seen, (
+        site,
+        bytes(seen[-2000:]),
+    )
+
+
+# --- round 5, claude N-A and N-B: the stderr drain -------------------------------
+
+
+class _Chunks:
+    """A reader yielding ``total`` bytes of ``fill`` in chunks, then ``tail``,
+    never holding the whole input."""
+
+    def __init__(self, total: int, fill: bytes, tail: bytes) -> None:
+        self.left, self.fill, self.tail = total, fill, tail
+
+    def read1(self, size: int) -> bytes:
+        if self.left > 0:
+            n = min(size, self.left)
+            self.left -= n
+            return self.fill * n
+        tail, self.tail = self.tail, b""
+        return tail
+
+
+def test_a_long_line_is_capped_in_bounded_memory() -> None:
+    """32 MiB with no newline: one capped line with a value-free note, the
+    next line intact, and memory near one cap (round 5, claude N-B: 223 MiB)."""
+    import tracemalloc
+
+    from pmcp.child_output import LINE_CAP, TRUNCATED, _render, bounded_lines
+
+    tracemalloc.start()
+    try:
+        lines = list(bounded_lines(_Chunks(32 << 20, b"x", b"\nshort\n")))  # type: ignore[arg-type]
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert [(len(raw), cut) for raw, cut in lines] == [(LINE_CAP, True), (5, False)]
+    assert peak < 4 * LINE_CAP + (1 << 20), peak
+    assert _render(*lines[0]).endswith(TRUNCATED)
+    assert _render(*lines[1]) == "short"
+
+
+def test_lines_split_across_chunks_are_whole() -> None:
+    import io
+
+    from pmcp.child_output import bounded_lines
+
+    data = b"a\r\nbb\n\nccc" + b"d" * 70000 + b"\nlast"
+    got = list(bounded_lines(io.BytesIO(data)))
+    assert [raw[:3] for raw, _cut in got] == [b"a\r", b"bb", b"", b"cccd"[:3], b"las"]
+    assert got[3][1] is True and got[4] == (b"last", False)
+
+
+@pytest.mark.asyncio
+async def test_the_drain_waits_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A grandchild that keeps the pipe open: leaving the context waits for
+    the drain off the loop, so the loop keeps running (round 5, claude N-A),
+    and lines are logged escaped and capped."""
+    import asyncio
+    import logging
+    import time
+
+    from pmcp import child_output
+
+    monkeypatch.setattr(child_output, "_DRAIN_JOIN_SECONDS", 1.0)
+    caplog.set_level(logging.DEBUG)
+    logger = logging.getLogger("pmcp.test.drain")
+    gaps: list[float] = []
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        last = time.monotonic()
+        while not stop.is_set():
+            await asyncio.sleep(0.02)
+            now = time.monotonic()
+            gaps.append(now - last)
+            last = now
+
+    task = asyncio.create_task(ticker())
+    await asyncio.sleep(0.05)  # the ticker is running before the drain starts
+    held: int | None = None
+    try:
+        async with child_output.drained_errlog("srv", logger) as errlog:
+            errlog.write(f"hello {_HOSTILE}\n")
+            errlog.flush()
+            held = os.dup(errlog.fileno())  # a grandchild's copy of the write end
+        await asyncio.sleep(0.1)
+    finally:
+        stop.set()
+        await task
+        if held is not None:
+            os.close(held)
+    assert max(gaps) < 0.5, max(gaps)
+    text = "\n".join(
+        r.getMessage() for r in caplog.records if r.name == "pmcp.test.drain"
+    )
+    assert "[srv] stderr: hello SENTINEL" in text, text
+    assert "\x1b" not in text and "\x9b" not in text

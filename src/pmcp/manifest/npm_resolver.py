@@ -62,6 +62,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from pmcp.child_output import detached
 from pmcp.argument_errors import exception_text
 from pmcp.parsing import load_json
 
@@ -355,6 +356,8 @@ class NpmResolver:
                 text=True,
                 shell=False,
                 bufsize=1,
+                # No controlling terminal (Consiliency/pmcp#388 round 5).
+                **detached(),
             )
         except FileNotFoundError as exc:
             # node is not installed. This is the ONE spawn failure that learns

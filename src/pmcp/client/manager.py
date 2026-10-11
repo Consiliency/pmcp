@@ -28,6 +28,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
 from pydantic import ValidationError
 
+from pmcp.child_output import detached
 from pmcp.argument_errors import (
     describe_value,
     exception_text,
@@ -3232,8 +3233,9 @@ class ClientManager:
                 env=env,
                 limit=_stdio_read_limit(),
                 # New session/process group so we can reap the whole tree
-                # (e.g. browsers launched by the server) on disconnect.
-                start_new_session=True,
+                # (e.g. browsers launched by the server) on disconnect, and
+                # no controlling terminal (`start_new_session=True` on POSIX).
+                **detached(),
             )
 
         managed = ManagedClient(
