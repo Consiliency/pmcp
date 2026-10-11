@@ -109,8 +109,9 @@ def operator_safe(value: str) -> str:
     quoting when a control character was present, and ``repr()`` picks double
     quotes, inside which a shell still expands ``$(...)``.
     """
-    escaped = "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in value)
-    return shlex.quote(escaped)
+    from pmcp.display import display_safe
+
+    return shlex.quote(display_safe(value))
 
 
 def approve_package_command(identity: PackageIdentity) -> str:

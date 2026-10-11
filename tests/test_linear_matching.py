@@ -56,9 +56,10 @@ def test_codex_input_is_classified_in_bounded_time(size: int) -> None:
     assert _elapsed(_downstream_error, {"code": -32602, "message": message}) < _BUDGET_S
     assert _elapsed(sr.sdk_built_message, message, -32602) < _BUDGET_S
     # Not the peer's text: too long to be one the SDK formats, so the
-    # code's fixed phrase.
+    # code's fixed phrase, and why (round 2, claude N-B).
     assert str(_downstream_error({"code": -32602, "message": message})) == (
-        sr.sdk_message_phrase(-32602)
+        f"{sr.sdk_message_phrase(-32602)} (the server's message was not shown: "
+        f"over {sr.MAX_CLASSIFIED_LENGTH} characters)"
     )
 
 

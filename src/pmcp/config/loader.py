@@ -14,7 +14,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from pmcp.argument_errors import exception_text
+from pmcp.argument_errors import describe_value, exception_text
+from pmcp.display import display_safe
 from pmcp.parsing import load_json
 from pmcp.types import (
     ConfigSourceInfo,
@@ -510,11 +511,13 @@ def registry_allow_private_from_config(
         value = raw[REGISTRY_ALLOW_PRIVATE_CONFIG_KEY]
         if isinstance(value, bool):
             return value
+        # The field and the value's type, never the value: a repository's
+        # `.mcp.json` chose it (Consiliency/pmcp#388 round 2, claude N-A).
         logger.warning(
-            "Ignoring %s in %s: expected a boolean, got %r",
+            "Ignoring %s in %s: expected a boolean, got %s",
             REGISTRY_ALLOW_PRIVATE_CONFIG_KEY,
             path,
-            value,
+            describe_value(value),
         )
     return None
 
@@ -1068,12 +1071,12 @@ def _merge_manifest_defaults(
     else:
         if not manifest_servers:
             logger.warning(
-                f"Skipping server '{name}' - command missing and manifest unavailable"
+                f"Skipping server '{display_safe(name)}' - command missing and manifest unavailable"
             )
             return None
         if not manifest_server:
             logger.warning(
-                f"Skipping server '{name}' - command missing and no manifest default found"
+                f"Skipping server '{display_safe(name)}' - command missing and no manifest default found"
             )
             return None
         merged = config.model_copy(deep=True)

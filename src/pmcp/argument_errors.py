@@ -53,6 +53,7 @@ from pydantic import ValidationError
 from pydantic_core import PydanticCustomError
 
 from pmcp import sdk_rejections as _sdk
+from pmcp.display import LOG_LAYOUT, display_safe
 
 #: Stands in for a path segment the caller chose.
 REDACTED_SEGMENT = "*"
@@ -941,7 +942,56 @@ def _is_validation_error(error: BaseException) -> bool:
     # includes urllib's refused tunnel, a bare `OSError` (rev 24).
     if exception_origin(error) == "http":
         return True
+    if _raised_by_text_parser(error):
+        return True
     return _withheld_sdk(error)
+
+
+#: Standard-library and dependency modules that parse text and raise with
+#: the rejected text in the message (`urllib.parse`: "netloc '…' contains
+#: invalid characters under NFKC normalization", "Port could not be cast to
+#: integer value as '…'"; `ipaddress`: "'…' does not appear to be an IPv4 or
+#: IPv6 address"; `idna`: "Codepoint U+… at position … of '…' not
+#: allowed"; `_strptime`: "time data '…' does not match format …").
+#: Consiliency/pmcp#388 round 2, codex F001. Module paths, relative to their
+#: installed directory.
+TEXT_PARSER_MODULES = (
+    "urllib/parse.py",
+    "ipaddress.py",
+    "encodings/idna.py",
+    "idna",
+    "shlex.py",
+    "_strptime.py",
+    "email",
+    "http/cookies.py",
+)
+
+
+@functools.cache
+def _text_parser_paths() -> tuple[str, ...]:
+    paths = (_module_path(name) for name in TEXT_PARSER_MODULES)
+    return tuple(path for path in paths if path is not None)
+
+
+def _raised_by_text_parser(error: BaseException) -> bool:
+    """Whether ``error`` was raised by a frame of a text-parsing module
+    (:data:`TEXT_PARSER_MODULES`), its innermost frame or a library frame
+    between it and the first frame outside the libraries. Such an error is
+    described by its class alone: its message quotes what it rejected."""
+    tb = error.__traceback__
+    frames: list[str] = []
+    while tb is not None:
+        frames.append(tb.tb_frame.f_code.co_filename)
+        tb = tb.tb_next
+    parsers = _text_parser_paths()
+    libraries = _library_prefixes()
+    for filename in reversed(frames):
+        if filename.startswith(parsers):
+            return True
+        if filename.startswith("<frozen ") or filename.startswith(libraries):
+            continue
+        return False
+    return False
 
 
 def _withheld_sdk(error: BaseException) -> bool:
@@ -983,9 +1033,10 @@ def _parse_text(error: BaseException) -> str:
     return f"could not parse {kind} ({type(error).__name__}){where}"
 
 
-def _chain(error: BaseException) -> Iterator[BaseException]:
+def _chain(error: BaseException, *, suppressed: bool = True) -> Iterator[BaseException]:
     """``error``, its ``__cause__``/``__context__`` chain and every exception
-    in a group, each once."""
+    in a group, each once. With ``suppressed=False``, a context that
+    ``raise ... from None`` suppressed is not followed."""
     pending, seen = [error], set()
     while pending:
         current = pending.pop()
@@ -993,7 +1044,10 @@ def _chain(error: BaseException) -> Iterator[BaseException]:
             continue
         seen.add(id(current))
         yield current
-        for linked in (current.__cause__, current.__context__):
+        links: tuple[BaseException | None, ...] = (current.__cause__,)
+        if suppressed or not current.__suppress_context__:
+            links += (current.__context__,)
+        for linked in links:
             if linked is not None:
                 pending.append(linked)
         members = getattr(current, "exceptions", None)
@@ -1016,6 +1070,8 @@ def _validation_text(error: BaseException) -> str:
         or _is_response_decode_error(error)
         or exception_origin(error) == "http"
     )
+    if not is_http and _raised_by_text_parser(error):
+        return f"could not parse the text ({type(error).__name__})"
     structural = isinstance(
         error, (ValidationError, jsonschema.ValidationError, jsonschema.SchemaError)
     )
@@ -1085,17 +1141,46 @@ def exception_text(error: BaseException) -> str:
     linked = _chained_value_bearing(error)
     if linked is not None:
         return f"{type(error).__name__}: {_validation_text(linked)}"
-    return str(error)
+    # Any other exception's own text, with every character a terminal acts
+    # on escaped (Consiliency/pmcp#388 round 2): it reaches CLI lines, logs
+    # and responses, and may carry text pmcp read from a file or a peer.
+    return display_safe(str(error), keep=LOG_LAYOUT)
 
 
 def _chained_value_bearing(error: BaseException) -> BaseException | None:
     """The first value-bearing error in ``error``'s chain other than
     ``error`` itself: through ``__cause__`` and ``__context__`` (suppressed
     or not) and exception-group members, at any depth."""
+    shown: set[int] | None = None
     for linked in _chain(error):
-        if linked is not error and _is_validation_error(linked):
-            return linked
+        if linked is error or not _is_validation_error(linked):
+            continue
+        if _only_a_text_parsers(linked):
+            # A text parser's error that pmcp replaced with its own fixed
+            # refusal (`raise ... from None`) is not the wrapper's text: no
+            # traceback prints a suppressed context, and the wrapper chose
+            # its words (Consiliency/pmcp#388 round 2). Anywhere else in the
+            # chain it describes the wrapper as any value-bearing error does.
+            if shown is None:
+                shown = {id(e) for e in _chain(error, suppressed=False)}
+            if id(linked) not in shown:
+                continue
+        return linked
     return None
+
+
+def _only_a_text_parsers(error: BaseException) -> bool:
+    """Value-bearing only because a text-parsing module raised it."""
+    if not _raised_by_text_parser(error):
+        return False
+    registered = isinstance(error, _value_bearing_types()) and not isinstance(
+        error, _value_free_types()
+    )
+    return (
+        not registered
+        and exception_origin(error) != "http"
+        and not _withheld_sdk(error)
+    )
 
 
 def safe_exc_info(error: BaseException) -> BaseException | None:
@@ -1749,6 +1834,7 @@ def install_log_scrubber() -> None:
     _install_extra_scrubbing()
     _install_handle_scrubbing()
     _install_filter_scrubbing()
+    _install_display_escaping()
     _install_excepthook()
     _install_threading_excepthook()
     _install_handle_error()
@@ -1816,6 +1902,36 @@ def _rescrub(record: logging.LogRecord) -> None:
                 setattr(record, key, _scrubbed(fields[key]))
     except Exception:  # noqa: BLE001 -- a log call must never fail here
         pass
+
+
+def _install_display_escaping() -> None:
+    """Every log line is shown escaped (Consiliency/pmcp#388 round 2): the
+    message a record renders (``LogRecord.getMessage``, which every
+    formatter and handler reads) and a formatted traceback
+    (``Formatter.formatException``) keep their line breaks and tabs, and
+    every other character a terminal acts on -- C0, DEL, C1, bidi and
+    zero-width characters, line separators -- reads as its backslash escape
+    (:func:`pmcp.display.display_safe`). A record's text is pmcp's, a
+    library's, or a value read from a file or a peer; whichever it is, it
+    cannot rewrite the operator's terminal. Idempotent."""
+    get_message = logging.LogRecord.getMessage
+    if not getattr(get_message, "pmcp_display_escaped", False):
+
+        def escaped_message(self: logging.LogRecord) -> str:
+            return display_safe(get_message(self), keep=LOG_LAYOUT)
+
+        escaped_message.pmcp_display_escaped = True  # type: ignore[attr-defined]
+        escaped_message.original = get_message  # type: ignore[attr-defined]
+        logging.LogRecord.getMessage = escaped_message  # type: ignore[method-assign]
+    format_exception = logging.Formatter.formatException
+    if not getattr(format_exception, "pmcp_display_escaped", False):
+
+        def escaped_exception(self: logging.Formatter, ei: Any) -> str:
+            return display_safe(format_exception(self, ei), keep=LOG_LAYOUT)
+
+        escaped_exception.pmcp_display_escaped = True  # type: ignore[attr-defined]
+        escaped_exception.original = format_exception  # type: ignore[attr-defined]
+        logging.Formatter.formatException = escaped_exception  # type: ignore[method-assign]
 
 
 def _install_filter_scrubbing() -> None:

@@ -58,8 +58,17 @@ def collect_remote_header_diagnostics(
             )
             continue
 
-        parsed = urlparse(raw_url.strip())
-        if not parsed.scheme or not parsed.netloc:
+        # A parse failure is caught here, at the parse site: `urlparse` (and
+        # `.port`) raise a ValueError whose message quotes the URL -- control
+        # characters and all -- and the CLI would print it (Consiliency/pmcp#388
+        # round 2, codex F001). It reads as the same fixed "is invalid" line.
+        try:
+            parsed = urlparse(raw_url.strip())
+            _ = parsed.port
+            well_formed = bool(parsed.scheme and parsed.netloc)
+        except ValueError:
+            well_formed = False
+        if not well_formed:
             checks.append(
                 (
                     "remote",
@@ -103,7 +112,7 @@ def collect_remote_header_diagnostics(
                         "remote",
                         "ok",
                         f"{server_name}: {metadata_key} configured at "
-                        f"{safe_metadata_url}{qualifier}.",
+                        f"{operator_safe(safe_metadata_url)}{qualifier}.",
                     )
                 )
 

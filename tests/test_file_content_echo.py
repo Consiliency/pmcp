@@ -5,6 +5,15 @@ Consiliency/pmcp#297 implementation, round 1 F001: a checkout's
 three messages printed it unchanged, through ``print``, which neither the
 log scrubber nor the exception-text guards see.
 
+Round 2 (claude N-A): the outputs include loggers, ``warnings.warn`` and a
+raised exception's arguments, as this docstring always said; a
+``.mcp.json`` server name reached the "Skipping server" WARNING and a
+rejected ``allowPrivateRegistry`` value was echoed through ``%r``. Every
+log line is also escaped where it is rendered
+(``pmcp.argument_errors._install_display_escaping``), so a value this walk
+cannot see -- one past a model's construction -- still cannot carry a
+control sequence to a terminal.
+
 The rule, derived over all of ``src/pmcp``: a value that comes from a
 file-content parser (the dotenv readers, the JSON, YAML and TOML loaders,
 and every function that returns what one of them read) reaches no output --
@@ -67,8 +76,14 @@ _SANITIZERS = frozenset(
         "safe_traceback_text",
         "class_only_traceback_text",
         "entry_log_name",
-        # Refuses any control character and any non-canonical host.
-        "sanitize_public_auth_url",
+        "display_safe",
+        # D9's value-free labels (tests/test_catalog_overlay_discovery.py):
+        # a name only when pmcp ships it, a rejection by field and type.
+        "_server_label",
+        "_cli_label",
+        "_rejection_reason",
+        "shipped_env_var",
+        "validation_error_kinds",
         "len",
         "bool",
         "type",
@@ -93,6 +108,11 @@ _DIRECT_OUTPUT = frozenset(
     {"print", "sys.stderr.write", "sys.stdout.write", "click.echo", "click.secho"}
 )
 _CONSOLE_OWNERS = frozenset({"console", "err_console", "_console", "stderr_console"})
+#: Logger calls: a level method on a receiver named like a logger.
+_LOGGER_OWNERS = frozenset({"logger", "log", "logging", "_logger", "_log", "LOGGER"})
+_LEVELS = frozenset(
+    {"debug", "info", "warning", "warn", "error", "exception", "critical", "log"}
+)
 
 
 def _dotted(node: ast.AST) -> str | None:
@@ -119,10 +139,15 @@ def _direct_sink(call: ast.Call) -> str | None:
     if dotted in _DIRECT_OUTPUT:
         return dotted
     func = call.func
-    if isinstance(func, ast.Attribute) and func.attr == "print":
+    if isinstance(func, ast.Attribute):
         owner = _dotted(func.value) or ""
-        if owner.split(".")[-1] in _CONSOLE_OWNERS:
+        last = owner.split(".")[-1]
+        if func.attr == "print" and last in _CONSOLE_OWNERS:
             return f"{owner}.print"
+        if func.attr in _LEVELS and (last in _LOGGER_OWNERS or last.endswith("logger")):
+            return f"{owner}.{func.attr}"
+        if func.attr == "warn" and owner == "warnings":
+            return "warnings.warn"
     return None
 
 
@@ -271,6 +296,14 @@ class _Walk:
                     for param, arg in self.model.bound(name, node):
                         if param in self.model.sinks[name] and self.taint(arg):
                             self.outputs.append((node.lineno, f"{name}({param})"))
+            elif isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+                # A raised exception's arguments become its text, which a
+                # handler, a log or the CLI's last-resort print shows.
+                exc = node.exc
+                if any(
+                    self.taint(v) for v in [*exc.args, *(k.value for k in exc.keywords)]
+                ):
+                    self.outputs.append((node.lineno, "raise"))
 
     def _nodes(self, root: ast.AST) -> list[ast.AST]:
         """``root``'s nodes, not descending into nested functions or classes
@@ -456,6 +489,11 @@ _GATEWAY_ANSWER = (
     "its response: the text an MCP client receives for the same call, held "
     "to the gateway's rules (D9 for config fields), not a file's content"
 )
+_UNPACKED_ERROR = (
+    "the `error` half of `_read_config_object`'s (value, error) pair: a fixed "
+    "code or `invalid_json: <exception_text>`; the walk taints both halves of "
+    "the unpacked pair"
+)
 _REVIEWED: dict[tuple[str, str, str], str] = {
     ("cli.py", "run_status", "print"): _GATEWAY_ANSWER
     + "; the in-process branch is reported only because the walk is "
@@ -471,6 +509,29 @@ _REVIEWED: dict[tuple[str, str, str], str] = {
     ("cli.py", "_run_trust_list_packages", "print"): (
         "the operator's own package-approval store: names and versions are "
         "re-validated when it is read (`_read_store_and_stale`)"
+    ),
+    ("package_approvals.py", "_read_store_and_stale", "logger.warning"): (
+        "a stale record of the operator's own package-approval store, which "
+        "pmcp wrote; its name passed the package-name check, and the line is "
+        "escaped like every log line (`_install_display_escaping`)"
+    ),
+    ("client/manager.py", "_handle_stdout_line", "_dispatch_downstream_frame(frame)"): (
+        "the frame's `method` is logged only after it matched one of "
+        "DOWNSTREAM_LIST_CHANGED_METHODS (three constants); an invalid frame "
+        "is logged by `jsonrpc_envelope_problem`'s value-free description"
+    ),
+    ("config/loader.py", "_parse_config_or_warn", "logger.warning"): _UNPACKED_ERROR,
+    (
+        "config/loader.py",
+        "_parse_project_config_or_warn",
+        "logger.warning",
+    ): _UNPACKED_ERROR,
+    ("config/loader.py", "registry_allow_private_from_config", "logger.warning"): (
+        _UNPACKED_ERROR
+    ),
+    ("manifest/loader.py", "_parse_overlay_document", "_checked_entry(kept)"): (
+        "`_EntryRejected` names the entry's culprit fields, which are keys of "
+        "the schema (`_schema_fields`), never a value or an unknown key"
     ),
 }
 
@@ -530,18 +591,39 @@ def through_a_source(path):
 def described(path):
     data = load_json(open(path).read(), source="x")
     print(f"{len(data)} entries")
+
+
+def logged(path):
+    for key in dotenv_values(path):
+        logger.warning("ignoring %s", key)
+
+
+def raised(path):
+    data = load_json(open(path).read(), source="x")
+    raise ValueError(f"bad entry {data['name']}")
+
+
+def warned(path):
+    import warnings
+
+    for key in dotenv_values(path):
+        warnings.warn(f"ignoring {key}")
 """
 
 
 def test_the_walk_reports_file_content_at_every_direct_output(tmp_path: Path) -> None:
     """A unit of the guard: ``print``, ``sys.stderr.write`` through a helper,
-    and ``click.echo`` of a derived source are reported; a value rendered by
+    ``click.echo`` of a derived source, a logger, ``warnings.warn`` and a
+    raised exception's arguments are reported; a value rendered by
     ``plain_name`` or reduced to its length is not."""
     (tmp_path / "synthetic.py").write_text(_SYNTHETIC)
     assert _reported(tmp_path) == {
         ("synthetic.py", "shown", "print"),
         ("synthetic.py", "through_a_helper", "writes(message)"),
         ("synthetic.py", "through_a_source", "click.echo"),
+        ("synthetic.py", "logged", "logger.warning"),
+        ("synthetic.py", "raised", "raise"),
+        ("synthetic.py", "warned", "warnings.warn"),
     }
 
 

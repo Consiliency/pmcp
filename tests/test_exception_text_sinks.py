@@ -1257,7 +1257,6 @@ _REPR_REJECTION_EXEMPT: dict[str, str] = {
     "cli.py::_run_trust_revoke_package::args.spec": "operator CLI argument",
     "client/manager.py::_request_ceiling_ms::raw": "operator environment",
     "client/manager.py::_stdio_read_limit::raw": "operator environment",
-    "config/loader.py::registry_allow_private_from_config::value": "operator config",
     "manifest/npm_resolver.py::_query_locked::status": "pmcp's own resolver child",
     "manifest/npm_resolver.py::resolve::command": "manifest/config command",
     "manifest/package_identity.py::_fetch_packument::name": (
@@ -1265,25 +1264,16 @@ _REPR_REJECTION_EXEMPT: dict[str, str] = {
     ),
     "manifest/refresher.py::check_staleness::cfg_name": "configured package",
     "manifest/refresher.py::check_staleness::desc.package": "cached package",
-    "package_approvals.py::_decode::decision": "pmcp's own approval store",
     "package_approvals.py::_read_store_and_stale::entry['name']": (
         "pmcp's own approval store"
     ),
     "package_approvals.py::_read_store_and_stale::entry['resolved_version']": (
         "pmcp's own approval store"
     ),
-    "package_approvals.py::_require_identity_fields::name": (
-        "pmcp's own approval store"
-    ),
-    "package_approvals.py::_require_identity_fields::registry": (
-        "pmcp's own approval store"
-    ),
     "provision_gate.py::evaluate_provision::getattr(server_config, 'name', None)": (
         "a resolved server config's name (operator/manifest config)"
     ),
-    "trust_store.py::_decode::decision": "pmcp's own trust store",
     "trust_store.py::record_resolved::decision": "pmcp's own trust store",
-    "validation.py::parse_package_spec::spec": "config/CLI/manifest package spec",
 }
 
 

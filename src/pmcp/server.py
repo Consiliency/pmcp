@@ -863,6 +863,16 @@ class GatewayServer:
     async def initialize(self) -> None:
         """Initialize connections to downstream servers and generate capability summary."""
         logger.info("Initializing MCP Gateway...")
+        # Build the SDK message registries off the event loop, once per
+        # process, so the first downstream error does not parse the SDK on
+        # it (Consiliency/pmcp#388 round 2, claude nit).
+        import threading
+
+        from pmcp.sdk_rejections import warm_registries
+
+        threading.Thread(
+            target=warm_registries, name="pmcp-sdk-registries", daemon=True
+        ).start()
 
         # Load pre-built descriptions cache
         cache_path = self._descriptions_cache_path

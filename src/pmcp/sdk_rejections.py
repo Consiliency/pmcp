@@ -243,6 +243,15 @@ def message_arguments(tree: ast.AST) -> list[ast.expr]:
 MAX_CLASSIFIED_LENGTH = 4096
 
 
+def warm_registries() -> None:
+    """Build the SDK message registries now (each parses the installed SDK
+    once, ~0.4 s together), so the first downstream error does not pay for
+    it on the event loop (Consiliency/pmcp#388 round 2, claude nit)."""
+    _sdk_message_texts()
+    _message_registry()
+    _log_patterns()
+
+
 def classifiable(text: str) -> bool:
     """Whether ``text`` is short enough to match against SDK messages."""
     return len(text) <= MAX_CLASSIFIED_LENGTH

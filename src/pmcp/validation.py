@@ -59,9 +59,9 @@ def parse_package_spec(spec: str) -> tuple[str, str | None]:
     else:
         name, version = spec[:at], spec[at + 1 :]
         if not version:
-            raise ValueError(f"package spec {spec!r} has an empty version")
+            raise ValueError("the package spec has an empty version")
     if not is_valid_package_name(name):
-        raise ValueError(f"package spec {spec!r} does not name a valid package")
+        raise ValueError("the package spec does not name a valid package")
     return name, version
 
 

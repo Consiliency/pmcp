@@ -431,8 +431,21 @@ def _downstream_error(error: Any) -> DownstreamError:
         # whose content is not the downstream's message (the SDK's transports
         # reject it outright; stdio is parsed without a model).
         return DownstreamError(_MALFORMED_ERROR_MESSAGE, code=code)
-    from pmcp.sdk_rejections import sdk_built_message, sdk_message_phrase
+    from pmcp.sdk_rejections import (
+        MAX_CLASSIFIED_LENGTH,
+        classifiable,
+        sdk_built_message,
+        sdk_message_phrase,
+    )
 
+    if not classifiable(message):
+        # Too long to classify: its code's phrase, and why the server's own
+        # message is not there (Consiliency/pmcp#388 round 2, claude N-B).
+        return DownstreamError(
+            f"{sdk_message_phrase(code)} (the server's message was not shown: "
+            f"over {MAX_CLASSIFIED_LENGTH} characters)",
+            code=code,
+        )
     if sdk_built_message(message, code):
         # The MCP SDK's client transport answered for the downstream, with
         # text it formats from the response (`Unexpected content type:

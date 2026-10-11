@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from pmcp.argument_errors import exception_text
+from pmcp.argument_errors import describe_value, exception_text
 from pmcp.parsing import load_json, parse_timestamp
 
 from pmcp.home_identity import (
@@ -624,7 +624,7 @@ def _decode(entry: Any) -> TrustRecord:
         raise TrustStoreError(f"Trust store entry is missing {missing}")
 
     if decision not in DECISIONS:
-        raise TrustStoreError(f"Unknown trust decision: {decision!r}")
+        raise TrustStoreError(f"Unknown trust decision: {describe_value(decision)}")
 
     # Raised outside the handler, chaining nothing, so the description shows
     # (Consiliency/pmcp#297 rev 19).

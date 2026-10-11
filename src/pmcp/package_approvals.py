@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any
 
 
 from pmcp import atomic_write as _atomic_write_module
-from pmcp.argument_errors import exception_text
+from pmcp.argument_errors import describe_value, exception_text
 from pmcp.atomic_write import (
     atomic_write,
     falls_back_to_pathname,
@@ -158,13 +158,13 @@ def _require_identity_fields(registry: Any, name: Any, version: Any) -> None:
     """
     if not isinstance(registry, str) or not registry:
         raise ValueError(
-            f"package registry must be a non-empty string, not {registry!r}"
+            f"package registry must be a non-empty string, not {describe_value(registry)}"
         )
     if not isinstance(name, str) or not is_valid_package_name(name):
-        raise ValueError(f"not a valid package name: {name!r}")
+        raise ValueError(f"not a valid package name: {describe_value(name)}")
     if not isinstance(version, str) or not is_valid_package_version(version):
         raise ValueError(
-            f"not one exact package version: {version!r} "
+            f"not one exact package version: {describe_value(version)} "
             "(ranges and dist-tags pin nothing)"
         )
 
@@ -200,7 +200,9 @@ def _decode(entry: Any) -> PackageApproval:
     if integrity is not None and not isinstance(integrity, str):
         raise PackageApprovalError("Package approval integrity is not a string")
     if decision not in DECISIONS:
-        raise PackageApprovalError(f"Unknown package decision: {decision!r}")
+        raise PackageApprovalError(
+            f"Unknown package decision: {describe_value(decision)}"
+        )
     try:
         parsed_at = parse_timestamp(str(recorded_at), source="package approval record")
     except ValueError as exc:

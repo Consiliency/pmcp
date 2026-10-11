@@ -52,8 +52,9 @@ def _operator_safe(value: str) -> str:
     value cannot overwrite, split or reorder the line; the result is then always
     shell-quoted, because operators copy log lines. Escape first, quote last.
     """
-    escaped = "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in value)
-    return shlex.quote(escaped)
+    from pmcp.display import display_safe
+
+    return shlex.quote(display_safe(value))
 
 
 def _pinned_package_spec(arg: str) -> str | None:
