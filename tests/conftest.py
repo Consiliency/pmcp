@@ -272,13 +272,19 @@ def isolate_trust_store(
     """
     fake_home = tmp_path_factory.mktemp("trust-home")
     monkeypatch.setenv("HOME", str(fake_home))
+    # Windows' `Path.home()` reads USERPROFILE, not HOME (the windows-smoke
+    # job, Consiliency/pmcp#388 round 8).
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
 
     # Assert the redirect took effect BEFORE any test body runs. A silently
     # ineffective redirect is the one failure mode that must never be quiet:
     # it does not fail a test, it writes the operator's real trust store.
     store = trust_store.trust_store_path()
+    # The real store's own directory, not the whole real home: on Windows the
+    # temporary directory -- and so the fake home -- is inside the real home
+    # (`AppData\Local\Temp`).
     if not store.is_relative_to(fake_home.resolve()) or store.is_relative_to(
-        _REAL_HOME
+        _REAL_HOME / ".config"
     ):
         raise RuntimeError(
             f"Trust store isolation failed: trust_store_path() is {store}, "

@@ -427,6 +427,7 @@ def _fake_tool_dir(tmp_path: Path, *names: str) -> Path:
     return bin_dir
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX semantics")
 def test_upgrade_child_output_reaches_no_terminal(tmp_path: Path) -> None:
     bin_dir = _fake_tool_dir(tmp_path, "uv")
     done = _run(
@@ -447,6 +448,7 @@ def test_upgrade_child_output_reaches_no_terminal(tmp_path: Path) -> None:
     assert b"SENTINEL" in done.stdout, done.stdout[-1500:]  # echoed, escaped
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX semantics")
 def test_service_restart_child_output_reaches_no_terminal(tmp_path: Path) -> None:
     bin_dir = _fake_tool_dir(tmp_path, "systemctl")
     done = _run(
@@ -741,6 +743,7 @@ def _run_probe(tmp_path: Path, source: str) -> list[tuple[str, str]]:
     return caught
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX semantics")
 def test_the_audit_backstop_records_an_undetached_spawn_from_pmcp_code(
     tmp_path: Path,
 ) -> None:
@@ -1382,6 +1385,7 @@ def test_the_windows_reader_ends_at_the_stop_with_a_writer_that_never_closes() -
     assert looks["n"] == 4  # three looks, the stop, one last look
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX semantics")
 def test_the_last_bytes_are_read_when_data_and_the_stop_are_both_ready() -> None:
     """Round 7 nit: the stop does not drop what the child already wrote."""
     from pmcp.child_output import _StoppableReader, bounded_lines
@@ -1513,8 +1517,8 @@ async def test_windows_server_teardown_terminates_the_job_when_the_leader_exits_
     monkeypatch.setattr(child_output, "_windows", lambda: True)
     monkeypatch.setattr(child_output, "_kernel32", lambda: kernel32)
     # No real group may be reached from the double's pid.
-    monkeypatch.setattr(os, "getpgid", lambda pid: -1)
-    monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(os, "getpgid", lambda pid: -1, raising=False)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: None, raising=False)
 
     class _Server:
         pid = 4242
@@ -1538,6 +1542,7 @@ async def test_windows_server_teardown_terminates_the_job_when_the_leader_exits_
     assert not server.terminated
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX semantics")
 @pytest.mark.asyncio
 async def test_a_teardown_of_an_exited_process_signals_no_group(
     monkeypatch: pytest.MonkeyPatch,
@@ -1660,7 +1665,7 @@ async def test_windows_teardown_terminates_job_when_leader_already_exited(
     monkeypatch.setattr(child_output, "_JOBS", {})
     monkeypatch.setattr(child_output, "_windows", lambda: True)
     monkeypatch.setattr(child_output, "_kernel32", lambda: kernel32)
-    monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: None, raising=False)
 
     class _Exited:
         pid = 4242
@@ -1808,6 +1813,7 @@ async def test_a_group_observed_empty_is_never_signalled_again(
     assert [s for _target, s in sent if s != 0] == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX semantics")
 def test_a_trusted_group_vouches_only_for_its_own_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1832,3 +1838,181 @@ def test_a_trusted_group_vouches_only_for_its_own_process(
         assert sent and sent[-1] != 0
     finally:
         child_output.forget_group(4343)
+
+
+# --- round 8: on a real Windows host (the windows-smoke job) -----------------------
+
+_WINDOWS = pytest.mark.skipif(sys.platform != "win32", reason="a real Windows host")
+
+
+def _windows_alive(pid: int) -> bool:
+    """Whether a Windows process still runs -- asked of the kernel, never
+    with `os.kill(pid, 0)`, which on Windows terminates the process."""
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong(0)
+        kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        return code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_gone(pid: int, within: float = 10.0) -> bool:
+    import time
+
+    deadline = time.monotonic() + within
+    while _windows_alive(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+_WINDOWS_LEADER = textwrap.dedent(
+    """
+    import os, subprocess, sys, time
+    out, stay = sys.argv[1], sys.argv[2] == "stay"
+    grandchild = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+    )
+    with open(os.path.join(out, "grandchild"), "w") as handle:
+        handle.write(str(grandchild.pid))
+    if stay:
+        time.sleep(60)
+    """
+)
+
+
+def _windows_leader(tmp_path: Path, stay: bool) -> subprocess.Popen[bytes]:
+    from pmcp.child_output import detached, track
+
+    script = tmp_path / "leader.py"
+    script.write_text(_WINDOWS_LEADER)
+    process = subprocess.Popen(
+        [sys.executable, str(script), str(tmp_path), "stay" if stay else "exit"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **detached(),
+    )
+    track(process)
+    _wait_for(tmp_path / "grandchild")
+    return process
+
+
+@_WINDOWS
+def test_windows_kill_ends_the_child_and_its_grandchild_through_its_job(
+    tmp_path: Path,
+) -> None:
+    """Round 7/8, claude N-A: a real Job Object -- the kill reaches what the
+    child started, not only the child."""
+    from pmcp import child_output
+
+    leader = _windows_leader(tmp_path, stay=True)
+    grandchild = int((tmp_path / "grandchild").read_text())
+    assert leader.pid in child_output._JOBS
+    child_output.kill_tree(leader)
+    leader.wait(timeout=10)
+    assert _windows_gone(grandchild), "the grandchild outlived the job"
+    assert leader.pid not in child_output._JOBS
+
+
+@_WINDOWS
+@pytest.mark.asyncio
+async def test_windows_teardown_ends_the_grandchild_of_a_leader_that_exited(
+    tmp_path: Path,
+) -> None:
+    """Round 8, codex F002 = gemini F001 = grok F001, for real: the leader
+    exits first; teardown still terminates its job, and the grandchild."""
+    from pmcp import child_output
+    from pmcp.client import manager
+
+    leader = _windows_leader(tmp_path, stay=False)
+    grandchild = int((tmp_path / "grandchild").read_text())
+    leader.wait(timeout=10)
+    assert _windows_alive(grandchild)
+    await manager._terminate_process_tree(leader, "srv")  # type: ignore[arg-type]
+    assert _windows_gone(grandchild), "the grandchild outlived the teardown"
+    assert leader.pid not in child_output._JOBS
+
+
+@_WINDOWS
+@pytest.mark.asyncio
+async def test_windows_drain_reads_every_line_and_stops_at_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round 8, codex F004, for real: `PeekNamedPipe` polling drains every
+    line, and the drain ends at its deadline while a descendant still holds
+    the pipe's write end."""
+    import logging
+    import threading
+    import time
+
+    from pmcp import child_output
+
+    monkeypatch.setattr(child_output, "_DRAIN_JOIN_SECONDS", 0.5)
+    caplog.set_level(logging.DEBUG)
+    logger = logging.getLogger("pmcp.test.drain")
+    async with child_output.drained_errlog("win", logger) as errlog:
+        writer = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys, time\n"
+                "[print(f'line {i}', file=sys.stderr, flush=True) for i in range(20)]\n"
+                "time.sleep(60)",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=errlog,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not any(
+            "line 19" in r.getMessage() for r in caplog.records
+        ):
+            await asyncio_sleep(0.05)
+    try:
+        lines = [r.getMessage() for r in caplog.records if r.name == "pmcp.test.drain"]
+        assert lines[:20] == [f"[win] stderr: line {i}" for i in range(20)], lines[:3]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and any(
+            t.name == "pmcp-errlog-win" for t in threading.enumerate()
+        ):
+            time.sleep(0.02)
+        assert not any(t.name == "pmcp-errlog-win" for t in threading.enumerate())
+        assert writer.poll() is None  # the writer never closed its end
+    finally:
+        writer.kill()
+        writer.wait()
+
+
+async def asyncio_sleep(seconds: float) -> None:
+    import asyncio
+
+    await asyncio.sleep(seconds)
+
+
+@_WINDOWS
+def test_windows_reader_reads_the_last_bytes_at_the_stop() -> None:
+    """The polling reader against a real Windows pipe: data written before
+    the stop is read; then it ends, the writer still open."""
+    import threading
+
+    from pmcp.child_output import _PollingReader, bounded_lines
+
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, b"last words\n")
+        stop = threading.Event()
+        stop.set()
+        reader = _PollingReader(read_fd, stop)
+        assert list(bounded_lines(reader)) == [(b"last words", False)]  # type: ignore[arg-type]
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
