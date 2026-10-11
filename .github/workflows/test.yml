@@ -86,8 +86,10 @@ jobs:
           uv run --python 3.12 pmcp --version
           uv run --python 3.12 pmcp --help
 
+      # Windows has no SIGALRM: pytest-timeout's `signal` method (pyproject)
+      # cannot run there, so this job uses its thread method.
       - name: Windows-path unit tests
-        run: uv run --python 3.12 pytest tests/test_child_output.py -q --tb=short -p no:cacheprovider
+        run: uv run --python 3.12 pytest tests/test_child_output.py -q --tb=short -p no:cacheprovider -o timeout_method=thread -rs
 
   # Every other job installs via `uv sync`, which uses uv.lock — so they only
   # ever exercise the PINNED dependency versions. That hid a shipped break: an
