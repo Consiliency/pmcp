@@ -1469,3 +1469,38 @@ async def test_windows_server_teardown_terminates_the_job_when_the_leader_exits_
     await manager._terminate_process_tree(server, "srv")  # type: ignore[arg-type]
     assert "TerminateJobObject" in kernel32.calls
     assert not server.terminated
+
+
+@pytest.mark.asyncio
+async def test_a_teardown_of_an_exited_process_signals_no_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process whose `returncode` is set has been reaped: its pid may be
+    anyone's. `ClientManager`'s teardown then reaches the group only through
+    the retained-group checks -- never a direct group signal, never the pid
+    (round 7, claude N-B; the `returncode` half of `leader_reserved`)."""
+    from pmcp.client import manager
+
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals.append((pgid, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)  # the pid reused
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+
+    class _Exited:
+        pid = 4242
+        returncode = 0
+        signalled = False
+
+        def terminate(self) -> None:
+            self.signalled = True
+
+        def kill(self) -> None:
+            self.signalled = True
+
+        async def wait(self) -> int:
+            return 0
+
+    exited = _Exited()
+    await manager._terminate_process_tree(exited, "srv", group_pgid=4242)  # type: ignore[arg-type]
+    assert [sig for _pgid, sig in signals if sig != 0] == []
+    assert not exited.signalled
