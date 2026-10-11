@@ -28,7 +28,15 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
 from pydantic import ValidationError
 
-from pmcp.child_output import detached
+from pmcp import child_output as _child_output
+from pmcp.child_output import (
+    detached,
+    kill_process_tree_now,
+    leader_reserved,
+    process_groups_supported,
+    signal_retained_group,
+    track,
+)
 from pmcp.argument_errors import (
     describe_value,
     exception_text,
@@ -591,13 +599,11 @@ class _NullCatalogEventSink:
 
 
 def _process_groups_supported() -> bool:
-    """Whether this platform has POSIX process groups to signal. Windows has
+    """Whether this platform has POSIX process groups to signal (the one
+    rule: :func:`pmcp.child_output.process_groups_supported`). Windows has
     neither `os.killpg` nor `os.getpgid`: there every group path is skipped
-    and teardown uses the single-process `terminate()`/`kill()` fallback, as
-    on main (codex round 7: a retained id reached `os.killpg` there and the
-    `AttributeError` failed `disconnect_server`). Read at call time, so a
-    test that removes the APIs sees it."""
-    return hasattr(os, "killpg") and hasattr(os, "getpgid")
+    and teardown uses the single-process fallback (codex round 7)."""
+    return process_groups_supported()
 
 
 def _spawned_group_pgid(process: asyncio.subprocess.Process) -> int | None:
@@ -631,34 +637,11 @@ def _own_group_pgid(process: asyncio.subprocess.Process | None) -> int | None:
 
 
 def _kill_retained_group(group_pgid: int | None) -> None:
-    """SIGKILL a group whose leader asyncio has already reaped, synchronously.
-
-    Only while (1) the group still has a member (``killpg(pgid, 0)``) and (2)
-    no process holds the leader's pid (``kill(pgid, 0)`` fails with
-    ``ProcessLookupError``). While any member of our group lives, the kernel
-    keeps the id in use, so it cannot have been handed to a new process; a
-    process holding that pid therefore means the id was reused after our
-    group emptied, and the group is left alone. Residual: the id is reused
-    by a new session leader that then exits while its own children live, all
-    between our reap and this call -- the pid space must cycle in that window.
-    """
-    if group_pgid is None or not _process_groups_supported():
-        return
-    try:
-        os.killpg(group_pgid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
-        return  # no member left (or not ours to signal)
-    try:
-        os.kill(group_pgid, 0)
-        return  # a live process holds the leader's pid: the id was reused
-    except ProcessLookupError:
-        pass
-    except (PermissionError, OSError):
-        return
-    try:
-        os.killpg(group_pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+    """SIGKILL a group whose leader has been reaped, synchronously -- only
+    while a member remains and no process holds the leader's pid
+    (:func:`pmcp.child_output.signal_retained_group`, the one rule shared by
+    every kill site, Consiliency/pmcp#388 round 7)."""
+    signal_retained_group(group_pgid, signal.SIGKILL)
 
 
 def _kill_process_tree_now(
@@ -669,40 +652,14 @@ def _kill_process_tree_now(
     """SIGKILL a downstream process and its group, synchronously.
 
     The uninterruptible step of a cancelled teardown (Consiliency/pmcp#324):
-    no await, so nothing can cancel or skip it. The leader is signalled only
-    while ``process.returncode is None`` -- once asyncio has reaped it, its
-    pid may be reused. Its group is signalled when the leader leads it (taken
-    from ``os.getpgid`` while the leader is unreaped) or when ``group_pgid``
-    was cached earlier by `_terminate_process_tree` and the group is still
-    alive.
+    no await, so nothing can cancel or skip it. It is
+    :func:`pmcp.child_output.kill_process_tree_now`, the one kill rule every
+    kill site shares (Consiliency/pmcp#388 round 7): the leader only while
+    it is alive or an unreaped zombie -- asked of the kernel, not only
+    ``returncode``, since asyncio's watcher thread reaps first on 3.10/3.11
+    -- and the group through the retained, checked id once it is reaped.
     """
-    if not _process_groups_supported():
-        group_pgid = None
-    if process is None:
-        _kill_retained_group(group_pgid)
-        return
-    pid = process.pid
-    if process.returncode is not None:
-        # The leader is reaped: never signal its pid; the group only through
-        # the retained, checked id (codex round 5).
-        _kill_retained_group(group_pgid)
-        return
-    if isinstance(pid, int):
-        if group_pgid is None and hasattr(os, "getpgid"):
-            try:
-                if os.getpgid(pid) == pid:
-                    group_pgid = pid
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-        try:
-            process.kill()
-        except (ProcessLookupError, OSError):
-            pass
-    if group_pgid is not None and hasattr(os, "killpg"):
-        try:
-            os.killpg(group_pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+    kill_process_tree_now(process, group_pgid=group_pgid)
 
 
 async def _terminate_process_tree(
@@ -722,9 +679,10 @@ async def _terminate_process_tree(
     (e.g. an adopted install-time process) or the group is already gone, so this
     never accidentally signals an unrelated group such as the gateway's own.
     """
-    if process is None or process.returncode is not None:
-        # Already reaped: a grandchild may still hold the group (codex round
-        # 5). Kill it through the id retained at spawn, never the pid.
+    if process is None or not leader_reserved(process):
+        # Already reaped (asked of the kernel, not only `returncode`: round 7,
+        # claude N-B): a grandchild may still hold the group (codex round 5).
+        # Kill it through the id retained at spawn, never the pid.
         _kill_retained_group(group_pgid)
         return
     retained_pgid = group_pgid if _process_groups_supported() else None
@@ -733,6 +691,16 @@ async def _terminate_process_tree(
         # Process-group signalling is POSIX-only. On Windows os.getpgid/os.killpg
         # (and signal.SIGKILL) don't exist, so fall back to the cross-platform
         # process.terminate()/kill() — preserving the pre-process-group behavior.
+        # A kill there terminates the child's Job Object (round 7, claude N-A).
+        if kill and _child_output._windows():
+            kill_process_tree_now(process)
+            return
+        # The one kill rule (round 7, claude N-B): the group is signalled
+        # directly only while the leader still reserves its id -- an await
+        # precedes this call, and the leader may have been reaped in it.
+        if not leader_reserved(process):
+            _kill_retained_group(group_pgid)
+            return
         pid = process.pid
         pgid: int | None = None
         if isinstance(pid, int) and hasattr(os, "getpgid"):
@@ -806,10 +774,15 @@ async def _terminate_process_tree(
                 )
 
         if _group_alive():
-            try:
-                os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+            if leader_reserved(process):
+                try:
+                    os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            else:
+                # The leader is reaped: the id is signalled only through the
+                # retained-group checks, so a reused pid is never reached.
+                _kill_retained_group(group_pgid)
             for _ in range(30):  # up to ~3s for the OS to reap the group
                 if not _group_alive():
                     break
@@ -3237,6 +3210,7 @@ class ClientManager:
                 # no controlling terminal (`start_new_session=True` on POSIX).
                 **detached(),
             )
+            track(process)  # its Job Object on Windows
 
         managed = ManagedClient(
             config=config,

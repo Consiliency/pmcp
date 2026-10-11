@@ -1000,9 +1000,402 @@ def test_kill_tree_signals_no_group_once_the_child_is_reaped(
         start_new_session=True,
     )
     process.wait()
-    groups: list[int] = []
-    monkeypatch.setattr(os, "killpg", lambda pgid, sig: groups.append(pgid))
-    # As if the pid had been reused by a new group's leader.
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals.append((pgid, sig)))
+    # As if the pid had been reused: a live process holds it.
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
     monkeypatch.setattr(os, "getpgid", lambda pid: pid)
     child_output.kill_tree(process)
-    assert groups == []
+    # At most the membership probe (signal 0); never a real signal.
+    assert [sig for _pgid, sig in signals if sig != 0] == []
+
+
+# --- round 7: the one kill rule; Windows; the drain under cancellation -----------
+
+#: A leader that starts a grandchild holding its stdout and stderr, records
+#: the grandchild's pid, and exits at once: `communicate()` then waits for
+#: the grandchild and times out (round 7, grok F001 / codex F002).
+_LEADER_EXITS_FIRST = textwrap.dedent(
+    """
+    import os, subprocess, sys
+    out = sys.argv[1]
+    grandchild = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+    )
+    with open(os.path.join(out, "grandchild"), "w") as handle:
+        handle.write(str(grandchild.pid))
+    """
+)
+
+
+def _leader_exits_first(tmp_path: Path) -> list[str]:
+    script = tmp_path / "leader.py"
+    script.write_text(_LEADER_EXITS_FIRST)
+    return [sys.executable, str(script), str(tmp_path)]
+
+
+def _short_waits(monkeypatch: pytest.MonkeyPatch, module: object) -> None:
+    from pmcp import waits
+
+    real = waits.bounded_wait
+
+    async def short(aw: object, timeout: float | None) -> object:
+        return await real(aw, 1.0)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(module, "bounded_wait", short)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe", ["check_cli", "get_cli_help"])
+async def test_a_timed_out_probe_whose_leader_exited_first_leaves_no_grandchild(
+    probe: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.manifest import environment
+
+    _short_waits(monkeypatch, environment)
+    command = _leader_exits_first(tmp_path)
+    if probe == "check_cli":
+        await environment.check_cli("probe", command)
+    else:
+        await environment.get_cli_help("probe", command)
+    grandchild = int((tmp_path / "grandchild").read_text())
+    assert _gone(grandchild), f"{probe}: the grandchild outlived the timeout"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_an_install_timeout_whose_leader_exited_first_leaves_no_grandchild(
+    tmp_path: Path,
+) -> None:
+    from pmcp.manifest import installer
+    from pmcp.manifest.loader import ServerConfig
+
+    command = _leader_exits_first(tmp_path)
+    server = ServerConfig(
+        name="memory",
+        description="memory",
+        keywords=["memory"],
+        install={"linux": command},
+        command=command[0],
+        args=command[1:],
+        requires_api_key=False,
+    )
+    with pytest.raises(installer.InstallError):
+        await installer.install_server(server, "linux", timeout=1.0)
+    grandchild = int((tmp_path / "grandchild").read_text())
+    assert _gone(grandchild), "the install's grandchild outlived its timeout"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_a_stalled_install_whose_leader_exited_first_leaves_no_grandchild(
+    tmp_path: Path,
+) -> None:
+    """`JobManager._monitor_install`'s stall path terminates through
+    `_safe_terminate_process`, which skipped an exited leader."""
+    import asyncio
+
+    from pmcp.child_output import detached
+    from pmcp.manifest import installer
+
+    command = _leader_exits_first(tmp_path)
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        **detached(),
+    )
+    await process.wait()  # the leader is gone; the grandchild holds the pipes
+    _wait_for(tmp_path / "grandchild")
+    await installer.JobManager()._safe_terminate_process(process, "job", force=True)
+    grandchild = int((tmp_path / "grandchild").read_text())
+    assert _gone(grandchild), "the stalled install's grandchild outlived it"
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").exists(), reason="Linux /proc")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("at", ["body", "first-join", "second-join"])
+async def test_a_cancelled_drain_releases_its_thread_and_fds(
+    at: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 7, codex F001: cancellation at each await point -- the body,
+    the first join, the join after the stop -- still stops the drain and
+    releases its read end, with a descendant holding the pipe open."""
+    import asyncio
+    import logging
+    import threading
+    import time
+
+    import anyio
+
+    from pmcp import child_output
+
+    monkeypatch.setattr(child_output, "_DRAIN_JOIN_SECONDS", 0.5)
+    real_run_sync = anyio.to_thread.run_sync
+    calls = 0
+
+    async def cancelling_run_sync(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if (at == "first-join" and calls == 1) or (at == "second-join" and calls == 2):
+            raise asyncio.CancelledError
+        return await real_run_sync(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(anyio.to_thread, "run_sync", cancelling_run_sync)
+    logger = logging.getLogger("pmcp.test.drain")
+    baseline_fds = _open_fds()
+    descendant: subprocess.Popen[bytes] | None = None
+
+    async def use() -> None:
+        nonlocal descendant
+        async with child_output.drained_errlog("srv", logger) as errlog:
+            descendant = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=errlog,
+                start_new_session=True,
+            )
+            await asyncio.sleep(30 if at == "body" else 0)
+
+    task = asyncio.create_task(use())
+    try:
+        if at == "body":
+            await asyncio.sleep(0.2)
+            task.cancel()
+        with contextlib_suppress_cancel():
+            await task
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and any(
+            t.name.startswith("pmcp-errlog-") for t in threading.enumerate()
+        ):
+            await asyncio.sleep(0.05)
+        assert not any(t.name.startswith("pmcp-errlog-") for t in threading.enumerate())
+        assert descendant is not None and descendant.poll() is None
+        assert _open_fds() <= baseline_fds, (_open_fds(), baseline_fds)
+    finally:
+        if descendant is not None:
+            descendant.kill()
+            descendant.wait()
+
+
+def contextlib_suppress_cancel() -> object:
+    import asyncio
+    import contextlib
+
+    return contextlib.suppress(asyncio.CancelledError)
+
+
+class _SocketsOnlySelector:
+    """Windows' `select` semantics: a pipe's registration is accepted, and
+    the wait fails ("not a socket", WinError 10038)."""
+
+    def __init__(self) -> None:
+        pass
+
+    def register(self, fileobj: object, events: int, data: object = None) -> None:
+        return None
+
+    def select(self, timeout: float | None = None) -> list[object]:
+        raise OSError(
+            10038, "An operation was attempted on something that is not a socket"
+        )
+
+    def close(self) -> None:
+        pass
+
+
+def _windows_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    import selectors
+
+    from pmcp import child_output
+
+    monkeypatch.setattr(child_output, "_windows", lambda: True)
+    monkeypatch.setattr(selectors, "DefaultSelector", _SocketsOnlySelector)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the Windows seam, run on POSIX")
+@pytest.mark.asyncio
+async def test_the_windows_drain_reads_a_pipe_select_rejects(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round 7, codex F003: on Windows the drain does not wait with `select`
+    (sockets only); it reads every line and ends at the pipe's end."""
+    import logging
+
+    from pmcp import child_output
+
+    _windows_drain(monkeypatch)
+    caplog.set_level(logging.DEBUG)
+    logger = logging.getLogger("pmcp.test.drain")
+    async with child_output.drained_errlog("srv", logger) as errlog:
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys; [print(f'line {i}', file=sys.stderr) for i in range(50)]",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=errlog,
+        )
+        child.wait()
+    lines = [r.getMessage() for r in caplog.records if r.name == "pmcp.test.drain"]
+    assert lines == [f"[srv] stderr: line {i}" for i in range(50)], lines[:3]
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").exists(), reason="Linux /proc")
+@pytest.mark.asyncio
+async def test_the_windows_drain_leak_is_bounded_by_the_descendant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The documented bounded leak: a Windows drain cannot be stopped early,
+    so while a descendant holds the write end past the context its thread
+    and read end live -- and no longer than that descendant."""
+    import logging
+    import threading
+    import time
+
+    from pmcp import child_output
+
+    _windows_drain(monkeypatch)
+    monkeypatch.setattr(child_output, "_DRAIN_JOIN_SECONDS", 0.2)
+    baseline = _open_fds()
+    logger = logging.getLogger("pmcp.test.drain")
+    async with child_output.drained_errlog("leak", logger) as errlog:
+        descendant = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=errlog,
+            start_new_session=True,
+        )
+
+    def drains() -> list[threading.Thread]:
+        return [t for t in threading.enumerate() if t.name == "pmcp-errlog-leak"]
+
+    try:
+        assert drains(), "the Windows drain ended while the descendant held the pipe"
+    finally:
+        descendant.kill()
+        descendant.wait()
+    deadline = time.monotonic() + 5
+    while drains() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not drains(), "the drain outlived the descendant"
+    assert _open_fds() <= baseline
+
+
+def test_the_last_bytes_are_read_when_data_and_the_stop_are_both_ready() -> None:
+    """Round 7 nit: the stop does not drop what the child already wrote."""
+    from pmcp.child_output import _StoppableReader, bounded_lines
+
+    data_read, data_write = os.pipe()
+    stop_read, stop_write = os.pipe()
+    try:
+        os.write(data_write, b"last words\n")
+        os.close(stop_write)  # the stop, already signalled
+        reader = _StoppableReader(data_read, stop_read)
+        assert list(bounded_lines(reader)) == [(b"last words", False)]  # type: ignore[arg-type]
+        reader.close()
+    finally:
+        for fd in (data_read, data_write, stop_read):
+            with __import__("contextlib").suppress(OSError):
+                os.close(fd)
+
+
+class _FakeKernel32:
+    """Records the Win32 calls pmcp makes; never a console control event."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def __getattr__(self, name: str) -> object:
+        def call(*args: object) -> int:
+            self.calls.append(name)
+            return {"CreateJobObjectW": 77, "OpenProcess": 5}.get(name, 1)
+
+        return call
+
+
+def test_windows_interrupt_and_kill_terminate_the_job_never_a_console_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 7, claude N-A: on Windows each child goes in a Job Object at
+    spawn; an interrupt waits briefly and terminates the job; nothing sends
+    `GenerateConsoleCtrlEvent` (or `CTRL_BREAK_EVENT`)."""
+    from pmcp import child_output
+
+    kernel32 = _FakeKernel32()
+    monkeypatch.setattr(child_output, "_windows", lambda: True)
+    monkeypatch.setattr(child_output, "_kernel32", lambda: kernel32)
+    monkeypatch.setattr(child_output, "_WINDOWS_INTERRUPT_WAIT_SECONDS", 0.01)
+
+    class _Process:
+        pid = 4242
+        returncode = None
+        signals: list[object] = []
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise subprocess.TimeoutExpired("x", timeout or 0)
+
+        def send_signal(self, sig: object) -> None:
+            self.signals.append(sig)
+
+        def kill(self) -> None:
+            self.signals.append("kill")
+
+        def poll(self) -> None:
+            return None
+
+    process = _Process()
+    child_output.track(process)
+    assert kernel32.calls[:5] == [
+        "CreateJobObjectW",
+        "OpenProcess",
+        "SetInformationJobObject",
+        "AssignProcessToJobObject",
+        "CloseHandle",
+    ]
+    child_output.interrupt_tree(process)  # type: ignore[arg-type]
+    assert "TerminateJobObject" in kernel32.calls
+    assert "GenerateConsoleCtrlEvent" not in kernel32.calls
+    assert process.signals == []  # neither CTRL_BREAK_EVENT nor a bare kill
+
+    kernel32.calls.clear()
+    child_output.track(process)
+    child_output.kill_tree(process)
+    assert "TerminateJobObject" in kernel32.calls
+
+
+def test_windows_without_a_job_kills_the_child_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If job assignment fails (a nested-job restriction), the kill falls
+    back to the child alone."""
+    from pmcp import child_output
+
+    class _Refusing(_FakeKernel32):
+        def __getattr__(self, name: str) -> object:
+            if name == "AssignProcessToJobObject":
+                return lambda *a: 0
+            return super().__getattr__(name)
+
+    monkeypatch.setattr(child_output, "_windows", lambda: True)
+    monkeypatch.setattr(child_output, "_kernel32", lambda: _Refusing())
+
+    class _Process:
+        pid = 4343
+        returncode = None
+        killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = _Process()
+    child_output.track(process)
+    child_output.kill_tree(process)
+    assert process.killed

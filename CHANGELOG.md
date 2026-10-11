@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Ctrl-C during `pmcp upgrade` or a service restart reaches the command and everything it started, as it did before children were detached: pmcp sends the interrupt to the child's process group, gives it 5 s, then kills what is left. A timed-out or cancelled install, its verification, a CLI version or help probe and the npm resolver are killed with every process they started (an npm lifecycle script, a node-gyp build), not only the command itself; a timed-out CLI probe used to be left running. A downstream server's stderr reader stops, and releases its pipe, 5 s after the server is done even when something the server started still holds the pipe open.
 
+  A timed-out probe whose command exited first while something it started still held its output (a CLI version or help probe, an install, a stalled install job) no longer leaves that process running: every kill now goes through one rule, which still reaches the group once the command is gone and never signals a process id that has been reused. A cancelled request no longer leaves its server's stderr reader and pipe behind. On Windows each child pmcp starts is put in its own Job Object: killing it ends everything it started, Ctrl-C during `pmcp upgrade` or a service restart waits 1 s and then ends the job (pmcp no longer sends console control events), and a server's stderr is read without `select`, which accepts only sockets there. A Windows stderr reader cannot be stopped early; if something a server started keeps the pipe open, the reader lasts until that process exits.
+
 ## [3.0.0] - 2026-10-09
 
 ### Upgrade notes

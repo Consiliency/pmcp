@@ -20,7 +20,7 @@ from typing import Any, Literal, cast, NamedTuple
 import anyio
 from mcp.types import Tool
 from pydantic import BaseModel
-from pmcp.child_output import detached, kill_tree
+from pmcp.child_output import detached, kill_tree, track
 from pmcp.argument_errors import describe_value, exception_text, safe_exc_info
 from pmcp import __version__ as PMCP_VERSION
 from pmcp.auth import (
@@ -3555,6 +3555,7 @@ class GatewayTools:
             env=child_process_env(base=env),
             **detached(),
         )
+        track(process)  # its Job Object on Windows
         # The spawn contract: `start_new_session=True` makes the probe a group
         # leader, so its pgid IS its pid -- not looked up, since a probe that
         # exits at once may already be reaped (Consiliency/pmcp#324, codex
@@ -6092,8 +6093,8 @@ class GatewayTools:
             job.status = "failed"
             job.error = f"Handoff failed: {exception_text(e)}"
             # Kill the orphaned process
-            if process and process.returncode is None:
-                kill_tree(process)  # its whole group (round 6, claude N-B)
+            if process:
+                kill_tree(process)  # its whole group, exited or not (round 7)
             job.process = None
 
             return ProvisionJobStatus(

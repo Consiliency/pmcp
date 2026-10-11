@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from pmcp.child_output import detached, kill_tree
+from pmcp.child_output import detached, kill_tree, track
 from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.env_store import (
     credential_value,
@@ -225,6 +225,7 @@ class JobManager:
                 # No controlling terminal (Consiliency/pmcp#388 round 5).
                 **detached(),
             )
+            track(process)  # its Job Object on Windows
             job.process = process
             job.status = "installing"
             job.last_heartbeat = time.time()
@@ -492,7 +493,10 @@ class JobManager:
         """Safely terminate a subprocess with timeout and fallback to kill."""
         try:
             if process.returncode is not None:
-                return  # Already exited
+                # Exited -- but a descendant may still run in its group,
+                # holding its pipes (round 7, codex F002).
+                kill_tree(process)
+                return
 
             if force:
                 kill_tree(process)
@@ -731,6 +735,7 @@ async def install_server(
             env=build_install_child_env(server_config, project_root),
             **detached(),
         )
+        track(process)  # its Job Object on Windows
 
         stdout, stderr = await bounded_wait(
             process.communicate(),
@@ -747,9 +752,12 @@ async def install_server(
 
     except asyncio.TimeoutError:
         # Kill the process on timeout
-        if process and process.returncode is None:
+        if process:
+            # Also when it exited first and a descendant still holds its
+            # pipes, so communicate() timed out (round 7, codex F002).
             kill_tree(process)
-            await process.wait()
+            if process.returncode is None:
+                await process.wait()
         raise InstallError(
             f"Installation of {server_config.name} timed out after {timeout}s"
         )
@@ -790,6 +798,7 @@ async def verify_installation(
             env=build_install_child_env(server_config, project_root),
             **detached(),
         )
+        track(process)  # its Job Object on Windows
 
         await bounded_wait(process.communicate(), timeout=5.0)
         return True

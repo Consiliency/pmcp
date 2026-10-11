@@ -62,7 +62,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from pmcp.child_output import detached, kill_tree
+from pmcp.child_output import detached, kill_tree, track
 from pmcp.argument_errors import exception_text
 from pmcp.parsing import load_json
 
@@ -315,9 +315,9 @@ class NpmResolver:
         if reader is not None:
             reader.stop()
         if proc is not None:
-            if proc.poll() is None:
-                # The child's whole group (round 6, claude N-B).
-                kill_tree(proc)
+            # The child's whole group (round 6, claude N-B), whether or not it
+            # has exited (round 7, codex F002).
+            kill_tree(proc)
             try:
                 proc.wait(timeout=2.0)
             except Exception:  # pragma: no cover - stubborn child
@@ -358,6 +358,7 @@ class NpmResolver:
                 # No controlling terminal (Consiliency/pmcp#388 round 5).
                 **detached(),
             )
+            track(proc)  # its Job Object on Windows
         except FileNotFoundError as exc:
             # node is not installed. This is the ONE spawn failure that learns
             # nothing about npm, so it is the one that falls back to the tables.
