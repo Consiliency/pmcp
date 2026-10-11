@@ -1335,7 +1335,12 @@ def parse_www_authenticate(header: str) -> AuthChallengeInfo | None:
 
 def protected_resource_metadata_urls(endpoint_url: str) -> list[str]:
     """Return candidate OAuth protected-resource metadata URLs for an endpoint."""
-    parsed = urlparse(endpoint_url)
+    try:
+        parsed = urlparse(endpoint_url)
+    except ValueError:
+        # Caught at the parse site: urllib's text quotes the URL
+        # (Consiliency/pmcp#388 round 2). An unparseable URL has no candidates.
+        return []
     if not parsed.scheme or not parsed.netloc:
         return []
     root = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))

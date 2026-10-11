@@ -318,3 +318,11 @@ def test_a_wrapped_parser_error_still_describes_its_wrapper() -> None:
             assert text == "pmcp's fixed refusal", text
         else:
             assert text == "RuntimeError: could not parse the text (ValueError)", text
+
+
+def test_an_unparseable_endpoint_has_no_metadata_candidates() -> None:
+    """`protected_resource_metadata_urls` catches urllib's error at the parse
+    site rather than raising text that quotes the URL."""
+    from pmcp.auth import protected_resource_metadata_urls
+
+    assert protected_resource_metadata_urls(f"https://{_S}\x1bc\x07：80/") == []
