@@ -3329,39 +3329,35 @@ def main() -> None:
     # a protocol: escaped from the first line on (Consiliency/pmcp#388 round 3).
     restore = _install_display_streams(stdout=False)
     try:
-        _main()
+        # Load .env from the current directory or project root, plus the PMCP
+        # credential stores -- recording which keys the plain .env introduced
+        # so they do not reach downstream servers (Consiliency/pmcp#229).
+        load_startup_env()
+
+        args = parse_args()
+        if human_output(args):
+            # A subcommand's own output, for a person: through the same
+            # escaping. The gateway's stdout and `--json` output are untouched.
+            _install_display_streams(stdout=True)
+        serve_project(getattr(args, "project", None))
+
+        # Resolve the `secrets set` value here (not in async_main) so it is
+        # never required on argv, while async_main stays a pure dispatcher.
+        if (
+            getattr(args, "command", None) == "secrets"
+            and getattr(args, "secrets_command", None) == "set"
+        ):
+            args.value = _resolve_secret_set_value(args)
+
+        try:
+            asyncio.run(async_main(args))
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            print(f"Fatal error: {exception_text(e)}", file=sys.stderr)
+            sys.exit(1)
     finally:
         restore()
-
-
-def _main() -> None:
-    # Load .env from the current directory or project root, plus the PMCP
-    # credential stores -- recording which keys the plain .env introduced so
-    # they do not reach downstream servers (Consiliency/pmcp#229).
-    load_startup_env()
-
-    args = parse_args()
-    if human_output(args):
-        # A subcommand's own output, for a person: through the same
-        # escaping. The gateway's stdout and `--json` output are untouched.
-        _install_display_streams(stdout=True)
-    serve_project(getattr(args, "project", None))
-
-    # Resolve the `secrets set` value here (not in async_main) so it is never
-    # required on argv, while async_main stays a pure dispatcher over args.
-    if (
-        getattr(args, "command", None) == "secrets"
-        and getattr(args, "secrets_command", None) == "set"
-    ):
-        args.value = _resolve_secret_set_value(args)
-
-    try:
-        asyncio.run(async_main(args))
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        print(f"Fatal error: {exception_text(e)}", file=sys.stderr)
-        sys.exit(1)
 
 
 if __name__ == "__main__":
