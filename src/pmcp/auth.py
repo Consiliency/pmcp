@@ -139,7 +139,7 @@ class AuthMessage:
     # refused, not rewritten. Rev 3: the text states the whole rule, from
     # `CANONICAL_HOST_FORMS`, so it is true of every host it refuses.
     PUBLIC_URL_CONTROL_CHARACTER = AuthText(
-        "Public auth URL contains a control character."
+        "Public auth URL contains a non-printable character."
     )
     # Rev 3: WHATWG ends the authority at `\` (yarl and urlsplit do not), so
     # `https://127.0.0.1\@auth.example.com/` is 127.0.0.1 to a browser.

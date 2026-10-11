@@ -197,7 +197,8 @@ async def _update_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 DRIVERS: dict[tuple[str, str], Callable[[pytest.MonkeyPatch], Awaitable[None]]] = {
     ("pmcp.cli", "_is_pmcp_system_service_active"): _which_systemctl,
     ("pmcp.cli", "_restart_local_pmcp_service"): _restart,
-    ("pmcp.cli", "run_upgrade"): _upgrade,
+    # `pmcp upgrade`'s installer, through the echoing runner (round 4).
+    ("pmcp.child_output", "run_echoed"): _upgrade,
     ("pmcp.client.manager", "_connect_stdio"): _connect_stdio,
     ("pmcp.manifest.environment", "check_cli"): _check_cli,
     ("pmcp.manifest.environment", "get_cli_help"): _cli_help,

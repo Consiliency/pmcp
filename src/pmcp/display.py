@@ -22,6 +22,7 @@ import first, can use it.
 
 from __future__ import annotations
 
+import io
 from typing import Any
 
 #: The two layout characters a multi-line log message may keep
@@ -59,8 +60,9 @@ class DisplaySafeStream:
     Installed over ``sys.stdout`` and ``sys.stderr`` by the CLI for a
     command whose output is for a person (:func:`pmcp.cli.human_output`),
     so no print site -- one that renders a value itself or one that does not
-    -- can send a terminal a control sequence. Everything else (``buffer``,
-    ``fileno``, ``isatty``, ``encoding``, ``flush``) is the wrapped
+    -- can send a terminal a control sequence. ``fileno`` raises: a child
+    handed the descriptor would bypass the escaping. Everything else
+    (``buffer``, ``isatty``, ``encoding``, ``flush``) is the wrapped
     stream's: bytes written to ``buffer`` are not text for a person and are
     passed through unchanged.
     """
@@ -77,6 +79,15 @@ class DisplaySafeStream:
     def write(self, text: str) -> int:
         self._stream.write(display_safe(text, keep=LOG_LAYOUT))
         return len(text)
+
+    def fileno(self) -> int:
+        """No raw descriptor: a child that inherited it would write to the
+        terminal past this stream (Consiliency/pmcp#388 round 4, grok F001).
+        Code that needs one must pipe the child instead
+        (:mod:`pmcp.child_output`)."""
+        raise io.UnsupportedOperation(
+            "a display-safe stream has no file descriptor to hand to a child"
+        )
 
     def writelines(self, lines: Any) -> None:
         for line in lines:

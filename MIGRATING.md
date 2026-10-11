@@ -845,11 +845,14 @@ validator on 2.7.3 and on 3.0:
 | `https://example.123/…` (numeric last label) | not canonical | a real DNS name or a dotted-quad address |
 | `https://[2606:4700:4700::1111%25eth0]/…` (IPv6 zone id) | not canonical | `https://[2606:4700:4700::1111]/…` |
 | `https://auth.example.com\@evil.example/…` (backslash; 2.7.3 stored it as `https://evil.example/…`) | `Public auth URL contains a backslash.` | write the URL you mean. In a path, percent-encode it as `%5C` |
-| `https://auth.example.com/key<TAB>set.json` (control character; 2.7.3 deleted it silently) | `Public auth URL contains a control character.` | `https://auth.example.com/keyset.json` |
+| `https://auth.example.com/key<TAB>set.json` (control character; 2.7.3 deleted it silently) | `Public auth URL contains a non-printable character.` | `https://auth.example.com/keyset.json` |
 | `http://auth.example.com/…` | `Plain http:// is not accepted for this public auth URL.` (2.7.3: `…only allows http:// URLs for loopback hosts.`) | `https://…` |
 
 Uppercase letters are still accepted and lowercased, and an explicit port
-such as `:8443` is still fine.
+such as `:8443` is still fine. pmcp 3.0.0 refused only C0 controls and DEL,
+with `Public auth URL contains a control character.`; 3.0.1 and later refuse
+every character that is not printable (C1 controls, bidi, zero-width and tag
+characters, line separators and non-ASCII spaces too) with the message shown.
 
 **How to verify.** Start the gateway with the corrected URL:
 

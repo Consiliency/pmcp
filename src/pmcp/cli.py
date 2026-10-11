@@ -56,6 +56,7 @@ from pmcp.env_store import (
 from pmcp.validation import is_valid_package_version, parse_package_spec
 from pmcp.manifest.loader import load_manifest
 from pmcp.parsing import load_json, load_json_file
+from pmcp.child_output import run_echoed
 from pmcp.provision_gate import operator_safe
 from pmcp.types import StartupPolicyOperation
 
@@ -2347,20 +2348,14 @@ def _restart_local_pmcp_service() -> None:
             print("No active pmcp systemd user service found — skipping restart.")
             return
         print("Restarting pmcp systemd user service...")
-        subprocess.run(
-            ["systemctl", "--user", "restart", "pmcp.service"],
-            check=False,
-            env=child_process_env(),
-        )
+        # Piped and echoed escaped, never the terminal's own descriptors
+        # (Consiliency/pmcp#388 round 4, claude N-B).
+        run_echoed(["systemctl", "--user", "restart", "pmcp.service"])
         return
     if sys.platform == "darwin" and shutil.which("launchctl"):
         label = f"gui/{os.getuid()}/com.user.pmcp"
         print(f"Kickstarting launchd {label}...")
-        subprocess.run(
-            ["launchctl", "kickstart", "-k", label],
-            check=False,
-            env=child_process_env(),
-        )
+        run_echoed(["launchctl", "kickstart", "-k", label])
         return
     print("No supported service manager detected — skipping restart.")
 
@@ -2404,16 +2399,18 @@ async def run_upgrade(args: argparse.Namespace) -> None:
 
     print(f"Upgrading pmcp via {method}: {' '.join(cmd)}")
     try:
-        result = subprocess.run(cmd, check=False, env=child_process_env())
+        # The installer's output, piped and echoed escaped as it arrives
+        # (Consiliency/pmcp#388 round 4, claude N-B).
+        returncode = run_echoed(cmd)
     except FileNotFoundError as exc:
         print(f"error: {exception_text(exc)}", file=sys.stderr)
         sys.exit(1)
-    if result.returncode != 0:
+    if returncode != 0:
         print(
-            f"error: upgrade command failed with exit {result.returncode}",
+            f"error: upgrade command failed with exit {returncode}",
             file=sys.stderr,
         )
-        sys.exit(result.returncode)
+        sys.exit(returncode)
 
     drift = detect_install_drift()
     if drift.has_drift:
@@ -3349,13 +3346,16 @@ def main() -> None:
         ):
             args.value = _resolve_secret_set_value(args)
 
-        try:
-            asyncio.run(async_main(args))
-        except KeyboardInterrupt:
-            pass
-        except Exception as e:
-            print(f"Fatal error: {exception_text(e)}", file=sys.stderr)
-            sys.exit(1)
+        asyncio.run(async_main(args))
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        # Anything that escapes -- startup loading, argument handling, the
+        # project choice, `secrets set`'s value, the command itself -- is
+        # rendered here, while stderr is still the escaping stream, never by
+        # the default hook after it is restored (round 4, claude N-A).
+        print(f"Fatal error: {exception_text(e)}", file=sys.stderr)
+        sys.exit(1)
     finally:
         restore()
 

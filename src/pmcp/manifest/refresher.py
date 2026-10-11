@@ -18,6 +18,7 @@ import anyio
 import yaml
 
 from pmcp.argument_errors import exception_text
+from pmcp.child_output import drained_errlog
 from pmcp.env_store import child_process_env
 from pmcp.manifest.loader import (
     credential_lookup_keys,
@@ -368,8 +369,14 @@ async def refresh_server(
         # hung `pmcp refresh` and the startup cache generation. Each request
         # waits at most the read timeout; the whole refresh at most the
         # overall bound.
-        with anyio.fail_after(REFRESH_TIMEOUT_SECONDS):
-            async with stdio_client(server_params) as (read, write):
+        # The child's stderr is piped and logged, escaped -- never the
+        # operator's terminal (Consiliency/pmcp#388 round 4, grok F001: the
+        # SDK's default `errlog` is `sys.stderr`, which the child inherited).
+        with (
+            drained_errlog(server_name, logger) as errlog,
+            anyio.fail_after(REFRESH_TIMEOUT_SECONDS),
+        ):
+            async with stdio_client(server_params, errlog=errlog) as (read, write):
                 async with ClientSession(
                     read, write, read_timeout_seconds=REFRESH_READ_TIMEOUT_SECONDS
                 ) as session:

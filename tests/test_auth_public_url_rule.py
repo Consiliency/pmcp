@@ -470,7 +470,7 @@ _CANONICAL_TEXT = (
 _TEXT_CLAIMS: dict[str, Callable[[str], bool]] = {
     # Round 3 of Consiliency/pmcp#388: any character that is not printable
     # (C0, DEL, C1, format, separators, non-ASCII spaces), not only C0 and DEL.
-    "Public auth URL contains a control character.": lambda url: (
+    "Public auth URL contains a non-printable character.": lambda url: (
         not _stripped(url).isprintable()
     ),
     "Public auth URL contains a backslash.": lambda url: "\\" in url,
