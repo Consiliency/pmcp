@@ -20,7 +20,7 @@ from typing import Any, Literal, cast, NamedTuple
 import anyio
 from mcp.types import Tool
 from pydantic import BaseModel
-from pmcp.child_output import detached
+from pmcp.child_output import detached, kill_tree
 from pmcp.argument_errors import describe_value, exception_text, safe_exc_info
 from pmcp import __version__ as PMCP_VERSION
 from pmcp.auth import (
@@ -6093,10 +6093,7 @@ class GatewayTools:
             job.error = f"Handoff failed: {exception_text(e)}"
             # Kill the orphaned process
             if process and process.returncode is None:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
+                kill_tree(process)  # its whole group (round 6, claude N-B)
             job.process = None
 
             return ProvisionJobStatus(

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from pmcp.child_output import detached
+from pmcp.child_output import detached, kill_tree
 from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.env_store import (
     credential_value,
@@ -269,7 +269,9 @@ class JobManager:
                     and job.process.returncode is None
                 ):
                     try:
-                        job.process.kill()
+                        # The whole group: an npm lifecycle script or a
+                        # node-gyp build it started too (round 6, claude N-B).
+                        kill_tree(job.process)
                     except Exception as e:
                         logger.debug(f"task cleanup error: {exception_text(e)}")
         except asyncio.CancelledError:
@@ -493,9 +495,9 @@ class JobManager:
                 return  # Already exited
 
             if force:
-                process.kill()
+                kill_tree(process)
             else:
-                process.terminate()
+                kill_tree(process, terminate=True)
 
             try:
                 await bounded_wait(process.wait(), timeout=5.0)
@@ -504,7 +506,7 @@ class JobManager:
                     logger.warning(
                         f"Install {job_id}: Process didn't terminate, killing"
                     )
-                    process.kill()
+                    kill_tree(process)
                     try:
                         await bounded_wait(process.wait(), timeout=2.0)
                     except asyncio.TimeoutError:
@@ -566,13 +568,13 @@ class JobManager:
 
         if job.process and job.process.returncode is None:
             logger.info(f"Cancelling install job {job_id}")
-            job.process.terminate()
+            kill_tree(job.process, terminate=True)
 
             # Give it a moment to terminate gracefully
             try:
                 await bounded_wait(job.process.wait(), timeout=2.0)
             except asyncio.TimeoutError:
-                job.process.kill()
+                kill_tree(job.process)
                 await job.process.wait()
 
             job.status = "failed"
@@ -746,7 +748,7 @@ async def install_server(
     except asyncio.TimeoutError:
         # Kill the process on timeout
         if process and process.returncode is None:
-            process.kill()
+            kill_tree(process)
             await process.wait()
         raise InstallError(
             f"Installation of {server_config.name} timed out after {timeout}s"

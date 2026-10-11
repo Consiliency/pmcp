@@ -329,7 +329,7 @@ def test_pmcp_upgrade_keeps_the_operators_own_index(
         seen.update(k.get("env") or {})  # type: ignore[arg-type]
         raise FileNotFoundError
 
-    monkeypatch.setattr(cli.subprocess, "run", spy)
+    monkeypatch.setattr(cli.subprocess, "Popen", spy)
     with pytest.raises(SystemExit):
         asyncio.run(
             cli.run_upgrade(
@@ -420,7 +420,7 @@ def test_a_synced_project_cannot_steer_the_next_upgrade(lay: dict[str, Path]) ->
         "def spy(*a, **k):\n"
         "    seen.update(k.get('env') or {})\n"
         "    raise FileNotFoundError\n"
-        "cli.subprocess.run = spy\n"
+        "cli.subprocess.Popen = spy\n"
         "try:\n"
         "    asyncio.run(cli.run_upgrade(argparse.Namespace(\n"
         "        log_level='warning', method='pip', dry_run=False)))\n"

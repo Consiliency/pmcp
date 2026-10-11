@@ -62,7 +62,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from pmcp.child_output import detached
+from pmcp.child_output import detached, kill_tree
 from pmcp.argument_errors import exception_text
 from pmcp.parsing import load_json
 
@@ -315,10 +315,9 @@ class NpmResolver:
         if reader is not None:
             reader.stop()
         if proc is not None:
-            try:
-                proc.kill()
-            except OSError:  # pragma: no cover - already reaped
-                pass
+            if proc.poll() is None:
+                # The child's whole group (round 6, claude N-B).
+                kill_tree(proc)
             try:
                 proc.wait(timeout=2.0)
             except Exception:  # pragma: no cover - stubborn child

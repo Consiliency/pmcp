@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from pmcp.child_output import detached
+from pmcp.child_output import detached, kill_tree
 from pmcp.env_store import child_process_env
 from pmcp.waits import bounded_wait
 import logging
@@ -75,6 +75,7 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
     if not path:
         return None
 
+    process: asyncio.subprocess.Process | None = None
     try:
         # Run version check command
         # Detached, stdin closed: a check command an overlay names cannot
@@ -104,12 +105,18 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
     except Exception as e:
         logger.debug(f"Error checking CLI {_label(name)}: {type(e).__name__}")
         return None
+    finally:
+        # A check that timed out (or was cancelled) is killed with everything
+        # it started (round 6, claude N-B): it used to be left running.
+        if process is not None and process.returncode is None:
+            kill_tree(process)
 
 
 async def get_cli_help(
     name: str, help_command: list[str], max_lines: int = 50
 ) -> str | None:
     """Get help output for a CLI."""
+    process: asyncio.subprocess.Process | None = None
     try:
         process = await asyncio.create_subprocess_exec(
             *help_command,
@@ -131,6 +138,9 @@ async def get_cli_help(
     except Exception as e:
         logger.debug(f"Error getting help for {_label(name)}: {type(e).__name__}")
         return None
+    finally:
+        if process is not None and process.returncode is None:
+            kill_tree(process)
 
 
 async def probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:

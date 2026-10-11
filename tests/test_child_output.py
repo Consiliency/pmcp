@@ -55,6 +55,61 @@ _SAFE_TARGETS = {"PIPE", "DEVNULL", "STDOUT"}
 _INHERITING_ALLOWED: dict[tuple[str, int], str] = {}
 
 
+#: Modules whose functions spawn, by the name the code imports them under.
+_SPAWN_MODULES = ("subprocess", "asyncio", "asyncio.subprocess", "anyio", "os", "pty")
+
+
+def _aliases(tree: ast.AST) -> dict[str, str]:
+    """``local name -> dotted target`` for every import of a spawn module or
+    of a function from one (`import subprocess as sp`, `from subprocess
+    import run as r`, `from asyncio import create_subprocess_exec`)."""
+    found: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _SPAWN_MODULES:
+                    found[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module in _SPAWN_MODULES:
+            for alias in node.names:
+                found[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return found
+
+
+def _spawn_kind(call: ast.Call, aliases: dict[str, str]) -> str | None:
+    """The spawn ``call`` makes, as ``module.function``, or None."""
+    func = call.func
+    if isinstance(func, ast.Attribute) and func.attr in (
+        "subprocess_exec",
+        "subprocess_shell",
+    ):
+        return f"loop.{func.attr}"  # loop.subprocess_exec(protocol, ...)
+    if isinstance(func, ast.Name) and func.id == "stdio_client":
+        return "stdio_client"
+    dotted = _dotted_name(func)
+    if dotted is None:
+        return None
+    head, _, rest = dotted.partition(".")
+    target = aliases.get(head)
+    resolved = f"{target}.{rest}" if target and rest else (target or dotted)
+    module, _, function = resolved.rpartition(".")
+    if module == "asyncio.subprocess":
+        module = "asyncio"
+    if (module, function) in _SPAWNS:
+        return f"{module}.{function}"
+    if module == "os" and function.startswith(("exec", "spawn", "posix_spawn", "fork")):
+        return f"os.{function}"
+    return None
+
+
+def _dotted_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        owner = _dotted_name(node.value)
+        return None if owner is None else f"{owner}.{node.attr}"
+    return None
+
+
 def _spawn_calls() -> list[tuple[str, ast.Call, str]]:
     found = []
     for path in sorted(SRC.rglob("*.py")):
@@ -62,19 +117,12 @@ def _spawn_calls() -> list[tuple[str, ast.Call, str]]:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         rel = path.relative_to(SRC).as_posix()
+        aliases = _aliases(tree)
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-                key = (func.value.id, func.attr)
-                if key in _SPAWNS:
-                    found.append((rel, node, f"{key[0]}.{key[1]}"))
-                elif func.attr.startswith("exec") and func.value.id == "os":
-                    found.append((rel, node, f"os.{func.attr}"))
-            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
-            if name == "stdio_client":
-                found.append((rel, node, "stdio_client"))
+            if isinstance(node, ast.Call):
+                kind = _spawn_kind(node, aliases)
+                if kind is not None:
+                    found.append((rel, node, kind))
     return found
 
 
@@ -105,7 +153,9 @@ def _streams_problem(call: ast.Call, kind: str) -> str | None:
         if errlog is None or ast.unparse(errlog) in ("sys.stderr", "sys.stdout"):
             return "stdio_client without a piped errlog"
         return None
-    if kind in ("os.system", "os.popen", "pty.spawn") or kind.startswith("os.exec"):
+    if kind in ("os.system", "os.popen", "pty.spawn") or kind.startswith(
+        ("os.exec", "os.spawn", "os.posix_spawn", "os.fork")
+    ):
         return f"{kind} always shares the terminal"
     if not _detached(call, keywords):
         return "not detached from the controlling terminal"
@@ -139,14 +189,11 @@ def test_no_spawn_lets_a_child_write_to_pmcps_streams() -> None:
 
 
 def test_the_spawn_guard_sees_each_shape() -> None:
-    def problem(source: str) -> str | None:
-        call = ast.parse(source).body[0].value  # type: ignore[attr-defined]
-        func = call.func
-        kind = (
-            "stdio_client"
-            if getattr(func, "id", "") == "stdio_client"
-            else f"{func.value.id}.{func.attr}"
-        )
+    def problem(source: str, imports: str = "") -> str | None:
+        tree = ast.parse(imports + "\n" + source)
+        call = tree.body[-1].value  # type: ignore[attr-defined]
+        kind = _spawn_kind(call, _aliases(tree))
+        assert kind is not None, source
         return _streams_problem(call, kind)
 
     ok = "stdin=subprocess.DEVNULL, **detached()"
@@ -186,6 +233,21 @@ def test_the_spawn_guard_sees_each_shape() -> None:
     assert problem("stdio_client(params, errlog=sys.stderr)") is not None
     assert problem("stdio_client(params, errlog=errlog)") is None
     assert problem("os.system('x')") is not None
+    # Round 6, claude N-C: aliased imports and the asyncio.subprocess forms.
+    assert problem("sp.run(['x'])", "import subprocess as sp") == (
+        "not detached from the controlling terminal"
+    )
+    assert problem("r(['x'])", "from subprocess import run as r") == (
+        "not detached from the controlling terminal"
+    )
+    assert problem("asyncio.subprocess.create_subprocess_exec('x')") is not None
+    assert (
+        problem("cse('x')", "from asyncio import create_subprocess_exec as cse")
+        is not None
+    )
+    assert problem("loop.subprocess_exec(proto, 'x')") is not None
+    assert problem("os.posix_spawn('x', ['x'], {})") is not None
+    assert problem("os.fork()") is not None
 
 
 def test_the_sdks_stdio_spawn_is_detached_with_a_piped_stdin() -> None:
@@ -655,3 +717,210 @@ async def test_the_drain_waits_off_the_event_loop(
     )
     assert "[srv] stderr: hello SENTINEL" in text, text
     assert "\x1b" not in text and "\x9b" not in text
+
+
+# --- round 6, claude N-C: the audit-hook backstop ---------------------------------
+
+
+def test_the_audit_backstop_records_an_undetached_spawn_from_pmcp_code() -> None:
+    """A spawn the static guard cannot see (here, behind `getattr`), from a
+    frame in pmcp's own source, is recorded by the session's audit hook --
+    and then removed, so this deliberate one does not fail the session."""
+    import pmcp
+    from tests import conftest
+
+    probe = Path(pmcp.__file__).parent / "_audit_probe_does_not_exist.py"
+    source = (
+        "import subprocess, sys\n"
+        "spawn = getattr(subprocess, 'run')\n"
+        "spawn([sys.executable, '-c', 'pass'])\n"
+    )
+    before = len(conftest.SPAWN_VIOLATIONS)
+    exec(compile(source, str(probe), "exec"), {})  # noqa: S102 - the probe
+    caught = conftest.SPAWN_VIOLATIONS[before:]
+    del conftest.SPAWN_VIOLATIONS[before:]
+    assert len(caught) == 1, caught
+    where, problem = caught[0]
+    assert where.startswith("_audit_probe_does_not_exist.py:"), where
+    assert "not detached" in problem and "stdin inherited" in problem, problem
+    assert "stdout inherited" in problem and "stderr inherited" in problem, problem
+
+
+def test_the_audit_backstop_passes_a_detached_spawn_from_pmcp_code() -> None:
+    import pmcp
+    from tests import conftest
+
+    probe = Path(pmcp.__file__).parent / "_audit_probe_does_not_exist.py"
+    source = (
+        "import subprocess, sys\n"
+        "subprocess.run([sys.executable, '-c', 'pass'], stdin=subprocess.DEVNULL,\n"
+        "    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)\n"
+    )
+    before = len(conftest.SPAWN_VIOLATIONS)
+    exec(compile(source, str(probe), "exec"), {})  # noqa: S102 - the probe
+    assert conftest.SPAWN_VIOLATIONS[before:] == []
+
+
+# --- round 6: the drain releases everything; groups are killed whole ---------------
+
+#: A child that starts a grandchild (recording its pid), optionally traps
+#: SIGINT (recording that it ran), and then waits.
+_FAMILY = textwrap.dedent(
+    """
+    import os, signal, subprocess, sys, time
+    out = sys.argv[1]
+    grandchild = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    with open(os.path.join(out, "grandchild"), "w") as handle:
+        handle.write(str(grandchild.pid))
+    def trapped(signum, frame):
+        with open(os.path.join(out, "trapped"), "w") as handle:
+            handle.write("yes")
+        sys.exit(130)
+    signal.signal(signal.SIGINT, trapped)
+    time.sleep(60)
+    """
+)
+
+
+def _gone(pid: int, within: float = 5.0) -> bool:
+    import time
+
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        # A zombie still answers signal 0: reaped by init shortly.
+        try:
+            with open(f"/proc/{pid}/stat") as handle:
+                if handle.read().split(")")[-1].split()[0] == "Z":
+                    return True
+        except OSError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _wait_for(path: Path, within: float = 10.0) -> None:
+    import time
+
+    deadline = time.monotonic() + within
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert path.exists(), path
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_ctrl_c_during_run_echoed_reaches_the_child_and_its_group(
+    tmp_path: Path,
+) -> None:
+    """Round 6, claude N-A: a detached child no longer gets the terminal's
+    SIGINT. `run_echoed` forwards it to the child's group, so the child's
+    trap runs, and then kills what is left, so its grandchild is gone."""
+    import signal
+
+    child = tmp_path / "family.py"
+    child.write_text(_FAMILY)
+    script = (
+        "import sys\n"
+        "from pmcp.child_output import run_echoed\n"
+        f"run_echoed([sys.executable, {str(child)!r}, {str(tmp_path)!r}])\n"
+    )
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PMCP_")}
+    env.update(PYTHONPATH=str(SRC.parent), HOME=str(tmp_path))
+    parent = subprocess.Popen(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for(tmp_path / "grandchild")
+        grandchild = int((tmp_path / "grandchild").read_text())
+        os.kill(parent.pid, signal.SIGINT)
+        parent.communicate(timeout=30)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+    assert (tmp_path / "trapped").exists(), "the child's SIGINT trap never ran"
+    assert _gone(grandchild), "the child's grandchild outlived the interrupt"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_an_install_that_times_out_is_killed_with_its_group(
+    tmp_path: Path,
+) -> None:
+    """Round 6, claude N-B: `install_server`'s timeout kills the install
+    command's whole group, so a grandchild it started (an npm lifecycle
+    script, a node-gyp build) does not keep running."""
+    from pmcp.manifest import installer
+    from pmcp.manifest.loader import ServerConfig
+
+    child = tmp_path / "family.py"
+    child.write_text(_FAMILY)
+    command = [sys.executable, str(child), str(tmp_path)]
+    server = ServerConfig(
+        name="memory",
+        description="memory",
+        keywords=["memory"],
+        install={"linux": command},
+        command=command[0],
+        args=command[1:],
+        requires_api_key=False,
+    )
+    with pytest.raises(installer.InstallError):
+        await installer.install_server(server, "linux", timeout=1.5)
+    grandchild = int((tmp_path / "grandchild").read_text())
+    assert _gone(grandchild), "the install's grandchild outlived its timeout"
+
+
+def _open_fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").exists(), reason="Linux /proc")
+@pytest.mark.asyncio
+async def test_the_drain_releases_its_thread_and_fds_while_a_descendant_lives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 6, codex F001: three errlog contexts, each with a descendant
+    that keeps the pipe's write end open past the context. Afterwards no
+    drain thread and no read end remain."""
+    import logging
+    import threading
+
+    from pmcp import child_output
+
+    monkeypatch.setattr(child_output, "_DRAIN_JOIN_SECONDS", 0.3)
+    logger = logging.getLogger("pmcp.test.drain")
+    baseline_fds = _open_fds()
+    baseline_threads = {t.name for t in threading.enumerate()}
+    descendants = []
+    try:
+        for _ in range(3):
+            async with child_output.drained_errlog("srv", logger) as errlog:
+                descendants.append(
+                    subprocess.Popen(
+                        [sys.executable, "-c", "import time; time.sleep(60)"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=errlog,
+                        start_new_session=True,
+                    )
+                )
+        assert all(d.poll() is None for d in descendants)  # still holding the pipe
+        drains = [t for t in threading.enumerate() if t.name.startswith("pmcp-errlog-")]
+        assert drains == [], drains
+        # Only the loop's own worker pool may have grown (anyio's idle
+        # workers, which ran the joins); no drain thread remains.
+        extra = {t.name for t in threading.enumerate()} - baseline_threads
+        assert extra <= {"AnyIO worker thread"}, extra
+        assert _open_fds() <= baseline_fds, (_open_fds(), baseline_fds)
+    finally:
+        for d in descendants:
+            d.kill()
+            d.wait()

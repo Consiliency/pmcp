@@ -45,6 +45,7 @@ passes for the wrong reason and looks green forever. So:
 from __future__ import annotations
 
 import os
+import sys as _sys
 import tempfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -82,6 +83,96 @@ from pmcp.types import (
 #: so a check written against a live ``Path.home()`` would compare the fake home
 #: with itself and pass however broken the redirect was.
 _REAL_HOME = Path.home().resolve()
+
+
+# --- the spawn backstop (Consiliency/pmcp#388 round 6, claude N-C) -----------
+#
+# The static guard (`tests/test_child_output.py`) reads spawn calls; it cannot
+# see a spawn behind `getattr`, a `partial`, a third-party library or one it
+# does not know the shape of. This audit hook sees every one the interpreter
+# makes, while the suite runs: each `subprocess.Popen` raised under a frame
+# of pmcp's own source must be detached (a new session), take stdin from
+# DEVNULL or a pipe, and have stdout and stderr redirected -- never fds 0, 1
+# or 2 inherited -- and pmcp code never forks, `exec`s, `posix_spawn`s or calls
+# `os.system`. Violations are collected and fail the session once, at the end.
+
+SPAWN_VIOLATIONS: list[tuple[str, str]] = []
+_SPAWN_EVENTS = frozenset(
+    {
+        "subprocess.Popen",
+        "os.posix_spawn",
+        "os.exec",
+        "os.system",
+        "os.fork",
+        "os.forkpty",
+        "os.spawn",
+    }
+)
+_PMCP_SOURCE: list[str] = []
+
+
+def _pmcp_source() -> str:
+    if not _PMCP_SOURCE:
+        import pmcp
+
+        _PMCP_SOURCE.append(os.path.dirname(os.path.abspath(pmcp.__file__)) + os.sep)
+    return _PMCP_SOURCE[0]
+
+
+def _pmcp_caller(frame: Any) -> str | None:
+    """``path:line`` of the innermost frame in pmcp's own source, or None."""
+    root = _pmcp_source()
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        if filename.startswith(root):
+            return f"{filename[len(root) :]}:{frame.f_lineno}"
+        frame = frame.f_back
+    return None
+
+
+def spawn_problems(locals_: dict[str, Any]) -> list[str]:
+    """What is wrong with a POSIX ``Popen._execute_child`` call, by its
+    resolved arguments."""
+    problems = []
+    if not locals_.get("start_new_session") and locals_.get("process_group") is None:
+        problems.append("not detached (no new session)")
+    if locals_.get("p2cread", -1) in (-1, 0):
+        problems.append("stdin inherited")
+    for name in ("c2pwrite", "errwrite"):
+        if locals_.get(name, -1) in (-1, 1, 2):
+            problems.append(f"{'stdout' if name == 'c2pwrite' else 'stderr'} inherited")
+    return problems
+
+
+def _spawn_audit_hook(event: str, _args: tuple[Any, ...]) -> None:
+    if event not in _SPAWN_EVENTS:
+        return
+    try:
+        caller = _pmcp_caller(_sys._getframe(1))
+        if caller is None:
+            return
+        if event != "subprocess.Popen":
+            SPAWN_VIOLATIONS.append((caller, f"{event} shares the terminal"))
+            return
+        if os.name == "nt":
+            return  # the static guard covers creationflags there
+        execute_child = _sys._getframe(1)
+        problems = spawn_problems(dict(execute_child.f_locals))
+        if problems:
+            SPAWN_VIOLATIONS.append((caller, ", ".join(problems)))
+    except Exception:  # noqa: BLE001 -- an audit hook must never raise
+        return
+
+
+_sys.addaudithook(_spawn_audit_hook)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def assert_no_undetached_spawn() -> Iterator[None]:
+    """Fail the session once, at its end, if pmcp code spawned a child that
+    could reach the operator's terminal (see `_spawn_audit_hook`)."""
+    yield
+    assert SPAWN_VIOLATIONS == [], SPAWN_VIOLATIONS
 
 
 @pytest.fixture(scope="session", autouse=True)

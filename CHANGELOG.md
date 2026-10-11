@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Every child process pmcp starts is detached from the terminal: it runs in a new session (POSIX) or a new process group with no console (Windows), so it cannot open `/dev/tty`, and its stdin is closed or a pipe pmcp owns, never the terminal. This covers a CLI's `check_command` (reached through `gateway.catalog_search`, `gateway.request_capability` and `gateway.sync_environment`), installs and their verification (`gateway.provision`), the update probe (`gateway.update_server`), `pmcp upgrade`, the service restart, the npm resolver, the CLI's service checks and the gateway's own server spawns. A server's stderr line is logged at most 64 KiB long, the rest dropped with `(truncated)`, and pmcp no longer holds a whole unbounded line in memory; when a server's grandchild keeps stderr open, pmcp waits for it (at most 5 s) without blocking other requests.
 
+  Ctrl-C during `pmcp upgrade` or a service restart reaches the command and everything it started, as it did before children were detached: pmcp sends the interrupt to the child's process group, gives it 5 s, then kills what is left. A timed-out or cancelled install, its verification, a CLI version or help probe and the npm resolver are killed with every process they started (an npm lifecycle script, a node-gyp build), not only the command itself; a timed-out CLI probe used to be left running. A downstream server's stderr reader stops, and releases its pipe, 5 s after the server is done even when something the server started still holds the pipe open.
+
 ## [3.0.0] - 2026-10-09
 
 ### Upgrade notes
