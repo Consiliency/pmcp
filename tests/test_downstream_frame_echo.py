@@ -518,7 +518,6 @@ def _only_pytests_log_handlers() -> Any:
         root.addHandler(handler)
 
 
-@pytest.mark.asyncio
 def test_the_rotation_covers_every_pair() -> None:
     cells = [
         (transport, method, shape, _rotated_family(transport, method, index))
@@ -546,6 +545,7 @@ def test_the_rotation_covers_every_pair() -> None:
             assert families == set(_FRAME_FAMILIES), (transport, method)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("method", _METHODS)
 @pytest.mark.parametrize("transport", _TRANSPORTS)
 async def test_no_malformed_frame_value_reaches_pmcps_output(
