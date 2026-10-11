@@ -941,33 +941,47 @@ async def test_the_drain_releases_its_thread_and_fds_while_a_descendant_lives(
             d.wait()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
 def test_kill_tree_signals_no_group_for_an_object_that_only_has_a_pid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A test double or adopted handle with a `pid` is killed through its
-    own `kill`, never `killpg`: in CI a double's `pid = 4321` named a real
-    process group, and the group kill ended the test run."""
+    own `kill`, never `killpg` -- even when that pid leads a real group: in
+    CI a double's `pid = 4321` named a real process group, and the group
+    kill ended the test run."""
     from pmcp import child_output
 
-    groups: list[int] = []
-    monkeypatch.setattr(os, "killpg", lambda pgid, sig: groups.append(pgid))
+    leader = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        groups: list[int] = []
+        monkeypatch.setattr(os, "killpg", lambda pgid, sig: groups.append(pgid))
 
-    class _Double:
-        pid = os.getpid()
-        returncode = None
-        killed = False
+        class _Double:
+            pid = leader.pid  # a real group leader, not this object's
+            returncode = None
+            killed = 0
 
-        def kill(self) -> None:
-            self.killed = True
+            def kill(self) -> None:
+                self.killed += 1
 
-        def terminate(self) -> None:
-            self.killed = True
+            def terminate(self) -> None:
+                self.killed += 1
 
-    double = _Double()
-    child_output.kill_tree(double)
-    child_output.kill_tree(double, terminate=True)
-    assert groups == []
-    assert double.killed
+        double = _Double()
+        child_output.kill_tree(double)
+        child_output.kill_tree(double, terminate=True)
+        assert groups == []
+        assert double.killed == 2
+        assert leader.poll() is None
+    finally:
+        leader.kill()
+        leader.wait()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
@@ -988,5 +1002,7 @@ def test_kill_tree_signals_no_group_once_the_child_is_reaped(
     process.wait()
     groups: list[int] = []
     monkeypatch.setattr(os, "killpg", lambda pgid, sig: groups.append(pgid))
+    # As if the pid had been reused by a new group's leader.
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
     child_output.kill_tree(process)
     assert groups == []
