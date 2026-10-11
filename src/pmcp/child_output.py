@@ -215,7 +215,7 @@ def kill_process_tree_now(
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(group_pgid, sig)
     if isinstance(pid, int):
-        with contextlib.suppress(ProcessLookupError, OSError):
+        with contextlib.suppress(Exception):  # never raises, whatever `process` is
             if sig == signal.SIGKILL:
                 process.kill()
             else:
