@@ -274,6 +274,12 @@ def kill_process_tree_now(
             own = os.getpgid(pid)
         except (ProcessLookupError, PermissionError, OSError):
             own = None
+        if own is None and group_pgid is not None:
+            # Reaped between the check above and the lookup (asyncio's watcher
+            # thread, 3.10/3.11): the passed id goes through the retained-group
+            # checks instead of being dropped.
+            signal_retained_group(group_pgid, sig, owner=process)
+            return
         if group_pgid is None and own == pid:
             group_pgid = pid
         if group_pgid is not None and own != group_pgid:

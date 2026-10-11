@@ -715,12 +715,7 @@ async def _terminate_process_tree(
         # Process-group signalling is POSIX-only. On Windows os.getpgid/os.killpg
         # (and signal.SIGKILL) don't exist, so fall back to the cross-platform
         # process.terminate()/kill() — preserving the pre-process-group behavior.
-        # There both arms terminate the child's Job Object (round 7, claude
-        # N-A): TerminateProcess is no gentler than the job, and a leader that
-        # exits within the wait would otherwise leave its descendants running.
-        if _child_output._windows():
-            kill_process_tree_now(process)
-            return
+        # (Windows never reaches here: the job is terminated at entry, round 8.)
         # The one kill rule (round 7, claude N-B): the group is signalled
         # directly only while the leader still reserves its id -- an await
         # precedes this call, and the leader may have been reaped in it.
@@ -1720,6 +1715,17 @@ class ClientManager:
         finally:
             if self._connect_tasks.get(name) is task:
                 self._connect_tasks.pop(name, None)
+
+    def _watch_server_group(self, name: str, managed: ManagedClient) -> None:
+        """Forget a stdio server's group -- spawned or adopted -- the moment
+        it is observed empty, so a later teardown never trusts an id that a
+        pid wrap handed to another group (round 8, claude N-A). The watcher
+        is the server's background task, cancelled with it."""
+        if managed.process is not None and managed.group_pgid is not None:
+            self._track_background_task(
+                asyncio.create_task(watch_group(managed.process, managed.group_pgid)),
+                name,
+            )
 
     def _track_background_task(
         self, task: _TaskT, server_name: str | None = None
@@ -3255,14 +3261,7 @@ class ClientManager:
             group_pgid=_spawned_group_pgid(process),
         )
         self._clients[name] = managed
-        # Forget the server's group the moment it is observed empty, so a
-        # later teardown never trusts an id that a pid wrap handed to another
-        # group (round 8, claude N-A).
-        if managed.group_pgid is not None:
-            self._track_background_task(
-                asyncio.create_task(watch_group(process, managed.group_pgid)),
-                name,
-            )
+        self._watch_server_group(name, managed)
 
         # Start reading stderr in background
         if process.stderr:
@@ -4802,6 +4801,7 @@ class ClientManager:
             group_pgid=_own_group_pgid(process),
         )
         self._clients[name] = managed
+        self._watch_server_group(name, managed)
 
         # Start reading stderr in background (if available)
         if process.stderr:
