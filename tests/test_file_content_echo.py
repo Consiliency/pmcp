@@ -484,6 +484,12 @@ def _reported(root: Path = SRC) -> set[tuple[str, str, str]]:
 #: Sites the walk reports that show no repository-controlled text, each with
 #: its reason. Fail-closed: a new site fails until it is made value-free or
 #: listed here; a row that no longer matches fails too.
+#: Every `cli.py` row is also behind the CLI's display-safe streams
+#: (`cli._install_display_streams`, Consiliency/pmcp#388 round 3): a
+#: subcommand's human stdout and every stderr line are escaped, which
+#: `tests/test_cli_human_output.py::test_a_subcommand_prints_nothing_raw`
+#: checks for every subcommand.
+_WRAPPED = " -- and escaped at the CLI boundary in any case"
 _GATEWAY_ANSWER = (
     "the running gateway's own tool answer or status snapshot, parsed from "
     "its response: the text an MCP client receives for the same call, held "
@@ -496,19 +502,20 @@ _UNPACKED_ERROR = (
 )
 _REVIEWED: dict[tuple[str, str, str], str] = {
     ("cli.py", "run_status", "print"): _GATEWAY_ANSWER
+    + _WRAPPED
     + "; the in-process branch is reported only because the walk is "
     "flow-insensitive and reuses the names `s` and `p`",
-    ("cli.py", "run_auth_connect", "print"): _GATEWAY_ANSWER,
-    ("cli.py", "run_auth_acknowledge", "print"): _GATEWAY_ANSWER,
-    ("cli.py", "run_update", "print"): _GATEWAY_ANSWER,
+    ("cli.py", "run_auth_connect", "print"): _GATEWAY_ANSWER + _WRAPPED,
+    ("cli.py", "run_auth_acknowledge", "print"): _GATEWAY_ANSWER + _WRAPPED,
+    ("cli.py", "run_update", "print"): _GATEWAY_ANSWER + _WRAPPED,
     ("cli.py", "_run_trust_list", "print"): (
         "the operator's own trust store under ~/.config/pmcp: a decision is a "
         "fixed word and a digest is hex, both checked when the store is read; "
-        "the approved path is shown through `operator_safe`"
+        "the approved path is shown through `operator_safe`" + _WRAPPED
     ),
     ("cli.py", "_run_trust_list_packages", "print"): (
         "the operator's own package-approval store: names and versions are "
-        "re-validated when it is read (`_read_store_and_stale`)"
+        "re-validated when it is read (`_read_store_and_stale`)" + _WRAPPED
     ),
     ("package_approvals.py", "_read_store_and_stale", "logger.warning"): (
         "a stale record of the operator's own package-approval store, which "

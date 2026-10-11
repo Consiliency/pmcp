@@ -157,7 +157,7 @@ CLASSES: list[tuple[str, str, str | None, str | None]] = [
         NOT_CANONICAL,
         NOT_CANONICAL,
     ),
-    ("soft hyphen", "https://local\u00adhost/x", NOT_CANONICAL, NOT_CANONICAL),
+    ("soft hyphen", "https://local\u00adhost/x", CONTROL, CONTROL),
     ("trailing-dot IPv4", "http://127.0.0.1./x", NOT_CANONICAL, NOT_CANONICAL),
     ("trailing-dot name", "https://localhost./jwks.json", NOT_CANONICAL, NOT_CANONICAL),
     ("percent-encoded IPv4", "https://127%2E0%2E0%2E1/x", NOT_CANONICAL, NOT_CANONICAL),
@@ -276,8 +276,6 @@ def _outcome(call: Callable[[], object]) -> str | None:
 # rewording without a re-derived claim fails. For a strict caller the texts
 # also characterise acceptance exactly: a URL is accepted if and only if no
 # text's claim holds for it (`test_each_message_is_true_and_acceptance_is_exact`).
-
-_C0_DEL = {chr(code) for code in [*range(0x20), 0x7F]}
 
 
 def _stripped(url: str) -> str:
@@ -470,8 +468,10 @@ _CANONICAL_TEXT = (
 )
 
 _TEXT_CLAIMS: dict[str, Callable[[str], bool]] = {
-    "Public auth URL contains a control character.": lambda url: any(
-        c in _C0_DEL for c in _stripped(url)
+    # Round 3 of Consiliency/pmcp#388: any character that is not printable
+    # (C0, DEL, C1, format, separators, non-ASCII spaces), not only C0 and DEL.
+    "Public auth URL contains a control character.": lambda url: (
+        not _stripped(url).isprintable()
     ),
     "Public auth URL contains a backslash.": lambda url: "\\" in url,
     "Invalid public auth URL.": _parse_raises,
@@ -1074,6 +1074,35 @@ def test_the_panel_hosts_map_to_non_public_hosts_in_yarl_and_are_refused(
 # class above and every generated host.
 
 _CONTROLS = [*range(0x20), 0x7F]
+#: Refused like a control character, but never stripped at either end
+#: (round 3): C1, bidi, zero-width, tag characters and separators.
+_NON_PRINTABLE = [
+    *range(0x80, 0xA0),
+    0xAD,
+    0x200B,
+    0x200D,
+    0x200E,
+    0x202E,
+    0x2028,
+    0x2029,
+    0x2066,
+    0xA0,
+    0x3000,
+    0xFEFF,
+    0xE0041,
+]
+
+
+@pytest.mark.parametrize("code", _NON_PRINTABLE, ids=hex)
+def test_every_non_printable_character_is_refused_anywhere(code: int) -> None:
+    c = chr(code)
+    for url in (
+        f"https://auth.exa{c}mple.com/x",
+        f"https://auth.example.com/k{c}s",
+        f"{c}https://auth.example.com/x",
+        f"https://auth.example.com/x{c}",
+    ):
+        assert _outcome(lambda: sanitize_public_auth_url(url)) == CONTROL, url
 
 
 def _control_urls() -> list[str]:

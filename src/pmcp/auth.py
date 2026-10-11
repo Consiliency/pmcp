@@ -752,7 +752,9 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> 
     and trailing tabs, CRs and LFs; nothing else is stripped -- a trailing
     space is kept (the startup check then refuses it as whitespace), and a
     trailing NUL or other control character is refused like one anywhere
-    else. Then, refused in this order: a C0 control or DEL anywhere
+    else. Then, refused in this order: a character that is not printable
+    anywhere -- a C0 or C1 control, DEL, a format character (bidi, zero-width,
+    tag), a line or paragraph separator, a space other than the ASCII one
     (`PUBLIC_URL_CONTROL_CHARACTER`); a backslash anywhere
     (`PUBLIC_URL_BACKSLASH`); an unparseable port or host
     (`PUBLIC_URL_INVALID`); no http(s) scheme or no host
@@ -773,7 +775,12 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> 
     stored host is the one checked.
     """
     url = url.lstrip(_C0_OR_SPACE).rstrip(_TRAILING_NEWLINE)
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in url):
+    # Any character Python does not count printable: C0, DEL, C1 (U+0080 to
+    # U+009F, U+009B among them), format characters (bidi controls,
+    # zero-width characters, tag characters), line and paragraph separators
+    # and every space but the ASCII one (Consiliency/pmcp#388 round 3: C1 in
+    # a peer's elicitation URL reached `pmcp auth connect` raw).
+    if not url.isprintable():
         raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_CONTROL_CHARACTER))
     if "\\" in url:
         raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_BACKSLASH))
@@ -1499,6 +1506,10 @@ def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
         elicitation_id = entry.get("elicitationId") or entry.get("elicitation_id")
         url = entry.get("url")
         if not isinstance(elicitation_id, str) or not isinstance(url, str):
+            continue
+        if not elicitation_id.isprintable():
+            # Printable only, like its URL: it is shown to the operator and
+            # copied into `next_step` (Consiliency/pmcp#388 round 3).
             continue
         try:
             safe_url = sanitize_url_elicitation_url(url, provenance="remote")

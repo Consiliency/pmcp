@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -3288,14 +3289,62 @@ def serve_project(project: Path | None) -> None:
     _load_project_store_at_startup(serve_project_root(project) / ".env.pmcp")
 
 
+def human_output(args: argparse.Namespace) -> bool:
+    """Whether a command's stdout is for a person (Consiliency/pmcp#388
+    round 3): any subcommand, unless it was asked for JSON or always answers
+    in JSON. Not the gateway itself (no subcommand): its stdout carries MCP
+    frames on the stdio transport, and is never touched."""
+    command = getattr(args, "command", None)
+    if command is None or command in _JSON_ONLY_COMMANDS:
+        return False
+    return not getattr(args, "json", False)
+
+
+#: Subcommands whose stdout is always JSON (`json.dumps`, ASCII-escaped).
+_JSON_ONLY_COMMANDS = frozenset({"secrets"})
+
+
+def _install_display_streams(*, stdout: bool) -> Callable[[], None]:
+    """Write ``sys.stderr`` -- and ``sys.stdout`` when it is for a person --
+    through :class:`pmcp.display.DisplaySafeStream`, so nothing printed
+    carries a character a terminal acts on. Returns a function that puts
+    the original streams back. A stream already wrapped is left alone."""
+    from pmcp.display import DisplaySafeStream
+
+    saved = (sys.stdout, sys.stderr)
+    if not getattr(sys.stderr, "pmcp_display_safe", False):
+        sys.stderr = DisplaySafeStream(sys.stderr)  # type: ignore[assignment]
+    if stdout and not getattr(sys.stdout, "pmcp_display_safe", False):
+        sys.stdout = DisplaySafeStream(sys.stdout)  # type: ignore[assignment]
+
+    def restore() -> None:
+        sys.stdout, sys.stderr = saved
+
+    return restore
+
+
 def main() -> None:
     """Main entry point."""
+    # Every line pmcp writes to stderr is for a person or a log file, never
+    # a protocol: escaped from the first line on (Consiliency/pmcp#388 round 3).
+    restore = _install_display_streams(stdout=False)
+    try:
+        _main()
+    finally:
+        restore()
+
+
+def _main() -> None:
     # Load .env from the current directory or project root, plus the PMCP
     # credential stores -- recording which keys the plain .env introduced so
     # they do not reach downstream servers (Consiliency/pmcp#229).
     load_startup_env()
 
     args = parse_args()
+    if human_output(args):
+        # A subcommand's own output, for a person: through the same
+        # escaping. The gateway's stdout and `--json` output are untouched.
+        _install_display_streams(stdout=True)
     serve_project(getattr(args, "project", None))
 
     # Resolve the `secrets set` value here (not in async_main) so it is never

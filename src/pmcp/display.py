@@ -22,6 +22,8 @@ import first, can use it.
 
 from __future__ import annotations
 
+from typing import Any
+
 #: The two layout characters a multi-line log message may keep
 #: (:func:`display_safe` with ``keep=LOG_LAYOUT``). A one-line display keeps
 #: neither.
@@ -48,3 +50,37 @@ def display_safe(value: object, *, keep: str = "") -> str:
     return "".join(
         ch if ch.isprintable() or ch in keep else _escaped(ch) for ch in text
     )
+
+
+class DisplaySafeStream:
+    """A text stream that writes every string through :func:`display_safe`,
+    keeping line breaks and tabs (Consiliency/pmcp#388 round 3).
+
+    Installed over ``sys.stdout`` and ``sys.stderr`` by the CLI for a
+    command whose output is for a person (:func:`pmcp.cli.human_output`),
+    so no print site -- one that renders a value itself or one that does not
+    -- can send a terminal a control sequence. Everything else (``buffer``,
+    ``fileno``, ``isatty``, ``encoding``, ``flush``) is the wrapped
+    stream's: bytes written to ``buffer`` are not text for a person and are
+    passed through unchanged.
+    """
+
+    pmcp_display_safe = True
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    @property
+    def wrapped(self) -> Any:
+        return self._stream
+
+    def write(self, text: str) -> int:
+        self._stream.write(display_safe(text, keep=LOG_LAYOUT))
+        return len(text)
+
+    def writelines(self, lines: Any) -> None:
+        for line in lines:
+            self.write(line)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
