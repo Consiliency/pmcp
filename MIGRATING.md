@@ -850,8 +850,8 @@ validator on 2.7.3 and on 3.0:
 
 Uppercase letters are still accepted and lowercased, and an explicit port
 such as `:8443` is still fine. pmcp 3.0.0 refused only C0 controls and DEL,
-with `Public auth URL contains a control character.`; 3.0.1 and later refuse
-every character that is not printable (C1 controls, bidi, zero-width and tag
+saying the URL contained a "control character"; 3.0.1 and later refuse every
+character that is not printable (C1 controls, bidi, zero-width and tag
 characters, line separators and non-ASCII spaces too) with the message shown.
 
 **How to verify.** Start the gateway with the corrected URL:
