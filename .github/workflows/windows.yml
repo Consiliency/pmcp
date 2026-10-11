@@ -1,0 +1,50 @@
+name: Windows
+
+# A separate workflow, not a job in test.yml: SECURITY.md's claim checker
+# (R22) holds test.yml to exactly one pytest invocation, the suite's.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Windows had no CI, and Consiliency/pmcp#388 round 8 found `import pmcp`
+  # failing there: `signal.SIGKILL` in a default argument, evaluated at
+  # import, does not exist on Windows. This job installs on a real Windows
+  # runner, imports the package, runs the entry point, and runs the
+  # Windows-path unit tests (the Job Object and pipe-reader seams in
+  # tests/test_child_output.py, which also run there for real). Kept small:
+  # the full suite is POSIX-specific in many places.
+  windows-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --python 3.12
+
+      - name: Import the package and run the entry point
+        run: |
+          uv run --python 3.12 python -c "import pmcp, pmcp.child_output, pmcp.cli, pmcp.client.manager, pmcp.server, pmcp.manifest.installer"
+          uv run --python 3.12 pmcp --version
+          uv run --python 3.12 pmcp --help
+
+      # Windows has no SIGALRM: pytest-timeout's `signal` method (pyproject)
+      # cannot run there, so this job uses its thread method.
+      - name: Windows-path unit tests
+        run: uv run --python 3.12 pytest tests/test_child_output.py -q --tb=short -p no:cacheprovider -o timeout_method=thread -rs
