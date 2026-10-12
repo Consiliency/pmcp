@@ -730,6 +730,37 @@ async def drained_errlog(label: str, logger: logging.Logger) -> AsyncIterator[Te
                 await anyio.to_thread.run_sync(thread.join, _DRAIN_JOIN_SECONDS)
 
 
+def release(process: Any) -> None:
+    """Close the parent's ends of a child's pipes, now (round 10, codex
+    F001): an asyncio child's pipe transports -- one a flooding downstream
+    left paused and unread is otherwise held until garbage collection --
+    or a ``Popen``'s stream objects. Every site that drops a child calls
+    this after its kill. Safe to repeat; never raises."""
+    if process is None:
+        return
+    if isinstance(process, subprocess.Popen):
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                with contextlib.suppress(Exception):
+                    stream.close()
+        return
+    transport = getattr(process, "_transport", None)
+    if transport is None:
+        return
+    # The pipes, always: closing them never touches the process.
+    for fd in (0, 1, 2):
+        with contextlib.suppress(Exception):
+            pipe = transport.get_pipe_transport(fd)
+            if pipe is not None:
+                pipe.close()
+    # The subprocess transport only once the child is reaped: closing it
+    # earlier polls -- and so reaps -- the child behind asyncio's own
+    # watcher, which then reports exit status 255 instead of the real one.
+    if process.returncode is not None:
+        with contextlib.suppress(Exception):
+            transport.close()
+
+
 #: How long :func:`owned` waits to reap a killed synchronous child.
 _REAP_SECONDS = 2.0
 
@@ -749,6 +780,7 @@ def owned(process: Any) -> Iterator[Any]:
         if isinstance(process, subprocess.Popen) and process.returncode is None:
             with contextlib.suppress(Exception):
                 process.wait(timeout=_REAP_SECONDS)
+        release(process)
 
 
 def run_captured(

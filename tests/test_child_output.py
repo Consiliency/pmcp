@@ -2298,3 +2298,117 @@ async def test_verify_installation_requires_a_successful_run(tmp_path: Path) -> 
         requires_api_key=False,
     )
     assert await installer.verify_installation(server) is False
+
+
+# --- round 10 ---------------------------------------------------------------------
+
+
+async def _server_ready_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, deadline: float
+) -> Any:
+    import asyncio
+
+    from pmcp.manifest import installer
+
+    monkeypatch.setattr(installer, "HANDOFF_DEADLINE_SECONDS", deadline)
+    script = tmp_path / "install.py"
+    script.write_text(
+        _STARTED_THEN_EXITS.format(out=str(tmp_path)) + "import time\ntime.sleep(60)\n"
+    )
+    command = [sys.executable, str(script)]
+    server = installer.ServerConfig(
+        name="memory",
+        description="memory",
+        keywords=["memory"],
+        install={"linux": command},
+        command=command[0],
+        args=command[1:],
+        requires_api_key=False,
+    )
+    jobs = installer.JobManager()
+    job_id = await jobs.start_install(server, "linux")
+    job = jobs._jobs[job_id]
+    limit = asyncio.get_running_loop().time() + 15
+    while job.status != "server_ready":
+        assert asyncio.get_running_loop().time() < limit, job.status
+        await asyncio.sleep(0.02)
+    return jobs, job_id, job
+
+
+def _adopting_manager(monkeypatch: pytest.MonkeyPatch, hold: float, fail: bool) -> Any:
+    import asyncio
+
+    from pmcp.client.manager import ClientManager
+
+    mgr = ClientManager()
+
+    async def initialize(managed: Any) -> None:
+        await asyncio.sleep(hold)
+        if fail:
+            raise RuntimeError("handshake failed")
+
+    async def no_capabilities(managed: Any) -> tuple[int, int, int]:
+        return 0, 0, 0
+
+    monkeypatch.setattr(mgr, "_send_initialize", initialize)
+    monkeypatch.setattr(mgr, "_index_capabilities", no_capabilities)
+    return mgr
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_the_handoff_deadline_never_kills_a_server_being_adopted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 10, claude F001 = grok F001 (both falsifiers): the deadline
+    passes while ClientManager is still adopting the server (a held
+    initialize). Ownership moved before the first await, so the adopted
+    server is alive, the job is complete, and one owner remains."""
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+
+    jobs, job_id, job = await _server_ready_job(tmp_path, monkeypatch, deadline=0.3)
+    process = job.process
+    mgr = _adopting_manager(monkeypatch, hold=1.0, fail=False)
+    tools = GatewayTools(client_manager=mgr, policy_manager=PolicyManager())
+    try:
+        result = await tools._finalize_server_ready(job, job_id, 0.0)
+        assert result.status == "complete", result.error
+        assert process.returncode is None, "the deadline killed a server being adopted"
+        assert "memory" in mgr._clients
+        assert job._handoff_deadline.cancelled()
+    finally:
+        await mgr.disconnect_all()
+        for task in list(mgr._background_tasks):
+            task.cancel()
+    _grandchild_gone(tmp_path, "the adopted server's disconnect")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_a_failed_handoff_and_a_cancelled_job_cancel_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 10 (gemini): the deadline is cancelled explicitly on the
+    handoff's failure branch and by `cancel_job`, not only on success; the
+    process is killed by exactly one owner."""
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+
+    jobs, job_id, job = await _server_ready_job(tmp_path, monkeypatch, deadline=60)
+    mgr = _adopting_manager(monkeypatch, hold=0.0, fail=True)
+    tools = GatewayTools(client_manager=mgr, policy_manager=PolicyManager())
+    result = await tools._finalize_server_ready(job, job_id, 0.0)
+    assert result.status == "failed"
+    assert job._handoff_deadline.cancelled()
+    _grandchild_gone(tmp_path, "the failed handoff")
+
+    other = tmp_path / "other"
+    other.mkdir()
+    jobs, job_id, job = await _server_ready_job(other, monkeypatch, deadline=60)
+    await jobs.cancel_job(job_id)
+    assert job._handoff_deadline.cancelled()
+    if job.process is not None:
+        from pmcp.child_output import kill_tree
+
+        kill_tree(job.process)

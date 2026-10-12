@@ -2230,6 +2230,11 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "re-raise",
     ),
+    ("tools/handlers.py", "GatewayTools._finalize_server_ready", "reraises"): (
+        1,
+        "records the cancelled handoff, kills only a process nothing tore "
+        "down (synchronously), closes its pipes, then re-raises",
+    ),
     # (`GatewayTools._run_update_probe_command` has no cancellation handler
     # since Consiliency/pmcp#388 round 8: a `finally` SIGKILLs the probe
     # synchronously on every exit, a cancellation included.)

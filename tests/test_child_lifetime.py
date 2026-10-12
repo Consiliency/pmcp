@@ -39,12 +39,16 @@ BOUND = 10.0
 _HOSTILE = textwrap.dedent(
     """
     import os, subprocess, sys, time
-    mode, piddir = {mode!r}, {piddir!r}
+    mode, piddir, leader = {mode!r}, {piddir!r}, {leader!r}
 
     def note(pid):
         open(os.path.join(piddir, str(pid)), "w").close()
 
     note(os.getpid())
+    open(leader, "w").write(str(os.getpid()))
+    # What an installer's server prints when it is up: an install job hands
+    # it off (`server_ready`); every other site ignores it.
+    print("Server started on stdio", flush=True)
     if mode in ("hold", "early"):
         # A grandchild that inherits stdout and stderr and keeps them open.
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -76,7 +80,9 @@ def _script(tmp_path: Path, mode: str) -> tuple[Path, Path]:
     piddir = tmp_path / "pids"
     piddir.mkdir()
     script = tmp_path / "hostile.py"
-    script.write_text(_HOSTILE.format(mode=mode, piddir=str(piddir)))
+    script.write_text(
+        _HOSTILE.format(mode=mode, piddir=str(piddir), leader=str(tmp_path / "leader"))
+    )
     return script, piddir
 
 
@@ -314,6 +320,139 @@ def _drains_named(label: str) -> list[str]:
     return [t for t in _drains() if t == f"pmcp-errlog-{label}"]
 
 
+async def _handoff(script: Path, piddir: Path, mode: str, mp: Any, how: str) -> None:
+    """A `server_ready` install handoff (round 10): the deadline expires
+    with nobody adopting; ClientManager adopts it; adoption fails; or
+    adoption straddles the deadline -- which must not kill a server being
+    adopted. Then ClientManager, its owner, disconnects."""
+    from pmcp.client.manager import ClientManager
+    from pmcp.manifest import installer
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+
+    deadline = 0.5 if how in ("expiry", "straddle") else 60.0
+    mp.setattr(installer, "HANDOFF_DEADLINE_SECONDS", deadline)
+    jobs = installer.JobManager()
+    job_id = await jobs.start_install(_server(script), "linux")
+    job = jobs._jobs[job_id]
+    await _until(lambda: job.status not in ("pending", "installing"), 15)
+    if how == "expiry":
+        await _until(lambda: job.status != "server_ready", 10)
+        return
+    mgr = ClientManager()
+
+    async def initialize(managed: Any) -> None:
+        if how == "straddle":
+            await asyncio.sleep(deadline * 3)  # the deadline passes meanwhile
+        if how == "fails":
+            raise RuntimeError("handshake failed")
+
+    async def no_capabilities(managed: Any) -> tuple[int, int, int]:
+        return 0, 0, 0
+
+    mp.setattr(mgr, "_send_initialize", initialize)
+    mp.setattr(mgr, "_index_capabilities", no_capabilities)
+    tools = GatewayTools(client_manager=mgr, policy_manager=PolicyManager())
+    try:
+        if job.status == "server_ready":
+            await tools._finalize_server_ready(job, job_id, 0.0)
+            if how == "straddle" and mode != "early":
+                leader = int((script.parent / "leader").read_text())
+                assert job.status == "complete", job.error
+                assert _alive(leader), "the deadline killed a server being adopted"
+    finally:
+        await mgr.disconnect_all()
+        for task in list(mgr._background_tasks):
+            task.cancel()
+
+
+def _handoff_owner(how: str) -> Callable[[Path, Path, str, Any], Awaitable[None]]:
+    async def owner(script: Path, piddir: Path, mode: str, mp: Any) -> None:
+        await _handoff(script, piddir, mode, mp, how)
+
+    return owner
+
+
+async def _run_captured_timeout(script: Path, piddir: Path, mode: str, mp: Any) -> None:
+    import subprocess
+
+    from pmcp.child_output import run_captured
+
+    def run() -> None:
+        try:
+            run_captured([sys.executable, str(script)], timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+
+    await asyncio.to_thread(run)
+
+
+def _ctrl_c(runner: str) -> Callable[[Path, Path, str, Any], Awaitable[None]]:
+    """The operator's Ctrl-C during `pmcp upgrade` (`run_echoed`) or a
+    service check (`run_captured`), in a real process."""
+
+    async def owner(script: Path, piddir: Path, mode: str, mp: Any) -> None:
+        import signal
+        import subprocess
+
+        harness = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal, sys\n"
+                "signal.signal(signal.SIGINT, signal.default_int_handler)\n"
+                f"from pmcp.child_output import {runner}\n"
+                "try:\n"
+                f"    {runner}([sys.executable, {str(script)!r}])\n"
+                "except KeyboardInterrupt:\n"
+                "    pass\n",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            await _wait_started(piddir, mode)
+            os.kill(harness.pid, signal.SIGINT)
+            await asyncio.to_thread(harness.wait, 30)
+        finally:
+            if harness.poll() is None:
+                harness.kill()
+                harness.wait()
+
+    return owner
+
+
+async def _npm_helper(script: Path, piddir: Path, mode: str, mp: Any) -> None:
+    """The npm resolver's long-lived helper, here a downstream that never
+    completes the handshake: the resolver terminates it, then closes."""
+    from pmcp.manifest.npm_resolver import NpmResolver
+
+    shim = script.parent / "bin"
+    shim.mkdir()
+    node = shim / "node"
+    node.write_text(f'#!/bin/sh\nexec {sys.executable} "$@"\n')
+    node.chmod(0o755)
+    mp.setenv("PATH", f"{shim}{os.pathsep}{os.environ.get('PATH', '')}")
+    resolver = NpmResolver()
+    resolver._helper = script
+    await asyncio.to_thread(resolver._spawn)
+    resolver.close()
+
+
+async def _refresh_child(script: Path, piddir: Path, mode: str, mp: Any) -> None:
+    """`pmcp refresh`'s child itself (the MCP SDK spawns it), not only its
+    drain: a downstream that never answers."""
+    from pmcp.manifest import refresher
+
+    async def no_version(*a: Any, **k: Any) -> tuple[None, None]:
+        return None, None
+
+    mp.setattr(refresher, "get_package_version", no_version)
+    mp.setattr(refresher, "REFRESH_READ_TIMEOUT_SECONDS", 1.0)
+    await refresher.refresh_server(_server(script), None, True)
+
+
 OWNERS: dict[str, Callable[[Path, Path, str, Any], Awaitable[None]]] = {
     "check_cli": _check_cli,
     "get_cli_help": _cli_help,
@@ -325,6 +464,15 @@ OWNERS: dict[str, Callable[[Path, Path, str, Any], Awaitable[None]]] = {
     "install job (cancelled)": _install_job,
     "stderr drain": _errlog,
     "stderr drain (Windows reader)": _errlog_windows,
+    "handoff: deadline expires": _handoff_owner("expiry"),
+    "handoff: adopted": _handoff_owner("adopted"),
+    "handoff: adoption fails": _handoff_owner("fails"),
+    "handoff: adoption straddles the deadline": _handoff_owner("straddle"),
+    "run_captured (timeout)": _run_captured_timeout,
+    "run_captured (Ctrl-C)": _ctrl_c("run_captured"),
+    "run_echoed (Ctrl-C)": _ctrl_c("run_echoed"),
+    "npm resolver helper": _npm_helper,
+    "refresh child": _refresh_child,
 }
 
 
@@ -334,7 +482,13 @@ OWNERS: dict[str, Callable[[Path, Path, str, Any], Awaitable[None]]] = {
 async def test_nothing_outlives_its_owner(
     owner: str, mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import gc
+
     script, piddir = _script(tmp_path, mode)
+    # Descriptors must be closed, not collected (round 10, codex F001): no
+    # automatic garbage collection while the owner runs and is checked.
+    gc.collect()
+    gc.disable()
     baseline_fds = _fds()
     baseline_drains = set(_drains())
     try:
@@ -353,6 +507,7 @@ async def test_nothing_outlives_its_owner(
             f"{_fds()} > {baseline_fds}"
         )
     finally:
+        gc.enable()
         import signal
 
         for entry in piddir.iterdir():

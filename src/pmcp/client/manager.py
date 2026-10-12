@@ -35,6 +35,7 @@ from pmcp.child_output import (
     leader_reserved,
     observe_group,
     process_groups_supported,
+    release,
     signal_retained_group,
     track,
     trust_group,
@@ -3415,6 +3416,7 @@ class ClientManager:
                 _abandon_owner(managed.transport_owner_task, managed.transport_shutdown)
             else:
                 _kill_process_tree_now(managed.process, group_pgid=managed.group_pgid)
+                release(managed.process)  # its pipes, now (round 10)
         except Exception as exc:
             logger.warning(
                 f"[{name}] teardown step failed while abandoning a cancelled "
@@ -4681,9 +4683,12 @@ class ClientManager:
                     f"[{name}] Error closing remote transport: {describe_exception(e)}"
                 )
         else:
-            await _terminate_process_tree(
-                managed.process, name, group_pgid=managed.group_pgid
-            )
+            try:
+                await _terminate_process_tree(
+                    managed.process, name, group_pgid=managed.group_pgid
+                )
+            finally:
+                release(managed.process)  # its pipes, now (round 10)
 
     async def refresh(self, configs: list[ResolvedServerConfig]) -> list[str]:
         """Refresh connections (disconnect + reconnect)."""
@@ -4739,6 +4744,7 @@ class ClientManager:
             # signals a reaped leader's pid, checks a retained group for
             # reuse, and never raises (so the cancel is what propagates).
             _kill_process_tree_now(process, group_pgid=group_pgid)
+            release(process)
             raise
         try:
             await self._adopt_process_locked(name, process, config)

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from pmcp.child_output import detached, kill_tree, owned, track
+from pmcp.child_output import detached, kill_tree, owned, release, track
 from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.env_store import (
     credential_value,
@@ -140,8 +140,16 @@ class InstallJob:
 
     id: str
     server_name: str
+    # `adopting`: handed to ClientManager, which owns the process from that
+    # moment (round 10); the job no longer kills it.
     status: Literal[
-        "pending", "installing", "server_ready", "complete", "failed", "timeout"
+        "pending",
+        "installing",
+        "server_ready",
+        "adopting",
+        "complete",
+        "failed",
+        "timeout",
     ] = "pending"
     progress: int = 0  # 0-100
     output_lines: list[str] = field(default_factory=list)
@@ -281,6 +289,7 @@ class JobManager:
                         # The whole group: an npm lifecycle script or a
                         # node-gyp build it started too (round 6, claude N-B).
                         kill_tree(job.process)
+                        release(job.process)
                     except Exception as e:
                         logger.debug(f"task cleanup error: {exception_text(e)}")
         except asyncio.CancelledError:
@@ -496,8 +505,10 @@ class JobManager:
             # Only clear process if NOT server_ready (process needed for handoff)
             if job.status != "server_ready":
                 # Every exit but the handoff: whatever the install left
-                # running is killed, synchronously (round 8, codex F003).
+                # running is killed, synchronously (round 8, codex F003),
+                # and its pipes closed (round 10, codex F001).
                 kill_tree(process)
+                release(process)
                 job.process = None  # Allow GC
 
     def _start_handoff_deadline(self, job: InstallJob) -> None:
@@ -513,6 +524,7 @@ class JobManager:
                     f"{HANDOFF_DEADLINE_SECONDS:.0f}s; killing it"
                 )
                 kill_tree(job.process)
+                release(job.process)  # a flooded, paused pipe too (round 10)
                 job.process = None
                 job.status = "failed"
                 job.error = "Server was not adopted in time"
@@ -604,6 +616,8 @@ class JobManager:
         job = self._jobs.get(job_id)
         if not job:
             return False
+        if job._handoff_deadline is not None:
+            job._handoff_deadline.cancel()  # round 10 (gemini)
 
         if job.process and job.process.returncode is not None:
             # Exited -- what it started may not have (round 9, grok F001).
@@ -621,6 +635,8 @@ class JobManager:
 
             job.status = "failed"
             job.error = "Cancelled by user"
+        if job.process is not None:
+            release(job.process)  # round 10, codex F001
 
         if job._monitor_task:
             job._monitor_task.cancel()

@@ -20,7 +20,7 @@ from typing import Any, Literal, cast, NamedTuple
 import anyio
 from mcp.types import Tool
 from pydantic import BaseModel
-from pmcp.child_output import detached, kill_tree, track
+from pmcp.child_output import detached, kill_tree, release, track
 from pmcp.argument_errors import describe_value, exception_text, safe_exc_info
 from pmcp import __version__ as PMCP_VERSION
 from pmcp.auth import (
@@ -3710,7 +3710,10 @@ class GatewayTools:
             f"{safe_description}\n\n"
             "## Telemetry\n"
             f"- pmcp_version: {PMCP_VERSION}\n"
-            f"- platform: {platform.platform()}\n"
+            # Not `platform.platform()`: it unpacks `uname()`, whose
+            # `processor` runs `uname -p` -- a child with pmcp's stdin, not
+            # detached (Consiliency/pmcp#388 round 10, the spawn audit).
+            f"- platform: {platform.system()}-{platform.release()}-{platform.machine()}\n"
             f"- python_version: {platform.python_version()}\n"
             f"- subordinate_server: {subordinate}\n"
             f"- failed_tool_call: {failed_call}\n"
@@ -5972,6 +5975,7 @@ class GatewayTools:
                 "pending": f"Preparing to install '{job_server_name}'...",
                 "installing": f"Installing '{job_server_name}'... ({job_progress}%)",
                 "server_ready": f"Server '{job_server_name}' starting, connecting...",
+                "adopting": f"Server '{job_server_name}' connecting...",
                 "failed": f"Installation failed: {job_error}",
                 "timeout": f"Installation timed out: {job_error}",
             }
@@ -5979,7 +5983,9 @@ class GatewayTools:
             return ProvisionJobStatus(
                 job_id=job_id,
                 server=job_server_name,
-                status=job_status,
+                # `adopting` is internal (the handoff in progress, round 10):
+                # reported as the `server_ready` the tool's contract names.
+                status="server_ready" if job_status == "adopting" else job_status,
                 progress=job_progress,
                 message=status_messages.get(job_status, f"Status: {job_status}"),
                 output_tail=job_output_lines[-5:],
@@ -6015,12 +6021,18 @@ class GatewayTools:
         job_output_lines = list(job.output_lines)
 
         process = job.process
+        deadline = getattr(job, "_handoff_deadline", None)
+        if deadline is not None:
+            # The handoff decides this server's fate from here, whatever it
+            # is: the job's deadline must not (round 10).
+            deadline.cancel()
         if not process or process.returncode is not None:
             # Process died before handoff. Whatever it started -- an npx
             # leader that exited while its node server lives on -- is killed
             # with its group: nothing will adopt it (round 9, grok F001).
             if process is not None:
                 kill_tree(process)
+                release(process)
                 job.process = None
             job.status = "failed"
             job.error = "Server process exited before handoff"
@@ -6035,6 +6047,14 @@ class GatewayTools:
                 error="Process exited before handoff",
             )
 
+        # Ownership moves to ClientManager here, before any await (round 10,
+        # claude F001 = grok F001): the job stops owning the process -- its
+        # deadline is cancelled above and `adopting` is not a state it
+        # kills -- and ClientManager's own timeouts govern the handshake.
+        # On a failure, ClientManager tears down what it registered; this
+        # path kills only a process nothing tore down.
+        job.status = "adopting"
+        job.process = None
         try:
             # Build config from manifest
             manifest = _manifest_for(self._project_root)
@@ -6054,9 +6074,6 @@ class GatewayTools:
             # Mark job complete and clear process reference
             job.status = "complete"
             job.process = None
-            deadline = getattr(job, "_handoff_deadline", None)
-            if deadline is not None:
-                deadline.cancel()  # adopted: ClientManager owns it now
             self._provision_finalized.add(job_id)
 
             # Persist to provisioned registry so refresh() can reconnect it
@@ -6094,6 +6111,15 @@ class GatewayTools:
                 else None,
             )
 
+        except asyncio.CancelledError:
+            # ClientManager killed what it held (its own cancellation arms);
+            # the job records the end rather than staying `adopting`.
+            job.status = "failed"
+            job.error = "Handoff cancelled"
+            if process.returncode is None:
+                kill_tree(process)
+            release(process)
+            raise
         except Exception as e:
             logger.error(
                 f"Handoff failed for {job_server_name}: {exception_text(e)}",
@@ -6101,9 +6127,12 @@ class GatewayTools:
             )
             job.status = "failed"
             job.error = f"Handoff failed: {exception_text(e)}"
-            # Kill the orphaned process
-            if process:
-                kill_tree(process)  # its whole group, exited or not (round 7)
+            # Exactly one owner kills it (round 10): ClientManager when it had
+            # registered the client (its cleanup waited for the exit), else
+            # this path -- a refusal before registration leaves it running.
+            if process is not None and process.returncode is None:
+                kill_tree(process)  # its whole group (round 7)
+            release(process)
             job.process = None
 
             return ProvisionJobStatus(

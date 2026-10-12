@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import contextlib
+import contextvars
+import os
+from typing import Any
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,7 +22,7 @@ import anyio
 import yaml
 
 from pmcp.argument_errors import exception_text
-from pmcp.child_output import drained_errlog
+from pmcp.child_output import drained_errlog, signal_retained_group, trust_group
 from pmcp.env_store import child_process_env
 from pmcp.manifest.loader import (
     credential_lookup_keys,
@@ -32,6 +36,7 @@ from pmcp.manifest.version_checker import (
     get_package_version,
 )
 from pmcp.parsing import load_yaml
+
 from pmcp.types import (
     DescriptionsCache,
     GeneratedServerDescriptions,
@@ -39,6 +44,55 @@ from pmcp.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# --- the SDK's child, owned (Consiliency/pmcp#388 round 10) -----------------------
+#
+# `stdio_client` spawns the server itself (a new session on POSIX, a Job Object
+# on Windows) and, on exit, kills it -- by looking up the group of a leader
+# that may already have exited, so a grandchild of a leader that exited first
+# outlived the refresh. The process it spawns is captured here, per task (a
+# context variable), and after the SDK's own teardown whatever is left of its
+# group is killed through the one retained-group rule.
+
+_SDK_CHILDREN: contextvars.ContextVar[list[Any] | None] = contextvars.ContextVar(
+    "pmcp_refresh_sdk_children", default=None
+)
+
+
+def _capture_sdk_spawns() -> None:
+    """Wrap the SDK's process factory once, so a refresh can see its child."""
+    import mcp.client.stdio as sdk_stdio
+
+    original = getattr(sdk_stdio, "_create_platform_compatible_process", None)
+    if original is None or getattr(original, "_pmcp_captures", False):
+        return
+
+    async def capturing(*args: Any, **kwargs: Any) -> Any:
+        process = await original(*args, **kwargs)
+        sink = _SDK_CHILDREN.get()
+        if sink is not None:
+            sink.append(process)
+            pid = getattr(process, "pid", None)
+            if isinstance(pid, int) and os.name != "nt":
+                # The SDK's spawn contract on POSIX: a new session, so the
+                # group id is the pid. Trusted for this process object.
+                trust_group(process, pid)
+        return process
+
+    capturing._pmcp_captures = True  # type: ignore[attr-defined]
+    sdk_stdio._create_platform_compatible_process = capturing  # type: ignore[assignment]
+
+
+def _end_sdk_children(children: list[Any]) -> None:
+    """After the SDK's teardown: the child if it somehow still runs, then
+    what is left of its group, through the retained-group checks (trusted
+    for this child, not empty, its pid not reused). Never raises."""
+    for process in children:
+        if getattr(process, "returncode", 0) is None:
+            with contextlib.suppress(Exception):
+                process.kill()
+        signal_retained_group(getattr(process, "pid", None), owner=process)
+
 
 #: The SDK session's per-request read timeout, and the bound on one server's
 #: whole refresh (connect, `initialize`, `tools/list`), in seconds.
@@ -372,54 +426,67 @@ async def refresh_server(
         # The child's stderr is piped and logged, escaped -- never the
         # operator's terminal (Consiliency/pmcp#388 round 4, grok F001: the
         # SDK's default `errlog` is `sys.stderr`, which the child inherited).
-        async with drained_errlog(server_name, logger) as errlog:
-            with anyio.fail_after(REFRESH_TIMEOUT_SECONDS):
-                async with stdio_client(server_params, errlog=errlog) as (read, write):
-                    async with ClientSession(
-                        read, write, read_timeout_seconds=REFRESH_READ_TIMEOUT_SECONDS
-                    ) as session:
-                        await session.initialize()
+        _capture_sdk_spawns()
+        children: list[Any] = []
+        capture = _SDK_CHILDREN.set(children)
+        try:
+            async with drained_errlog(server_name, logger) as errlog:
+                with anyio.fail_after(REFRESH_TIMEOUT_SECONDS):
+                    async with stdio_client(server_params, errlog=errlog) as (
+                        read,
+                        write,
+                    ):
+                        async with ClientSession(
+                            read,
+                            write,
+                            read_timeout_seconds=REFRESH_READ_TIMEOUT_SECONDS,
+                        ) as session:
+                            await session.initialize()
 
-                        # List tools
-                        tools_result = await session.list_tools()
-                        tools = tools_result.tools
+                            # List tools
+                            tools_result = await session.list_tools()
+                            tools = tools_result.tools
 
-                        logger.info(f"Found {len(tools)} tools for {server_name}")
+                            logger.info(f"Found {len(tools)} tools for {server_name}")
 
-                        # Convert to PrebuiltToolInfo
-                        prebuilt_tools = []
-                        for tool in tools:
-                            name = tool.name
-                            description = tool.description or ""
-                            short_desc = (
-                                description[:100] + "..."
-                                if len(description) > 100
-                                else description
-                            )
-
-                            prebuilt_tools.append(
-                                PrebuiltToolInfo(
-                                    name=name,
-                                    description=description,
-                                    short_description=short_desc,
-                                    tags=_extract_tags(name, description),
-                                    risk_hint=_infer_risk(name, description),
+                            # Convert to PrebuiltToolInfo
+                            prebuilt_tools = []
+                            for tool in tools:
+                                name = tool.name
+                                description = tool.description or ""
+                                short_desc = (
+                                    description[:100] + "..."
+                                    if len(description) > 100
+                                    else description
                                 )
+
+                                prebuilt_tools.append(
+                                    PrebuiltToolInfo(
+                                        name=name,
+                                        description=description,
+                                        short_description=short_desc,
+                                        tags=_extract_tags(name, description),
+                                        risk_hint=_infer_risk(name, description),
+                                    )
+                                )
+
+                            # Generate capability summary
+                            capability_summary = await _generate_capability_summary(
+                                server_name, prebuilt_tools
                             )
 
-                        # Generate capability summary
-                        capability_summary = await _generate_capability_summary(
-                            server_name, prebuilt_tools
-                        )
+                            return GeneratedServerDescriptions(
+                                package=pkg_name,
+                                package_type=pkg_type,
+                                version=version,
+                                generated_at=datetime.now(timezone.utc).isoformat(),
+                                capability_summary=capability_summary,
+                                tools=prebuilt_tools,
+                            )
 
-                        return GeneratedServerDescriptions(
-                            package=pkg_name,
-                            package_type=pkg_type,
-                            version=version,
-                            generated_at=datetime.now(timezone.utc).isoformat(),
-                            capability_summary=capability_summary,
-                            tools=prebuilt_tools,
-                        )
+        finally:
+            _SDK_CHILDREN.reset(capture)
+            _end_sdk_children(children)
 
     except Exception as e:
         logger.error(f"Failed to refresh {server_name}: {exception_text(e)}")
