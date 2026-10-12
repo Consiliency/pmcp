@@ -802,8 +802,10 @@ def run_captured(
         env=child_process_env(),
         **detached(),
     )
-    track(process)
+    # Owned from the moment it exists (round 10): an interrupt landing
+    # before the communicate still kills it with its group.
     with owned(process):
+        track(process)
         stdout, stderr = process.communicate(timeout=timeout)
     return subprocess.CompletedProcess(
         list(command), int(process.returncode), stdout, stderr
@@ -846,9 +848,11 @@ def run_echoed(command: Sequence[str]) -> int:
         env=child_process_env(),
         **detached(),
     )
-    track(process)
+    # Owned from the moment it exists (round 10): a Ctrl-C landing before
+    # the communicate is forwarded and the child killed with its group too.
     with owned(process):
         try:
+            track(process)
             output, _ = process.communicate()
         except KeyboardInterrupt:
             interrupt_tree(process)

@@ -5952,7 +5952,9 @@ class GatewayTools:
             # Both are one-shot per job: serialize on a per-job lock and re-read
             # the live status inside it so two concurrent polls cannot
             # double-adopt or re-refresh a job another poll already finalized.
-            if job_status in ("server_ready", "complete"):
+            # `adopting` too (round 10): a poll that arrives mid-handoff waits
+            # for it on the lock and reports its result, as before.
+            if job_status in ("server_ready", "adopting", "complete"):
                 finalize_lock = self._provision_finalize_locks.setdefault(
                     job_id, asyncio.Lock()
                 )
