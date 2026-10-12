@@ -399,7 +399,9 @@ def _ctrl_c(runner: str) -> Callable[[Path, Path, str, Any], Awaitable[None]]:
             [
                 sys.executable,
                 "-c",
-                "import signal, sys\n"
+                "import faulthandler, os, signal, sys\n"
+                "_trace = open(os.environ['PMCP_HARNESS_TRACE'], 'w')\n"
+                "faulthandler.dump_traceback_later(20, file=_trace)\n"
                 "signal.signal(signal.SIGINT, signal.default_int_handler)\n"
                 f"from pmcp.child_output import {runner}\n"
                 "try:\n"
@@ -410,11 +412,19 @@ def _ctrl_c(runner: str) -> Callable[[Path, Path, str, Any], Awaitable[None]]:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env={**os.environ, "PMCP_HARNESS_TRACE": str(script.parent / "trace")},
         )
         try:
             await _wait_started(piddir, mode)
             os.kill(harness.pid, signal.SIGINT)
-            await asyncio.to_thread(harness.wait, 30)
+            try:
+                await asyncio.to_thread(harness.wait, 30)
+            except subprocess.TimeoutExpired:
+                trace = script.parent / "trace"
+                raise AssertionError(
+                    "the harness did not exit; its stack at 20 s:\n"
+                    + (trace.read_text() if trace.exists() else "(none)")
+                ) from None
         finally:
             if harness.poll() is None:
                 harness.kill()

@@ -832,9 +832,9 @@ def run_echoed(command: Sequence[str]) -> int:
     """Run ``command`` for the operator, with its stdout and stderr piped
     and each line then echoed to pmcp's stdout escaped. Returns the exit
     code. Raises ``OSError`` (``FileNotFoundError``) as ``subprocess.run``
-    does when the executable is missing. The commands it runs (an installer
-    upgrade, a service restart) are short, so the output is echoed when the
-    child is done rather than streamed. An operator's Ctrl-C is forwarded
+    does when the executable is missing. Each line is echoed as the child
+    writes it (round 10: streamed, so a child that never stops writing can
+    still be interrupted, and memory stays bounded). An operator's Ctrl-C is forwarded
     to the child's whole group (:func:`interrupt_tree`): a detached child no
     longer gets the terminal's SIGINT itself."""
     from pmcp.env_store import child_process_env
@@ -853,13 +853,17 @@ def run_echoed(command: Sequence[str]) -> int:
     with owned(process):
         try:
             track(process)
-            output, _ = process.communicate()
+            # Streamed, a chunk at a time, not `communicate()` (round 10):
+            # with one pipe it reads to the end in a single C loop that
+            # never returns to the interpreter while the child keeps writing,
+            # so an operator's Ctrl-C was never delivered -- and the whole
+            # output was held in memory. Each line is echoed as it arrives;
+            # memory stays at one capped line.
+            assert process.stdout is not None
+            for raw, truncated in bounded_lines(process.stdout):
+                print(_render(raw, truncated), file=sys.stdout, flush=True)
+            process.wait()
         except KeyboardInterrupt:
             interrupt_tree(process)
             raise
-    if isinstance(output, bytes) and output:
-        import io
-
-        for raw, truncated in bounded_lines(io.BytesIO(output)):
-            print(_render(raw, truncated), file=sys.stdout, flush=True)
     return int(process.returncode)

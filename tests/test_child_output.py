@@ -2487,3 +2487,48 @@ async def test_a_teardown_closes_a_flooded_unread_pipe(teardown: str) -> None:
         assert _open_fds() <= baseline, (_open_fds(), baseline)
     finally:
         gc.enable()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_ctrl_c_reaches_run_echoed_while_its_child_floods(tmp_path: Path) -> None:
+    """Round 10: with one pipe, `communicate()` reads to the end in one C
+    loop that never returns to the interpreter while the pipe stays
+    readable -- a child writing without pause made `pmcp upgrade` immune to
+    Ctrl-C (and held all its output in memory). Streamed, it stops."""
+    import signal
+    import time
+
+    child = tmp_path / "flood.py"
+    child.write_text(
+        "import os, sys\n"
+        f"open({str(tmp_path / 'started')!r}, 'w').close()\n"
+        "chunk = b'x' * 65535 + b'\\n'\n"
+        "while True:\n"
+        "    os.write(1, chunk)\n"
+    )
+    harness = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, sys\n"
+            "signal.signal(signal.SIGINT, signal.default_int_handler)\n"
+            "from pmcp.child_output import run_echoed\n"
+            "try:\n"
+            f"    run_echoed([sys.executable, {str(child)!r}])\n"
+            "except KeyboardInterrupt:\n"
+            "    print('interrupted', file=sys.stderr)\n",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for(tmp_path / "started")
+        time.sleep(0.5)  # the flood is well under way
+        harness.send_signal(signal.SIGINT)
+        _, err = harness.communicate(timeout=20)
+        assert b"interrupted" in err, err[-500:]
+    finally:
+        if harness.poll() is None:
+            harness.kill()
+            harness.wait()
