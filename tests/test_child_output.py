@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from typing import Any
 from pathlib import Path
 
 import pytest
@@ -2016,3 +2017,284 @@ def test_windows_reader_reads_the_last_bytes_at_the_stop() -> None:
     finally:
         os.close(read_fd)
         os.close(write_fd)
+
+
+# --- round 9 ----------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not Path("/dev/zero").exists(), reason="a never-empty source")
+def test_the_windows_reader_stops_while_its_pipe_is_flooded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 9, codex F001: data always available no longer outruns the
+    stop. A source that is never empty (`/dev/zero`, always "ready"): once
+    stopped the reader reads at most one final budget, then ends."""
+    import threading
+
+    from pmcp import child_output
+
+    monkeypatch.setattr(child_output, "_peek_pipe", lambda fd: 1 << 20)
+    zero = os.open("/dev/zero", os.O_RDONLY)
+    stop = threading.Event()
+    reader = child_output._PollingReader(zero, stop)
+    try:
+        assert reader.read1(4096)  # data, while running
+        stop.set()
+        final = reader.read1(1 << 20)
+        assert 0 < len(final) <= child_output._FINAL_READ_BUDGET
+        assert reader.read1(1 << 20) == b""  # ended, the source still full
+    finally:
+        os.close(zero)
+
+
+def contextlib_suppress_oserror() -> Any:
+    import contextlib
+
+    return contextlib.suppress(OSError)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_the_group_watcher_never_waits_on_the_pipes(tmp_path: Path) -> None:
+    """Round 9, codex F002: `process.wait()` also waits for the pipes, and a
+    descendant that left the group but kept the pipes made an empty group
+    stay trusted forever. The watcher forgets it within its bound."""
+    import asyncio
+
+    from pmcp import child_output
+    from pmcp.child_output import detached, track
+
+    script = tmp_path / "leader.py"
+    script.write_text(
+        textwrap.dedent(
+            f"""
+            import subprocess, sys
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                start_new_session=True,  # leaves the group, keeps the pipes
+            )
+            open({str(tmp_path / "grandchild")!r}, "w").write(str(child.pid))
+            """
+        )
+    )
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(script),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        **detached(),
+    )
+    track(process)
+    _wait_for(tmp_path / "grandchild")
+    grandchild = int((tmp_path / "grandchild").read_text())
+    try:
+        await asyncio.wait_for(child_output.watch_group(process, process.pid), 10)
+        assert not child_output.group_trusted(process.pid, process)
+    finally:
+        os.kill(grandchild, signal_sigkill())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_the_group_watcher_does_not_call_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same rule on every Python: a `wait()` that never returns (3.11+
+    waits for the pipes) does not hold the watcher -- an empty group is
+    forgotten regardless."""
+    import asyncio
+
+    from pmcp import child_output
+    from pmcp.child_output import detached, track
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "pass",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        **detached(),
+    )
+    track(process)
+    real_wait = process.wait
+    await real_wait()
+
+    async def never() -> int:
+        await asyncio.Event().wait()
+        return 0
+
+    monkeypatch.setattr(process, "wait", never)
+    await asyncio.wait_for(child_output.watch_group(process, process.pid), 10)
+    assert not child_output.group_trusted(process.pid, process)
+
+
+def signal_sigkill() -> int:
+    import signal
+
+    return int(signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_clients_group_watcher_is_cancelled() -> None:
+    """Round 9, codex F002: the per-client cleanup -- graceful and
+    abandoning -- cancels the group watcher with the client's other tasks."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from pmcp.client.manager import ClientManager, ManagedClient
+    from pmcp.types import ServerStatus, ServerStatusEnum
+
+    mgr = ClientManager()
+    for teardown in ("graceful", "abandon"):
+        watcher = asyncio.create_task(asyncio.sleep(3600))
+        status = ServerStatus(name="srv", status=ServerStatusEnum.OFFLINE, tool_count=0)
+        managed = ManagedClient(config=MagicMock(), process=None, status=status)
+        managed.group_watch = watcher
+        if teardown == "graceful":
+            await mgr._cleanup_client_io("srv", managed)
+        else:
+            mgr._abandon_client_io("srv", managed)
+            await asyncio.sleep(0)
+        await asyncio.wait([watcher], timeout=5)
+        assert watcher.cancelled(), teardown
+        watcher.cancel()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_kill_tree_keeps_the_retained_group_when_the_lookup_races_a_reap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 9, codex F003: the leader reaped between `leader_reserved()`
+    and `getpgid()` (3.10/3.11's watcher thread) no longer drops the group:
+    the retained-group checks decide, and the grandchild is killed."""
+    from pmcp import child_output
+    from pmcp.child_output import detached, track
+
+    script = tmp_path / "leader.py"
+    script.write_text(_LEADER_EXITS_FIRST)
+    leader = subprocess.Popen(
+        [sys.executable, str(script), str(tmp_path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **detached(),
+    )
+    track(leader)
+    _wait_for(tmp_path / "grandchild")
+    os.waitpid(leader.pid, 0)  # reaped behind the check below
+    # The race: the reserved check ran before the reap.
+    monkeypatch.setattr(child_output, "leader_reserved", lambda process: True)
+    child_output.kill_tree(leader)
+    _grandchild_gone(tmp_path, "kill_tree (lookup raced a reap)")
+
+
+_STARTED_THEN_EXITS = textwrap.dedent(
+    """
+    import os, subprocess, sys
+    out = {out!r}
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    open(os.path.join(out, "grandchild"), "w").write(str(child.pid))
+    print("Server started on stdio", flush=True)
+    """
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_exited_install_leader_does_not_leave_its_grandchild(
+    tmp_path: Path,
+) -> None:
+    """Round 9, grok F001 (grok's falsifier): an install that reports its
+    server started and exits, leaving the server it started, is found dead
+    at the handoff -- and its grandchild is killed with its group."""
+    import asyncio
+
+    from pmcp.manifest import installer
+    from pmcp.tools.handlers import GatewayTools
+
+    script = tmp_path / "install.py"
+    script.write_text(_STARTED_THEN_EXITS.format(out=str(tmp_path)))
+    command = [sys.executable, str(script)]
+    server = installer.ServerConfig(
+        name="memory",
+        description="memory",
+        keywords=["memory"],
+        install={"linux": command},
+        command=command[0],
+        args=command[1:],
+        requires_api_key=False,
+    )
+    jobs = installer.JobManager()
+    job_id = await jobs.start_install(server, "linux")
+    job = jobs._jobs[job_id]
+    deadline = asyncio.get_running_loop().time() + 15
+    while not (job.status == "server_ready" and job.process.returncode is not None):
+        assert asyncio.get_running_loop().time() < deadline, job.status
+        await asyncio.sleep(0.05)
+    tools = GatewayTools.__new__(GatewayTools)
+    result = await tools._finalize_server_ready(job, job_id, 0.0)
+    assert result.status == "failed"
+    _grandchild_gone(tmp_path, "the install handoff")
+    if job._handoff_deadline is not None:
+        job._handoff_deadline.cancel()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_an_unadopted_server_is_killed_at_the_handoff_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 9, grok F001: the job owns a `server_ready` server until it is
+    adopted; one that is never adopted is killed with its group at the
+    handoff deadline."""
+    import asyncio
+
+    from pmcp.manifest import installer
+
+    monkeypatch.setattr(installer, "HANDOFF_DEADLINE_SECONDS", 0.5)
+    script = tmp_path / "install.py"
+    script.write_text(
+        _STARTED_THEN_EXITS.format(out=str(tmp_path)) + "import time\ntime.sleep(60)\n"
+    )
+    command = [sys.executable, str(script)]
+    server = installer.ServerConfig(
+        name="memory",
+        description="memory",
+        keywords=["memory"],
+        install={"linux": command},
+        command=command[0],
+        args=command[1:],
+        requires_api_key=False,
+    )
+    jobs = installer.JobManager()
+    job_id = await jobs.start_install(server, "linux")
+    job = jobs._jobs[job_id]
+    deadline = asyncio.get_running_loop().time() + 15
+    while job.status != "failed":
+        assert asyncio.get_running_loop().time() < deadline, job.status
+        await asyncio.sleep(0.05)
+    assert job.error == "Server was not adopted in time"
+    _grandchild_gone(tmp_path, "the unadopted handoff")
+
+
+@pytest.mark.asyncio
+async def test_verify_installation_requires_a_successful_run(tmp_path: Path) -> None:
+    """Round 9 (grok): runnable means it ran -- a command whose `--help`
+    fails is not verified."""
+    from pmcp.manifest import installer
+
+    server = installer.ServerConfig(
+        name="memory",
+        description="memory",
+        keywords=["memory"],
+        install={"linux": [sys.executable]},
+        command=sys.executable,
+        args=["-c", "import sys; sys.exit(3)"],
+        requires_api_key=False,
+    )
+    assert await installer.verify_installation(server) is False

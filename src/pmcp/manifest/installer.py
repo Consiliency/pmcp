@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import shlex
 import time
@@ -34,6 +35,12 @@ HEARTBEAT_TIMEOUT = 120  # seconds
 
 # Time to wait before assuming uvx server is ready (they don't output startup messages)
 UVX_STARTUP_SECONDS = 3
+
+# How long a `server_ready` job's running server waits to be adopted by
+# `gateway.provision_status` before it is killed with its group (round 9,
+# grok F001): the job owns the process until the handoff, and an owner that
+# is never asked for it must not keep it running forever.
+HANDOFF_DEADLINE_SECONDS = 600.0
 
 _REDACTED = "<redacted>"
 
@@ -144,6 +151,7 @@ class InstallJob:
     error: str | None = None
     command: str = ""  # The command used (e.g., "uvx", "npx")
     _monitor_task: asyncio.Task | None = field(default=None, repr=False)
+    _handoff_deadline: asyncio.Task | None = field(default=None, repr=False)
 
 
 class JobManager:
@@ -483,12 +491,36 @@ class JobManager:
             await self._safe_terminate_process(process, job.id, force=True)
 
         finally:
+            if job.status == "server_ready":
+                self._start_handoff_deadline(job)
             # Only clear process if NOT server_ready (process needed for handoff)
             if job.status != "server_ready":
                 # Every exit but the handoff: whatever the install left
                 # running is killed, synchronously (round 8, codex F003).
                 kill_tree(process)
                 job.process = None  # Allow GC
+
+    def _start_handoff_deadline(self, job: InstallJob) -> None:
+        """Kill a `server_ready` job's server, with its group, if it is not
+        adopted within :data:`HANDOFF_DEADLINE_SECONDS` (round 9, grok F001).
+        The adoption cancels this."""
+
+        async def expire() -> None:
+            await asyncio.sleep(HANDOFF_DEADLINE_SECONDS)
+            if job.status == "server_ready" and job.process is not None:
+                logger.warning(
+                    f"Install job {job.id}: server was not adopted within "
+                    f"{HANDOFF_DEADLINE_SECONDS:.0f}s; killing it"
+                )
+                kill_tree(job.process)
+                job.process = None
+                job.status = "failed"
+                job.error = "Server was not adopted in time"
+
+        with contextlib.suppress(RuntimeError):  # no running loop
+            job._handoff_deadline = asyncio.create_task(
+                expire(), name=f"install-handoff-{job.id}"
+            )
 
     async def _safe_terminate_process(
         self, process: asyncio.subprocess.Process, job_id: str, force: bool = False
@@ -573,7 +605,10 @@ class JobManager:
         if not job:
             return False
 
-        if job.process and job.process.returncode is None:
+        if job.process and job.process.returncode is not None:
+            # Exited -- what it started may not have (round 9, grok F001).
+            kill_tree(job.process)
+        elif job.process:
             logger.info(f"Cancelling install job {job_id}")
             kill_tree(job.process, terminate=True)
 
@@ -809,7 +844,9 @@ async def verify_installation(
         # started, not left running (round 8, codex F003).
         with owned(process):
             await bounded_wait(process.communicate(), timeout=5.0)
-        return True
+        # Runnable means it ran: a command that fails `--help` is not
+        # (round 9, grok).
+        return process.returncode == 0
 
     except Exception:
         return False

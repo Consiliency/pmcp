@@ -6016,7 +6016,12 @@ class GatewayTools:
 
         process = job.process
         if not process or process.returncode is not None:
-            # Process died before handoff
+            # Process died before handoff. Whatever it started -- an npx
+            # leader that exited while its node server lives on -- is killed
+            # with its group: nothing will adopt it (round 9, grok F001).
+            if process is not None:
+                kill_tree(process)
+                job.process = None
             job.status = "failed"
             job.error = "Server process exited before handoff"
             return ProvisionJobStatus(
@@ -6049,6 +6054,9 @@ class GatewayTools:
             # Mark job complete and clear process reference
             job.status = "complete"
             job.process = None
+            deadline = getattr(job, "_handoff_deadline", None)
+            if deadline is not None:
+                deadline.cancel()  # adopted: ClientManager owns it now
             self._provision_finalized.add(job_id)
 
             # Persist to provisioned registry so refresh() can reconnect it

@@ -1557,6 +1557,9 @@ class ManagedClient:
     # drains the queue, recreated on demand when the previous one is done.
     outbound: asyncio.Queue[dict[str, Any]] | None = None
     outbound_writer: asyncio.Task[None] | None = None
+    # Forgets the group the moment it is empty (round 8, claude N-A);
+    # cancelled with the client's other tasks (round 9, codex F002).
+    group_watch: asyncio.Task[None] | None = None
     # The process group the downstream leads, so every kill path can reach a
     # grandchild after asyncio has reaped the leader (codex rounds 5 and 6,
     # Consiliency/pmcp#324). Set by the creator from the spawn contract
@@ -1722,7 +1725,7 @@ class ClientManager:
         pid wrap handed to another group (round 8, claude N-A). The watcher
         is the server's background task, cancelled with it."""
         if managed.process is not None and managed.group_pgid is not None:
-            self._track_background_task(
+            managed.group_watch = self._track_background_task(
                 asyncio.create_task(watch_group(managed.process, managed.group_pgid)),
                 name,
             )
@@ -3398,7 +3401,12 @@ class ClientManager:
         """
         if managed.status.status == ServerStatusEnum.ONLINE:
             managed.status.status = ServerStatusEnum.OFFLINE
-        for task in (managed.read_task, managed.stderr_task, managed.outbound_writer):
+        for task in (
+            managed.read_task,
+            managed.stderr_task,
+            managed.outbound_writer,
+            managed.group_watch,
+        ):
             _cancel_without_waiting(task)
         managed.outbound = None
         managed.outbound_writer = None
@@ -4634,7 +4642,12 @@ class ClientManager:
     async def _cleanup_client_io(self, name: str, managed: ManagedClient) -> None:
         """`_cleanup_client`'s graceful teardown; a caller cancellation
         propagates out of any await here."""
-        for task in (managed.read_task, managed.stderr_task, managed.outbound_writer):
+        for task in (
+            managed.read_task,
+            managed.stderr_task,
+            managed.outbound_writer,
+            managed.group_watch,
+        ):
             await _reap_child(task)
         # Reset the outbound path so nothing survives onto a next generation.
         # The writer was cancelled above, but the Queue -- and any reply /

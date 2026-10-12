@@ -324,7 +324,11 @@ def kill_tree(process: Any, *, terminate: bool = False) -> None:
         try:
             group = process.pid if os.getpgid(process.pid) == process.pid else None
         except (ProcessLookupError, PermissionError, OSError):
-            group = None
+            # Reaped between the check and the lookup (asyncio's watcher
+            # thread, 3.10/3.11): keep the spawn contract's id; the retained
+            # group checks -- trusted for this process, not empty -- decide
+            # (round 9, codex F003).
+            pass
     kill_process_tree_now(process, group_pgid=group, sig=sig)
 
 
@@ -579,6 +583,10 @@ class _StoppableReader:
 #: How often a Windows drain looks at its pipe and its stop event.
 _POLL_SECONDS = 0.05
 
+#: The most a stopped drain still reads: one final read, so a descendant
+#: writing without pause cannot keep the drain past its stop (round 9).
+_FINAL_READ_BUDGET = 64 * 1024
+
 
 def _peek_pipe(fd: int) -> int | None:  # pragma: no cover - Windows only
     """Bytes ready in a Windows pipe, without blocking (``PeekNamedPipe``);
@@ -618,18 +626,21 @@ class _PollingReader:
         if self._stopping:
             return b""
         while True:
+            # The stop first, on every iteration (round 9, codex F001): a
+            # descendant that keeps the pipe readable must not outrun it.
+            if self._stop.is_set():
+                self._stopping = True
+                # One last read of what is already there, at most
+                # :data:`_FINAL_READ_BUDGET` bytes, then the end.
+                available = _peek_pipe(self._fd)
+                if available:
+                    return os.read(self._fd, min(size, available, _FINAL_READ_BUDGET))
+                return b""
             available = _peek_pipe(self._fd)
             if available is None:
                 return b""  # the pipe's end
             if available:
                 return os.read(self._fd, min(size, available))
-            if self._stop.is_set():
-                self._stopping = True
-                # One last look at what is already there, then the end.
-                available = _peek_pipe(self._fd)
-                if available:
-                    return os.read(self._fd, min(size, available))
-                return b""
             self._stop.wait(_POLL_SECONDS)
 
     def close(self) -> None:
@@ -773,14 +784,12 @@ _WATCH_SECONDS = 0.5
 
 async def watch_group(process: Any, pgid: int | None) -> None:
     """Forget a long-lived child's group as soon as it is empty (round 8,
-    claude N-A): once the leader is done, the group is probed every
-    :data:`_WATCH_SECONDS` until the first probe that finds no member, which
-    forgets the id -- so it is not trusted across a pid wrap. Ends at once
-    for an untrusted id; never raises."""
-    if not group_trusted(pgid, process):
-        return
-    with contextlib.suppress(Exception):
-        await process.wait()
+    claude N-A): the group is probed every :data:`_WATCH_SECONDS` until the
+    first probe that finds no member, which forgets the id -- so it is not
+    trusted across a pid wrap. It never waits on the process or its pipes
+    (round 9, codex F002: an asyncio ``wait()`` also waits for the pipes to
+    close, and a descendant holding them kept an empty group trusted). Ends
+    at once for an untrusted id; never raises."""
     while observe_group(pgid, process):
         await asyncio.sleep(_WATCH_SECONDS)
 

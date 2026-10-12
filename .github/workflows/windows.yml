@@ -9,6 +9,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Read-only: the job checks out and runs tests, nothing more (round 9,
+# claude N-B).
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
