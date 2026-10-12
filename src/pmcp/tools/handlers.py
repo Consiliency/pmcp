@@ -6115,10 +6115,13 @@ class GatewayTools:
 
         except asyncio.CancelledError:
             # ClientManager's two cancellation arms (before the lock, and
-            # after registration) kill the process synchronously; the job
-            # records the end rather than staying `adopting`.
+            # after registration) kill the process synchronously; this kill
+            # is the backstop for any await between them (round 11): after
+            # them it only probes an empty group. The job records the end
+            # rather than staying `adopting`.
             job.status = "failed"
             job.error = "Handoff cancelled"
+            kill_tree(process)
             release(process)
             raise
         except Exception as e:

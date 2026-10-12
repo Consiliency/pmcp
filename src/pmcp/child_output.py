@@ -761,6 +761,21 @@ def release(process: Any) -> None:
             transport.close()
 
 
+def _quiet_broken_stdout() -> None:
+    """After a broken pipe on the operator's stdout: point descriptor 1 at
+    the null device, so the interpreter's flush at exit neither raises nor
+    prints a traceback. Only for the human CLI's display stream (the one
+    :func:`run_echoed` writes through), never a gateway's protocol stream."""
+    from pmcp.display import DisplaySafeStream
+
+    if not isinstance(sys.stdout, DisplaySafeStream):
+        return
+    with contextlib.suppress(OSError):
+        null = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(null, 1)
+        os.close(null)
+
+
 #: How long :func:`owned` waits to reap a killed synchronous child.
 _REAP_SECONDS = 2.0
 
@@ -860,8 +875,19 @@ def run_echoed(command: Sequence[str]) -> int:
             # output was held in memory. Each line is echoed as it arrives;
             # memory stays at one capped line.
             assert process.stdout is not None
+            echoing = True
             for raw, truncated in bounded_lines(process.stdout):
-                print(_render(raw, truncated), file=sys.stdout, flush=True)
+                if not echoing:
+                    continue  # drained and discarded: the child must not block
+                try:
+                    print(_render(raw, truncated), file=sys.stdout, flush=True)
+                except BrokenPipeError:
+                    # `pmcp upgrade | head` (round 11, claude N-A): the reader
+                    # went away. Stop echoing, keep draining until the child
+                    # exits on its own -- never kill an installer mid-install
+                    # for it -- and report its exit status.
+                    echoing = False
+                    _quiet_broken_stdout()
             process.wait()
         except KeyboardInterrupt:
             interrupt_tree(process)

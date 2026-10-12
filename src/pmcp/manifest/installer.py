@@ -616,30 +616,34 @@ class JobManager:
         job = self._jobs.get(job_id)
         if not job:
             return False
-        if job._handoff_deadline is not None:
-            job._handoff_deadline.cancel()  # round 10 (gemini)
 
-        if job.process and job.process.returncode is not None:
-            # Exited -- what it started may not have (round 9, grok F001).
-            kill_tree(job.process)
-        elif job.process:
-            logger.info(f"Cancelling install job {job_id}")
-            kill_tree(job.process, terminate=True)
-
-            # Give it a moment to terminate gracefully
-            try:
-                await bounded_wait(job.process.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                kill_tree(job.process)
-                await job.process.wait()
-
-            job.status = "failed"
-            job.error = "Cancelled by user"
-        if job.process is not None:
-            release(job.process)  # round 10, codex F001
-
-        if job._monitor_task:
-            job._monitor_task.cancel()
+        process = job.process
+        try:
+            if process is not None and process.returncode is None:
+                logger.info(f"Cancelling install job {job_id}")
+                kill_tree(process, terminate=True)
+                # A moment to terminate gracefully. A cancellation of this
+                # wait is the caller's to have; the kill is not (round 11,
+                # codex F001): it follows in the `finally`.
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await bounded_wait(process.wait(), timeout=2.0)
+        finally:
+            # Synchronous, on every exit, a cancellation included: the job and
+            # everything it started are killed and their pipes closed. Exited
+            # already, the group is still checked (round 9, grok F001).
+            if process is not None:
+                kill_tree(process)
+                release(process)  # round 10, codex F001
+                if job.status not in ("complete", "adopting"):
+                    job.status = "failed"
+                    job.error = "Cancelled by user"
+            # The backstop is disarmed only now, after the kill it guards
+            # (round 11): a cancelled wait above must not leave a server
+            # running with no deadline either.
+            if job._handoff_deadline is not None:
+                job._handoff_deadline.cancel()
+            if job._monitor_task:
+                job._monitor_task.cancel()
 
         return True
 

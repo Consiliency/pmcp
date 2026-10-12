@@ -4790,6 +4790,14 @@ class ClientManager:
 
         logger.info(f"Adopting process for MCP server: {name}")
 
+        # A client already registered under this name -- a lazy connect of
+        # the same server during a long install -- is torn down, not
+        # overwritten: its process would otherwise be left running with no
+        # owner (round 11, claude).
+        existing = self._clients.get(name)
+        if existing is not None:
+            await self._cleanup_client(name, existing)
+
         # #175 item 2. Every other path into the indexers clears this server's
         # entries first. The two this one is modelled on are the connect and
         # cleanup paths -- `_connect_stdio`, `_connect_remote_stream` and

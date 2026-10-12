@@ -49,6 +49,17 @@ _HOSTILE = textwrap.dedent(
     # What an installer's server prints when it is up: an install job hands
     # it off (`server_ready`); every other site ignores it.
     print("Server started on stdio", flush=True)
+    if mode == "cancel":
+        # Ignores SIGTERM (so every graceful wait really waits), and holds
+        # the pipes through a grandchild that ignores it too.
+        import signal
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        child = subprocess.Popen([sys.executable, "-c",
+            "import signal, time\\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"
+            "time.sleep(60)\\n"])
+        note(child.pid)
+        time.sleep(60)
     if mode in ("hold", "early"):
         # A grandchild that inherits stdout and stderr and keeps them open.
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -73,7 +84,21 @@ _HOSTILE = textwrap.dedent(
     """
 )
 
-BEHAVIOURS = ("hold", "early", "flood")
+BEHAVIOURS = ("hold", "early", "flood", "cancel")
+
+#: The owners whose teardown awaits the child's exit -- the `cancel`
+#: dimension cancels that await. The rest kill synchronously (`owned()`,
+#: the npm resolver), or are test harnesses a cancel would SIGKILL.
+CANCELLABLE = (
+    "install_server (timeout)",
+    "install_server (cancelled)",
+    "update probe",
+    "ClientManager server",
+    "install job (cancelled)",
+    "handoff: adopted",
+    "handoff: adoption fails",
+    "handoff: adoption straddles the deadline",
+)
 
 
 def _script(tmp_path: Path, mode: str) -> tuple[Path, Path]:
@@ -125,6 +150,28 @@ async def _short(module: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         return await real(aw, 1.0)
 
     monkeypatch.setattr(module, "bounded_wait", short)
+
+
+def _cancel_every_exit_wait(mp: Any) -> None:
+    """The `cancel` dimension (round 11, codex F001): every await on a
+    child's exit made through `bounded_wait` -- a teardown's graceful wait --
+    is cancelled instead. A kill that sits behind such an await is lost."""
+    from pmcp import waits
+    from pmcp.client import manager
+    from pmcp.manifest import environment, installer
+    from pmcp.tools import handlers
+
+    real = waits.bounded_wait
+
+    async def cancelling(aw: Any, timeout: float | None) -> Any:
+        if getattr(aw, "__qualname__", "").endswith("Process.wait"):
+            aw.close()
+            raise asyncio.CancelledError
+        return await real(aw, timeout)
+
+    mp.setattr(waits, "bounded_wait", cancelling)
+    for module in (manager, installer, handlers, environment):
+        mp.setattr(module, "bounded_wait", cancelling)
 
 
 async def _wait_started(piddir: Path, mode: str) -> None:
@@ -494,7 +541,11 @@ async def test_nothing_outlives_its_owner(
 ) -> None:
     import gc
 
+    if mode == "cancel" and owner not in CANCELLABLE:
+        pytest.skip("no await in this owner's teardown to cancel")
     script, piddir = _script(tmp_path, mode)
+    if mode == "cancel":
+        _cancel_every_exit_wait(monkeypatch)
     # Descriptors must be closed, not collected (round 10, codex F001): no
     # automatic garbage collection while the owner runs and is checked.
     gc.collect()
@@ -502,7 +553,11 @@ async def test_nothing_outlives_its_owner(
     baseline_fds = _fds()
     baseline_drains = set(_drains())
     try:
-        await asyncio.wait_for(OWNERS[owner](script, piddir, mode, monkeypatch), 60)
+        try:
+            await asyncio.wait_for(OWNERS[owner](script, piddir, mode, monkeypatch), 60)
+        except asyncio.CancelledError:
+            if mode != "cancel":
+                raise  # only the cancel dimension's own cancellations end here
         pids = [int(p.name) for p in piddir.iterdir()]
         assert pids, "the behaviour never started"
         assert await _until(lambda: not any(_alive(p) for p in pids), BOUND), (

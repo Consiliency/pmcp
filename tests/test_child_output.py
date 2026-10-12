@@ -2407,6 +2407,10 @@ async def test_a_failed_handoff_and_a_cancelled_job_cancel_the_deadline(
     other.mkdir()
     jobs, job_id, job = await _server_ready_job(other, monkeypatch, deadline=60)
     await jobs.cancel_job(job_id)
+    # Disarmed last, after the kill (round 11): let the cancellation land.
+    import asyncio
+
+    await asyncio.wait([job._handoff_deadline], timeout=5)
     assert job._handoff_deadline.cancelled()
     if job.process is not None:
         from pmcp.child_output import kill_tree
@@ -2532,3 +2536,201 @@ def test_ctrl_c_reaches_run_echoed_while_its_child_floods(tmp_path: Path) -> Non
         if harness.poll() is None:
             harness.kill()
             harness.wait()
+
+
+# --- round 11 ---------------------------------------------------------------------
+
+_IGNORES_TERM = (
+    "import os, signal, subprocess, sys, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "child = subprocess.Popen([sys.executable, '-c', "
+    "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])\n"
+    "open({out!r}, 'w').write(str(child.pid))\n"
+    "print('Server started on stdio', flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
+async def _term_ignoring_server_ready_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    import asyncio
+
+    from pmcp.manifest import installer
+
+    monkeypatch.setattr(installer, "HANDOFF_DEADLINE_SECONDS", 60.0)
+    script = tmp_path / "install.py"
+    script.write_text(_IGNORES_TERM.format(out=str(tmp_path / "grandchild")))
+    command = [sys.executable, str(script)]
+    server = installer.ServerConfig(
+        name="memory",
+        description="memory",
+        keywords=["memory"],
+        install={"linux": command},
+        command=command[0],
+        args=command[1:],
+        requires_api_key=False,
+    )
+    jobs = installer.JobManager()
+    job_id = await jobs.start_install(server, "linux")
+    job = jobs._jobs[job_id]
+    limit = asyncio.get_running_loop().time() + 15
+    while job.status != "server_ready" or not (tmp_path / "grandchild").exists():
+        assert asyncio.get_running_loop().time() < limit, job.status
+        await asyncio.sleep(0.02)
+    return jobs, job_id, job
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_a_cancelled_cancel_job_still_kills_the_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 11, codex F001 (codex's repro): `cancel_job` on a
+    `server_ready` server that ignores SIGTERM, its caller cancelled during
+    the graceful wait. The kill, the pipes and the status all still
+    happen; nothing else would."""
+    import asyncio
+
+    jobs, job_id, job = await _term_ignoring_server_ready_job(tmp_path, monkeypatch)
+    process = job.process
+    caller = asyncio.create_task(jobs.cancel_job(job_id))
+    await asyncio.sleep(0.3)  # inside the 2 s graceful wait
+    assert not caller.done()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert await asyncio.wait_for(process.wait(), 10) is not None
+    assert job.status == "failed"
+    assert process._transport.get_pipe_transport(1) is None or (
+        process._transport.get_pipe_transport(1).is_closing()
+    )
+    _grandchild_gone(tmp_path, "a cancelled cancel_job")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_cancel_job_disarms_the_deadline_only_after_the_kill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 11: the deadline is a backstop for the kill. If the kill does
+    not happen -- here, it raises -- the deadline stays armed."""
+    from pmcp.child_output import kill_tree
+    from pmcp.manifest import installer
+
+    jobs, job_id, job = await _term_ignoring_server_ready_job(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def failing_once(process: Any, *, terminate: bool = False) -> None:
+        calls["n"] += 1
+        if not terminate:
+            raise RuntimeError("the kill failed")
+        kill_tree(process, terminate=True)
+
+    monkeypatch.setattr(installer, "kill_tree", failing_once)
+    with pytest.raises(RuntimeError):
+        await jobs.cancel_job(job_id)
+    assert not job._handoff_deadline.cancelled(), "the backstop was disarmed"
+    monkeypatch.undo()
+    kill_tree(job.process)
+    job._handoff_deadline.cancel()
+    _grandchild_gone(tmp_path, "the backstop test's cleanup")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipes")
+def test_a_closed_stdout_does_not_kill_the_installer(tmp_path: Path) -> None:
+    """Round 11, claude N-A: `pmcp upgrade | head`. Once the reader goes
+    away, the echo stops, the output is drained, the installer runs to its
+    own end, its exit status is returned, and nothing prints a traceback."""
+    child = tmp_path / "installer.py"
+    done = tmp_path / "done"
+    child.write_text(
+        "import sys, time\n"
+        "for i in range(200):\n"
+        "    print(f'line {i}', flush=True)\n"
+        "    time.sleep(0.005)\n"
+        f"open({str(done)!r}, 'w').close()\n"
+        "sys.exit(7)\n"
+    )
+    harness = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "from pmcp.display import DisplaySafeStream\n"
+            "sys.stdout = DisplaySafeStream(sys.stdout)\n"
+            "from pmcp.child_output import run_echoed\n"
+            f"rc = run_echoed([sys.executable, {str(child)!r}])\n"
+            "sys.stderr.write(f'rc={rc}\\n')\n",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert harness.stdout is not None
+    harness.stdout.readline()  # one line, then the reader goes away (`head -1`)
+    harness.stdout.close()
+    err = harness.stderr.read() if harness.stderr else b""
+    assert harness.wait(timeout=30) == 0, err
+    assert done.exists(), "the installer was killed mid-install"
+    assert b"rc=7" in err, err
+    assert b"Traceback" not in err and b"BrokenPipe" not in err, err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_adopting_a_name_that_is_connected_tears_the_old_client_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 11 (claude): adoption under a name already connected -- a lazy
+    connect of the same server during a long install -- tears the old
+    client down instead of overwriting it, so its process is not orphaned."""
+    import asyncio
+
+    from pmcp.child_output import detached
+    from pmcp.client.manager import ClientManager
+    from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+
+    mgr = ClientManager()
+
+    async def initialize(managed: Any) -> None:
+        return None
+
+    async def no_capabilities(managed: Any) -> tuple[int, int, int]:
+        return 0, 0, 0
+
+    monkeypatch.setattr(mgr, "_send_initialize", initialize)
+    monkeypatch.setattr(mgr, "_index_capabilities", no_capabilities)
+    config = ResolvedServerConfig(
+        name="memory",
+        source="project",
+        config=LocalMcpServerConfig(
+            command=sys.executable, args=["-c", "import time; time.sleep(60)"]
+        ),
+    )
+
+    async def spawn() -> Any:
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **detached(),
+        )
+
+    first, second = await spawn(), await spawn()
+    try:
+        await mgr.adopt_process("memory", first, config)
+        await mgr.adopt_process("memory", second, config)
+        assert await asyncio.wait_for(first.wait(), 10) is not None, "orphaned"
+        assert mgr._clients["memory"].process is second
+    finally:
+        await mgr.disconnect_all()
+        for task in list(mgr._background_tasks):
+            task.cancel()
+        for process in (first, second):
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
