@@ -2412,3 +2412,78 @@ async def test_a_failed_handoff_and_a_cancelled_job_cancel_the_deadline(
         from pmcp.child_output import kill_tree
 
         kill_tree(job.process)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_a_leader_that_exits_during_the_handoff_leaves_no_grandchild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 10: the leader passes the handoff's dead-check, then exits
+    before ClientManager registers it (`adopt_process` refuses: already
+    exited). Nothing tore its group down, so the handoff's failure arm
+    kills it -- whatever the leader's `returncode` says."""
+    import asyncio
+    import signal
+
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+
+    jobs, job_id, job = await _server_ready_job(tmp_path, monkeypatch, deadline=60)
+    mgr = _adopting_manager(monkeypatch, hold=0.0, fail=False)
+
+    async def refusing_adopt(name: str, process: Any, config: Any) -> None:
+        os.kill(process.pid, signal.SIGKILL)  # the leader exits mid-handoff
+        while process.returncode is None:
+            await asyncio.sleep(0.02)
+        raise RuntimeError(f"Process for {name} has already exited")
+
+    monkeypatch.setattr(mgr, "adopt_process", refusing_adopt)
+    tools = GatewayTools(client_manager=mgr, policy_manager=PolicyManager())
+    result = await tools._finalize_server_ready(job, job_id, 0.0)
+    assert result.status == "failed"
+    _grandchild_gone(tmp_path, "a leader that exited during the handoff")
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").exists(), reason="Linux /proc")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("teardown", ["graceful", "synchronous"])
+async def test_a_teardown_closes_a_flooded_unread_pipe(teardown: str) -> None:
+    """Round 10, codex F001, at each shared teardown helper: a child floods
+    stdout that nobody reads, so asyncio pauses the pipe and never sees its
+    end. The teardown closes it -- no descriptor waits for the garbage
+    collector (automatic collection is off here)."""
+    import asyncio
+    import gc
+
+    from pmcp.child_output import detached, track
+    from pmcp.client import manager
+
+    gc.collect()
+    gc.disable()
+    try:
+        baseline = _open_fds()
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import sys\nwhile True:\n    sys.stdout.write('o' * 65536)\n    sys.stdout.flush()",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            **detached(),
+        )
+        track(process)
+        await asyncio.sleep(0.5)  # the unread pipe fills; asyncio pauses it
+        if teardown == "graceful":
+            await manager._terminate_process_tree(
+                process, "flood", group_pgid=process.pid
+            )
+        else:
+            manager._kill_process_tree_now(process, group_pgid=process.pid)
+            await asyncio.wait_for(process.wait(), 10)
+        deadline = asyncio.get_running_loop().time() + 5
+        while _open_fds() > baseline and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+        assert _open_fds() <= baseline, (_open_fds(), baseline)
+    finally:
+        gc.enable()

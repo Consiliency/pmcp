@@ -6112,12 +6112,11 @@ class GatewayTools:
             )
 
         except asyncio.CancelledError:
-            # ClientManager killed what it held (its own cancellation arms);
-            # the job records the end rather than staying `adopting`.
+            # ClientManager's two cancellation arms (before the lock, and
+            # after registration) kill the process synchronously; the job
+            # records the end rather than staying `adopting`.
             job.status = "failed"
             job.error = "Handoff cancelled"
-            if process.returncode is None:
-                kill_tree(process)
             release(process)
             raise
         except Exception as e:
@@ -6127,10 +6126,11 @@ class GatewayTools:
             )
             job.status = "failed"
             job.error = f"Handoff failed: {exception_text(e)}"
-            # Exactly one owner kills it (round 10): ClientManager when it had
-            # registered the client (its cleanup waited for the exit), else
-            # this path -- a refusal before registration leaves it running.
-            if process is not None and process.returncode is None:
+            # The group, unconditionally (round 10): a refusal before
+            # registration -- the leader exited during the handoff -- leaves
+            # its descendants to this path alone; after ClientManager's own
+            # teardown the group is empty and forgotten, so this only probes.
+            if process is not None:
                 kill_tree(process)  # its whole group (round 7)
             release(process)
             job.process = None

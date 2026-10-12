@@ -671,6 +671,9 @@ def _kill_process_tree_now(
     -- and the group through the retained, checked id once it is reaped.
     """
     kill_process_tree_now(process, group_pgid=group_pgid)
+    # And its pipes, now: every teardown that drops a process closes them
+    # (round 10, codex F001).
+    release(process)
 
 
 async def _terminate_process_tree(
@@ -690,143 +693,148 @@ async def _terminate_process_tree(
     (e.g. an adopted install-time process) or the group is already gone, so this
     never accidentally signals an unrelated group such as the gateway's own.
     """
-    if _child_output._windows():
-        # Windows first (round 8, codex F002 = gemini F001 = grok F001): the
-        # child's Job Object is terminated -- and its handle released --
-        # whether or not the leader is still alive; a leader that exited
-        # first must not leave its descendants (or the handle) behind. No
-        # job: the child alone.
-        kill_process_tree_now(process)
-        if process is not None and process.returncode is None:
-            try:
-                await bounded_wait(process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning(f"[{name}] Process PID={process.pid} did not exit")
-        return
-    if process is None or not leader_reserved(process):
-        # Already reaped (asked of the kernel, not only `returncode`: round 7,
-        # claude N-B): a grandchild may still hold the group (codex round 5).
-        # Kill it through the id retained at spawn, never the pid, and only
-        # while it is still trusted for this process (round 8, claude N-A).
-        _kill_retained_group(group_pgid, owner=process)
-        return
-    retained_pgid = group_pgid if _process_groups_supported() else None
-
-    def _signal(kill: bool) -> None:
-        # Process-group signalling is POSIX-only. On Windows os.getpgid/os.killpg
-        # (and signal.SIGKILL) don't exist, so fall back to the cross-platform
-        # process.terminate()/kill() — preserving the pre-process-group behavior.
-        # (Windows never reaches here: the job is terminated at entry, round 8.)
-        # The one kill rule (round 7, claude N-B): the group is signalled
-        # directly only while the leader still reserves its id -- an await
-        # precedes this call, and the leader may have been reaped in it.
-        if not leader_reserved(process):
+    try:
+        if _child_output._windows():
+            # Windows first (round 8, codex F002 = gemini F001 = grok F001): the
+            # child's Job Object is terminated -- and its handle released --
+            # whether or not the leader is still alive; a leader that exited
+            # first must not leave its descendants (or the handle) behind. No
+            # job: the child alone.
+            kill_process_tree_now(process)
+            if process is not None and process.returncode is None:
+                try:
+                    await bounded_wait(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{name}] Process PID={process.pid} did not exit")
+            return
+        if process is None or not leader_reserved(process):
+            # Already reaped (asked of the kernel, not only `returncode`: round 7,
+            # claude N-B): a grandchild may still hold the group (codex round 5).
+            # Kill it through the id retained at spawn, never the pid, and only
+            # while it is still trusted for this process (round 8, claude N-A).
             _kill_retained_group(group_pgid, owner=process)
             return
-        pid = process.pid
-        pgid: int | None = None
-        if isinstance(pid, int) and hasattr(os, "getpgid"):
-            try:
-                pgid = os.getpgid(pid)
-            except (ProcessLookupError, PermissionError, OSError):
-                pgid = None
-        # Only signal the group if this process leads it; otherwise signalling
-        # its group could hit unrelated processes (including the gateway, for an
-        # adopted process that was not given its own session).
-        if pgid is not None and pgid == pid and hasattr(os, "killpg"):
-            try:
-                os.killpg(pgid, signal.SIGKILL if kill else signal.SIGTERM)
-                return
-            except (ProcessLookupError, PermissionError):
-                pass
-        try:
-            if kill:
-                process.kill()
-            else:
-                process.terminate()
-        except ProcessLookupError:
-            pass
+        retained_pgid = group_pgid if _process_groups_supported() else None
 
-    # Cache the process group up front: once the leader exits, os.getpgid(pid)
-    # fails, so we could no longer find the group to escalate against. Only set
-    # when this process leads its own group (POSIX, start_new_session=True).
-    group_pgid = retained_pgid
-    pid = process.pid
-    if (
-        group_pgid is None
-        and isinstance(pid, int)
-        and hasattr(os, "getpgid")
-        and hasattr(os, "killpg")
-    ):
-        try:
-            if os.getpgid(pid) == pid:
-                group_pgid = pid
-        except (ProcessLookupError, PermissionError, OSError):
-            group_pgid = None
-    # The leader is reserved (checked at entry): a group it leads is
-    # verified now, and trusted for it until observed empty (round 8,
-    # claude N-A). An id that is not the leader's own group is never used.
-    if group_pgid is not None:
-        try:
-            if os.getpgid(pid) == group_pgid:
-                trust_group(process, group_pgid)
-            else:
-                group_pgid = None
-        except (ProcessLookupError, PermissionError, OSError, AttributeError):
-            pass
-
-    def _group_alive() -> bool:
-        # A probe of the trusted group; the first that finds it empty
-        # forgets the id for good (round 8, claude N-A).
-        return observe_group(group_pgid, process)
-
-    _signal(kill=False)
-    try:
-        try:
-            await bounded_wait(process.wait(), timeout=5.0)
-            leader_exited = True
-        except asyncio.TimeoutError:
-            leader_exited = False
-
-        # If the leader is still alive, SIGKILL it (and, when it leads a group, the
-        # whole group). The leader exiting is NOT sufficient: a grandchild (e.g. a
-        # SIGTERM-ignoring browser) can outlive the leader inside the group and keep
-        # the profile SingletonLock — so we still escalate to a group SIGKILL below.
-        if not leader_exited:
-            _signal(kill=True)
-            try:
-                await bounded_wait(process.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"[{name}] Process PID={process.pid} did not exit after SIGKILL "
-                    "(possible D-state / uninterruptible I/O wait)"
-                )
-
-        if _group_alive():
-            if leader_reserved(process):
-                try:
-                    os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-            else:
-                # The leader is reaped: the id is signalled only through the
-                # retained-group checks, so a reused pid is never reached.
+        def _signal(kill: bool) -> None:
+            # Process-group signalling is POSIX-only. On Windows os.getpgid/os.killpg
+            # (and signal.SIGKILL) don't exist, so fall back to the cross-platform
+            # process.terminate()/kill() — preserving the pre-process-group behavior.
+            # (Windows never reaches here: the job is terminated at entry, round 8.)
+            # The one kill rule (round 7, claude N-B): the group is signalled
+            # directly only while the leader still reserves its id -- an await
+            # precedes this call, and the leader may have been reaped in it.
+            if not leader_reserved(process):
                 _kill_retained_group(group_pgid, owner=process)
-            for _ in range(30):  # up to ~3s for the OS to reap the group
-                if not _group_alive():
-                    break
-                await asyncio.sleep(0.1)
-            else:
-                logger.warning(
-                    f"[{name}] process group {group_pgid} survived SIGKILL "
-                    "(possible orphaned grandchild / D-state)"
-                )
-    except asyncio.CancelledError:
-        # Whoever cancelled this wait -- a caller, or loop shutdown cancelling
-        # every task -- the tree is SIGKILLed synchronously before the
-        # cancellation propagates (Consiliency/pmcp#324).
-        _kill_process_tree_now(process, group_pgid=group_pgid)
-        raise
+                return
+            pid = process.pid
+            pgid: int | None = None
+            if isinstance(pid, int) and hasattr(os, "getpgid"):
+                try:
+                    pgid = os.getpgid(pid)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pgid = None
+            # Only signal the group if this process leads it; otherwise signalling
+            # its group could hit unrelated processes (including the gateway, for an
+            # adopted process that was not given its own session).
+            if pgid is not None and pgid == pid and hasattr(os, "killpg"):
+                try:
+                    os.killpg(pgid, signal.SIGKILL if kill else signal.SIGTERM)
+                    return
+                except (ProcessLookupError, PermissionError):
+                    pass
+            try:
+                if kill:
+                    process.kill()
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                pass
+
+        # Cache the process group up front: once the leader exits, os.getpgid(pid)
+        # fails, so we could no longer find the group to escalate against. Only set
+        # when this process leads its own group (POSIX, start_new_session=True).
+        group_pgid = retained_pgid
+        pid = process.pid
+        if (
+            group_pgid is None
+            and isinstance(pid, int)
+            and hasattr(os, "getpgid")
+            and hasattr(os, "killpg")
+        ):
+            try:
+                if os.getpgid(pid) == pid:
+                    group_pgid = pid
+            except (ProcessLookupError, PermissionError, OSError):
+                group_pgid = None
+        # The leader is reserved (checked at entry): a group it leads is
+        # verified now, and trusted for it until observed empty (round 8,
+        # claude N-A). An id that is not the leader's own group is never used.
+        if group_pgid is not None:
+            try:
+                if os.getpgid(pid) == group_pgid:
+                    trust_group(process, group_pgid)
+                else:
+                    group_pgid = None
+            except (ProcessLookupError, PermissionError, OSError, AttributeError):
+                pass
+
+        def _group_alive() -> bool:
+            # A probe of the trusted group; the first that finds it empty
+            # forgets the id for good (round 8, claude N-A).
+            return observe_group(group_pgid, process)
+
+        _signal(kill=False)
+        try:
+            try:
+                await bounded_wait(process.wait(), timeout=5.0)
+                leader_exited = True
+            except asyncio.TimeoutError:
+                leader_exited = False
+
+            # If the leader is still alive, SIGKILL it (and, when it leads a group, the
+            # whole group). The leader exiting is NOT sufficient: a grandchild (e.g. a
+            # SIGTERM-ignoring browser) can outlive the leader inside the group and keep
+            # the profile SingletonLock — so we still escalate to a group SIGKILL below.
+            if not leader_exited:
+                _signal(kill=True)
+                try:
+                    await bounded_wait(process.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[{name}] Process PID={process.pid} did not exit after SIGKILL "
+                        "(possible D-state / uninterruptible I/O wait)"
+                    )
+
+            if _group_alive():
+                if leader_reserved(process):
+                    try:
+                        os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+                else:
+                    # The leader is reaped: the id is signalled only through the
+                    # retained-group checks, so a reused pid is never reached.
+                    _kill_retained_group(group_pgid, owner=process)
+                for _ in range(30):  # up to ~3s for the OS to reap the group
+                    if not _group_alive():
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    logger.warning(
+                        f"[{name}] process group {group_pgid} survived SIGKILL "
+                        "(possible orphaned grandchild / D-state)"
+                    )
+        except asyncio.CancelledError:
+            # Whoever cancelled this wait -- a caller, or loop shutdown cancelling
+            # every task -- the tree is SIGKILLed synchronously before the
+            # cancellation propagates (Consiliency/pmcp#324).
+            _kill_process_tree_now(process, group_pgid=group_pgid)
+            raise
+    finally:
+        # Every exit drops the process with its pipes closed (round
+        # 10, codex F001): every caller tears down through here.
+        release(process)
 
 
 # Heartbeat thresholds for health monitoring
