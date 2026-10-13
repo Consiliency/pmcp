@@ -84,7 +84,20 @@ _HOSTILE = textwrap.dedent(
     """
 )
 
-BEHAVIOURS = ("hold", "early", "flood", "cancel")
+BEHAVIOURS = ("hold", "early", "flood", "cancel", "spawn-cancel")
+
+#: The owners that spawn asynchronously -- the `spawn-cancel` dimension
+#: cancels them while the spawn still connects its pipes (round 13).
+SPAWN_CANCELLABLE = (
+    "check_cli",
+    "get_cli_help",
+    "install_server (timeout)",
+    "verify_installation",
+    "update probe",
+    "ClientManager server",
+    "install job (cancelled)",
+    "refresh child",
+)  # `install_server (cancelled)` spawns in its own inner task: same site
 
 #: The owners whose teardown awaits the child's exit -- the `cancel`
 #: dimension cancels that await. The rest kill synchronously (`owned()`,
@@ -102,6 +115,7 @@ CANCELLABLE = (
 
 
 def _script(tmp_path: Path, mode: str) -> tuple[Path, Path]:
+    mode = "hold" if mode == "spawn-cancel" else mode
     piddir = tmp_path / "pids"
     piddir.mkdir()
     script = tmp_path / "hostile.py"
@@ -172,6 +186,38 @@ def _cancel_every_exit_wait(mp: Any) -> None:
     mp.setattr(waits, "bounded_wait", cancelling)
     for module in (manager, installer, handlers, environment):
         mp.setattr(module, "bounded_wait", cancelling)
+
+
+def _slow_pipe_connect(mp: Any, piddir: Path) -> None:
+    """The `spawn-cancel` dimension (round 13, grok F001 = codex F001): every
+    spawn -- `asyncio.create_subprocess_exec` and anyio's (the MCP SDK's)
+    alike, both through `loop.subprocess_exec` -- returns only after the
+    child has forked and a second has passed, as a slow pipe connect would;
+    cancelled meanwhile, it kills the leader's pid alone, as CPython's
+    `_make_subprocess_transport` does."""
+    import signal
+
+    loop_type = type(asyncio.get_running_loop())
+    real = loop_type.subprocess_exec
+
+    async def slow(self: Any, *args: Any, **kwargs: Any) -> Any:
+        transport, protocol = await real(self, *args, **kwargs)
+        try:
+            while len(list(piddir.iterdir())) < 2:
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pid = transport.get_pid()
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            transport.close()
+            raise
+        return transport, protocol
+
+    mp.setattr(loop_type, "subprocess_exec", slow)
 
 
 async def _wait_started(piddir: Path, mode: str) -> None:
@@ -413,6 +459,23 @@ async def _handoff(script: Path, piddir: Path, mode: str, mp: Any, how: str) -> 
             task.cancel()
 
 
+async def _handoff_at_shutdown(script: Path, piddir: Path, mode: str, mp: Any) -> None:
+    """A started server waiting to be adopted when the gateway's loop shuts
+    down (round 13, claude F001): the loop cancels the handoff deadline,
+    whose `finally` kills the server -- nothing else owns it."""
+    from pmcp.manifest import installer
+
+    mp.setattr(installer, "HANDOFF_DEADLINE_SECONDS", 600.0)
+    jobs = installer.JobManager()
+    job_id = await jobs.start_install(_server(script), "linux")
+    job = jobs._jobs[job_id]
+    await _until(lambda: job.status not in ("pending", "installing"), 15)
+    deadline = job._handoff_deadline
+    if deadline is not None:
+        deadline.cancel()  # what the loop's shutdown does to every task
+        await asyncio.gather(deadline, return_exceptions=True)
+
+
 def _handoff_owner(how: str) -> Callable[[Path, Path, str, Any], Awaitable[None]]:
     async def owner(script: Path, piddir: Path, mode: str, mp: Any) -> None:
         await _handoff(script, piddir, mode, mp, how)
@@ -525,6 +588,7 @@ OWNERS: dict[str, Callable[[Path, Path, str, Any], Awaitable[None]]] = {
     "handoff: adopted": _handoff_owner("adopted"),
     "handoff: adoption fails": _handoff_owner("fails"),
     "handoff: adoption straddles the deadline": _handoff_owner("straddle"),
+    "handoff: the gateway shuts down while server_ready": _handoff_at_shutdown,
     "run_captured (timeout)": _run_captured_timeout,
     "run_captured (Ctrl-C)": _ctrl_c("run_captured"),
     "run_echoed (Ctrl-C)": _ctrl_c("run_echoed"),
@@ -543,6 +607,8 @@ async def test_nothing_outlives_its_owner(
 
     if mode == "cancel" and owner not in CANCELLABLE:
         pytest.skip("no await in this owner's teardown to cancel")
+    if mode == "spawn-cancel" and owner not in SPAWN_CANCELLABLE:
+        pytest.skip("this owner does not spawn asynchronously")
     script, piddir = _script(tmp_path, mode)
     if mode == "cancel":
         _cancel_every_exit_wait(monkeypatch)
@@ -553,11 +619,22 @@ async def test_nothing_outlives_its_owner(
     baseline_fds = _fds()
     baseline_drains = set(_drains())
     try:
-        try:
-            await asyncio.wait_for(OWNERS[owner](script, piddir, mode, monkeypatch), 60)
-        except asyncio.CancelledError:
-            if mode != "cancel":
-                raise  # only the cancel dimension's own cancellations end here
+        if mode == "spawn-cancel":
+            _slow_pipe_connect(monkeypatch, piddir)
+            running = asyncio.ensure_future(
+                OWNERS[owner](script, piddir, "hold", monkeypatch)
+            )
+            await _until(lambda: len(list(piddir.iterdir())) >= 2, 15)
+            running.cancel()  # a shutdown, while the spawn connects its pipes
+            await asyncio.gather(running, return_exceptions=True)
+        else:
+            try:
+                await asyncio.wait_for(
+                    OWNERS[owner](script, piddir, mode, monkeypatch), 60
+                )
+            except asyncio.CancelledError:
+                if mode != "cancel":
+                    raise  # only the cancel dimension's own cancellations end here
         pids = [int(p.name) for p in piddir.iterdir()]
         assert pids, "the behaviour never started"
         assert await _until(lambda: not any(_alive(p) for p in pids), BOUND), (

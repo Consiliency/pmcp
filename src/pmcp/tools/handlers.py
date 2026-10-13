@@ -20,7 +20,7 @@ from typing import Any, Literal, cast, NamedTuple
 import anyio
 from mcp.types import Tool
 from pydantic import BaseModel
-from pmcp.child_output import detached, kill_tree, release, track
+from pmcp.child_output import detached, kill_tree, release, spawn_owned
 from pmcp.argument_errors import describe_value, exception_text, safe_exc_info
 from pmcp import __version__ as PMCP_VERSION
 from pmcp.auth import (
@@ -3545,17 +3545,18 @@ class GatewayTools:
         # (EC-PKGID-4): log the rendered, secret-safe argv at WARNING first, so
         # a spawn that raises still leaves the record.
         logger.warning(f"Running update probe: {_render_install_argv(command)}")
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            # stdin closed: an HTTP gateway's stdin may be the operator's
-            # terminal (Consiliency/pmcp#388 round 5).
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=child_process_env(base=env),
-            **detached(),
+        process = await spawn_owned(
+            lambda: asyncio.create_subprocess_exec(
+                *command,
+                # stdin closed: an HTTP gateway's stdin may be the operator's
+                # terminal (Consiliency/pmcp#388 round 5).
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=child_process_env(base=env),
+                **detached(),
+            )
         )
-        track(process)  # its Job Object on Windows
         # The spawn contract: `start_new_session=True` makes the probe a group
         # leader, so its pgid IS its pid -- not looked up, since a probe that
         # exits at once may already be reaped (Consiliency/pmcp#324, codex

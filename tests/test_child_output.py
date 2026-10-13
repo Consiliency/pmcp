@@ -2844,7 +2844,10 @@ async def test_a_shutdown_during_a_connect_spawn_kills_the_new_server(
         ),
     )
     try:
-        with pytest.raises(manager_mod._ManagerAbandoned):
+        # Refused at registration, or -- the sweep also cancels a connect task
+        # the reconnect is waiting on -- cancelled at the shielded spawn
+        # (round 13), whose own callback then kills the new server.
+        with pytest.raises((manager_mod._ManagerAbandoned, asyncio.CancelledError)):
             if path == "connect":
                 await mgr._connect_server(config)
             else:
@@ -2917,3 +2920,248 @@ def test_a_shared_broken_stdout_and_stderr_keep_the_installers_status(
     harness.stdout.close()
     assert harness.wait(timeout=30) == 7
     assert status.read_text() == "7"
+
+
+# --- round 13 ---------------------------------------------------------------------
+
+
+def _in_spawn_owned(call: ast.Call, parents: dict[ast.AST, ast.AST]) -> bool:
+    node: ast.AST | None = call
+    while node is not None:
+        parent = parents.get(node)
+        if (
+            isinstance(parent, ast.Call)
+            and isinstance(parent.func, ast.Name)
+            and parent.func.id == "spawn_owned"
+        ):
+            return True
+        node = parent
+    return False
+
+
+def test_every_async_spawn_goes_through_spawn_owned() -> None:
+    """Round 13 (grok F001 = codex F001): a spawn is never cancellable
+    between the child's creation and its ownership. Every
+    `create_subprocess_exec` in src/pmcp is the factory of a `spawn_owned`."""
+    problems = []
+    for path in sorted(SRC.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr
+                in ("create_subprocess_exec", "create_subprocess_shell")
+                and not _in_spawn_owned(node, parents)
+            ):
+                problems.append(f"{path.relative_to(SRC)}:{node.lineno}")
+    assert problems == []
+
+
+_FORKS_AT_ONCE = textwrap.dedent(
+    """
+    import os, subprocess, sys, time
+    out = sys.argv[1]
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    open(os.path.join(out, "grandchild"), "w").write(str(child.pid))
+    open(os.path.join(out, "leader"), "w").write(str(os.getpid()))
+    time.sleep(60)
+    """
+)
+
+
+def _slow_pipe_connect(monkeypatch: pytest.MonkeyPatch, out: Path) -> None:
+    """CPython's spawn as a cancellation sees it: the child runs (and forks)
+    while the spawn still awaits its pipe connections; cancelled there, only
+    the leader's pid is killed (`_make_subprocess_transport`)."""
+    import asyncio
+    import signal
+
+    real = asyncio.create_subprocess_exec
+
+    async def slow(*args: Any, **kwargs: Any) -> Any:
+        process = await real(*args, **kwargs)
+        try:
+            while not (out / "grandchild").exists():
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(1.0)  # still "connecting pipes"
+        except asyncio.CancelledError:
+            with contextlib_suppress_oserror():
+                os.kill(process.pid, signal.SIGKILL)  # the leader alone
+            raise
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", slow)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_a_shutdown_during_the_spawn_kills_what_the_child_forked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 13, grok F001 = codex F001: the connect is cancelled (as by a
+    shutdown) while the spawn awaits its pipes and the child has already
+    forked. The shielded spawn finishes; the child is owned and killed with
+    its group -- the grandchild included."""
+    import asyncio
+
+    from pmcp.child_output import spawn_owned, detached
+
+    _slow_pipe_connect(monkeypatch, tmp_path)
+    script = tmp_path / "forks.py"
+    script.write_text(_FORKS_AT_ONCE)
+    task = asyncio.create_task(
+        spawn_owned(
+            lambda: asyncio.create_subprocess_exec(
+                sys.executable,
+                str(script),
+                str(tmp_path),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **detached(),
+            )
+        )
+    )
+    limit = asyncio.get_running_loop().time() + 15
+    while not (tmp_path / "grandchild").exists():
+        assert asyncio.get_running_loop().time() < limit
+        await asyncio.sleep(0.02)
+    task.cancel()  # the caller, while the spawn is still connecting pipes
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The shielded spawn finishes connecting; the child is then owned.
+    await asyncio.sleep(1.5)
+    _grandchild_gone(tmp_path, "a spawn cancelled while connecting its pipes")
+
+
+_LOOP_ENDS_WHILE_SERVER_READY = textwrap.dedent(
+    """
+    import asyncio, os, sys
+    from pmcp.manifest import installer
+    from pmcp.manifest.loader import ServerConfig
+
+    out = sys.argv[1]
+    script = os.path.join(out, "install.py")
+    server = ServerConfig(
+        name="memory", description="memory", keywords=["memory"],
+        install={"linux": [sys.executable, script]},
+        command=sys.executable, args=[script], requires_api_key=False,
+    )
+
+    async def main():
+        jobs = installer.JobManager()
+        job_id = await jobs.start_install(server, "linux")
+        job = jobs._jobs[job_id]
+        while job.status != "server_ready":
+            await asyncio.sleep(0.02)
+        open(os.path.join(out, "server"), "w").write(str(job.process.pid))
+        # main returns: asyncio.run cancels every task left -- the deadline.
+
+    asyncio.run(main())
+    """
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_a_server_ready_job_is_killed_when_the_gateway_loop_shuts_down(
+    tmp_path: Path,
+) -> None:
+    """Round 13, claude F001 (claude's falsifier): a provisioned server
+    waiting to be adopted, and the loop ends (asyncio.run cancels the
+    handoff deadline). The deadline's `finally` kills the server and what
+    it started; nothing outlives the gateway."""
+    (tmp_path / "install.py").write_text(
+        _STARTED_THEN_EXITS.format(out=str(tmp_path)) + "import time\ntime.sleep(60)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", _LOOP_ENDS_WHILE_SERVER_READY, str(tmp_path)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=60,
+        start_new_session=True,
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
+    server = int((tmp_path / "server").read_text())
+    assert _gone(server), "the server outlived the gateway's loop"
+    _grandchild_gone(tmp_path, "a server_ready job at loop shutdown")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_the_gateway_shutdown_sweeps_every_install_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 13, claude F001 (belt and braces): `JobManager.shutdown()`, run
+    from the gateway's teardown, kills a job's server synchronously, ready
+    or not, and the gateway's `shutdown()` calls it."""
+    import asyncio
+
+    from pmcp.manifest import installer
+
+    jobs, job_id, job = await _server_ready_job(tmp_path, monkeypatch, deadline=60)
+    process = job.process
+    jobs.shutdown()
+    assert job.process is None and job.status == "failed"
+    assert await asyncio.wait_for(process.wait(), 10) is not None
+    _grandchild_gone(tmp_path, "the job manager's shutdown sweep")
+
+    swept: list[bool] = []
+    monkeypatch.setattr(
+        installer.JobManager, "shutdown", lambda self: swept.append(True)
+    )
+    from pmcp.server import GatewayServer
+
+    gateway = GatewayServer.__new__(GatewayServer)
+    gateway._listen_handler = type("L", (), {"close": lambda self: None})()
+    gateway._scoped_advisor_audit = None
+
+    class _Manager:
+        async def disconnect_all(self) -> None:
+            return None
+
+        def abandon_all_now(self) -> None:
+            return None
+
+    gateway._client_manager = _Manager()
+    await gateway.shutdown()
+    assert swept == [True]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_a_refused_registration_closes_the_new_process_pipes() -> None:
+    """Round 13 (claude nit): `_register_or_kill`'s refusal kills the new
+    process and closes its pipes at once."""
+    import asyncio
+
+    from pmcp.child_output import detached
+    from pmcp.client import manager as manager_mod
+    from pmcp.client.manager import ClientManager, ManagedClient
+    from pmcp.types import ServerStatus, ServerStatusEnum
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(60)",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        **detached(),
+    )
+    mgr = ClientManager()
+    mgr.abandon_all_now()
+    status = ServerStatus(name="srv", status=ServerStatusEnum.CONNECTING, tool_count=0)
+    managed = ManagedClient(
+        config=None, process=process, status=status, group_pgid=process.pid
+    )
+    with pytest.raises(manager_mod._ManagerAbandoned):
+        mgr._register_or_kill("srv", managed)
+    for fd in (0, 1, 2):
+        pipe = process._transport.get_pipe_transport(fd)
+        assert pipe is None or pipe.is_closing(), fd
+    assert await asyncio.wait_for(process.wait(), 10) is not None

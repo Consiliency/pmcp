@@ -22,7 +22,12 @@ import anyio
 import yaml
 
 from pmcp.argument_errors import exception_text
-from pmcp.child_output import drained_errlog, signal_retained_group, trust_group
+from pmcp.child_output import (
+    drained_errlog,
+    signal_retained_group,
+    spawn_owned,
+    trust_group,
+)
 from pmcp.env_store import child_process_env
 from pmcp.manifest.loader import (
     credential_lookup_keys,
@@ -68,7 +73,9 @@ def _capture_sdk_spawns() -> None:
         return
 
     async def capturing(*args: Any, **kwargs: Any) -> Any:
-        process = await original(*args, **kwargs)
+        # Through the one spawn rule (round 13): a cancel during the SDK's
+        # spawn kills the child with its group instead of the leader alone.
+        process = await spawn_owned(lambda: original(*args, **kwargs))
         sink = _SDK_CHILDREN.get()
         if sink is not None:
             sink.append(process)

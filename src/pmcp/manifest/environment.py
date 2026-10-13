@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from pmcp.child_output import detached, owned, track
+from pmcp.child_output import detached, owned, spawn_owned
 from pmcp.env_store import child_process_env
 from pmcp.waits import bounded_wait
 import logging
@@ -79,15 +79,16 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
         # Run version check command
         # Detached, stdin closed: a check command an overlay names cannot
         # reach the operator's terminal (Consiliency/pmcp#388 round 5).
-        process = await asyncio.create_subprocess_exec(
-            *check_command,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=child_process_env(),
-            **detached(),
+        process = await spawn_owned(
+            lambda: asyncio.create_subprocess_exec(
+                *check_command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=child_process_env(),
+                **detached(),
+            )
         )
-        track(process)  # its Job Object on Windows
         # Owned: killed with everything it started on every exit -- a timeout,
         # a cancellation, or a descendant left behind (round 8, codex F003).
         with owned(process):
@@ -115,15 +116,16 @@ async def get_cli_help(
 ) -> str | None:
     """Get help output for a CLI."""
     try:
-        process = await asyncio.create_subprocess_exec(
-            *help_command,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=child_process_env(),
-            **detached(),
+        process = await spawn_owned(
+            lambda: asyncio.create_subprocess_exec(
+                *help_command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=child_process_env(),
+                **detached(),
+            )
         )
-        track(process)  # its Job Object on Windows
         with owned(process):
             stdout, stderr = await bounded_wait(process.communicate(), timeout=10.0)
 

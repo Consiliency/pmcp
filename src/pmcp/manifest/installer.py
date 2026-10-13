@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from pmcp.child_output import detached, kill_tree, owned, release, track
+from pmcp.child_output import detached, kill_tree, owned, release, spawn_owned
 from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.env_store import (
     credential_value,
@@ -232,16 +232,17 @@ class JobManager:
             # Start subprocess with stdin/stdout/stderr pipes
             # stdin is needed for JSON-RPC communication after server starts
             # stderr is separate so ClientManager can read it independently
-            process = await asyncio.create_subprocess_exec(
-                *install_cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=build_install_child_env(server_config, project_root),
-                # No controlling terminal (Consiliency/pmcp#388 round 5).
-                **detached(),
+            process = await spawn_owned(
+                lambda: asyncio.create_subprocess_exec(
+                    *install_cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=build_install_child_env(server_config, project_root),
+                    # No controlling terminal (Consiliency/pmcp#388 round 5).
+                    **detached(),
+                )
             )
-            track(process)  # its Job Object on Windows
             job.process = process
             job.status = "installing"
             job.last_heartbeat = time.time()
@@ -517,17 +518,35 @@ class JobManager:
         The adoption cancels this."""
 
         async def expire() -> None:
-            await asyncio.sleep(HANDOFF_DEADLINE_SECONDS)
-            if job.status == "server_ready" and job.process is not None:
-                logger.warning(
-                    f"Install job {job.id}: server was not adopted within "
-                    f"{HANDOFF_DEADLINE_SECONDS:.0f}s; killing it"
-                )
-                kill_tree(job.process)
-                release(job.process)  # a flooded, paused pipe too (round 10)
-                job.process = None
-                job.status = "failed"
-                job.error = "Server was not adopted in time"
+            expired = False
+            try:
+                await asyncio.sleep(HANDOFF_DEADLINE_SECONDS)
+                expired = True
+            finally:
+                # On expiry -- and on any other end of this task while the
+                # job still owns its server: a cancellation at gateway
+                # shutdown (round 13, claude F001). The handoff and
+                # `cancel_job` take the process from the job before they
+                # cancel this, so for them there is nothing left here.
+                if job.status == "server_ready" and job.process is not None:
+                    logger.warning(
+                        f"Install job {job.id}: server was not adopted"
+                        + (
+                            f" within {HANDOFF_DEADLINE_SECONDS:.0f}s"
+                            if expired
+                            else " before shutdown"
+                        )
+                        + "; killing it"
+                    )
+                    kill_tree(job.process)
+                    release(job.process)  # a flooded, paused pipe too (round 10)
+                    job.process = None
+                    job.status = "failed"
+                    job.error = (
+                        "Server was not adopted in time"
+                        if expired
+                        else "The gateway shut down before the server was adopted"
+                    )
 
         with contextlib.suppress(RuntimeError):  # no running loop
             job._handoff_deadline = asyncio.create_task(
@@ -649,6 +668,26 @@ class JobManager:
                 job._monitor_task.cancel()
 
         return True
+
+    def shutdown(self) -> None:
+        """Kill every job's process with its group, synchronously, and stop
+        the job's tasks: an install in progress, or a started server waiting
+        to be adopted (round 13, claude F001: ClientManager's shutdown sweep
+        did not reach them, and a cancelled handoff deadline left the server
+        running past the gateway). Called from the gateway's teardown, on
+        every exit. Never raises."""
+        for job in list(self._jobs.values()):
+            process, job.process = job.process, None
+            if process is not None:
+                with contextlib.suppress(Exception):
+                    kill_tree(process)
+                    release(process)
+                if job.status not in ("complete", "adopting", "failed", "timeout"):
+                    job.status = "failed"
+                    job.error = "The gateway shut down"
+            for task in (job._handoff_deadline, job._monitor_task):
+                if task is not None:
+                    task.cancel()
 
     def cleanup_old_jobs(self, max_age: float = 3600) -> int:
         """Remove jobs older than max_age seconds."""
@@ -788,15 +827,16 @@ async def install_server(
             f"Installing {_operator_safe(server_config.name)}: "
             f"{_render_install_argv(install_cmd)}"
         )
-        process = await asyncio.create_subprocess_exec(
-            *install_cmd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=build_install_child_env(server_config, project_root),
-            **detached(),
+        process = await spawn_owned(
+            lambda: asyncio.create_subprocess_exec(
+                *install_cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=build_install_child_env(server_config, project_root),
+                **detached(),
+            )
         )
-        track(process)  # its Job Object on Windows
 
         # Owned: killed with everything it started on every exit, a
         # cancelled caller included (round 8, codex F003).
@@ -853,15 +893,16 @@ async def verify_installation(
             f"Verifying installation of {_operator_safe(server_config.name)}: "
             f"{_render_install_argv(verify_cmd)}"
         )
-        process = await asyncio.create_subprocess_exec(
-            *verify_cmd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=build_install_child_env(server_config, project_root),
-            **detached(),
+        process = await spawn_owned(
+            lambda: asyncio.create_subprocess_exec(
+                *verify_cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=build_install_child_env(server_config, project_root),
+                **detached(),
+            )
         )
-        track(process)  # its Job Object on Windows
 
         # Owned: a verification that times out is killed with everything it
         # started, not left running (round 8, codex F003).

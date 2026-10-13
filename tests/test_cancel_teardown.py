@@ -2230,6 +2230,12 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "re-raise",
     ),
+    ("child_output.py", "spawn_owned", "reraises"): (
+        1,
+        "hands the still-running shielded spawn to a done-callback that "
+        "kills the child with its group and closes its pipes, then re-raises "
+        "(Consiliency/pmcp#388 round 13)",
+    ),
     ("tools/handlers.py", "GatewayTools._finalize_server_ready", "reraises"): (
         1,
         "records the cancelled handoff, kills only a process nothing tore "

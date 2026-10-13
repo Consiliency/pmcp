@@ -24,7 +24,7 @@ import subprocess
 import sys
 import threading
 import weakref
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from typing import IO, Any, TextIO
 
 from pmcp.display import display_safe
@@ -728,6 +728,55 @@ async def drained_errlog(label: str, logger: logging.Logger) -> AsyncIterator[Te
                 os.close(stop_write)
             with anyio.CancelScope(shield=True), contextlib.suppress(Exception):
                 await anyio.to_thread.run_sync(thread.join, _DRAIN_JOIN_SECONDS)
+
+
+async def spawn_owned(start: Callable[[], Awaitable[Any]]) -> Any:
+    """Spawn a child so that no cancellation can land between its creation
+    and its ownership (Consiliency/pmcp#388 round 13, grok F001 = codex
+    F001). Every async spawn in ``src/pmcp`` goes through here (the spawn
+    guard in ``tests/test_child_output.py`` pins it).
+
+    ``start`` makes the child (``asyncio.create_subprocess_exec``, or the
+    MCP SDK's factory). The child already runs while that awaits its pipes;
+    cancelled there, asyncio kills the leader's pid alone, and a grandchild
+    it forked meanwhile survives with no owner. So the spawn runs shielded:
+    a caller's cancellation does not reach it. If the caller was cancelled
+    meanwhile, the child is owned the moment it exists -- :func:`track`ed
+    (its Job Object on Windows, its group trusted on POSIX), killed with
+    everything it started, its pipes closed -- and the cancellation
+    propagates. Otherwise it is tracked and returned.
+
+    Not covered: a loop being torn down cancels the shielded spawn itself,
+    and asyncio then kills the leader alone; the gateway abandons its
+    servers before that point."""
+    spawning = asyncio.ensure_future(start())
+    try:
+        process = await asyncio.shield(spawning)
+    except asyncio.CancelledError:
+        spawning.add_done_callback(_own_abandoned_spawn)
+        raise
+    track(process)
+    return process
+
+
+def _own_abandoned_spawn(spawning: asyncio.Future[Any]) -> None:
+    """The spawn whose caller was cancelled has finished: kill what it made
+    with its group, close its pipes. Never raises."""
+    if spawning.cancelled() or spawning.exception() is not None:
+        return
+    process = _unwrapped(spawning.result())
+    with contextlib.suppress(Exception):
+        track(process)
+        kill_tree(process)  # the group first, while the leader reserves it
+        release(process)
+
+
+def _unwrapped(process: Any) -> Any:
+    """The asyncio child inside an anyio ``Process`` (the MCP SDK's spawn),
+    so it is killed by the one rule -- the group while the leader is
+    reserved -- not by its leader alone."""
+    inner = getattr(process, "_process", None)
+    return inner if _is_child(inner) else process
 
 
 def release(process: Any) -> None:

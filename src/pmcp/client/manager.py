@@ -30,6 +30,7 @@ from pydantic import ValidationError
 
 from pmcp import child_output as _child_output
 from pmcp.child_output import (
+    spawn_owned,
     detached,
     kill_process_tree_now,
     leader_reserved,
@@ -37,7 +38,6 @@ from pmcp.child_output import (
     process_groups_supported,
     release,
     signal_retained_group,
-    track,
     trust_group,
     watch_group,
 )
@@ -3247,21 +3247,22 @@ class ClientManager:
 
         # Spawn process (semaphore caps concurrent spawns to avoid FD exhaustion)
         async with self._spawn_semaphore:
-            process = await asyncio.create_subprocess_exec(
-                local_config.command,
-                *local_config.args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=local_config.cwd,
-                env=env,
-                limit=_stdio_read_limit(),
-                # New session/process group so we can reap the whole tree
-                # (e.g. browsers launched by the server) on disconnect, and
-                # no controlling terminal (`start_new_session=True` on POSIX).
-                **detached(),
+            process = await spawn_owned(
+                lambda: asyncio.create_subprocess_exec(
+                    local_config.command,
+                    *local_config.args,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=local_config.cwd,
+                    env=env,
+                    limit=_stdio_read_limit(),
+                    # New session/process group so we can reap the whole tree
+                    # (e.g. browsers launched by the server) on disconnect, and
+                    # no controlling terminal (`start_new_session=True` on POSIX).
+                    **detached(),
+                )
             )
-            track(process)  # its Job Object on Windows
 
         managed = ManagedClient(
             config=config,

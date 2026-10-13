@@ -1192,6 +1192,12 @@ class GatewayServer:
         except Exception as e:
             logger.error(f"Error during shutdown: {exception_text(e)}")
         finally:
+            # Every install job's process -- one running, or a started server
+            # waiting to be adopted -- dies with the gateway, synchronously
+            # and on every exit (Consiliency/pmcp#388 round 13, claude F001).
+            from pmcp.manifest.installer import get_job_manager
+
+            get_job_manager().shutdown()
             # Always release singleton lock
             release_singleton_lock()
             if self._scoped_advisor_audit is not None:
