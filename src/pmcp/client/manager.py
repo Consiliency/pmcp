@@ -30,6 +30,7 @@ from pydantic import ValidationError
 
 from pmcp import child_output as _child_output
 from pmcp.child_output import (
+    abandon_pending_spawns,
     spawn_owned,
     detached,
     kill_process_tree_now,
@@ -3377,6 +3378,9 @@ class ClientManager:
         already in flight (a `refresh` holding the lock) or queued behind
         one cannot spawn a server afterwards (`_connect_server`)."""
         self._abandoned = True
+        # Every spawn still in flight is owned and killed when it completes
+        # (Consiliency/pmcp#388 round 14).
+        abandon_pending_spawns()
         for name, managed in list(self._clients.items()):
             self._abandon_client_io(name, managed)
         self._cancel_background_tasks_now()

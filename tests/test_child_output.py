@@ -3165,3 +3165,211 @@ async def test_a_refused_registration_closes_the_new_process_pipes() -> None:
         pipe = process._transport.get_pipe_transport(fd)
         assert pipe is None or pipe.is_closing(), fd
     assert await asyncio.wait_for(process.wait(), 10) is not None
+
+
+# --- round 14 ---------------------------------------------------------------------
+
+_LOOP_ENDS_DURING_SPAWN = textwrap.dedent(
+    """
+    import asyncio, os, sys
+    import asyncio.base_subprocess as base
+    from pmcp.child_output import detached, spawn_owned
+
+    out, script = sys.argv[1], sys.argv[2]
+    grandchild = os.path.join(out, "grandchild")
+    real = base.BaseSubprocessTransport._connect_pipes
+
+    async def slow(self, waiter):
+        # CPython's own pipe connect, held: the child runs, and forks, while
+        # the spawn is still pending.
+        while not os.path.exists(grandchild):
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(3600)
+        await real(self, waiter)
+
+    base.BaseSubprocessTransport._connect_pipes = slow
+
+    async def main():
+        asyncio.ensure_future(
+            spawn_owned(
+                lambda: asyncio.create_subprocess_exec(
+                    sys.executable, script, out,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    **detached(),
+                )
+            )
+        )
+        while not os.path.exists(grandchild):
+            await asyncio.sleep(0.02)
+        # main returns with the spawn pending: asyncio.run cancels every task
+        # left, the spawn itself included -- CPython then kills the leader.
+
+    asyncio.run(main())
+    """
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_a_loop_that_ends_during_a_spawn_leaves_no_leader_and_no_grandchild(
+    tmp_path: Path,
+) -> None:
+    """Round 14, codex F001 (codex's falsifier): `asyncio.run` ends while a
+    spawn is still connecting its pipes, so it cancels the spawn itself and
+    CPython kills the leader alone. The spawn task records the child's pid
+    before that cancellation lands, and its group -- the grandchild -- is
+    killed too."""
+    script = tmp_path / "forks.py"
+    script.write_text(_FORKS_AT_ONCE)
+    done = subprocess.run(
+        [sys.executable, "-c", _LOOP_ENDS_DURING_SPAWN, str(tmp_path), str(script)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=60,
+        start_new_session=True,
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
+    leader = int((tmp_path / "leader").read_text())
+    assert _gone(leader), "the leader outlived the loop"
+    _grandchild_gone(tmp_path, "a spawn pending when the loop ended")
+
+
+_GATEWAY_HANGUP = textwrap.dedent(
+    """
+    import asyncio, os, signal, sys
+    from pmcp.cli import install_shutdown_signals
+    from pmcp.manifest import installer
+    from pmcp.manifest.loader import ServerConfig
+    from pmcp.server import GatewayServer
+
+    out = sys.argv[1]
+    script = os.path.join(out, "install.py")
+    server_config = ServerConfig(
+        name="memory", description="memory", keywords=["memory"],
+        install={"linux": [sys.executable, script]},
+        command=sys.executable, args=[script], requires_api_key=False,
+    )
+
+    async def main():
+        gateway = GatewayServer()
+        stop = asyncio.Event()
+        install_shutdown_signals(asyncio.get_running_loop(), lambda sig: stop.set())
+        jobs = installer.get_job_manager()
+        job_id = await jobs.start_install(server_config, "linux")
+        job = jobs._jobs[job_id]
+        while job.status != "server_ready":
+            await asyncio.sleep(0.02)
+        open(os.path.join(out, "server"), "w").write(str(job.process.pid))
+        open(os.path.join(out, "ready"), "w").close()
+        await stop.wait()  # the terminal closes: SIGHUP
+        await gateway.shutdown()
+        open(os.path.join(out, "shut"), "w").close()
+
+    asyncio.run(main())
+    """
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGHUP")
+def test_a_hangup_shuts_the_gateway_down_with_its_server_ready_job(
+    tmp_path: Path,
+) -> None:
+    """Round 14, claude N-A: SIGHUP (a closed terminal, a dropped SSH
+    session) goes through the gateway's shutdown like SIGTERM. A real
+    gateway with a `server_ready` job and its live server: after SIGHUP, the
+    gateway shuts down and the server and what it started are gone."""
+    import signal
+    import time
+
+    from pmcp.cli import shutdown_signals
+
+    assert signal.SIGHUP in shutdown_signals()
+    (tmp_path / "install.py").write_text(
+        _STARTED_THEN_EXITS.format(out=str(tmp_path)) + "import time\ntime.sleep(60)\n"
+    )
+    gateway = subprocess.Popen(
+        [sys.executable, "-c", _GATEWAY_HANGUP, str(tmp_path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        _wait_for(tmp_path / "ready", within=30)
+        server = int((tmp_path / "server").read_text())
+        assert not _gone(server, within=0.1)
+        gateway.send_signal(signal.SIGHUP)
+        _, err = gateway.communicate(timeout=60)
+        assert gateway.returncode == 0, err[-2000:]
+        assert (tmp_path / "shut").exists(), "the gateway did not shut down"
+        assert _gone(server), "the server outlived the gateway"
+        _grandchild_gone(tmp_path, "a server_ready job at SIGHUP")
+    finally:
+        if gateway.poll() is None:
+            gateway.kill()
+            gateway.wait()
+        time.sleep(0)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_the_gateway_shutdown_drains_a_spawn_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 14, codex F001: the gateway's shutdown does not return while a
+    spawn is still in flight -- an install whose child has forked but whose
+    pipes are not yet connected, so the job holds no process yet. The drain
+    waits for it, and it is killed with its group before shutdown returns
+    (before the loop's own cancellation could kill the leader alone)."""
+    import asyncio
+    import asyncio.base_subprocess as base
+
+    from pmcp.manifest import installer
+    from pmcp.server import GatewayServer
+
+    real = base.BaseSubprocessTransport._connect_pipes
+
+    async def slow(self: Any, waiter: Any) -> None:
+        while not (tmp_path / "grandchild").exists():
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(1.0)  # the pipes connect a second later
+        await real(self, waiter)
+
+    monkeypatch.setattr(base.BaseSubprocessTransport, "_connect_pipes", slow)
+    script = tmp_path / "forks.py"
+    script.write_text(_FORKS_AT_ONCE)
+    server = installer.ServerConfig(
+        name="memory",
+        description="memory",
+        keywords=["memory"],
+        install={"linux": [sys.executable, str(script), str(tmp_path)]},
+        command=sys.executable,
+        args=[str(script), str(tmp_path)],
+        requires_api_key=False,
+    )
+    install = asyncio.ensure_future(
+        installer.JobManager().start_install(server, "linux")
+    )
+    limit = asyncio.get_running_loop().time() + 15
+    while not (tmp_path / "grandchild").exists():
+        assert asyncio.get_running_loop().time() < limit
+        await asyncio.sleep(0.02)
+    gateway = GatewayServer.__new__(GatewayServer)
+    gateway._listen_handler = type("L", (), {"close": lambda self: None})()
+    gateway._scoped_advisor_audit = None
+
+    class _Manager:
+        async def disconnect_all(self) -> None:
+            return None
+
+        def abandon_all_now(self) -> None:
+            return None
+
+    gateway._client_manager = _Manager()
+    await gateway.shutdown()
+    # Checked at once: the drain, not later luck, must have killed them.
+    leader = int((tmp_path / "leader").read_text())
+    assert _gone(leader, within=0.5), "shutdown returned with the leader alive"
+    _grandchild_gone(tmp_path, "a spawn in flight at the gateway's shutdown")
+    await asyncio.gather(install, return_exceptions=True)

@@ -2616,15 +2616,7 @@ async def run_server(args: argparse.Namespace) -> None:
         logger.info(f"Received {sig.name}, shutting down...")
         shutdown_event.set()
 
-    loop = asyncio.get_event_loop()
-    if sys.platform != "win32":
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, handle_signal, sig)
-    else:
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(
-                sig, lambda signum, frame: handle_signal(signal.Signals(signum))
-            )
+    install_shutdown_signals(asyncio.get_event_loop(), handle_signal)
 
     try:
         # Run server with shutdown handling
@@ -2655,6 +2647,29 @@ async def run_server(args: argparse.Namespace) -> None:
     except Exception as e:
         logger.error(f"Fatal error: {exception_text(e)}")
         raise
+
+
+def shutdown_signals() -> tuple[signal.Signals, ...]:
+    """The signals that end the gateway through its shutdown. SIGHUP too on
+    POSIX (Consiliency/pmcp#388 round 14, claude N-A): a closed terminal or
+    a dropped SSH session ends the gateway through the same shutdown as
+    SIGTERM -- its children are detached and no longer get the hangup
+    themselves. (Windows: a closed console window ends the process without
+    a handler pmcp registers; CTRL_CLOSE_EVENT is not handled.)"""
+    if sys.platform == "win32":
+        return (signal.SIGINT, signal.SIGTERM)
+    return (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def install_shutdown_signals(
+    loop: asyncio.AbstractEventLoop, handle: Callable[[signal.Signals], None]
+) -> None:
+    """Route each of :func:`shutdown_signals` to ``handle``."""
+    for sig in shutdown_signals():
+        if sys.platform != "win32":
+            loop.add_signal_handler(sig, handle, sig)
+        else:
+            signal.signal(sig, lambda signum, frame: handle(signal.Signals(signum)))
 
 
 def run_guidance(args: argparse.Namespace) -> None:

@@ -12,7 +12,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from pmcp.child_output import detached, kill_tree, owned, release, spawn_owned
+from pmcp.child_output import (
+    abandon_pending_spawns,
+    detached,
+    kill_tree,
+    owned,
+    release,
+    spawn_owned,
+)
 from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.env_store import (
     credential_value,
@@ -676,6 +683,9 @@ class JobManager:
         did not reach them, and a cancelled handoff deadline left the server
         running past the gateway). Called from the gateway's teardown, on
         every exit. Never raises."""
+        # An install whose spawn is still in flight has no `job.process`
+        # yet: it is owned and killed when the spawn completes (round 14).
+        abandon_pending_spawns()
         for job in list(self._jobs.values()):
             process, job.process = job.process, None
             if process is not None:

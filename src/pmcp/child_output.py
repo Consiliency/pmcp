@@ -24,7 +24,7 @@ import subprocess
 import sys
 import threading
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Sequence
 from typing import IO, Any, TextIO
 
 from pmcp.display import display_safe
@@ -730,48 +730,157 @@ async def drained_errlog(label: str, logger: logging.Logger) -> AsyncIterator[Te
                 await anyio.to_thread.run_sync(thread.join, _DRAIN_JOIN_SECONDS)
 
 
-async def spawn_owned(start: Callable[[], Awaitable[Any]]) -> Any:
+# --- spawns: owned from creation (Consiliency/pmcp#388 rounds 13-14) -------------
+
+#: Spawns still in flight: :func:`drain_pending_spawns` and
+#: :func:`abandon_pending_spawns` reach them at shutdown.
+_PENDING_SPAWNS: set[_SpawnTask] = set()
+
+
+def _spawn_pid(task: asyncio.Future[Any]) -> int | None:
+    """The pid of the child a still-running spawn has already started, read
+    from the subprocess transport on its coroutine's frames (CPython's
+    ``_make_subprocess_transport`` holds it as ``transp`` while it connects
+    the pipes). ``None`` before the child exists, or on any surprise."""
+    try:
+        coro: Any = task.get_coro()  # type: ignore[attr-defined]
+        for _ in range(32):
+            if coro is None:
+                return None
+            frame = getattr(coro, "cr_frame", None) or getattr(coro, "gi_frame", None)
+            if frame is not None:
+                for name in ("transp", "transport"):
+                    transport = frame.f_locals.get(name)
+                    pid = getattr(transport, "_pid", None)
+                    if isinstance(pid, int) and pid > 0:
+                        return pid
+            coro = getattr(coro, "cr_await", None) or getattr(
+                coro, "gi_yieldfrom", None
+            )
+    except Exception:  # noqa: BLE001 -- best effort, never raises
+        return None
+    return None
+
+
+class _SpawnTask(asyncio.Task):  # type: ignore[type-arg]
+    """The task a spawn runs in. Cancelling it -- `asyncio.run` tearing the
+    loop down, or the shutdown drain giving up -- makes CPython kill the
+    leader's pid alone; so before the cancellation lands, the child's pid is
+    recorded, and the settle callback kills its whole group (round 14,
+    codex F001)."""
+
+    pid: int | None = None
+    abandoned: bool = False
+    settled: bool = False
+
+    def cancel(self, *args: Any, **kwargs: Any) -> bool:
+        if self.pid is None:
+            self.pid = _spawn_pid(self)
+        self.abandoned = True
+        return super().cancel(*args, **kwargs)
+
+
+async def spawn_owned(start: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
     """Spawn a child so that no cancellation can land between its creation
-    and its ownership (Consiliency/pmcp#388 round 13, grok F001 = codex
-    F001). Every async spawn in ``src/pmcp`` goes through here (the spawn
-    guard in ``tests/test_child_output.py`` pins it).
+    and its ownership (Consiliency/pmcp#388 rounds 13-14). Every async spawn
+    in ``src/pmcp`` goes through here (the spawn guard in
+    ``tests/test_child_output.py`` pins it).
 
     ``start`` makes the child (``asyncio.create_subprocess_exec``, or the
     MCP SDK's factory). The child already runs while that awaits its pipes;
     cancelled there, asyncio kills the leader's pid alone, and a grandchild
-    it forked meanwhile survives with no owner. So the spawn runs shielded:
-    a caller's cancellation does not reach it. If the caller was cancelled
-    meanwhile, the child is owned the moment it exists -- :func:`track`ed
-    (its Job Object on Windows, its group trusted on POSIX), killed with
-    everything it started, its pipes closed -- and the cancellation
-    propagates. Otherwise it is tracked and returned.
+    it forked meanwhile survives with no owner. So:
 
-    Not covered: a loop being torn down cancels the shielded spawn itself,
-    and asyncio then kills the leader alone; the gateway abandons its
-    servers before that point."""
-    spawning = asyncio.ensure_future(start())
+    * the spawn runs shielded, in its own task: a caller's cancellation
+      does not reach it. The caller's cancellation propagates; the spawn,
+      marked abandoned, is owned when it completes -- tracked (its Job
+      Object on Windows), killed with everything it started, its pipes
+      closed.
+    * the spawn task itself cancelled (the loop torn down; the shutdown
+      drain giving up): it records the child's pid first, and the group is
+      killed through the retained-group rule once CPython has killed the
+      leader.
+    * at shutdown, :func:`abandon_pending_spawns` (synchronous) marks every
+      spawn in flight abandoned, and the gateway awaits them, bounded, with
+      :func:`drain_pending_spawns` before the loop's own cancellation."""
+    spawning = _SpawnTask(start(), loop=asyncio.get_running_loop())
+    _PENDING_SPAWNS.add(spawning)
+    spawning.add_done_callback(_settle_spawn)
     try:
         process = await asyncio.shield(spawning)
     except asyncio.CancelledError:
-        spawning.add_done_callback(_own_abandoned_spawn)
+        spawning.abandoned = True
+        if spawning.done():
+            _settle_spawn(spawning)  # it finished as the caller was cancelled
         raise
+    if spawning.abandoned:
+        # Shutdown abandoned it while it ran: the settle callback kills it.
+        _settle_spawn(spawning)
+        raise asyncio.CancelledError
     track(process)
     return process
 
 
-def _own_abandoned_spawn(spawning: asyncio.Future[Any]) -> None:
-    """The spawn whose caller was cancelled has finished: kill what it made
-    with its group, close its pipes. Never raises."""
+def _settle_spawn(spawning: asyncio.Future[Any]) -> None:
+    """A spawn has ended. Owned by its caller unless abandoned; abandoned,
+    what it made is killed with its group and its pipes closed; cancelled,
+    the group of the pid it recorded is killed. Idempotent; never raises."""
+    _PENDING_SPAWNS.discard(spawning)  # type: ignore[arg-type]
+    task = spawning if isinstance(spawning, _SpawnTask) else None
+    if task is None or task.settled:
+        return
     if spawning.cancelled():
+        task.settled = True
+        if task.pid is not None and process_groups_supported() and not _windows():
+            with contextlib.suppress(Exception):
+                # The spawn contract (a new session): the group id is the
+                # pid. CPython killed and reaped the leader; what it forked
+                # is reached through the retained-group checks.
+                trust_group(task, task.pid)
+                signal_retained_group(task.pid, owner=task)
         return
     failed = spawning.exception()
     if failed is not None:
+        task.settled = True
         return  # nothing was made
+    if not task.abandoned:
+        return  # its caller owns it (`spawn_owned` returns it)
+    task.settled = True
     process = _unwrapped(spawning.result())
     with contextlib.suppress(Exception):
         track(process)
         kill_tree(process)  # the group first, while the leader reserves it
         release(process)
+
+
+def abandon_pending_spawns() -> None:
+    """Mark every spawn in flight abandoned, synchronously: what each one
+    makes is killed when it completes (shutdown: ``abandon_all_now``,
+    ``JobManager.shutdown``). Their pids are recorded now, while the
+    transports still hold them."""
+    for task in list(_PENDING_SPAWNS):
+        if task.pid is None:
+            task.pid = _spawn_pid(task)
+        task.abandoned = True
+
+
+async def drain_pending_spawns(within: float = 3.0) -> None:
+    """The gateway's shutdown, before the loop's own cancellation of every
+    task (round 14, codex F001): mark every spawn in flight abandoned and
+    wait, at most ``within`` seconds, for each to finish -- each is then
+    owned and killed with its group. A spawn still unfinished is cancelled,
+    its pid recorded first, so its group is killed too. Never raises."""
+    abandon_pending_spawns()
+    pending = [task for task in list(_PENDING_SPAWNS) if not task.done()]
+    if pending:
+        with contextlib.suppress(Exception):
+            await asyncio.wait(pending, timeout=within)
+    for task in pending:
+        if not task.done():
+            task.cancel()
+    if pending:
+        with contextlib.suppress(Exception):
+            await asyncio.wait(pending, timeout=within)
 
 
 def _unwrapped(process: Any) -> Any:
