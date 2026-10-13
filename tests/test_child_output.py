@@ -3181,11 +3181,14 @@ _LOOP_ENDS_DURING_SPAWN = textwrap.dedent(
 
     async def slow(self, waiter):
         # CPython's own pipe connect, held: the child runs, and forks, while
-        # the spawn is still pending.
-        while not os.path.exists(grandchild):
-            await asyncio.sleep(0.02)
-        await asyncio.sleep(3600)
-        await real(self, waiter)
+        # the spawn is still pending. It always connects in the end, as a
+        # real one does (3.11+ waits for connected pipes before finishing).
+        try:
+            while not os.path.exists(grandchild):
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(3600)
+        finally:
+            await real(self, waiter)
 
     base.BaseSubprocessTransport._connect_pipes = slow
 
