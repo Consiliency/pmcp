@@ -2597,6 +2597,7 @@ async def test_a_cancelled_cancel_job_still_kills_the_server(
     caller = asyncio.create_task(jobs.cancel_job(job_id))
     await asyncio.sleep(0.3)  # inside the 2 s graceful wait
     assert not caller.done()
+    assert job.process is None  # owned by cancel_job before its first await
     caller.cancel()
     with pytest.raises(asyncio.CancelledError):
         await caller
@@ -2619,6 +2620,7 @@ async def test_cancel_job_disarms_the_deadline_only_after_the_kill(
     from pmcp.manifest import installer
 
     jobs, job_id, job = await _term_ignoring_server_ready_job(tmp_path, monkeypatch)
+    process = job.process  # cancel_job takes it from the job (round 12)
     calls = {"n": 0}
 
     def failing_once(process: Any, *, terminate: bool = False) -> None:
@@ -2632,7 +2634,7 @@ async def test_cancel_job_disarms_the_deadline_only_after_the_kill(
         await jobs.cancel_job(job_id)
     assert not job._handoff_deadline.cancelled(), "the backstop was disarmed"
     monkeypatch.undo()
-    kill_tree(job.process)
+    kill_tree(process)
     job._handoff_deadline.cancel()
     _grandchild_gone(tmp_path, "the backstop test's cleanup")
 
@@ -2734,3 +2736,184 @@ async def test_adopting_a_name_that_is_connected_tears_the_old_client_down(
             if process.returncode is None:
                 process.kill()
                 await process.wait()
+
+
+# --- round 12 ---------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_a_shutdown_during_a_same_name_adoption_kills_the_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 12, codex F001 (codex's interleaving, real processes): adoption
+    tears down a same-name client while holding the lifecycle lock; a
+    `disconnect_all` waiting on that lock is cancelled, which runs
+    `abandon_all_now()`. The replacement must not register after that
+    sweep: it is killed, and the handoff reads failed."""
+    import asyncio
+
+    from pmcp.child_output import detached
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+    from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+
+    jobs, job_id, job = await _server_ready_job(tmp_path, monkeypatch, deadline=60)
+    replacement = job.process
+    mgr = _adopting_manager(monkeypatch, hold=0.0, fail=False)
+    # An "old" client under the same name whose process ignores SIGTERM, so
+    # its teardown inside the adoption holds the lock for seconds.
+    ready = tmp_path / "old-ready"
+    old = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"open({str(ready)!r}, 'w').close(); time.sleep(60)",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        **detached(),
+    )
+    # Only once SIGTERM is ignored does its teardown really hold the lock.
+    limit = asyncio.get_running_loop().time() + 15
+    while not ready.exists():
+        assert asyncio.get_running_loop().time() < limit
+        await asyncio.sleep(0.02)
+    config = ResolvedServerConfig(
+        name="memory",
+        source="project",
+        config=LocalMcpServerConfig(command=sys.executable, args=["-c", "pass"]),
+    )
+    await mgr.adopt_process("memory", old, config)
+    tools = GatewayTools(client_manager=mgr, policy_manager=PolicyManager())
+    handoff = asyncio.create_task(tools._finalize_server_ready(job, job_id, 0.0))
+    await asyncio.sleep(0.5)  # inside the old client's teardown, lock held
+    shutdown = asyncio.create_task(mgr.disconnect_all())
+    await asyncio.sleep(0.1)  # waiting on the lifecycle lock
+    shutdown.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await shutdown
+    assert mgr._abandoned
+    result = await asyncio.wait_for(handoff, 30)
+    try:
+        assert result.status == "failed", result
+        assert job.status == "failed"
+        assert await asyncio.wait_for(replacement.wait(), 10) is not None
+        assert mgr._clients == {}
+    finally:
+        for process in (old, replacement):
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+    _grandchild_gone(tmp_path, "the replacement refused after shutdown")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["connect", "reconnect"])
+async def test_a_shutdown_during_a_connect_spawn_kills_the_new_server(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 12, the same class for connect and reconnect: `abandon_all_now()`
+    runs while the spawn is awaited. The new server is not registered after
+    the sweep; it is killed, and the connect fails."""
+    import asyncio
+
+    from pmcp.client import manager as manager_mod
+    from pmcp.client.manager import ClientManager
+    from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+
+    mgr = ClientManager()
+    spawned: list[Any] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def spawn_then_shutdown(*args: Any, **kwargs: Any) -> Any:
+        process = await real_exec(*args, **kwargs)
+        spawned.append(process)
+        mgr.abandon_all_now()  # the shutdown sweep runs during the await
+        return process
+
+    monkeypatch.setattr(
+        manager_mod.asyncio, "create_subprocess_exec", spawn_then_shutdown
+    )
+    config = ResolvedServerConfig(
+        name="memory",
+        source="project",
+        config=LocalMcpServerConfig(
+            command=sys.executable, args=["-c", "import time; time.sleep(60)"]
+        ),
+    )
+    try:
+        with pytest.raises(manager_mod._ManagerAbandoned):
+            if path == "connect":
+                await mgr._connect_server(config)
+            else:
+                await mgr._connect_singleflight(config)  # the reconnect's connect
+        assert spawned and await asyncio.wait_for(spawned[0].wait(), 10) is not None
+        assert mgr._clients == {}
+    finally:
+        monkeypatch.undo()
+        for process in spawned:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+
+
+def test_every_client_registration_goes_through_register_or_kill() -> None:
+    """Round 12: one registration site, so one abandonment check with no
+    await before it. Any other assignment into `_clients` fails this."""
+    tree = ast.parse((SRC / "client" / "manager.py").read_text())
+    sites: list[str] = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(func):
+            targets = node.targets if isinstance(node, ast.Assign) else []
+            for target in targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Attribute)
+                    and target.value.attr == "_clients"
+                ):
+                    sites.append(func.name)
+    assert sites == ["_register_or_kill"], sites
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipes")
+def test_a_shared_broken_stdout_and_stderr_keep_the_installers_status(
+    tmp_path: Path,
+) -> None:
+    """Round 12 (claude): `pmcp upgrade 2>&1 | head`. With stderr the same
+    broken pipe, pmcp's own last words do not replace the installer's exit
+    status with a broken-pipe one."""
+    child = tmp_path / "installer.py"
+    status = tmp_path / "status"
+    child.write_text(
+        "import sys, time\n"
+        "for i in range(200):\n"
+        "    print(f'line {i}', flush=True)\n"
+        "    time.sleep(0.005)\n"
+        "sys.exit(7)\n"
+    )
+    harness = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "from pmcp.display import DisplaySafeStream\n"
+            "sys.stdout = DisplaySafeStream(sys.stdout)\n"
+            "from pmcp.child_output import run_echoed\n"
+            f"rc = run_echoed([sys.executable, {str(child)!r}])\n"
+            f"open({str(status)!r}, 'w').write(str(rc))\n"
+            "print(f'upgrade finished: {rc}', file=sys.stderr)\n"
+            "sys.exit(rc)\n",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert harness.stdout is not None
+    harness.stdout.readline()
+    harness.stdout.close()
+    assert harness.wait(timeout=30) == 7
+    assert status.read_text() == "7"

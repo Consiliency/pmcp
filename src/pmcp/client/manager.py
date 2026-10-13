@@ -3272,7 +3272,9 @@ class ClientManager:
             # true even if it has already exited and been reaped.
             group_pgid=_spawned_group_pgid(process),
         )
-        self._clients[name] = managed
+        # The spawn awaited: shutdown may have swept since `_connect_server`
+        # checked (round 12).
+        self._register_or_kill(name, managed)
         self._watch_server_group(name, managed)
 
         # Start reading stderr in background
@@ -3676,7 +3678,8 @@ class ClientManager:
                 transport_owner_task=owner_task,
                 transport_shutdown=shutdown,
             )
-            self._clients[name] = managed
+            # `ready` awaited: a refusal here unwinds the owner below.
+            self._register_or_kill(name, managed)
         except BaseException:
             # BaseException, not Exception: cancellation is the case that
             # bites here, and it is a BaseException. Cancel rather than
@@ -4759,6 +4762,23 @@ class ClientManager:
         finally:
             self._lifecycle_lock.release()
 
+    def _register_or_kill(self, name: str, managed: ManagedClient) -> None:
+        """Register a client -- the only place one is registered -- unless
+        the manager has been abandoned, checked here with no await between
+        the check and the registration (Consiliency/pmcp#388 round 12, codex
+        F001). Every registration path (connect, reconnect, refresh, lazy
+        start, adoption) awaits before it registers, and `abandon_all_now()`
+        may have swept in that await: a client registered afterwards would
+        outlive the shutdown with no owner. Refused, its process is killed
+        with its group and its pipes closed, and `_ManagerAbandoned` raised."""
+        if self._abandoned:
+            if managed.process is not None:
+                _kill_process_tree_now(managed.process, group_pgid=managed.group_pgid)
+            raise _ManagerAbandoned(
+                f"Not registering {name}: the client manager was abandoned"
+            )
+        self._clients[name] = managed
+
     def _refuse_adoption_if_abandoned(self, name: str) -> None:
         # Adoption registers a client without going through `_connect_server`,
         # so it checks abandonment itself: nothing may register a client after
@@ -4835,7 +4855,9 @@ class ClientManager:
             # as running above).
             group_pgid=_own_group_pgid(process),
         )
-        self._clients[name] = managed
+        # The same-name teardown above awaited: a `disconnect_all` cancelled
+        # meanwhile ran `abandon_all_now()` (round 12, codex F001).
+        self._register_or_kill(name, managed)
         self._watch_server_group(name, managed)
 
         # Start reading stderr in background (if available)

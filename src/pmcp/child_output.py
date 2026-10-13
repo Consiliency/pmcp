@@ -771,8 +771,15 @@ def _quiet_broken_stdout() -> None:
     if not isinstance(sys.stdout, DisplaySafeStream):
         return
     with contextlib.suppress(OSError):
+        # stderr too when it is the same broken pipe (`2>&1 | head`, round
+        # 12, claude): pmcp's own last words must not turn the installer's
+        # exit status into a broken-pipe one.
+        out, err = os.fstat(1), os.fstat(2)
+        same = (out.st_dev, out.st_ino) == (err.st_dev, err.st_ino)
         null = os.open(os.devnull, os.O_WRONLY)
         os.dup2(null, 1)
+        if same:
+            os.dup2(null, 2)
         os.close(null)
 
 

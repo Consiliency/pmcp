@@ -618,6 +618,9 @@ class JobManager:
             return False
 
         process = job.process
+        # Ownership is taken before the first await (round 12, claude), as the
+        # handoff does: nothing else acts on this process from here on.
+        job.process = None
         try:
             if process is not None and process.returncode is None:
                 logger.info(f"Cancelling install job {job_id}")
