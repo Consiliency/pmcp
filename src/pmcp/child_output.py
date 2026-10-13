@@ -762,8 +762,11 @@ async def spawn_owned(start: Callable[[], Awaitable[Any]]) -> Any:
 def _own_abandoned_spawn(spawning: asyncio.Future[Any]) -> None:
     """The spawn whose caller was cancelled has finished: kill what it made
     with its group, close its pipes. Never raises."""
-    if spawning.cancelled() or spawning.exception() is not None:
+    if spawning.cancelled():
         return
+    failed = spawning.exception()
+    if failed is not None:
+        return  # nothing was made
     process = _unwrapped(spawning.result())
     with contextlib.suppress(Exception):
         track(process)
