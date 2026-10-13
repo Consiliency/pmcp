@@ -1097,6 +1097,9 @@ def test_the_inline_readers_in_src_are_the_expected_six() -> None:
         # records through `_remove_server_indexes`
         "_forget_client",
         "_forget_disconnected",
+        # Consiliency/pmcp#388 round 12: the one registration site drops the
+        # name's records the instant before it registers
+        "_register_or_kill",
     }
 
 
@@ -1861,11 +1864,12 @@ def test_every_task_request_is_bound_to_the_connection_its_state_came_from() -> 
 #: binding the attribute itself (rev 6). Derived and compared whole.
 CLIENT_WRITES = {
     ("__init__", "bind"),
-    ("_connect_stdio", "register"),
-    ("_connect_remote_stream", "register"),
+    # Consiliency/pmcp#388 round 12: the one registration site, checked
+    # against shutdown with no await before it (`_connect_stdio`, the remote
+    # connect and adoption all register through it).
+    ("_register_or_kill", "register"),
     # Consiliency/pmcp#324 (on main since this plan's base) moved these writes
     # into helpers; each is classified where it now lives
-    ("_adopt_process_locked", "register"),
     ("_drop_client", "pop"),  # a failed connect forgets its own client only
     ("_forget_client", "pop"),  # `_cleanup_client`'s bookkeeping
     ("_forget_disconnected", "pop"),  # `disconnect_server`'s bookkeeping

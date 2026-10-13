@@ -4777,6 +4777,10 @@ class ClientManager:
             raise _ManagerAbandoned(
                 f"Not registering {name}: the client manager was abandoned"
             )
+        # The name's records are dropped here too, the instant before the new
+        # connection is registered (every caller dropped them before its
+        # awaits; nothing has been indexed for the new one yet).
+        self._remove_server_indexes(name)
         self._clients[name] = managed
 
     def _refuse_adoption_if_abandoned(self, name: str) -> None:
