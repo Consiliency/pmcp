@@ -2664,8 +2664,14 @@ def shutdown_signals() -> tuple[signal.Signals, ...]:
 def install_shutdown_signals(
     loop: asyncio.AbstractEventLoop, handle: Callable[[signal.Signals], None]
 ) -> None:
-    """Route each of :func:`shutdown_signals` to ``handle``."""
+    """Route each of :func:`shutdown_signals` to ``handle`` -- except one
+    the process inherited as ignored (Consiliency/pmcp#388 round 15): `nohup`
+    sets SIGHUP to SIG_IGN so the gateway outlives the operator's logout,
+    and a shell without job control starts background jobs with SIGINT
+    ignored. An inherited SIG_IGN is the launcher's choice; it is kept."""
     for sig in shutdown_signals():
+        if signal.getsignal(sig) is signal.SIG_IGN:
+            continue
         if sys.platform != "win32":
             loop.add_signal_handler(sig, handle, sig)
         else:

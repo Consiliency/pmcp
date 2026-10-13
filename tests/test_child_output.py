@@ -3275,13 +3275,20 @@ _GATEWAY_HANGUP = textwrap.dedent(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGHUP")
+@pytest.mark.parametrize("launch", ["terminal", "nohup"])
 def test_a_hangup_shuts_the_gateway_down_with_its_server_ready_job(
-    tmp_path: Path,
+    launch: str, tmp_path: Path
 ) -> None:
     """Round 14, claude N-A: SIGHUP (a closed terminal, a dropped SSH
     session) goes through the gateway's shutdown like SIGTERM. A real
     gateway with a `server_ready` job and its live server: after SIGHUP, the
-    gateway shuts down and the server and what it started are gone."""
+    gateway shuts down and the server and what it started are gone.
+
+    Round 15: under `nohup` (the README's deployment) SIGHUP is inherited as
+    ignored, and stays ignored -- the gateway keeps running through the
+    operator's logout; SIGTERM still shuts it down with everything it
+    started."""
+    import shutil
     import signal
     import time
 
@@ -3291,8 +3298,14 @@ def test_a_hangup_shuts_the_gateway_down_with_its_server_ready_job(
     (tmp_path / "install.py").write_text(
         _STARTED_THEN_EXITS.format(out=str(tmp_path)) + "import time\ntime.sleep(60)\n"
     )
+    command = [sys.executable, "-c", _GATEWAY_HANGUP, str(tmp_path)]
+    if launch == "nohup":
+        nohup = shutil.which("nohup")
+        if nohup is None:
+            pytest.skip("no nohup on this host")
+        command = [nohup, *command]
     gateway = subprocess.Popen(
-        [sys.executable, "-c", _GATEWAY_HANGUP, str(tmp_path)],
+        command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -3303,16 +3316,23 @@ def test_a_hangup_shuts_the_gateway_down_with_its_server_ready_job(
         server = int((tmp_path / "server").read_text())
         assert not _gone(server, within=0.1)
         gateway.send_signal(signal.SIGHUP)
+        if launch == "nohup":
+            time.sleep(1.5)
+            assert gateway.poll() is None, (
+                "nohup's ignored SIGHUP shut the gateway down"
+            )
+            assert not (tmp_path / "shut").exists()
+            assert not _gone(server, within=0.1), "the server died with the hangup"
+            gateway.send_signal(signal.SIGTERM)  # the operator's stop, later
         _, err = gateway.communicate(timeout=60)
         assert gateway.returncode == 0, err[-2000:]
         assert (tmp_path / "shut").exists(), "the gateway did not shut down"
         assert _gone(server), "the server outlived the gateway"
-        _grandchild_gone(tmp_path, "a server_ready job at SIGHUP")
+        _grandchild_gone(tmp_path, f"a server_ready job at shutdown ({launch})")
     finally:
         if gateway.poll() is None:
             gateway.kill()
             gateway.wait()
-        time.sleep(0)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
