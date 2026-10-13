@@ -3304,12 +3304,19 @@ def test_a_hangup_shuts_the_gateway_down_with_its_server_ready_job(
         if nohup is None:
             pytest.skip("no nohup on this host")
         command = [nohup, *command]
+
+    def default_hangup() -> None:
+        # A terminal-attached launch: SIGHUP at its default, whatever this
+        # test process inherited (a CI runner or a `nohup`ed test run).
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
     gateway = subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         start_new_session=True,
+        preexec_fn=default_hangup,  # noqa: PLW1509 -- sets one disposition
     )
     try:
         _wait_for(tmp_path / "ready", within=30)
