@@ -102,7 +102,7 @@ UNPROVEN = (
 
 # `.github/workflows/test.yml:54`, the invocation R9 mirrors and R22 guards.
 CI_INVOCATION = (
-    "uv run pytest tests/ -v --tb=short --cov --cov-report=xml "
+    "uv run pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml "
     "--cov-report=term-missing"
 )
 

@@ -113,6 +113,7 @@ dev = [
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",
     "pytest-mock>=3.0",
+    "pytest-xdist>=3.8",
     # Consiliency/pmcp#200: without this the `timeout` ini option below is
     # inert and a stuck await is a silent job-cap cancel.
     "pytest-timeout>=2.3",
