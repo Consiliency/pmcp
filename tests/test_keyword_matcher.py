@@ -5,8 +5,8 @@ expression; it now runs through `keyword_matches`, which must produce exactly
 the same matches. These tests compare the two on a seeded corpus of short
 strings built from the characters the rule cares about (key fragments,
 identifier joiners, separator characters, value characters, case-fold
-letters), where the regex itself is fast, and check that long inputs stay
-fast.
+letters), where the regex itself is fast, and check that CPU cost grows
+with input size rather than quadratically.
 """
 
 from __future__ import annotations
@@ -105,20 +105,24 @@ def test_sanitize_auth_diagnostic_uses_the_linear_matcher() -> None:
 
 
 @pytest.mark.parametrize(
-    "text",
+    "short_text,text",
     [
-        "a-" * 33000,
-        "a_" * 33000,
-        "token-" * 11000,
-        "x" + "-a" * 33000 + " password",
+        ("a-" * 8250, "a-" * 33000),
+        ("a_" * 8250, "a_" * 33000),
+        ("token-" * 2750, "token-" * 11000),
+        ("x" + "-a" * 8250 + " password", "x" + "-a" * 33000 + " password"),
     ],
     ids=["hyphens", "underscores", "keyword-hyphens", "trailing-keyword"],
 )
-def test_long_identifier_runs_stay_fast(text: str) -> None:
-    # Keep the CPU budget independent of other xdist workers' scheduling.
-    started = time.process_time()
-    sanitize_auth_diagnostic(text, max_length=None)
-    assert time.process_time() - started < 2.0
+def test_long_identifier_runs_stay_fast(short_text: str, text: str) -> None:
+    # Four times the input allows 8x CPU cost for runner variation; a
+    # quadratic regression costs 16x. No machine-specific seconds budget.
+    costs = []
+    for candidate in (short_text, text):
+        started = time.process_time()
+        sanitize_auth_diagnostic(candidate, max_length=None)
+        costs.append(time.process_time() - started)
+    assert costs[1] < 8 * costs[0], costs
 
 
 @pytest.mark.parametrize(
@@ -140,6 +144,10 @@ def test_url_trailing_punctuation_is_kept_outside_the_url(text: str) -> None:
 
 
 def test_a_url_with_a_long_punctuation_tail_stays_fast() -> None:
-    started = time.process_time()
-    sanitize_auth_diagnostic("http://a" + ")" * 1_000_000, max_length=None)
-    assert time.process_time() - started < 2.0
+    costs = []
+    for size in (250_000, 1_000_000):
+        text = "http://a" + ")" * size
+        started = time.process_time()
+        sanitize_auth_diagnostic(text, max_length=None)
+        costs.append(time.process_time() - started)
+    assert costs[1] < 8 * costs[0], costs
