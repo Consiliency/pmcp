@@ -222,10 +222,7 @@ def booted_gateway(
         project.mkdir()
         lock_dir = work / "lock"
 
-        # Unique command basename + a fresh-mktemp arg, so
-        # _kill_orphan_processes' (Path(command).name, tuple(args))
-        # fingerprint (server.py) cannot collide with anything the live
-        # gateway is running — same recipe as test_credential_boot.py.
+        # Unique fixture path for this isolated boot, as in test_credential_boot.py.
         fixture_py = work / "rt_fixture_server.py"
         fixture_py.write_text(RT_FIXTURE_SRC)
         wrapper = work / "rt-fixture-server"
