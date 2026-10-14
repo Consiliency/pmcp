@@ -738,7 +738,9 @@ def _dispatched_top_level_verbs() -> frozenset[str]:
     are read out of the shipped source, so neither can drift from a list a test
     author maintains.
     """
-    tree = ast.parse(inspect.getsource(cli_module.async_main))
+    # The dispatch chain lives in `cli._dispatch` since Consiliency/pmcp#388
+    # round 16 (`async_main` wraps it with the subcommands' signal handling).
+    tree = ast.parse(inspect.getsource(cli_module._dispatch))
     verbs: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Compare):
@@ -755,7 +757,7 @@ def _dispatched_top_level_verbs() -> frozenset[str]:
             and isinstance(node.comparators[0].value, str)
         ):
             verbs.add(node.comparators[0].value)
-    assert verbs, "no dispatch branches found in async_main; the audit is blind"
+    assert verbs, "no dispatch branches found in _dispatch; the audit is blind"
     return frozenset(verbs)
 
 
