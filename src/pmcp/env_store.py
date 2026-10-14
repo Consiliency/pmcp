@@ -32,7 +32,9 @@ ENV_VAR_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def validate_env_var_name(name: str) -> str:
     """Validate and return a shell-compatible env var name."""
     if not ENV_VAR_NAME_PATTERN.fullmatch(name):
-        raise ValueError(f"Env var name must match ^[A-Za-z_][A-Za-z0-9_]*$: {name!r}")
+        # The rejected name is not quoted: through `gateway.auth_connect` it is
+        # a caller's value (Consiliency/pmcp#297, rev 12).
+        raise ValueError("Env var name must match ^[A-Za-z_][A-Za-z0-9_]*$")
     return name
 
 
@@ -777,8 +779,11 @@ def repository_may_supply(name: str) -> bool:
 
 
 def describe_uncopied_store_entry(variable: str, store_name: str, reason: str) -> str:
-    """Value-free: an entry of a repository store that was not copied."""
-    return f"Not copying {variable} from {store_name}: {reason}."
+    """Value-free: an entry of a repository store that was not copied. The
+    name is shown only when it is a plain identifier (:func:`plain_name`)."""
+    from pmcp.argument_errors import plain_name
+
+    return f"Not copying {plain_name(variable)} from {store_name}: {reason}."
 
 
 def declared_credential_names() -> frozenset[str]:
@@ -975,9 +980,12 @@ def credential_lookup(project: Path | None = None) -> Callable[[str], str | None
 
 
 def describe_ignored_store_env_var(variable: str, store_name: str) -> str:
-    """Value-free: a variable a repository file may not supply (:func:`repository_may_supply`)."""
+    """Value-free: a variable a repository file may not supply
+    (:func:`repository_may_supply`), named only when it is a plain identifier."""
+    from pmcp.argument_errors import plain_name
+
     return (
-        f"Ignoring {variable} in {store_name}: a project file supplies credentials "
+        f"Ignoring {plain_name(variable)} in {store_name}: a project file supplies credentials "
         "only, and this variable decides what pmcp or a program it starts loads, "
         "trusts or connects to, so export it in the shell that starts pmcp (or set "
         "it in ~/.config/pmcp/pmcp.env)."
@@ -985,9 +993,12 @@ def describe_ignored_store_env_var(variable: str, store_name: str) -> str:
 
 
 def describe_unresolved_store_value(variable: str, store_name: str) -> str:
-    """Value-free: a repository file's value refers to a variable it does not define."""
+    """Value-free: a repository file's value refers to a variable it does not
+    define; the binding is named only when it is a plain identifier."""
+    from pmcp.argument_errors import plain_name
+
     return (
-        f"Ignoring {variable} in {store_name}: its value refers to a variable the "
+        f"Ignoring {plain_name(variable)} in {store_name}: its value refers to a variable the "
         "file does not define, and a project file's values are never expanded from "
         "your environment or your user store."
     )
@@ -1147,8 +1158,10 @@ def _load_operator_text(text: str, name: str) -> None:
         if value is None or key in os.environ:
             continue
         if key.upper() in _NEVER_LOADED:
+            from pmcp.argument_errors import plain_name
+
             print(
-                f"pmcp: Ignoring {key} in {name}: where the operator's files "
+                f"pmcp: Ignoring {plain_name(key)} in {name}: where the operator's files "
                 "are is never set by a file pmcp loads",
                 file=sys.stderr,
             )
@@ -1408,12 +1421,16 @@ def store_refusal(
     """
     from pmcp.atomic_write import ConfinedWriteError, refusing
 
+    from pmcp.argument_errors import exception_text
+
     if isinstance(exc, ConfinedWriteError):
-        return str(exc)
+        return exception_text(exc)
     if isinstance(exc, UnicodeDecodeError):
         return f"{refusing(verb)} {store_path.name}: it is not valid UTF-8"
     if isinstance(exc, ValueError):
-        return f"{refusing(verb)} {store_path.name}: {exc}"
+        # Through the registry (Consiliency/pmcp#297): a validation or parse
+        # error chained here is described, never quoted.
+        return f"{refusing(verb)} {store_path.name}: {exception_text(exc)}"
     reason = os.strerror(exc.errno) if exc.errno else "the write failed"
     return f"{refusing(verb)} {store_path.name}: {reason}"
 

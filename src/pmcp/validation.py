@@ -59,9 +59,9 @@ def parse_package_spec(spec: str) -> tuple[str, str | None]:
     else:
         name, version = spec[:at], spec[at + 1 :]
         if not version:
-            raise ValueError(f"package spec {spec!r} has an empty version")
+            raise ValueError("the package spec has an empty version")
     if not is_valid_package_name(name):
-        raise ValueError(f"package spec {spec!r} does not name a valid package")
+        raise ValueError("the package spec does not name a valid package")
     return name, version
 
 
@@ -266,3 +266,16 @@ def discovered_env_var_allowed(name: str) -> bool:
     if is_package_manager_env_var(name):
         return False
     return bool(_CREDENTIAL_NAME_RE.fullmatch(name))
+
+
+def discovered_env_var_refusal_reason(name: str) -> str:
+    """Why ``discovered_env_var_allowed`` refuses *name*, in pmcp's own words
+    -- never the name, which is the caller's value (Consiliency/pmcp#297,
+    rev 12)."""
+    if name and not is_dangerous_env_var(name):
+        for prefix in _PACKAGE_MANAGER_ENV_PREFIXES:
+            if name.upper().startswith(prefix):
+                return f"in the {prefix}* family"
+    if not name or is_dangerous_env_var(name):
+        return "a variable pmcp never sets for a server"
+    return "not credential-shaped"

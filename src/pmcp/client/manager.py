@@ -13,7 +13,6 @@ from pathlib import Path
 import random
 import re
 import signal
-import traceback
 import string
 import time
 from collections import deque
@@ -29,10 +28,32 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
 from pydantic import ValidationError
 
+from pmcp import child_output as _child_output
+from pmcp.child_output import (
+    abandon_pending_spawns,
+    spawn_owned,
+    detached,
+    kill_process_tree_now,
+    leader_reserved,
+    observe_group,
+    process_groups_supported,
+    release,
+    signal_retained_group,
+    trust_group,
+    watch_group,
+)
+from pmcp.argument_errors import (
+    describe_value,
+    exception_text,
+    jsonrpc_envelope_problem,
+    safe_traceback_text,
+    install_log_scrubber,
+)
 from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
 from pmcp.env_store import bind_project_root, sanitized_subprocess_env
 from pmcp.manifest.installer import _operator_safe, _render_install_argv
+from pmcp.parsing import load_json
 from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
     resolve_remote_headers_for_tenant,
@@ -75,6 +96,9 @@ except ImportError:
     HAS_RESOURCE = False
 
 logger = logging.getLogger(__name__)
+# The SDK logs rejected frames with a traceback (Consiliency/pmcp#297); every
+# record is scrubbed at creation (`install_log_scrubber`).
+install_log_scrubber()
 
 
 def _lazy_log_name(config: ResolvedServerConfig) -> str:
@@ -154,7 +178,9 @@ def describe_exception(exc: BaseException) -> str:
 
     shown = leaves[:_MAX_DESCRIBED_LEAVES]
     rendered = "; ".join(
-        f"{type(leaf).__name__}: {leaf}" if str(leaf) else type(leaf).__name__
+        f"{type(leaf).__name__}: {exception_text(leaf)}"
+        if str(leaf)
+        else type(leaf).__name__
         for leaf in shown
     )
     if len(leaves) > len(shown):
@@ -279,9 +305,7 @@ def _log_abandoned_owner_failure(name: str, task: asyncio.Future[Any]) -> None:
         return
     # Formatted and sanitised rather than passed as `exc_info=`: `exc_info`
     # appends the unredacted exception tree after the sanitised message.
-    traceback_text = "".join(
-        traceback.format_exception(type(exc), exc, exc.__traceback__)
-    )
+    traceback_text = safe_traceback_text(exc)
     logger.warning(
         f"[{name}] remote transport failed to unwind after our caller's "
         f"cancellation: {describe_exception(exc)}\n"
@@ -391,15 +415,167 @@ class DownstreamError(Exception):
         self.data = data
 
 
+#: JSON-RPC's parse-error code. The SDK's HTTP transports synthesise it for a
+#: downstream frame their models reject, with `f"Failed to parse ...: {exc}"`
+#: -- pydantic's text, rejected value included -- as the message
+#: (`mcp/client/streamable_http.py:188,407`); it reaches pmcp as a plain
+#: string, where `exception_text` cannot recognise it (Consiliency/pmcp#297).
+_PARSE_ERROR = -32700
+_PARSE_ERROR_MESSAGE = "downstream sent a response that could not be parsed"
+_MALFORMED_ERROR_MESSAGE = "downstream sent a malformed JSON-RPC error"
+
+
 def _downstream_error(error: Any) -> DownstreamError:
-    """Build a `DownstreamError` from a JSON-RPC `error` member."""
+    """Build a `DownstreamError` from a JSON-RPC `error` member.
+
+    A parse error's message is replaced by fixed text, whoever wrote it: the
+    SDK's carries the rejected frame, and a downstream's own parse-error
+    prose describes our request, not its failure. So is a malformed `error`
+    (not an object, or a non-string `message`). Every other error keeps the
+    downstream's own message string, returned by design.
+    """
     if not isinstance(error, dict):
-        return DownstreamError(str(error))
-    return DownstreamError(
-        str(error.get("message", "Unknown error")),
-        code=error.get("code"),
-        data=error.get("data"),
+        return DownstreamError(_MALFORMED_ERROR_MESSAGE)
+    code = error.get("code")
+    if code == _PARSE_ERROR:
+        return DownstreamError(_PARSE_ERROR_MESSAGE, code=code)
+    message = error.get("message", "Unknown error")
+    if not isinstance(message, str):
+        # JSON-RPC requires a string: anything else is a malformed frame,
+        # whose content is not the downstream's message (the SDK's transports
+        # reject it outright; stdio is parsed without a model).
+        return DownstreamError(_MALFORMED_ERROR_MESSAGE, code=code)
+    from pmcp.sdk_rejections import (
+        MAX_CLASSIFIED_LENGTH,
+        classifiable,
+        sdk_built_message,
+        sdk_message_phrase,
     )
+
+    if not classifiable(message):
+        # Too long to classify: its code's phrase, and why the server's own
+        # message is not there (Consiliency/pmcp#388 round 2, claude N-B).
+        return DownstreamError(
+            f"{sdk_message_phrase(code)} (the server's message was not shown: "
+            f"over {MAX_CLASSIFIED_LENGTH} characters)",
+            code=code,
+        )
+    if sdk_built_message(message, code):
+        # The MCP SDK's client transport answered for the downstream, with
+        # text it formats from the response (`Unexpected content type:
+        # <type>`): its code's fixed phrase, and no `data` (rev 26).
+        return DownstreamError(sdk_message_phrase(code), code=code)
+    return DownstreamError(message, code=code, data=error.get("data"))
+
+
+#: Each task field's wire names, for `_usable_task_raw`.
+_TASK_WIRE_KEYS: dict[str, tuple[str, ...]] = {
+    "status": ("status",),
+    "created_at": ("createdAt", "created_at"),
+    "updated_at": ("updatedAt", "updated_at", "lastUpdatedAt", "last_updated_at"),
+    "ttl": ("ttl",),
+    "poll_interval": ("pollInterval", "poll_interval"),
+}
+
+
+def _usable_task_raw(payload: dict[str, Any]) -> dict[str, Any]:
+    """A downstream task payload as `raw`, without the values pmcp found
+    unusable (Consiliency/pmcp#297 on Consiliency/pmcp#298's drop rule).
+
+    The model drops an unusable hint and names the field in
+    `unusable_fields`; the payload it came from is returned to the caller
+    as `raw` by every `gateway.tasks_*` tool, so the rejected value went back
+    out there. A `null` is kept (`ttl: null` means unlimited), and so is
+    every member pmcp does not read."""
+    unusable = {
+        key
+        for name, keys in _TASK_WIRE_KEYS.items()
+        for key in keys
+        if key in payload
+        and payload[key] is not None
+        and not task_hint_is_usable(name, payload[key])
+    }
+    for key in ("statusMessage", "status_message"):
+        if key in payload and not isinstance(payload[key], (str, type(None))):
+            unusable.add(key)
+    return {key: value for key, value in payload.items() if key not in unusable}
+
+
+def effective_task_mode(
+    tool_info: ToolInfo, task: TaskMetadataInput | dict[str, Any] | None
+) -> bool:
+    """Whether a call runs as an MCP task (the tool requires it, or it was
+    requested and not `enabled: false`): the one derivation for `call_tool`
+    and `gateway.invoke` (rev 17). Otherwise the answer is opaque data."""
+    support = (tool_info.execution or {}).get("taskSupport")
+    if support == "required":
+        return True
+    if task is None:
+        return False
+    parsed = (
+        task
+        if isinstance(task, TaskMetadataInput)
+        else TaskMetadataInput.model_validate(task)
+    )
+    return parsed.enabled
+
+
+def _task_candidate(result: Any) -> dict[str, Any] | None:
+    """Where a downstream answer would carry a task: its nested `task`
+    object if it has one, else the answer itself (flat)."""
+    if not isinstance(result, dict):
+        return None
+    task = result.get("task")
+    return task if isinstance(task, dict) else result
+
+
+def _names_a_task(result: Any) -> bool:
+    """Main's condition for not polling `tasks/get` after `tasks/result`,
+    kept exactly. It decides only that poll (rev 15)."""
+    return isinstance(result, dict) and (
+        isinstance(result.get("task"), dict) or isinstance(result.get("taskId"), str)
+    )
+
+
+def task_answer_of(result: Any) -> tuple[dict[str, Any], McpTaskInfo] | None:
+    """The task a downstream answer carries, and its parse -- or None. The
+    one recogniser, and it is the parser (rev 15): the candidate is a task
+    only if `ClientManager._task_info_from_payload` parses it."""
+    payload = _task_candidate(result)
+    if payload is None:
+        return None
+    info = ClientManager._task_info_from_payload(payload)
+    if info is None:
+        return None
+    return payload, info
+
+
+def usable_task_response(result: Any) -> Any:
+    """`result` with its task replaced by that task's parse (`raw`, without
+    the values pmcp dropped), so a dropped hint is neither returned nor sized
+    (Consiliency/pmcp#297). It acts if and only if `task_answer_of` finds a
+    task; anything else is returned unchanged, as data."""
+    found = task_answer_of(result)
+    if found is None:
+        return result
+    payload, info = found
+    if payload is result:
+        return dict(info.raw)
+    return {**result, "task": dict(info.raw)}
+
+
+def parse_request_id(request_id: str) -> tuple[str, int] | None:
+    """`server_name::local_id` as `gateway.cancel` takes it, or None when the
+    id does not have that format (no `::`, or a local id that is not an
+    integer). The handler uses the same parse, so a rejected id is never
+    copied into the response or the audit event (rev 13, round-12 B1)."""
+    if "::" not in request_id:
+        return None
+    server_name, local_id_str = request_id.rsplit("::", 1)
+    try:
+        return server_name, int(local_id_str)
+    except ValueError:
+        return None
 
 
 class _ManagerAbandoned(Exception):
@@ -428,13 +604,11 @@ class _NullCatalogEventSink:
 
 
 def _process_groups_supported() -> bool:
-    """Whether this platform has POSIX process groups to signal. Windows has
+    """Whether this platform has POSIX process groups to signal (the one
+    rule: :func:`pmcp.child_output.process_groups_supported`). Windows has
     neither `os.killpg` nor `os.getpgid`: there every group path is skipped
-    and teardown uses the single-process `terminate()`/`kill()` fallback, as
-    on main (codex round 7: a retained id reached `os.killpg` there and the
-    `AttributeError` failed `disconnect_server`). Read at call time, so a
-    test that removes the APIs sees it."""
-    return hasattr(os, "killpg") and hasattr(os, "getpgid")
+    and teardown uses the single-process fallback (codex round 7)."""
+    return process_groups_supported()
 
 
 def _spawned_group_pgid(process: asyncio.subprocess.Process) -> int | None:
@@ -462,40 +636,24 @@ def _own_group_pgid(process: asyncio.subprocess.Process | None) -> int | None:
     if not isinstance(pid, int) or not _process_groups_supported():
         return None
     try:
-        return pid if os.getpgid(pid) == pid else None
+        if os.getpgid(pid) != pid:
+            return None
     except (ProcessLookupError, PermissionError, OSError):
         return None
+    # Verified while the process is ours: trusted until observed empty
+    # (round 8, claude N-A).
+    trust_group(process, pid)
+    return pid
 
 
-def _kill_retained_group(group_pgid: int | None) -> None:
-    """SIGKILL a group whose leader asyncio has already reaped, synchronously.
-
-    Only while (1) the group still has a member (``killpg(pgid, 0)``) and (2)
-    no process holds the leader's pid (``kill(pgid, 0)`` fails with
-    ``ProcessLookupError``). While any member of our group lives, the kernel
-    keeps the id in use, so it cannot have been handed to a new process; a
-    process holding that pid therefore means the id was reused after our
-    group emptied, and the group is left alone. Residual: the id is reused
-    by a new session leader that then exits while its own children live, all
-    between our reap and this call -- the pid space must cycle in that window.
-    """
-    if group_pgid is None or not _process_groups_supported():
-        return
-    try:
-        os.killpg(group_pgid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
-        return  # no member left (or not ours to signal)
-    try:
-        os.kill(group_pgid, 0)
-        return  # a live process holds the leader's pid: the id was reused
-    except ProcessLookupError:
-        pass
-    except (PermissionError, OSError):
-        return
-    try:
-        os.killpg(group_pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+def _kill_retained_group(group_pgid: int | None, owner: Any = None) -> None:
+    """SIGKILL a group whose leader has been reaped, synchronously -- only
+    while pmcp still trusts the id (for ``owner``, when given: not observed
+    empty since its leader was spawned, round 8, claude N-A), a member
+    remains, and no process holds the leader's pid
+    (:func:`pmcp.child_output.signal_retained_group`, the one rule shared by
+    every kill site, Consiliency/pmcp#388 round 7)."""
+    signal_retained_group(group_pgid, owner=owner)
 
 
 def _kill_process_tree_now(
@@ -506,40 +664,17 @@ def _kill_process_tree_now(
     """SIGKILL a downstream process and its group, synchronously.
 
     The uninterruptible step of a cancelled teardown (Consiliency/pmcp#324):
-    no await, so nothing can cancel or skip it. The leader is signalled only
-    while ``process.returncode is None`` -- once asyncio has reaped it, its
-    pid may be reused. Its group is signalled when the leader leads it (taken
-    from ``os.getpgid`` while the leader is unreaped) or when ``group_pgid``
-    was cached earlier by `_terminate_process_tree` and the group is still
-    alive.
+    no await, so nothing can cancel or skip it. It is
+    :func:`pmcp.child_output.kill_process_tree_now`, the one kill rule every
+    kill site shares (Consiliency/pmcp#388 round 7): the leader only while
+    it is alive or an unreaped zombie -- asked of the kernel, not only
+    ``returncode``, since asyncio's watcher thread reaps first on 3.10/3.11
+    -- and the group through the retained, checked id once it is reaped.
     """
-    if not _process_groups_supported():
-        group_pgid = None
-    if process is None:
-        _kill_retained_group(group_pgid)
-        return
-    pid = process.pid
-    if process.returncode is not None:
-        # The leader is reaped: never signal its pid; the group only through
-        # the retained, checked id (codex round 5).
-        _kill_retained_group(group_pgid)
-        return
-    if isinstance(pid, int):
-        if group_pgid is None and hasattr(os, "getpgid"):
-            try:
-                if os.getpgid(pid) == pid:
-                    group_pgid = pid
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-        try:
-            process.kill()
-        except (ProcessLookupError, OSError):
-            pass
-    if group_pgid is not None and hasattr(os, "killpg"):
-        try:
-            os.killpg(group_pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+    kill_process_tree_now(process, group_pgid=group_pgid)
+    # And its pipes, now: every teardown that drops a process closes them
+    # (round 10, codex F001).
+    release(process)
 
 
 async def _terminate_process_tree(
@@ -559,109 +694,148 @@ async def _terminate_process_tree(
     (e.g. an adopted install-time process) or the group is already gone, so this
     never accidentally signals an unrelated group such as the gateway's own.
     """
-    if process is None or process.returncode is not None:
-        # Already reaped: a grandchild may still hold the group (codex round
-        # 5). Kill it through the id retained at spawn, never the pid.
-        _kill_retained_group(group_pgid)
-        return
-    retained_pgid = group_pgid if _process_groups_supported() else None
-
-    def _signal(kill: bool) -> None:
-        # Process-group signalling is POSIX-only. On Windows os.getpgid/os.killpg
-        # (and signal.SIGKILL) don't exist, so fall back to the cross-platform
-        # process.terminate()/kill() — preserving the pre-process-group behavior.
-        pid = process.pid
-        pgid: int | None = None
-        if isinstance(pid, int) and hasattr(os, "getpgid"):
-            try:
-                pgid = os.getpgid(pid)
-            except (ProcessLookupError, PermissionError, OSError):
-                pgid = None
-        # Only signal the group if this process leads it; otherwise signalling
-        # its group could hit unrelated processes (including the gateway, for an
-        # adopted process that was not given its own session).
-        if pgid is not None and pgid == pid and hasattr(os, "killpg"):
-            try:
-                os.killpg(pgid, signal.SIGKILL if kill else signal.SIGTERM)
-                return
-            except (ProcessLookupError, PermissionError):
-                pass
-        try:
-            if kill:
-                process.kill()
-            else:
-                process.terminate()
-        except ProcessLookupError:
-            pass
-
-    # Cache the process group up front: once the leader exits, os.getpgid(pid)
-    # fails, so we could no longer find the group to escalate against. Only set
-    # when this process leads its own group (POSIX, start_new_session=True).
-    group_pgid = retained_pgid
-    pid = process.pid
-    if (
-        group_pgid is None
-        and isinstance(pid, int)
-        and hasattr(os, "getpgid")
-        and hasattr(os, "killpg")
-    ):
-        try:
-            if os.getpgid(pid) == pid:
-                group_pgid = pid
-        except (ProcessLookupError, PermissionError, OSError):
-            group_pgid = None
-
-    def _group_alive() -> bool:
-        if group_pgid is None:
-            return False
-        try:
-            os.killpg(group_pgid, 0)  # signal 0 == liveness probe
-            return True
-        except (ProcessLookupError, PermissionError, OSError):
-            return False
-
-    _signal(kill=False)
     try:
-        try:
-            await bounded_wait(process.wait(), timeout=5.0)
-            leader_exited = True
-        except asyncio.TimeoutError:
-            leader_exited = False
+        if _child_output._windows():
+            # Windows first (round 8, codex F002 = gemini F001 = grok F001): the
+            # child's Job Object is terminated -- and its handle released --
+            # whether or not the leader is still alive; a leader that exited
+            # first must not leave its descendants (or the handle) behind. No
+            # job: the child alone.
+            kill_process_tree_now(process)
+            if process is not None and process.returncode is None:
+                try:
+                    await bounded_wait(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{name}] Process PID={process.pid} did not exit")
+            return
+        if process is None or not leader_reserved(process):
+            # Already reaped (asked of the kernel, not only `returncode`: round 7,
+            # claude N-B): a grandchild may still hold the group (codex round 5).
+            # Kill it through the id retained at spawn, never the pid, and only
+            # while it is still trusted for this process (round 8, claude N-A).
+            _kill_retained_group(group_pgid, owner=process)
+            return
+        retained_pgid = group_pgid if _process_groups_supported() else None
 
-        # If the leader is still alive, SIGKILL it (and, when it leads a group, the
-        # whole group). The leader exiting is NOT sufficient: a grandchild (e.g. a
-        # SIGTERM-ignoring browser) can outlive the leader inside the group and keep
-        # the profile SingletonLock — so we still escalate to a group SIGKILL below.
-        if not leader_exited:
-            _signal(kill=True)
+        def _signal(kill: bool) -> None:
+            # Process-group signalling is POSIX-only. On Windows os.getpgid/os.killpg
+            # (and signal.SIGKILL) don't exist, so fall back to the cross-platform
+            # process.terminate()/kill() — preserving the pre-process-group behavior.
+            # (Windows never reaches here: the job is terminated at entry, round 8.)
+            # The one kill rule (round 7, claude N-B): the group is signalled
+            # directly only while the leader still reserves its id -- an await
+            # precedes this call, and the leader may have been reaped in it.
+            if not leader_reserved(process):
+                _kill_retained_group(group_pgid, owner=process)
+                return
+            pid = process.pid
+            pgid: int | None = None
+            if isinstance(pid, int) and hasattr(os, "getpgid"):
+                try:
+                    pgid = os.getpgid(pid)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pgid = None
+            # Only signal the group if this process leads it; otherwise signalling
+            # its group could hit unrelated processes (including the gateway, for an
+            # adopted process that was not given its own session).
+            if pgid is not None and pgid == pid and hasattr(os, "killpg"):
+                try:
+                    os.killpg(pgid, signal.SIGKILL if kill else signal.SIGTERM)
+                    return
+                except (ProcessLookupError, PermissionError):
+                    pass
             try:
-                await bounded_wait(process.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"[{name}] Process PID={process.pid} did not exit after SIGKILL "
-                    "(possible D-state / uninterruptible I/O wait)"
-                )
-
-        if _group_alive():
-            try:
-                os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
-            except (ProcessLookupError, PermissionError, OSError):
+                if kill:
+                    process.kill()
+                else:
+                    process.terminate()
+            except ProcessLookupError:
                 pass
-            for _ in range(30):  # up to ~3s for the OS to reap the group
-                if not _group_alive():
-                    break
-                await asyncio.sleep(0.1)
-            else:
-                logger.warning(
-                    f"[{name}] process group {group_pgid} survived SIGKILL "
-                    "(possible orphaned grandchild / D-state)"
-                )
-    except asyncio.CancelledError:
-        # Whoever cancelled this wait -- a caller, or loop shutdown cancelling
-        # every task -- the tree is SIGKILLed synchronously before the
-        # cancellation propagates (Consiliency/pmcp#324).
-        _kill_process_tree_now(process, group_pgid=group_pgid)
-        raise
+
+        # Cache the process group up front: once the leader exits, os.getpgid(pid)
+        # fails, so we could no longer find the group to escalate against. Only set
+        # when this process leads its own group (POSIX, start_new_session=True).
+        group_pgid = retained_pgid
+        pid = process.pid
+        if (
+            group_pgid is None
+            and isinstance(pid, int)
+            and hasattr(os, "getpgid")
+            and hasattr(os, "killpg")
+        ):
+            try:
+                if os.getpgid(pid) == pid:
+                    group_pgid = pid
+            except (ProcessLookupError, PermissionError, OSError):
+                group_pgid = None
+        # The leader is reserved (checked at entry): a group it leads is
+        # verified now, and trusted for it until observed empty (round 8,
+        # claude N-A). An id that is not the leader's own group is never used.
+        if group_pgid is not None:
+            try:
+                if os.getpgid(pid) == group_pgid:
+                    trust_group(process, group_pgid)
+                else:
+                    group_pgid = None
+            except (ProcessLookupError, PermissionError, OSError, AttributeError):
+                pass
+
+        def _group_alive() -> bool:
+            # A probe of the trusted group; the first that finds it empty
+            # forgets the id for good (round 8, claude N-A).
+            return observe_group(group_pgid, process)
+
+        _signal(kill=False)
+        try:
+            try:
+                await bounded_wait(process.wait(), timeout=5.0)
+                leader_exited = True
+            except asyncio.TimeoutError:
+                leader_exited = False
+
+            # If the leader is still alive, SIGKILL it (and, when it leads a group, the
+            # whole group). The leader exiting is NOT sufficient: a grandchild (e.g. a
+            # SIGTERM-ignoring browser) can outlive the leader inside the group and keep
+            # the profile SingletonLock — so we still escalate to a group SIGKILL below.
+            if not leader_exited:
+                _signal(kill=True)
+                try:
+                    await bounded_wait(process.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[{name}] Process PID={process.pid} did not exit after SIGKILL "
+                        "(possible D-state / uninterruptible I/O wait)"
+                    )
+
+            if _group_alive():
+                if leader_reserved(process):
+                    try:
+                        os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+                else:
+                    # The leader is reaped: the id is signalled only through the
+                    # retained-group checks, so a reused pid is never reached.
+                    _kill_retained_group(group_pgid, owner=process)
+                for _ in range(30):  # up to ~3s for the OS to reap the group
+                    if not _group_alive():
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    logger.warning(
+                        f"[{name}] process group {group_pgid} survived SIGKILL "
+                        "(possible orphaned grandchild / D-state)"
+                    )
+        except asyncio.CancelledError:
+            # Whoever cancelled this wait -- a caller, or loop shutdown cancelling
+            # every task -- the tree is SIGKILLed synchronously before the
+            # cancellation propagates (Consiliency/pmcp#324).
+            _kill_process_tree_now(process, group_pgid=group_pgid)
+            raise
+    finally:
+        # Every exit drops the process with its pipes closed (round
+        # 10, codex F001): every caller tears down through here.
+        release(process)
 
 
 # Heartbeat thresholds for health monitoring
@@ -914,7 +1088,11 @@ def _entry_label(entry: Any, key: str = "name") -> str:
         identifier = entry.get(key)
         if isinstance(identifier, str) and identifier:
             return repr(identifier)
-    return repr(entry)[:120]
+        # No usable identifier: describe the entry's structure, never its
+        # content -- the downstream's data that failed validation
+        # (Consiliency/pmcp#297, rev 10; it was `repr(entry)[:120]`).
+        return f"(an entry with {len(entry)} key{'' if len(entry) == 1 else 's'})"
+    return f"(a {type(entry).__name__} entry)"
 
 
 def _required_identity(entry: Any, key: str) -> str:
@@ -1389,6 +1567,9 @@ class ManagedClient:
     # drains the queue, recreated on demand when the previous one is done.
     outbound: asyncio.Queue[dict[str, Any]] | None = None
     outbound_writer: asyncio.Task[None] | None = None
+    # Forgets the group the moment it is empty (round 8, claude N-A);
+    # cancelled with the client's other tasks (round 9, codex F002).
+    group_watch: asyncio.Task[None] | None = None
     # The process group the downstream leads, so every kill path can reach a
     # grandchild after asyncio has reaped the leader (codex rounds 5 and 6,
     # Consiliency/pmcp#324). Set by the creator from the spawn contract
@@ -1513,7 +1694,9 @@ class ClientManager:
         errors: list[str] = []
         for config, result in zip(configs, results):
             if isinstance(result, Exception):
-                error_msg = f"Failed to connect to {config.name}: {result}"
+                error_msg = (
+                    f"Failed to connect to {config.name}: {exception_text(result)}"
+                )
                 logger.error(error_msg)
                 errors.append(error_msg)
 
@@ -1545,6 +1728,17 @@ class ClientManager:
         finally:
             if self._connect_tasks.get(name) is task:
                 self._connect_tasks.pop(name, None)
+
+    def _watch_server_group(self, name: str, managed: ManagedClient) -> None:
+        """Forget a stdio server's group -- spawned or adopted -- the moment
+        it is observed empty, so a later teardown never trusts an id that a
+        pid wrap handed to another group (round 8, claude N-A). The watcher
+        is the server's background task, cancelled with it."""
+        if managed.process is not None and managed.group_pgid is not None:
+            managed.group_watch = self._track_background_task(
+                asyncio.create_task(watch_group(managed.process, managed.group_pgid)),
+                name,
+            )
 
     def _track_background_task(
         self, task: _TaskT, server_name: str | None = None
@@ -2125,15 +2319,8 @@ class ClientManager:
             payload["task"] = {"requestorContext": requestor_context}
         return payload
 
-    def _extract_task_payload(self, result: dict[str, Any]) -> dict[str, Any] | None:
-        task = result.get("task")
-        if isinstance(task, dict):
-            return task
-        if isinstance(result.get("taskId"), str):
-            return result
-        return None
-
-    def _task_info_from_payload(self, payload: dict[str, Any]) -> McpTaskInfo | None:
+    @staticmethod
+    def _task_info_from_payload(payload: dict[str, Any]) -> McpTaskInfo | None:
         task_id = payload.get("taskId") or payload.get("task_id")
         if not isinstance(task_id, str) or not task_id:
             return None
@@ -2187,10 +2374,11 @@ class ClientManager:
             created_at=created_at,
             updated_at=updated_at,
             # MCP's milliseconds become pmcp's seconds here, and only here;
-            # `raw` keeps the downstream's own units (Consiliency/pmcp#330).
+            # `raw` keeps the downstream's own units (Consiliency/pmcp#330),
+            # without the values pmcp dropped as unusable (Consiliency/pmcp#297).
             ttl=task_duration_from_wire("ttl", payload.get("ttl")),
             poll_interval=task_duration_from_wire("poll_interval", poll_interval),
-            raw=payload,
+            raw=_usable_task_raw(payload),
         )
 
     def _record_task(
@@ -2588,7 +2776,9 @@ class ClientManager:
             ("prompts", listing_results[2]),
         ):
             if isinstance(result, BaseException):
-                logger.debug(f"Server {name} doesn't support {kind}: {result}")
+                logger.debug(
+                    f"Server {name} doesn't support {kind}: {exception_text(result)}"
+                )
                 listings[kind] = None
             else:
                 listings[kind] = result
@@ -2677,14 +2867,15 @@ class ClientManager:
             if not isinstance(raw_cursor, str) or not raw_cursor:
                 logger.warning(
                     f"[{managed.config.name}] {kind}/list returned an unusable "
-                    f"cursor ({raw_cursor!r}); treating as unreadable rather "
-                    f"than as the end of the listing"
+                    f"cursor ({describe_value(raw_cursor)}); treating as "
+                    f"unreadable rather than as the end of the listing"
                 )
                 return None
             if raw_cursor in seen_cursors:
                 logger.warning(
-                    f"[{managed.config.name}] {kind}/list repeated cursor "
-                    f"{raw_cursor!r}; treating as unreadable rather than looping"
+                    f"[{managed.config.name}] {kind}/list repeated a cursor "
+                    f"({describe_value(raw_cursor)}); treating as unreadable "
+                    f"rather than looping"
                 )
                 return None
             seen_cursors.add(raw_cursor)
@@ -3057,18 +3248,21 @@ class ClientManager:
 
         # Spawn process (semaphore caps concurrent spawns to avoid FD exhaustion)
         async with self._spawn_semaphore:
-            process = await asyncio.create_subprocess_exec(
-                local_config.command,
-                *local_config.args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=local_config.cwd,
-                env=env,
-                limit=_stdio_read_limit(),
-                # New session/process group so we can reap the whole tree
-                # (e.g. browsers launched by the server) on disconnect.
-                start_new_session=True,
+            process = await spawn_owned(
+                lambda: asyncio.create_subprocess_exec(
+                    local_config.command,
+                    *local_config.args,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=local_config.cwd,
+                    env=env,
+                    limit=_stdio_read_limit(),
+                    # New session/process group so we can reap the whole tree
+                    # (e.g. browsers launched by the server) on disconnect, and
+                    # no controlling terminal (`start_new_session=True` on POSIX).
+                    **detached(),
+                )
             )
 
         managed = ManagedClient(
@@ -3080,7 +3274,10 @@ class ClientManager:
             # true even if it has already exited and been reaped.
             group_pgid=_spawned_group_pgid(process),
         )
-        self._clients[name] = managed
+        # The spawn awaited: shutdown may have swept since `_connect_server`
+        # checked (round 12).
+        self._register_or_kill(name, managed)
+        self._watch_server_group(name, managed)
 
         # Start reading stderr in background
         if process.stderr:
@@ -3181,6 +3378,9 @@ class ClientManager:
         already in flight (a `refresh` holding the lock) or queued behind
         one cannot spawn a server afterwards (`_connect_server`)."""
         self._abandoned = True
+        # Every spawn still in flight is owned and killed when it completes
+        # (Consiliency/pmcp#388 round 14).
+        abandon_pending_spawns()
         for name, managed in list(self._clients.items()):
             self._abandon_client_io(name, managed)
         self._cancel_background_tasks_now()
@@ -3217,7 +3417,12 @@ class ClientManager:
         """
         if managed.status.status == ServerStatusEnum.ONLINE:
             managed.status.status = ServerStatusEnum.OFFLINE
-        for task in (managed.read_task, managed.stderr_task, managed.outbound_writer):
+        for task in (
+            managed.read_task,
+            managed.stderr_task,
+            managed.outbound_writer,
+            managed.group_watch,
+        ):
             _cancel_without_waiting(task)
         managed.outbound = None
         managed.outbound_writer = None
@@ -3226,6 +3431,7 @@ class ClientManager:
                 _abandon_owner(managed.transport_owner_task, managed.transport_shutdown)
             else:
                 _kill_process_tree_now(managed.process, group_pgid=managed.group_pgid)
+                release(managed.process)  # its pipes, now (round 10)
         except Exception as exc:
             logger.warning(
                 f"[{name}] teardown step failed while abandoning a cancelled "
@@ -3477,7 +3683,8 @@ class ClientManager:
                 transport_owner_task=owner_task,
                 transport_shutdown=shutdown,
             )
-            self._clients[name] = managed
+            # `ready` awaited: a refusal here unwinds the owner below.
+            self._register_or_kill(name, managed)
         except BaseException:
             # BaseException, not Exception: cancellation is the case that
             # bites here, and it is a BaseException. Cancel rather than
@@ -3578,12 +3785,16 @@ class ClientManager:
                     f"[{name}] downstream sent undecodable bytes on stdout; "
                     "the line was decoded with replacement characters"
                 )
-            message = json.loads(text)
-        except json.JSONDecodeError:
-            # Non-JSON output already counted as a heartbeat by the caller.
-            logger.debug(
-                f"[{name}] Non-JSON output: {line.decode(errors='replace').strip()}"
-            )
+            message = load_json(text, source="downstream stdio frame")
+        except json.JSONDecodeError as error:
+            # Already counted as a heartbeat by the caller. A line that is not
+            # a JSON-RPC message is never shown, whatever it holds: a banner,
+            # a log line, or part of a frame the downstream broke across lines
+            # (Consiliency/pmcp#297, rev 12). MCP's stdio transport allows only
+            # newline-delimited messages on stdout; a server's own log belongs
+            # on stderr, which is logged as before. The record is fixed text
+            # plus the parser's value-free description.
+            logger.debug(f"[{name}] non-protocol stdout line: {exception_text(error)}")
             return
         except (ValueError, RecursionError) as e:
             # Parses as neither JSON nor a JSONDecodeError: an integer over
@@ -3621,34 +3832,32 @@ class ClientManager:
     ) -> None:
         """Classify one frame and act on it. See `_dispatch_downstream_frame`.
 
-        Each guard below exists because a later access depends on it, and each
-        drops the frame with a value-free debug log, as a non-JSON line is
-        dropped:
+        A frame that is not a JSON-RPC 2.0 message (`jsonrpc_envelope_problem`)
+        is dropped with a value-free record, like a line that is not JSON
+        (Consiliency/pmcp#297, rev 13). Before, the guards here were only the
+        ones a later access depended on, so `{"jsonrpc": "1.0", "id": 8,
+        "error": {...}}`, a frame with no `jsonrpc`, one with both `result`
+        and `error`, or one whose `error.code` was an object resolved pending
+        request 8, and its `message` reached the caller's log as the
+        downstream's error. A malformed frame carrying a pending request's id
+        does not settle that request: nothing in a frame that is not a message
+        is acted on, its id included, so the request is answered by a valid
+        frame or times out (idle timeout; `tools/call`'s ceiling). The
+        alternative, failing it with fixed text, would let any line that
+        parses with a colliding id end a caller's request.
 
-        - `frame.get` / `"method" in frame` / `frame["error"]` need a JSON
-          object: `[]`, `42`, `"x"`, `null`, `true` all parse but are not one.
-        - `msg_id in managed.pending_requests` needs a hashable id, and must not
-          match one of our int ids by numeric equality: `True == 1` and
-          `1.0 == 1` both hash equal, so a bool or float id would resolve
-          request 1. JSON-RPC ids are strings, integers or null.
-        - `set_result` / `set_exception` raise `InvalidStateError` on a future
-          that is already settled (a caller cancelled it, and the response
-          raced its `finally` pop).
+        The envelope rules also give the dispatcher what its accesses need: a
+        JSON object; an id that is a string or an integer, so a bool or float
+        cannot resolve request 1 by numeric equality. `set_result` /
+        `set_exception` still raise `InvalidStateError` on a future that is
+        already settled (a caller cancelled it, and the response raced its
+        `finally` pop), which is checked below.
         """
-        if not isinstance(frame, dict):
-            logger.debug(
-                f"[{name}] dropped invalid frame: not a JSON object "
-                f"({type(frame).__name__})"
-            )
+        problem = jsonrpc_envelope_problem(frame)
+        if problem is not None:
+            logger.debug(f"[{name}] dropped invalid frame: {problem}")
             return
         msg_id = frame.get("id")
-        if msg_id is not None and (
-            isinstance(msg_id, bool) or not isinstance(msg_id, (str, int))
-        ):
-            logger.debug(
-                f"[{name}] dropped invalid frame: id of type {type(msg_id).__name__}"
-            )
-            return
         method = frame.get("method")
         # Classify by `method` FIRST (C-01). A frame carrying a `method` can
         # never resolve a pending future, so this both handles server->client
@@ -3657,20 +3866,12 @@ class ClientManager:
         # mistaken for that response.
         if isinstance(method, str):
             if msg_id is None:
-                # Notification: no id, nothing to resolve.
+                # Notification: no id (or `id: null`, which main and the MCP
+                # SDK read as a notification; rev 15), nothing to resolve.
                 self._handle_downstream_notification(name, managed, method)
             else:
                 # Server->client request: reply (ping -> {} else -32601).
                 self._reply_to_downstream_request(name, managed, msg_id, method)
-        elif "method" in frame:
-            # A `method` that is present but not a string is not a valid
-            # JSON-RPC request -- and it is not a response either, so it must
-            # not fall through to the pending lookup, where an id colliding with
-            # one of ours would resolve that future.
-            logger.debug(
-                f"[{name}] dropped invalid frame: non-string method "
-                f"({type(method).__name__})"
-            )
         elif msg_id is not None and msg_id in managed.pending_requests:
             pending = managed.pending_requests.pop(msg_id)
 
@@ -4459,7 +4660,12 @@ class ClientManager:
     async def _cleanup_client_io(self, name: str, managed: ManagedClient) -> None:
         """`_cleanup_client`'s graceful teardown; a caller cancellation
         propagates out of any await here."""
-        for task in (managed.read_task, managed.stderr_task, managed.outbound_writer):
+        for task in (
+            managed.read_task,
+            managed.stderr_task,
+            managed.outbound_writer,
+            managed.group_watch,
+        ):
             await _reap_child(task)
         # Reset the outbound path so nothing survives onto a next generation.
         # The writer was cancelled above, but the Queue -- and any reply /
@@ -4493,9 +4699,12 @@ class ClientManager:
                     f"[{name}] Error closing remote transport: {describe_exception(e)}"
                 )
         else:
-            await _terminate_process_tree(
-                managed.process, name, group_pgid=managed.group_pgid
-            )
+            try:
+                await _terminate_process_tree(
+                    managed.process, name, group_pgid=managed.group_pgid
+                )
+            finally:
+                release(managed.process)  # its pipes, now (round 10)
 
     async def refresh(self, configs: list[ResolvedServerConfig]) -> list[str]:
         """Refresh connections (disconnect + reconnect)."""
@@ -4551,11 +4760,33 @@ class ClientManager:
             # signals a reaped leader's pid, checks a retained group for
             # reuse, and never raises (so the cancel is what propagates).
             _kill_process_tree_now(process, group_pgid=group_pgid)
+            release(process)
             raise
         try:
             await self._adopt_process_locked(name, process, config)
         finally:
             self._lifecycle_lock.release()
+
+    def _register_or_kill(self, name: str, managed: ManagedClient) -> None:
+        """Register a client -- the only place one is registered -- unless
+        the manager has been abandoned, checked here with no await between
+        the check and the registration (Consiliency/pmcp#388 round 12, codex
+        F001). Every registration path (connect, reconnect, refresh, lazy
+        start, adoption) awaits before it registers, and `abandon_all_now()`
+        may have swept in that await: a client registered afterwards would
+        outlive the shutdown with no owner. Refused, its process is killed
+        with its group and its pipes closed, and `_ManagerAbandoned` raised."""
+        if self._abandoned:
+            if managed.process is not None:
+                _kill_process_tree_now(managed.process, group_pgid=managed.group_pgid)
+            raise _ManagerAbandoned(
+                f"Not registering {name}: the client manager was abandoned"
+            )
+        # The name's records are dropped here too, the instant before the new
+        # connection is registered (every caller dropped them before its
+        # awaits; nothing has been indexed for the new one yet).
+        self._remove_server_indexes(name)
+        self._clients[name] = managed
 
     def _refuse_adoption_if_abandoned(self, name: str) -> None:
         # Adoption registers a client without going through `_connect_server`,
@@ -4587,6 +4818,14 @@ class ClientManager:
             raise RuntimeError(f"Process for {name} has no stdout pipe")
 
         logger.info(f"Adopting process for MCP server: {name}")
+
+        # A client already registered under this name -- a lazy connect of
+        # the same server during a long install -- is torn down, not
+        # overwritten: its process would otherwise be left running with no
+        # owner (round 11, claude).
+        existing = self._clients.get(name)
+        if existing is not None:
+            await self._cleanup_client(name, existing)
 
         # #175 item 2. Every other path into the indexers clears this server's
         # entries first. The two this one is modelled on are the connect and
@@ -4625,7 +4864,10 @@ class ClientManager:
             # as running above).
             group_pgid=_own_group_pgid(process),
         )
-        self._clients[name] = managed
+        # The same-name teardown above awaited: a `disconnect_all` cancelled
+        # meanwhile ran `abandon_all_now()` (round 12, codex F001).
+        self._register_or_kill(name, managed)
+        self._watch_server_group(name, managed)
 
         # Start reading stderr in background (if available)
         if process.stderr:
@@ -4718,12 +4960,10 @@ class ClientManager:
             )
 
         support = self._tool_task_support(tool_info)
-        task_requested = task is not None
-        if support == "required":
-            task_requested = True
-        if task_requested and support == "forbidden":
+        asked = task is not None or support == "required"
+        if asked and support == "forbidden":
             raise RuntimeError(f"Tool {tool_id} does not support MCP task execution")
-        if task_requested and not self._server_supports_tasks(managed):
+        if asked and not self._server_supports_tasks(managed):
             raise RuntimeError(
                 f"Server {tool_info.server_name} does not advertise MCP task support"
             )
@@ -4733,17 +4973,15 @@ class ClientManager:
         if trace_meta:
             params["_meta"] = {**params.get("_meta", {}), **trace_meta}
         requestor_context: dict[str, Any] | None = None
+        task_requested = effective_task_mode(tool_info, task)
         if task_requested:
             parsed_task = (
                 task
                 if isinstance(task, TaskMetadataInput)
                 else TaskMetadataInput.model_validate(task or {})
             )
-            if not parsed_task.enabled and support != "required":
-                task_requested = False
-            else:
-                params["task"] = self._task_wire_metadata(parsed_task)
-                requestor_context = parsed_task.requestor_context
+            params["task"] = self._task_wire_metadata(parsed_task)
+            requestor_context = parsed_task.requestor_context
 
         # Send tool call with metadata for health monitoring
         result = await self._send_request(
@@ -4755,17 +4993,18 @@ class ClientManager:
         )
         built: McpTaskRecord | None = None
         if task_requested and isinstance(result, dict):
-            task_payload = self._extract_task_payload(result)
-            if task_payload is not None:
-                task_info = self._task_info_from_payload(task_payload)
-                if task_info is not None:
-                    built = self._record_task(
-                        tool_info.server_name,
-                        task_info,
-                        tool_id=tool_id,
-                        requestor_context=requestor_context,
-                        connection=managed,
-                    )
+            found = task_answer_of(result)
+            if found is not None:
+                built = self._record_task(
+                    tool_info.server_name,
+                    found[1],
+                    tool_id=tool_id,
+                    requestor_context=requestor_context,
+                    connection=managed,
+                )
+            # A task call returns, and is sized from, the answer reduced to
+            # what pmcp could use (Consiliency/pmcp#297 rev 14/17).
+            result = usable_task_response(result)
 
         return TaskReply(result, built)
 
@@ -4961,13 +5200,12 @@ class ClientManager:
             "tasks/get",
             self._task_request_params(task_id=task_id, requestor_context=sent_context),
         )
-        payload = self._extract_task_payload(result) or result
-        task_info = self._task_info_from_payload(payload)
-        if task_info is None:
+        found = task_answer_of(result)
+        if found is None:
             raise KeyError(f"Task not found: {server_name}::{task_id}")
         return self._record_task(
             server_name,
-            task_info,
+            found[1],
             requestor_context=None,  # a reply supplies no context
             connection=managed,
         )
@@ -5007,17 +5245,19 @@ class ClientManager:
             self._task_request_params(task_id=task_id, requestor_context=context),
         )
         built: McpTaskRecord | None = None
-        task_payload = self._extract_task_payload(result)
-        if task_payload is not None:
-            task_info = self._task_info_from_payload(task_payload)
-            if task_info is not None:
-                built = self._record_task(
-                    server_name,
-                    task_info,
-                    requestor_context=None,  # a reply supplies no context
-                    connection=managed,
-                )
-        elif self._owns(server_name, managed):
+        # The parser is the only task recogniser (Consiliency/pmcp#297 rev
+        # 15): a reply carries a task only if it parses. The `tasks/get`
+        # fallback keeps main's condition exactly -- the reply names no task
+        # at all -- and Consiliency/pmcp#338's connection rule.
+        found = task_answer_of(result)
+        if found is not None:
+            built = self._record_task(
+                server_name,
+                found[1],
+                requestor_context=None,  # a reply supplies no context
+                connection=managed,
+            )
+        elif not _names_a_task(result) and self._owns(server_name, managed):
             # The fallback continues this request on the connection it started
             # on, never one resolved again by name (rev 7). If that connection
             # was replaced during `tasks/result`, there is nothing to continue
@@ -5029,10 +5269,11 @@ class ClientManager:
                 connection=managed,
             )
         # A reply about a different task is recorded, but it is not this
-        # task's record.
+        # task's record. The reply is returned reduced to what pmcp could use
+        # (Consiliency/pmcp#297).
         if built is not None and built.task_id != task_id:
             built = None
-        return TaskReply(result, built)
+        return TaskReply(usable_task_response(result), built)
 
     @_pins_task
     async def cancel_task(
@@ -5077,14 +5318,18 @@ class ClientManager:
         )
         params["force"] = force
         result = await self._send_request(managed, "tasks/cancel", params)
-        payload = self._extract_task_payload(result) or result
-        task_info = self._task_info_from_payload(payload)
-        if task_info is None:
+        found = task_answer_of(result)
+        if found is not None:
+            task_info = found[1]
+        else:
+            # The answer carries no task pmcp can parse, so nothing in it was
+            # read: `raw` stays empty rather than holding the whole answer
+            # (rev 15, round-14 claude F001: an unparseable task's `ttl` went
+            # back out through `gateway.tasks_cancel`).
             task_info = McpTaskInfo(
                 task_id=task_id,
                 status="cancelled",
                 updated_at=time.time(),
-                raw=result,
             )
         return self._record_task(
             server_name,
@@ -5385,16 +5630,20 @@ class ClientManager:
         if "::" not in request_id:
             return (
                 "not_found",
-                f"Invalid request_id format: {request_id}",
+                "Invalid request_id format: expected server_name::local_id "
+                f"({describe_value(request_id)})",
                 False,
                 None,
             )
-
-        server_name, local_id_str = request_id.rsplit("::", 1)
-        try:
-            local_id = int(local_id_str)
-        except ValueError:
-            return ("not_found", f"Invalid local_id: {local_id_str}", False, None)
+        parsed_id = parse_request_id(request_id)
+        if parsed_id is None:
+            return (
+                "not_found",
+                "Invalid local_id: expected an integer (a string)",
+                False,
+                None,
+            )
+        server_name, local_id = parsed_id
 
         managed = self._clients.get(server_name)
         if not managed:

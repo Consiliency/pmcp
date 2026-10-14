@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 
 
 from pmcp import atomic_write as _atomic_write_module
+from pmcp.argument_errors import describe_value, exception_text
 from pmcp.atomic_write import (
     atomic_write,
     falls_back_to_pathname,
@@ -49,6 +50,7 @@ from pmcp.atomic_write import (
     open_final_directory,
     resolve_write_target,
 )
+from pmcp.parsing import load_json, parse_timestamp
 from pmcp.trust_store import (
     TrustStoreError,
     refuse_checkout_resident,
@@ -134,7 +136,8 @@ def package_approvals_path(*, project_root: Path | None = None) -> Path:
                 target = resolve_write_target(path)
     except OSError as exc:
         raise TrustStoreError(
-            f"Cannot resolve {path.name}: {os.strerror(exc.errno) if exc.errno else exc}"
+            f"Cannot resolve {path.name}: "
+            f"{os.strerror(exc.errno) if exc.errno else type(exc).__name__}"
         ) from exc
     try:
         refuse_checkout_resident(
@@ -155,13 +158,13 @@ def _require_identity_fields(registry: Any, name: Any, version: Any) -> None:
     """
     if not isinstance(registry, str) or not registry:
         raise ValueError(
-            f"package registry must be a non-empty string, not {registry!r}"
+            f"package registry must be a non-empty string, not {describe_value(registry)}"
         )
     if not isinstance(name, str) or not is_valid_package_name(name):
-        raise ValueError(f"not a valid package name: {name!r}")
+        raise ValueError(f"not a valid package name: {describe_value(name)}")
     if not isinstance(version, str) or not is_valid_package_version(version):
         raise ValueError(
-            f"not one exact package version: {version!r} "
+            f"not one exact package version: {describe_value(version)} "
             "(ranges and dist-tags pin nothing)"
         )
 
@@ -178,22 +181,34 @@ def _decode(entry: Any) -> PackageApproval:
         decision = entry["decision"]
         recorded_at = entry["recorded_at"]
     except KeyError as exc:
-        raise PackageApprovalError(f"Package approval entry is missing {exc}") from exc
+        missing: str | None = exception_text(exc)
+    else:
+        missing = None
+    if missing is not None:
+        # Raised after the handler, chaining nothing (rev 19/21).
+        raise PackageApprovalError(f"Package approval entry is missing {missing}")
 
+    # Raised outside the handler, chaining nothing, so the description shows
+    # (Consiliency/pmcp#297 rev 19).
+    failure: str | None = None
     try:
         _require_identity_fields(registry, name, version)
     except ValueError as exc:
-        raise PackageApprovalError(f"Invalid package approval entry: {exc}") from exc
+        failure = exception_text(exc)
+    if failure is not None:
+        raise PackageApprovalError(f"Invalid package approval entry: {failure}")
     if integrity is not None and not isinstance(integrity, str):
         raise PackageApprovalError("Package approval integrity is not a string")
     if decision not in DECISIONS:
-        raise PackageApprovalError(f"Unknown package decision: {decision!r}")
-    try:
-        parsed_at = datetime.fromisoformat(str(recorded_at))
-    except ValueError as exc:
         raise PackageApprovalError(
-            f"Unparseable package approval timestamp: {exc}"
-        ) from exc
+            f"Unknown package decision: {describe_value(decision)}"
+        )
+    try:
+        parsed_at = parse_timestamp(str(recorded_at), source="package approval record")
+    except ValueError as exc:
+        failure = exception_text(exc)
+    if failure is not None:
+        raise PackageApprovalError(f"Unparseable package approval timestamp: {failure}")
 
     return PackageApproval(
         registry=registry,
@@ -223,15 +238,21 @@ def _read_store_and_stale(
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
+        unreadable: str | None = exception_text(exc)
+    else:
+        unreadable = None
+    if unreadable is not None:
         raise PackageApprovalError(
-            f"Cannot read package approvals {path}: {exc}"
-        ) from exc
+            f"Cannot read package approvals {path}: {unreadable}"
+        )
+    failure: str | None = None
     try:
-        data = json.loads(raw)
+        data = load_json(raw, source="package approvals")
     except ValueError as exc:
-        raise PackageApprovalError(
-            f"Cannot parse package approvals {path}: {exc}"
-        ) from exc
+        failure = exception_text(exc)
+    if failure is not None:
+        # Outside the handler: chains nothing (Consiliency/pmcp#297 rev 19).
+        raise PackageApprovalError(f"Cannot parse package approvals {path}: {failure}")
     if not isinstance(data, dict):
         raise PackageApprovalError(f"Package approvals {path} is not a JSON object")
     entries = data.get("records")

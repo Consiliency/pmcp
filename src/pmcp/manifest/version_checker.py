@@ -13,6 +13,7 @@ import aiohttp
 from packaging.version import InvalidVersion, Version
 from semver import Version as SemverVersion
 
+from pmcp.argument_errors import exception_text
 from pmcp import __version__
 from pmcp.manifest.npm_resolver import get_resolver
 
@@ -1412,7 +1413,7 @@ async def get_npm_version(package_name: str, timeout: float = 10.0) -> str | Non
         logger.debug(f"npm lookup timeout for {package_name}")
         return None
     except Exception as e:
-        logger.debug(f"npm lookup error for {package_name}: {e}")
+        logger.debug(f"npm lookup error for {package_name}: {exception_text(e)}")
         return None
 
 
@@ -1454,7 +1455,7 @@ async def get_pypi_version(package_name: str, timeout: float = 10.0) -> str | No
         logger.debug(f"PyPI lookup timeout for {package_name}")
         return None
     except Exception as e:
-        logger.debug(f"PyPI lookup error for {package_name}: {e}")
+        logger.debug(f"PyPI lookup error for {package_name}: {exception_text(e)}")
         return None
 
 
@@ -1498,7 +1499,7 @@ async def get_cargo_version(crate_name: str, timeout: float = 10.0) -> str | Non
         logger.debug(f"crates.io lookup timeout for {crate_name}")
         return None
     except Exception as e:
-        logger.debug(f"crates.io lookup error for {crate_name}: {e}")
+        logger.debug(f"crates.io lookup error for {crate_name}: {exception_text(e)}")
         return None
 
 
@@ -1552,7 +1553,7 @@ async def get_docker_version(image_name: str, timeout: float = 10.0) -> str | No
         logger.debug(f"Docker Hub lookup timeout for {image_name}")
         return None
     except Exception as e:
-        logger.debug(f"Docker Hub lookup error for {image_name}: {e}")
+        logger.debug(f"Docker Hub lookup error for {image_name}: {exception_text(e)}")
         return None
 
 

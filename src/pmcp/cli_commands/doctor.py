@@ -11,6 +11,8 @@ from pmcp.auth import (
     sanitize_auth_diagnostic,
     sanitize_public_auth_url,
 )
+from pmcp.argument_errors import plain_name
+from pmcp.provision_gate import operator_safe
 from pmcp.remote_auth import build_remote_header_env_lookup, resolve_remote_headers
 
 
@@ -35,9 +37,13 @@ def collect_remote_header_diagnostics(
 
     env_lookup = build_remote_header_env_lookup(project_root)
 
-    for server_name, server_cfg in servers.items():
+    for raw_name, server_cfg in servers.items():
         if not isinstance(server_cfg, dict):
             continue
+        # A `.mcp.json` key is named as the operator wrote it (D9), but
+        # through `operator_safe`: a checkout's file may hold a tab, a bell or
+        # an ANSI escape in it (Consiliency/pmcp#297 implementation, F001).
+        server_name = operator_safe(str(raw_name))
         if server_cfg.get("type") not in {"remote", "sse", "http", "streamable-http"}:
             continue
 
@@ -52,13 +58,22 @@ def collect_remote_header_diagnostics(
             )
             continue
 
-        parsed = urlparse(raw_url.strip())
-        if not parsed.scheme or not parsed.netloc:
+        # A parse failure is caught here, at the parse site: `urlparse` (and
+        # `.port`) raise a ValueError whose message quotes the URL -- control
+        # characters and all -- and the CLI would print it (Consiliency/pmcp#388
+        # round 2, codex F001). It reads as the same fixed "is invalid" line.
+        try:
+            parsed = urlparse(raw_url.strip())
+            _ = parsed.port
+            well_formed = bool(parsed.scheme and parsed.netloc)
+        except ValueError:
+            well_formed = False
+        if not well_formed:
             checks.append(
                 (
                     "remote",
                     "fail",
-                    f"{server_name}: remote url '{sanitize_auth_diagnostic(raw_url)}' is invalid. Use an absolute URL (for example https://host/sse).",
+                    f"{server_name}: remote url {operator_safe(sanitize_auth_diagnostic(raw_url))} is invalid. Use an absolute URL (for example https://host/sse).",
                 )
             )
 
@@ -79,7 +94,7 @@ def collect_remote_header_diagnostics(
                     (
                         "remote",
                         "warn",
-                        f"{server_name}: {metadata_key} '{redact_auth_url(metadata_url)}' is invalid: {sanitize_auth_diagnostic(exc)}",
+                        f"{server_name}: {metadata_key} {operator_safe(redact_auth_url(metadata_url))} is invalid: {sanitize_auth_diagnostic(exc)}",
                     )
                 )
             else:
@@ -97,7 +112,7 @@ def collect_remote_header_diagnostics(
                         "remote",
                         "ok",
                         f"{server_name}: {metadata_key} configured at "
-                        f"{safe_metadata_url}{qualifier}.",
+                        f"{operator_safe(safe_metadata_url)}{qualifier}.",
                     )
                 )
 
@@ -111,12 +126,14 @@ def collect_remote_header_diagnostics(
             if isinstance(key, str) and isinstance(value, str)
         }
         resolution = resolve_remote_headers(string_headers, env_lookup)
-        for header_name, referenced_vars in sorted(
+        for raw_header, referenced_vars in sorted(
             resolution.referenced_env_vars_by_header.items()
         ):
-            for var_name in referenced_vars:
-                if var_name not in resolution.missing_env_vars:
+            header_name = operator_safe(str(raw_header))
+            for raw_var in referenced_vars:
+                if raw_var not in resolution.missing_env_vars:
                     continue
+                var_name = plain_name(raw_var)
                 checks.append(
                     (
                         "remote",

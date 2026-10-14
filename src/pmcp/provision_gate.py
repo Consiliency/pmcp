@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Literal
 
+from pmcp.argument_errors import exception_text
 from pmcp.package_approvals import is_package_approved
 from pmcp.validation import (
     is_valid_package_name,
@@ -108,8 +109,9 @@ def operator_safe(value: str) -> str:
     quoting when a control character was present, and ``repr()`` picks double
     quotes, inside which a shell still expands ``$(...)``.
     """
-    escaped = "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in value)
-    return shlex.quote(escaped)
+    from pmcp.display import display_safe
+
+    return shlex.quote(display_safe(value))
 
 
 def approve_package_command(identity: PackageIdentity) -> str:
@@ -465,7 +467,7 @@ def evaluate_provision(
         logger.warning(
             "Provisioning gate failed closed for %r: %s",
             getattr(server_config, "name", None),
-            exc,
+            exception_text(exc),
         )
         return _deny(
             "not_approved", _fallback_remedy(server_config, identity), identity

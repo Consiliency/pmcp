@@ -146,8 +146,9 @@ def _operator_safe(value: str) -> str:
     quotes. So `payload'<CR>$(id).json` executed on paste -- the control-character
     branch reintroduced the injection the helper exists to stop. Reproduced.
     """
-    escaped = "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in value)
-    return shlex.quote(escaped)
+    from pmcp.display import display_safe
+
+    return shlex.quote(display_safe(value))
 
 
 def _approval_path(target: Path, source: Path | None) -> str:

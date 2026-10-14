@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 import aiohttp
 
 from pmcp.atomic_write import atomic_write
+from pmcp.parsing import load_json
 
 logger = logging.getLogger(__name__)
 
@@ -494,7 +495,7 @@ async def _fetch_registry_servers_uncached(
                 if body is None:
                     diagnostics.append("registry_response_size_cap")
                     break
-                payload = json.loads(body.decode("utf-8"))
+                payload = load_json(body, source="registry response", encoding="utf-8")
                 cache = _parse_cache_payload(payload, endpoint)
                 servers.extend(cache.servers)
                 diagnostics.extend(cache.diagnostics)
@@ -693,7 +694,7 @@ def load_registry_cache(cache_path: Path | None = None) -> RegistryCache | None:
     """Load a deterministic registry cache, returning None on failure."""
     path = _cache_path(cache_path)
     try:
-        payload = json.loads(path.read_text())
+        payload = load_json(path.read_text(), source="registry cache")
     except Exception:
         return None
     if not isinstance(payload, dict):

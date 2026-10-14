@@ -198,10 +198,9 @@ class TestUpgradeCommand:
             dry_run=False,
             log_level="warn",
         )
-        fake_result = type("R", (), {"returncode": 0})()
         no_drift = InstallDrift(has_drift=False, uv_path=None, pip_user_site=None)
 
-        with patch("pmcp.cli.subprocess.run", return_value=fake_result) as run_mock:
+        with patch("pmcp.cli.run_echoed", return_value=0) as run_mock:
             with patch("pmcp.cli.detect_install_drift", return_value=no_drift):
                 await run_upgrade(args)
 
@@ -219,14 +218,13 @@ class TestUpgradeCommand:
             dry_run=False,
             log_level="warn",
         )
-        fake_result = type("R", (), {"returncode": 0})()
         drift = InstallDrift(
             has_drift=True,
             uv_path=tmp_path / "uv" / "pmcp",
             pip_user_site=tmp_path / "user_site",
         )
 
-        with patch("pmcp.cli.subprocess.run", return_value=fake_result):
+        with patch("pmcp.cli.run_echoed", return_value=0):
             with patch("pmcp.cli.detect_install_drift", return_value=drift):
                 await run_upgrade(args)
 

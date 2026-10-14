@@ -14,6 +14,9 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from pmcp.argument_errors import describe_value, exception_text
+from pmcp.display import display_safe
+from pmcp.parsing import load_json
 from pmcp.types import (
     ConfigSourceInfo,
     ConfigSourceName,
@@ -294,7 +297,7 @@ def parse_json_file(file_path: Path) -> McpConfigFile | None:
             return None
         content = file_path.read_bytes()
     except Exception as e:
-        logger.warning(f"Failed to parse config file {file_path}: {e}")
+        logger.warning(f"Failed to parse config file {file_path}: {exception_text(e)}")
         return None
     return parse_config_bytes(content, file_path)
 
@@ -310,7 +313,7 @@ def parse_config_bytes(content: bytes, file_path: Path) -> McpConfigFile | None:
     for diagnostics only; nothing here touches the filesystem.
     """
     try:
-        data = json.loads(content)
+        data = load_json(content, source="config file")
 
         raw_servers = data.get("mcpServers")
         if isinstance(raw_servers, dict):
@@ -331,7 +334,7 @@ def parse_config_bytes(content: bytes, file_path: Path) -> McpConfigFile | None:
 
         return McpConfigFile.model_validate(data)
     except Exception as e:
-        logger.warning(f"Failed to parse config file {file_path}: {e}")
+        logger.warning(f"Failed to parse config file {file_path}: {exception_text(e)}")
         return None
 
 
@@ -371,7 +374,7 @@ def _read_config_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     try:
         content = path.read_bytes()
     except Exception as exc:
-        return None, f"invalid_json: {exc}"
+        return None, f"invalid_json: {exception_text(exc)}"
     return _config_object_from_bytes(content)
 
 
@@ -380,9 +383,9 @@ def _config_object_from_bytes(
 ) -> tuple[dict[str, Any] | None, str | None]:
     """The object form of config bytes already in hand. See ``parse_config_bytes``."""
     try:
-        data = json.loads(content)
+        data = load_json(content, source="config file")
     except Exception as exc:
-        return None, f"invalid_json: {exc}"
+        return None, f"invalid_json: {exception_text(exc)}"
     if not isinstance(data, dict):
         return None, "config_root_not_object"
     return data, None
@@ -508,11 +511,13 @@ def registry_allow_private_from_config(
         value = raw[REGISTRY_ALLOW_PRIVATE_CONFIG_KEY]
         if isinstance(value, bool):
             return value
+        # The field and the value's type, never the value: a repository's
+        # `.mcp.json` chose it (Consiliency/pmcp#388 round 2, claude N-A).
         logger.warning(
-            "Ignoring %s in %s: expected a boolean, got %r",
+            "Ignoring %s in %s: expected a boolean, got %s",
             REGISTRY_ALLOW_PRIVATE_CONFIG_KEY,
             path,
-            value,
+            describe_value(value),
         )
     return None
 
@@ -797,7 +802,12 @@ def _pin_and_read_policy_target(
                 "invalid_source",
                 f"symlinked_config: refusing to edit a symlinked .mcp.json at {path}",
             )
-        return path.resolve(), None, "invalid_source", f"unreadable_config: {exc}"
+        return (
+            path.resolve(),
+            None,
+            "invalid_source",
+            f"unreadable_config: {exception_text(exc)}",
+        )
     try:
         # Capture the true identity of the opened file BEFORE anything else can
         # move it, then read its bytes from the descriptor itself.
@@ -808,7 +818,7 @@ def _pin_and_read_policy_target(
                 path.resolve(),
                 None,
                 "unpinnable_config",
-                f"cannot stat the opened descriptor: {exc}",
+                f"cannot stat the opened descriptor: {exception_text(exc)}",
             )
         chunks: list[bytes] = []
         while True:
@@ -831,7 +841,7 @@ def _pin_and_read_policy_target(
                 path.resolve(),
                 None,
                 "unpinnable_config",
-                f"the target path no longer resolves to a live file: {exc}",
+                f"the target path no longer resolves to a live file: {exception_text(exc)}",
             )
         if (candidate_stat.st_dev, candidate_stat.st_ino) != (
             fd_stat.st_dev,
@@ -999,7 +1009,7 @@ def set_startup_policy(
                         code="approval_not_carried_forward",
                         message=(
                             "Startup policy was written, but the prior trust "
-                            f"approval could not be carried forward: {exc}"
+                            f"approval could not be carried forward: {exception_text(exc)}"
                         ),
                         source=target.source,
                         path=str(pinned_key),
@@ -1061,12 +1071,12 @@ def _merge_manifest_defaults(
     else:
         if not manifest_servers:
             logger.warning(
-                f"Skipping server '{name}' - command missing and manifest unavailable"
+                f"Skipping server '{display_safe(name)}' - command missing and manifest unavailable"
             )
             return None
         if not manifest_server:
             logger.warning(
-                f"Skipping server '{name}' - command missing and no manifest default found"
+                f"Skipping server '{display_safe(name)}' - command missing and no manifest default found"
             )
             return None
         merged = config.model_copy(deep=True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import shlex
 import time
@@ -11,6 +12,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from pmcp.child_output import (
+    abandon_pending_spawns,
+    detached,
+    kill_tree,
+    owned,
+    release,
+    spawn_owned,
+)
+from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.env_store import (
     credential_value,
     resolve_scope_path,
@@ -33,6 +43,12 @@ HEARTBEAT_TIMEOUT = 120  # seconds
 # Time to wait before assuming uvx server is ready (they don't output startup messages)
 UVX_STARTUP_SECONDS = 3
 
+# How long a `server_ready` job's running server waits to be adopted by
+# `gateway.provision_status` before it is killed with its group (round 9,
+# grok F001): the job owns the process until the handoff, and an owner that
+# is never asked for it must not keep it running forever.
+HANDOFF_DEADLINE_SECONDS = 600.0
+
 _REDACTED = "<redacted>"
 
 # Flag literals shown as themselves wherever they appear. Frozen: widening this set
@@ -51,8 +67,9 @@ def _operator_safe(value: str) -> str:
     value cannot overwrite, split or reorder the line; the result is then always
     shell-quoted, because operators copy log lines. Escape first, quote last.
     """
-    escaped = "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in value)
-    return shlex.quote(escaped)
+    from pmcp.display import display_safe
+
+    return shlex.quote(display_safe(value))
 
 
 def _pinned_package_spec(arg: str) -> str | None:
@@ -130,8 +147,16 @@ class InstallJob:
 
     id: str
     server_name: str
+    # `adopting`: handed to ClientManager, which owns the process from that
+    # moment (round 10); the job no longer kills it.
     status: Literal[
-        "pending", "installing", "server_ready", "complete", "failed", "timeout"
+        "pending",
+        "installing",
+        "server_ready",
+        "adopting",
+        "complete",
+        "failed",
+        "timeout",
     ] = "pending"
     progress: int = 0  # 0-100
     output_lines: list[str] = field(default_factory=list)
@@ -141,6 +166,7 @@ class InstallJob:
     error: str | None = None
     command: str = ""  # The command used (e.g., "uvx", "npx")
     _monitor_task: asyncio.Task | None = field(default=None, repr=False)
+    _handoff_deadline: asyncio.Task | None = field(default=None, repr=False)
 
 
 class JobManager:
@@ -213,12 +239,16 @@ class JobManager:
             # Start subprocess with stdin/stdout/stderr pipes
             # stdin is needed for JSON-RPC communication after server starts
             # stderr is separate so ClientManager can read it independently
-            process = await asyncio.create_subprocess_exec(
-                *install_cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=build_install_child_env(server_config, project_root),
+            process = await spawn_owned(
+                lambda: asyncio.create_subprocess_exec(
+                    *install_cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=build_install_child_env(server_config, project_root),
+                    # No controlling terminal (Consiliency/pmcp#388 round 5).
+                    **detached(),
+                )
             )
             job.process = process
             job.status = "installing"
@@ -236,12 +266,12 @@ class JobManager:
 
         except FileNotFoundError as e:
             job.status = "failed"
-            job.error = f"Command not found: {e}"
+            job.error = f"Command not found: {exception_text(e)}"
             logger.error(f"Install job {job_id} failed: {job.error}")
 
         except Exception as e:
             job.status = "failed"
-            job.error = str(e)[:300]
+            job.error = exception_text(e)[:300]
             logger.error(f"Install job {job_id} failed: {job.error}")
 
         return job_id
@@ -251,10 +281,12 @@ class JobManager:
         try:
             exc = task.exception()
             if exc:
-                logger.error(f"Install job {job.id} task crashed: {exc}")
+                logger.error(
+                    f"Install job {job.id} task crashed: {exception_text(exc)}"
+                )
                 if job.status == "installing":
                     job.status = "failed"
-                    job.error = f"Monitor task crashed: {exc}"
+                    job.error = f"Monitor task crashed: {exception_text(exc)}"
                 # Kill subprocess if still running (but NOT if server_ready - it's being handed off)
                 if (
                     job.status != "server_ready"
@@ -262,9 +294,12 @@ class JobManager:
                     and job.process.returncode is None
                 ):
                     try:
-                        job.process.kill()
+                        # The whole group: an npm lifecycle script or a
+                        # node-gyp build it started too (round 6, claude N-B).
+                        kill_tree(job.process)
+                        release(job.process)
                     except Exception as e:
-                        logger.debug(f"task cleanup error: {e}")
+                        logger.debug(f"task cleanup error: {exception_text(e)}")
         except asyncio.CancelledError:
             # Task was cancelled, not an error
             pass
@@ -300,7 +335,7 @@ class JobManager:
                 line = await stream.readline()
                 return (name, line)
             except Exception as e:
-                logger.debug(f"stream reader error: {e}")
+                logger.debug(f"stream reader error: {exception_text(e)}")
                 return (name, None)
 
         try:
@@ -426,7 +461,7 @@ class JobManager:
                                         return
                                 except Exception as e:
                                     logger.warning(
-                                        f"Install {job.id}: Error in server detection: {e}"
+                                        f"Install {job.id}: Error in server detection: {exception_text(e)}"
                                     )
 
                 except asyncio.CancelledError:
@@ -463,16 +498,67 @@ class JobManager:
             job.error = "Installation cancelled"
 
         except Exception as e:
-            logger.error(f"Install job {job.id} monitor error: {e}", exc_info=True)
+            logger.error(
+                f"Install job {job.id} monitor error: {exception_text(e)}",
+                exc_info=safe_exc_info(e),
+            )
             job.status = "failed"
-            job.error = str(e)
+            job.error = exception_text(e)
             # Try to clean up process
             await self._safe_terminate_process(process, job.id, force=True)
 
         finally:
+            if job.status == "server_ready":
+                self._start_handoff_deadline(job)
             # Only clear process if NOT server_ready (process needed for handoff)
             if job.status != "server_ready":
+                # Every exit but the handoff: whatever the install left
+                # running is killed, synchronously (round 8, codex F003),
+                # and its pipes closed (round 10, codex F001).
+                kill_tree(process)
+                release(process)
                 job.process = None  # Allow GC
+
+    def _start_handoff_deadline(self, job: InstallJob) -> None:
+        """Kill a `server_ready` job's server, with its group, if it is not
+        adopted within :data:`HANDOFF_DEADLINE_SECONDS` (round 9, grok F001).
+        The adoption cancels this."""
+
+        async def expire() -> None:
+            expired = False
+            try:
+                await asyncio.sleep(HANDOFF_DEADLINE_SECONDS)
+                expired = True
+            finally:
+                # On expiry -- and on any other end of this task while the
+                # job still owns its server: a cancellation at gateway
+                # shutdown (round 13, claude F001). The handoff and
+                # `cancel_job` take the process from the job before they
+                # cancel this, so for them there is nothing left here.
+                if job.status == "server_ready" and job.process is not None:
+                    logger.warning(
+                        f"Install job {job.id}: server was not adopted"
+                        + (
+                            f" within {HANDOFF_DEADLINE_SECONDS:.0f}s"
+                            if expired
+                            else " before shutdown"
+                        )
+                        + "; killing it"
+                    )
+                    kill_tree(job.process)
+                    release(job.process)  # a flooded, paused pipe too (round 10)
+                    job.process = None
+                    job.status = "failed"
+                    job.error = (
+                        "Server was not adopted in time"
+                        if expired
+                        else "The gateway shut down before the server was adopted"
+                    )
+
+        with contextlib.suppress(RuntimeError):  # no running loop
+            job._handoff_deadline = asyncio.create_task(
+                expire(), name=f"install-handoff-{job.id}"
+            )
 
     async def _safe_terminate_process(
         self, process: asyncio.subprocess.Process, job_id: str, force: bool = False
@@ -480,12 +566,15 @@ class JobManager:
         """Safely terminate a subprocess with timeout and fallback to kill."""
         try:
             if process.returncode is not None:
-                return  # Already exited
+                # Exited -- but a descendant may still run in its group,
+                # holding its pipes (round 7, codex F002).
+                kill_tree(process)
+                return
 
             if force:
-                process.kill()
+                kill_tree(process)
             else:
-                process.terminate()
+                kill_tree(process, terminate=True)
 
             try:
                 await bounded_wait(process.wait(), timeout=5.0)
@@ -494,13 +583,15 @@ class JobManager:
                     logger.warning(
                         f"Install {job_id}: Process didn't terminate, killing"
                     )
-                    process.kill()
+                    kill_tree(process)
                     try:
                         await bounded_wait(process.wait(), timeout=2.0)
                     except asyncio.TimeoutError:
                         logger.error(f"Install {job_id}: Process won't die!")
         except Exception as e:
-            logger.warning(f"Install {job_id}: Error terminating process: {e}")
+            logger.warning(
+                f"Install {job_id}: Error terminating process: {exception_text(e)}"
+            )
 
     def _parse_progress(self, line: str, current: int) -> int:
         """Try to parse progress percentage from output line."""
@@ -552,24 +643,61 @@ class JobManager:
         if not job:
             return False
 
-        if job.process and job.process.returncode is None:
-            logger.info(f"Cancelling install job {job_id}")
-            job.process.terminate()
-
-            # Give it a moment to terminate gracefully
-            try:
-                await bounded_wait(job.process.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                job.process.kill()
-                await job.process.wait()
-
-            job.status = "failed"
-            job.error = "Cancelled by user"
-
-        if job._monitor_task:
-            job._monitor_task.cancel()
+        process = job.process
+        # Ownership is taken before the first await (round 12, claude), as the
+        # handoff does: nothing else acts on this process from here on.
+        job.process = None
+        try:
+            if process is not None and process.returncode is None:
+                logger.info(f"Cancelling install job {job_id}")
+                kill_tree(process, terminate=True)
+                # A moment to terminate gracefully. A cancellation of this
+                # wait is the caller's to have; the kill is not (round 11,
+                # codex F001): it follows in the `finally`.
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await bounded_wait(process.wait(), timeout=2.0)
+        finally:
+            # Synchronous, on every exit, a cancellation included: the job and
+            # everything it started are killed and their pipes closed. Exited
+            # already, the group is still checked (round 9, grok F001).
+            if process is not None:
+                kill_tree(process)
+                release(process)  # round 10, codex F001
+                if job.status not in ("complete", "adopting"):
+                    job.status = "failed"
+                    job.error = "Cancelled by user"
+            # The backstop is disarmed only now, after the kill it guards
+            # (round 11): a cancelled wait above must not leave a server
+            # running with no deadline either.
+            if job._handoff_deadline is not None:
+                job._handoff_deadline.cancel()
+            if job._monitor_task:
+                job._monitor_task.cancel()
 
         return True
+
+    def shutdown(self) -> None:
+        """Kill every job's process with its group, synchronously, and stop
+        the job's tasks: an install in progress, or a started server waiting
+        to be adopted (round 13, claude F001: ClientManager's shutdown sweep
+        did not reach them, and a cancelled handoff deadline left the server
+        running past the gateway). Called from the gateway's teardown, on
+        every exit. Never raises."""
+        # An install whose spawn is still in flight has no `job.process`
+        # yet: it is owned and killed when the spawn completes (round 14).
+        abandon_pending_spawns()
+        for job in list(self._jobs.values()):
+            process, job.process = job.process, None
+            if process is not None:
+                with contextlib.suppress(Exception):
+                    kill_tree(process)
+                    release(process)
+                if job.status not in ("complete", "adopting", "failed", "timeout"):
+                    job.status = "failed"
+                    job.error = "The gateway shut down"
+            for task in (job._handoff_deadline, job._monitor_task):
+                if task is not None:
+                    task.cancel()
 
     def cleanup_old_jobs(self, max_age: float = 3600) -> int:
         """Remove jobs older than max_age seconds."""
@@ -709,17 +837,24 @@ async def install_server(
             f"Installing {_operator_safe(server_config.name)}: "
             f"{_render_install_argv(install_cmd)}"
         )
-        process = await asyncio.create_subprocess_exec(
-            *install_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=build_install_child_env(server_config, project_root),
+        process = await spawn_owned(
+            lambda: asyncio.create_subprocess_exec(
+                *install_cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=build_install_child_env(server_config, project_root),
+                **detached(),
+            )
         )
 
-        stdout, stderr = await bounded_wait(
-            process.communicate(),
-            timeout=timeout,
-        )
+        # Owned: killed with everything it started on every exit, a
+        # cancelled caller included (round 8, codex F003).
+        with owned(process):
+            stdout, stderr = await bounded_wait(
+                process.communicate(),
+                timeout=timeout,
+            )
 
         if process.returncode != 0:
             error_output = stderr.decode() or stdout.decode()
@@ -731,14 +866,20 @@ async def install_server(
 
     except asyncio.TimeoutError:
         # Kill the process on timeout
-        if process and process.returncode is None:
-            process.kill()
-            await process.wait()
+        if process:
+            # Killed by `owned` above, also when it exited first and a
+            # descendant still held its pipes (round 7, codex F002); reaped.
+            if process.returncode is None:
+                await process.wait()
         raise InstallError(
             f"Installation of {server_config.name} timed out after {timeout}s"
         )
     except FileNotFoundError as e:
-        raise InstallError(f"Command not found for {server_config.name}: {e}")
+        not_found: str | None = exception_text(e)
+    else:
+        not_found = None
+    if not_found is not None:
+        raise InstallError(f"Command not found for {server_config.name}: {not_found}")
 
 
 async def verify_installation(
@@ -762,15 +903,24 @@ async def verify_installation(
             f"Verifying installation of {_operator_safe(server_config.name)}: "
             f"{_render_install_argv(verify_cmd)}"
         )
-        process = await asyncio.create_subprocess_exec(
-            *verify_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=build_install_child_env(server_config, project_root),
+        process = await spawn_owned(
+            lambda: asyncio.create_subprocess_exec(
+                *verify_cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=build_install_child_env(server_config, project_root),
+                **detached(),
+            )
         )
 
-        await bounded_wait(process.communicate(), timeout=5.0)
-        return True
+        # Owned: a verification that times out is killed with everything it
+        # started, not left running (round 8, codex F003).
+        with owned(process):
+            await bounded_wait(process.communicate(), timeout=5.0)
+        # Runnable means it ran: a command that fails `--help` is not
+        # (round 9, grok).
+        return process.returncode == 0
 
     except Exception:
         return False

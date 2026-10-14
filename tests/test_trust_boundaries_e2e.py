@@ -647,7 +647,9 @@ async def test_s01_a_package_manager_variable_is_refused_at_registration(
     )
 
     assert refused.registered is False
-    assert "npm_config_registry" in refused.message
+    # rev 12 (Consiliency/pmcp#297): the rule is named, never the name.
+    assert "NPM_CONFIG_* family" in refused.message
+    assert "npm_config_registry" not in refused.message
     # No config applied: the server does not exist afterwards, so the later
     # doors have nothing to refuse rather than refusing something that is there.
     assert ALLOWLISTED_NAME not in gateway._discovered_server_configs

@@ -387,15 +387,19 @@ async def test_every_reply_path_reports_and_records_seconds(
 
 def test_the_reply_path_table_covers_every_task_operation() -> None:
     """Derived from the code: every `ClientManager` method that turns a
-    downstream reply into a task (calls `_task_info_from_payload`) has a row in
-    `REPLY_PATHS`, and so does each one with a no-task fallback branch."""
+    downstream reply into a task (calls `_task_info_from_payload`, or
+    `task_answer_of`, the recogniser that is that parser -- Consiliency/pmcp#297)
+    has a row in `REPLY_PATHS`, and so does each one with a no-task fallback
+    branch."""
     funcs = dict(((p, f.name), f) for p, f in _functions())
+    readers = {"_task_info_from_payload", "task_answer_of"}
     parsers = {
         name
         for (path, name), func in funcs.items()
         if path == "client/manager.py"
-        and name != "_task_info_from_payload"
-        and any(_called(n) == "_task_info_from_payload" for n in ast.walk(func))
+        # the recogniser's own module helpers are not operations
+        and name not in readers | {"usable_task_response"}
+        and any(_called(n) in readers for n in ast.walk(func))
     }
     # Consiliency/pmcp#338 moved each parse into the helper the public
     # operation goes through; every parser is mapped to the operation the
@@ -995,8 +999,9 @@ _TASK_DATA_KEYWORDS = {"task", "tasks", "ttl", "poll_interval", "raw", None}
 TASK_MODEL_CONSTRUCTIONS: dict[tuple[str, str, str, str], tuple[str, str]] = {
     ("client/manager.py", "_task_info_from_payload", "McpTaskInfo", "call"): (
         "poll_interval=task_duration_from_wire('poll_interval', poll_interval); "
-        "raw=payload; ttl=task_duration_from_wire('ttl', payload.get('ttl'))",
-        "THE inbound converter",
+        "raw=_usable_task_raw(payload); "
+        "ttl=task_duration_from_wire('ttl', payload.get('ttl'))",
+        "THE inbound converter; `raw` without the values dropped (#297)",
     ),
     ("client/manager.py", "_record_task", "McpTaskRecord", "call"): (
         "poll_interval=task_info.poll_interval; raw=task_info.raw; ttl=task_info.ttl",
@@ -1005,8 +1010,9 @@ TASK_MODEL_CONSTRUCTIONS: dict[tuple[str, str, str, str], tuple[str, str]] = {
     # `_send_task_cancel`: the one sender `cancel_task` and the forced
     # teardowns share (Consiliency/pmcp#338)
     ("client/manager.py", "_send_task_cancel", "McpTaskInfo", "call"): (
-        "raw=result",
-        "no duration: task_id, status, updated_at; `raw` is verbatim by design",
+        "",
+        "no duration: task_id, status, updated_at; no `raw`: nothing in an "
+        "unparsed answer was read (Consiliency/pmcp#297)",
     ),
     ("tools/handlers.py", "tasks_list", "McpTaskInfo", "call"): (
         "**task",

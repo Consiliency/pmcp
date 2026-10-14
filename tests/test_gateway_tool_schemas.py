@@ -444,16 +444,20 @@ async def _call_through_gate(name: str, arguments: dict[str, Any]) -> Any:
 @pytest.mark.parametrize(
     ("name", "arguments", "fragment"),
     [
-        ("gateway.describe", {"tool_id": ""}, "should be non-empty"),
+        (
+            "gateway.describe",
+            {"tool_id": ""},
+            "$.tool_id: must be at least 1 character",
+        ),
         (
             "gateway.submit_feedback",
             {"title": "short", "description": "d"},
-            "is too short",
+            "$.title: must be at least 8 characters",
         ),
         (
             "gateway.tasks_result",
             {"server_name": "s", "task_id": "t", "options": {"max_output_chars": 5}},
-            "less than the minimum",
+            "$.options.max_output_chars: must be greater than or equal to",
         ),
     ],
 )

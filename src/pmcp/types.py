@@ -17,6 +17,14 @@ from pydantic import (
     model_validator,
 )
 
+from pmcp.argument_errors import (
+    CORRELATION_ID_CHARSET,
+    PACKAGE_NAME_INVALID,
+    SCOPED_CORRELATION_INCOMPLETE,
+    PACKAGE_PATTERN_VERSIONED,
+    argument_error,
+)
+from pmcp.parsing import parse_timestamp
 from pmcp.validation import is_valid_package_name, version_separator_index
 
 # === Transport Types ===
@@ -612,7 +620,9 @@ def _usable_task_timestamp(value: Any) -> Any:
         if candidate.endswith("Z"):
             candidate = f"{candidate[:-1]}+00:00"
         try:
-            return datetime.fromisoformat(candidate).timestamp()
+            # Through the parse helper (Consiliency/pmcp#297): its failure
+            # is value-free; the value itself is dropped, as main drops it.
+            return parse_timestamp(candidate, source="task timestamp").timestamp()
         except (ValueError, OverflowError, OSError):
             return _UNUSABLE
     return _UNUSABLE
@@ -1118,7 +1128,7 @@ class InvokeInput(GatewayArguments):
         if value is None:
             return None
         if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", value) is None:
-            raise ValueError("correlation IDs may contain only alphanumerics and ._:-")
+            raise argument_error(CORRELATION_ID_CHARSET)
         return value
 
     @model_validator(mode="after")
@@ -1131,9 +1141,7 @@ class InvokeInput(GatewayArguments):
         if any(value is not None for value in values) and not all(
             value is not None for value in values
         ):
-            raise ValueError(
-                "scoped advisor correlation fields must be supplied together"
-            )
+            raise argument_error(SCOPED_CORRELATION_INCOMPLETE)
         return self
 
 
@@ -1324,7 +1332,9 @@ class CancelInput(GatewayArguments):
 class CancelOutput(BaseModel):
     """Output for gateway.cancel."""
 
-    request_id: str
+    #: The id cancelled, or null when it was rejected for its format
+    #: (Consiliency/pmcp#297): a rejected value is not copied back.
+    request_id: str | None
     status: str  # "cancelled", "not_found", "already_complete", "refused"
     message: str
     was_stalled: bool  # True if request had no recent heartbeat
@@ -1394,10 +1404,9 @@ class PackagePolicy(BaseModel):
     def _reject_version_qualified_entries(cls, value: list[str]) -> list[str]:
         for entry in value:
             if version_separator_index(entry) != -1:
-                raise ValueError(
-                    f"package pattern {entry!r} names a version; package "
-                    "patterns match the package name only"
-                )
+                # Fixed text: the entry is the operator's own value, and the
+                # error's path names it (Consiliency/pmcp#297 rev 20).
+                raise argument_error(PACKAGE_PATTERN_VERSIONED)
         return value
 
 
@@ -1626,11 +1635,7 @@ class RegisterDiscoveredServerInput(GatewayArguments):
     @classmethod
     def _validate_package(cls, value: str) -> str:
         if not is_valid_package_name(value):
-            raise ValueError(
-                "package must be a valid npm/pypi identifier "
-                "(no leading dash, whitespace, path separators, or shell "
-                "metacharacters)"
-            )
+            raise argument_error(PACKAGE_NAME_INVALID)
         return value
 
 

@@ -20,7 +20,9 @@ import aiohttp
 import jwt
 from jwt import PyJWKSet
 
+from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
+from pmcp.parsing import load_json
 from pmcp.redaction_additive import redact_additive
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
@@ -137,7 +139,7 @@ class AuthMessage:
     # refused, not rewritten. Rev 3: the text states the whole rule, from
     # `CANONICAL_HOST_FORMS`, so it is true of every host it refuses.
     PUBLIC_URL_CONTROL_CHARACTER = AuthText(
-        "Public auth URL contains a control character."
+        "Public auth URL contains a non-printable character."
     )
     # Rev 3: WHATWG ends the authority at `\` (yarl and urlsplit do not), so
     # `https://127.0.0.1\@auth.example.com/` is 127.0.0.1 to a browser.
@@ -302,6 +304,12 @@ def pyjwt_text(exc: BaseException) -> PyJwtText:
     if not isinstance(exc, _FIXED_TEXT_CLAIM_ERRORS):
         raise TypeError(
             f"pyjwt_text() takes a fixed-text pyjwt error, not {type(exc).__name__}"
+        )
+    if safe_exc_info(exc) is None:
+        # Its chain holds a registered value-bearing error: never read
+        # (Consiliency/pmcp#297 rev 20).
+        raise TypeError(
+            "pyjwt_text() takes a pyjwt error that chains no rejected value"
         )
     return PyJwtText(str(exc), _mint=_PYJWT_MINT)
 
@@ -744,7 +752,9 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> 
     and trailing tabs, CRs and LFs; nothing else is stripped -- a trailing
     space is kept (the startup check then refuses it as whitespace), and a
     trailing NUL or other control character is refused like one anywhere
-    else. Then, refused in this order: a C0 control or DEL anywhere
+    else. Then, refused in this order: a character that is not printable
+    anywhere -- a C0 or C1 control, DEL, a format character (bidi, zero-width,
+    tag), a line or paragraph separator, a space other than the ASCII one
     (`PUBLIC_URL_CONTROL_CHARACTER`); a backslash anywhere
     (`PUBLIC_URL_BACKSLASH`); an unparseable port or host
     (`PUBLIC_URL_INVALID`); no http(s) scheme or no host
@@ -765,7 +775,12 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> 
     stored host is the one checked.
     """
     url = url.lstrip(_C0_OR_SPACE).rstrip(_TRAILING_NEWLINE)
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in url):
+    # Any character Python does not count printable: C0, DEL, C1 (U+0080 to
+    # U+009F, U+009B among them), format characters (bidi controls,
+    # zero-width characters, tag characters), line and paragraph separators
+    # and every space but the ASCII one (Consiliency/pmcp#388 round 3: C1 in
+    # a peer's elicitation URL reached `pmcp auth connect` raw).
+    if not url.isprintable():
         raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_CONTROL_CHARACTER))
     if "\\" in url:
         raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_BACKSLASH))
@@ -773,8 +788,10 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> 
         parsed = urlparse(url)
         hostname = parsed.hostname
         _ = parsed.port
-    except ValueError as exc:
-        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_INVALID)) from exc
+    except ValueError:
+        # `from None`: urllib's text quotes the rejected port, and a chained
+        # cause reaches any traceback (Consiliency/pmcp#297).
+        raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_INVALID)) from None
 
     if not _is_absolute_http(parsed) or not hostname:
         raise ValueError(render_auth_message(AuthMessage.PUBLIC_URL_NOT_ABSOLUTE))
@@ -988,10 +1005,13 @@ class AsyncJWKS:
                 AuthMessage.JWKS_TOO_LARGE, url=self.url
             )
         try:
-            jwks = json.loads(content.decode("utf-8"))
+            jwks = load_json(content, source="JWKS response", encoding="utf-8")
         except (ValueError, RecursionError) as exc:
             # ValueError covers JSONDecodeError and UnicodeDecodeError; a
             # deeply nested body under the size cap raises RecursionError.
+            # (`load_json` already classifies all of them as a value-free
+            # `JSONParseError`, a ValueError; RecursionError stays listed for
+            # the reader.)
             raise ResourceServerJWKSUnavailable(
                 AuthMessage.JWKS_INVALID_JSON, url=self.url
             ) from exc
@@ -1140,7 +1160,11 @@ def validate_resource_server_token(
         ) from exc
 
     scopes = _claim_scopes(claims)
-    missing_scopes = sorted(set(required_scopes or []) - set(scopes))
+    # The operator's required scopes the token lacks: names from pmcp's
+    # configuration, never the token's (Consiliency/pmcp#297).
+    missing_scopes = sorted(
+        {scope for scope in required_scopes or [] if scope not in scopes}
+    )
     if missing_scopes:
         scope_names = " ".join(missing_scopes)
         raise ResourceServerAuthError(
@@ -1202,7 +1226,10 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> 
     can only replace more of it with the marker (Consiliency/pmcp#234). The
     cut is taken last, as before.
     """
-    text = redact_additive(_sanitize_base(str(value)))
+    # An exception goes through `exception_text`: a validation error's own
+    # text carries the rejected value (Consiliency/pmcp#297).
+    raw = exception_text(value) if isinstance(value, BaseException) else str(value)
+    text = redact_additive(_sanitize_base(raw))
     return text if max_length is None else text[:max_length]
 
 
@@ -1315,7 +1342,12 @@ def parse_www_authenticate(header: str) -> AuthChallengeInfo | None:
 
 def protected_resource_metadata_urls(endpoint_url: str) -> list[str]:
     """Return candidate OAuth protected-resource metadata URLs for an endpoint."""
-    parsed = urlparse(endpoint_url)
+    try:
+        parsed = urlparse(endpoint_url)
+    except ValueError:
+        # Caught at the parse site: urllib's text quotes the URL
+        # (Consiliency/pmcp#388 round 2). An unparseable URL has no candidates.
+        return []
     if not parsed.scheme or not parsed.netloc:
         return []
     root = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
@@ -1414,20 +1446,43 @@ def normalize_auth_metadata(
     )
 
 
+#: The object :func:`_embedded_object_text` finds. Anchored at a line's
+#: start, so each line is scanned once: unanchored, ``(\{.*\})`` restarts at
+#: every ``{`` and is quadratic on a peer's text of many ``{`` and no ``}``.
+_EMBEDDED_OBJECT_RE = re.compile(r"(?m)^[^{\n]*(\{[^\n]*\})")
+
+
+def _embedded_object_text(text: str) -> str | None:
+    r"""What ``re.search(r"(\{.*\})", text)`` finds -- on the first line
+    holding a ``{`` with a ``}`` after it, from that ``{`` to the line's last
+    ``}`` -- in linear time (round 1 codex F001's audit: the unanchored regex
+    took 368 s at 1 MiB)."""
+    found = _EMBEDDED_OBJECT_RE.search(text)
+    return found.group(1) if found else None
+
+
 def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
-    """Parse JSON-RPC URLElicitationRequiredError payloads."""
+    """Parse JSON-RPC URLElicitationRequiredError payloads.
+
+    An exception whose chain holds a registered value-bearing error yields
+    nothing: an elicitation comes from the SDK or a downstream, never from
+    validation, and the rejected value must not be read back as an
+    elicitation id or URL (Consiliency/pmcp#297 rev 20, round-18 codex F001).
+    """
     if isinstance(payload, BaseException):
+        if safe_exc_info(payload) is None:
+            return []
         payload = payload.args[0] if payload.args else str(payload)
     if isinstance(payload, str):
         payload_text = payload
         try:
-            payload = json.loads(payload_text)
+            payload = load_json(payload_text, source="URL elicitation payload")
         except json.JSONDecodeError:
-            match = re.search(r"(\{.*\})", payload_text)
-            if not match:
+            embedded = _embedded_object_text(payload_text)
+            if embedded is None:
                 return []
             try:
-                payload = json.loads(match.group(1))
+                payload = load_json(embedded, source="URL elicitation payload")
             except json.JSONDecodeError:
                 return []
     if not isinstance(payload, Mapping):
@@ -1451,6 +1506,10 @@ def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
         elicitation_id = entry.get("elicitationId") or entry.get("elicitation_id")
         url = entry.get("url")
         if not isinstance(elicitation_id, str) or not isinstance(url, str):
+            continue
+        if not elicitation_id.isprintable():
+            # Printable only, like its URL: it is shown to the operator and
+            # copied into `next_step` (Consiliency/pmcp#388 round 3).
             continue
         try:
             safe_url = sanitize_url_elicitation_url(url, provenance="remote")
@@ -1515,7 +1574,7 @@ def fetch_json_metadata(
             body = response.read(1024 * 256)
         if "json" not in content_type.lower():
             return None, f"{safe_url} returned non-JSON content"
-        data = json.loads(body.decode("utf-8"))
+        data = load_json(body, source="auth metadata response", encoding="utf-8")
         if not isinstance(data, dict):
             return None, f"{safe_url} returned JSON that was not an object"
         return data, None

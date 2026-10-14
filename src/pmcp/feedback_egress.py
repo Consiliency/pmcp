@@ -46,6 +46,7 @@ from pmcp.env_store import (
     managed_secret_keys_strict,
     pmcp_introduced_keys,
 )
+from pmcp.parsing import load_json
 from pmcp.provision_gate import operator_safe
 from pmcp.types import FeedbackSubmissionOutcome
 
@@ -522,7 +523,9 @@ def _classify_response(status: int, raw: bytes, search_url: str) -> FeedbackSubm
     if not 200 <= status < 300:
         return _unconfirmed(search_url, f"unestablished_status_{status}")
     try:
-        document: Any = json.loads(raw.decode("utf-8"))
+        document: Any = load_json(
+            raw, source="feedback issue response", encoding="utf-8"
+        )
     except Exception:
         return _unconfirmed(search_url, "unparseable_body")
     if isinstance(document, dict):
@@ -596,7 +599,9 @@ def _probe_repository_visibility(
     try:
         with _OPENER.open(request, timeout=_PROBE_PHASE_BUDGET_SECONDS) as response:
             raw = _read_bounded_body(response, bound)
-        document: Any = json.loads(raw.decode("utf-8"))
+        document: Any = load_json(
+            raw, source="feedback repository response", encoding="utf-8"
+        )
     except Exception:
         return "unknown"
     if not isinstance(document, dict) or "private" not in document:

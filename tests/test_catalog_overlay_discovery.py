@@ -1575,7 +1575,15 @@ def test_a_malformed_overlay_is_reported_without_any_value(
     assert not [m for m in messages if YAML_SENTINEL in m]
     unreadable = [m for m in messages if "Skipping unreadable manifest overlay" in m]
     assert unreadable, messages[-5:]
-    assert all(re.search(r"Error at line \d+, column \d+$", m) for m in unreadable)
+    # The parse failure's value-free description: format, source, position
+    # and class (Consiliency/pmcp#297).
+    assert all(
+        re.search(
+            r": could not parse YAML manifest overlay at line \d+, column \d+ \(\w+\)$",
+            m,
+        )
+        for m in unreadable
+    ), unreadable
 
 
 def test_codex_f002_falsifier_parse_overlay_document_directly(
@@ -2800,6 +2808,10 @@ _NOT_A_FIELD = (
     "argparse namespace that happens to be named `args`"
 )
 _NOT_MANIFEST = "a discovered or registry package, not manifest input"
+_PARSE_SOURCE = (
+    "`source` is the label pmcp chose for the parsed text (a path or a fixed "
+    "description), not a config's `source` field (Consiliency/pmcp#297)"
+)
 DIAGNOSTIC_SITES_OUTSIDE_D9 = {
     ("auth.py", "redirect_request"): _NOT_A_FIELD,
     ("feedback_egress.py", "redirect_request"): _NOT_A_FIELD,
@@ -2834,6 +2846,9 @@ DIAGNOSTIC_SITES_OUTSIDE_D9 = {
     ("tools/handlers.py", "register_discovered_server"): _NOT_MANIFEST,
     ("package_approvals.py", "_require_identity_fields"): _NOT_MANIFEST,
     ("cli.py", "_run_trust_revoke_package"): _NOT_A_FIELD,
+    ("parsing.py", "load_yaml"): _PARSE_SOURCE,
+    ("parsing.py", "load_json"): _PARSE_SOURCE,
+    ("parsing.py", "parse_timestamp"): _PARSE_SOURCE,
 }
 
 
