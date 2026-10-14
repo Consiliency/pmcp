@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import importlib.metadata
 import json
 import logging
@@ -3104,7 +3105,48 @@ async def run_auth_acknowledge(args: argparse.Namespace) -> None:
 
 
 async def async_main(args: argparse.Namespace) -> None:
-    """Async main entry point - dispatch to appropriate command."""
+    """Async main entry point - dispatch to appropriate command. A
+    subcommand (not the gateway, which installs its own shutdown) ends on
+    SIGTERM or SIGHUP by cancelling its work, so each child's owner kills it,
+    and any spawn still in flight is drained (Consiliency/pmcp#388 round 16).
+    A signal inherited as ignored stays ignored."""
+    if args.command is None:
+        await _dispatch(args)
+        return
+    from pmcp.child_output import drain_pending_spawns, termination_signals
+
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    received: list[int] = []
+
+    def terminate(signum: int) -> None:
+        received.append(signum)
+        if main_task is not None:
+            main_task.cancel()
+
+    installed = []
+    if sys.platform != "win32":
+        for sig in termination_signals():
+            if signal.getsignal(sig) is signal.SIG_IGN:
+                continue
+            with contextlib.suppress(Exception):
+                loop.add_signal_handler(sig, terminate, sig)
+                installed.append(sig)
+    try:
+        await _dispatch(args)
+    except asyncio.CancelledError:
+        if not received:
+            raise
+        await drain_pending_spawns()
+        raise SystemExit(128 + received[0]) from None
+    finally:
+        for sig in installed:
+            with contextlib.suppress(Exception):
+                loop.remove_signal_handler(sig)
+
+
+async def _dispatch(args: argparse.Namespace) -> None:
+    """Dispatch to the command's handler."""
     if args.command == "refresh":
         await run_refresh(args)
     elif args.command == "update":

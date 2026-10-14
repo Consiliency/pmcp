@@ -2230,6 +2230,12 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "re-raise",
     ),
+    ("cli.py", "async_main", "reraises"): (
+        1,
+        "a subcommand cancelled by its own SIGTERM/SIGHUP handler drains the "
+        "spawns in flight and exits with the signal's status; any other "
+        "cancellation re-raises (Consiliency/pmcp#388 round 16)",
+    ),
     ("child_output.py", "spawn_owned", "reraises"): (
         1,
         "hands the still-running shielded spawn to a done-callback that "
@@ -2247,7 +2253,14 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
 }
 
 # Handlers allowed to await: task roots whose own cancellation ends them.
-_AWAITING_HANDLERS = {("manifest/installer.py", "JobManager._monitor_install")}
+_AWAITING_HANDLERS = {
+    ("manifest/installer.py", "JobManager._monitor_install"),
+    # Consiliency/pmcp#388 round 16: the CLI's own top-level task, cancelled
+    # by its own SIGTERM/SIGHUP handler -- it drains the spawns in flight
+    # (bounded) before exiting with the signal's status. Nothing else holds
+    # it, and the process ends right after.
+    ("cli.py", "async_main"),
+}
 
 
 def _catches_cancellation(handler: ast.ExceptHandler) -> bool:

@@ -3403,3 +3403,198 @@ async def test_the_gateway_shutdown_drains_a_spawn_in_flight(
     assert _gone(leader, within=0.5), "shutdown returned with the leader alive"
     _grandchild_gone(tmp_path, "a spawn in flight at the gateway's shutdown")
     await asyncio.gather(install, return_exceptions=True)
+
+
+# --- round 16 ---------------------------------------------------------------------
+
+_UPGRADE_UNDER_SIGNAL = textwrap.dedent(
+    """
+    import sys
+    from pmcp import cli
+    cli.detect_install_drift = lambda: type("D", (), {"has_drift": False})()
+    sys.argv = ["pmcp", "upgrade", "--method", "uv"]
+    cli.main()
+    """
+)
+
+
+def _fake_installer(tmp_path: Path, finishes: bool) -> Path:
+    """A `uv` that starts a grandchild, records both pids, and runs on (or,
+    with `finishes`, completes after a moment and writes `done`)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text(
+        f"#!{sys.executable}\n"
+        "import os, subprocess, sys, time\n"
+        f"out = {str(tmp_path)!r}\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+        "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "open(os.path.join(out, 'grandchild'), 'w').write(str(child.pid))\n"
+        "open(os.path.join(out, 'installer'), 'w').write(str(os.getpid()))\n"
+        "print('installing', flush=True)\n"
+        + (
+            "time.sleep(1.5)\nchild.kill()\nopen(os.path.join(out, 'done'), 'w').close()\n"
+            if finishes
+            else "time.sleep(60)\n"
+        )
+    )
+    uv.chmod(0o755)
+    return bin_dir
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+@pytest.mark.parametrize("sig_name", ["SIGHUP", "SIGTERM"])
+def test_a_hangup_or_sigterm_during_upgrade_ends_the_installer(
+    sig_name: str, tmp_path: Path
+) -> None:
+    """Round 16, codex F001 (codex's reproduction): `pmcp upgrade` with an
+    installer that starts a grandchild and runs on; the parent's process
+    group gets SIGHUP (a closed terminal) or SIGTERM. pmcp exits with the
+    conventional status, and the installer and its grandchild are gone --
+    they are detached and no longer get the group's signal themselves."""
+    import signal
+
+    sig = getattr(signal, sig_name)
+    bin_dir = _fake_installer(tmp_path, finishes=False)
+
+    def default_dispositions() -> None:
+        os.setsid()  # the parent leads its own group, as a terminal's job does
+        for each in (signal.SIGHUP, signal.SIGTERM):
+            signal.signal(each, signal.SIG_DFL)
+
+    parent = subprocess.Popen(
+        [sys.executable, "-c", _UPGRADE_UNDER_SIGNAL],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "HOME": str(tmp_path),
+        },
+        preexec_fn=default_dispositions,  # noqa: PLW1509
+    )
+    try:
+        _wait_for(tmp_path / "grandchild", within=30)
+        installer = int((tmp_path / "installer").read_text())
+        os.killpg(parent.pid, sig)  # the parent's group, as the terminal does
+        _, err = parent.communicate(timeout=30)
+        assert parent.returncode == 128 + sig, (parent.returncode, err[-1500:])
+        assert _gone(installer), "the installer outlived pmcp"
+        _grandchild_gone(tmp_path, f"pmcp upgrade at {sig_name}")
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGHUP")
+def test_a_hangup_under_nohup_lets_the_upgrade_finish(tmp_path: Path) -> None:
+    """Round 16: under `nohup` SIGHUP stays ignored (round 15's rule) -- the
+    upgrade runs to its end and reports the installer's status."""
+    import shutil
+    import signal
+
+    nohup = shutil.which("nohup")
+    if nohup is None:
+        pytest.skip("no nohup on this host")
+    bin_dir = _fake_installer(tmp_path, finishes=True)
+    parent = subprocess.Popen(
+        [nohup, sys.executable, "-c", _UPGRADE_UNDER_SIGNAL],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "HOME": str(tmp_path),
+        },
+        start_new_session=True,
+        cwd=tmp_path,
+    )
+    try:
+        _wait_for(tmp_path / "grandchild", within=30)
+        os.killpg(parent.pid, signal.SIGHUP)
+        _, err = parent.communicate(timeout=30)
+        assert (tmp_path / "done").exists(), "the hangup cut the upgrade short"
+        assert parent.returncode == 0, (parent.returncode, err[-1500:])
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
+
+
+_ASYNC_COMMAND_UNDER_SIGNAL = textwrap.dedent(
+    """
+    import asyncio, sys
+    from pmcp import cli
+    from pmcp.child_output import detached, owned, spawn_owned
+
+    script = sys.argv[1]
+
+    async def command(args):
+        process = await spawn_owned(
+            lambda: asyncio.create_subprocess_exec(
+                sys.executable, script,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                **detached(),
+            )
+        )
+        with owned(process):
+            await asyncio.sleep(3600)  # a long refresh, say
+
+    cli._dispatch = command
+    sys.argv = ["pmcp", "refresh"]
+    cli.main()
+    """
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_a_sigterm_during_an_async_subcommand_ends_its_children(
+    tmp_path: Path,
+) -> None:
+    """Round 16, the audit's other half: an async subcommand (`pmcp
+    refresh`, `update`, `doctor`...) on SIGTERM cancels its work, so each
+    child's owner kills it, drains any spawn in flight, and exits 143."""
+    import signal
+
+    script = tmp_path / "server.py"
+    script.write_text(
+        "import os, subprocess, sys, time\n"
+        f"out = {str(tmp_path)!r}\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "open(os.path.join(out, 'grandchild'), 'w').write(str(child.pid))\n"
+        "open(os.path.join(out, 'leader'), 'w').write(str(os.getpid()))\n"
+        "time.sleep(60)\n"
+    )
+
+    def default_term() -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+    parent = subprocess.Popen(
+        [sys.executable, "-c", _ASYNC_COMMAND_UNDER_SIGNAL, str(script)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        preexec_fn=default_term,  # noqa: PLW1509
+    )
+    try:
+        _wait_for(tmp_path / "grandchild", within=30)
+        leader = int((tmp_path / "leader").read_text())
+        parent.send_signal(signal.SIGTERM)
+        _, err = parent.communicate(timeout=30)
+        assert parent.returncode == 128 + signal.SIGTERM, (
+            parent.returncode,
+            err[-1500:],
+        )
+        assert _gone(leader), "the subcommand's child outlived pmcp"
+        _grandchild_gone(tmp_path, "an async subcommand at SIGTERM")
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()

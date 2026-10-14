@@ -357,7 +357,50 @@ def _exited_unreaped(pid: int, within: float) -> bool:
 _WINDOWS_INTERRUPT_WAIT_SECONDS = 1.0
 
 
-def interrupt_tree(process: subprocess.Popen[bytes]) -> None:
+class Terminated(BaseException):
+    """A termination signal (SIGTERM, SIGHUP) that arrived while a CLI child
+    ran (Consiliency/pmcp#388 round 16): raised in the waiting thread so the
+    child's group is signalled and killed before pmcp exits."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def termination_signals() -> list[int]:
+    """SIGTERM, and SIGHUP where it exists (not Windows)."""
+    return [getattr(signal, n) for n in ("SIGTERM", "SIGHUP") if hasattr(signal, n)]
+
+
+@contextlib.contextmanager
+def terminating_on_signal() -> Iterator[None]:
+    """While a CLI child runs: SIGTERM and SIGHUP raise :class:`Terminated`
+    in the main thread (round 16, codex F001: a hangup during `pmcp upgrade`
+    killed pmcp without its cleanup, and the detached installer no longer got
+    the group's signal). A signal inherited as ignored -- SIGHUP under
+    `nohup` -- stays ignored (round 15's rule). The previous dispositions are
+    restored after. A no-op outside the main thread."""
+    previous: dict[int, Any] = {}
+
+    def raise_terminated(signum: int, frame: Any) -> None:
+        raise Terminated(signum)
+
+    for sig in termination_signals():
+        try:
+            if signal.getsignal(sig) is signal.SIG_IGN:
+                continue
+            previous[sig] = signal.signal(sig, raise_terminated)
+        except (ValueError, OSError):
+            pass  # not the main thread
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            with contextlib.suppress(Exception):
+                signal.signal(sig, handler)
+
+
+def interrupt_tree(process: subprocess.Popen[bytes], sig: int | None = None) -> None:
     """Forward an operator's Ctrl-C to a detached child and everything it
     started (round 6, claude N-A). POSIX: SIGINT to its group, up to
     :data:`_INTERRUPT_GRACE_SECONDS` for it to exit, then SIGKILL to what
@@ -376,7 +419,7 @@ def interrupt_tree(process: subprocess.Popen[bytes]) -> None:
     pid = process.pid
     if leader_reserved(process) and _leads(pid):
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGINT)
+            os.killpg(pid, signal.SIGINT if sig is None else sig)
         _exited_unreaped(pid, _INTERRUPT_GRACE_SECONDS)
         # The leader is alive or an unreaped zombie: its group id is still
         # its own. Whatever of the group is left is killed.
@@ -987,9 +1030,13 @@ def run_captured(
     )
     # Owned from the moment it exists (round 10): an interrupt landing
     # before the communicate still kills it with its group.
-    with owned(process):
-        track(process)
-        stdout, stderr = process.communicate(timeout=timeout)
+    with owned(process), terminating_on_signal():
+        try:
+            track(process)
+            stdout, stderr = process.communicate(timeout=timeout)
+        except Terminated as terminated:
+            interrupt_tree(process, terminated.signum)  # type: ignore[arg-type]
+            raise SystemExit(128 + terminated.signum) from None
     return subprocess.CompletedProcess(
         list(command), int(process.returncode), stdout, stderr
     )
@@ -1033,7 +1080,7 @@ def run_echoed(command: Sequence[str]) -> int:
     )
     # Owned from the moment it exists (round 10): a Ctrl-C landing before
     # the communicate is forwarded and the child killed with its group too.
-    with owned(process):
+    with owned(process), terminating_on_signal():
         try:
             track(process)
             # Streamed, a chunk at a time, not `communicate()` (round 10):
@@ -1060,4 +1107,9 @@ def run_echoed(command: Sequence[str]) -> int:
         except KeyboardInterrupt:
             interrupt_tree(process)
             raise
+        except Terminated as terminated:
+            # Forwarded to the child's group as received, a moment to exit,
+            # then the rest killed; pmcp exits with the conventional status.
+            interrupt_tree(process, terminated.signum)
+            raise SystemExit(128 + terminated.signum) from None
     return int(process.returncode)
