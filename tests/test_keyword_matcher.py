@@ -112,11 +112,13 @@ def test_sanitize_auth_diagnostic_uses_the_linear_matcher() -> None:
         "token-" * 11000,
         "x" + "-a" * 33000 + " password",
     ],
+    ids=["hyphens", "underscores", "keyword-hyphens", "trailing-keyword"],
 )
 def test_long_identifier_runs_stay_fast(text: str) -> None:
-    started = time.perf_counter()
+    # Keep the CPU budget independent of other xdist workers' scheduling.
+    started = time.process_time()
     sanitize_auth_diagnostic(text, max_length=None)
-    assert time.perf_counter() - started < 2.0
+    assert time.process_time() - started < 2.0
 
 
 @pytest.mark.parametrize(
@@ -138,6 +140,6 @@ def test_url_trailing_punctuation_is_kept_outside_the_url(text: str) -> None:
 
 
 def test_a_url_with_a_long_punctuation_tail_stays_fast() -> None:
-    started = time.perf_counter()
+    started = time.process_time()
     sanitize_auth_diagnostic("http://a" + ")" * 1_000_000, max_length=None)
-    assert time.perf_counter() - started < 2.0
+    assert time.process_time() - started < 2.0
