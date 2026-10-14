@@ -946,15 +946,24 @@ async def _sigterm_ignoring_process() -> asyncio.subprocess.Process:
     return process
 
 
-async def test_disconnect_all_cancelled_before_its_workers_start_kills_every_tree() -> (
-    None
-):
+async def test_disconnect_all_cancelled_before_its_workers_start_kills_every_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Codex, round 3: `call_soon(task.cancel)` right after creating the
     `disconnect_all` task cancels the gather's `_shutdown_one` workers before
     their first instruction, so no per-server handler runs. The parent-level
     fallback kills every tree anyway (real processes)."""
     mgr = ClientManager()
     processes = [await _sigterm_ignoring_process() for _ in range(2)]
+    killed_groups: list[int] = []
+    real_killpg = os.killpg
+
+    def killpg(pgid: int, sig: int) -> None:
+        real_killpg(pgid, sig)
+        if sig == signal.SIGKILL:
+            killed_groups.append(pgid)
+
+    monkeypatch.setattr(os, "killpg", killpg)
     try:
         for i, process in enumerate(processes):
             status = ServerStatus(
@@ -973,7 +982,10 @@ async def test_disconnect_all_cancelled_before_its_workers_start_kills_every_tre
             if p.returncode is None:
                 p.kill()
     assert kind == "cancelled", f"{kind} {detail!r}"
-    assert codes == [-signal.SIGKILL, -signal.SIGKILL], codes
+    assert {p.pid for p in processes} <= set(killed_groups), killed_groups
+    # A concurrent Popen.poll can reap the killed child before asyncio's watcher,
+    # which reports 255 (Consiliency/pmcp#391). Prove SIGKILL and exit separately.
+    assert set(codes) <= {-signal.SIGKILL, 255}, codes
     assert mgr._clients == {} and not mgr._lifecycle_lock.locked()
 
 
