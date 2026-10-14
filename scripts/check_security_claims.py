@@ -217,7 +217,7 @@ REGION_EXTERNAL_ALLOWLIST = (
 
 CI_WORKFLOW_PATH = ".github/workflows/test.yml"
 CI_PYTEST_INVOCATION = (
-    "uv run pytest tests/ -v --tb=short --cov --cov-report=xml "
+    "uv run pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml "
     "--cov-report=term-missing"
 )
 DISCOVERY_INVOCATION = ("uv", "run", "pytest", "tests/", "--collect-only", "-q")
