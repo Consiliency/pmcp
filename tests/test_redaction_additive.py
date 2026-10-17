@@ -1,19 +1,21 @@
 """The additive redaction rules (Consiliency/pmcp#234).
 
 `sanitize_auth_diagnostic` and `PolicyManager.redact_secrets` run the
-redactor's own rules unchanged, then the additive rules
+redactor's own rules with the Consiliency/pmcp#401 URL boundary correction, then the additive rules
 (`pmcp.redaction_additive`, rev 10's) over that output. Four guarantees:
 
 1. **Floor, by construction.** The additive rules only replace text with the
    marker, so every piece the redactor removed stays removed. Checked against
    an independent copy of the redactor (`tests/_main_redactor.py`): the base
-   pass is that redactor exactly, and every stretch of the final output
-   outside a marker appears, in order, in the base output.
+   pass only tightens that independent corrected snapshot. The historical
+   corpus retains its ordered-stretch floor; collision suffixes on protected
+   mapping-key markers are checked independently with field-preservation tests.
 2. **JSON.** When the base output is a JSON document, the final output is
    one too, and a structured result that came back a dict still does.
 3. **Linear time and memory** of the additive pass on every entry point, on a
    deterministic work count and tracemalloc peaks -- never on the clock.
-4. **Markers** are never split, doubled into one another, or re-spelled.
+4. **Markers** in values are never split, doubled into one another, or re-spelled.
+   A protected mapping key is replaced atomically, including any marker it held.
 
 Plus what the additive rules are for: credentials the base pass keeps are
 removed, and prose the base pass keeps survives.
@@ -500,7 +502,8 @@ def _texts(rows: list[G.Row]) -> list[str]:
 
 def test_the_base_pass_is_the_redactor_unchanged() -> None:
     """`_sanitize_base` is the vendored redactor, output for output, on every
-    tier-1 text, the prose, the credentials and the JSON fuzz."""
+    tier-1 text, the prose, the credentials and the JSON fuzz. The newly
+    tightened key/value/suffix cases have independent regressions below."""
     texts = _texts(G.corpus(1)) + [PROSE] + [c[1] for c in CREDENTIALS]
     texts += [json.dumps(o, indent=2) for o in _json_fuzz_corpus()]
     assert [t for t in texts if _sanitize_base(t) != _main_e(t)] == []
@@ -619,6 +622,319 @@ def test_floor_mutant_a_restoring_pass_is_caught(
 # =================================================================== JSON ==== #
 
 
+@pytest.mark.parametrize("depth", [0, 1, 3])
+@pytest.mark.parametrize(
+    "href", ["", "https://example.test/watch", "https://example.test/watch?v=abc"]
+)
+def test_url_escape_credential_keys_keep_distinct_entries(
+    depth: int, href: str
+) -> None:
+    keys = [
+        "AKIAABCDEFGHIJKLMNOP",
+        "xoxb-" + "123456789012-abcdefghijklmnopqrstuvwx",
+        "AIza" + "A1b2" * 9,
+        "xoxb-" + '987654321098-abcdefghijklmnopqrstuvwx\nquoted"suffix',
+    ]
+    rows = {
+        "keys": {
+            "[REDACTED]": "reserved",
+            **{key: f"entry-{i}" for i, key in enumerate(keys)},
+        },
+        "snippet": f'<Card href="{href}">Person</Card>',
+    }
+    nested = json.dumps(rows)
+    for _ in range(depth):
+        nested = json.dumps(nested)
+    payload = {
+        "content": [{"type": "text", "text": nested}],
+        "structuredContent": rows,
+        "isError": False,
+    }
+    serialized = json.dumps(payload)
+    policy = _policy()
+    processed = policy.process_output(payload, redact=True, max_bytes=200000)
+    assert processed["raw_size"] == len(json.dumps(payload, indent=2).encode("utf-8"))
+    assert processed["truncated"] is False
+    assert processed["summary"] is None
+    assert (
+        policy.process_output(payload, redact=False, max_bytes=200000)["result"]
+        == payload
+    )
+    outputs = [
+        json.loads(_ours_e(serialized)),
+        json.loads(policy.redact_secrets(serialized)),
+        json.loads(
+            policy.process_output(serialized, redact=True, max_bytes=200000)["result"]
+        ),
+        processed["result"],
+    ]
+    for result in outputs:
+        assert isinstance(result, dict)
+        assert all(key.split("\n")[0] not in json.dumps(result) for key in keys)
+        decoded = result["content"][0]["text"]
+        for _ in range(depth + 1):
+            decoded = json.loads(decoded)
+        assert decoded == result["structuredContent"]
+        assert decoded["keys"]["[REDACTED]"] == "reserved"
+        assert sorted(decoded["keys"].values()) == [
+            *[f"entry-{i}" for i in range(len(keys))],
+            "reserved",
+        ]
+        reversed_rows = {**rows, "keys": dict(reversed(list(rows["keys"].items())))}
+        reversed_result = policy.process_output(
+            reversed_rows, redact=True, max_bytes=200000
+        )["result"]
+        assert reversed_result["keys"] == decoded["keys"]
+
+
+@pytest.mark.parametrize("depth", [0, 1, 3])
+@pytest.mark.parametrize("escaped", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_url_escape_keys_with_existing_markers_are_atomic(
+    depth: int, escaped: bool, reverse: bool
+) -> None:
+    key = "AKIAABCDEFGHIJKLMNOP [REDACTED]"
+    rows = {
+        key: "protected",
+        "[REDACTED][REDACTED]": "benign",
+        "[REDACTED]": "reserved",
+    }
+    if reverse:
+        rows = dict(reversed(list(rows.items())))
+    doc = json.dumps(rows)
+    if escaped:
+        doc = doc.replace("[REDACTED]", r"\u005bREDACTED\u005d")
+    nested = doc
+    for _ in range(depth):
+        nested = json.dumps(nested)
+    payload = {"text": nested, "structuredContent": json.loads(doc)}
+    for redact in (_ours_e, _ours_p):
+        result = json.loads(redact(json.dumps(payload)))
+        decoded = result["text"]
+        for _ in range(depth + 1):
+            decoded = json.loads(decoded)
+        assert (
+            decoded
+            == result["structuredContent"]
+            == {
+                "[REDACTED][REDACTED]": "benign",
+                "[REDACTED]": "reserved",
+                "[REDACTED]#2": "protected",
+            }
+        )
+        assert "AKIAABCDEFGHIJKLMNOP" not in json.dumps(result)
+
+
+def test_url_escape_atomic_key_mutant_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    merge = A.merge_redaction_spans
+    monkeypatch.setattr(
+        A,
+        "merge_redaction_spans",
+        lambda text, spans: merge(
+            text, [(a, b, str(replacement)) for a, b, replacement in spans]
+        ),
+    )
+    with pytest.raises(AssertionError):
+        test_url_escape_keys_with_existing_markers_are_atomic(1, False, False)
+
+
+@pytest.mark.parametrize("key", ["credential", "credentials", "auth", "code"])
+@pytest.mark.parametrize("depth", [0, 1, 3])
+def test_url_escape_weak_query_values_are_secrets(key: str, depth: int) -> None:
+    snippet = f'<a href="https://example.test/watch?{key}=hunter">Person</a>'
+    nested = snippet
+    for _ in range(depth):
+        nested = json.dumps(nested)
+    rows = {
+        "snippet": snippet,
+        "nested": nested,
+        "status": {"code": "not_found", "credentials": "include", "auth": "basic"},
+    }
+    payload = {
+        "content": [{"type": "text", "text": json.dumps(rows)}],
+        "structuredContent": rows,
+    }
+    result = _ours_process(payload)
+    assert isinstance(result, dict)
+    assert "hunter" not in json.dumps(result)
+    assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
+    assert result["structuredContent"]["status"] == rows["status"]
+    for redact in (_ours_e, _ours_p):
+        assert "hunter" not in redact(json.dumps(payload))
+
+
+@pytest.mark.parametrize("depth", [0, 1, 3])
+def test_url_escape_escaped_benign_keys_reserve_markers(depth: int) -> None:
+    key = "AKIAABCDEFGHIJKLMNOP"
+    doc = (
+        '{"\\u005bREDACTED\\u005d": "keep", "\\u005bREDACTED\\u005d#2": "also keep", "'
+        + key
+        + '": "protected"}'
+    )
+    nested = doc
+    for _ in range(depth):
+        nested = json.dumps(nested)
+    payload = {"text": nested, "structuredContent": json.loads(doc)}
+    for redact in (_ours_e, _ours_p):
+        result = json.loads(redact(json.dumps(payload)))
+        decoded = result["text"]
+        for _ in range(depth + 1):
+            decoded = json.loads(decoded)
+        assert (
+            decoded
+            == result["structuredContent"]
+            == {
+                "[REDACTED]": "keep",
+                "[REDACTED]#2": "also keep",
+                "[REDACTED]#3": "protected",
+            }
+        )
+        assert key not in json.dumps(result)
+        assert json.loads(redact(doc)) == decoded
+
+
+@pytest.mark.parametrize("depth", [0, 1, 3])
+@pytest.mark.parametrize("value", ["tokPieceO.\\", "\\\\", ";;;\\"])
+@pytest.mark.parametrize(
+    "component",
+    [
+        "?token=",
+        "?credential=",
+        "#access_token=",
+        "?q=ghp_abcdefghijklmnopqrstuvwx1234567890",
+    ],
+)
+def test_url_escape_policy_secret_suffix_is_not_returned(
+    depth: int, value: str, component: str
+) -> None:
+    snippet = f'<a href="https://example.test/p{component}{value}">Person</a>'
+    nested = snippet
+    for _ in range(depth):
+        nested = json.dumps(nested)
+    rows = {"snippet": snippet, "nested": nested}
+    payload = {
+        "content": [{"type": "text", "text": json.dumps(rows)}],
+        "structuredContent": rows,
+    }
+    result = _ours_process(payload)
+    assert isinstance(result, dict)
+    rows = result["structuredContent"]
+    assert json.loads(result["content"][0]["text"]) == rows
+    assert "\\" not in rows["snippet"]
+    assert "tokPieceO" not in rows["snippet"]
+    assert "ghp_abcdefghijklmnopqrstuvwx1234567890" not in rows["snippet"]
+    decoded = rows["nested"]
+    for _ in range(depth):
+        decoded = json.loads(decoded)
+    assert decoded == rows["snippet"]
+    for redact in (_ours_e, _ours_p):
+        raw = redact(f"see https://example.test/p{component}{value} next")
+        assert "\\" not in raw
+        assert "tokPieceO" not in raw
+        assert "ghp_abcdefghijklmnopqrstuvwx1234567890" not in raw
+
+
+def test_url_escape_mutants_restoring_newly_protected_bytes_are_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pmcp.auth
+
+    with monkeypatch.context() as patch:
+        patch.setattr(A, "_json_string_context", lambda text: ([], {}))
+        with pytest.raises(AssertionError):
+            test_url_escape_credential_keys_keep_distinct_entries(
+                1, "https://example.test/watch?v=abc"
+            )
+    with monkeypatch.context() as patch:
+        patch.setattr(A, "_url_component_spans", lambda *args: [])
+        with pytest.raises(AssertionError):
+            test_url_escape_weak_query_values_are_secrets("credential", 1)
+    with monkeypatch.context() as patch:
+        patch.setattr(pmcp.auth, "_sanitize_base", _main_e)
+        with pytest.raises(AssertionError):
+            test_url_escape_policy_secret_suffix_is_not_returned(
+                1, "tokPieceO.\\", "?token="
+            )
+    # The ordered relation also rejects restoring these bytes when the
+    # comparison output actually withheld them. The historical oracle did
+    # not withhold these new cases, hence the separate regressions above.
+    for protected, restored in (
+        (
+            '{"[REDACTED]": 1, "[REDACTED]#2": 2}',
+            '{"AKIAABCDEFGHIJKLMNOP": 1, "[REDACTED]#2": 2}',
+        ),
+        ("credential=[REDACTED]", "credential=hunter"),
+        ("token=[REDACTED] next", "token=[REDACTED]\\ next"),
+    ):
+        assert not _is_additive_of(restored, protected)
+
+
+@pytest.mark.parametrize("depth", [0, 2, 4])
+@pytest.mark.parametrize(
+    ("url", "suffix", "label", "secrets"),
+    [
+        ("https://example.test/watch?v=abc", "", "Person", ()),
+        (r"https://example.test/a\b?v=%5C", "\\\\", "人 café", ()),
+        ("https://example.test/watch?v=abc", "\\).,;\\", "人 café", ()),
+        (
+            r"https://userPiece:passPiece@example.test/watch?token=leftPiece\rightPiece&code=codePiece&v=abc",
+            "\\\\",
+            "人 café",
+            (
+                "userPiece",
+                "passPiece",
+                "leftPiece",
+                "rightPiece",
+                "codePiece",
+            ),
+        ),
+    ],
+)
+def test_url_escape_structured_result_regression(
+    depth: int, url: str, suffix: str, label: str, secrets: tuple[str, ...]
+) -> None:
+    snippet = f'<Card href="{url}{suffix}">{label}</Card>'
+    rows = {"results": [{"file": "example.dart", "snippet": snippet}]}
+    nested = snippet
+    for _ in range(depth):
+        nested = json.dumps(nested, ensure_ascii=False)
+    if depth:
+        rows["results"][0]["nested"] = nested
+    payload = {
+        "content": [{"type": "text", "text": json.dumps(rows)}],
+        "structuredContent": rows,
+        "isError": False,
+    }
+    policy = _policy()
+    processed = policy.process_output(payload, redact=True, max_bytes=200000)
+    assert processed["truncated"] is False
+    assert processed["summary"] is None
+    assert processed["raw_size"] == len(json.dumps(payload, indent=2).encode("utf-8"))
+    result = processed["result"]
+    assert isinstance(result, dict)
+    serialized = json.dumps(payload, indent=2, ensure_ascii=False)
+    results = [
+        result,
+        json.loads(sanitize_auth_diagnostic(serialized, max_length=None)),
+        json.loads(policy.redact_secrets(serialized)),
+    ]
+    for result in results:
+        assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
+        assert result["isError"] is False
+        if not secrets:
+            assert result == payload
+        for secret in secrets:
+            assert secret not in json.dumps(result)
+        row = result["structuredContent"]["results"][0]
+        if depth:
+            decoded = row["nested"]
+            for _ in range(depth):
+                decoded = json.loads(decoded)
+            assert decoded == row["snippet"]
+
+
 def test_json_documents_stay_documents() -> None:
     """Wherever the base output of a JSON text parses, the final output
     parses too, on both surfaces; and a structured result the base
@@ -669,21 +985,21 @@ def test_json_mutant_without_clipping_breaks_a_document(
         test_a_span_across_a_string_boundary_is_confined_to_the_string()
 
 
-def test_object_keys_are_left_alone_so_entries_never_collide() -> None:
-    """Two random-looking keys redacted to the same marker collapsed a map to
-    its last entry (rev 15's board). The additive pass writes only into
-    string VALUES of a document."""
+def test_credential_keys_are_redacted_without_colliding() -> None:
+    """Credential keys are protected, and both entries survive (rev 15's
+    board). Ordinary keys retain their spelling and value."""
     obj = {"Xk9mQ2vLp3RtY7wBaaQ1": 1, "Pq7rS2tUv9WxY3zAbC4d": 2}
-    assert _ours_process(obj) == obj
+    result = _ours_process({**obj, "ordinary": 3})
+    assert result == {"[REDACTED]#2": 1, "[REDACTED]": 2, "ordinary": 3}
     doc = json.dumps({"Xk9mQ2vLp3RtY7wBaaQ1": "Pq7rS2tUv9WxY3zAbC4d"})
-    assert json.loads(_ours_e(doc)) == {"Xk9mQ2vLp3RtY7wBaaQ1": "[REDACTED]"}
+    assert json.loads(_ours_e(doc)) == {"[REDACTED]": "[REDACTED]"}
 
 
 def test_object_keys_mutant_clipping_into_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """Rev 15's clipping, which let spans into object keys, collides them."""
     monkeypatch.setattr(A, "_is_object_key", lambda text, end: False)
     with pytest.raises(AssertionError):
-        test_object_keys_are_left_alone_so_entries_never_collide()
+        test_credential_keys_are_redacted_without_colliding()
 
 
 # ================================================================ markers ==== #
@@ -913,6 +1229,8 @@ _PER_4X = 4 * (16 / 14) * 1.05
 #: Every shape four review rounds found (the additive rules' share of
 #: them), and the families derived from the rules' loops.
 LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
+    "credential keys and escaped reserved marker": lambda n: json.dumps({"text": '{"\\u005bREDACTED\\u005d": 1, "AKIAABCDEFGHIJKLMNOP": 2}', "padding": "x " * (n // 2)}),
+    "backslash run alongside credential keys": lambda n: json.dumps({"AKIAABCDEFGHIJKLMNOP": 1, "text": "\\" * (n // 2)}),
     "closers after a Bearer value": lambda n: "Bearer x" + ")" * n + "a",
     "escaped quotes after Authorization": lambda n: "Authorization: x" + '\\"' * (n // 2) + "a",
     "line breaks before a Bearer value": lambda n: "x Bearer" + "\n" * n + " abc",

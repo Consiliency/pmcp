@@ -1,11 +1,11 @@
 """The additive redaction rules (Consiliency/pmcp#234).
 
 `sanitize_auth_diagnostic` and `PolicyManager.redact_secrets` first run the
-redactor exactly as it was (its URL, Authorization, Bearer, keyword and JWT
-rules, then the policy patterns), and then apply these rules to that
-redactor's OUTPUT. A rule here can only replace text with the redaction
-marker; it never restores anything. So every piece the redactor removed
-stays removed, by construction, and these rules can only add.
+redactor's URL, Authorization, Bearer, keyword and JWT rules, then the policy
+patterns, and then apply these rules to that redactor's OUTPUT. A rule here
+can only replace text with the redaction marker (with numeric collision
+suffixes for mapping keys); it never restores anything. So every piece the
+redactor removed stays removed, by construction, and these rules can only add.
 
 What they add: separator-anchored keyword rules over a wider key set,
 keyword lists, whitespace keywords with a credential-shaped value, Bearer
@@ -30,7 +30,7 @@ import re
 from collections.abc import Callable, Iterator
 from urllib.parse import unquote
 
-from pmcp.parsing import load_json
+from pmcp.parsing import _decode_json_string_token, load_json
 
 #: Test-only work counter. None in production; the complexity tests set it to
 #: `[0]`, and every loop and string build below adds what it iterates over
@@ -289,6 +289,11 @@ def _reads_as_route(run: str) -> bool:
 #: needs (Consiliency/pmcp#234, revs 2-3: the `Bearer` pass ate a closing
 #: quote, the URL pass ate the backslash that escaped one).
 Span = tuple[int, int, str]
+
+
+class _KeyReplacement(str):
+    """An atomic mapping-key replacement, including any marker inside it."""
+
 
 REDACTED = "[REDACTED]"
 
@@ -972,7 +977,11 @@ def _url_component_spans(
         for pair in raw_url[query_start + 1 : query_end].split("&"):
             key, equals, value = pair.partition("=")
             value_start = position + len(key) + 1
-            if equals and value and unquote(key).lower() in QUERY_SECRET_KEYS:
+            if (
+                equals
+                and value
+                and unquote(key).lower() in QUERY_SECRET_KEYS | WEAK_SECRET_KEYS
+            ):
                 spans.append(
                     (base + value_start, base + value_start + len(value), REDACTED)
                 )
@@ -1025,7 +1034,7 @@ def _url_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
         # Trailing sentence punctuation is handed back, and so is a trailing
         # backslash: in a serialised leaf it escapes the closing quote
         # (`…?sid=x\\"`), and a query-value span that ate it broke the JSON.
-        raw_url = raw_url.rstrip(").,;\\")  # in one pass, as main does
+        raw_url = raw_url.rstrip(").,;\\")
         spans.extend(_url_component_spans(match.start(), raw_url, depth, covers))
     return spans
 
@@ -1193,7 +1202,8 @@ def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
     """The disjoint spans `apply_redaction_spans` applies, ascending.
 
     Every marker already in the text -- `[REDACTED]`, and the URL rule's
-    `%5BREDACTED%5D` -- is left exactly as it is:
+    `%5BREDACTED%5D` -- is left exactly as it is, except inside an atomic
+    credential-key replacement whose collision-free name owns the whole key:
 
     * a span that starts ON a marker keeps the marker and replaces only the
       run glued to its end, up to whitespace, `&`, `#`, a quote, a
@@ -1226,6 +1236,9 @@ def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
     marker_starts = [start for start, _ in markers]
     pieces: list[Span] = []
     for start, end, replacement in spans:
+        if isinstance(replacement, _KeyReplacement):
+            pieces.append((start, end, replacement))
+            continue
         i = bisect.bisect_right(marker_starts, start) - 1
         if i >= 0 and markers[i][1] > start:
             # starts on a marker: keep it, and replace only the run glued to
@@ -1333,6 +1346,12 @@ def apply_redaction_spans(text: str, spans: list[Span]) -> str:
 #: state for every character of a long string).
 _JSON_STRING_RE = re.compile(r"\"[^\"\\]*(?:\\.[^\"\\]*)*\"")
 _JSON_ESCAPE_RE = re.compile(r"\\u[0-9a-fA-F]{4}|\\.", re.DOTALL)
+# A surrogate pair decodes to one character, hence one source boundary.
+_JSON_CHARACTER_ESCAPE_RE = re.compile(
+    r"\\u[dD][89aAbB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}"
+    r"|\\u[0-9a-fA-F]{4}|\\.",
+    re.DOTALL,
+)
 
 
 def _is_object_key(text: str, end: int) -> bool:
@@ -1344,15 +1363,73 @@ def _is_object_key(text: str, end: int) -> bool:
     return rest < len(text) and text[rest] == ":"
 
 
+def _json_string_context(
+    text: str,
+) -> tuple[list[tuple[str, int, int]], dict[int, int]]:
+    """Decoded key names and URL quote escapes, with original source offsets.
+
+    Read nested JSON strings iteratively; never serialize or rebuild them.
+    Each decoded character keeps its source boundary, so a secret's literal
+    backslashes and the escapes of a following quote remain distinguishable.
+    The caller has already established that the outer text is valid JSON.
+    """
+    keys: list[tuple[str, int, int]] = []
+    quote_escapes: dict[int, int] = {}
+    urls = {match.start(): match.end() for match in URL_RE.finditer(text)}
+    pending = [(text, list(range(len(text) + 1)))]
+    while pending:
+        current, positions = pending.pop()
+        work(3 * len(current))
+        for token in _JSON_STRING_RE.finditer(current):
+            decoded = _decode_json_string_token(
+                current, token.start() + 1, source="redaction string context"
+            )
+            is_key = _is_object_key(current, token.end())
+            nested = False
+            if not is_key and decoded.lstrip()[:1] in ('"', "{", "["):
+                work(len(decoded))
+                try:
+                    load_json(decoded, source="nested redaction context")
+                    nested = True
+                except (ValueError, RecursionError):
+                    pass
+            if not (is_key or nested or "://" in decoded):
+                continue
+            start, end = token.start() + 1, token.end() - 1
+            boundaries = [positions[start]]
+            cursor = start
+            for escape in _JSON_CHARACTER_ESCAPE_RE.finditer(current, start, end):
+                boundaries.extend(positions[cursor + 1 : escape.start() + 1])
+                boundaries.append(positions[escape.end()])
+                cursor = escape.end()
+            boundaries.extend(positions[cursor + 1 : end + 1])
+            work(end - start)
+            if is_key:
+                keys.append((decoded, boundaries[0], boundaries[-1]))
+            if nested:
+                pending.append((decoded, boundaries))
+            else:
+                for url in URL_RE.finditer(decoded):
+                    original_start = boundaries[url.start()]
+                    original_end = urls.get(original_start, boundaries[url.end()])
+                    # The raw URL scanner can run past encoded whitespace
+                    # that ends its decoded counterpart. Locate its actual
+                    # closing quote, rather than borrowing the decoded end.
+                    boundary = bisect.bisect_right(boundaries, original_end) - 1
+                    suffix_start = boundaries[boundary]
+                    suffix = text[suffix_start:original_end]
+                    if not suffix.strip("\\"):
+                        quote_escapes[original_start] = len(suffix)
+    return keys, quote_escapes
+
+
 def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
     """When ``text`` is a JSON document, confine every span to the contents
-    of string VALUES, whole escapes at a time: a replacement then never
-    touches a delimiting quote, a bracket, a separator, a bare scalar or an
-    object key, and never splits an escape. So the document stays a
-    document, and no two keys of an object can collide into one (rev 15's
-    board: random-looking keys redacted to the same marker collapsed a map
-    to its last entry). Anything a span covered outside a string value is
-    left as it is."""
+    of strings, whole escapes at a time: a replacement then never
+    touches a delimiting quote, a bracket, a separator, a bare scalar or a
+    benign object key, and never splits an escape. Credential-shaped keys
+    receive collision-free markers, including inside nested JSON text.
+    Anything a span covered outside strings is left as it is."""
     head = text.lstrip()[:1]
     if head not in ("{", "[", '"') or not spans:
         return spans
@@ -1361,6 +1438,26 @@ def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
     except (ValueError, RecursionError):
         return spans
     work(3 * len(text))
+    keys, _ = _json_string_context(text)
+    protected = {key for key, _, _ in keys if _shape_spans(key)}
+    reserved = {key for key, _, _ in keys} - protected
+    work(len(protected) * max(1, len(protected).bit_length()))
+    replacements: dict[str, str] = {}
+    number = 1
+    for key in sorted(protected):
+        marker = REDACTED if number == 1 else f"{REDACTED}#{number}"
+        while marker in reserved:
+            number += 1
+            marker = f"{REDACTED}#{number}"
+        replacements[key] = _KeyReplacement(marker)
+        reserved.add(marker)
+        number += 1
+    key_spans = sorted(
+        (start, end, replacements[key])
+        for key, start, end in keys
+        if key in replacements
+    )
+    key_starts = [start for start, _, _ in key_spans]
     values: list[tuple[int, int]] = []
     for match in _JSON_STRING_RE.finditer(text):
         start, end = match.span()
@@ -1389,7 +1486,21 @@ def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
                     high += 1
                 clipped.append((low, high, replacement))
             i += 1
-    return clipped
+    # Nested key spans lie inside string values. Remove their intersections
+    # from the ordinary spans before installing the collision-free marker.
+    result: list[Span] = []
+    for low, high, replacement in clipped:
+        i = max(0, bisect.bisect_right(key_starts, low) - 1)
+        while i < len(key_spans) and key_spans[i][0] < high:
+            start, end, _ = key_spans[i]
+            if end > low:
+                if start > low:
+                    result.append((low, start, replacement))
+                low = max(low, end)
+            i += 1
+        if low < high:
+            result.append((low, high, replacement))
+    return result + key_spans
 
 
 def redact_additive(

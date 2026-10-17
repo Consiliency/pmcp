@@ -13,7 +13,7 @@ from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from itertools import product
 from typing import Any, Literal
 from urllib.error import HTTPError
-from urllib.parse import ParseResult, parse_qsl, quote, urlparse, urlunparse
+from urllib.parse import ParseResult, parse_qsl, quote, unquote, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import aiohttp
@@ -23,7 +23,11 @@ from jwt import PyJWKSet
 from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
 from pmcp.parsing import load_json
-from pmcp.redaction_additive import redact_additive
+from pmcp.redaction_additive import (
+    _covers_anything,
+    _json_string_context,
+    redact_additive,
+)
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
 
@@ -1221,7 +1225,7 @@ def sanitize_url_elicitation_url(
 def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> str:
     """Return a display-safe diagnostic string for auth failures.
 
-    The redactor's own rules run first, unchanged (`_sanitize_base`); the
+    The redactor's own rules run first (`_sanitize_base`); the
     additive rules (`pmcp.redaction_additive`) then run over that output and
     can only replace more of it with the marker (Consiliency/pmcp#234). The
     cut is taken last, as before.
@@ -1237,10 +1241,63 @@ def _sanitize_base(text: str) -> str:
     """The redactor's own rules, in order: URLs, Authorization, Bearer, the
     keyword rule, JWTs."""
 
+    quote_escapes: dict[int, int] = {}
+    if "\\" in text and text.lstrip()[:1] in ('"', "{", "["):
+        try:
+            load_json(text, source="redaction candidate")
+            _, quote_escapes = _json_string_context(text)
+        except (ValueError, RecursionError):
+            pass
+
     def redact_url_match(match: re.Match[str]) -> str:
         whole = match.group(0)
-        raw_url = whole.rstrip(").,;")  # trailing sentence punctuation, in one pass
-        return redact_auth_url(raw_url) + whole[len(raw_url) :]
+        raw_url = whole.rstrip(").,;\\")
+        suffix = whole[len(raw_url) :]
+        fragment_suffix = False
+        # A secret's own backslashes are not surrounding punctuation. The
+        # decoded JSON string establishes exactly which source backslashes
+        # belong to a closing quote, including nested serialized strings.
+        last_pair = raw_url.partition("?")[2].rsplit("&", 1)[-1]
+        key, equals, value = last_pair.partition("=")
+        covered_value = bool(
+            "\\" in suffix
+            and "?" in raw_url
+            and equals
+            and _covers_anything(unquote(value), 0, None)
+        )
+        if "\\" in suffix and (
+            "#" in raw_url
+            or (
+                "?" in raw_url
+                and equals
+                and (
+                    unquote(key).lower()
+                    in AUTH_SECRET_QUERY_KEYS | {"credential", "credentials"}
+                    or covered_value
+                )
+            )
+        ):
+            escapes = quote_escapes.get(match.start(), 0)
+            raw_url = whole[:-escapes] if escapes else whole
+            suffix = "\\" * escapes
+            fragment_suffix = "#" in raw_url and len(raw_url) > len(
+                whole.rstrip(").,;\\")
+            )
+            if (
+                covered_value
+                and "#" not in raw_url
+                and len(raw_url) > len(whole.rstrip(").,;\\"))
+            ):
+                # Complete a shaped value's redaction before a later policy
+                # pattern can replace only its recognizable prefix and hide
+                # the context that makes its encoded suffix secret too.
+                pair_start = max(raw_url.find("?"), raw_url.rfind("&")) + 1
+                raw_url = raw_url[: pair_start + len(key) + 1] + "[REDACTED]"
+        return (
+            redact_auth_url(raw_url)
+            + ("[REDACTED]" if fragment_suffix else "")
+            + suffix
+        )
 
     text = re.sub(r"https?://[^\s\"'<>]+", redact_url_match, text)
     text = re.sub(

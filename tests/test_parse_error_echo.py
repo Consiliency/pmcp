@@ -54,6 +54,7 @@ _HELPERS = "parsing.py"
 #: ``compose``, ``JSONDecoder``, ``fromisoformat``, ``strptime``, whatever a
 #: later release adds -- is a parser reference.
 _SAFE_ATTRIBUTES: dict[str, frozenset[str]] = {
+    "_json": frozenset(),
     "json": frozenset({"dumps", "dump", "JSONDecodeError", "JSONEncoder"}),
     "yaml": frozenset(
         {
@@ -156,7 +157,7 @@ def _qualified(node: ast.AST, bound: dict[str, str]) -> str | None:
 #: ``yaml.constructor.SafeConstructor``, ``json.decoder.JSONDecoder``) is a
 #: parser reference unless its name is safe in the package itself (rev 8,
 #: round-7 claude (3)).
-_PARSER_PACKAGES = ("json", "yaml", "tomllib")
+_PARSER_PACKAGES = ("_json", "json", "yaml", "tomllib")
 
 
 def _violation(qualified: str) -> bool:
@@ -262,6 +263,10 @@ def test_no_parser_call_outside_the_helpers() -> None:
         "import yaml\nyaml.compose(t)",
         "import yaml\nf = yaml.full_load",
         "import json\njson.loads(t)",
+        "import _json\n_json.scanstring(t, 1)",
+        "import _json as j\nj.scanstring(t, 1)",
+        "from _json import scanstring\nscanstring(t, 1)",
+        "from _json import scanstring as scan\nscan(t, 1)",
         "import json as j\nj.load(f)",
         "from json import loads\nloads(t)",
         "import json\njson.JSONDecoder().decode(t)",
@@ -730,6 +735,40 @@ def test_load_json_classifies_every_failure_by_origin(family: str) -> None:
     assert {"RecursionError", "UnicodeDecodeError"} <= causes, causes
 
 
+@pytest.mark.parametrize("family", sorted(_FAMILIES))
+def test_json_string_token_decoder_is_value_free(
+    family: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.argument_errors import exception_text, safe_traceback_text
+    from pmcp import parsing
+
+    sentinel = _FAMILIES[family][1]
+    forbidden = _forbidden_any_case(sentinel)
+    token = json.dumps("😀 " + sentinel + "\\suffix")
+    assert parsing._decode_json_string_token(
+        token, 1, source="redaction token"
+    ) == json.loads(token)
+    for malformed in (token[:-1], token[:-1] + r'\q"'):
+        with pytest.raises(parsing.JSONParseError) as caught:
+            parsing._decode_json_string_token(malformed, 1, source="redaction token")
+        error = caught.value
+        assert error.__cause__ is None and error.__context__ is None
+        assert error.doc == ""
+        for text in (str(error), exception_text(error), safe_traceback_text(error)):
+            assert not any(form in text for form in forbidden)
+
+    def broken(*args: Any) -> Any:
+        raise ValueError(sentinel)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(parsing, "scanstring", broken)
+        with pytest.raises(parsing.JSONParseError) as caught:
+            parsing._decode_json_string_token(token, 1, source="redaction token")
+    assert caught.value.cause == "ValueError"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert not any(form in str(caught.value) for form in forbidden)
+
+
 def test_duplicate_yaml_keys_are_data_not_a_parse_error() -> None:
     """Measured, so the sweep's `_rejects` filter drops them: PyYAML's
     safe_load keeps the last value."""
@@ -1145,6 +1184,7 @@ _NOT_HTTP_CLIENTS = frozenset(
     {
         # The standard library, apart from `urllib`.
         "__future__",
+        "_json",  # stdlib lexical JSON scanner; no HTTP or file IO
         "argparse",
         "ast",
         "asyncio",

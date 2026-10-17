@@ -9,6 +9,55 @@ from pathlib import Path
 from pmcp.policy.policy import PolicyManager
 
 
+def test_url_escape_output_budget_contract() -> None:
+    policy = PolicyManager()
+    secret = "budgetSecretPiece"
+    snippet = (
+        f'<Card href="https://example.test/watch?token={secret}&v=abc">人 café</Card>'
+    )
+    rows = {"results": [{"file": "example.dart", "snippet": snippet}]}
+    payload = {
+        "content": [{"type": "text", "text": json.dumps(rows)}],
+        "structuredContent": rows,
+        "isError": False,
+        "filler": "人 café " * 100,
+    }
+    for source in (payload, json.dumps(payload, indent=2, ensure_ascii=False)):
+        serialized = source if isinstance(source, str) else json.dumps(source, indent=2)
+        raw_size = len(serialized.encode("utf-8"))
+        for budget in (raw_size, raw_size - 1, 220):
+            for redact in (False, True):
+                processed = policy.process_output(
+                    source, redact=redact, max_bytes=budget
+                )
+                truncated = budget < raw_size
+                assert processed["raw_size"] == raw_size
+                assert processed["truncated"] is truncated
+                result = processed["result"]
+                if truncated:
+                    assert isinstance(result, str)
+                    marker = f"[... OUTPUT TRUNCATED: {raw_size} bytes -> {budget} bytes ...]"
+                    assert result.endswith(marker)
+                    assert processed["summary"] is not None
+                    assert f"Output was {raw_size} bytes" in processed["summary"]
+                    if not redact:
+                        expected, _, _ = policy.truncate_output(serialized, budget)
+                        assert result == expected
+                else:
+                    assert processed["summary"] is None
+                    assert isinstance(result, str) == isinstance(source, str)
+                    if not redact:
+                        assert result == source
+                    decoded = json.loads(result) if isinstance(result, str) else result
+                    assert (
+                        json.loads(decoded["content"][0]["text"])
+                        == decoded["structuredContent"]
+                    )
+                if redact:
+                    assert secret not in json.dumps(result)
+                    assert secret not in (processed["summary"] or "")
+
+
 class TestServerAllowDeny:
     """Tests for server allow/deny lists."""
 
