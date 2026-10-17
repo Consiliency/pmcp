@@ -1311,6 +1311,12 @@ _SDK_ERROR_CONSTRUCTIONS: dict[tuple[str, str, str, str], str] = {
     (
         "mcp.server.mcpserver.server",
         "MCPError",
+        "message",
+        "f'Error completing argument {params.argument.name}'",
+    ): _UNUSED,
+    (
+        "mcp.server.mcpserver.server",
+        "MCPError",
         "data",
         "{'uri': str(params.uri)}",
     ): _UNUSED,
@@ -1345,6 +1351,12 @@ _SDK_ERROR_CONSTRUCTIONS: dict[tuple[str, str, str, str], str] = {
         "f'Validation error: {str(e)}'",
     ): _PRE,
     (
+        "mcp.server.streamable_http_manager",
+        "ErrorData",
+        "message",
+        "message",
+    ): _PLUMB,
+    (
         "mcp.shared.direct_dispatcher",
         "MCPError",
         "message",
@@ -1372,7 +1384,7 @@ _SDK_ERROR_CONSTRUCTIONS: dict[tuple[str, str, str, str], str] = {
         "InboundLadderRejection",
         "data",
         "UnsupportedProtocolVersionErrorData(supported=list(supported_modern_versions), "
-        "requested=protocol_version).model_dump(mode='json')",
+        "requested=requested).model_dump(mode='json')",
     ): _WRITE,
     (
         "mcp.shared.inbound",
@@ -1499,7 +1511,8 @@ def test_every_sdk_error_construction_is_classified() -> None:
     )
 
 
-#: Every other exception the SDK builds from non-literal text -- `ValueError`,
+#: Every other exception and registered message helper the SDK builds from
+#: non-literal text -- `ValueError`,
 #: `RuntimeError`, its own error classes -- anywhere in the package, client
 #: transports included (rev 26, round-24 ruling). Each is withheld by origin
 #: (`pmcp.sdk_rejections.withheld_sdk_error`): raised from the SDK's frames,
@@ -1520,11 +1533,6 @@ _SDK_EXCEPTION_CONSTRUCTIONS: frozenset[tuple[str, str, str]] = frozenset(
             "mcp.client.auth.extensions.identity_assertion",
             "OAuthFlowError",
             "f'Token endpoint {token_endpoint} is not on the configured issuer origin {self._issuer}'",
-        ),
-        (
-            "mcp.client.auth.extensions.identity_assertion",
-            "OAuthTokenError",
-            "f'Token exchange failed ({token_response.status_code}): {body}'",
         ),
         (
             "mcp.client.auth.oauth2",
@@ -1558,11 +1566,6 @@ _SDK_EXCEPTION_CONSTRUCTIONS: frozenset[tuple[str, str, str]] = frozenset(
         ),
         (
             "mcp.client.auth.oauth2",
-            "OAuthTokenError",
-            "f'Token exchange failed ({response.status_code}): {body_text}'",
-        ),
-        (
-            "mcp.client.auth.oauth2",
             "ValueError",
             "f'client_metadata_url must be a valid HTTPS URL with a non-root pathname, got: {client_metadata_url}'",
         ),
@@ -1580,11 +1583,6 @@ _SDK_EXCEPTION_CONSTRUCTIONS: frozenset[tuple[str, str, str]] = frozenset(
             "mcp.client.auth.utils",
             "OAuthRegistrationError",
             "f'Invalid registration response: {e}'",
-        ),
-        (
-            "mcp.client.auth.utils",
-            "OAuthRegistrationError",
-            "f'Registration failed: {response.status_code} {response.text}'",
         ),
         ("mcp.client.auth.utils", "OAuthTokenError", "f'Invalid token response: {e}'"),
         (
@@ -1779,16 +1777,6 @@ _SDK_EXCEPTION_CONSTRUCTIONS: frozenset[tuple[str, str, str]] = frozenset(
         (
             "mcp.server.mcpserver.prompts.base",
             "ValueError",
-            "f'Could not convert prompt result to message: {msg}'",
-        ),
-        (
-            "mcp.server.mcpserver.prompts.base",
-            "ValueError",
-            "f'Error rendering prompt {self.name}: {e}'",
-        ),
-        (
-            "mcp.server.mcpserver.prompts.base",
-            "ValueError",
             "f'Missing required arguments: {missing}'",
         ),
         (
@@ -1828,11 +1816,6 @@ _SDK_EXCEPTION_CONSTRUCTIONS: frozenset[tuple[str, str, str]] = frozenset(
         ),
         (
             "mcp.server.mcpserver.resources.templates",
-            "ResourceError",
-            "f'Error creating resource from template {uri}'",
-        ),
-        (
-            "mcp.server.mcpserver.resources.templates",
             "ResourceSecurityError",
             "self.uri_template",
         ),
@@ -1846,32 +1829,7 @@ _SDK_EXCEPTION_CONSTRUCTIONS: frozenset[tuple[str, str, str]] = frozenset(
             "NotADirectoryError",
             "f'Not a directory: {self.path}'",
         ),
-        (
-            "mcp.server.mcpserver.resources.types",
-            "ValueError",
-            "f'Error listing directory {self.path}: {e}'",
-        ),
-        (
-            "mcp.server.mcpserver.resources.types",
-            "ValueError",
-            "f'Error reading directory {self.path}: {e}'",
-        ),
-        (
-            "mcp.server.mcpserver.resources.types",
-            "ValueError",
-            "f'Error reading file {self.path}: {e}'",
-        ),
-        (
-            "mcp.server.mcpserver.resources.types",
-            "ValueError",
-            "f'Error reading resource {self.uri}: {e}'",
-        ),
         ("mcp.server.mcpserver.resources.types", "ValueError", "str(e)"),
-        (
-            "mcp.server.mcpserver.server",
-            "ResourceError",
-            "f'Error reading resource {uri}'",
-        ),
         ("mcp.server.mcpserver.server", "ValueError", "_MISSING_AUDIENCE"),
         (
             "mcp.server.mcpserver.server",
@@ -1910,11 +1868,6 @@ _SDK_EXCEPTION_CONSTRUCTIONS: frozenset[tuple[str, str, str]] = frozenset(
             "f'Unknown transport: {transport}'",
         ),
         ("mcp.server.mcpserver.server", "ValueError", "str(e)"),
-        (
-            "mcp.server.mcpserver.tools.base",
-            "ToolError",
-            "f'Error executing tool {self.name}: {e}'",
-        ),
         (
             "mcp.server.mcpserver.tools.tool_manager",
             "ToolError",
@@ -2018,6 +1971,88 @@ _SDK_EXCEPTION_CONSTRUCTIONS: frozenset[tuple[str, str, str]] = frozenset(
             "mcp.shared.uri_template",
             "TypeError",
             "f'Variable {var.name!r} must be str or a sequence of str, got {type(value).__name__}'",
+        ),
+        (
+            "mcp.client.auth.extensions.client_credentials",
+            "OAuthFlowError",
+            "f'Authorization server metadata issuer mismatch: {metadata.issuer} != {issuer}'",
+        ),
+        (
+            "mcp.client.auth.extensions.client_credentials",
+            "OAuthFlowError",
+            "f'No authorization server metadata discovered for configured issuer {issuer}'",
+        ),
+        (
+            "mcp.client.auth.extensions.client_credentials",
+            "ValueError",
+            'f"issuer must be the authorization server\'s http(s) issuer URL, got {issuer!r}"',
+        ),
+        (
+            "mcp.client.auth.extensions.identity_assertion",
+            "OAuthTokenError",
+            "f'Token exchange failed ({token_response.status_code}){redirect_note(token_response)}: {body}'",
+        ),
+        (
+            "mcp.client.auth.oauth2",
+            "OAuthFlowError",
+            "f'Protected resource metadata request failed: HTTP {prm_request_failed}'",
+        ),
+        (
+            "mcp.client.auth.oauth2",
+            "OAuthTokenError",
+            "f'Token exchange failed ({response.status_code}){redirect_note(response)}: {body_text}'",
+        ),
+        (
+            "mcp.client.auth.utils",
+            "OAuthRegistrationError",
+            "f'Registration failed: {response.status_code}{redirect_note(response)} {response.text}'",
+        ),
+        (
+            "mcp.client.streamable_http",
+            "_unfollowed_redirect",
+            "f\"Redirect to {location} not followed: it would downgrade this HTTPS endpoint to plain HTTP.\\nThe server is likely behind a TLS-terminating proxy whose forwarded headers it does not trust,\\noften combined with a trailing-slash difference. Try {location.copy_with(scheme='https')} instead, or fix the proxy settings.\"",
+        ),
+        (
+            "mcp.client.streamable_http",
+            "_unfollowed_redirect",
+            "f'Redirect to {location} not followed; use that URL as the endpoint if it is the intended server'",
+        ),
+        ("mcp.server.fastmcp", "ModuleNotFoundError", "_MESSAGE"),
+        (
+            "mcp.server.mcpserver.prompts.base",
+            "ValueError",
+            "f'Error rendering prompt {self.name}'",
+        ),
+        ("mcp.server.mcpserver.resolve", "ToolError", "f'Resolver {key!r}: {detail}'"),
+        (
+            "mcp.server.mcpserver.resources.templates",
+            "UnexpectedResourceError",
+            "f'Error creating resource from template {uri}'",
+        ),
+        (
+            "mcp.server.mcpserver.server",
+            "TypeError",
+            "f'Resource.read() must return str or bytes, not {type(content).__name__}'",
+        ),
+        (
+            "mcp.server.mcpserver.server",
+            "UnexpectedResourceError",
+            "f'Error reading resource {uri}'",
+        ),
+        (
+            "mcp.server.mcpserver.tools.base",
+            "ToolError",
+            "f'Error executing tool {self.name}: {exc}'",
+        ),
+        (
+            "mcp.server.mcpserver.tools.base",
+            "UnexpectedToolError",
+            "f'Error executing tool {self.name}'",
+        ),
+        (
+            "mcp.server.mcpserver.tools.base",
+            "UnexpectedToolError",
+            "f'Error executing tool {self.name}: {exc}'",
         ),
     }
 )

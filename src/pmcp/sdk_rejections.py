@@ -59,7 +59,11 @@ _MESSAGE_ARGUMENTS: dict[str, tuple[str, int | None]] = {
     "McpError": ("message", 1),
     "InboundLadderRejection": ("message", None),
     "_create_error_response": ("error_message", 0),
+    "_error_response": ("message", 0),
 }
+
+# SDK helpers whose returned text is relayed as an ErrorData message.
+_MESSAGE_HELPERS = frozenset({"_unfollowed_redirect"})
 
 #: f-string message templates (their source, as ``ast.unparse`` prints it)
 #: that pmcp keeps, each bound to the one code its site raises and, per
@@ -556,9 +560,17 @@ def _is_error_call(name: str | None) -> bool:
 def error_message_arguments(tree: ast.AST) -> list[tuple[str, ast.expr]]:
     """(callee, message argument) of every exception or wire-error
     construction in ``tree``: the ``message``/``msg`` keyword, else the
-    message's position (the second for ``MCPError``, else the first)."""
+    message's position (the second for ``MCPError``, else the first), plus
+    returned messages from the SDK's registered message-building helpers."""
     found: list[tuple[str, ast.expr]] = []
     for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in _MESSAGE_HELPERS:
+                found.extend(
+                    (node.name, item.value)
+                    for item in ast.walk(node)
+                    if isinstance(item, ast.Return) and item.value is not None
+                )
         if not isinstance(node, ast.Call):
             continue
         name = _call_name(node)
