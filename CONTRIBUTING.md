@@ -9,8 +9,8 @@ Thank you for your interest in contributing to PMCP (Progressive MCP)!
 git clone https://github.com/Consiliency/pmcp
 cd pmcp
 
-# Install with uv (recommended; CI tests Python 3.10, 3.11 and 3.12)
-uv sync --all-extras -p 3.10
+# Install with uv (recommended; CI tests Python 3.12)
+uv sync --all-extras -p 3.12
 
 # Or with pip (the tests need the http extra as well as dev)
 pip install -e ".[all]"
@@ -23,7 +23,7 @@ pip install -e ".[all]"
 uv run pytest
 
 # What CI runs (coverage must stay at or above 60%)
-uv run pytest tests/ -v --cov=pmcp --cov-report=term-missing
+uv run pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml --cov-report=term-missing
 
 # Run with coverage
 uv run pytest --cov=pmcp --cov-report=term-missing
@@ -38,6 +38,11 @@ uv run pytest tests/test_integration.py -v
 # differentials and regex sweeps)
 uv run pytest -m 'slow and not live'
 ```
+
+CI runs test files across separate worker processes. `--dist loadfile` keeps
+each file's tests and module fixtures together. Each worker runs its tests
+sequentially, with its own environment, cwd, module globals and temporary files.
+Local `uv run pytest` remains sequential unless you supply `-n`.
 
 ### Timing in tests
 

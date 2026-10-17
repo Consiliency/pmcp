@@ -544,7 +544,8 @@ def test_a_lock_path_that_is_not_a_plain_file_is_refused_without_blocking(
         os.mkfifo(lock)
     elif kind == "socket":
         server = socket.socket(socket.AF_UNIX)
-        server.bind(str(lock))
+        monkeypatch.chdir(tmp_path)
+        server.bind(str(lock.relative_to(tmp_path)))
         held.append(server)
     elif kind == "directory":
         lock.mkdir()

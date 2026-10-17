@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.12"]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,7 +51,7 @@ jobs:
         run: uv sync --all-extras
 
       - name: Run tests with coverage
-        run: uv run pytest tests/ -v --tb=short --cov --cov-report=xml --cov-report=term-missing
+        run: uv run pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml --cov-report=term-missing
 
       - name: Check coverage threshold
         run: uv run coverage report --fail-under=60

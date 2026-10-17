@@ -901,7 +901,28 @@ async def test_disconnect_all_redelivers_a_cancel_and_kills_now() -> None:
 # --- real processes -------------------------------------------------------------------
 
 
-async def test_a_cancelled_terminate_kills_a_sigterm_ignoring_tree() -> None:
+@pytest.fixture
+def killed_groups(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record real group kills independently of asyncio's exit-status watcher.
+
+    Popen.poll can reap first, leaving the watcher to report 255 instead of
+    SIGKILL (Consiliency/pmcp#391). Tests must still prove both kill and exit.
+    """
+    groups: list[int] = []
+    real_killpg = os.killpg
+
+    def killpg(pgid: int, sig: int) -> None:
+        real_killpg(pgid, sig)
+        if sig == signal.SIGKILL:
+            groups.append(pgid)
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    return groups
+
+
+async def test_a_cancelled_terminate_kills_a_sigterm_ignoring_tree(
+    killed_groups: list[int],
+) -> None:
     """`_terminate_process_tree`'s own cancel path, for its callers that do not
     abandon on their own (the update probe's timeout branch): cancelled during
     the SIGTERM grace, it SIGKILLs synchronously before re-raising."""
@@ -926,7 +947,8 @@ async def test_a_cancelled_terminate_kills_a_sigterm_ignoring_tree() -> None:
         if process.returncode is None:
             process.kill()
     assert kind == "cancelled"
-    assert returncode == -signal.SIGKILL
+    assert process.pid in killed_groups, killed_groups
+    assert returncode in {-signal.SIGKILL, 255}, returncode
 
 
 # --- round 3 of the panel (codex): fan-out and handoff ------------------------------
@@ -946,9 +968,9 @@ async def _sigterm_ignoring_process() -> asyncio.subprocess.Process:
     return process
 
 
-async def test_disconnect_all_cancelled_before_its_workers_start_kills_every_tree() -> (
-    None
-):
+async def test_disconnect_all_cancelled_before_its_workers_start_kills_every_tree(
+    killed_groups: list[int],
+) -> None:
     """Codex, round 3: `call_soon(task.cancel)` right after creating the
     `disconnect_all` task cancels the gather's `_shutdown_one` workers before
     their first instruction, so no per-server handler runs. The parent-level
@@ -973,7 +995,8 @@ async def test_disconnect_all_cancelled_before_its_workers_start_kills_every_tre
             if p.returncode is None:
                 p.kill()
     assert kind == "cancelled", f"{kind} {detail!r}"
-    assert codes == [-signal.SIGKILL, -signal.SIGKILL], codes
+    assert {p.pid for p in processes} <= set(killed_groups), killed_groups
+    assert set(codes) <= {-signal.SIGKILL, 255}, codes
     assert mgr._clients == {} and not mgr._lifecycle_lock.locked()
 
 
@@ -2626,7 +2649,7 @@ def _reconnects(mgr: ClientManager) -> list[str]:
 
 @pytest.mark.parametrize("cancel", [None, "disconnect_all", "adopt"])
 async def test_a_client_adopted_during_disconnect_all_is_not_left_running(
-    cancel: str | None, tmp_path: Path
+    cancel: str | None, tmp_path: Path, killed_groups: list[int]
 ) -> None:
     """Codex round 5, grok round 6: adoption registered a client without the
     lifecycle lock, so a client adopted while `disconnect_all` was suspended
@@ -2685,9 +2708,11 @@ async def test_a_client_adopted_during_disconnect_all_is_not_left_running(
             if cancel == "adopt":
                 adopting.cancel()
                 assert (await _outcome(adopting))[0] == "cancelled"
-                assert await asyncio.wait_for(late.wait(), _HANG_GUARD_S) == (
-                    -signal.SIGKILL
-                )
+                assert late.pid in killed_groups, killed_groups
+                assert await asyncio.wait_for(late.wait(), _HANG_GUARD_S) in {
+                    -signal.SIGKILL,
+                    255,
+                }
                 assert (await _outcome(disconnecting))[0] == "returned"
             elif cancel == "disconnect_all":
                 # Its cancelled teardown kills what it was tearing down; the
@@ -2729,7 +2754,7 @@ async def test_a_client_adopted_during_disconnect_all_is_not_left_running(
 @pytest.mark.parametrize("cancel", [True, False])
 @pytest.mark.parametrize("entrypoint", ["disconnect_server", "_cleanup_client"])
 async def test_an_adoption_waits_for_a_per_server_teardown(
-    entrypoint: str, cancel: bool, tmp_path: Path
+    entrypoint: str, cancel: bool, tmp_path: Path, killed_groups: list[int]
 ) -> None:
     """Codex/grok round 6: `disconnect_server` and `_cleanup_client` abandon
     the client they captured and then drop `_clients[name]` by name, so a
@@ -2784,7 +2809,11 @@ async def test_an_adoption_waits_for_a_per_server_teardown(
                 message="the torn-down server survived",
             )
             mgr.abandon_all_now()
-            assert await asyncio.wait_for(late.wait(), _HANG_GUARD_S) == -signal.SIGKILL
+            assert late.pid in killed_groups, killed_groups
+            assert await asyncio.wait_for(late.wait(), _HANG_GUARD_S) in {
+                -signal.SIGKILL,
+                255,
+            }
             await eventually(
                 lambda: not any(_pid_alive(p) for p in late_pids),
                 timeout=_HANG_GUARD_S,
@@ -2796,7 +2825,7 @@ async def test_an_adoption_waits_for_a_per_server_teardown(
 
 
 async def test_a_cancel_while_adoption_waits_for_the_lock_kills_the_process(
-    tmp_path: Path,
+    tmp_path: Path, killed_groups: list[int]
 ) -> None:
     """Nothing is registered while adoption waits for the lifecycle lock, and
     its caller catches only `Exception`: a cancel there kills the handed-over
@@ -2822,7 +2851,11 @@ async def test_a_cancel_while_adoption_waits_for_the_lock_kills_the_process(
             task.cancel()
             assert (await _outcome(task))[0] == "cancelled"
             assert kill.call_count == 1 and seen, seen
-        assert await asyncio.wait_for(late.wait(), _HANG_GUARD_S) == -signal.SIGKILL
+        assert late.pid in killed_groups, killed_groups
+        assert await asyncio.wait_for(late.wait(), _HANG_GUARD_S) in {
+            -signal.SIGKILL,
+            255,
+        }
         assert mgr._clients == {} and mgr._background_tasks == set()
     finally:
         mgr._lifecycle_lock.release()
