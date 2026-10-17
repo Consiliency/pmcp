@@ -54,19 +54,11 @@ dependencies = [
     # future 3.x may reshape either surface again; raising this cap requires
     # re-auditing both the way P2 did for 2.x, not just relaxing the pin.
     #
-    # The lower bound is load-bearing too: 2.0.0 is the first mcp release
-    # with all three symbols pmcp now imports directly — the low-level
-    # Server's on_* constructor kwargs (server.py), streamable_http_client
-    # (client/manager.py), and the server/discover handler + the
-    # 2026-07-28 modern-era envelope (mcp_types.version) — and it is also
-    # simply the oldest stable 2.x release; there is no 2.0.0-rc or 1.x
-    # release that has these. Below 2.0.0, client/manager.py's module-scope
-    # `from mcp.client.streamable_http import streamable_http_client`
-    # raises ImportError (that name doesn't exist before 2.0.0) and the
-    # gateway dies on startup. The min-version-smoke CI job re-proves this
-    # floor on every run, including a real downstream tool call through a
-    # booted gateway.
-    "mcp>=2.0.0,<3.0.0",
+    # The 2.x APIs above require at least 2.0.0; the security floor is now
+    # 2.2.0, which excludes GHSA-84m7-p3x7-pcfv's unbounded stateful HTTP
+    # session retention (Consiliency/pmcp#403). min-version-smoke installs
+    # this exact floor and proves a real downstream tool call through pmcp.
+    "mcp>=2.2.0,<3.0.0",
     # httpx (distinct from httpx2 below) is for cli.py's two diagnostics
     # probes (_probe_sse_endpoint, _probe_http_health), which do a bare
     # `import httpx`. Through mcp 1.x this rode in transitively via mcp's
