@@ -2725,6 +2725,24 @@ def test_an_sdk_raised_error_is_withheld_unless_reviewed() -> None:
     other = "client/sse.py::sse_reader"
     cases = [
         (relay, MCPError(-32600, f"Unexpected content type: text/{s}"), True),
+        (
+            relay,
+            MCPError(
+                -32600,
+                f"Redirect to http://{s}/ not followed; use that URL as the endpoint if it is the intended server",
+            ),
+            True,
+        ),
+        (
+            relay,
+            MCPError(
+                -32600,
+                f"Redirect to http://{s}/ not followed: it would downgrade this HTTPS endpoint to plain HTTP.\n"
+                "The server is likely behind a TLS-terminating proxy whose forwarded headers it does not trust,\n"
+                f"often combined with a trailing-slash difference. Try https://{s}/ instead, or fix the proxy settings.",
+            ),
+            True,
+        ),
         (relay, MCPError(-32603, f"the downstream's own words {s}"), False),
         (other, ValueError(f"Endpoint origin does not match: http://{s}/"), True),
         (other, MCPError(-32000, "Connection closed"), False),

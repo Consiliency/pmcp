@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from mcp.server import Server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.testclient import TestClient
 
 from pmcp import __version__
@@ -49,6 +52,54 @@ def _make_app(
             resource_server_audience=resource_server_audience,
         )
         return TestClient(app, raise_server_exceptions=False)
+
+
+@pytest.mark.parametrize("ending", ["delete", "refused-open"])
+def test_legacy_sessions_reclaim_capacity(
+    monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    """GHSA-84m7-p3x7-pcfv: ended/refused sessions must free their slot."""
+    monkeypatch.setattr(
+        "pmcp.transport.http.StreamableHTTPSessionManager",
+        partial(StreamableHTTPSessionManager, max_sessions=1),
+    )
+    app = create_http_app(Server("session-retention-proof"))
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-11-25",
+    }
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "session-proof", "version": "1.0"},
+        },
+    }
+    with TestClient(app) as client:
+        if ending == "delete":
+            first = client.post("/mcp", headers=headers, json=initialize)
+            assert first.status_code == 200
+            session_headers = {
+                **headers,
+                "mcp-session-id": first.headers["mcp-session-id"],
+            }
+            assert (
+                client.post("/mcp", headers=headers, json=initialize).status_code == 503
+            )
+            assert client.delete("/mcp", headers=session_headers).status_code == 200
+            assert client.delete("/mcp", headers=session_headers).status_code == 404
+        else:
+            for _ in range(2):
+                refused = client.post(
+                    "/mcp",
+                    headers=headers,
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                )
+                assert refused.status_code == 400
+        assert client.post("/mcp", headers=headers, json=initialize).status_code == 200
 
 
 # ---------------------------------------------------------------------------
