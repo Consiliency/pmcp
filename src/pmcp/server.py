@@ -6,8 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import signal
-import sys
 from pathlib import Path
 from typing import Any, Literal
 
@@ -89,8 +87,6 @@ from pmcp.types import (
     DescriptionsCache,
     GatewayDiagnosticsInfo,
     InvokeInput,
-    LocalMcpServerConfig,
-    ResolvedServerConfig,
 )
 from pmcp.waits import bounded_wait
 
@@ -943,9 +939,6 @@ class GatewayServer:
         for skipped in resolution.skipped:
             logger.info(startup_skip_message("startup", skipped))
 
-        # Kill any orphan processes from a previous PMCP crash before registering servers
-        self._kill_orphan_processes(resolution.lazy_configs + resolution.eager_configs)
-
         # Register lazy configs FIRST (before connecting auto-start)
         self._client_manager.register_lazy_configs(resolution.lazy_configs)
 
@@ -1019,54 +1012,6 @@ class GatewayServer:
 
         # Create MCP server with capability instructions
         self._create_server(instructions=self._capability_summary)
-
-    def _kill_orphan_processes(
-        self,
-        configs: list[ResolvedServerConfig],
-        _proc_path: Path = Path("/proc"),
-    ) -> None:
-        """Kill orphan stdio server processes left over from a previous PMCP crash.
-
-        Scans /proc (Linux only) for processes whose argv0 + args match any configured
-        local stdio server. Matching processes are sent SIGKILL immediately since their
-        state cannot be adopted.
-        """
-        if sys.platform != "linux":
-            return
-        own_pid = os.getpid()
-        fingerprints: dict[tuple, str] = {}
-        for cfg in configs:
-            if isinstance(cfg.config, LocalMcpServerConfig):
-                key = (Path(cfg.config.command).name, tuple(cfg.config.args))
-                fingerprints[key] = cfg.name
-        if not fingerprints:
-            return
-        for entry in _proc_path.iterdir():
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            if pid == own_pid:
-                continue
-            try:
-                raw = (entry / "cmdline").read_bytes()
-            except (PermissionError, FileNotFoundError, ProcessLookupError):
-                continue
-            parts = [p for p in raw.split(b"\x00") if p]
-            if not parts:
-                continue
-            argv0 = Path(parts[0].decode(errors="replace")).name
-            args = tuple(p.decode(errors="replace") for p in parts[1:])
-            if (argv0, args) in fingerprints:
-                server_name = fingerprints[(argv0, args)]
-                logger.warning(
-                    f"Found orphan PID {pid} matching server '{server_name}'; sending SIGKILL"
-                )
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    logger.warning(f"Insufficient permissions to kill orphan PID {pid}")
 
     async def run(self, transport: str = "stdio") -> None:
         """Run the MCP server with specified transport.

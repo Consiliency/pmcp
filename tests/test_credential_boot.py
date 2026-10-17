@@ -12,9 +12,7 @@ cbe98be, `plans/phase-plan-v11-p6clean.md`) — do not re-derive it. Two
 mistakes are baked in as regression guards below: `--config` alone does NOT
 bound resolution (the shipped manifest layers in additively), and redirected
 `HOME` alone is ALSO not sufficient on its own to prove isolation — the
-`--policy` allowlist is what actually narrows the kill set
-(`_kill_orphan_processes`, `src/pmcp/server.py:683-700`, fed by
-`resolution.lazy_configs + resolution.eager_configs`, `server.py:604`).
+`--policy` allowlist narrows which configured servers this fixture may start.
 
 Marked `@pytest.mark.live` — excluded from the default `-m 'not live'` run
 (`pyproject.toml`). Run explicitly:
@@ -100,10 +98,7 @@ def test_relaxed_manifest_server_boots_eager_with_no_credential() -> None:
         project.mkdir()
         lock_dir = work / "lock"
 
-        # Fixture wrapper script — unique command basename + a fresh-mktemp
-        # arg, so _kill_orphan_processes' (Path(command).name, tuple(args))
-        # fingerprint (server.py:700) cannot collide with anything the live
-        # gateway is running.
+        # Fixture wrapper script with a unique path for this isolated boot.
         fixture_py = work / "p5_fixture_server.py"
         fixture_py.write_text(FIXTURE_SERVER_SRC)
         wrapper = work / "p5-fixture-server"

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import signal
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -162,8 +162,8 @@ class TestGatewayServerIntegration:
                     assert server._capability_summary == "No tools available"
 
 
-class TestOrphanScan:
-    """Tests for GatewayServer._kill_orphan_processes."""
+class TestStartupProcessOwnership:
+    """Startup must not signal processes it did not start (Consiliency/pmcp#389)."""
 
     def _make_config(self, command: str, args: list[str]) -> ResolvedServerConfig:
         return ResolvedServerConfig(
@@ -172,90 +172,50 @@ class TestOrphanScan:
             config=LocalMcpServerConfig(command=command, args=args),
         )
 
-    def _write_cmdline(self, proc_dir: Path, pid: int, argv: list[str]) -> None:
-        entry = proc_dir / str(pid)
-        entry.mkdir()
-        (entry / "cmdline").write_bytes(
-            b"\x00".join(a.encode() for a in argv) + b"\x00"
+    @pytest.mark.skipif(sys.platform != "linux", reason="Linux startup scan")
+    @pytest.mark.parametrize("eager", [False, True])
+    async def test_startup_leaves_matching_foreign_process_alive(
+        self, tmp_path: Path, eager: bool
+    ) -> None:
+        args = ["-c", "import time; time.sleep(299.123)", str(tmp_path)]
+        config = self._make_config(sys.executable, args)
+        foreign = subprocess.Popen(
+            [sys.executable, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
-
-    def test_skips_on_non_linux(self, tmp_path: Path) -> None:
-        """_kill_orphan_processes should do nothing on non-Linux platforms."""
-        server = GatewayServer()
-        config = self._make_config("npx", ["some-mcp-server"])
-        with (
-            patch("pmcp.server.sys") as mock_sys,
-            patch("pmcp.server.os.kill") as mock_kill,
-        ):
-            mock_sys.platform = "darwin"
-            server._kill_orphan_processes([config], _proc_path=tmp_path)
-        mock_kill.assert_not_called()
-
-    def test_kills_matching_pid(self, tmp_path: Path) -> None:
-        """_kill_orphan_processes should SIGKILL a process whose argv matches a config."""
-        proc_dir = tmp_path / "proc"
-        proc_dir.mkdir()
-        self._write_cmdline(proc_dir, 12345, ["npx", "@mcp/server-fs", "/srv"])
-
-        server = GatewayServer()
-        config = self._make_config("npx", ["@mcp/server-fs", "/srv"])
-
-        with patch("pmcp.server.sys") as mock_sys, patch("pmcp.server.os") as mock_os:
-            mock_sys.platform = "linux"
-            mock_os.getpid.return_value = 1  # own pid won't match 12345
-            server._kill_orphan_processes([config], _proc_path=proc_dir)
-            mock_os.kill.assert_called_once_with(12345, signal.SIGKILL)
-
-    def test_skips_own_pid(self, tmp_path: Path) -> None:
-        """_kill_orphan_processes should not kill its own PID."""
-        proc_dir = tmp_path / "proc"
-        proc_dir.mkdir()
-        own_pid = os.getpid()
-        self._write_cmdline(proc_dir, own_pid, ["npx", "@mcp/server-fs", "/srv"])
-
-        server = GatewayServer()
-        config = self._make_config("npx", ["@mcp/server-fs", "/srv"])
-
-        with (
-            patch("pmcp.server.sys") as mock_sys,
-            patch("pmcp.server.os.kill") as mock_kill,
-        ):
-            mock_sys.platform = "linux"
-            server._kill_orphan_processes([config], _proc_path=proc_dir)
-        mock_kill.assert_not_called()
-
-    def test_handles_permission_error_on_kill(self, tmp_path: Path) -> None:
-        """PermissionError on os.kill should be caught and not propagate."""
-        proc_dir = tmp_path / "proc"
-        proc_dir.mkdir()
-        self._write_cmdline(proc_dir, 55555, ["npx", "some-server"])
-
-        server = GatewayServer()
-        config = self._make_config("npx", ["some-server"])
-
-        with patch("pmcp.server.sys") as mock_sys, patch("pmcp.server.os") as mock_os:
-            mock_sys.platform = "linux"
-            mock_os.getpid.return_value = 1
-            mock_os.kill.side_effect = PermissionError("not allowed")
-            # Should not raise
-            server._kill_orphan_processes([config], _proc_path=proc_dir)
-
-    def test_ignores_unreadable_cmdline(self, tmp_path: Path) -> None:
-        """PermissionError when reading cmdline should be silently skipped."""
-        proc_dir = tmp_path / "proc"
-        proc_dir.mkdir()
-        entry = proc_dir / "77777"
-        entry.mkdir()
-        cmdline = entry / "cmdline"
-        cmdline.write_bytes(b"")  # empty — simulates unreadable/zombie process
-
-        server = GatewayServer()
-        config = self._make_config("npx", ["some-server"])
-
-        with (
-            patch("pmcp.server.sys") as mock_sys,
-            patch("pmcp.server.os.kill") as mock_kill,
-        ):
-            mock_sys.platform = "linux"
-            server._kill_orphan_processes([config], _proc_path=proc_dir)
-        mock_kill.assert_not_called()
+        server = GatewayServer(project_root=tmp_path)
+        try:
+            with (
+                patch("pmcp.server.load_configs", return_value=[config]),
+                patch("pmcp.server._manifest_for", return_value=MagicMock(servers={})),
+                patch(
+                    "pmcp.server.load_enabled_auto_start",
+                    return_value={config.name} if eager else set(),
+                ),
+                patch("pmcp.server.load_disabled_auto_start", return_value=set()),
+                patch("pmcp.server.load_descriptions_cache", return_value=None),
+                patch(
+                    "pmcp.server.generate_capability_summary", return_value="No tools"
+                ),
+                patch.object(server._client_manager, "start_health_monitor"),
+                patch.object(
+                    server._client_manager, "connect_all", return_value=[]
+                ) as connect,
+                patch.object(server._client_manager, "register_lazy_configs") as lazy,
+            ):
+                await server.initialize()
+                if eager:
+                    connect.assert_awaited_once_with([config])
+                else:
+                    lazy.assert_called_once_with([config])
+                with pytest.raises(subprocess.TimeoutExpired):
+                    foreign.wait(timeout=0.2)
+                await server.shutdown()
+                with pytest.raises(subprocess.TimeoutExpired):
+                    foreign.wait(timeout=0.2)
+        finally:
+            foreign.terminate()
+            foreign.wait(timeout=5)
