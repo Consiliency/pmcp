@@ -1680,30 +1680,48 @@ class TestMonitorInstall:
 
     @pytest.mark.asyncio
     async def test_monitor_reads_stderr(self) -> None:
-        """Stderr output also tracked."""
-        # Use bash to write to stderr
+        """Stderr output from a live installer is tracked before it exits."""
         server_config = ServerConfig(
             name="test",
             description="Test",
             keywords=["test"],
-            install={"linux": ["bash", "-c", "echo stderr_message >&2"]},
+            install={
+                "linux": [
+                    "bash",
+                    "-c",
+                    'echo stderr_message >&2; IFS= read -r -t 10 ack && [ "$ack" = read ]',
+                ]
+            },
             command="echo",
             args=["test"],
             requires_api_key=False,
         )
-
         manager = JobManager.get_instance()
         job_id = await manager.start_install(server_config, "linux")
-
-        # Wait deterministically for the monitor to drain output and finish,
-        # rather than racing a fixed wall-clock sleep against the subprocess.
         job = manager.get_job(job_id)
         assert job is not None
-        assert job._monitor_task is not None
-        await asyncio.wait_for(job._monitor_task, timeout=5.0)
-        # Check stderr was captured
-        stderr_found = any("stderr_message" in line for line in job.output_lines)
-        assert stderr_found, f"Expected stderr in output: {job.output_lines}"
+        try:
+            assert job.process is not None
+            assert job._monitor_task is not None
+            await eventually(
+                lambda: any("stderr_message" in line for line in job.output_lines),
+                timeout=5.0,
+                message=f"Expected stderr in output: {job.output_lines}",
+            )
+            assert job.process.returncode is None
+            assert job.process.stdin is not None
+            job.process.stdin.write(b"read\n")
+            await job.process.stdin.drain()
+            await asyncio.wait_for(job._monitor_task, timeout=5.0)
+            stderr_found = any("stderr_message" in line for line in job.output_lines)
+            assert stderr_found, f"Expected stderr in output: {job.output_lines}"
+        finally:
+            await manager.cancel_job(job_id)
+            if job._monitor_task is not None:
+                await asyncio.wait_for(
+                    asyncio.gather(job._monitor_task, return_exceptions=True),
+                    timeout=5.0,
+                )
 
     @pytest.mark.asyncio
     async def test_monitor_keeps_last_20_lines(self) -> None:
