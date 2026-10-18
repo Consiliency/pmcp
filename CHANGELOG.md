@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Withhold SDK-built SSE failure messages from connection errors and `gateway.health` when a downstream response has a malformed SSE Content-Type, including on MCP SDK 2.3 (see Consiliency/pmcp#405).
+
 - Preserve escaped URL quote boundaries in redacted structured output, keeping benign nested JSON text and structured content parseable (see Consiliency/pmcp#401).
 
 - Redact credential-shaped JSON mapping keys without dropping entries, reserving benign keys and adding numeric suffixes to `[REDACTED]` only to avoid collisions. Redact weak-key values in URL queries and secret-value backslash suffixes while retaining established JSON quote escapes (see Consiliency/pmcp#407, Consiliency/pmcp#409 and Consiliency/pmcp#410).
