@@ -2574,6 +2574,10 @@ def _sdk_transport_handler(kind: str, s: str) -> Callable[[Any], None]:
             _GRID_REQUESTS.append(line.encode())
             if kind == "content-type":
                 conn.sendall(reply("200 OK", {"Content-Type": f"text/{s}"}, "{}"))
+            elif kind == "sse-content-type":
+                conn.sendall(
+                    reply("200 OK", {"Content-Type": f"text/event-stream-{s}"}, "{}")
+                )
             elif kind == "sse-event":
                 body = f"event: {s}\ndata: {{}}\n\n"
                 conn.sendall(
@@ -2601,6 +2605,7 @@ def _sdk_transport_handler(kind: str, s: str) -> Callable[[Any], None]:
     [
         ("content-type", "http"),
         ("content-type", "sse"),
+        ("sse-content-type", "http"),
         ("sse-event", "http"),
         ("sse-event", "sse"),
         ("sse-endpoint", "sse"),
@@ -2663,8 +2668,13 @@ def test_no_sdk_transport_rejection_reaches_any_output(
                     _drive_remote(transport, 0), 5 if kind == "sse-endpoint" else 25
                 )
             )
+            if kind == "sse-content-type":
+                assert errors, "connection did not fail"
+                assert last and all(last), "gateway.health has no connection error"
             outcome = json.dumps([errors, last], default=str)
         except Exception as error:  # noqa: BLE001 -- inspected
+            if kind == "sse-content-type":
+                raise  # A timeout or unrelated exception cannot prove rejection.
             from pmcp.argument_errors import exception_text, safe_traceback_text
 
             outcome = exception_text(error) + safe_traceback_text(error)
@@ -2675,6 +2685,20 @@ def test_no_sdk_transport_rejection_reaches_any_output(
         "result (connect errors, gateway.health)": outcome,
         "log": "\n".join(_record_text(record) for record in caplog.records),
     }
+    if kind == "sse-content-type":
+        from pmcp.argument_errors import safe_traceback_text
+
+        texts.update(
+            {
+                "connect errors": json.dumps(errors, default=str),
+                "gateway.health": json.dumps(last, default=str),
+                "tracebacks": "\n".join(
+                    safe_traceback_text(record.exc_info[1])
+                    for record in caplog.records
+                    if record.exc_info and record.exc_info[1] is not None
+                ),
+            }
+        )
     leaked = {
         surface: text[:400]
         for surface, text in texts.items()
@@ -2715,6 +2739,8 @@ def test_an_sdk_raised_error_is_withheld_unless_reviewed() -> None:
     """Rev 26: an exception the SDK raises keeps its text only when that is
     a literal of the SDK's source, a reviewed template, or -- at a site that
     relays an `ErrorData` -- a message matching no template the SDK builds."""
+    from importlib.metadata import version
+
     from mcp.shared.exceptions import MCPError
 
     from pmcp.argument_errors import exception_text
@@ -2725,6 +2751,15 @@ def test_an_sdk_raised_error_is_withheld_unless_reviewed() -> None:
     other = "client/sse.py::sse_reader"
     cases = [
         (relay, MCPError(-32600, f"Unexpected content type: text/{s}"), True),
+        (
+            relay,
+            MCPError(
+                -32000,
+                f"SSE stream failed: Expected response header Content-Type to contain 'text/event-stream', got 'text/event-stream-{s}'",
+            ),
+            tuple(map(int, version("mcp").split(".")[:2])) >= (2, 3),
+        ),
+        (relay, MCPError(-32000, "SSE stream ended without a response"), False),
         (
             relay,
             MCPError(
@@ -2753,6 +2788,10 @@ def test_an_sdk_raised_error_is_withheld_unless_reviewed() -> None:
         assert withheld_sdk_error(raised) is withheld, (site, error)
         text = exception_text(raised)
         assert (s in text) is (not withheld and s in str(error)), text
+        if isinstance(error, MCPError):
+            if not withheld:
+                assert text == str(error)
+            assert raised.code == error.code
     assert not withheld_sdk_error(MCPError(-32600, f"Unexpected content type: {s}"))
 
 
