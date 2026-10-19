@@ -86,7 +86,8 @@ jobs:
         if: ${{ inputs.dry_run != 'true' }}
         env:
           GOVERNED_PIPELINE_REPOSITORY: Consiliency/governed-pipeline
-          GOVERNED_PIPELINE_REF: main
+          GOVERNED_PIPELINE_REF: 798109d271405378c9f15bdf9db9a383814d5f42
+          GOVERNED_PIPELINE_LOCK_SHA256: 72ce0d6e867d66a99ba8965802b8740135b40d204a3fa49196a4f2079eed3afc
           GOVERNED_PIPELINE_TOKEN: ${{ secrets.GOVERNED_PIPELINE_READ_TOKEN || secrets.BOOTSTRAP_CLONE_TOKEN }}
         run: |
           if [ -z "$GOVERNED_PIPELINE_TOKEN" ]; then
@@ -95,14 +96,18 @@ jobs:
           fi
 
           gp_dir="$RUNNER_TEMP/governed-pipeline"
-          repo_url="https://x-access-token:${GOVERNED_PIPELINE_TOKEN}@github.com/${GOVERNED_PIPELINE_REPOSITORY}.git"
-
-          git clone --depth 1 --branch "$GOVERNED_PIPELINE_REF" "$repo_url" "$gp_dir" || {
-            git clone --depth 1 "$repo_url" "$gp_dir"
-            git -C "$gp_dir" checkout "$GOVERNED_PIPELINE_REF"
-          }
-
-          npm install --ignore-scripts --prefix "$gp_dir"
+          git init "$gp_dir"
+          git -C "$gp_dir" remote add origin "https://github.com/${GOVERNED_PIPELINE_REPOSITORY}.git"
+          # Use the existing read token only for this fetch, not a persisted URL.
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GOVERNED_PIPELINE_TOKEN" | base64 -w0)"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_0="$auth_header" \
+            git -C "$gp_dir" fetch --depth 1 origin "$GOVERNED_PIPELINE_REF"
+          test "$(git -C "$gp_dir" rev-parse FETCH_HEAD)" = "$GOVERNED_PIPELINE_REF"
+          git -C "$gp_dir" checkout --detach FETCH_HEAD
+          echo "${GOVERNED_PIPELINE_LOCK_SHA256}  ${gp_dir}/package-lock.json" | sha256sum -c -
+          npm ci --ignore-scripts --prefix "$gp_dir"
           echo "GOVERNED_PIPELINE_NODE_MODULES=$gp_dir/node_modules" >> "$GITHUB_ENV"
 
           mkdir -p "$RUNNER_TEMP/pipeline-bin"
