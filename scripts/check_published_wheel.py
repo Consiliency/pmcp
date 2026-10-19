@@ -125,6 +125,16 @@ def main() -> int:
                 str(archive) + "[http]",
             ]
         )
+        report["dependencies"] = json.loads(
+            subprocess.check_output(
+                ["uv", "pip", "list", "--python", str(python), "--format", "json"],
+                cwd=work,
+                env=env,
+                text=True,
+                timeout=30,
+            )
+        )
+        args.report.write_text(json.dumps(report, sort_keys=True) + "\n")
         run([str(venv / "bin/pmcp"), "--version"])
         run([str(venv / "bin/pmcp"), "--help"])
         run(
@@ -135,15 +145,6 @@ def main() -> int:
                 str(work / "release_installed.py"),
                 wheel["version"],
             ]
-        )
-        report["dependencies"] = json.loads(
-            subprocess.check_output(
-                ["uv", "pip", "list", "--python", str(python), "--format", "json"],
-                cwd=work,
-                env=env,
-                text=True,
-                timeout=30,
-            )
         )
     report["status"] = "success"
     args.report.write_text(json.dumps(report, sort_keys=True) + "\n")
