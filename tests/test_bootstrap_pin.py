@@ -24,7 +24,11 @@ def test_bootstrap_installs_only_exact_verified_lock() -> None:
         step["env"]["GOVERNED_PIPELINE_LOCK_SHA256"]
         == "72ce0d6e867d66a99ba8965802b8740135b40d204a3fa49196a4f2079eed3afc"
     )
+    assert (
+        step["env"]["GOVERNED_PIPELINE_REPOSITORY"] == "Consiliency/governed-pipeline"
+    )
     script = step["run"]
+    assert script.index("::add-mask::") < script.index("GIT_CONFIG_VALUE_0=")
     assert "||" not in script and "git clone" not in script
     assert "npm install" not in script
     assert 'npm ci --ignore-scripts --prefix "$gp_dir"' in script

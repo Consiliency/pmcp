@@ -86,6 +86,8 @@ jobs:
         if: ${{ inputs.dry_run != 'true' }}
         env:
           GOVERNED_PIPELINE_REPOSITORY: Consiliency/governed-pipeline
+          # Pinned from governed-pipeline main on 2026-10-19; lock hash read independently.
+          # Bumps require an exact-SHA PR, lock digest verification and review; never a branch.
           GOVERNED_PIPELINE_REF: 798109d271405378c9f15bdf9db9a383814d5f42
           GOVERNED_PIPELINE_LOCK_SHA256: 72ce0d6e867d66a99ba8965802b8740135b40d204a3fa49196a4f2079eed3afc
           GOVERNED_PIPELINE_TOKEN: ${{ secrets.GOVERNED_PIPELINE_READ_TOKEN || secrets.BOOTSTRAP_CLONE_TOKEN }}
@@ -99,7 +101,9 @@ jobs:
           git init "$gp_dir"
           git -C "$gp_dir" remote add origin "https://github.com/${GOVERNED_PIPELINE_REPOSITORY}.git"
           # Use the existing read token only for this fetch, not a persisted URL.
-          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GOVERNED_PIPELINE_TOKEN" | base64 -w0)"
+          auth_base64=$(printf 'x-access-token:%s' "$GOVERNED_PIPELINE_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth_base64"
+          auth_header="AUTHORIZATION: basic $auth_base64"
           GIT_CONFIG_COUNT=1 \
           GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
           GIT_CONFIG_VALUE_0="$auth_header" \
