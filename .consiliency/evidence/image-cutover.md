@@ -10,14 +10,21 @@ control is still absent and must default to disabled when introduced.
 Run `python scripts/image_cutover_inventory.py --output <fresh-evidence.json>`
 using the existing authenticated gh reader. The correct old Docker workflow ID
 is 219424499, path .github/workflows/docker.yml, repository ID 1123923171. The tool
-checks those identities, enumerates every unfiltered page, checks counts and
-unique IDs, records actual status/attempt/SHA/conclusion, and selects every
+checks those identities and enumerates every unfiltered page twice back to back.
+It checks counts and unique IDs, records actual status/attempt/SHA/conclusion, and selects every
 non-pull_request status other than completed. It deliberately has no event,
 status, date or search filter: filtered Actions queries can cap at 1000 results.
+Both passes must have identical run IDs, attempts, SHAs, events, actual statuses
+and conclusions. Missing or malformed terminal conclusions are incomplete.
 Changed totals, duplicate/missing entries, API failures or incomplete evidence
 fail closed. An unknown nonterminal status is a blocker. No cancellation or
 registry API write is implemented. Cancellation requested is never terminal
 quiescence. The report always says activation_allowed=false, even if drained.
+Use a fresh output path: an existing path is refused, and a new incomplete placeholder is written
+before querying, so a crash cannot leave a prior successful report in that path.
+Two matching passes are bounded point observations, not an atomic snapshot or a
+guarantee against an operator replay after the final read. The final pre-activation
+rescan and prohibited-replay detection remain mandatory.
 
 After G merges, record its exact merge SHA and cutover timestamp, run the complete
 inventory, handle outstanding runs through the owner procedure, then repeat until

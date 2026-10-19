@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -28,7 +29,7 @@ def read_api(endpoint: str) -> Any:
     return json.loads(output)
 
 
-def inventory(read: Callable[[str], Any] = read_api) -> dict[str, Any]:
+def _inventory_pass(read: Callable[[str], Any] = read_api) -> dict[str, Any]:
     report: dict[str, Any] = {
         "schema": 1,
         "standing": "READ_ONLY_INVENTORY_ONLY",
@@ -110,6 +111,17 @@ def inventory(read: Callable[[str], Any] = read_api) -> dict[str, Any]:
                     or any(c not in "0123456789abcdef" for c in row["head_sha"])
                 ):
                     raise ValueError("invalid source SHA")
+                if "conclusion" not in row:
+                    raise ValueError("missing actual conclusion")
+                conclusion = row["conclusion"]
+                if conclusion is not None and (
+                    not isinstance(conclusion, str)
+                    or not conclusion.strip()
+                    or len(conclusion) > 128
+                ):
+                    raise ValueError("invalid actual conclusion")
+                if row["status"] == "completed" and conclusion is None:
+                    raise ValueError("missing terminal conclusion")
                 record = {
                     key: row.get(key)
                     for key in (
@@ -140,10 +152,53 @@ def inventory(read: Callable[[str], Any] = read_api) -> dict[str, Any]:
     return report
 
 
+def inventory(read: Callable[[str], Any] = read_api) -> dict[str, Any]:
+    """Require two back-to-back identical full observations, never an atomic snapshot."""
+    first = _inventory_pass(read)
+    result = dict(first)
+    result["verification_passes"] = [first]
+    result["stability_verified"] = False
+    result["collector_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    if not first["complete"]:
+        return result
+    second = _inventory_pass(read)
+    result = dict(second)
+    result.update(
+        verification_passes=[first, second],
+        stability_verified=False,
+        collector_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        started_at=first["started_at"],
+    )
+    if not second["complete"]:
+        return result
+    if sorted(first["runs"], key=lambda row: row["id"]) != sorted(
+        second["runs"], key=lambda row: row["id"]
+    ):
+        result["complete"] = False
+        result["error"] = (
+            "legacy run identities, attempts or results changed between observations; repeat the whole inventory"
+        )
+        return result
+    result["stability_verified"] = True
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    # A previous report must never masquerade as this invocation after a crash.
+    with args.output.open("x") as stream:
+        json.dump(
+            {
+                "complete": False,
+                "activation_allowed": False,
+                "registry_writes": False,
+                "standing": "INVENTORY_STARTED_INCOMPLETE",
+                "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            },
+            stream,
+        )
     result = inventory()
     args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
     print(

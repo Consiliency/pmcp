@@ -135,3 +135,133 @@ def test_prs_are_enumerated_then_excluded_from_drain() -> None:
         and len(result["runs"]) == 2
         and not result["non_pr_not_completed"]
     )
+
+
+@pytest.mark.parametrize("value", [None, {}, 0, False, "", " ", [], "x" * 129])
+def test_terminal_conclusion_must_be_actual_and_usable(value: Any) -> None:
+    record = row(1)
+    record["conclusion"] = value
+    assert not inv.inventory(fixture_read([record]))["complete"]
+
+
+def test_conclusion_must_be_present() -> None:
+    record = row(1)
+    record.pop("conclusion")
+    assert not inv.inventory(fixture_read([record]))["complete"]
+
+
+def test_recorded_identity_contains_actual_sha_and_conclusion() -> None:
+    record = row(1)
+    result = inv.inventory(fixture_read([record]))
+    expected = {
+        k: record[k]
+        for k in ("id", "run_attempt", "head_sha", "event", "status", "conclusion")
+    }
+    assert result["runs"] == [expected] and result["stability_verified"]
+    assert len(result["verification_passes"]) == 2
+    assert all(p["runs"] == [expected] for p in result["verification_passes"])
+
+
+@pytest.mark.parametrize("mutation", ["rerun", "same-total-new-run", "result-changed"])
+def test_two_passes_detect_changes_even_with_same_total(mutation: str) -> None:
+    passes = 0
+    first = [row(1)]
+    second = [row(1)]
+    if mutation == "rerun":
+        second[0].update(run_attempt=3, status="queued", conclusion=None)
+    elif mutation == "same-total-new-run":
+        second = [row(2, status="queued")]
+    else:
+        second[0]["conclusion"] = "failure"
+
+    def read(endpoint: str) -> Any:
+        nonlocal passes
+        if endpoint.endswith(str(inv.WORKFLOW_ID)):
+            passes += 1
+        return fixture_read(first if passes == 1 else second)(endpoint)
+
+    result = inv.inventory(read)
+    assert not result["complete"] and not result["stability_verified"]
+    assert len(result["verification_passes"]) == 2
+    assert not result["activation_allowed"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "changed-total",
+        "root-repository",
+        "overfull-page",
+        "empty-event",
+        "negative-count",
+        "reader-failure",
+    ],
+)
+def test_response_failures_cannot_become_complete(mutation: str) -> None:
+    rows = [row(i) for i in range(1, 102)]
+    if mutation == "empty-event":
+        rows[0]["event"] = ""
+    valid = fixture_read(rows)
+
+    def read(endpoint: str) -> Any:
+        if mutation == "reader-failure":
+            raise OSError("private-reader-canary")
+        data = valid(endpoint)
+        if mutation == "root-repository" and endpoint == f"repos/{inv.REPOSITORY}":
+            data["id"] = 1
+        if "?" in endpoint:
+            if mutation == "changed-total" and endpoint.endswith("page=2"):
+                data["total_count"] += 1
+            if mutation == "overfull-page":
+                data["workflow_runs"] = rows if endpoint.endswith("page=1") else []
+            if mutation == "negative-count":
+                data["total_count"] = -1
+        return data
+
+    result = inv.inventory(read)
+    assert not result["complete"] and not result["activation_allowed"]
+    import json
+
+    assert "private-reader-canary" not in json.dumps(result)
+
+
+def test_cli_refuses_existing_output_and_marks_crash_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    import sys
+
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(sys, "argv", ["inventory", "--output", str(output)])
+
+    def fail() -> Any:
+        raise RuntimeError("simulated collector crash")
+
+    monkeypatch.setattr(inv, "inventory", fail)
+    with pytest.raises(RuntimeError):
+        inv.main()
+    assert json.loads(output.read_text())["complete"] is False
+    output.write_text('{"complete": true, "old": true}')
+    with pytest.raises(FileExistsError):
+        inv.main()
+    assert json.loads(output.read_text())["old"] is True
+
+
+def test_cli_incomplete_evidence_returns_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    monkeypatch.setattr(
+        sys, "argv", ["inventory", "--output", str(tmp_path / "report.json")]
+    )
+    monkeypatch.setattr(
+        inv,
+        "inventory",
+        lambda: {
+            "complete": False,
+            "activation_allowed": False,
+            "non_pr_not_completed": [],
+        },
+    )
+    assert inv.main() == 1
