@@ -95,6 +95,13 @@ def main() -> int:
         cwd=source,
         env=env,
     )
+    # uv creates this known housekeeping file in a fresh build output. It is
+    # never publishable; every other unexpected output still fails closed.
+    housekeeping = dist / ".gitignore"
+    if housekeeping.exists():
+        if housekeeping.is_symlink() or housekeeping.read_bytes() not in {b"*", b"*\n"}:
+            raise ValueError("unexpected build housekeeping")
+        housekeeping.unlink()
     paths = archives(dist, version)
     before = {p.name: {"sha256": digest(p), "bytes": p.stat().st_size} for p in paths}
     # Each install starts in an independent environment and cwd with no src/.
