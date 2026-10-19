@@ -102,8 +102,8 @@ UNPROVEN = (
 
 # `.github/workflows/test.yml:54`, the invocation R9 mirrors and R22 guards.
 CI_INVOCATION = (
-    "uv run pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml "
-    "--cov-report=term-missing"
+    "uv run --locked pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml "
+    "--cov-report=term-missing -p tests.ci_diagnostics --junitxml=.ci-reports/raw/junit.xml --durations=50"
 )
 
 WORKFLOW = """\

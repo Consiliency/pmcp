@@ -83,6 +83,10 @@ concurrency-added|0|-|NOT COVERED by invariant: workflow-level concurrency with 
 guard-self-disabled|0|-|NOT COVERED by the checker: if: false on this guard's own job; GitHub counts a skipped job as satisfying a required check. Caught by the test job, not by this script
 guard-self-disabled-nonconstant|0|-|NOT COVERED by the checker: an always-false but NON-constant if: on the same job; actionlint's if-cond rule only sees the literal. Caught by the test job
 guard-step-gutted|0|-|NOT COVERED by the checker: the checker step's command replaced by a no-op, since the script runs from the PR branch. Caught by the test job
+diagnostics-upload-raw|1|[diagnostics]|upload raw reports instead of reconstructed safe output
+diagnostics-upload-ungated|1|[diagnostics]|upload despite sanitizer failure
+diagnostics-sanitize-not-always|1|[diagnostics]|omit failure-path sanitization
+diagnostics-retention|1|[diagnostics]|retain diagnostic artifacts beyond the approved 14 days
 TSV
 )"
 
@@ -468,6 +472,18 @@ guard-step-gutted)
 	replace "$TEST_WF" \
 		'        run: uv run python scripts/check_workflows.py --base-ref "${{ steps.drift-base.outputs.base }}"' \
 		'        run: echo "workflow guards skipped"'
+	;;
+diagnostics-upload-raw)
+	replace "$TEST_WF" '          path: .ci-reports/safe/' '          path: .ci-reports/raw/'
+	;;
+diagnostics-upload-ungated)
+	replace "$TEST_WF" "        if: \${{ always() && steps.sanitize.outcome == 'success' && vars.PMCP_CI_DISABLE_REPORTS == '' }}" '        if: always()'
+	;;
+diagnostics-sanitize-not-always)
+	replace "$TEST_WF" $'        id: sanitize\n        if: always()' '        id: sanitize'
+	;;
+diagnostics-retention)
+	replace "$TEST_WF" '          retention-days: 14' '          retention-days: 90'
 	;;
 *)
 	echo "unhandled mutant: ${NAME}" >&2
