@@ -1,6 +1,8 @@
 """Every integration run has its own namespace; PR heads may supersede."""
 
 from pathlib import Path
+import importlib.util
+import pytest
 
 import yaml
 
@@ -27,3 +29,20 @@ def test_validation_cancellation_is_only_per_pr() -> None:
 def test_release_is_outside_pr_cancellation() -> None:
     doc = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
     assert "concurrency" not in doc
+
+
+@pytest.mark.parametrize("filename", ["test.yml", "windows.yml"])
+def test_job_cancellation_cannot_override_integration_policy(filename: str) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "checker", ROOT / "scripts/check_workflows.py"
+    )
+    assert spec and spec.loader
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    doc = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text())
+    assert not checker.validation_concurrency_invariants(doc, Path(filename))
+    next(iter(doc["jobs"].values()))["concurrency"] = {
+        "group": "shared",
+        "cancel-in-progress": True,
+    }
+    assert checker.validation_concurrency_invariants(doc, Path(filename))

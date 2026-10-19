@@ -885,9 +885,9 @@ def full_bootstrap_invariants(doc: Any) -> list[str]:
 
 
 def validation_concurrency_invariants(doc: Any, path: Path) -> list[str]:
-    if (
-        path.name in {"test.yml", "windows.yml"}
-        and doc.get("concurrency") != EXPECTED_VALIDATION_CONCURRENCY
+    if path.name in {"test.yml", "windows.yml"} and (
+        doc.get("concurrency") != EXPECTED_VALIDATION_CONCURRENCY
+        or any("concurrency" in job for job in _jobs(doc).values())
     ):
         return [
             "[concurrency] isolate PR cancellation and retain each integration run: "
