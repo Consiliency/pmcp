@@ -87,6 +87,9 @@ release-suite-removed|1|[release]|remove full release validation
 release-coverage-drift|1|[release]|replace the full coverage command with a narrower invocation
 release-audit-removed|1|[release]|remove blocking tag dependency audit
 release-node-removed|1|[release]|remove explicit release Node environment
+release-xml-root|1|[release]|write runner coverage data into the release source tree
+release-history-shallow|1|[release]|remove full release history
+release-suite-env-filter|1|[release]|filter the full suite through environment overrides
 diagnostics-upload-raw|1|[diagnostics]|upload raw reports instead of reconstructed safe output
 diagnostics-upload-ungated|1|[diagnostics]|upload despite sanitizer failure
 diagnostics-sanitize-not-always|1|[diagnostics]|omit failure-path sanitization
@@ -488,6 +491,15 @@ release-audit-removed)
 	;;
 release-node-removed)
 	replace_re "$RELEASE" '      - uses: actions/setup-node@[0-9a-f]{40} # \S+\n        with:\n          node-version: "22"\n' ''
+	;;
+release-xml-root)
+	replace "$RELEASE" '--cov-report=xml:"$RUNNER_TEMP/release-coverage.xml"' '--cov-report=xml'
+	;;
+release-history-shallow)
+	replace "$RELEASE" '          fetch-depth: 0' '          fetch-depth: 1'
+	;;
+release-suite-env-filter)
+	replace "$RELEASE" '      - name: Run tests with coverage' $'      - name: Run tests with coverage\n        env:\n          PYTEST_ADDOPTS: "-k nothing"'
 	;;
 diagnostics-upload-raw)
 	replace "$TEST_WF" '          path: .ci-reports/safe/' '          path: .ci-reports/raw/'
