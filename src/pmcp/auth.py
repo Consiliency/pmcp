@@ -141,8 +141,10 @@ class AuthMessage:
     PUBLIC_URL_CONTROL_CHARACTER = AuthText(
         "Public auth URL contains a non-printable character."
     )
-    # Rev 3: WHATWG ends the authority at `\` (yarl and urlsplit do not), so
-    # `https://127.0.0.1\@auth.example.com/` is 127.0.0.1 to a browser.
+    # Rev 3: WHATWG ends the authority at `\`; urlsplit and older yarl do
+    # not, while current yarl rejects it. Thus the URL below is 127.0.0.1
+    # to a browser; pmcp refuses the backslash before any fetcher sees it.
+    # `https://127.0.0.1\@auth.example.com/`
     PUBLIC_URL_BACKSLASH = AuthText("Public auth URL contains a backslash.")
     PUBLIC_URL_HOST_NOT_CANONICAL = AuthText(
         "Public auth URL host must be "
