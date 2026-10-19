@@ -908,6 +908,22 @@ class TestCiWiring:
             upload["with"]["retention-days"] = 90
         assert cw.diagnostic_invariants(doc)
 
+    @pytest.mark.parametrize("mutation", ["missing", "before-tests", "not-always"])
+    def test_diagnostics_environment_cannot_suppress_tests(self, mutation: str) -> None:
+        doc = copy.deepcopy(_TEST_WF)
+        steps = doc["jobs"]["test"]["steps"]
+        recorder = next(
+            s for s in steps if s.get("name") == "Record environment identity"
+        )
+        if mutation == "missing":
+            steps.remove(recorder)
+        elif mutation == "before-tests":
+            steps.remove(recorder)
+            steps.insert(0, recorder)
+        else:
+            recorder.pop("if")
+        assert cw.diagnostic_invariants(doc)
+
     def test_both_guard_jobs_exist(self) -> None:
         assert "workflows" in _TEST_WF["jobs"]
         assert "release-diff-ack" in _TEST_WF["jobs"]

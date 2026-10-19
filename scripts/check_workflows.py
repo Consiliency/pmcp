@@ -711,6 +711,25 @@ def diagnostic_invariants(doc: Any) -> list[str]:
         ]
         if len(sanitizers) != 1 or len(uploads) != 1:
             return ["[diagnostics] exactly one sanitizer and safe upload required"]
+        identity_steps = [
+            s for s in steps if s.get("name") == "Record environment identity"
+        ]
+        if len(identity_steps) != 1:
+            return ["[diagnostics] exactly one environment recorder required"]
+        recorder = identity_steps[0]
+        tests = [
+            i for i, s in enumerate(steps) if s.get("name") == "Run tests with coverage"
+        ]
+        if (
+            len(tests) != 1
+            or recorder.get("if") != "always()"
+            or recorder.get("continue-on-error")
+            or steps.index(recorder) <= tests[0]
+            or steps.index(recorder) >= steps.index(sanitizers[0])
+            or recorder.get("run")
+            != "mkdir -p .ci-reports/raw\nuv run --locked python scripts/ci_environment.py .ci-reports/raw/environment.json\n"
+        ):
+            return ["[diagnostics] environment evidence follows tests even on failure"]
         sanitizer, upload = sanitizers[0], uploads[0]
         if (
             sanitizer.get("if") != "always()"
@@ -720,7 +739,8 @@ def diagnostic_invariants(doc: Any) -> list[str]:
         ):
             return ["[diagnostics] sanitizer must run after failures and fail closed"]
         if (
-            upload.get("if")
+            upload.get("continue-on-error")
+            or upload.get("if")
             != "${{ always() && steps.sanitize.outcome == 'success' && vars.PMCP_CI_DISABLE_REPORTS == '' }}"
         ):
             return [

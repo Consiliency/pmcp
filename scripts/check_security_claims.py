@@ -207,7 +207,7 @@ REGION_EXTERNAL_ALLOWLIST = (
 # --------------------------------------------------------------------------
 # R9 / R22: CI's invocation, and the one this script mirrors.
 #
-# CI_PYTEST_INVOCATION is `.github/workflows/test.yml:54` verbatim.
+# CI_PYTEST_INVOCATION is the full-suite step in `.github/workflows/test.yml` verbatim.
 # DISCOVERY_INVOCATION shares CI's target (`tests/`) and inherits the same
 # pyproject.toml configuration -- including `addopts = "-m 'not live'"`, which
 # deselects the suite's `live`-marked tests -- so what it finds is what CI runs.
@@ -217,10 +217,22 @@ REGION_EXTERNAL_ALLOWLIST = (
 
 CI_WORKFLOW_PATH = ".github/workflows/test.yml"
 CI_PYTEST_INVOCATION = (
-    "uv run --locked pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml "
+    "uv run --locked python -m pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml "
     "--cov-report=term-missing -p tests.ci_diagnostics --junitxml=.ci-reports/raw/junit.xml --durations=50"
 )
-DISCOVERY_INVOCATION = ("uv", "run", "pytest", "tests/", "--collect-only", "-q")
+DISCOVERY_INVOCATION = (
+    "uv",
+    "run",
+    "--locked",
+    "python",
+    "-m",
+    "pytest",
+    "tests/",
+    "-p",
+    "tests.ci_diagnostics",
+    "--collect-only",
+    "-q",
+)
 
 # --------------------------------------------------------------------------
 # R12 / R14 / R20: the sentence rule.
