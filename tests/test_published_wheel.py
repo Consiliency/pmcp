@@ -73,3 +73,35 @@ def test_schedule_is_read_only_and_distinct_from_main_source() -> None:
     assert all(
         "packages" not in job.get("permissions", {}) for job in doc["jobs"].values()
     )
+
+
+def test_failed_probe_retains_only_ready_safe_report() -> None:
+    doc = yaml.safe_load((ROOT / ".github/workflows/published-wheel.yml").read_text())
+    steps = doc["jobs"]["published-wheel"]["steps"]
+    probe = next(s for s in steps if s.get("id") == "published")
+    upload = next(
+        s for s in steps if s.get("name") == "Retain public compatibility identity"
+    )
+    assert (
+        upload["if"]
+        == "${{ always() && steps.published.outputs.report_ready == 'true' && vars.PMCP_CI_DISABLE_REPORTS == '' }}"
+    )
+    assert steps.index(probe) < steps.index(upload)
+    assert upload["with"] == {
+        "name": "published-wheel-${{ github.run_id }}-${{ github.run_attempt }}",
+        "path": "${{ runner.temp }}/published-wheel/report.json",
+        "retention-days": 14,
+        "if-no-files-found": "error",
+    }
+    assert (
+        "continue-on-error" not in probe
+        and "continue-on-error" not in doc["jobs"]["published-wheel"]
+    )
+    node = next(s for s in steps if s.get("name") == "Verify Node and npm environment")
+    release = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+    assert node["run"] == next(
+        s["run"]
+        for s in release["jobs"]["build"]["steps"]
+        if s.get("name") == "Verify Node and npm environment"
+    )
+    assert steps.index(node) < steps.index(probe)

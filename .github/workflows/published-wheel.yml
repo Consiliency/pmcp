@@ -21,6 +21,16 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
+      - name: Verify Node and npm environment
+        run: |
+          test "$(node -p "process.versions.node.split('.')[0]")" = 22
+          npm_version=$(npm --version)
+          case "$npm_version" in
+            10.*|11.*) ;;
+            *) echo 'Unsupported npm major for identity validation'; exit 1 ;;
+          esac
+          node --version
+          npm --version
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.13.1"
