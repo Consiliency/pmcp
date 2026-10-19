@@ -105,7 +105,8 @@ async def downstream() -> None:
                 "gateway.connect_server", {"server_name": "p1probe"}
             )
             assert not connected.is_error
-            assert json.loads(connected.content[0].text)["ok"] is True
+            connect_text = "\n".join(getattr(x, "text", "") for x in connected.content)
+            assert json.loads(connect_text)["ok"] is True
             response = await session.call_tool(
                 "gateway.invoke",
                 {"tool_id": "p1probe::p1_echo", "arguments": {"text": "release"}},
