@@ -111,6 +111,11 @@ TAG_TRIGGERED_WORKFLOWS = {"release.yml", "docker.yml"}
 # until the test matrix job reached 29m42s; 45 is a stopgap while the suite is
 # parallelised (see Consiliency/pmcp#383).
 TIMEOUT_MIN = 10
+EXPECTED_VALIDATION_CONCURRENCY = {
+    "group": "${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}-{2}', github.event_name, github.sha, github.run_id) }}",
+    "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+}
+
 TIMEOUT_MAX = 45
 
 
@@ -699,6 +704,18 @@ def workflow_files() -> list[Path]:
     return sorted(found)
 
 
+def validation_concurrency_invariants(doc: Any, path: Path) -> list[str]:
+    if (
+        path.name in {"test.yml", "windows.yml"}
+        and doc.get("concurrency") != EXPECTED_VALIDATION_CONCURRENCY
+    ):
+        return [
+            "[concurrency] isolate PR cancellation and retain each integration run: "
+            + str(path)
+        ]
+    return []
+
+
 def diagnostic_invariants(doc: Any) -> list[str]:
     """Uploads must be gated on reconstruction, never raw test output."""
     try:
@@ -795,6 +812,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         failures.extend(timeout_invariants(doc, path))
         failures.extend(tag_trigger_invariants(doc, path))
+        failures.extend(validation_concurrency_invariants(doc, path))
         if path.name == "test.yml":
             failures.extend(diagnostic_invariants(doc))
 

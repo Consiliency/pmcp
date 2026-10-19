@@ -199,6 +199,7 @@ TESTED_MUTANTS = (
         "diagnostics-sanitize-not-always",
         "diagnostics-retention",
     }
+    | {"integration-cancelled", "integration-shared-group"}
 )
 
 
@@ -876,6 +877,17 @@ def _step_named(job: dict[str, Any], fragment: str) -> dict[str, Any]:
 class TestCiWiring:
     """A correct script wired up wrongly guards nothing, and a script-level test
     cannot see that. These assert the workflow expressions themselves."""
+
+    @pytest.mark.parametrize(
+        "mutant", ["integration-cancelled", "integration-shared-group"]
+    )
+    def test_integration_concurrency_mutants_fail(self, mutant: str) -> None:
+        doc = copy.deepcopy(_TEST_WF)
+        if mutant == "integration-cancelled":
+            doc["concurrency"]["cancel-in-progress"] = True
+        else:
+            doc["concurrency"]["group"] = "${{ github.workflow }}-${{ github.ref }}"
+        assert cw.validation_concurrency_invariants(doc, TEST_YML)
 
     def test_diagnostic_contract_is_wired(self) -> None:
         assert cw.diagnostic_invariants(_TEST_WF) == []

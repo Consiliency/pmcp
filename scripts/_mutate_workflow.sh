@@ -87,6 +87,8 @@ diagnostics-upload-raw|1|[diagnostics]|upload raw reports instead of reconstruct
 diagnostics-upload-ungated|1|[diagnostics]|upload despite sanitizer failure
 diagnostics-sanitize-not-always|1|[diagnostics]|omit failure-path sanitization
 diagnostics-retention|1|[diagnostics]|retain diagnostic artifacts beyond the approved 14 days
+integration-cancelled|1|[concurrency]|main validation can be cancelled by a newer event
+integration-shared-group|1|[concurrency]|non-PR validation shares a pending-replacement namespace
 TSV
 )"
 
@@ -484,6 +486,12 @@ diagnostics-sanitize-not-always)
 	;;
 diagnostics-retention)
 	replace "$TEST_WF" '          retention-days: 14' '          retention-days: 90'
+	;;
+integration-cancelled)
+	replace "$TEST_WF" "  cancel-in-progress: \${{ github.event_name == 'pull_request' }}" '  cancel-in-progress: true'
+	;;
+integration-shared-group)
+	replace_re "$TEST_WF" '^  group: .+$' '  group: ${{ github.workflow }}-${{ github.ref }}'
 	;;
 *)
 	echo "unhandled mutant: ${NAME}" >&2
