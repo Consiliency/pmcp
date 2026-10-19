@@ -74,36 +74,56 @@ def sanitize_junit(data: bytes) -> tuple[bytes, int]:
         # Hash ALL identifiers, including parametrization and local path text.
         key = case.get("classname", "") + "\0" + case.get("name", "")
         name = "case-" + hashlib.sha256(key.encode()).hexdigest()
-        safe = ET.SubElement(
-            suite, "testcase", name=name, time=str(seconds(case.get("time", "0")))
-        )
+        safe = ET.SubElement(suite, "testcase", name=name)
+        if "time" in case.attrib:
+            safe.set("time", str(seconds(case.attrib["time"])))
+        if any("}" in child.tag for child in case):
+            raise ValueError("namespaced outcomes are not accepted")
         outcomes = [
             child.tag for child in case if child.tag in {"failure", "error", "skipped"}
         ]
-        if len(outcomes) > 1:
-            raise ValueError("ambiguous test outcome")
-        if outcomes:
-            ET.SubElement(safe, outcomes[0])
+        # Pytest emits multiple outcomes for setup/call plus teardown failures.
+        # Preserve the strongest result without copying any diagnostic text.
+        for outcome in ("error", "failure", "skipped"):
+            if outcome in outcomes:
+                ET.SubElement(safe, outcome)
+                break
     suite.set("tests", str(len(cases)))
     return ET.tostring(suite, encoding="utf-8", xml_declaration=True), len(cases)
 
 
-def sanitize_timings(raw: Path) -> list[dict[str, object]]:
-    """Check and reconstruct worker phase records; do not pass through metadata."""
-    result = []
-    files = sorted(raw.glob("timing-*.json"))
-    if not files or len(files) > 128:
+def sanitize_timings(raw: Path) -> dict[str, object]:
+    """Reconstruct one bounded controller inventory, including crashed workers."""
+    source = json.loads(bounded_read(raw / "timings.json"))
+    if source["schema"] != 2 or not isinstance(source["workers"], list):
+        raise ValueError("invalid timing schema")
+    expected, unattributed = source["expected_workers"], source["unattributed_reports"]
+    if (
+        type(expected) is not int
+        or not 1 <= expected <= 128
+        or type(unattributed) is not int
+        or not 0 <= unattributed <= MAX_CASES * 3
+        or not 0 < len(source["workers"]) <= 128
+    ):
         raise ValueError("worker evidence missing or excessive")
-    for path in files:
-        data = json.loads(bounded_read(path))
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    collected: set[int] = set()
+    complete = len(source["workers"]) == expected and unattributed == 0
+    total_records = 0
+    for data in source["workers"]:
         worker = data["worker"]
         if not isinstance(worker, str) or not re.fullmatch(
             r"(?:gw[0-9]{1,3}|master)", worker
         ):
             raise ValueError("invalid worker")
-        records = []
+        if worker in seen:
+            raise ValueError("duplicate worker")
+        seen.add(worker)
+        records: list[dict[str, object]] = []
         for record in data["phases"]:
-            if len(records) >= MAX_CASES * 3:
+            total_records += 1
+            if total_records > MAX_CASES * 3:
                 raise ValueError("too many phase records")
             if not re.fullmatch(r"[0-9a-f]{64}", record["id"]):
                 raise ValueError("invalid case identity")
@@ -113,17 +133,43 @@ def sanitize_timings(raw: Path) -> list[dict[str, object]]:
                 raise ValueError("invalid phase result")
             records.append(
                 {
-                    "id": record["id"],
+                    "id": hashlib.sha256(record["id"].encode()).hexdigest(),
                     "phase": record["phase"],
                     "outcome": record["outcome"],
                     "seconds": seconds(record["seconds"]),
                 }
             )
-        selected = data["selected"]
-        if type(selected) is not int or not 0 <= selected <= MAX_CASES:
-            raise ValueError("invalid selection count")
-        result.append({"worker": worker, "selected": selected, "phases": records})
-    return result
+        count = data["collected_total"]
+        if count is not None and (
+            type(count) is not int or not 0 <= count <= MAX_CASES
+        ):
+            raise ValueError("invalid collection count")
+        if count is not None:
+            collected.add(count)
+        finished, crashed = data["finished"], data["crashed"]
+        if type(finished) is not bool or type(crashed) is not bool:
+            raise ValueError("invalid worker state")
+        complete = complete and finished and not crashed and count is not None
+        selected = len({r["id"] for r in records if r["phase"] == "setup"})
+        completed = len({r["id"] for r in records if r["phase"] == "teardown"})
+        result.append(
+            {
+                "worker": worker,
+                "collected_total": count,
+                "selected": selected,
+                "completed": completed,
+                "finished": finished,
+                "crashed": crashed,
+                "phases": records,
+            }
+        )
+    complete = complete and len(collected) == 1
+    return {
+        "complete": complete,
+        "expected_workers": expected,
+        "unattributed_reports": unattributed,
+        "workers": result,
+    }
 
 
 def sanitize_environment(data: bytes) -> dict[str, object]:
@@ -182,12 +228,16 @@ def main() -> int:
         )
         (staging / "timings.json").write_text(
             json.dumps(
-                {"schema": 1, "run": binding, "cases": count, "workers": timings},
+                {"schema": 2, "run": binding, "cases": count, **timings},
                 sort_keys=True,
             )
             + "\n"
         )
         staging.rename(args.safe)
+        if not timings["complete"]:
+            print(
+                "::warning::Timing evidence incomplete; observed phases retained; not success evidence"
+            )
     except (OSError, ValueError, KeyError, TypeError, ET.ParseError):
         # Do not print the exception: parser diagnostics can echo input bytes.
         print("::error::Diagnostic evidence missing or unsafe; upload refused")

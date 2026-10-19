@@ -25,17 +25,26 @@ def inputs(raw: Path) -> None:
     (raw / "junit.xml").write_text(
         '<testsuites><testsuite><testcase name="test_ok" time="0.5"/></testsuite></testsuites>'
     )
-    (raw / "timing-gw0.json").write_text(
+    (raw / "timings.json").write_text(
         json.dumps(
             {
-                "worker": "gw0",
-                "selected": 1,
-                "phases": [
+                "schema": 2,
+                "expected_workers": 1,
+                "unattributed_reports": 0,
+                "workers": [
                     {
-                        "id": "a" * 64,
-                        "phase": "teardown",
-                        "outcome": "passed",
-                        "seconds": 0.5,
+                        "worker": "gw0",
+                        "collected_total": 1,
+                        "finished": True,
+                        "crashed": False,
+                        "phases": [
+                            {
+                                "id": "a" * 64,
+                                "phase": "teardown",
+                                "outcome": "passed",
+                                "seconds": 0.5,
+                            }
+                        ],
                     }
                 ],
             }
@@ -98,10 +107,10 @@ def test_text_attributes_properties_and_parameter_canaries_are_discarded() -> No
         b"<broken",
         b"<testsuite/>",
         b'<testsuite><testcase time="NaN"/></testsuite>',
-        b"<testsuite><testcase><failure/><skipped/></testcase></testsuite>",
+        b'<testsuite><testcase><x:error xmlns:x="urn:unknown"/></testcase></testsuite>',
     ],
 )
-def test_malformed_empty_entities_and_ambiguous_reports_are_refused(
+def test_malformed_empty_entities_and_namespaced_reports_are_refused(
     data: bytes,
 ) -> None:
     with pytest.raises((ValueError, reports.ET.ParseError)):
@@ -154,13 +163,13 @@ def test_failure_never_installs_safe_output(
     if change == "missing-junit":
         (raw / "junit.xml").unlink()
     elif change == "missing-worker":
-        (raw / "timing-gw0.json").unlink()
+        (raw / "timings.json").unlink()
     elif change == "invalid-worker":
-        (raw / "timing-gw0.json").write_text('{"worker":"SECRET-CANARY"}')
+        (raw / "timings.json").write_text('{"worker":"SECRET-CANARY"}')
     elif change == "invalid-identity":
         monkeypatch.setenv("GITHUB_SHA", "SECRET-CANARY")
     else:
-        (raw / "timing-gw0.json").write_text("SECRET-CANARY")
+        (raw / "timings.json").write_text("SECRET-CANARY")
     monkeypatch.setattr(sys, "argv", ["ci_reports", str(raw), str(safe)])
     assert reports.main() == 1
     assert not safe.exists()
@@ -190,3 +199,65 @@ def test_workflow_upload_cannot_run_on_sanitizer_failure() -> None:
     assert "vars.PMCP_CI_DISABLE_REPORTS == ''" in upload["if"]
     assert upload["with"]["path"] == ".ci-reports/safe/"
     assert upload["with"]["retention-days"] == 14
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing-worker", "crash", "unfinished", "no-collection", "unknown-report"],
+)
+def test_partial_controller_inventory_is_visible(tmp_path: Path, mutation: str) -> None:
+    raw = tmp_path / "raw"
+    inputs(raw)
+    path = raw / "timings.json"
+    data = json.loads(path.read_text())
+    if mutation == "missing-worker":
+        data["expected_workers"] = 2
+    elif mutation == "crash":
+        data["workers"][0]["crashed"] = True
+    elif mutation == "unfinished":
+        data["workers"][0]["finished"] = False
+    elif mutation == "no-collection":
+        data["workers"][0]["collected_total"] = None
+    else:
+        data["unattributed_reports"] = 1
+    path.write_text(json.dumps(data))
+    timing = reports.sanitize_timings(raw)
+    assert timing["complete"] is False
+    assert timing["workers"][0]["phases"]
+
+
+def test_timing_ids_are_rederived_and_missing_junit_time_is_not_invented(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw"
+    inputs(raw)
+    timing = reports.sanitize_timings(raw)
+    assert timing["workers"][0]["phases"][0]["id"] != "a" * 64
+    safe, _ = reports.sanitize_junit(b'<testsuite><testcase name="one"/></testsuite>')
+    assert b"time=" not in safe
+
+
+def test_environment_recorder_fixed_inventory_and_private_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "ci_environment", ROOT / "scripts/ci_environment.py"
+    )
+    assert spec and spec.loader
+    recorder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(recorder)
+    values = {"uv": "uv 0.13.1", "node": "v22.1.0", "npm": "10.9.0"}
+    monkeypatch.setattr(
+        recorder.subprocess,
+        "check_output",
+        lambda command, **kwargs: values[command[0]],
+    )
+    monkeypatch.setattr(recorder.importlib.metadata, "version", lambda name: "1.2.3")
+    monkeypatch.setenv("SECRET_CANARY", "NEVER-UPLOAD")
+    result = recorder.environment()
+    assert set(result) == {"schema", "tools", "dependencies", "runner"}
+    assert set(result["dependencies"]) == set(recorder.PACKAGES)
+    assert "NEVER-UPLOAD" not in json.dumps(result)
+    values["uv"] = "SECRET-CANARY /private/path"
+    with pytest.raises(ValueError, match="^unexpected tool version$"):
+        recorder.environment()
