@@ -130,8 +130,17 @@ def test_missing_dependencies_and_unknown_events_fail(
 ) -> None:
     missing = copy.deepcopy(binding)
     missing.pop("test")
+    assert not contract.validate_results("pull_request", missing)
     with pytest.raises(AssertionError):
         evaluate(missing, monkeypatch)
     monkeypatch.setenv("GITHUB_EVENT_NAME", "merge_group")
+    assert not contract.validate_results("merge_group", binding)
     with pytest.raises(AssertionError):
         evaluate(binding, monkeypatch)
+
+
+def test_stale_attempt_names_full_rerun_recovery(
+    binding: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(AssertionError, match="re-run all jobs"):
+        evaluate(binding, monkeypatch, {"identity": {}})

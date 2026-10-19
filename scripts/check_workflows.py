@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -117,8 +118,10 @@ TIMEOUT_MAX = 45
 # FULL-only bootstrap/recovery bytes; normal pinned policy is a later rollout.
 BOOTSTRAP_STEPS_SHA256 = {
     "ci-scope": "06f67bdc7b7c3e836c3b1849caa62bc484c8d47da370a5ed372006c987096b50",
-    "ci-required": "0d2b594f66e3a04931783e739c91cb5f235ba5f969f904e0af046237fe4e0a48",
+    "ci-required": "c57d62f18b78fadcc688c48e7a40e4c0d56db8296bf96ae79fa202ce8ebf332d",
 }
+
+AUDIT_VERIFY_SHA256 = "d8be7aa4ed92d83495fb7a003c7c082090e8cc9740863a782f5a3cba5737cb4e"
 
 
 def get_on(doc: Any) -> Any:
@@ -706,13 +709,45 @@ def workflow_files() -> list[Path]:
     return sorted(found)
 
 
+def stable_context_invariants(doc: Any, path: Path) -> list[str]:
+    """Only the two reviewed Test jobs may emit the new stable contexts."""
+    for name, job in _jobs(doc).items():
+        if not isinstance(job, dict):
+            return ["[ci-gate] malformed job definition"]
+        display = job.get("name", name)
+        if isinstance(display, str) and "${{" in display:
+            return ["[ci-gate] dynamic job names require deliberate context review"]
+        for context in ("ci-scope", "ci-required"):
+            if name == context or display == context:
+                if path.name != "test.yml" or name != context or "name" in job:
+                    return [
+                        "[ci-gate] stable context collision or display-name override"
+                    ]
+    return []
+
+
 def full_bootstrap_invariants(doc: Any) -> list[str]:
-    """Pin the reviewed dependency-free FULL path while legacy checks protect it."""
+    """Bind the complete embedded jobs and same-run inputs, not only code text."""
     try:
         jobs = doc["jobs"]
+        if "defaults" in doc or "env" in doc:
+            return ["[ci-gate] workflow defaults/env can alter the embedded contract"]
+        if doc.get("name") != "Test" or get_on(doc) != {
+            "push": {"branches": ["main"]},
+            "pull_request": {"branches": ["main"]},
+            "schedule": [{"cron": "0 8 * * 1"}],
+            "workflow_dispatch": None,
+        }:
+            return ["[ci-gate] Test triggers must remain complete and unfiltered"]
         if "needs" in jobs["test"] or "if" in jobs["test"]:
             return ["[ci-gate] pre-S suite must remain independent and unconditional"]
-        gate = jobs["ci-required"]
+        if jobs["test"].get("env") != {
+            "UV_PYTHON": "3.12",
+            "PMCP_CI_REPORT_DIR": "${{ github.workspace }}/.ci-reports/raw",
+        } or jobs["test"].get("strategy") != {"matrix": {"python-version": ["3.12"]}}:
+            return [
+                "[ci-gate] preserve the full-suite environment and legacy matrix context"
+            ]
         expected = [
             "ci-scope",
             "test",
@@ -725,30 +760,108 @@ def full_bootstrap_invariants(doc: Any) -> list[str]:
             "changelog",
             "release-diff-ack",
         ]
-        if gate.get("if") != "always()" or gate.get("needs") != expected:
-            return [
-                "[ci-gate] gate must always evaluate the exact FULL/P3-A dependency set"
-            ]
-        for job, digest in BOOTSTRAP_STEPS_SHA256.items():
-            value = jobs[job]
-            if value.get("continue-on-error") or value.get("permissions") != {
-                "contents": "read"
-            }:
-                return ["[ci-gate] bootstrap cannot be best-effort or privileged"]
-            steps = value["steps"]
-            if (
-                len(steps) != 1
-                or steps[0].get("if")
-                or steps[0].get("continue-on-error")
-            ):
-                return ["[ci-gate] bootstrap step cannot skip or ignore failures"]
-            if hashlib.sha256(steps[0]["run"].encode()).hexdigest() != digest:
+        for name, digest in BOOTSTRAP_STEPS_SHA256.items():
+            value = jobs[name]
+            step = value["steps"][0]
+            code = step["run"]
+            if hashlib.sha256(code.encode()).hexdigest() != digest:
                 return [
                     "[ci-gate] embedded FULL-only contract changed; deliberate review required"
                 ]
-        if "if" in jobs["ci-scope"] or "needs" in jobs["ci-scope"]:
-            return ["[ci-gate] bootstrap scope must be independent and unconditional"]
-    except (KeyError, TypeError, AttributeError):
+            common = {
+                "runs-on": "ubuntu-latest",
+                "timeout-minutes": 10,
+                "permissions": {"contents": "read"},
+            }
+            env = {"FORCE_FULL": "${{ vars.PMCP_CI_FORCE_FULL }}"}
+            if name == "ci-scope":
+                required = common | {
+                    "outputs": {
+                        key: "${{ steps.scope.outputs." + key + " }}"
+                        for key in ("mode", "proof_valid", "decision")
+                    },
+                    "steps": [
+                        {
+                            "name": "Emit FULL-only bootstrap decision",
+                            "id": "scope",
+                            "env": env,
+                            "run": code,
+                        }
+                    ],
+                }
+            else:
+                env.update(
+                    NEEDS_JSON="${{ toJSON(needs) }}",
+                    SCOPE_DECISION="${{ needs.ci-scope.outputs.decision }}",
+                )
+                required = common | {
+                    "if": "always()",
+                    "needs": expected,
+                    "steps": [
+                        {
+                            "name": "Evaluate FULL-only bootstrap and recovery contract",
+                            "env": env,
+                            "run": code,
+                        }
+                    ],
+                }
+            if value != required:
+                return [
+                    "[ci-gate] complete bootstrap job/wiring must match the reviewed contract"
+                ]
+        diagnostics = {
+            "Record environment identity": "always()",
+            "Sanitize reports": "always()",
+            "Upload safe reports": "${{ always() && steps.sanitize.outcome == 'success' && vars.PMCP_CI_DISABLE_REPORTS == '' }}",
+            "Report diagnostic availability": "always()",
+        }
+        for name in expected[1:]:
+            job = jobs[name]
+            if "name" in job or "continue-on-error" in job or "defaults" in job:
+                return [
+                    "[ci-gate] selected jobs cannot rename, ignore failures or override shells"
+                ]
+            condition = (
+                "github.event_name == 'pull_request'"
+                if name in {"changelog", "release-diff-ack"}
+                else None
+            )
+            if ("if" in job) != (condition is not None) or job.get("if") != condition:
+                return [
+                    "[ci-gate] selected jobs must execute except enumerated PR-only checks"
+                ]
+            for selected in job["steps"]:
+                if "continue-on-error" in selected:
+                    return ["[ci-gate] selected verification cannot ignore failures"]
+                if "if" in selected and (
+                    name != "test"
+                    or selected.get("name") not in diagnostics
+                    or selected["if"] != diagnostics[selected["name"]]
+                ):
+                    return [
+                        "[ci-gate] selected verification cannot be conditionally skipped"
+                    ]
+        audit = jobs["audit"]["steps"][-1]
+        if (
+            hashlib.sha256(json.dumps(audit, sort_keys=True).encode()).hexdigest()
+            != AUDIT_VERIFY_SHA256
+        ):
+            return [
+                "[ci-gate] locked P3-A audit execution must remain unconditional and exact"
+            ]
+        suite = next(
+            s
+            for s in jobs["test"]["steps"]
+            if s.get("name") == "Run tests with coverage"
+        )
+        if set(suite) != {"name", "run"}:
+            return [
+                "[ci-gate] full suite cannot override invocation environment or shell"
+            ]
+        failures = stable_context_invariants(doc, Path("test.yml"))
+        if failures:
+            return failures
+    except (KeyError, TypeError, AttributeError, IndexError, StopIteration):
         return ["[ci-gate] missing bootstrap contract"]
     return []
 
@@ -849,6 +962,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         failures.extend(timeout_invariants(doc, path))
         failures.extend(tag_trigger_invariants(doc, path))
+        failures.extend(stable_context_invariants(doc, path))
         if path.name == "test.yml":
             failures.extend(diagnostic_invariants(doc))
             failures.extend(full_bootstrap_invariants(doc))

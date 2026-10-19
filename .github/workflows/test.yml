@@ -85,7 +85,7 @@ jobs:
           assert decision['reason'] == ('force_full' if forced else 'bootstrap')
           assert decision['identity'] == {key: os.environ[key] for key in (
               'GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT',
-              'GITHUB_EVENT_NAME', 'GITHUB_REPOSITORY_ID')}
+              'GITHUB_EVENT_NAME', 'GITHUB_REPOSITORY_ID')}, 'scope identity mismatch; re-run all jobs in a new attempt'
           for job in jobs:
               expected = 'skipped' if event != 'pull_request' and job in ('changelog', 'release-diff-ack') else 'success'
               assert needs[job]['result'] == expected, 'unsatisfied FULL dependency: ' + job

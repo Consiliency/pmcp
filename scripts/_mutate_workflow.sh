@@ -91,6 +91,21 @@ scope-manufactures-asset|1|[ci-gate]|FULL-only bootstrap emits an asset mode
 gate-no-always|1|[ci-gate]|aggregate loses cancellation/failure evaluation
 gate-missing-audit|1|[ci-gate]|P3-A aggregate omits audit dependency
 test-needs-before-protection|1|[ci-gate]|pre-S suite gains a suppressible scope dependency
+gate-static-needs|1|[ci-gate]|replace same-run dependency results with static success data
+gate-step-false|1|[ci-gate]|skip the embedded evaluator with a YAML boolean false
+gate-shell-override|1|[ci-gate]|replace the evaluator shell with a success-only shell
+scope-output-rebound|1|[ci-gate]|point scope decision output at another field
+scope-step-id|1|[ci-gate]|disconnect the scope output step identity
+scope-force-full-unbound|1|[ci-gate]|disconnect scope restriction from the repository variable
+gate-job-name|1|[ci-gate]|rename the stable required context
+gate-matrix|1|[ci-gate]|make the stable gate a matrix check
+workflow-shell-default|1|[ci-gate]|override the embedded shell through workflow defaults
+audit-step-skipped|1|[ci-gate]|skip locked advisory verification
+audit-step-best-effort|1|[ci-gate]|ignore a failed advisory verification
+audit-command-omitted|1|[ci-gate]|remove actual advisory execution
+test-path-filtered|1|[ci-gate]|remove Test checks from unrelated PRs through a path filter
+gate-context-collision|1|[ci-gate]|let another Test job emit the aggregate name
+gate-context-cross-workflow|1|[ci-gate]|let another workflow emit the aggregate name
 TSV
 )"
 
@@ -501,6 +516,94 @@ gate-missing-audit)
 test-needs-before-protection)
 	replace "$TEST_WF" $'  test:\n    runs-on:' $'  test:\n    needs: [ci-scope]\n    runs-on:'
 	;;
+gate-static-needs)
+	replace "$TEST_WF" '          NEEDS_JSON: ${{ toJSON(needs) }}' '          NEEDS_JSON: |
+            {"ci-scope":{"result":"success"},"test":{"result":"success"},"install-smoke":{"result":"success"},"min-version-smoke":{"result":"success"},"lint":{"result":"success"},"typecheck":{"result":"success"},"workflows":{"result":"success"},"audit":{"result":"success"},"changelog":{"result":"success"},"release-diff-ack":{"result":"success"}}'
+	;;
+gate-step-false)
+	replace "$TEST_WF" '      - name: Evaluate FULL-only bootstrap and recovery contract' '      - name: Evaluate FULL-only bootstrap and recovery contract
+        if: false'
+	;;
+gate-shell-override)
+	replace "$TEST_WF" '      - name: Evaluate FULL-only bootstrap and recovery contract' '      - name: Evaluate FULL-only bootstrap and recovery contract
+        shell: bash -c "exit 0" -- {0}'
+	;;
+scope-output-rebound)
+	replace "$TEST_WF" '      decision: ${{ steps.scope.outputs.decision }}' '      decision: ${{ steps.scope.outputs.mode }}'
+	;;
+scope-step-id)
+	replace "$TEST_WF" '        id: scope' '        id: wrong'
+	;;
+scope-force-full-unbound)
+	replace "$TEST_WF" '      - name: Emit FULL-only bootstrap decision
+        id: scope
+        env:
+          FORCE_FULL: ${{ vars.PMCP_CI_FORCE_FULL }}' '      - name: Emit FULL-only bootstrap decision
+        id: scope
+        env:
+          FORCE_FULL: ""'
+	;;
+gate-job-name)
+	replace "$TEST_WF" '  ci-required:
+' '  ci-required:
+    name: harmless
+'
+	;;
+gate-matrix)
+	replace "$TEST_WF" '  ci-required:
+' '  ci-required:
+    strategy:
+      matrix:
+        slot: [one, two]
+'
+	;;
+workflow-shell-default)
+	replace "$TEST_WF" '
+jobs:
+' '
+defaults:
+  run:
+    shell: bash -c "exit 0" -- {0}
+jobs:
+'
+	;;
+audit-step-skipped)
+	replace "$TEST_WF" '      - name: pip-audit (locked dependencies)' '      - name: pip-audit (locked dependencies)
+        if: false'
+	;;
+audit-step-best-effort)
+	replace "$TEST_WF" '      - name: pip-audit (locked dependencies)' '      - name: pip-audit (locked dependencies)
+        continue-on-error: true'
+	;;
+audit-command-omitted)
+	replace "$TEST_WF" 'uv run --locked --with pip-audit==2.9.0 pip-audit' 'true # omitted audit'
+	;;
+test-path-filtered)
+	replace "$TEST_WF" '  pull_request:
+    branches: [main]' '  pull_request:
+    branches: [main]
+    paths: ["src/**"]'
+	;;
+gate-context-collision)
+	replace "$TEST_WF" '  lint:
+' '  lint:
+    name: ci-required
+'
+	;;
+gate-context-cross-workflow)
+	replace "$MAINTENANCE" '
+jobs:
+' '
+jobs:
+  shadow:
+    name: ci-required
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - run: echo collision
+'
+	;;
+
 *)
 	echo "unhandled mutant: ${NAME}" >&2
 	exit 2

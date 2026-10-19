@@ -204,6 +204,21 @@ TESTED_MUTANTS = (
         "gate-no-always",
         "gate-missing-audit",
         "test-needs-before-protection",
+        "gate-static-needs",
+        "gate-step-false",
+        "gate-shell-override",
+        "scope-output-rebound",
+        "scope-step-id",
+        "scope-force-full-unbound",
+        "gate-job-name",
+        "gate-matrix",
+        "workflow-shell-default",
+        "audit-step-skipped",
+        "audit-step-best-effort",
+        "audit-command-omitted",
+        "test-path-filtered",
+        "gate-context-collision",
+        "gate-context-cross-workflow",
     }
 )
 
@@ -907,6 +922,107 @@ class TestCiWiring:
             jobs["ci-required"]["needs"].remove("audit")
         else:
             jobs["test"]["needs"] = ["ci-scope"]
+        assert cw.full_bootstrap_invariants(doc)
+
+    @pytest.mark.parametrize(
+        "mutant",
+        [
+            "gate-static-needs",
+            "gate-step-false",
+            "gate-shell-override",
+            "scope-output-rebound",
+            "scope-step-id",
+            "scope-force-full-unbound",
+            "gate-job-name",
+            "gate-matrix",
+            "workflow-shell-default",
+            "audit-step-skipped",
+            "audit-step-best-effort",
+            "audit-command-omitted",
+            "test-path-filtered",
+            "gate-context-collision",
+            "gate-context-cross-workflow",
+        ],
+    )
+    def test_complete_bootstrap_wiring_mutants_fail(self, mutant: str) -> None:
+        doc = copy.deepcopy(_TEST_WF)
+        jobs = doc["jobs"]
+        gate = jobs["ci-required"]
+        scope = jobs["ci-scope"]
+        audit = jobs["audit"]["steps"][-1]
+        if mutant == "gate-static-needs":
+            gate["steps"][0]["env"]["NEEDS_JSON"] = '{"test":{"result":"success"}}'
+        elif mutant == "gate-step-false":
+            gate["steps"][0]["if"] = False
+        elif mutant == "gate-shell-override":
+            gate["steps"][0]["shell"] = 'bash -c "exit 0" -- {0}'
+        elif mutant == "scope-output-rebound":
+            scope["outputs"]["decision"] = "${{ steps.scope.outputs.mode }}"
+        elif mutant == "scope-step-id":
+            scope["steps"][0]["id"] = "wrong"
+        elif mutant == "scope-force-full-unbound":
+            scope["steps"][0]["env"]["FORCE_FULL"] = ""
+        elif mutant == "gate-job-name":
+            gate["name"] = "harmless"
+        elif mutant == "gate-matrix":
+            gate["strategy"] = {"matrix": {"slot": ["one", "two"]}}
+        elif mutant == "workflow-shell-default":
+            doc["defaults"] = {"run": {"shell": 'bash -c "exit 0" -- {0}'}}
+        elif mutant == "audit-step-skipped":
+            audit["if"] = False
+        elif mutant == "audit-step-best-effort":
+            audit["continue-on-error"] = True
+        elif mutant == "audit-command-omitted":
+            audit["run"] = "echo audit disabled"
+        elif mutant == "test-path-filtered":
+            cw.get_on(doc)["pull_request"]["paths"] = ["src/**"]
+        elif mutant == "gate-context-collision":
+            jobs["lint"]["name"] = "ci-required"
+        else:
+            other = {"jobs": {"build": {"name": "ci-required", "steps": []}}}
+            assert cw.stable_context_invariants(other, Path("maintenance.yml"))
+            return
+        assert cw.full_bootstrap_invariants(doc)
+
+    @pytest.mark.parametrize("job", ["ci-scope", "ci-required"])
+    @pytest.mark.parametrize("condition", [False, None, 0, "", "${{ false }}"])
+    def test_falsy_bootstrap_step_conditions_fail(
+        self, job: str, condition: Any
+    ) -> None:
+        doc = copy.deepcopy(_TEST_WF)
+        doc["jobs"][job]["steps"][0]["if"] = condition
+        assert cw.full_bootstrap_invariants(doc)
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "global-env",
+            "gate-defaults",
+            "scope-environment",
+            "scope-container",
+            "suite-env",
+            "suite-job-env",
+        ],
+    )
+    def test_execution_overrides_fail(self, mutation: str) -> None:
+        doc = copy.deepcopy(_TEST_WF)
+        if mutation == "global-env":
+            doc["env"] = {"PATH": "/wrong"}
+        elif mutation == "gate-defaults":
+            doc["jobs"]["ci-required"]["defaults"] = {"run": {"shell": "python {0}"}}
+        elif mutation == "scope-environment":
+            doc["jobs"]["ci-scope"]["environment"] = "wrong"
+        elif mutation == "scope-container":
+            doc["jobs"]["ci-scope"]["container"] = "untrusted"
+        elif mutation == "suite-job-env":
+            doc["jobs"]["test"]["env"]["PYTEST_ADDOPTS"] = "-k one_test"
+        else:
+            suite = next(
+                s
+                for s in doc["jobs"]["test"]["steps"]
+                if s.get("name") == "Run tests with coverage"
+            )
+            suite["env"] = {"PYTEST_ADDOPTS": "-k one_test"}
         assert cw.full_bootstrap_invariants(doc)
 
     def test_diagnostic_contract_is_wired(self) -> None:

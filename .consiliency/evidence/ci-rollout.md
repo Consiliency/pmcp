@@ -38,3 +38,23 @@ protection, read back and demonstrate actual red blocking.
 The trust root remains exact-head human cross-vendor control-plane review.
 Candidate-owned workflow and guard code cannot resist an arbitrary author who
 rewrites both. There is no new unattended-merge authority.
+
+The current owner instruction selects P3-A: audit blocks every PR, including
+asset-only and unrelated changes. This is an implementation default already
+authorized by the owner, not a new pending policy choice.
+
+Bootstrap guards bind the entire two job definitions (including env, outputs,
+step IDs, shells, matrix absence and stable names) as well as the embedded code.
+Global execution overrides and top-level trigger filters fail closed. All
+selected verification steps reject unauthorized skipping or best-effort behavior;
+the locked audit's exact execution is pinned. Stable ci-scope/ci-required names
+cannot be emitted by another workflow. These remain reviewed controls within
+the human workflow-author trust boundary. They are not an independent defense
+against an author who rewrites the workflows and the guards together.
+
+Source records: original B0 d3dfb30c39530482582bd0efb004d062ac739921 was reviewed
+against A6c44b3bf25edab7d79dd294ded2d23dfa0738f26. The corrected B0 is rebased on
+Acf09cd50eff39ec762db807f4659bf27ef743945 and the separate advisory-floor patch
+446afb18a67efcedb46c71136c9d966c2441d772. Full current implementation head,
+findings and new-round receipts live in the durable implementation status and
+PR426. No previous head/base approval is reused.
