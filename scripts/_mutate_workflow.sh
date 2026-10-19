@@ -83,6 +83,8 @@ concurrency-added|0|-|NOT COVERED by invariant: workflow-level concurrency with 
 guard-self-disabled|1|[ci-gate]|selected workflows job cannot be skipped; the independent full suite also enforces this
 guard-self-disabled-nonconstant|1|[ci-gate]|selected workflows job cannot be conditionally skipped, including a nonconstant expression
 guard-step-gutted|0|-|NOT COVERED by the checker: the checker step's command replaced by a no-op, since the script runs from the PR branch. Caught by the test job
+bootstrap-suite-decoy|1|[ci-gate]|rename actual suite into a conditional diagnostic and add decoy
+bootstrap-selected-shell|1|[ci-gate]|override the coverage verification shell
 diagnostics-upload-raw|1|[diagnostics]|upload raw reports instead of reconstructed safe output
 diagnostics-upload-ungated|1|[diagnostics]|upload despite sanitizer failure
 diagnostics-sanitize-not-always|1|[diagnostics]|omit failure-path sanitization
@@ -491,6 +493,13 @@ guard-step-gutted)
 	replace "$TEST_WF" \
 		'        run: uv run python scripts/check_workflows.py --base-ref "${{ steps.drift-base.outputs.base }}"' \
 		'        run: echo "workflow guards skipped"'
+	;;
+bootstrap-suite-decoy)
+	replace "$TEST_WF" '      - name: Run tests with coverage' "$(sed -n '/      - name: Upload safe reports/,+1p' "$TEST_WF")"
+	replace "$TEST_WF" '      - name: Check coverage threshold' $'      - name: Run tests with coverage\n        run: echo decoy\n\n      - name: Check coverage threshold'
+	;;
+bootstrap-selected-shell)
+	replace "$TEST_WF" '      - name: Check coverage threshold' $'      - name: Check coverage threshold\n        shell: true {0}'
 	;;
 diagnostics-upload-raw)
 	replace "$TEST_WF" '          path: .ci-reports/safe/' '          path: .ci-reports/raw/'

@@ -188,7 +188,8 @@ PIN_MUTANTS: dict[str, tuple[Path, str, str]] = {
 # evidence matrix is generated from that TSV: a phantom row there would
 # otherwise appear in the matrix with nothing exercising it.
 TESTED_MUTANTS = (
-    set(RELEASE_MUTANTS)
+    {"bootstrap-suite-decoy", "bootstrap-selected-shell"}
+    | set(RELEASE_MUTANTS)
     | set(TIMEOUT_MUTANTS)
     | set(DRIFT_MUTANTS)
     | set(PIN_MUTANTS)
@@ -1313,3 +1314,23 @@ class TestMutationHelperContract:
             check=False,
         )
         assert result.returncode != 0
+
+
+@pytest.mark.parametrize(
+    "mutant", ["bootstrap-suite-decoy", "bootstrap-selected-shell"]
+)
+def test_bootstrap_selected_execution_binds_actual_command(mutant: str) -> None:
+    doc = copy.deepcopy(_TEST_WF)
+    steps = doc["jobs"]["test"]["steps"]
+    if mutant == "bootstrap-suite-decoy":
+        real = next(s for s in steps if s.get("name") == "Run tests with coverage")
+        real["name"] = "Upload safe reports"
+        real["if"] = (
+            "${{ always() && steps.sanitize.outcome == 'success' && vars.PMCP_CI_DISABLE_REPORTS == '' }}"
+        )
+        steps.append({"name": "Run tests with coverage", "run": "echo decoy"})
+    else:
+        next(s for s in steps if s.get("name") == "Check coverage threshold")[
+            "shell"
+        ] = "true {0}"
+    assert cw.full_bootstrap_invariants(doc)

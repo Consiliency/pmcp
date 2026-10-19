@@ -46,7 +46,8 @@ authorized by the owner, not a new pending policy choice.
 Bootstrap guards bind the entire two job definitions (including env, outputs,
 step IDs, shells, matrix absence and stable names) as well as the embedded code.
 Global execution overrides and top-level trigger filters fail closed. All
-selected verification steps reject unauthorized skipping or best-effort behavior;
+selected verification steps reject unexpected if/continue-on-error and shell overrides;
+step names are unique and the exact suite command binds its unconditional step;
 the locked audit's exact execution is pinned. Stable ci-scope/ci-required names
 cannot be emitted by another workflow. These remain reviewed controls within
 the human workflow-author trust boundary. They are not an independent defense

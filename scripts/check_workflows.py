@@ -726,6 +726,9 @@ def stable_context_invariants(doc: Any, path: Path) -> list[str]:
     return []
 
 
+EXPECTED_FULL_SUITE_COMMAND = "uv run --locked python -m pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml --cov-report=term-missing -p tests.ci_diagnostics --junitxml=.ci-reports/raw/junit.xml --durations=50"
+
+
 def full_bootstrap_invariants(doc: Any) -> list[str]:
     """Bind the complete embedded jobs and same-run inputs, not only code text."""
     try:
@@ -830,7 +833,14 @@ def full_bootstrap_invariants(doc: Any) -> list[str]:
                 return [
                     "[ci-gate] selected jobs must execute except enumerated PR-only checks"
                 ]
+            labels = [step["name"] for step in job["steps"] if "name" in step]
+            if any(not isinstance(label, str) for label in labels) or len(
+                labels
+            ) != len(set(labels)):
+                return ["[ci-gate] selected step names must be unique and literal"]
             for selected in job["steps"]:
+                if "shell" in selected:
+                    return ["[ci-gate] selected verification cannot override its shell"]
                 if "continue-on-error" in selected:
                     return ["[ci-gate] selected verification cannot ignore failures"]
                 if "if" in selected and (
@@ -849,14 +859,17 @@ def full_bootstrap_invariants(doc: Any) -> list[str]:
             return [
                 "[ci-gate] locked P3-A audit execution must remain unconditional and exact"
             ]
-        suite = next(
+        suites = [
             s
             for s in jobs["test"]["steps"]
-            if s.get("name") == "Run tests with coverage"
-        )
-        if set(suite) != {"name", "run"}:
+            if s.get("run") == EXPECTED_FULL_SUITE_COMMAND
+        ]
+        if len(suites) != 1 or suites[0] != {
+            "name": "Run tests with coverage",
+            "run": EXPECTED_FULL_SUITE_COMMAND,
+        }:
             return [
-                "[ci-gate] full suite cannot override invocation environment or shell"
+                "[ci-gate] actual full suite command must bind its unconditional step, name and invocation"
             ]
         failures = stable_context_invariants(doc, Path("test.yml"))
         if failures:
