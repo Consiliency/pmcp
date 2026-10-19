@@ -222,13 +222,34 @@ def main() -> int:
         environment = sanitize_environment(bounded_read(args.raw / "environment.json"))
         args.safe.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix="safe-report-", dir=args.safe.parent))
-        (staging / "junit.xml").write_bytes(junit)
-        (staging / "environment.json").write_text(
+        suffix = f"{binding['run_id']}-{binding['run_attempt']}"
+        (staging / f"junit-{suffix}-controller.xml").write_bytes(junit)
+        (staging / f"environment-{suffix}-controller.json").write_text(
             json.dumps({"run": binding, **environment}, sort_keys=True) + "\n"
         )
-        (staging / "timings.json").write_text(
+        summaries: list[dict[str, object]] = []
+        workers = timings["workers"]
+        if not isinstance(workers, list):
+            raise TypeError("invalid reconstructed worker inventory")
+        for worker in workers:
+            name = f"timings-{suffix}-{worker['worker']}.json"
+            (staging / name).write_text(
+                json.dumps({"schema": 2, "run": binding, **worker}, sort_keys=True)
+                + "\n"
+            )
+            summaries.append(
+                {key: value for key, value in worker.items() if key != "phases"}
+                | {"report": name}
+            )
+        (staging / f"timings-{suffix}-controller.json").write_text(
             json.dumps(
-                {"schema": 2, "run": binding, "cases": count, **timings},
+                {
+                    "schema": 2,
+                    "run": binding,
+                    "cases": count,
+                    **timings,
+                    "workers": summaries,
+                },
                 sort_keys=True,
             )
             + "\n"
@@ -238,7 +259,7 @@ def main() -> int:
             print(
                 "::warning::Timing evidence incomplete; observed phases retained; not success evidence"
             )
-    except (OSError, ValueError, KeyError, TypeError, ET.ParseError):
+    except (OSError, ValueError, KeyError, TypeError, RecursionError, ET.ParseError):
         # Do not print the exception: parser diagnostics can echo input bytes.
         print("::error::Diagnostic evidence missing or unsafe; upload refused")
         return 1

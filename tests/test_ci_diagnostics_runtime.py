@@ -149,7 +149,13 @@ def test_recorder_state_resets_when_disabled_or_collecting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from types import SimpleNamespace
-    from tests import ci_diagnostics as plugin
+
+    spec = importlib.util.spec_from_file_location(
+        "ci_diagnostics_private_state_test", ROOT / "tests/ci_diagnostics.py"
+    )
+    assert spec and spec.loader
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
 
     monkeypatch.setenv("PMCP_CI_REPORT_DIR", str(tmp_path))
     config = SimpleNamespace(

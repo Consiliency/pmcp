@@ -126,18 +126,24 @@ def test_success_is_bound_and_only_allowlisted_files_exist(
     monkeypatch.setattr(sys, "argv", ["ci_reports", str(raw), str(safe)])
     assert reports.main() == 0
     assert {p.name for p in safe.iterdir()} == {
-        "junit.xml",
-        "timings.json",
-        "environment.json",
+        "junit-123-2-controller.xml",
+        "timings-123-2-controller.json",
+        "timings-123-2-gw0.json",
+        "environment-123-2-controller.json",
     }
-    result = json.loads((safe / "timings.json").read_text())
+    result = json.loads((safe / "timings-123-2-controller.json").read_text())
     assert result["run"] == {
         "sha": "b" * 40,
         "run_id": "123",
         "run_attempt": "2",
         "event_name": "pull_request",
     }
-    assert result["workers"][0]["phases"][0]["phase"] == "teardown"
+    worker = result["workers"][0]
+    assert worker["report"] == "timings-123-2-gw0.json"
+    assert "phases" not in worker
+    detail = json.loads((safe / worker["report"]).read_text())
+    assert detail["run"] == result["run"] and detail["worker"] == "gw0"
+    assert detail["phases"][0]["phase"] == "teardown"
     assert all("SECRET-CANARY" not in p.read_text() for p in safe.iterdir())
 
 
@@ -261,3 +267,22 @@ def test_environment_recorder_fixed_inventory_and_private_failures(
     values["uv"] = "SECRET-CANARY /private/path"
     with pytest.raises(ValueError, match="^unexpected tool version$"):
         recorder.environment()
+
+
+def test_deep_json_uses_fixed_refusal_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    run_identity: None,
+) -> None:
+    raw, safe = tmp_path / "raw", tmp_path / "safe"
+    inputs(raw)
+    (raw / "timings.json").write_text("[" * 2000 + '"SECRET-CANARY"' + "]" * 2000)
+    monkeypatch.setattr(sys, "argv", ["ci_reports", str(raw), str(safe)])
+    assert reports.main() == 1
+    captured = capsys.readouterr()
+    assert (
+        captured.out
+        == "::error::Diagnostic evidence missing or unsafe; upload refused\n"
+    )
+    assert captured.err == "" and not safe.exists()
