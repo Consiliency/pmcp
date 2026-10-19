@@ -219,6 +219,8 @@ TESTED_MUTANTS = (
         "test-path-filtered",
         "gate-context-collision",
         "gate-context-cross-workflow",
+        "guard-self-disabled",
+        "guard-self-disabled-nonconstant",
     }
 )
 
@@ -1023,6 +1025,14 @@ class TestCiWiring:
                 if s.get("name") == "Run tests with coverage"
             )
             suite["env"] = {"PYTEST_ADDOPTS": "-k one_test"}
+        assert cw.full_bootstrap_invariants(doc)
+
+    @pytest.mark.parametrize(
+        "condition", [False, "${{ github.event_name == 'never' }}"]
+    )
+    def test_selected_workflow_verification_cannot_skip(self, condition: Any) -> None:
+        doc = copy.deepcopy(_TEST_WF)
+        doc["jobs"]["workflows"]["if"] = condition
         assert cw.full_bootstrap_invariants(doc)
 
     def test_diagnostic_contract_is_wired(self) -> None:
