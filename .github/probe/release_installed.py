@@ -113,6 +113,44 @@ async def downstream() -> None:
             assert not response.is_error
             text = "\n".join(getattr(x, "text", "") for x in response.content)
             assert json.loads(text)["ok"] is True and "p1-floor-ok:release" in text
+            owned = owned_probe_processes(root / "p1_probe_server.py")
+            assert owned, "real downstream process was not observed"
+    survivors = {pid for pid, started in owned.items() if process_start(pid) == started}
+    if survivors:
+        # Fail normal shutdown even when emergency cleanup is necessary.
+        for pid in survivors:
+            if process_start(pid) == owned[pid]:
+                os.kill(pid, 9)
+        raise AssertionError("downstream outlived normal gateway shutdown")
+
+
+def process_start(pid: int) -> str | None:
+    try:
+        return (
+            (Path("/proc") / str(pid) / "stat")
+            .read_text()
+            .rsplit(")", 1)[1]
+            .split()[19]
+        )
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+def owned_probe_processes(script: Path) -> dict[int, str]:
+    result = {}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if proc.stat().st_uid != os.getuid():
+                continue
+            if os.fsencode(script) in (proc / "cmdline").read_bytes().split(b"\0"):
+                start = process_start(int(proc.name))
+                if start is not None:
+                    result[int(proc.name)] = start
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return result
 
 
 if __name__ == "__main__":

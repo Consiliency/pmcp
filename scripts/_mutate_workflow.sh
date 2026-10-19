@@ -90,6 +90,8 @@ release-node-removed|1|[release]|remove explicit release Node environment
 release-xml-root|1|[release]|write runner coverage data into the release source tree
 release-history-shallow|1|[release]|remove full release history
 release-suite-env-filter|1|[release]|filter the full suite through environment overrides
+release-artifact-unverified|1|[release]|remove publish-side archive hash verification
+release-artifact-path-widened|1|[release]|publish manifest/reports alongside distributions
 diagnostics-upload-raw|1|[diagnostics]|upload raw reports instead of reconstructed safe output
 diagnostics-upload-ungated|1|[diagnostics]|upload despite sanitizer failure
 diagnostics-sanitize-not-always|1|[diagnostics]|omit failure-path sanitization
@@ -500,6 +502,12 @@ release-history-shallow)
 	;;
 release-suite-env-filter)
 	replace "$RELEASE" '      - name: Run tests with coverage' $'      - name: Run tests with coverage\n        env:\n          PYTEST_ADDOPTS: "-k nothing"'
+	;;
+release-artifact-unverified)
+	replace_re "$RELEASE" '(?s)(  publish:.*?)(      - name: Verify artifact identity\n        run: python3 -I -B scripts/verify_release_bundle\.py \.release-bundle\n)' '\1'
+	;;
+release-artifact-path-widened)
+	replace "$RELEASE" '          packages-dir: .release-bundle/dist/' '          packages-dir: .release-bundle/'
 	;;
 diagnostics-upload-raw)
 	replace "$TEST_WF" '          path: .ci-reports/safe/' '          path: .ci-reports/raw/'

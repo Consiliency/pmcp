@@ -105,6 +105,7 @@ def main() -> int:
     paths = archives(dist, version)
     before = {p.name: {"sha256": digest(p), "bytes": p.stat().st_size} for p in paths}
     # Each install starts in an independent environment and cwd with no src/.
+    resolved = {}
     with tempfile.TemporaryDirectory(prefix="pmcp-archive-") as scratch:
         root = Path(scratch)
         for index, path in enumerate(paths):
@@ -134,6 +135,15 @@ def main() -> int:
                 cwd=work,
                 env=env,
             )
+            resolved[path.name] = json.loads(
+                subprocess.check_output(
+                    ["uv", "pip", "list", "--python", str(python), "--format", "json"],
+                    cwd=work,
+                    env=env,
+                    text=True,
+                    timeout=30,
+                )
+            )
             run([str(venv / "bin/pmcp"), "--version"], cwd=work, env=env)
             run([str(venv / "bin/pmcp"), "--help"], cwd=work, env=env)
             run(
@@ -157,6 +167,10 @@ def main() -> int:
         "lock_sha256": digest(source / "uv.lock"),
         "build_constraints_sha256": digest(constraints),
         "archives": before,
+        "resolved_dependencies": resolved,
+        "uv_version": subprocess.check_output(
+            ["uv", "--version"], text=True, timeout=10
+        ).strip(),
     }
     (bundle / "manifest.json").write_text(
         json.dumps(manifest, sort_keys=True, indent=2) + "\n"

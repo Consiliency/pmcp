@@ -66,12 +66,12 @@ EXPECTED_RELEASE_COMMANDS = {
     "Run tests with coverage": 'uv run --locked python -m pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml:"$RUNNER_TEMP/release-coverage.xml" --cov-report=term-missing --cov-fail-under=60',
 }
 EXPECTED_JOBS = {"build", "publish", "github-release"}
-EXPECTED_NEEDS = {"publish": ["build"], "github-release": ["publish"]}
+EXPECTED_NEEDS = {"publish": ["build"], "github-release": ["publish", "build"]}
 EXPECTED_ENVIRONMENT = {"publish": "release"}
 # ``None`` means the job declares no permissions: block at all.
 EXPECTED_JOB_PERMISSIONS: dict[str, dict[str, str] | None] = {
     "build": {"contents": "read"},
-    "publish": {"id-token": "write"},
+    "publish": {"id-token": "write", "contents": "read"},
     "github-release": {"contents": "write"},
 }
 # SHA form ONLY — no `# vX.Y.Z` here. `yaml.safe_load` strips the comment before
@@ -86,6 +86,7 @@ EXPECTED_USES = {
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
     ],
     "publish": [
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
         # v1.14.2 == the release/v1 head on the day of pinning. Any re-pin must
         # stay >= 1.13.0: GHSA-vxmw-7h4f-hqxh (injectable expression expansions)
@@ -299,6 +300,56 @@ def release_invariants(doc: Any) -> list[str]:
     ]
     if len(uv_steps) != 1 or uv_steps[0].get("with", {}).get("version") != "0.13.1":
         reasons.append("[release] uv tool version must remain pinned")
+
+    if build.get("outputs") != {"bundle_id": "${{ steps.upload.outputs.artifact-id }}"}:
+        reasons.append("[release] build must expose the same-run immutable artifact ID")
+    verification = [
+        s
+        for s in build.get("steps", [])
+        if s.get("name") == "Build and verify exact archives"
+    ]
+    if (
+        len(verification) != 1
+        or verification[0].get("run")
+        != "uv run --locked python scripts/release_artifacts.py --bundle .release-bundle"
+    ):
+        reasons.append("[release] exact wheel and sdist verification is mandatory")
+    for target in ("publish", "github-release"):
+        steps = jobs.get(target, {}).get("steps", [])
+        checks = [s for s in steps if s.get("name") == "Verify artifact identity"]
+        downloads = [
+            s
+            for s in steps
+            if str(s.get("uses", "")).startswith("actions/download-artifact@")
+        ]
+        if (
+            len(checks) != 1
+            or checks[0].get("run")
+            != "python3 -I -B scripts/verify_release_bundle.py .release-bundle"
+        ):
+            reasons.append(
+                "[release] missing downstream archive identity verification: " + target
+            )
+        if len(downloads) != 1 or downloads[0].get("with") != {
+            "artifact-ids": "${{ needs.build.outputs.bundle_id }}",
+            "path": ".release-bundle/",
+            "merge-multiple": True,
+        }:
+            reasons.append(
+                "[release] downstream must use the exact build artifact ID: " + target
+            )
+    pypi = [
+        s
+        for s in jobs.get("publish", {}).get("steps", [])
+        if str(s.get("uses", "")).startswith("pypa/")
+    ]
+    if len(pypi) != 1 or pypi[0].get("with") != {
+        "packages-dir": ".release-bundle/dist/"
+    }:
+        reasons.append("[release] publish only verified distribution files")
+    release_steps = jobs.get("github-release", {}).get("steps", [])
+    if any("--clobber" in str(s.get("run", "")) for s in release_steps):
+        reasons.append("[release] published archive bytes may never be clobbered")
 
     for name, expected_needs in EXPECTED_NEEDS.items():
         job = jobs.get(name)

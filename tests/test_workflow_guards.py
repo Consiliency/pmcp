@@ -74,6 +74,20 @@ _PYPA_PIN = next(u for u in cw.EXPECTED_USES["publish"] if u.startswith("pypa/")
 # Each key is a mutant name in scripts/_mutate_workflow.sh; the callable is the
 # same edit applied to the parsed document.
 RELEASE_MUTANTS: dict[str, Any] = {
+    "release-artifact-unverified": lambda d: d["jobs"]["publish"].update(
+        {
+            "steps": [
+                s
+                for s in d["jobs"]["publish"]["steps"]
+                if s.get("name") != "Verify artifact identity"
+            ]
+        }
+    ),
+    "release-artifact-path-widened": lambda d: next(
+        s
+        for s in d["jobs"]["publish"]["steps"]
+        if str(s.get("uses", "")).startswith("pypa/")
+    ).update({"with": {"packages-dir": ".release-bundle/"}}),
     "release-suite-removed": lambda d: d["jobs"]["build"].update(
         {
             "steps": [
@@ -449,7 +463,8 @@ class TestShaPinning:
         monkeypatch.chdir(REPO_ROOT)
         # Milestone A adds the safe diagnostic artifact uploader.
         # Release alignment adds its explicit Node setup too.
-        assert len(cw.remote_uses(cw.pin_scan_files())) == 36
+        # Artifact verification checks out its same trusted tag in publish.
+        assert len(cw.remote_uses(cw.pin_scan_files())) == 37
 
     def test_expected_uses_is_sha_form_without_comments(self) -> None:
         # yaml.safe_load strips comments before _collect_uses runs, so a value
@@ -1053,7 +1068,9 @@ class TestCiWiring:
     def test_release_diff_ack_passes_when_release_yml_is_untouched(self) -> None:
         step = _step_named(_job("release-diff-ack"), "Require an acknowledgement")
         run = step["run"]
-        assert "grep -qx '\\.github/workflows/release\\.yml'" in run
+        assert "release|test" in run and "release_artifacts\\.py" in run
+        assert "verify_release_bundle\\.py" in run and "check_workflows\\.py" in run
+        assert "release_installed\\.py" in run and "p1_probe_server\\.py" in run
         assert "no acknowledgement required" in run
 
     def test_release_diff_ack_only_runs_on_pull_request(self) -> None:
