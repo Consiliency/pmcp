@@ -75,6 +75,7 @@ jobs:
         with:
           name: release-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release-bundle/
+          include-hidden-files: true
           if-no-files-found: error
 
   publish:

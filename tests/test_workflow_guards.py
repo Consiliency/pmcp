@@ -234,7 +234,17 @@ PIN_MUTANTS: dict[str, tuple[Path, str, str]] = {
 # evidence matrix is generated from that TSV: a phantom row there would
 # otherwise appear in the matrix with nothing exercising it.
 TESTED_MUTANTS = (
-    {"release-xml-root", "release-history-shallow", "release-suite-env-filter"}
+    {
+        "release-xml-root",
+        "release-bundle-hidden",
+        "release-verifier-env",
+        "release-notes-mutated",
+        "release-history-shallow",
+        "release-suite-env-filter",
+        "release-bundle-hidden",
+        "release-verifier-env",
+        "release-notes-mutated",
+    }
     | set(RELEASE_MUTANTS)
     | set(TIMEOUT_MUTANTS)
     | set(DRIFT_MUTANTS)
@@ -1293,3 +1303,65 @@ def test_release_exact_publication_boundary(mutation: str) -> None:
                 if "--released-dir" not in line
             )
     assert cw.release_invariants(doc)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["hidden-disabled", "verify-env", "notes-bytes", "create-repo", "job-env"],
+)
+def test_release_upload_and_downstream_mapping(mutation: str) -> None:
+    doc = release_doc()
+    if mutation == "hidden-disabled":
+        next(
+            x
+            for x in doc["jobs"]["build"]["steps"]
+            if x.get("name") == "Upload artifacts"
+        )["with"].pop("include-hidden-files")
+    elif mutation == "job-env":
+        doc["jobs"]["publish"]["env"] = {"GIT_CONFIG_COUNT": "0"}
+    else:
+        label = {
+            "verify-env": "Verify artifact identity",
+            "notes-bytes": "Extract release notes",
+            "create-repo": "Create GitHub Release",
+        }[mutation]
+        target = "publish" if mutation == "verify-env" else "github-release"
+        step = next(x for x in doc["jobs"][target]["steps"] if x.get("name") == label)
+        if mutation == "notes-bytes":
+            step["run"] += (
+                "\ncp /tmp/other.whl .release-bundle/dist/pmcp-3.0.0-py3-none-any.whl\n"
+            )
+        else:
+            step.setdefault("env", {})["GH_REPO"] = "different/repository"
+    assert cw.release_invariants(doc)
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        ".github/workflows/release.yml",
+        ".github/workflows/test.yml",
+        "scripts/release_artifacts.py",
+        "scripts/verify_release_bundle.py",
+        "scripts/ci_environment.py",
+        "scripts/check_workflows.py",
+        "scripts/release-build-constraints.txt",
+        ".github/probe/release_installed.py",
+        ".github/probe/p1_probe_server.py",
+    ],
+)
+def test_release_acknowledgement_covers_invoked_graph(filename: str) -> None:
+    import re
+
+    run = _step_named(_TEST_WF["jobs"]["release-diff-ack"], "Require")["run"]
+    match = re.search(r"grep -Eq '([^']+)'", run)
+    assert match
+    assert (
+        subprocess.run(
+            ["grep", "-Eq", match[1]],
+            input=filename + "\n",
+            text=True,
+            capture_output=True,
+        ).returncode
+        == 0
+    )

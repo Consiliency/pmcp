@@ -585,7 +585,7 @@ jobs:
           echo "$CHANGED"
 
           if ! echo "$CHANGED" | grep -Eq '^(\.github/workflows/(release|test)\.yml|scripts/(release_artifacts\.py|verify_release_bundle\.py|ci_environment\.py|release-build-constraints\.txt|check_workflows\.py)|\.github/probe/(release_installed\.py|p1_probe_server\.py))$'; then
-            echo "release.yml is untouched — no acknowledgement required."
+            echo "No release publication files changed; no acknowledgement required."
             exit 0
           fi
 

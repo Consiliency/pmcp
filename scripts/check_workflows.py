@@ -65,6 +65,7 @@ EXPECTED_RELEASE_COMMANDS = {
     "Audit locked dependencies before publication": 'uv export --locked --all-extras --dev --no-emit-project --format requirements-txt -o "$RUNNER_TEMP/requirements.txt"\nuv run --locked --with pip-audit==2.9.0 pip-audit --progress-spinner off --strict --disable-pip -r "$RUNNER_TEMP/requirements.txt"\n',
     "Run tests with coverage": 'uv run --locked python -m pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml:"$RUNNER_TEMP/release-coverage.xml" --cov-report=term-missing --cov-fail-under=60',
 }
+EXPECTED_RELEASE_NOTES_COMMAND = 'tag="${GITHUB_REF_NAME}"\nversion="${tag#v}"\nawk -v version="$version" \'\n  $0 ~ "^## \\\\[" version "\\\\]([ -]|$)" {\n    in_section = 1\n    next\n  }\n  in_section && /^## \\[/ {\n    exit\n  }\n  in_section {\n    print\n  }\n\' CHANGELOG.md > release-notes.md\n\nif [ ! -s release-notes.md ]; then\n  printf \'Release %s\\n\' "$tag" > release-notes.md\nfi\n'
 EXPECTED_GITHUB_RELEASE_COMMAND = 'tag="${GITHUB_REF_NAME}"\nif gh release view "$tag" >/dev/null 2>&1; then\n  mkdir -p "$RUNNER_TEMP/published-dist"\n  gh release download "$tag" --dir "$RUNNER_TEMP/published-dist"\n  python3 -I -B scripts/verify_release_bundle.py .release-bundle --released-dir "$RUNNER_TEMP/published-dist"\n  gh release edit "$tag" \\\n    --title "$tag" \\\n    --notes-file release-notes.md\nelse\n  gh release create "$tag" .release-bundle/dist/* \\\n    --title "$tag" \\\n    --notes-file release-notes.md \\\n    --verify-tag\nfi\n'
 EXPECTED_JOBS = {"build", "publish", "github-release"}
 EXPECTED_NEEDS = {"publish": ["build"], "github-release": ["publish", "build"]}
@@ -323,6 +324,7 @@ def release_invariants(doc: Any) -> list[str]:
         != {
             "name": "release-${{ github.run_id }}-${{ github.run_attempt }}",
             "path": ".release-bundle/",
+            "include-hidden-files": True,
             "if-no-files-found": "error",
         }
     ):
@@ -350,6 +352,59 @@ def release_invariants(doc: Any) -> list[str]:
         }:
             reasons.append(
                 "[release] downstream must use the exact build artifact ID: " + target
+            )
+        expected_steps = [
+            {
+                "uses": EXPECTED_USES[target][0],
+                "with": {"ref": "${{ github.sha }}", "persist-credentials": False},
+            },
+            {
+                "name": "Download artifacts",
+                "uses": EXPECTED_USES[target][1],
+                "with": {
+                    "artifact-ids": "${{ needs.build.outputs.bundle_id }}",
+                    "path": ".release-bundle/",
+                    "merge-multiple": True,
+                },
+            },
+            {
+                "name": "Verify artifact identity",
+                "run": "python3 -I -B scripts/verify_release_bundle.py .release-bundle",
+            },
+        ]
+        if target == "publish":
+            expected_steps.append(
+                {
+                    "name": "Publish to PyPI",
+                    "uses": EXPECTED_USES[target][2],
+                    "with": {"packages-dir": ".release-bundle/dist/"},
+                }
+            )
+        else:
+            expected_steps.extend(
+                [
+                    {
+                        "name": "Extract release notes",
+                        "run": EXPECTED_RELEASE_NOTES_COMMAND,
+                    },
+                    {
+                        "name": "Create GitHub Release",
+                        "env": {"GH_TOKEN": "${{ github.token }}"},
+                        "run": EXPECTED_GITHUB_RELEASE_COMMAND,
+                    },
+                ]
+            )
+        expected_job_keys = {
+            "needs",
+            "runs-on",
+            "timeout-minutes",
+            "permissions",
+            "steps",
+        } | ({"environment"} if target == "publish" else set())
+        if steps != expected_steps or set(jobs[target]) != expected_job_keys:
+            reasons.append(
+                "[release] complete downstream execution mapping must remain exact: "
+                + target
             )
         expected_order = [
             "actions/checkout",
