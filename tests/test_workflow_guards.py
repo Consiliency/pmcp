@@ -199,6 +199,12 @@ TESTED_MUTANTS = (
         "diagnostics-sanitize-not-always",
         "diagnostics-retention",
     }
+    | {
+        "scope-manufactures-asset",
+        "gate-no-always",
+        "gate-missing-audit",
+        "test-needs-before-protection",
+    }
 )
 
 
@@ -876,6 +882,32 @@ def _step_named(job: dict[str, Any], fragment: str) -> dict[str, Any]:
 class TestCiWiring:
     """A correct script wired up wrongly guards nothing, and a script-level test
     cannot see that. These assert the workflow expressions themselves."""
+
+    def test_full_bootstrap_contract_is_wired(self) -> None:
+        assert cw.full_bootstrap_invariants(_TEST_WF) == []
+
+    @pytest.mark.parametrize(
+        "mutant",
+        [
+            "scope-manufactures-asset",
+            "gate-no-always",
+            "gate-missing-audit",
+            "test-needs-before-protection",
+        ],
+    )
+    def test_bootstrap_mutants_fail(self, mutant: str) -> None:
+        doc = copy.deepcopy(_TEST_WF)
+        jobs = doc["jobs"]
+        if mutant == "scope-manufactures-asset":
+            step = jobs["ci-scope"]["steps"][0]
+            step["run"] = step["run"].replace("'mode': 'FULL'", "'mode': 'ASSET_V1'")
+        elif mutant == "gate-no-always":
+            jobs["ci-required"].pop("if")
+        elif mutant == "gate-missing-audit":
+            jobs["ci-required"]["needs"].remove("audit")
+        else:
+            jobs["test"]["needs"] = ["ci-scope"]
+        assert cw.full_bootstrap_invariants(doc)
 
     def test_diagnostic_contract_is_wired(self) -> None:
         assert cw.diagnostic_invariants(_TEST_WF) == []

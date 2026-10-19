@@ -41,6 +41,7 @@ older release with an honest comment (``pypa-rolled-back`` in
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import subprocess
 import sys
@@ -112,6 +113,12 @@ TAG_TRIGGERED_WORKFLOWS = {"release.yml", "docker.yml"}
 # parallelised (see Consiliency/pmcp#383).
 TIMEOUT_MIN = 10
 TIMEOUT_MAX = 45
+
+# FULL-only bootstrap/recovery bytes; normal pinned policy is a later rollout.
+BOOTSTRAP_STEPS_SHA256 = {
+    "ci-scope": "06f67bdc7b7c3e836c3b1849caa62bc484c8d47da370a5ed372006c987096b50",
+    "ci-required": "0d2b594f66e3a04931783e739c91cb5f235ba5f969f904e0af046237fe4e0a48",
+}
 
 
 def get_on(doc: Any) -> Any:
@@ -699,6 +706,53 @@ def workflow_files() -> list[Path]:
     return sorted(found)
 
 
+def full_bootstrap_invariants(doc: Any) -> list[str]:
+    """Pin the reviewed dependency-free FULL path while legacy checks protect it."""
+    try:
+        jobs = doc["jobs"]
+        if "needs" in jobs["test"] or "if" in jobs["test"]:
+            return ["[ci-gate] pre-S suite must remain independent and unconditional"]
+        gate = jobs["ci-required"]
+        expected = [
+            "ci-scope",
+            "test",
+            "install-smoke",
+            "min-version-smoke",
+            "lint",
+            "typecheck",
+            "workflows",
+            "audit",
+            "changelog",
+            "release-diff-ack",
+        ]
+        if gate.get("if") != "always()" or gate.get("needs") != expected:
+            return [
+                "[ci-gate] gate must always evaluate the exact FULL/P3-A dependency set"
+            ]
+        for job, digest in BOOTSTRAP_STEPS_SHA256.items():
+            value = jobs[job]
+            if value.get("continue-on-error") or value.get("permissions") != {
+                "contents": "read"
+            }:
+                return ["[ci-gate] bootstrap cannot be best-effort or privileged"]
+            steps = value["steps"]
+            if (
+                len(steps) != 1
+                or steps[0].get("if")
+                or steps[0].get("continue-on-error")
+            ):
+                return ["[ci-gate] bootstrap step cannot skip or ignore failures"]
+            if hashlib.sha256(steps[0]["run"].encode()).hexdigest() != digest:
+                return [
+                    "[ci-gate] embedded FULL-only contract changed; deliberate review required"
+                ]
+        if "if" in jobs["ci-scope"] or "needs" in jobs["ci-scope"]:
+            return ["[ci-gate] bootstrap scope must be independent and unconditional"]
+    except (KeyError, TypeError, AttributeError):
+        return ["[ci-gate] missing bootstrap contract"]
+    return []
+
+
 def diagnostic_invariants(doc: Any) -> list[str]:
     """Uploads must be gated on reconstruction, never raw test output."""
     try:
@@ -797,6 +851,7 @@ def main(argv: list[str] | None = None) -> int:
         failures.extend(tag_trigger_invariants(doc, path))
         if path.name == "test.yml":
             failures.extend(diagnostic_invariants(doc))
+            failures.extend(full_bootstrap_invariants(doc))
 
     # 2b. SHA pinning — raw text, every workflow AND every local action. Wired
     # here, not only into pytest: the evidence loop runs this CLI.

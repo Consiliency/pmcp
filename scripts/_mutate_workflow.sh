@@ -87,6 +87,10 @@ diagnostics-upload-raw|1|[diagnostics]|upload raw reports instead of reconstruct
 diagnostics-upload-ungated|1|[diagnostics]|upload despite sanitizer failure
 diagnostics-sanitize-not-always|1|[diagnostics]|omit failure-path sanitization
 diagnostics-retention|1|[diagnostics]|retain diagnostic artifacts beyond the approved 14 days
+scope-manufactures-asset|1|[ci-gate]|FULL-only bootstrap emits an asset mode
+gate-no-always|1|[ci-gate]|aggregate loses cancellation/failure evaluation
+gate-missing-audit|1|[ci-gate]|P3-A aggregate omits audit dependency
+test-needs-before-protection|1|[ci-gate]|pre-S suite gains a suppressible scope dependency
 TSV
 )"
 
@@ -484,6 +488,18 @@ diagnostics-sanitize-not-always)
 	;;
 diagnostics-retention)
 	replace "$TEST_WF" '          retention-days: 14' '          retention-days: 90'
+	;;
+scope-manufactures-asset)
+	replace "$TEST_WF" "'schema': 'FULL_BOOTSTRAP_V1', 'mode': 'FULL'" "'schema': 'FULL_BOOTSTRAP_V1', 'mode': 'ASSET_V1'"
+	;;
+gate-no-always)
+	replace "$TEST_WF" $'    if: always()\n    needs: [ci-scope' '    needs: [ci-scope'
+	;;
+gate-missing-audit)
+	replace "$TEST_WF" 'needs: [ci-scope, test, install-smoke, min-version-smoke, lint, typecheck, workflows, audit, changelog, release-diff-ack]' 'needs: [ci-scope, test, install-smoke, min-version-smoke, lint, typecheck, workflows, changelog, release-diff-ack]'
+	;;
+test-needs-before-protection)
+	replace "$TEST_WF" $'  test:\n    runs-on:' $'  test:\n    needs: [ci-scope]\n    runs-on:'
 	;;
 *)
 	echo "unhandled mutant: ${NAME}" >&2

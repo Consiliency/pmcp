@@ -18,6 +18,80 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # FULL-only bootstrap: no policy checkout, API, decoder or candidate imports.
+  # The Linux suite stays independent and unconditional until protection S and
+  # a separately reviewed post-S shadow edge rehearsal (president note N3).
+  ci-scope:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.scope.outputs.mode }}
+      proof_valid: ${{ steps.scope.outputs.proof_valid }}
+      decision: ${{ steps.scope.outputs.decision }}
+    steps:
+      - name: Emit FULL-only bootstrap decision
+        id: scope
+        env:
+          FORCE_FULL: ${{ vars.PMCP_CI_FORCE_FULL }}
+        run: |
+          python3 -I -B - <<'PY'
+          import json, os, re
+          # Read the restriction before any future policy dependency.
+          forced = os.environ.get('FORCE_FULL', '') != ''
+          identity = {key: os.environ[key] for key in (
+              'GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT',
+              'GITHUB_EVENT_NAME', 'GITHUB_REPOSITORY_ID')}
+          assert re.fullmatch('[0-9a-f]{40}', identity['GITHUB_SHA'])
+          assert identity['GITHUB_EVENT_NAME'] in ('pull_request', 'push', 'schedule', 'workflow_dispatch')
+          for key in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_REPOSITORY_ID'):
+              assert re.fullmatch('[1-9][0-9]{0,19}', identity[key])
+          decision = {'schema': 'FULL_BOOTSTRAP_V1', 'mode': 'FULL',
+                      'proof_valid': False, 'identity': identity,
+                      'reason': 'force_full' if forced else 'bootstrap'}
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write('mode=FULL\nproof_valid=false\ndecision=' + json.dumps(decision, separators=(',', ':')) + '\n')
+          PY
+
+  ci-required:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    if: always()
+    needs: [ci-scope, test, install-smoke, min-version-smoke, lint, typecheck, workflows, audit, changelog, release-diff-ack]
+    steps:
+      - name: Evaluate FULL-only bootstrap and recovery contract
+        env:
+          FORCE_FULL: ${{ vars.PMCP_CI_FORCE_FULL }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          SCOPE_DECISION: ${{ needs.ci-scope.outputs.decision }}
+        run: |
+          python3 -I -B - <<'PY'
+          import json, os
+          # This branch is dependency-free, and can never accept an asset proof.
+          forced = os.environ.get('FORCE_FULL', '') != ''
+          event = os.environ['GITHUB_EVENT_NAME']
+          assert event in ('pull_request', 'push', 'schedule', 'workflow_dispatch')
+          needs = json.loads(os.environ['NEEDS_JSON'])
+          jobs = ('ci-scope', 'test', 'install-smoke', 'min-version-smoke', 'lint',
+                  'typecheck', 'workflows', 'audit', 'changelog', 'release-diff-ack')
+          assert set(needs) == set(jobs), 'missing or unexpected gate dependency'
+          decision = json.loads(os.environ['SCOPE_DECISION'])
+          assert set(decision) == {'schema', 'mode', 'proof_valid', 'identity', 'reason'}
+          assert decision['schema'] == 'FULL_BOOTSTRAP_V1'
+          assert decision['mode'] == 'FULL' and decision['proof_valid'] is False
+          assert decision['reason'] == ('force_full' if forced else 'bootstrap')
+          assert decision['identity'] == {key: os.environ[key] for key in (
+              'GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT',
+              'GITHUB_EVENT_NAME', 'GITHUB_REPOSITORY_ID')}
+          for job in jobs:
+              expected = 'skipped' if event != 'pull_request' and job in ('changelog', 'release-diff-ack') else 'success'
+              assert needs[job]['result'] == expected, 'unsatisfied FULL dependency: ' + job
+          print('FULL gate satisfied (P3-A); no suite exemption is enabled')
+          PY
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
