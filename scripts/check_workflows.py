@@ -58,12 +58,18 @@ RELEASE_PATH = WORKFLOW_DIR / "release.yml"
 # --- committed shape of release.yml -----------------------------------------
 
 EXPECTED_TAGS = ["v*"]
+EXPECTED_RELEASE_COMMANDS = {
+    "Verify Node and npm environment": 'test "$(node -p "process.versions.node.split(\'.\')[0]")" = 22\nnpm_version=$(npm --version)\ncase "$npm_version" in\n  10.*|11.*) ;;\n  *) echo \'Unsupported npm major for identity validation\'; exit 1 ;;\nesac\nnode --version\nnpm --version\n',
+    "Install dependencies": "uv sync --locked --all-extras --python 3.12",
+    "Audit locked dependencies before publication": 'uv export --locked --all-extras --dev --no-emit-project --format requirements-txt -o "$RUNNER_TEMP/requirements.txt"\nuv run --locked --with pip-audit==2.9.0 pip-audit --progress-spinner off --strict --disable-pip -r "$RUNNER_TEMP/requirements.txt"\n',
+    "Run tests with coverage": "uv run --locked python -m pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml --cov-report=term-missing --cov-fail-under=60",
+}
 EXPECTED_JOBS = {"build", "publish", "github-release"}
 EXPECTED_NEEDS = {"publish": ["build"], "github-release": ["publish"]}
 EXPECTED_ENVIRONMENT = {"publish": "release"}
 # ``None`` means the job declares no permissions: block at all.
 EXPECTED_JOB_PERMISSIONS: dict[str, dict[str, str] | None] = {
-    "build": None,
+    "build": {"contents": "read"},
     "publish": {"id-token": "write"},
     "github-release": {"contents": "write"},
 }
@@ -74,6 +80,7 @@ EXPECTED_JOB_PERMISSIONS: dict[str, dict[str, str] | None] = {
 EXPECTED_USES = {
     "build": [
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
         "astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7",
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
     ],
@@ -264,6 +271,21 @@ def release_invariants(doc: Any) -> list[str]:
             f"{tag} job set is {sorted(jobs)}, expected "
             f"{sorted(EXPECTED_JOBS)} ({'; '.join(detail)})"
         )
+
+    build = jobs.get("build", {})
+    if build.get("env") != {"UV_PYTHON": "3.12"}:
+        reasons.append("[release] build must select Python 3.12 explicitly")
+    for label, command in EXPECTED_RELEASE_COMMANDS.items():
+        matches = [step for step in build.get("steps", []) if step.get("name") == label]
+        if len(matches) != 1 or matches[0].get("run") != command:
+            reasons.append("[release] missing or changed validation step: " + label)
+    uv_steps = [
+        step
+        for step in build.get("steps", [])
+        if str(step.get("uses", "")).startswith("astral-sh/setup-uv@")
+    ]
+    if len(uv_steps) != 1 or uv_steps[0].get("with", {}).get("version") != "0.13.1":
+        reasons.append("[release] uv tool version must remain pinned")
 
     for name, expected_needs in EXPECTED_NEEDS.items():
         job = jobs.get(name)

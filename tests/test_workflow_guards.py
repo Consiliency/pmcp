@@ -74,6 +74,38 @@ _PYPA_PIN = next(u for u in cw.EXPECTED_USES["publish"] if u.startswith("pypa/")
 # Each key is a mutant name in scripts/_mutate_workflow.sh; the callable is the
 # same edit applied to the parsed document.
 RELEASE_MUTANTS: dict[str, Any] = {
+    "release-suite-removed": lambda d: d["jobs"]["build"].update(
+        {
+            "steps": [
+                s
+                for s in d["jobs"]["build"]["steps"]
+                if s.get("name") != "Run tests with coverage"
+            ]
+        }
+    ),
+    "release-coverage-drift": lambda d: next(
+        s
+        for s in d["jobs"]["build"]["steps"]
+        if s.get("name") == "Run tests with coverage"
+    ).update({"run": "uv run --locked python -m pytest tests/"}),
+    "release-audit-removed": lambda d: d["jobs"]["build"].update(
+        {
+            "steps": [
+                s
+                for s in d["jobs"]["build"]["steps"]
+                if s.get("name") != "Audit locked dependencies before publication"
+            ]
+        }
+    ),
+    "release-node-removed": lambda d: d["jobs"]["build"].update(
+        {
+            "steps": [
+                s
+                for s in d["jobs"]["build"]["steps"]
+                if not str(s.get("uses", "")).startswith("actions/setup-node@")
+            ]
+        }
+    ),
     "tag-case": lambda d: _on(d)["push"].update({"tags": ["V*"]}),
     "tags-deleted": lambda d: _on(d).update({"push": {"branches": ["main"]}}),
     # The trigger set is a SET, not one key with an allowlist. `publish` holds
@@ -440,7 +472,8 @@ class TestShaPinning:
         # firing on an unreviewed addition is the point.
         monkeypatch.chdir(REPO_ROOT)
         # Milestone A adds the safe diagnostic artifact uploader.
-        assert len(cw.remote_uses(cw.pin_scan_files())) == 35
+        # Release alignment adds its explicit Node setup too.
+        assert len(cw.remote_uses(cw.pin_scan_files())) == 36
 
     def test_expected_uses_is_sha_form_without_comments(self) -> None:
         # yaml.safe_load strips comments before _collect_uses runs, so a value
