@@ -299,7 +299,7 @@ needs-build-dropped)
 ' ''
 	;;
 needs-publish-to-build)
-	replace "$RELEASE" '    needs: publish' '    needs: build'
+	replace "$RELEASE" '    needs: [publish, build]' '    needs: build'
 	;;
 needs-as-list)
 	replace "$RELEASE" '    needs: build' '    needs: [build]'
