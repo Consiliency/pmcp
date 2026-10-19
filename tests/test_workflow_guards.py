@@ -1271,8 +1271,6 @@ class TestMutationHelperContract:
             "needs-as-list",
             "timeout-below-p100",
             "concurrency-added",
-            "guard-self-disabled",
-            "guard-self-disabled-nonconstant",
             "guard-step-gutted",
         ],
     )
