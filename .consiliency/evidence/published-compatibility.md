@@ -31,3 +31,8 @@ the failed report preserves all 44 installed dependencies. Keep this red product
 observation until a separately authorized fixed release passes. No production
 release is authorized by this lane. Hosted scheduling and failure-artifact wiring
 remain to be demonstrated after landing; observations have not started.
+
+The wheel_metadata_url field records the fixed public PyPI JSON metadata endpoint.
+It does not claim a dependency resolver index: uv may use runner configuration
+and index environment variables. The report retains actual resolved versions,
+without private index URLs or credentials.

@@ -59,7 +59,14 @@ def test_index_binding(
         lambda *a, **k: io.BytesIO(json.dumps(doc).encode()),
     )
     if mutation == "none":
-        assert checker.current_wheel()["sha256"] == "a" * 64
+        monkeypatch.setenv(
+            "UV_INDEX_URL", "https://private-index-canary.invalid/simple"
+        )
+        selected = checker.current_wheel()
+        assert selected["sha256"] == "a" * 64
+        assert selected["wheel_metadata_url"] == "https://pypi.org/pypi/pmcp/json"
+        assert "index" not in selected
+        assert "private-index-canary" not in json.dumps(selected)
     else:
         with pytest.raises(ValueError):
             checker.current_wheel()

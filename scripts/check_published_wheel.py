@@ -53,7 +53,7 @@ def current_wheel() -> dict[str, str]:
         "filename": filename,
         "sha256": sha,
         "url": wheel["url"],
-        "index": "https://pypi.org/simple",
+        "wheel_metadata_url": "https://pypi.org/pypi/pmcp/json",
     }
 
 
