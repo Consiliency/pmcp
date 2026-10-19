@@ -83,6 +83,10 @@ concurrency-added|0|-|NOT COVERED by invariant: workflow-level concurrency with 
 guard-self-disabled|0|-|NOT COVERED by the checker: if: false on this guard's own job; GitHub counts a skipped job as satisfying a required check. Caught by the test job, not by this script
 guard-self-disabled-nonconstant|0|-|NOT COVERED by the checker: an always-false but NON-constant if: on the same job; actionlint's if-cond rule only sees the literal. Caught by the test job
 guard-step-gutted|0|-|NOT COVERED by the checker: the checker step's command replaced by a no-op, since the script runs from the PR branch. Caught by the test job
+release-suite-removed|1|[release]|remove full release validation
+release-coverage-drift|1|[release]|replace the full coverage command with a narrower invocation
+release-audit-removed|1|[release]|remove blocking tag dependency audit
+release-node-removed|1|[release]|remove explicit release Node environment
 diagnostics-upload-raw|1|[diagnostics]|upload raw reports instead of reconstructed safe output
 diagnostics-upload-ungated|1|[diagnostics]|upload despite sanitizer failure
 diagnostics-sanitize-not-always|1|[diagnostics]|omit failure-path sanitization
@@ -472,6 +476,18 @@ guard-step-gutted)
 	replace "$TEST_WF" \
 		'        run: uv run python scripts/check_workflows.py --base-ref "${{ steps.drift-base.outputs.base }}"' \
 		'        run: echo "workflow guards skipped"'
+	;;
+release-suite-removed)
+	replace "$RELEASE" "$(sed -n '/      - name: Run tests with coverage/,+1p' "$RELEASE")" ''
+	;;
+release-coverage-drift)
+	replace_re "$RELEASE" 'run: uv run --locked python -m pytest tests/[^\n]+' 'run: uv run --locked python -m pytest tests/'
+	;;
+release-audit-removed)
+	delete_block "$RELEASE" '      - name: Audit locked dependencies before publication' '      - name: Run tests with coverage'
+	;;
+release-node-removed)
+	replace_re "$RELEASE" '      - uses: actions/setup-node@[0-9a-f]{40} # \S+\n        with:\n          node-version: "22"\n' ''
 	;;
 diagnostics-upload-raw)
 	replace "$TEST_WF" '          path: .ci-reports/safe/' '          path: .ci-reports/raw/'
