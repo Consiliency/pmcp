@@ -1233,10 +1233,63 @@ def test_release_validation_identity_and_order(mutation: str) -> None:
     elif mutation == "release-history-shallow":
         steps[0]["with"] = {"fetch-depth": 1}
     elif mutation == "build-before-tests":
-        i = next(i for i, x in enumerate(steps) if x.get("name") == "Build package")
+        i = next(
+            i
+            for i, x in enumerate(steps)
+            if x.get("name") == "Build and verify exact archives"
+        )
         steps.insert(1, steps.pop(i))
     else:
         next(x for x in steps if x.get("name") == "Run tests with coverage")["env"] = {
             "PYTEST_ADDOPTS": "-k nothing"
         }
     assert any("[release]" in x for x in cw.release_invariants(doc))
+
+
+@pytest.mark.parametrize("target", ["publish", "github-release"])
+def test_release_verification_must_precede_publication(target: str) -> None:
+    doc = release_doc()
+    steps = doc["jobs"][target]["steps"]
+    verify = next(s for s in steps if s.get("name") == "Verify artifact identity")
+    steps.remove(verify)
+    steps.append(verify)
+    assert cw.release_invariants(doc)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "upload-path",
+        "checkout-ref",
+        "existing-assets-filter",
+        "existing-verify-removed",
+    ],
+)
+def test_release_exact_publication_boundary(mutation: str) -> None:
+    doc = release_doc()
+    if mutation == "upload-path":
+        next(
+            s
+            for s in doc["jobs"]["build"]["steps"]
+            if s.get("name") == "Upload artifacts"
+        )["with"]["path"] = "."
+    elif mutation == "checkout-ref":
+        doc["jobs"]["github-release"]["steps"][0]["with"] = {}
+    else:
+        step = next(
+            s
+            for s in doc["jobs"]["github-release"]["steps"]
+            if s.get("name") == "Create GitHub Release"
+        )
+        if mutation == "existing-assets-filter":
+            step["run"] = step["run"].replace(
+                'gh release download "$tag"',
+                'gh release download "$tag" --pattern "*.whl"',
+            )
+        else:
+            step["run"] = "\n".join(
+                line
+                for line in step["run"].splitlines()
+                if "--released-dir" not in line
+            )
+    assert cw.release_invariants(doc)

@@ -111,3 +111,39 @@ def test_identity_and_archive_substitutions(
     else:
         with pytest.raises(ValueError):
             verifier.verify(tmp_path)
+
+
+@pytest.mark.parametrize("tracked_change", [False, True])
+def test_export_uses_only_committed_tree(tmp_path: Path, tracked_change: bool) -> None:
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    (repo / "tracked").write_text("committed")
+    subprocess.run(["git", "add", "tracked"], cwd=repo, check=True)
+    # Local synthetic fixture only; never pushed or used as an implementation identity.
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    (repo / "coverage.xml").write_text("private generated runner path")
+    if tracked_change:
+        (repo / "tracked").write_text("modified")
+        with pytest.raises(subprocess.CalledProcessError):
+            artifacts.export_committed_source(repo, "HEAD", tmp_path / "exported")
+    else:
+        artifacts.export_committed_source(repo, "HEAD", tmp_path / "exported")
+        assert sorted(p.name for p in (tmp_path / "exported").iterdir()) == ["tracked"]
+        assert (tmp_path / "exported/tracked").read_text() == "committed"

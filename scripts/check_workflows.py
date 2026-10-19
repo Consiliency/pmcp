@@ -61,10 +61,11 @@ EXPECTED_RELEASE_COMMANDS = {
     "Set up Python": "uv python install 3.12",
     "Install dependencies": "uv sync --locked --all-extras --python 3.12",
     "Record environment identity": 'uv run --locked python scripts/ci_environment.py "$RUNNER_TEMP/release-environment.json"\ncat "$RUNNER_TEMP/release-environment.json"\n',
-    "Build package": "uv build",
+    "Build and verify exact archives": "uv run --locked python scripts/release_artifacts.py --bundle .release-bundle",
     "Audit locked dependencies before publication": 'uv export --locked --all-extras --dev --no-emit-project --format requirements-txt -o "$RUNNER_TEMP/requirements.txt"\nuv run --locked --with pip-audit==2.9.0 pip-audit --progress-spinner off --strict --disable-pip -r "$RUNNER_TEMP/requirements.txt"\n',
     "Run tests with coverage": 'uv run --locked python -m pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml:"$RUNNER_TEMP/release-coverage.xml" --cov-report=term-missing --cov-fail-under=60',
 }
+EXPECTED_GITHUB_RELEASE_COMMAND = 'tag="${GITHUB_REF_NAME}"\nif gh release view "$tag" >/dev/null 2>&1; then\n  mkdir -p "$RUNNER_TEMP/published-dist"\n  gh release download "$tag" --dir "$RUNNER_TEMP/published-dist"\n  python3 -I -B scripts/verify_release_bundle.py .release-bundle --released-dir "$RUNNER_TEMP/published-dist"\n  gh release edit "$tag" \\\n    --title "$tag" \\\n    --notes-file release-notes.md\nelse\n  gh release create "$tag" .release-bundle/dist/* \\\n    --title "$tag" \\\n    --notes-file release-notes.md \\\n    --verify-tag\nfi\n'
 EXPECTED_JOBS = {"build", "publish", "github-release"}
 EXPECTED_NEEDS = {"publish": ["build"], "github-release": ["publish", "build"]}
 EXPECTED_ENVIRONMENT = {"publish": "release"}
@@ -280,7 +281,7 @@ def release_invariants(doc: Any) -> list[str]:
         "Record environment identity",
         "Audit locked dependencies before publication",
         "Run tests with coverage",
-        "Build package",
+        "Build and verify exact archives",
         "Upload artifacts",
     ]
     if labels != expected_labels:
@@ -314,6 +315,18 @@ def release_invariants(doc: Any) -> list[str]:
         != "uv run --locked python scripts/release_artifacts.py --bundle .release-bundle"
     ):
         reasons.append("[release] exact wheel and sdist verification is mandatory")
+    uploads = [s for s in build.get("steps", []) if s.get("name") == "Upload artifacts"]
+    if (
+        len(uploads) != 1
+        or uploads[0].get("id") != "upload"
+        or uploads[0].get("with")
+        != {
+            "name": "release-${{ github.run_id }}-${{ github.run_attempt }}",
+            "path": ".release-bundle/",
+            "if-no-files-found": "error",
+        }
+    ):
+        reasons.append("[release] upload only the verified bundle with immutable ID")
     for target in ("publish", "github-release"):
         steps = jobs.get(target, {}).get("steps", [])
         checks = [s for s in steps if s.get("name") == "Verify artifact identity"]
@@ -338,6 +351,29 @@ def release_invariants(doc: Any) -> list[str]:
             reasons.append(
                 "[release] downstream must use the exact build artifact ID: " + target
             )
+        expected_order = [
+            "actions/checkout",
+            "Download artifacts",
+            "Verify artifact identity",
+        ] + (
+            ["Publish to PyPI"]
+            if target == "publish"
+            else ["Extract release notes", "Create GitHub Release"]
+        )
+        if [
+            s.get("name", s.get("uses", "").split("@")[0]) for s in steps
+        ] != expected_order:
+            reasons.append(
+                "[release] downstream download and verification must precede publication: "
+                + target
+            )
+        if not steps or steps[0].get("with") != {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": False,
+        }:
+            reasons.append(
+                "[release] downstream checkout must bind the triggering SHA: " + target
+            )
     pypi = [
         s
         for s in jobs.get("publish", {}).get("steps", [])
@@ -350,6 +386,12 @@ def release_invariants(doc: Any) -> list[str]:
     release_steps = jobs.get("github-release", {}).get("steps", [])
     if any("--clobber" in str(s.get("run", "")) for s in release_steps):
         reasons.append("[release] published archive bytes may never be clobbered")
+
+    create = [s for s in release_steps if s.get("name") == "Create GitHub Release"]
+    if len(create) != 1 or create[0].get("run") != EXPECTED_GITHUB_RELEASE_COMMAND:
+        reasons.append(
+            "[release] existing release must retain exact whole-asset verification before notes edit"
+        )
 
     for name, expected_needs in EXPECTED_NEEDS.items():
         job = jobs.get(name)

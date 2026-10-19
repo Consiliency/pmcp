@@ -118,6 +118,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -157,7 +160,7 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           if gh release view "$tag" >/dev/null 2>&1; then
             mkdir -p "$RUNNER_TEMP/published-dist"
-            gh release download "$tag" --pattern '*.whl' --pattern '*.tar.gz' --dir "$RUNNER_TEMP/published-dist"
+            gh release download "$tag" --dir "$RUNNER_TEMP/published-dist"
             python3 -I -B scripts/verify_release_bundle.py .release-bundle --released-dir "$RUNNER_TEMP/published-dist"
             gh release edit "$tag" \
               --title "$tag" \
