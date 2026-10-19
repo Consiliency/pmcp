@@ -221,6 +221,7 @@ PIN_MUTANTS: dict[str, tuple[Path, str, str]] = {
 # otherwise appear in the matrix with nothing exercising it.
 TESTED_MUTANTS = (
     {"bootstrap-suite-decoy", "bootstrap-selected-shell"}
+    | {"release-xml-root", "release-history-shallow", "release-suite-env-filter"}
     | set(RELEASE_MUTANTS)
     | set(TIMEOUT_MUTANTS)
     | set(DRIFT_MUTANTS)
@@ -1379,3 +1380,35 @@ def test_bootstrap_selected_execution_binds_actual_command(mutant: str) -> None:
             "shell"
         ] = "true {0}"
     assert cw.full_bootstrap_invariants(doc)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "release-xml-root",
+        "identity-removed",
+        "release-history-shallow",
+        "build-before-tests",
+        "release-suite-env-filter",
+    ],
+)
+def test_release_validation_identity_and_order(mutation: str) -> None:
+    doc = release_doc()
+    steps = doc["jobs"]["build"]["steps"]
+    if mutation == "release-xml-root":
+        step = next(x for x in steps if x.get("name") == "Run tests with coverage")
+        step["run"] = step["run"].replace(
+            'xml:"$RUNNER_TEMP/release-coverage.xml"', "xml"
+        )
+    elif mutation == "identity-removed":
+        steps[:] = [x for x in steps if x.get("name") != "Record environment identity"]
+    elif mutation == "release-history-shallow":
+        steps[0]["with"] = {"fetch-depth": 1}
+    elif mutation == "build-before-tests":
+        i = next(i for i, x in enumerate(steps) if x.get("name") == "Build package")
+        steps.insert(1, steps.pop(i))
+    else:
+        next(x for x in steps if x.get("name") == "Run tests with coverage")["env"] = {
+            "PYTEST_ADDOPTS": "-k nothing"
+        }
+    assert any("[release]" in x for x in cw.release_invariants(doc))
