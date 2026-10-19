@@ -23,9 +23,8 @@ def installed() -> None:
     prefix = Path(sys.prefix).resolve()
     assert Path(pmcp.__file__).resolve().is_relative_to(prefix)
     assert importlib.metadata.version("pmcp") == sys.argv[1]
-    import pmcp.client.manager  # noqa: F401
-    import pmcp.server  # noqa: F401
-    import pmcp.config.loader  # noqa: F401
+    for module in ("pmcp.client.manager", "pmcp.server", "pmcp.config.loader"):
+        importlib.import_module(module)
 
     assert npm_resolver._HELPER.is_file()
     result = npm_resolver.get_resolver().resolve(
