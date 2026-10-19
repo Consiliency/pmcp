@@ -46,7 +46,14 @@ observation and later scope/protection/publication activation are separate work.
 Source binding: accepted plan SHA-256
 `eaed8eee0b5c38cc62fd27e41e04034056cb810e9ad401a2e2bf1a66309e65f7`;
 original source `1e0b0b0dc98c5a94b869058d85ba9c1db9c3c94c`; integration base
-`c9461850372e2a3a4bfeddd2b82235cac5ba37f7` adds only the separate audit dependency patch, which still requires independent
-review. Exact implementation heads and review dispositions are
+`446afb18a67efcedb46c71136c9d966c2441d772` is the separate advisory dependency/floor patch, which still requires independent review. Exact implementation heads and review dispositions are
 recorded in PR #425 and the durable implementation status, avoiding a
 self-referential commit identifier in this document.
+
+Sanitized report filenames include the run, attempt and worker: per-worker
+`timings-<run>-<attempt>-gwN.json` files hold phases, while the `controller`
+reports hold aggregate timing metadata, JUnit and environment identity. The
+controller index points to each worker file without duplicating phase payloads.
+A whole-process-group interrupt through uv can interrupt pytest twice during
+xdist shutdown and prevent both raw reports. The subsequent fixed refusal is
+missing evidence; it never establishes a successful test or complete timing.
