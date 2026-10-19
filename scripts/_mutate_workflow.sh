@@ -369,10 +369,7 @@ forked-action)
 		'uses: attacker-fork/gh-action-pypi-publish@\1'
 	;;
 permissions-job-widened)
-	replace "$RELEASE" '      id-token: write  # Required for trusted publishing
-' '      id-token: write  # Required for trusted publishing
-      contents: write
-'
+	replace_re "$RELEASE" '(?s)(  publish:.*?    permissions:\n      id-token: write[^\n]*\n)      contents: read\n' '\1      contents: write\n'
 	;;
 permissions-workflow-level)
 	replace "$RELEASE" '
