@@ -3,7 +3,8 @@
 Both implementations run in fresh bounded children, with fixed samples and
 the same CPU-growth rule. No retry, fastest-sample selection or changed wall
 budget in test_linear_matching is involved. The historical mutant must be
-rejected by the growth rule, rather than merely timing out during import.
+rejected by the growth rule or its hard deadline with proof it entered the
+real matching path. An import/startup timeout cannot qualify as a rejection.
 """
 
 from __future__ import annotations
@@ -26,11 +27,29 @@ def test_object_matcher_growth_discriminates_the_historical_regex(
     if historical:
         command.append("--historical")
     env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(root / "src"), str(root)]))
-    result = subprocess.run(
-        command, env=env, capture_output=True, text=True, timeout=20, check=False
-    )
+    try:
+        result = subprocess.run(
+            command, env=env, capture_output=True, text=True, timeout=20, check=False
+        )
+    except subprocess.TimeoutExpired as failure:
+        # A bad matcher may consume the bounded child's whole wall budget.
+        # Keep the positive implementation strict and refuse startup failures.
+        output = failure.stdout or b""
+        text = output.decode() if isinstance(output, bytes) else output
+        receipts = [json.loads(line) for line in text.splitlines()]
+        assert historical, receipts
+        assert any(
+            receipt.get("phase") == "matching"
+            and receipt.get("historical_mutant") is True
+            and receipt.get("input_class") == "open-line-then-close-line"
+            and receipt.get("size", 0) >= 16 << 10
+            for receipt in receipts
+        ), receipts
+        return
     assert result.returncode == (2 if historical else 0), result.stdout[-4000:]
-    report = json.loads(result.stdout)
+    receipts = [json.loads(line) for line in result.stdout.splitlines()]
+    report = receipts[-1]
+    assert report["phase"] == "result"
     assert report["verdict"] == ("nonlinear" if historical else "linear"), report
     assert report["historical_mutant"] is historical
     assert len(report["rows"]) >= 2

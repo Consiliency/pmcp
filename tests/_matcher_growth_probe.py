@@ -34,6 +34,19 @@ def main() -> int:
     previous = None
     for size in SIZES:
         text = "{" * size + "\n}"
+        # A hard deadline can reject the historical mutant under contention.
+        # Flush proof of actual matcher entry, not just interpreter startup.
+        print(
+            json.dumps(
+                {
+                    "phase": "matching",
+                    "historical_mutant": historical,
+                    "input_class": "open-line-then-close-line",
+                    "size": len(text),
+                }
+            ),
+            flush=True,
+        )
         samples = []
         for _ in range(SAMPLES):
             wall_start = time.perf_counter()
@@ -54,6 +67,7 @@ def main() -> int:
     print(
         json.dumps(
             {
+                "phase": "result",
                 "verdict": verdict,
                 "historical_mutant": historical,
                 "input_class": "open-line-then-close-line",
