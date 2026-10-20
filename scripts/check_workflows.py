@@ -113,12 +113,12 @@ TAG_TRIGGERED_WORKFLOWS = {"release.yml", "docker.yml"}
 # until the test matrix job reached 29m42s; 45 is a stopgap while the suite is
 # parallelised (see Consiliency/pmcp#383).
 TIMEOUT_MIN = 10
+TIMEOUT_MAX = 45
+
 EXPECTED_VALIDATION_CONCURRENCY = {
     "group": "${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}-{2}', github.event_name, github.sha, github.run_id) }}",
     "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
 }
-
-TIMEOUT_MAX = 45
 
 # FULL-only bootstrap/recovery bytes; normal pinned policy is a later rollout.
 BOOTSTRAP_STEPS_SHA256 = {
