@@ -72,3 +72,5 @@ code_index.db
 # claude-execute-phase orchestrator worktrees
 .claude/worktrees/
 .worktrees/
+# Local raw security-test reports must never enter version control.
+.ci-reports/

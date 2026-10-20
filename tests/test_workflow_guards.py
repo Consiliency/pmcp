@@ -193,6 +193,12 @@ TESTED_MUTANTS = (
     | set(DRIFT_MUTANTS)
     | set(PIN_MUTANTS)
     | {"file-deleted", "timeout-deleted", "new-tag-triggered-workflow"}
+    | {
+        "diagnostics-upload-raw",
+        "diagnostics-upload-ungated",
+        "diagnostics-sanitize-not-always",
+        "diagnostics-retention",
+    }
 )
 
 
@@ -399,7 +405,7 @@ class TestShaPinning:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Spelled twice on purpose, like EXPECTED_USES: a new remote action is a
-        # deliberate event, and this guard is what makes it one. 33 in the
+        # deliberate event, and this guard is what makes it one. 34 in the
         # workflows + 1 in the composite.
         #
         # Was 30 until the `audit` job (pip-audit, see #224) added a checkout
@@ -408,7 +414,8 @@ class TestShaPinning:
         # actions. Raising this number is the deliberate step; the guard
         # firing on an unreviewed addition is the point.
         monkeypatch.chdir(REPO_ROOT)
-        assert len(cw.remote_uses(cw.pin_scan_files())) == 34
+        # Milestone A adds the safe diagnostic artifact uploader.
+        assert len(cw.remote_uses(cw.pin_scan_files())) == 35
 
     def test_expected_uses_is_sha_form_without_comments(self) -> None:
         # yaml.safe_load strips comments before _collect_uses runs, so a value
@@ -869,6 +876,53 @@ def _step_named(job: dict[str, Any], fragment: str) -> dict[str, Any]:
 class TestCiWiring:
     """A correct script wired up wrongly guards nothing, and a script-level test
     cannot see that. These assert the workflow expressions themselves."""
+
+    def test_diagnostic_contract_is_wired(self) -> None:
+        assert cw.diagnostic_invariants(_TEST_WF) == []
+
+    @pytest.mark.parametrize(
+        "mutant",
+        [
+            "diagnostics-upload-raw",
+            "diagnostics-upload-ungated",
+            "diagnostics-sanitize-not-always",
+            "diagnostics-retention",
+        ],
+    )
+    def test_diagnostic_mutants_fail(self, mutant: str) -> None:
+        doc = copy.deepcopy(_TEST_WF)
+        steps = doc["jobs"]["test"]["steps"]
+        upload = next(
+            s
+            for s in steps
+            if str(s.get("uses", "")).startswith("actions/upload-artifact@")
+        )
+        sanitizer = next(s for s in steps if s.get("id") == "sanitize")
+        if mutant == "diagnostics-upload-raw":
+            upload["with"]["path"] = ".ci-reports/raw/"
+        elif mutant == "diagnostics-upload-ungated":
+            upload["if"] = "always()"
+        elif mutant == "diagnostics-sanitize-not-always":
+            sanitizer.pop("if")
+        else:
+            upload["with"]["retention-days"] = 90
+        assert cw.diagnostic_invariants(doc)
+
+    @pytest.mark.parametrize("mutation", ["missing", "before-tests", "not-always"])
+    def test_diagnostics_environment_cannot_suppress_tests(self, mutation: str) -> None:
+        doc = copy.deepcopy(_TEST_WF)
+        steps = doc["jobs"]["test"]["steps"]
+        recorder = next(
+            s for s in steps if s.get("name") == "Record environment identity"
+        )
+        if mutation == "missing":
+            steps.remove(recorder)
+        elif mutation == "before-tests":
+            steps.remove(recorder)
+            steps.insert(0, recorder)
+        else:
+            recorder.pop("if")
+        assert cw.diagnostic_invariants(doc)
 
     def test_both_guard_jobs_exist(self) -> None:
         assert "workflows" in _TEST_WF["jobs"]

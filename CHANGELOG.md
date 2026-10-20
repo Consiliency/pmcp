@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CI retains public-safe, run-bound test outcomes and worker phase timings for 14 days. Raw assertion output and parameter values are excluded; unsafe or missing reports prevent diagnostic upload. The full suite and coverage threshold are unchanged.
+
 ### Fixed
 
 - Require and lock aiohttp 3.14.4 or later for GHSA-5wr8-gcqf-gqf3, GHSA-2g87-pp6c-29x5 and GHSA-494j-54xm-rwp3. Its required yarl dependency advances to 1.25.1; no advisory suppression is added.

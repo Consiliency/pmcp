@@ -699,6 +699,67 @@ def workflow_files() -> list[Path]:
     return sorted(found)
 
 
+def diagnostic_invariants(doc: Any) -> list[str]:
+    """Uploads must be gated on reconstruction, never raw test output."""
+    try:
+        steps = doc["jobs"]["test"]["steps"]
+        sanitizers = [s for s in steps if s.get("id") == "sanitize"]
+        uploads = [
+            s
+            for s in steps
+            if str(s.get("uses", "")).startswith("actions/upload-artifact@")
+        ]
+        if len(sanitizers) != 1 or len(uploads) != 1:
+            return ["[diagnostics] exactly one sanitizer and safe upload required"]
+        identity_steps = [
+            s for s in steps if s.get("name") == "Record environment identity"
+        ]
+        if len(identity_steps) != 1:
+            return ["[diagnostics] exactly one environment recorder required"]
+        recorder = identity_steps[0]
+        tests = [
+            i for i, s in enumerate(steps) if s.get("name") == "Run tests with coverage"
+        ]
+        if (
+            len(tests) != 1
+            or recorder.get("if") != "always()"
+            or recorder.get("continue-on-error")
+            or steps.index(recorder) <= tests[0]
+            or steps.index(recorder) >= steps.index(sanitizers[0])
+            or recorder.get("run")
+            != "mkdir -p .ci-reports/raw\nuv run --locked python scripts/ci_environment.py .ci-reports/raw/environment.json\n"
+        ):
+            return ["[diagnostics] environment evidence follows tests even on failure"]
+        sanitizer, upload = sanitizers[0], uploads[0]
+        if (
+            sanitizer.get("if") != "always()"
+            or sanitizer.get("continue-on-error")
+            or sanitizer.get("run")
+            != "python3 -I -B scripts/ci_reports.py .ci-reports/raw .ci-reports/safe"
+        ):
+            return ["[diagnostics] sanitizer must run after failures and fail closed"]
+        if (
+            upload.get("continue-on-error")
+            or upload.get("if")
+            != "${{ always() && steps.sanitize.outcome == 'success' && vars.PMCP_CI_DISABLE_REPORTS == '' }}"
+        ):
+            return [
+                "[diagnostics] upload must require successful sanitization and honor disable"
+            ]
+        if upload.get("with") != {
+            "name": "ci-reports-${{ github.run_id }}-${{ github.run_attempt }}-linux",
+            "path": ".ci-reports/safe/",
+            "retention-days": 14,
+            "if-no-files-found": "error",
+        }:
+            return [
+                "[diagnostics] upload only bounded safe reports with run/attempt identity"
+            ]
+    except (KeyError, TypeError, AttributeError):
+        return ["[diagnostics] missing diagnostic contract"]
+    return []
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -734,6 +795,8 @@ def main(argv: list[str] | None = None) -> int:
             continue
         failures.extend(timeout_invariants(doc, path))
         failures.extend(tag_trigger_invariants(doc, path))
+        if path.name == "test.yml":
+            failures.extend(diagnostic_invariants(doc))
 
     # 2b. SHA pinning — raw text, every workflow AND every local action. Wired
     # here, not only into pytest: the evidence loop runs this CLI.
