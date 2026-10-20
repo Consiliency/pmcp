@@ -162,7 +162,10 @@ class TestRemoteEmitterReachesDispatch:
                 await remote.emitter.emit("notifications/tools/list_changed")
 
                 await eventually(
-                    lambda: calls,
+                    lambda: any(
+                        c.get("method") == "notifications/tools/list_changed"
+                        for c in calls
+                    ),
                     timeout=2.5,
                     interval=0.05,
                     message="the emitted notification never reached the spy",
@@ -187,7 +190,10 @@ class TestRemoteEmitterReachesDispatch:
                 await remote.emitter.emit("notifications/something_unrecognised")
 
                 await eventually(
-                    lambda: calls,
+                    lambda: any(
+                        c.get("method") == "notifications/something_unrecognised"
+                        for c in calls
+                    ),
                     timeout=2.5,
                     interval=0.05,
                     message="the emitted notification never reached the spy",
@@ -214,7 +220,10 @@ class TestRemoteEmitterReachesDispatch:
                 await remote.emitter.emit("notifications/tools/list_changed")
 
                 await eventually(
-                    lambda: calls,
+                    lambda: any(
+                        c.get("method") == "notifications/tools/list_changed"
+                        for c in calls
+                    ),
                     timeout=2.5,
                     interval=0.05,
                     message="the emitted notification never reached the spy",
