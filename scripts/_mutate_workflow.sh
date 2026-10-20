@@ -85,6 +85,13 @@ guard-self-disabled-nonconstant|1|[ci-gate]|selected workflows job cannot be con
 guard-step-gutted|0|-|NOT COVERED by the checker: the checker step's command replaced by a no-op, since the script runs from the PR branch. Caught by the test job
 bootstrap-suite-decoy|1|[ci-gate]|rename actual suite into a conditional diagnostic and add decoy
 bootstrap-selected-shell|1|[ci-gate]|override the coverage verification shell
+release-suite-removed|1|[release]|remove full release validation
+release-coverage-drift|1|[release]|replace the full coverage command with a narrower invocation
+release-audit-removed|1|[release]|remove blocking tag dependency audit
+release-node-removed|1|[release]|remove explicit release Node environment
+release-xml-root|1|[release]|write runner coverage data into the release source tree
+release-history-shallow|1|[release]|remove full release history
+release-suite-env-filter|1|[release]|filter the full suite through environment overrides
 diagnostics-upload-raw|1|[diagnostics]|upload raw reports instead of reconstructed safe output
 diagnostics-upload-ungated|1|[diagnostics]|upload despite sanitizer failure
 diagnostics-sanitize-not-always|1|[diagnostics]|omit failure-path sanitization
@@ -502,6 +509,27 @@ bootstrap-suite-decoy)
 	;;
 bootstrap-selected-shell)
 	replace "$TEST_WF" '      - name: Check coverage threshold' $'      - name: Check coverage threshold\n        shell: true {0}'
+	;;
+release-suite-removed)
+	replace "$RELEASE" "$(sed -n '/      - name: Run tests with coverage/,+1p' "$RELEASE")" ''
+	;;
+release-coverage-drift)
+	replace_re "$RELEASE" 'run: uv run --locked python -m pytest tests/[^\n]+' 'run: uv run --locked python -m pytest tests/'
+	;;
+release-audit-removed)
+	delete_block "$RELEASE" '      - name: Audit locked dependencies before publication' '      - name: Run tests with coverage'
+	;;
+release-node-removed)
+	replace_re "$RELEASE" '      - uses: actions/setup-node@[0-9a-f]{40} # \S+\n        with:\n          node-version: "22"\n' ''
+	;;
+release-xml-root)
+	replace "$RELEASE" '--cov-report=xml:"$RUNNER_TEMP/release-coverage.xml"' '--cov-report=xml'
+	;;
+release-history-shallow)
+	replace "$RELEASE" '          fetch-depth: 0' '          fetch-depth: 1'
+	;;
+release-suite-env-filter)
+	replace "$RELEASE" '      - name: Run tests with coverage' $'      - name: Run tests with coverage\n        env:\n          PYTEST_ADDOPTS: "-k nothing"'
 	;;
 diagnostics-upload-raw)
 	replace "$TEST_WF" '          path: .ci-reports/safe/' '          path: .ci-reports/raw/'

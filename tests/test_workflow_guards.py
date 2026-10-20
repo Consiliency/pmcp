@@ -74,6 +74,38 @@ _PYPA_PIN = next(u for u in cw.EXPECTED_USES["publish"] if u.startswith("pypa/")
 # Each key is a mutant name in scripts/_mutate_workflow.sh; the callable is the
 # same edit applied to the parsed document.
 RELEASE_MUTANTS: dict[str, Any] = {
+    "release-suite-removed": lambda d: d["jobs"]["build"].update(
+        {
+            "steps": [
+                s
+                for s in d["jobs"]["build"]["steps"]
+                if s.get("name") != "Run tests with coverage"
+            ]
+        }
+    ),
+    "release-coverage-drift": lambda d: next(
+        s
+        for s in d["jobs"]["build"]["steps"]
+        if s.get("name") == "Run tests with coverage"
+    ).update({"run": "uv run --locked python -m pytest tests/"}),
+    "release-audit-removed": lambda d: d["jobs"]["build"].update(
+        {
+            "steps": [
+                s
+                for s in d["jobs"]["build"]["steps"]
+                if s.get("name") != "Audit locked dependencies before publication"
+            ]
+        }
+    ),
+    "release-node-removed": lambda d: d["jobs"]["build"].update(
+        {
+            "steps": [
+                s
+                for s in d["jobs"]["build"]["steps"]
+                if not str(s.get("uses", "")).startswith("actions/setup-node@")
+            ]
+        }
+    ),
     "tag-case": lambda d: _on(d)["push"].update({"tags": ["V*"]}),
     "tags-deleted": lambda d: _on(d).update({"push": {"branches": ["main"]}}),
     # The trigger set is a SET, not one key with an allowlist. `publish` holds
@@ -189,6 +221,7 @@ PIN_MUTANTS: dict[str, tuple[Path, str, str]] = {
 # otherwise appear in the matrix with nothing exercising it.
 TESTED_MUTANTS = (
     {"bootstrap-suite-decoy", "bootstrap-selected-shell"}
+    | {"release-xml-root", "release-history-shallow", "release-suite-env-filter"}
     | set(RELEASE_MUTANTS)
     | set(TIMEOUT_MUTANTS)
     | set(DRIFT_MUTANTS)
@@ -440,7 +473,8 @@ class TestShaPinning:
         # firing on an unreviewed addition is the point.
         monkeypatch.chdir(REPO_ROOT)
         # Milestone A adds the safe diagnostic artifact uploader.
-        assert len(cw.remote_uses(cw.pin_scan_files())) == 35
+        # Release alignment adds its explicit Node setup too.
+        assert len(cw.remote_uses(cw.pin_scan_files())) == 36
 
     def test_expected_uses_is_sha_form_without_comments(self) -> None:
         # yaml.safe_load strips comments before _collect_uses runs, so a value
@@ -1346,3 +1380,35 @@ def test_bootstrap_selected_execution_binds_actual_command(mutant: str) -> None:
             "shell"
         ] = "true {0}"
     assert cw.full_bootstrap_invariants(doc)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "release-xml-root",
+        "identity-removed",
+        "release-history-shallow",
+        "build-before-tests",
+        "release-suite-env-filter",
+    ],
+)
+def test_release_validation_identity_and_order(mutation: str) -> None:
+    doc = release_doc()
+    steps = doc["jobs"]["build"]["steps"]
+    if mutation == "release-xml-root":
+        step = next(x for x in steps if x.get("name") == "Run tests with coverage")
+        step["run"] = step["run"].replace(
+            'xml:"$RUNNER_TEMP/release-coverage.xml"', "xml"
+        )
+    elif mutation == "identity-removed":
+        steps[:] = [x for x in steps if x.get("name") != "Record environment identity"]
+    elif mutation == "release-history-shallow":
+        steps[0]["with"] = {"fetch-depth": 1}
+    elif mutation == "build-before-tests":
+        i = next(i for i, x in enumerate(steps) if x.get("name") == "Build package")
+        steps.insert(1, steps.pop(i))
+    else:
+        next(x for x in steps if x.get("name") == "Run tests with coverage")["env"] = {
+            "PYTEST_ADDOPTS": "-k nothing"
+        }
+    assert any("[release]" in x for x in cw.release_invariants(doc))
