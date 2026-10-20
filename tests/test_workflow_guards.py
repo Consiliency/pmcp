@@ -223,6 +223,7 @@ TESTED_MUTANTS = (
         "guard-self-disabled",
         "guard-self-disabled-nonconstant",
     }
+    | {"integration-cancelled", "integration-shared-group"}
 )
 
 
@@ -1035,6 +1036,17 @@ class TestCiWiring:
         doc = copy.deepcopy(_TEST_WF)
         doc["jobs"]["workflows"]["if"] = condition
         assert cw.full_bootstrap_invariants(doc)
+
+    @pytest.mark.parametrize(
+        "mutant", ["integration-cancelled", "integration-shared-group"]
+    )
+    def test_integration_concurrency_mutants_fail(self, mutant: str) -> None:
+        doc = copy.deepcopy(_TEST_WF)
+        if mutant == "integration-cancelled":
+            doc["concurrency"]["cancel-in-progress"] = True
+        else:
+            doc["concurrency"]["group"] = "${{ github.workflow }}-${{ github.ref }}"
+        assert cw.validation_concurrency_invariants(doc, TEST_YML)
 
     def test_diagnostic_contract_is_wired(self) -> None:
         assert cw.diagnostic_invariants(_TEST_WF) == []

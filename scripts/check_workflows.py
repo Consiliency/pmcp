@@ -115,6 +115,11 @@ TAG_TRIGGERED_WORKFLOWS = {"release.yml", "docker.yml"}
 TIMEOUT_MIN = 10
 TIMEOUT_MAX = 45
 
+EXPECTED_VALIDATION_CONCURRENCY = {
+    "group": "${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}-{2}', github.event_name, github.sha, github.run_id) }}",
+    "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+}
+
 # FULL-only bootstrap/recovery bytes; normal pinned policy is a later rollout.
 BOOTSTRAP_STEPS_SHA256 = {
     "ci-scope": "06f67bdc7b7c3e836c3b1849caa62bc484c8d47da370a5ed372006c987096b50",
@@ -879,6 +884,18 @@ def full_bootstrap_invariants(doc: Any) -> list[str]:
     return []
 
 
+def validation_concurrency_invariants(doc: Any, path: Path) -> list[str]:
+    if path.name in {"test.yml", "windows.yml"} and (
+        doc.get("concurrency") != EXPECTED_VALIDATION_CONCURRENCY
+        or any("concurrency" in job for job in _jobs(doc).values())
+    ):
+        return [
+            "[concurrency] isolate PR cancellation and retain each integration run: "
+            + str(path)
+        ]
+    return []
+
+
 def diagnostic_invariants(doc: Any) -> list[str]:
     """Uploads must be gated on reconstruction, never raw test output."""
     try:
@@ -976,6 +993,7 @@ def main(argv: list[str] | None = None) -> int:
         failures.extend(timeout_invariants(doc, path))
         failures.extend(tag_trigger_invariants(doc, path))
         failures.extend(stable_context_invariants(doc, path))
+        failures.extend(validation_concurrency_invariants(doc, path))
         if path.name == "test.yml":
             failures.extend(diagnostic_invariants(doc))
             failures.extend(full_bootstrap_invariants(doc))

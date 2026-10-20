@@ -108,6 +108,8 @@ audit-command-omitted|1|[ci-gate]|remove actual advisory execution
 test-path-filtered|1|[ci-gate]|remove Test checks from unrelated PRs through a path filter
 gate-context-collision|1|[ci-gate]|let another Test job emit the aggregate name
 gate-context-cross-workflow|1|[ci-gate]|let another workflow emit the aggregate name
+integration-cancelled|1|[concurrency]|main validation can be cancelled by a newer event
+integration-shared-group|1|[concurrency]|non-PR validation shares a pending-replacement namespace
 TSV
 )"
 
@@ -613,6 +615,12 @@ jobs:
 '
 	;;
 
+integration-cancelled)
+	replace "$TEST_WF" "  cancel-in-progress: \${{ github.event_name == 'pull_request' }}" '  cancel-in-progress: true'
+	;;
+integration-shared-group)
+	replace_re "$TEST_WF" '^  group: .+$' '  group: ${{ github.workflow }}-${{ github.ref }}'
+	;;
 *)
 	echo "unhandled mutant: ${NAME}" >&2
 	exit 2
