@@ -88,10 +88,11 @@ dependencies = [
     "pyjwt[crypto]>=2.15.0",
     "pyyaml>=6.0",
     "python-dotenv>=1.2.2",
-    # >=3.14.2 excludes PYSEC-2026-3546/3547. aiohttp is the JWKS fetch
+    # >=3.14.4 excludes PYSEC-2026-3546/3547 and GHSA-5wr8-gcqf-gqf3,
+    # GHSA-2g87-pp6c-29x5, GHSA-494j-54xm-rwp3. aiohttp is the JWKS fetch
     # client on the resource-server auth path, so its floor is a security
     # boundary, not a convenience (Consiliency/pmcp#224).
-    "aiohttp>=3.14.2",
+    "aiohttp>=3.14.4",
 ]
 
 [project.urls]
