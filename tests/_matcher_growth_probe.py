@@ -56,6 +56,19 @@ def main() -> int:
             wall = time.perf_counter() - wall_start
             assert found is None
             samples.append({"wall_s": wall, "process_cpu_s": cpu})
+            print(
+                json.dumps(
+                    {
+                        "phase": "sample",
+                        "historical_mutant": historical,
+                        "input_class": "open-line-then-close-line",
+                        "size": len(text),
+                        "wall_s": wall,
+                        "process_cpu_s": cpu,
+                    }
+                ),
+                flush=True,
+            )
         median = statistics.median(sample["process_cpu_s"] for sample in samples)
         rows.append({"size": len(text), "samples": samples, "median_cpu_s": median})
         if previous is not None and median > previous * GROWTH_LIMIT + CPU_NOISE_S:

@@ -39,10 +39,11 @@ def test_object_matcher_growth_discriminates_the_historical_regex(
         receipts = [json.loads(line) for line in text.splitlines()]
         assert historical, receipts
         assert any(
-            receipt.get("phase") == "matching"
+            receipt.get("phase") == "sample"
             and receipt.get("historical_mutant") is True
             and receipt.get("input_class") == "open-line-then-close-line"
             and receipt.get("size", 0) >= 16 << 10
+            and receipt.get("process_cpu_s", 0) > 0
             for receipt in receipts
         ), receipts
         return
