@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject delimiter-free URL-elicitation error text before scanning regex line starts, preserving matching semantics and the existing security timing bounds. Timing failures now identify input class, size, worker and CPU cost (Consiliency/pmcp#444).
+
 - Require and lock aiohttp 3.14.4 or later for GHSA-5wr8-gcqf-gqf3, GHSA-2g87-pp6c-29x5 and GHSA-494j-54xm-rwp3. Its required yarl dependency advances to 1.25.1; no advisory suppression is added.
 
 - Withhold SDK-built SSE failure messages from connection errors and `gateway.health` when a downstream response has a malformed SSE Content-Type, including on MCP SDK 2.3 (see Consiliency/pmcp#405).

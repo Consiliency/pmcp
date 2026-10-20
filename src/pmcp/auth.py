@@ -1459,6 +1459,14 @@ def _embedded_object_text(text: str) -> str | None:
     holding a ``{`` with a ``}`` after it, from that ``{`` to the line's last
     ``}`` -- in linear time (round 1 codex F001's audit: the unanchored regex
     took 368 s at 1 MiB)."""
+    # Reject missing delimiters with native scans before visiting every line's
+    # regex start. In particular, a peer can send hundreds of thousands of
+    # short lines containing only closing braces. The anchored regex is still
+    # linear there, but its per-line overhead needlessly consumes the event
+    # loop's matching budget (Consiliency/pmcp#444). Both delimiters remain
+    # necessary, not sufficient: the regex preserves the same-line semantics.
+    if "{" not in text or "}" not in text:
+        return None
     found = _EMBEDDED_OBJECT_RE.search(text)
     return found.group(1) if found else None
 
