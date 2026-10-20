@@ -9,6 +9,7 @@ forced cleanup is in finally, after the closure oracle, and cannot make it pass.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -52,9 +53,17 @@ async def test_owned_order_removes_a_real_open_stream_dependency(
     manager = ClientManager()
 
     async def body() -> None:
-        async with fake_remote.run_fake_remote(
-            alloc_port(), expected_auth_value=AUTH_VALUE
-        ) as remote:
+        context = (
+            fake_remote.run_owned_remote(
+                manager, alloc_port(), expected_auth_value=AUTH_VALUE
+            )
+            if disconnect_first
+            else fake_remote.run_fake_remote(
+                alloc_port(), expected_auth_value=AUTH_VALUE
+            )
+        )
+        async with context as remote:
+            remote.observe_client(manager)
             assert (
                 await manager.connect_server(
                     _remote_config("owned-order", remote.mcp_url)
@@ -62,15 +71,24 @@ async def test_owned_order_removes_a_real_open_stream_dependency(
                 == []
             )
             await eventually(watcher_ready.is_set, timeout=3)
-            if disconnect_first:
-                await _disconnect(manager)
 
     try:
         if disconnect_first:
             await body()
         else:
-            with pytest.raises(RuntimeError, match="ended only once cancelled"):
+            with pytest.raises(
+                RuntimeError, match="ended only once cancelled"
+            ) as failure:
                 await body()
+            milestones = json.loads(str(failure.value).split("lifecycle=", 1)[1])
+            assert [item["stage"] for item in milestones] == [
+                "before_signal",
+                "stop_deadline",
+                "after_cancel",
+            ]
+            assert milestones[1]["client_readers_pending"] == 1
+            assert milestones[1]["client_owners_pending"] == 1
+            assert all("elapsed_s" in item and "worker" in item for item in milestones)
     finally:
         await _disconnect(manager)
 
@@ -158,3 +176,64 @@ async def test_normal_server_shutdown_closes_the_original_http_stream(
         await _disconnect(manager)
     assert not manager._clients
     assert not manager._reconnect_tasks
+
+
+@pytest.mark.asyncio
+async def test_owned_remote_disconnects_even_when_the_body_asserts() -> None:
+    manager = ClientManager()
+    managed = None
+    with pytest.raises(AssertionError, match="body sentinel"):
+        async with fake_remote.run_owned_remote(
+            manager, alloc_port(), expected_auth_value=AUTH_VALUE
+        ) as remote:
+            assert (
+                await manager.connect_server(
+                    _remote_config("body-error", remote.mcp_url)
+                )
+                == []
+            )
+            managed = manager._clients["body-error"]
+            raise AssertionError("body sentinel")
+    assert managed is not None
+    assert managed.read_task is not None and managed.read_task.done()
+    assert (
+        managed.transport_owner_task is not None and managed.transport_owner_task.done()
+    )
+    assert (
+        managed.remote_http_client is not None and managed.remote_http_client.is_closed
+    )
+    assert not manager._clients and not manager._reconnect_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resist_cancel", [False, True], ids=["never-finishes", "cancel-resistant"]
+)
+async def test_owned_disconnect_cannot_hide_a_pending_task(
+    monkeypatch: pytest.MonkeyPatch, resist_cancel: bool
+) -> None:
+    manager = ClientManager()
+    escape = asyncio.Event()
+    tasks = []
+
+    async def stuck_disconnect() -> None:
+        tasks.append(asyncio.current_task())
+        try:
+            await escape.wait()
+        except asyncio.CancelledError:
+            if not resist_cancel:
+                raise
+            await escape.wait()
+
+    monkeypatch.setattr(manager, "disconnect_all", stuck_disconnect)
+    monkeypatch.setattr(fake_remote, "CLIENT_STOP_TIMEOUT", 0.05)
+    monkeypatch.setattr(fake_remote, "CANCEL_GRACE", 0.05)
+    try:
+        with pytest.raises(RuntimeError) as failure:
+            await fake_remote.disconnect_owned_client(manager)
+        assert "exceeded 0.05s" in str(failure.value)
+        assert f"survived_cancellation={resist_cancel}" in str(failure.value)
+    finally:
+        escape.set()
+        _, pending = await asyncio.wait(set(tasks), timeout=1)
+        assert not pending, "test mutant itself was not retired"

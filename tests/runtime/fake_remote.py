@@ -23,9 +23,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import logging
+import os
+import signal
+import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import uvicorn
 from mcp.server import MCPServer
@@ -39,6 +44,9 @@ from starlette.responses import PlainTextResponse, RedirectResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 from tests._timing import eventually
 
+if TYPE_CHECKING:
+    from pmcp.client.manager import ClientManager
+
 AUTH_HEADER = "authorization"
 
 # Bounds on `run_fake_remote`'s stop sequence (Consiliency/pmcp#200). uvicorn's
@@ -51,6 +59,7 @@ AUTH_HEADER = "authorization"
 # and says so out loud.
 SERVE_STOP_TIMEOUT = 10.0
 CANCEL_GRACE = 5.0
+CLIENT_STOP_TIMEOUT = 7.0
 
 # The three notification methods a real downstream can claim through the
 # SDK's typed `ServerSession` helpers -- anything else (including an
@@ -223,6 +232,92 @@ class RunningFakeRemote:
     mcp_url: str
     redirect_url: str
     emitter: RemoteEmitter
+    _server: uvicorn.Server = field(repr=False)
+    _task: asyncio.Task[None] = field(repr=False)
+    _manager: ClientManager | None = field(default=None, repr=False)
+
+    def observe_client(self, manager: ClientManager) -> None:
+        """Include counts of this owner's client tasks in failure evidence."""
+        self._manager = manager
+
+    def stop_snapshot(self, stage: str, started: float) -> dict[str, object]:
+        """Safe milestones only: no names, URLs, headers or task reprs."""
+        state = getattr(self._server, "server_state", None)
+        clients = list(self._manager._clients.values()) if self._manager else []
+        signal_owner = getattr(signal.getsignal(signal.SIGTERM), "__self__", None)
+        return {
+            "stage": stage,
+            "elapsed_s": time.monotonic() - started,
+            "worker": os.environ.get("PYTEST_XDIST_WORKER", "controller"),
+            "server_should_exit": self._server.should_exit,
+            "app_should_exit": AppStatus.should_exit,
+            "signal_owner_is_server": signal_owner is self._server,
+            "serve_done": self._task.done(),
+            "server_connections": len(state.connections) if state is not None else None,
+            "server_tasks": len(state.tasks) if state is not None else None,
+            "managed_clients": len(clients),
+            "client_readers_pending": sum(
+                c.read_task is not None and not c.read_task.done() for c in clients
+            ),
+            "client_owners_pending": sum(
+                c.transport_owner_task is not None and not c.transport_owner_task.done()
+                for c in clients
+            ),
+            "http_clients_open": sum(
+                c.remote_http_client is not None and not c.remote_http_client.is_closed
+                for c in clients
+            ),
+            "reconnect_tasks_pending": sum(
+                not task.done() for task in self._manager._reconnect_tasks.values()
+            )
+            if self._manager
+            else 0,
+        }
+
+
+async def disconnect_owned_client(manager: ClientManager) -> None:
+    """Close an owned client before its peer, under a finite outer bound.
+
+    Keep the actual postconditions after disconnect_all: its exception policy
+    must not make a pending transport or HTTP resource look closed.
+    """
+    clients = list(manager._clients.values())
+    task = asyncio.create_task(manager.disconnect_all())
+    _, pending = await asyncio.wait({task}, timeout=CLIENT_STOP_TIMEOUT)
+    if pending:
+        task.cancel()
+        _, pending = await asyncio.wait({task}, timeout=CANCEL_GRACE)
+        raise RuntimeError(
+            f"owned client disconnect exceeded {CLIENT_STOP_TIMEOUT}s "
+            f"[survived_cancellation={bool(pending)}]"
+        )
+    task.result()
+    assert all(c.read_task is None or c.read_task.done() for c in clients)
+    assert all(
+        c.transport_owner_task is None or c.transport_owner_task.done() for c in clients
+    )
+    assert all(
+        c.remote_http_client is None or c.remote_http_client.is_closed for c in clients
+    )
+    assert not manager._reconnect_tasks
+
+
+@contextlib.asynccontextmanager
+async def run_owned_remote(
+    manager: ClientManager, port: int, *, expected_auth_value: str
+) -> AsyncIterator[RunningFakeRemote]:
+    """Unwind the client inside its owned server, including assertion errors.
+
+    The missed-shutdown-watcher experiment proves an open client can otherwise
+    hold the real uvicorn drain. It does not identify the hosted root cause.
+    The separate normal-operation stream-closure oracle remains mandatory.
+    """
+    async with run_fake_remote(port, expected_auth_value=expected_auth_value) as remote:
+        remote.observe_client(manager)
+        try:
+            yield remote
+        finally:
+            await disconnect_owned_client(manager)
 
 
 @contextlib.asynccontextmanager
@@ -251,6 +346,15 @@ async def run_fake_remote(
     # and succeeds without it.
     AppStatus.should_exit = False
     task = asyncio.create_task(server.serve())
+    remote = RunningFakeRemote(
+        port=port,
+        base_url=f"http://127.0.0.1:{port}",
+        mcp_url=f"http://127.0.0.1:{port}/mcp",
+        redirect_url=f"http://127.0.0.1:{port}/relocated",
+        emitter=app.state.fake_remote_emitter,
+        _server=server,
+        _task=task,
+    )
     try:
         await eventually(
             lambda: server.started,
@@ -258,15 +362,11 @@ async def run_fake_remote(
             interval=0.05,
             message="fake remote server never started",
         )
-        yield RunningFakeRemote(
-            port=port,
-            base_url=f"http://127.0.0.1:{port}",
-            mcp_url=f"http://127.0.0.1:{port}/mcp",
-            redirect_url=f"http://127.0.0.1:{port}/relocated",
-            emitter=app.state.fake_remote_emitter,
-        )
+        yield remote
     finally:
         try:
+            stop_started = time.monotonic()
+            milestones = [remote.stop_snapshot("before_signal", stop_started)]
             server.should_exit = True
             # Bounded, so a server that never stops fails this test in 15 s
             # with a message instead of stalling the job for 25 minutes
@@ -283,9 +383,12 @@ async def run_fake_remote(
             # `tests/runtime/test_hang_diagnostics.py` pins both mutants.
             _, pending = await asyncio.wait({task}, timeout=SERVE_STOP_TIMEOUT)
             if pending:
+                # Capture before cancellation changes the ownership evidence.
+                milestones.append(remote.stop_snapshot("stop_deadline", stop_started))
                 task.cancel()
                 _, pending = await asyncio.wait({task}, timeout=CANCEL_GRACE)
                 survived = bool(pending)
+                milestones.append(remote.stop_snapshot("after_cancel", stop_started))
                 # Whether the task survived cancellation is the single most
                 # valuable fact for root-causing this, and no stack dump
                 # reports it -- an idle loop parked in `epoll.poll()` names
@@ -302,11 +405,16 @@ async def run_fake_remote(
                     + f" [server.started={server.started!r} "
                     f"server.should_exit={server.should_exit!r} "
                     f"AppStatus.should_exit={AppStatus.should_exit!r}]"
-                    " -- see Consiliency/pmcp#200"
+                    " -- see Consiliency/pmcp#200; lifecycle="
+                    + json.dumps(milestones, sort_keys=True)
                 )
             # Healthy path: surface whatever `serve()` itself raised, exactly
             # as the previous bare `await task` did.
             task.result()
+            milestones.append(remote.stop_snapshot("stopped", stop_started))
+            logging.getLogger(__name__).info(
+                "fake remote stop lifecycle=%s", json.dumps(milestones, sort_keys=True)
+            )
         finally:
             # sse_starlette.sse.AppStatus.should_exit is a process-global class
             # attribute, latched True by its uvicorn-shutdown signal handler and

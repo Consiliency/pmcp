@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Remote-emitter tests disconnect their owned client under a bound before stopping its server, including assertion failures. Shutdown diagnostics record safe lifecycle and ownership counts; independent real-stream and teardown-mutant checks remain (Consiliency/pmcp#445).
+
 - Lock certifi 2026.10.19 to exclude the affected CA bundle identified by PYSEC-2026-4320 (GHSA-6q48-6c7w-9gw2); retain the blocking locked-dependency audit without suppressions.
 
 - Avoid regex work for URL-elicitation error text missing either brace; text containing both braces still runs the unchanged linear regex at unchanged cost. Retain the 50ms/200ms wall limits on the missing-brace path and check matching CPU growth across long and repeated short lines against historical-regex and line-copying negative controls. Timing failures identify input class, size, worker and CPU cost without peer text. No universal timing guarantee or confirmed hosted root cause is claimed (Consiliency/pmcp#444).

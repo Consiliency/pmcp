@@ -35,7 +35,7 @@ from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
 from tests.runtime.fake_remote import (
     DownstreamEmitter,
     build_fake_remote_app,
-    run_fake_remote,
+    run_owned_remote,
 )
 from tests.runtime.fake_stdio_server import StdioEmitter, build_fake_stdio_downstream
 from tests.runtime.harness import alloc_port
@@ -118,30 +118,27 @@ class TestRemoteEmitterReachesDispatch:
     async def test_add_tool_then_emit_reaches_read_sse(self) -> None:
         manager = ClientManager()
         patcher, calls = _spy_read_sse()
-        try:
-            async with run_fake_remote(
-                alloc_port(), expected_auth_value=AUTH_VALUE
-            ) as remote:
-                with patcher:
-                    errors = await manager.connect_server(
-                        _remote_config("fr-emit-add", remote.mcp_url)
-                    )
-                    assert errors == []
+        async with run_owned_remote(
+            manager, alloc_port(), expected_auth_value=AUTH_VALUE
+        ) as remote:
+            with patcher:
+                errors = await manager.connect_server(
+                    _remote_config("fr-emit-add", remote.mcp_url)
+                )
+                assert errors == []
 
-                    await remote.emitter.add_tool("fr_dyn", description="dynamic")
-                    await remote.emitter.emit("notifications/tools/list_changed")
+                await remote.emitter.add_tool("fr_dyn", description="dynamic")
+                await remote.emitter.emit("notifications/tools/list_changed")
 
-                    await eventually(
-                        lambda: any(
-                            c.get("method") == "notifications/tools/list_changed"
-                            for c in calls
-                        ),
-                        timeout=2.5,
-                        interval=0.05,
-                        message="the emitted notification never reached the spy",
-                    )
-        finally:
-            await manager.disconnect_all()
+                await eventually(
+                    lambda: any(
+                        c.get("method") == "notifications/tools/list_changed"
+                        for c in calls
+                    ),
+                    timeout=2.5,
+                    interval=0.05,
+                    message="the emitted notification never reached the spy",
+                )
 
         matches = [
             c for c in calls if c.get("method") == "notifications/tools/list_changed"
@@ -153,26 +150,23 @@ class TestRemoteEmitterReachesDispatch:
         mutation still reaches the dispatch."""
         manager = ClientManager()
         patcher, calls = _spy_read_sse()
-        try:
-            async with run_fake_remote(
-                alloc_port(), expected_auth_value=AUTH_VALUE
-            ) as remote:
-                with patcher:
-                    errors = await manager.connect_server(
-                        _remote_config("fr-emit-noop", remote.mcp_url)
-                    )
-                    assert errors == []
+        async with run_owned_remote(
+            manager, alloc_port(), expected_auth_value=AUTH_VALUE
+        ) as remote:
+            with patcher:
+                errors = await manager.connect_server(
+                    _remote_config("fr-emit-noop", remote.mcp_url)
+                )
+                assert errors == []
 
-                    await remote.emitter.emit("notifications/tools/list_changed")
+                await remote.emitter.emit("notifications/tools/list_changed")
 
-                    await eventually(
-                        lambda: calls,
-                        timeout=2.5,
-                        interval=0.05,
-                        message="the emitted notification never reached the spy",
-                    )
-        finally:
-            await manager.disconnect_all()
+                await eventually(
+                    lambda: calls,
+                    timeout=2.5,
+                    interval=0.05,
+                    message="the emitted notification never reached the spy",
+                )
 
         assert any(c.get("method") == "notifications/tools/list_changed" for c in calls)
 
@@ -181,26 +175,23 @@ class TestRemoteEmitterReachesDispatch:
         put an unrecognised `notifications/*` method on the wire at all."""
         manager = ClientManager()
         patcher, calls = _spy_read_sse()
-        try:
-            async with run_fake_remote(
-                alloc_port(), expected_auth_value=AUTH_VALUE
-            ) as remote:
-                with patcher:
-                    errors = await manager.connect_server(
-                        _remote_config("fr-emit-unknown", remote.mcp_url)
-                    )
-                    assert errors == []
+        async with run_owned_remote(
+            manager, alloc_port(), expected_auth_value=AUTH_VALUE
+        ) as remote:
+            with patcher:
+                errors = await manager.connect_server(
+                    _remote_config("fr-emit-unknown", remote.mcp_url)
+                )
+                assert errors == []
 
-                    await remote.emitter.emit("notifications/something_unrecognised")
+                await remote.emitter.emit("notifications/something_unrecognised")
 
-                    await eventually(
-                        lambda: calls,
-                        timeout=2.5,
-                        interval=0.05,
-                        message="the emitted notification never reached the spy",
-                    )
-        finally:
-            await manager.disconnect_all()
+                await eventually(
+                    lambda: calls,
+                    timeout=2.5,
+                    interval=0.05,
+                    message="the emitted notification never reached the spy",
+                )
 
         assert any(
             c.get("method") == "notifications/something_unrecognised" for c in calls
@@ -209,28 +200,25 @@ class TestRemoteEmitterReachesDispatch:
     async def test_remove_tool_then_emit_reaches_read_sse(self) -> None:
         manager = ClientManager()
         patcher, calls = _spy_read_sse()
-        try:
-            async with run_fake_remote(
-                alloc_port(), expected_auth_value=AUTH_VALUE
-            ) as remote:
-                with patcher:
-                    errors = await manager.connect_server(
-                        _remote_config("fr-emit-remove", remote.mcp_url)
-                    )
-                    assert errors == []
+        async with run_owned_remote(
+            manager, alloc_port(), expected_auth_value=AUTH_VALUE
+        ) as remote:
+            with patcher:
+                errors = await manager.connect_server(
+                    _remote_config("fr-emit-remove", remote.mcp_url)
+                )
+                assert errors == []
 
-                    await remote.emitter.add_tool("fr_removable")
-                    await remote.emitter.remove_tool("fr_removable")
-                    await remote.emitter.emit("notifications/tools/list_changed")
+                await remote.emitter.add_tool("fr_removable")
+                await remote.emitter.remove_tool("fr_removable")
+                await remote.emitter.emit("notifications/tools/list_changed")
 
-                    await eventually(
-                        lambda: calls,
-                        timeout=2.5,
-                        interval=0.05,
-                        message="the emitted notification never reached the spy",
-                    )
-        finally:
-            await manager.disconnect_all()
+                await eventually(
+                    lambda: calls,
+                    timeout=2.5,
+                    interval=0.05,
+                    message="the emitted notification never reached the spy",
+                )
 
         assert any(c.get("method") == "notifications/tools/list_changed" for c in calls)
 
