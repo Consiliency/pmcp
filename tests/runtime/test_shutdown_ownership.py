@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 from sse_starlette import sse
+import httpx2
 
 from pmcp.client.manager import ClientManager
 from tests._timing import eventually
@@ -75,8 +76,12 @@ async def test_owned_order_removes_a_real_open_stream_dependency(
 
 
 @pytest.mark.asyncio
-async def test_normal_server_shutdown_closes_the_original_pmcp_transport(
+@pytest.mark.parametrize(
+    "hold_close", [False, True], ids=["normal", "leaked-stream-mutant"]
+)
+async def test_normal_server_shutdown_closes_the_original_http_stream(
     monkeypatch: pytest.MonkeyPatch,
+    hold_close: bool,
 ) -> None:
     servers = []
     original_server = fake_remote.uvicorn.Server
@@ -87,6 +92,27 @@ async def test_normal_server_shutdown_closes_the_original_pmcp_transport(
             servers.append(self)
 
     monkeypatch.setattr(fake_remote.uvicorn, "Server", ObservedServer)
+    original_send = httpx2.AsyncClient.send
+    responses = []
+    release = asyncio.Event()
+
+    async def observe_send(self, request, *args, **kwargs):
+        response = await original_send(self, request, *args, **kwargs)
+        if request.method == "GET":
+            responses.append(response)
+            if hold_close:
+                close = response.aclose
+
+                async def held_close():
+                    await release.wait()
+                    await close()
+
+                response.aclose = held_close
+        return response
+
+    # Observe, then return the actual response unchanged in the normal case.
+    # The mutant holds its close, rather than replacing the real transport.
+    monkeypatch.setattr(httpx2.AsyncClient, "send", observe_send)
     manager = ClientManager()
     try:
         async with fake_remote.run_fake_remote(
@@ -101,15 +127,34 @@ async def test_normal_server_shutdown_closes_the_original_pmcp_transport(
             owner = managed.transport_owner_task
             client = managed.remote_http_client
             assert reader is not None and owner is not None and client is not None
+            await eventually(lambda: responses, timeout=3)
+            response = responses[0]
+            assert not response.is_closed
             # Signal only the server. No client close or manager disconnect is
-            # allowed before this normal-operation closure assertion.
+            # allowed before the *actual GET response* closure assertion.
+            # Streamable HTTP permits SDK reconnects: its owner task and HTTP
+            # pool need not close merely because one notification stream ends.
             servers[0].should_exit = True
-            await eventually(
-                lambda: reader.done() and owner.done() and client.is_closed,
-                timeout=7,
-                message="PMCP retained the original stream after server shutdown",
-            )
+
+            async def assert_closed():
+                await eventually(
+                    lambda: response.is_closed,
+                    timeout=7,
+                    message="PMCP retained the original HTTP stream after server shutdown",
+                )
+
+            if hold_close:
+                with pytest.raises(
+                    AssertionError, match="retained the original HTTP stream"
+                ):
+                    await assert_closed()
+            else:
+                await assert_closed()
+            release.set()
+            await _disconnect(manager)
+            assert reader.done() and owner.done() and client.is_closed
     finally:
+        release.set()
         await _disconnect(manager)
     assert not manager._clients
     assert not manager._reconnect_tasks
