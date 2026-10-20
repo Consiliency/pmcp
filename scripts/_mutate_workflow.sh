@@ -80,13 +80,34 @@ uses-quoted-key|1|[pin]|.github/actions/pipeline-bootstrap-setup/action.yml: the
 needs-as-list|0|-|release.yml: needs: build -> needs: [build]; a legitimate equivalent form that must NOT false-positive
 timeout-below-p100|0|-|NOT COVERED: release.yml build timeout-minutes 20 -> 12, above the floor but potentially below a future p100
 concurrency-added|0|-|NOT COVERED by invariant: workflow-level concurrency with cancel-in-progress on release.yml; release-diff-ack covers it by label
-guard-self-disabled|0|-|NOT COVERED by the checker: if: false on this guard's own job; GitHub counts a skipped job as satisfying a required check. Caught by the test job, not by this script
-guard-self-disabled-nonconstant|0|-|NOT COVERED by the checker: an always-false but NON-constant if: on the same job; actionlint's if-cond rule only sees the literal. Caught by the test job
+guard-self-disabled|1|[ci-gate]|selected workflows job cannot be skipped; the independent full suite also enforces this
+guard-self-disabled-nonconstant|1|[ci-gate]|selected workflows job cannot be conditionally skipped, including a nonconstant expression
 guard-step-gutted|0|-|NOT COVERED by the checker: the checker step's command replaced by a no-op, since the script runs from the PR branch. Caught by the test job
+bootstrap-suite-decoy|1|[ci-gate]|rename actual suite into a conditional diagnostic and add decoy
+bootstrap-selected-shell|1|[ci-gate]|override the coverage verification shell
 diagnostics-upload-raw|1|[diagnostics]|upload raw reports instead of reconstructed safe output
 diagnostics-upload-ungated|1|[diagnostics]|upload despite sanitizer failure
 diagnostics-sanitize-not-always|1|[diagnostics]|omit failure-path sanitization
 diagnostics-retention|1|[diagnostics]|retain diagnostic artifacts beyond the approved 14 days
+scope-manufactures-asset|1|[ci-gate]|FULL-only bootstrap emits an asset mode
+gate-no-always|1|[ci-gate]|aggregate loses cancellation/failure evaluation
+gate-missing-audit|1|[ci-gate]|P3-A aggregate omits audit dependency
+test-needs-before-protection|1|[ci-gate]|pre-S suite gains a suppressible scope dependency
+gate-static-needs|1|[ci-gate]|replace same-run dependency results with static success data
+gate-step-false|1|[ci-gate]|skip the embedded evaluator with a YAML boolean false
+gate-shell-override|1|[ci-gate]|replace the evaluator shell with a success-only shell
+scope-output-rebound|1|[ci-gate]|point scope decision output at another field
+scope-step-id|1|[ci-gate]|disconnect the scope output step identity
+scope-force-full-unbound|1|[ci-gate]|disconnect scope restriction from the repository variable
+gate-job-name|1|[ci-gate]|rename the stable required context
+gate-matrix|1|[ci-gate]|make the stable gate a matrix check
+workflow-shell-default|1|[ci-gate]|override the embedded shell through workflow defaults
+audit-step-skipped|1|[ci-gate]|skip locked advisory verification
+audit-step-best-effort|1|[ci-gate]|ignore a failed advisory verification
+audit-command-omitted|1|[ci-gate]|remove actual advisory execution
+test-path-filtered|1|[ci-gate]|remove Test checks from unrelated PRs through a path filter
+gate-context-collision|1|[ci-gate]|let another Test job emit the aggregate name
+gate-context-cross-workflow|1|[ci-gate]|let another workflow emit the aggregate name
 TSV
 )"
 
@@ -473,6 +494,13 @@ guard-step-gutted)
 		'        run: uv run python scripts/check_workflows.py --base-ref "${{ steps.drift-base.outputs.base }}"' \
 		'        run: echo "workflow guards skipped"'
 	;;
+bootstrap-suite-decoy)
+	replace "$TEST_WF" '      - name: Run tests with coverage' "$(sed -n '/      - name: Upload safe reports/,+1p' "$TEST_WF")"
+	replace "$TEST_WF" '      - name: Check coverage threshold' $'      - name: Run tests with coverage\n        run: echo decoy\n\n      - name: Check coverage threshold'
+	;;
+bootstrap-selected-shell)
+	replace "$TEST_WF" '      - name: Check coverage threshold' $'      - name: Check coverage threshold\n        shell: true {0}'
+	;;
 diagnostics-upload-raw)
 	replace "$TEST_WF" '          path: .ci-reports/safe/' '          path: .ci-reports/raw/'
 	;;
@@ -485,6 +513,106 @@ diagnostics-sanitize-not-always)
 diagnostics-retention)
 	replace "$TEST_WF" '          retention-days: 14' '          retention-days: 90'
 	;;
+scope-manufactures-asset)
+	replace "$TEST_WF" "'schema': 'FULL_BOOTSTRAP_V1', 'mode': 'FULL'" "'schema': 'FULL_BOOTSTRAP_V1', 'mode': 'ASSET_V1'"
+	;;
+gate-no-always)
+	replace "$TEST_WF" $'    if: always()\n    needs: [ci-scope' '    needs: [ci-scope'
+	;;
+gate-missing-audit)
+	replace "$TEST_WF" 'needs: [ci-scope, test, install-smoke, min-version-smoke, lint, typecheck, workflows, audit, changelog, release-diff-ack]' 'needs: [ci-scope, test, install-smoke, min-version-smoke, lint, typecheck, workflows, changelog, release-diff-ack]'
+	;;
+test-needs-before-protection)
+	replace "$TEST_WF" $'  test:\n    runs-on:' $'  test:\n    needs: [ci-scope]\n    runs-on:'
+	;;
+gate-static-needs)
+	replace "$TEST_WF" '          NEEDS_JSON: ${{ toJSON(needs) }}' '          NEEDS_JSON: |
+            {"ci-scope":{"result":"success"},"test":{"result":"success"},"install-smoke":{"result":"success"},"min-version-smoke":{"result":"success"},"lint":{"result":"success"},"typecheck":{"result":"success"},"workflows":{"result":"success"},"audit":{"result":"success"},"changelog":{"result":"success"},"release-diff-ack":{"result":"success"}}'
+	;;
+gate-step-false)
+	replace "$TEST_WF" '      - name: Evaluate FULL-only bootstrap and recovery contract' '      - name: Evaluate FULL-only bootstrap and recovery contract
+        if: false'
+	;;
+gate-shell-override)
+	replace "$TEST_WF" '      - name: Evaluate FULL-only bootstrap and recovery contract' '      - name: Evaluate FULL-only bootstrap and recovery contract
+        shell: bash -c "exit 0" -- {0}'
+	;;
+scope-output-rebound)
+	replace "$TEST_WF" '      decision: ${{ steps.scope.outputs.decision }}' '      decision: ${{ steps.scope.outputs.mode }}'
+	;;
+scope-step-id)
+	replace "$TEST_WF" '        id: scope' '        id: wrong'
+	;;
+scope-force-full-unbound)
+	replace "$TEST_WF" '      - name: Emit FULL-only bootstrap decision
+        id: scope
+        env:
+          FORCE_FULL: ${{ vars.PMCP_CI_FORCE_FULL }}' '      - name: Emit FULL-only bootstrap decision
+        id: scope
+        env:
+          FORCE_FULL: ""'
+	;;
+gate-job-name)
+	replace "$TEST_WF" '  ci-required:
+' '  ci-required:
+    name: harmless
+'
+	;;
+gate-matrix)
+	replace "$TEST_WF" '  ci-required:
+' '  ci-required:
+    strategy:
+      matrix:
+        slot: [one, two]
+'
+	;;
+workflow-shell-default)
+	replace "$TEST_WF" '
+jobs:
+' '
+defaults:
+  run:
+    shell: bash -c "exit 0" -- {0}
+jobs:
+'
+	;;
+audit-step-skipped)
+	replace "$TEST_WF" '      - name: pip-audit (locked dependencies)' '      - name: pip-audit (locked dependencies)
+        if: false'
+	;;
+audit-step-best-effort)
+	replace "$TEST_WF" '      - name: pip-audit (locked dependencies)' '      - name: pip-audit (locked dependencies)
+        continue-on-error: true'
+	;;
+audit-command-omitted)
+	replace "$TEST_WF" 'uv run --locked --with pip-audit==2.9.0 pip-audit' 'true # omitted audit'
+	;;
+test-path-filtered)
+	replace "$TEST_WF" '  pull_request:
+    branches: [main]' '  pull_request:
+    branches: [main]
+    paths: ["src/**"]'
+	;;
+gate-context-collision)
+	replace "$TEST_WF" '  lint:
+' '  lint:
+    name: ci-required
+'
+	;;
+gate-context-cross-workflow)
+	replace "$MAINTENANCE" '
+jobs:
+' '
+jobs:
+  shadow:
+    name: ci-required
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - run: echo collision
+'
+	;;
+
 *)
 	echo "unhandled mutant: ${NAME}" >&2
 	exit 2
