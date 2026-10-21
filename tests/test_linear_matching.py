@@ -13,8 +13,11 @@ unreviewed, so its code's fixed phrase is shown), and every template is a
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
+from collections.abc import Callable
 
 import pytest
 
@@ -36,10 +39,68 @@ def _codex(size: int) -> str:
     return (unit * (size // len(unit) + 1))[:size]
 
 
-def _elapsed(call: object, *args: object) -> float:
-    start = time.perf_counter()
-    call(*args)  # type: ignore[operator]
-    return time.perf_counter() - start
+def _assert_bounded(
+    call: Callable[..., object],
+    *args: object,
+    input_class: str,
+    size: int,
+    budget: float = _BUDGET_S,
+    template_index: int | None = None,
+) -> None:
+    """Retain the wall oracle; report work and scheduling separately.
+
+    Only fixed class names, size and worker identity appear in diagnostics,
+    never peer text, template contents or exception values.
+    """
+    wall_start = time.perf_counter()
+    process_start = time.process_time()
+    thread_start = time.thread_time()
+    call(*args)
+    thread_cpu = time.thread_time() - thread_start
+    process_cpu = time.process_time() - process_start
+    wall = time.perf_counter() - wall_start
+    diagnostics: dict[str, object] = {
+        "wall_s": wall,
+        "process_cpu_s": process_cpu,
+        "thread_cpu_s": thread_cpu,
+        "worker": os.environ.get("PYTEST_XDIST_WORKER", "controller"),
+        "input_class": input_class,
+        "size": size,
+        "budget_s": budget,
+    }
+    if template_index is not None:
+        diagnostics["template_index"] = template_index
+    assert wall < budget, json.dumps(diagnostics, sort_keys=True)
+
+
+def test_timing_failure_keeps_safe_diagnostics_under_pytest_rewriting() -> None:
+    sentinel = "PMCP_SYNTHETIC_PEER_SENTINEL"
+    with pytest.raises(AssertionError) as failure:
+        _assert_bounded(
+            lambda _text: None,
+            sentinel,
+            input_class="diagnostic-control",
+            size=1048576,
+            budget=0.0,
+            template_index=7,
+        )
+    rendered = str(failure.value)
+    diagnostics = json.loads(rendered.splitlines()[0])
+    assert {
+        "input_class",
+        "size",
+        "budget_s",
+        "worker",
+        "wall_s",
+        "process_cpu_s",
+        "thread_cpu_s",
+        "template_index",
+    } <= diagnostics.keys()
+    assert diagnostics["input_class"] == "diagnostic-control"
+    assert diagnostics["size"] == 1048576
+    assert diagnostics["budget_s"] == 0.0
+    assert diagnostics["template_index"] == 7
+    assert sentinel not in rendered
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -53,8 +114,15 @@ def _warm() -> None:
 @pytest.mark.parametrize("size", [1 << 20, 10 << 20])
 def test_codex_input_is_classified_in_bounded_time(size: int) -> None:
     message = _codex(size)
-    assert _elapsed(_downstream_error, {"code": -32602, "message": message}) < _BUDGET_S
-    assert _elapsed(sr.sdk_built_message, message, -32602) < _BUDGET_S
+    _assert_bounded(
+        _downstream_error,
+        {"code": -32602, "message": message},
+        input_class="sdk-prefix",
+        size=size,
+    )
+    _assert_bounded(
+        sr.sdk_built_message, message, -32602, input_class="sdk-prefix", size=size
+    )
     # Not the peer's text: too long to be one the SDK formats, so the
     # code's fixed phrase, and why (round 2, claude N-B).
     assert str(_downstream_error({"code": -32602, "message": message})) == (
@@ -70,14 +138,19 @@ def test_every_template_matches_an_adversarial_input_in_bounded_time(
     """Each template's prefix repeated without its suffix, matched directly
     (past the length cap), at 64 KiB, 1 MiB and 10 MiB. Fails at the first
     slow template: a backtracking matcher takes seconds per template here."""
-    for template in _templates():
+    for template_index, template in enumerate(_templates()):
         head = template.parts[0] + (
             template.parts[1] if len(template.parts) > 2 else ""
         )
         unit = head or "x"
         text = (unit * (size // len(unit) + 1))[:size]
-        elapsed = _elapsed(template.fullmatch, text)
-        assert elapsed < _BUDGET_S, (template, size, elapsed)
+        _assert_bounded(
+            template.fullmatch,
+            text,
+            input_class="template-prefix",
+            size=size,
+            template_index=template_index,
+        )
 
 
 def test_every_template_still_matches_its_own_message() -> None:
@@ -164,14 +237,34 @@ def test_the_elicitation_payload_object_is_found_as_the_regex_found_it() -> None
             assert _embedded_object_text(text) == (found.group(1) if found else None)
 
 
-@pytest.mark.parametrize("unit", ["{", "{a", "{\n", "}\n", "a{\n"])
-def test_the_elicitation_payload_object_is_found_in_bounded_time(unit: str) -> None:
+@pytest.mark.parametrize(
+    ("input_class", "unit"),
+    [
+        ("open-only", "{"),
+        ("open-text", "{a"),
+        ("open-lines", "{\n"),
+        ("close-lines", "}\n"),
+        ("text-open-lines", "a{\n"),
+    ],
+    ids=["open-only", "open-text", "open-lines", "close-lines", "text-open-lines"],
+)
+def test_the_elicitation_payload_object_is_found_in_bounded_time(
+    input_class: str, unit: str
+) -> None:
     from pmcp.auth import _embedded_object_text, parse_url_elicitation_error
 
     for size in (64 << 10, 1 << 20):  # the small size first: fail fast
         text = unit * (size // len(unit))
-        assert _elapsed(_embedded_object_text, text) < _BUDGET_S
-        assert _elapsed(parse_url_elicitation_error, text) < _BUDGET_S * 4
+        _assert_bounded(
+            _embedded_object_text, text, input_class=input_class, size=len(text)
+        )
+        _assert_bounded(
+            parse_url_elicitation_error,
+            text,
+            input_class=input_class,
+            size=len(text),
+            budget=_BUDGET_S * 4,
+        )
 
 
 @pytest.mark.parametrize("unit", ["+.", "a", "a@", "a@a.", "-"])
@@ -190,7 +283,14 @@ def test_feedback_email_scrubbing_is_linear(unit: str) -> None:
         _policy_manager = _Policy()
 
     for size in (64 << 10, 1 << 20):  # the small size first: fail fast
-        assert _elapsed(scrub, _Self(), text[:size]) < _BUDGET_S * 4
+        _assert_bounded(
+            scrub,
+            _Self(),
+            text[:size],
+            input_class="email-adversary",
+            size=size,
+            budget=_BUDGET_S * 4,
+        )
     assert scrub(_Self(), "write to dev.null+x@example.org now") == (
         "write to [REDACTED_EMAIL] now"
     )
