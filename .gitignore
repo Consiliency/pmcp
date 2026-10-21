@@ -74,3 +74,4 @@ code_index.db
 .worktrees/
 # Local raw security-test reports must never enter version control.
 .ci-reports/
+.release-bundle/

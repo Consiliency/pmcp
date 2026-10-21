@@ -16,6 +16,8 @@ jobs:
     # cancelled at 54% of the tests, so nothing was published (see
     # Consiliency/pmcp#383, which tracks parallelising the suite).
     timeout-minutes: 45
+    outputs:
+      bundle_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,14 +66,17 @@ jobs:
       - name: Run tests with coverage
         run: uv run --locked python -m pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml:"$RUNNER_TEMP/release-coverage.xml" --cov-report=term-missing --cov-fail-under=60
 
-      - name: Build package
-        run: uv build
+      - name: Build and verify exact archives
+        run: uv run --locked python scripts/release_artifacts.py --bundle .release-bundle
 
       - name: Upload artifacts
+        id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: dist
-          path: dist/
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release-bundle/
+          include-hidden-files: true
+          if-no-files-found: error
 
   publish:
     needs: build
@@ -80,21 +85,33 @@ jobs:
     environment: release
     permissions:
       id-token: write  # Required for trusted publishing
+      contents: read
 
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: dist
-          path: dist/
+          artifact-ids: ${{ needs.build.outputs.bundle_id }}
+          path: .release-bundle/
+          merge-multiple: true
+
+      - name: Verify artifact identity
+        run: python3 -I -B scripts/verify_release_bundle.py .release-bundle
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         # Uses trusted publishing - no token needed
         # Configure at: https://pypi.org/manage/project/pmcp/settings/publishing/
+        with:
+          packages-dir: .release-bundle/dist/
 
   github-release:
-    needs: publish
+    needs: [publish, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -102,12 +119,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: dist
-          path: dist/
+          artifact-ids: ${{ needs.build.outputs.bundle_id }}
+          path: .release-bundle/
+          merge-multiple: true
+
+      - name: Verify artifact identity
+        run: python3 -I -B scripts/verify_release_bundle.py .release-bundle
 
       - name: Extract release notes
         run: |
@@ -136,12 +160,14 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           if gh release view "$tag" >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/published-dist"
+            gh release download "$tag" --dir "$RUNNER_TEMP/published-dist"
+            python3 -I -B scripts/verify_release_bundle.py .release-bundle --released-dir "$RUNNER_TEMP/published-dist"
             gh release edit "$tag" \
               --title "$tag" \
               --notes-file release-notes.md
-            gh release upload "$tag" dist/* --clobber
           else
-            gh release create "$tag" dist/* \
+            gh release create "$tag" .release-bundle/dist/* \
               --title "$tag" \
               --notes-file release-notes.md \
               --verify-tag

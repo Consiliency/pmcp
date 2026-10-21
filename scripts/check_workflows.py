@@ -63,17 +63,19 @@ EXPECTED_RELEASE_COMMANDS = {
     "Set up Python": "uv python install 3.12",
     "Install dependencies": "uv sync --locked --all-extras --python 3.12",
     "Record environment identity": 'uv run --locked python scripts/ci_environment.py "$RUNNER_TEMP/release-environment.json"\ncat "$RUNNER_TEMP/release-environment.json"\n',
-    "Build package": "uv build",
+    "Build and verify exact archives": "uv run --locked python scripts/release_artifacts.py --bundle .release-bundle",
     "Audit locked dependencies before publication": 'uv export --locked --all-extras --dev --no-emit-project --format requirements-txt -o "$RUNNER_TEMP/requirements.txt"\nuv run --locked --with pip-audit==2.9.0 pip-audit --progress-spinner off --strict --disable-pip -r "$RUNNER_TEMP/requirements.txt"\n',
     "Run tests with coverage": 'uv run --locked python -m pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml:"$RUNNER_TEMP/release-coverage.xml" --cov-report=term-missing --cov-fail-under=60',
 }
+EXPECTED_RELEASE_NOTES_COMMAND = 'tag="${GITHUB_REF_NAME}"\nversion="${tag#v}"\nawk -v version="$version" \'\n  $0 ~ "^## \\\\[" version "\\\\]([ -]|$)" {\n    in_section = 1\n    next\n  }\n  in_section && /^## \\[/ {\n    exit\n  }\n  in_section {\n    print\n  }\n\' CHANGELOG.md > release-notes.md\n\nif [ ! -s release-notes.md ]; then\n  printf \'Release %s\\n\' "$tag" > release-notes.md\nfi\n'
+EXPECTED_GITHUB_RELEASE_COMMAND = 'tag="${GITHUB_REF_NAME}"\nif gh release view "$tag" >/dev/null 2>&1; then\n  mkdir -p "$RUNNER_TEMP/published-dist"\n  gh release download "$tag" --dir "$RUNNER_TEMP/published-dist"\n  python3 -I -B scripts/verify_release_bundle.py .release-bundle --released-dir "$RUNNER_TEMP/published-dist"\n  gh release edit "$tag" \\\n    --title "$tag" \\\n    --notes-file release-notes.md\nelse\n  gh release create "$tag" .release-bundle/dist/* \\\n    --title "$tag" \\\n    --notes-file release-notes.md \\\n    --verify-tag\nfi\n'
 EXPECTED_JOBS = {"build", "publish", "github-release"}
-EXPECTED_NEEDS = {"publish": ["build"], "github-release": ["publish"]}
+EXPECTED_NEEDS = {"publish": ["build"], "github-release": ["publish", "build"]}
 EXPECTED_ENVIRONMENT = {"publish": "release"}
 # ``None`` means the job declares no permissions: block at all.
 EXPECTED_JOB_PERMISSIONS: dict[str, dict[str, str] | None] = {
     "build": {"contents": "read"},
-    "publish": {"id-token": "write"},
+    "publish": {"id-token": "write", "contents": "read"},
     "github-release": {"contents": "write"},
 }
 # SHA form ONLY — no `# vX.Y.Z` here. `yaml.safe_load` strips the comment before
@@ -88,6 +90,7 @@ EXPECTED_USES = {
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
     ],
     "publish": [
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
         # v1.14.2 == the release/v1 head on the day of pinning. Any re-pin must
         # stay >= 1.13.0: GHSA-vxmw-7h4f-hqxh (injectable expression expansions)
@@ -294,7 +297,7 @@ def release_invariants(doc: Any) -> list[str]:
         "Record environment identity",
         "Audit locked dependencies before publication",
         "Run tests with coverage",
-        "Build package",
+        "Build and verify exact archives",
         "Upload artifacts",
     ]
     if labels != expected_labels:
@@ -314,6 +317,151 @@ def release_invariants(doc: Any) -> list[str]:
     ]
     if len(uv_steps) != 1 or uv_steps[0].get("with", {}).get("version") != "0.13.1":
         reasons.append("[release] uv tool version must remain pinned")
+
+    if build.get("outputs") != {"bundle_id": "${{ steps.upload.outputs.artifact-id }}"}:
+        reasons.append("[release] build must expose the same-run immutable artifact ID")
+    verification = [
+        s
+        for s in build.get("steps", [])
+        if s.get("name") == "Build and verify exact archives"
+    ]
+    if (
+        len(verification) != 1
+        or verification[0].get("run")
+        != "uv run --locked python scripts/release_artifacts.py --bundle .release-bundle"
+    ):
+        reasons.append("[release] exact wheel and sdist verification is mandatory")
+    uploads = [s for s in build.get("steps", []) if s.get("name") == "Upload artifacts"]
+    if (
+        len(uploads) != 1
+        or uploads[0].get("id") != "upload"
+        or uploads[0].get("with")
+        != {
+            "name": "release-${{ github.run_id }}-${{ github.run_attempt }}",
+            "path": ".release-bundle/",
+            "include-hidden-files": True,
+            "if-no-files-found": "error",
+        }
+    ):
+        reasons.append("[release] upload only the verified bundle with immutable ID")
+    for target in ("publish", "github-release"):
+        steps = jobs.get(target, {}).get("steps", [])
+        checks = [s for s in steps if s.get("name") == "Verify artifact identity"]
+        downloads = [
+            s
+            for s in steps
+            if str(s.get("uses", "")).startswith("actions/download-artifact@")
+        ]
+        if (
+            len(checks) != 1
+            or checks[0].get("run")
+            != "python3 -I -B scripts/verify_release_bundle.py .release-bundle"
+        ):
+            reasons.append(
+                "[release] missing downstream archive identity verification: " + target
+            )
+        if len(downloads) != 1 or downloads[0].get("with") != {
+            "artifact-ids": "${{ needs.build.outputs.bundle_id }}",
+            "path": ".release-bundle/",
+            "merge-multiple": True,
+        }:
+            reasons.append(
+                "[release] downstream must use the exact build artifact ID: " + target
+            )
+        expected_steps = [
+            {
+                "uses": EXPECTED_USES[target][0],
+                "with": {"ref": "${{ github.sha }}", "persist-credentials": False},
+            },
+            {
+                "name": "Download artifacts",
+                "uses": EXPECTED_USES[target][1],
+                "with": {
+                    "artifact-ids": "${{ needs.build.outputs.bundle_id }}",
+                    "path": ".release-bundle/",
+                    "merge-multiple": True,
+                },
+            },
+            {
+                "name": "Verify artifact identity",
+                "run": "python3 -I -B scripts/verify_release_bundle.py .release-bundle",
+            },
+        ]
+        if target == "publish":
+            expected_steps.append(
+                {
+                    "name": "Publish to PyPI",
+                    "uses": EXPECTED_USES[target][2],
+                    "with": {"packages-dir": ".release-bundle/dist/"},
+                }
+            )
+        else:
+            expected_steps.extend(
+                [
+                    {
+                        "name": "Extract release notes",
+                        "run": EXPECTED_RELEASE_NOTES_COMMAND,
+                    },
+                    {
+                        "name": "Create GitHub Release",
+                        "env": {"GH_TOKEN": "${{ github.token }}"},
+                        "run": EXPECTED_GITHUB_RELEASE_COMMAND,
+                    },
+                ]
+            )
+        expected_job_keys = {
+            "needs",
+            "runs-on",
+            "timeout-minutes",
+            "permissions",
+            "steps",
+        } | ({"environment"} if target == "publish" else set())
+        if steps != expected_steps or set(jobs[target]) != expected_job_keys:
+            reasons.append(
+                "[release] complete downstream execution mapping must remain exact: "
+                + target
+            )
+        expected_order = [
+            "actions/checkout",
+            "Download artifacts",
+            "Verify artifact identity",
+        ] + (
+            ["Publish to PyPI"]
+            if target == "publish"
+            else ["Extract release notes", "Create GitHub Release"]
+        )
+        if [
+            s.get("name", s.get("uses", "").split("@")[0]) for s in steps
+        ] != expected_order:
+            reasons.append(
+                "[release] downstream download and verification must precede publication: "
+                + target
+            )
+        if not steps or steps[0].get("with") != {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": False,
+        }:
+            reasons.append(
+                "[release] downstream checkout must bind the triggering SHA: " + target
+            )
+    pypi = [
+        s
+        for s in jobs.get("publish", {}).get("steps", [])
+        if str(s.get("uses", "")).startswith("pypa/")
+    ]
+    if len(pypi) != 1 or pypi[0].get("with") != {
+        "packages-dir": ".release-bundle/dist/"
+    }:
+        reasons.append("[release] publish only verified distribution files")
+    release_steps = jobs.get("github-release", {}).get("steps", [])
+    if any("--clobber" in str(s.get("run", "")) for s in release_steps):
+        reasons.append("[release] published archive bytes may never be clobbered")
+
+    create = [s for s in release_steps if s.get("name") == "Create GitHub Release"]
+    if len(create) != 1 or create[0].get("run") != EXPECTED_GITHUB_RELEASE_COMMAND:
+        reasons.append(
+            "[release] existing release must retain exact whole-asset verification before notes edit"
+        )
 
     for name, expected_needs in EXPECTED_NEEDS.items():
         job = jobs.get(name)
