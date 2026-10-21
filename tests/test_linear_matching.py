@@ -13,6 +13,7 @@ unreviewed, so its code's fixed phrase is shown), and every template is a
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -69,7 +70,37 @@ def _assert_bounded(
     }
     if template_index is not None:
         diagnostics["template_index"] = template_index
-    assert wall < budget, diagnostics
+    assert wall < budget, json.dumps(diagnostics, sort_keys=True)
+
+
+def test_timing_failure_keeps_safe_diagnostics_under_pytest_rewriting() -> None:
+    sentinel = "PMCP_SYNTHETIC_PEER_SENTINEL"
+    with pytest.raises(AssertionError) as failure:
+        _assert_bounded(
+            lambda _text: None,
+            sentinel,
+            input_class="diagnostic-control",
+            size=1048576,
+            budget=0.0,
+            template_index=7,
+        )
+    rendered = str(failure.value)
+    diagnostics = json.loads(rendered.splitlines()[0])
+    assert {
+        "input_class",
+        "size",
+        "budget_s",
+        "worker",
+        "wall_s",
+        "process_cpu_s",
+        "thread_cpu_s",
+        "template_index",
+    } <= diagnostics.keys()
+    assert diagnostics["input_class"] == "diagnostic-control"
+    assert diagnostics["size"] == 1048576
+    assert diagnostics["budget_s"] == 0.0
+    assert diagnostics["template_index"] == 7
+    assert sentinel not in rendered
 
 
 @pytest.fixture(autouse=True, scope="module")

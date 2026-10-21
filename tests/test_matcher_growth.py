@@ -80,7 +80,7 @@ def test_object_matcher_growth_discriminates_the_historical_regex(
         text = output.decode() if isinstance(output, bytes) else output
         receipts = [json.loads(line) for line in text.splitlines()]
         diagnostics = {"receipts": receipts, **_stderr_metadata(failure.stderr, None)}
-        assert mode == "historical", diagnostics
+        assert mode == "historical", json.dumps(diagnostics, sort_keys=True)
         assert any(
             receipt.get("phase") == "sample"
             and receipt.get("mode") == "historical"
@@ -90,18 +90,23 @@ def test_object_matcher_growth_discriminates_the_historical_regex(
             and receipt.get("size", 0) >= 16 << 10
             and receipt.get("process_cpu_s", 0) >= _HISTORICAL_MIN_CPU_S
             for receipt in receipts
-        ), diagnostics
+        ), json.dumps(diagnostics, sort_keys=True)
         request.node.user_properties.append(
             ("matching_path", "historical-completed-sample-deadline")
         )
         return
     negative = mode != "current"
-    assert result.returncode == (2 if negative else 0), _failure_diagnostics(result)
+    returncode = result.returncode
+    assert returncode == (2 if negative else 0), json.dumps(
+        _failure_diagnostics(result), sort_keys=True
+    )
     receipts = [json.loads(line) for line in result.stdout.splitlines()]
     report = receipts[-1]
     assert report["phase"] == "result"
     assert report["mode"] == mode
-    assert report["verdict"] == ("nonlinear" if negative else "linear"), report
+    assert report["verdict"] == ("nonlinear" if negative else "linear"), json.dumps(
+        report, sort_keys=True
+    )
     assert report["historical_mutant"] is (mode == "historical")
     assert report["line_copy_mutant"] is (mode == "line-copy")
     classes = report["classes"]
@@ -128,3 +133,40 @@ def test_object_matcher_growth_discriminates_the_historical_regex(
     request.node.user_properties.append(
         ("matching_path", mode + "-completed-cpu-growth")
     )
+
+
+def test_growth_crash_keeps_stderr_private_under_pytest_rewriting(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    sentinel = "PMCP_SYNTHETIC_STDERR_SENTINEL"
+    private_path = "/synthetic/private/diagnostic-control"
+    result = subprocess.CompletedProcess(
+        args=[private_path],
+        returncode=1,
+        stdout="",
+        stderr=f"ValueError: {sentinel} {private_path}\n",
+    )
+
+    def crashed_child(
+        *_args: object, **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return result
+
+    with monkeypatch.context() as context:
+        context.setattr(subprocess, "run", crashed_child)
+        with pytest.raises(AssertionError) as failure:
+            test_object_matcher_growth_discriminates_the_historical_regex(
+                "current", request
+            )
+    rendered = str(failure.value)
+    diagnostics = json.loads(rendered.splitlines()[0])
+    assert diagnostics["stderr_exception_class"] == "ValueError"
+    assert diagnostics["returncode"] == 1
+    assert diagnostics["stderr_bytes"] == len(result.stderr.encode())
+    assert (
+        diagnostics["stderr_sha256"]
+        == hashlib.sha256(result.stderr.encode()).hexdigest()
+    )
+    assert sentinel not in rendered
+    assert private_path not in rendered
+    assert "CompletedProcess" not in rendered
