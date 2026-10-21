@@ -282,15 +282,51 @@ async def disconnect_owned_client(manager: ClientManager) -> None:
     must not make a pending transport or HTTP resource look closed.
     """
     clients = list(manager._clients.values())
+    reconnects = list(manager._reconnect_tasks.values())
     task = asyncio.create_task(manager.disconnect_all())
-    _, pending = await asyncio.wait({task}, timeout=CLIENT_STOP_TIMEOUT)
-    if pending:
-        task.cancel()
-        _, pending = await asyncio.wait({task}, timeout=CANCEL_GRACE)
-        raise RuntimeError(
-            f"owned client disconnect exceeded {CLIENT_STOP_TIMEOUT}s "
-            f"[survived_cancellation={bool(pending)}]"
+
+    def retrieve_outcome(done: asyncio.Task[None]) -> None:
+        # A resistant child may finish after the caller has propagated cancellation.
+        # Retrieve its outcome without leaking its exception text or replacing the
+        # caller's CancelledError. Normal completion still uses task.result below.
+        if not done.cancelled():
+            done.exception()
+
+    stage = "initial_wait"
+    try:
+        _, pending = await asyncio.wait({task}, timeout=CLIENT_STOP_TIMEOUT)
+        if pending:
+            task.cancel()
+            stage = "cancellation_grace"
+            _, pending = await asyncio.wait({task}, timeout=CANCEL_GRACE)
+            raise RuntimeError(
+                f"owned client disconnect exceeded {CLIENT_STOP_TIMEOUT}s "
+                f"[survived_cancellation={bool(pending)}]"
+            )
+    except asyncio.CancelledError as cancellation:
+        task.add_done_callback(retrieve_outcome)
+        if not task.done():
+            task.cancel()
+        interrupted = False
+        try:
+            await asyncio.wait({task}, timeout=CANCEL_GRACE)
+        except asyncio.CancelledError:
+            interrupted = True
+            if not task.done():
+                task.cancel()
+        if task.done():
+            retrieve_outcome(task)
+        cancellation.add_note(
+            json.dumps(
+                {
+                    "stage": stage,
+                    "supervision_interrupted": interrupted,
+                    "survived_cancellation": not task.done(),
+                },
+                sort_keys=True,
+            )
         )
+        raise cancellation
     task.result()
     assert all(c.read_task is None or c.read_task.done() for c in clients)
     assert all(
@@ -299,6 +335,7 @@ async def disconnect_owned_client(manager: ClientManager) -> None:
     assert all(
         c.remote_http_client is None or c.remote_http_client.is_closed for c in clients
     )
+    assert all(task.done() for task in reconnects), "owned reconnect task still pending"
     assert not manager._reconnect_tasks
 
 

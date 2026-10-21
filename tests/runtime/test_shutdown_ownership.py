@@ -24,13 +24,7 @@ from tests.runtime.test_emitter_harness import AUTH_VALUE, _remote_config
 
 
 async def _disconnect(manager: ClientManager) -> None:
-    task = asyncio.create_task(manager.disconnect_all())
-    done, pending = await asyncio.wait({task}, timeout=7)
-    if pending:
-        task.cancel()
-        await asyncio.wait({task}, timeout=1)
-        raise AssertionError("owned client disconnect exceeded seven seconds")
-    next(iter(done)).result()
+    await fake_remote.disconnect_owned_client(manager)
 
 
 @pytest.mark.asyncio
@@ -49,7 +43,8 @@ async def test_owned_order_removes_a_real_open_stream_dependency(
     # Fault injection only: the watcher never sees this server's exit flag.
     # The same real transport and uvicorn drain run in both orderings.
     monkeypatch.setattr(sse, "_get_uvicorn_server", missed_shutdown)
-    monkeypatch.setattr(fake_remote, "SERVE_STOP_TIMEOUT", 1.5)
+    if not disconnect_first:
+        monkeypatch.setattr(fake_remote, "SERVE_STOP_TIMEOUT", 1.5)
     manager = ClientManager()
 
     async def body() -> None:
@@ -88,6 +83,7 @@ async def test_owned_order_removes_a_real_open_stream_dependency(
             ]
             assert milestones[1]["client_readers_pending"] == 1
             assert milestones[1]["client_owners_pending"] == 1
+            assert milestones[1]["app_should_exit"] is False
             assert all("elapsed_s" in item and "worker" in item for item in milestones)
     finally:
         await _disconnect(manager)
@@ -136,6 +132,7 @@ async def test_normal_server_shutdown_closes_the_original_http_stream(
         async with fake_remote.run_fake_remote(
             alloc_port(), expected_auth_value=AUTH_VALUE
         ) as remote:
+            remote.observe_client(manager)
             name = "normal-shutdown"
             assert (
                 await manager.connect_server(_remote_config(name, remote.mcp_url)) == []
@@ -237,3 +234,122 @@ async def test_owned_disconnect_cannot_hide_a_pending_task(
         escape.set()
         _, pending = await asyncio.wait(set(tasks), timeout=1)
         assert not pending, "test mutant itself was not retired"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "resist_cancel", "second_cancel"),
+    [
+        ("initial_wait", False, False),
+        ("initial_wait", True, False),
+        ("cancellation_grace", False, False),
+        ("cancellation_grace", True, False),
+        ("initial_wait", True, True),
+    ],
+    ids=[
+        "initial-honouring",
+        "initial-resistant",
+        "grace-honouring",
+        "grace-resistant",
+        "supervision-interrupted",
+    ],
+)
+async def test_caller_cancellation_keeps_disconnect_supervised(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    resist_cancel: bool,
+    second_cancel: bool,
+) -> None:
+    manager = ClientManager()
+    started = asyncio.Event()
+    got_cancel = asyncio.Event()
+    release = asyncio.Event()
+    children = []
+    delivered = []
+    original_wait = asyncio.wait
+    wait_calls = 0
+
+    async def disconnect() -> None:
+        children.append(asyncio.current_task())
+        started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                got_cancel.set()
+                if not resist_cancel:
+                    raise
+
+    async def observed_wait(tasks, *, timeout):
+        nonlocal wait_calls
+        if asyncio.current_task() is caller:
+            wait_calls += 1
+            cancel_at = 1 if stage == "initial_wait" else 2
+            if wait_calls == cancel_at:
+                await started.wait()
+                asyncio.get_running_loop().call_soon(caller.cancel, "caller sentinel")
+            elif second_cancel and wait_calls == cancel_at + 1:
+                asyncio.get_running_loop().call_soon(caller.cancel, "second sentinel")
+            try:
+                return await original_wait(tasks, timeout=timeout)
+            except asyncio.CancelledError as cancellation:
+                delivered.append(cancellation)
+                raise
+        return await original_wait(tasks, timeout=timeout)
+
+    monkeypatch.setattr(manager, "disconnect_all", disconnect)
+    monkeypatch.setattr(fake_remote, "CLIENT_STOP_TIMEOUT", 0.01)
+    monkeypatch.setattr(fake_remote, "CANCEL_GRACE", 0.02)
+    monkeypatch.setattr(fake_remote.asyncio, "wait", observed_wait)
+    caller = asyncio.create_task(fake_remote.disconnect_owned_client(manager))
+    try:
+        _, pending = await original_wait({caller}, timeout=1)
+        assert not pending, "caller cancellation escaped the finite cleanup bound"
+        with pytest.raises(asyncio.CancelledError, match="caller sentinel") as failure:
+            await caller
+        assert failure.value is delivered[0]
+        assert got_cancel.is_set()
+        assert len(children) == 1
+        assert children[0].done() is not resist_cancel
+        note = json.loads(failure.value.__notes__[-1])
+        assert note == {
+            "stage": stage,
+            "supervision_interrupted": second_cancel,
+            "survived_cancellation": resist_cancel,
+        }
+        if not resist_cancel:
+            assert children[0].cancelled()
+        if second_cancel:
+            assert len(delivered) == 2
+    finally:
+        release.set()
+        if not caller.done():
+            caller.cancel()
+        done, pending = await original_wait({caller, *children}, timeout=1)
+        assert not pending, "caller-cancellation mutant itself was not retired"
+        for task in done:
+            if not task.cancelled():
+                task.result()
+
+
+@pytest.mark.asyncio
+async def test_owned_disconnect_rejects_a_late_reconnect_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = ClientManager()
+    release = asyncio.Event()
+    late = asyncio.create_task(release.wait())
+    manager._reconnect_tasks["late-mutant"] = late
+
+    async def incomplete_disconnect() -> None:
+        manager._reconnect_tasks.clear()
+
+    monkeypatch.setattr(manager, "disconnect_all", incomplete_disconnect)
+    try:
+        with pytest.raises(AssertionError, match="owned reconnect task still pending"):
+            await fake_remote.disconnect_owned_client(manager)
+        assert not late.done()
+    finally:
+        release.set()
+        _, pending = await asyncio.wait({late}, timeout=1)
+        assert not pending, "late-task mutant itself was not retired"
