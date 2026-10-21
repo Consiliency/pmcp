@@ -275,6 +275,15 @@ class RunningFakeRemote:
         }
 
 
+def _add_cancellation_note(cancellation: asyncio.CancelledError, note: str) -> None:
+    """Keep failure-path notes on the declared Python 3.10 floor too."""
+    add_note = getattr(cancellation, "add_note", None)
+    if add_note is not None:
+        add_note(note)
+    else:
+        vars(cancellation).setdefault("__notes__", []).append(note)
+
+
 async def disconnect_owned_client(manager: ClientManager) -> None:
     """Close an owned client before its peer, under a finite outer bound.
 
@@ -316,7 +325,8 @@ async def disconnect_owned_client(manager: ClientManager) -> None:
                 task.cancel()
         if task.done():
             retrieve_outcome(task)
-        cancellation.add_note(
+        _add_cancellation_note(
+            cancellation,
             json.dumps(
                 {
                     "stage": stage,
@@ -324,7 +334,7 @@ async def disconnect_owned_client(manager: ClientManager) -> None:
                     "survived_cancellation": not task.done(),
                 },
                 sort_keys=True,
-            )
+            ),
         )
         raise cancellation
     task.result()

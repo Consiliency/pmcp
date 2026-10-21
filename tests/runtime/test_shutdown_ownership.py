@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -266,16 +267,26 @@ async def test_caller_cancellation_keeps_disconnect_supervised(
     release = asyncio.Event()
     children = []
     delivered = []
+    helper_cancellations = []
+    child_cancellations = 0
+    expected_cancellations = (
+        2 if second_cancel or (stage == "cancellation_grace" and resist_cancel) else 1
+    )
+    enough_cancellations = asyncio.get_running_loop().create_future()
     original_wait = asyncio.wait
     wait_calls = 0
 
     async def disconnect() -> None:
+        nonlocal child_cancellations
         children.append(asyncio.current_task())
         started.set()
         while not release.is_set():
             try:
                 await release.wait()
             except asyncio.CancelledError:
+                child_cancellations += 1
+                if child_cancellations == expected_cancellations:
+                    enough_cancellations.set_result(None)
                 got_cancel.set()
                 if not resist_cancel:
                     raise
@@ -301,17 +312,37 @@ async def test_caller_cancellation_keeps_disconnect_supervised(
     monkeypatch.setattr(fake_remote, "CLIENT_STOP_TIMEOUT", 0.01)
     monkeypatch.setattr(fake_remote, "CANCEL_GRACE", 0.02)
     monkeypatch.setattr(fake_remote.asyncio, "wait", observed_wait)
-    caller = asyncio.create_task(fake_remote.disconnect_owned_client(manager))
+
+    async def call_disconnect() -> None:
+        try:
+            await fake_remote.disconnect_owned_client(manager)
+        except asyncio.CancelledError as cancellation:
+            helper_cancellations.append(cancellation)
+            raise
+
+    caller = asyncio.create_task(call_disconnect())
     try:
         _, pending = await original_wait({caller}, timeout=1)
         assert not pending, "caller cancellation escaped the finite cleanup bound"
-        with pytest.raises(asyncio.CancelledError, match="caller sentinel") as failure:
-            await caller
-        assert failure.value is delivered[0]
+        assert caller.cancelled()
+        if sys.version_info >= (3, 11):
+            with pytest.raises(
+                asyncio.CancelledError, match="caller sentinel"
+            ) as failure:
+                await caller
+            assert failure.value is delivered[0]
+            assert failure.value.__notes__ == helper_cancellations[0].__notes__
+        else:
+            # Python 3.10's Task boundary creates a new, message-less exception.
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+        (recorded,) = helper_cancellations
+        assert recorded is delivered[0]
+        assert recorded.args == ("caller sentinel",)
         assert got_cancel.is_set()
         assert len(children) == 1
         assert children[0].done() is not resist_cancel
-        note = json.loads(failure.value.__notes__[-1])
+        note = json.loads(recorded.__notes__[-1])
         assert note == {
             "stage": stage,
             "supervision_interrupted": second_cancel,
@@ -321,7 +352,12 @@ async def test_caller_cancellation_keeps_disconnect_supervised(
             assert children[0].cancelled()
         if second_cancel:
             assert len(delivered) == 2
+        _, pending = await original_wait({enough_cancellations}, timeout=1)
+        assert not pending, "owned child missed a cancellation delivery"
+        assert child_cancellations == expected_cancellations
     finally:
+        if not enough_cancellations.done():
+            enough_cancellations.cancel()
         release.set()
         if not caller.done():
             caller.cancel()
@@ -330,6 +366,94 @@ async def test_caller_cancellation_keeps_disconnect_supervised(
         for task in done:
             if not task.cancelled():
                 task.result()
+
+
+@pytest.mark.parametrize("legacy_note_api", [False, True], ids=["native", "fallback"])
+def test_cancellation_note_preserves_exception_and_existing_notes(
+    legacy_note_api: bool,
+) -> None:
+    class LegacyCancellation(asyncio.CancelledError):
+        add_note = None
+
+    cancellation = (
+        LegacyCancellation("caller sentinel")
+        if legacy_note_api
+        else asyncio.CancelledError("caller sentinel")
+    )
+    existing = "existing safe note"
+    vars(cancellation)["__notes__"] = [existing]
+    note = json.dumps(
+        {
+            "stage": "initial_wait",
+            "supervision_interrupted": False,
+            "survived_cancellation": True,
+        },
+        sort_keys=True,
+    )
+    assert fake_remote._add_cancellation_note(cancellation, note) is None
+    assert cancellation.args == ("caller sentinel",)
+    assert cancellation.__notes__ == [existing, note]
+
+
+@pytest.mark.asyncio
+async def test_owned_disconnect_retrieves_a_late_failing_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LateDisconnectFailure(Exception):
+        pass
+
+    manager = ClientManager()
+    loop = asyncio.get_running_loop()
+    started = loop.create_future()
+    callbacks_finished = loop.create_future()
+    release = asyncio.Event()
+    children = []
+    caller = None
+
+    async def disconnect() -> None:
+        children.append(asyncio.current_task())
+        started.set_result(None)
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                pass
+        raise LateDisconnectFailure("late disconnect sentinel")
+
+    monkeypatch.setattr(manager, "disconnect_all", disconnect)
+    monkeypatch.setattr(fake_remote, "CANCEL_GRACE", 0.02)
+    try:
+        caller = asyncio.create_task(fake_remote.disconnect_owned_client(manager))
+        _, pending = await asyncio.wait({started}, timeout=1)
+        assert not pending, "late-failure child did not start"
+        caller.cancel("caller sentinel")
+        _, pending = await asyncio.wait({caller}, timeout=1)
+        assert not pending, "caller cancellation escaped the finite cleanup bound"
+        assert caller.cancelled()
+        (child,) = children
+        assert not child.done()
+        # Registered after the helper's retrieval callback: observing this future
+        # means that earlier callback ran, without retrieving the outcome here.
+        child.add_done_callback(lambda _: callbacks_finished.set_result(None))
+        release.set()
+        _, pending = await asyncio.wait({callbacks_finished}, timeout=1)
+        assert not pending, "late-failure callbacks did not finish"
+        assert child.done() and not child.cancelled()
+        assert child._log_traceback is False
+        assert isinstance(child.exception(), LateDisconnectFailure)
+    finally:
+        release.set()
+        tasks = {*children}
+        if caller is not None:
+            tasks.add(caller)
+            if not caller.done():
+                caller.cancel()
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=1)
+            assert not pending, "late-failure mutant itself was not retired"
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
 
 
 @pytest.mark.asyncio
