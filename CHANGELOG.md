@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Reject delimiter-free URL-elicitation error text before scanning regex line starts, preserving matching semantics and the existing security timing bounds. Timing failures now identify input class, size, worker and CPU cost (Consiliency/pmcp#444).
+- Avoid regex work for URL-elicitation error text missing either brace; text containing both braces still runs the unchanged linear regex at unchanged cost. Retain the 50ms/200ms wall limits on the missing-brace path and check matching CPU growth across long and repeated short lines against historical-regex and line-copying negative controls. Timing failures identify input class, size, worker and CPU cost without peer text. No universal timing guarantee or confirmed hosted root cause is claimed (Consiliency/pmcp#444).
 
 - Require and lock aiohttp 3.14.4 or later for GHSA-5wr8-gcqf-gqf3, GHSA-2g87-pp6c-29x5 and GHSA-494j-54xm-rwp3. Its required yarl dependency advances to 1.25.1; no advisory suppression is added.
 

@@ -44,6 +44,7 @@ def _assert_bounded(
     input_class: str,
     size: int,
     budget: float = _BUDGET_S,
+    template_index: int | None = None,
 ) -> None:
     """Retain the wall oracle; report work and scheduling separately.
 
@@ -57,7 +58,7 @@ def _assert_bounded(
     thread_cpu = time.thread_time() - thread_start
     process_cpu = time.process_time() - process_start
     wall = time.perf_counter() - wall_start
-    assert wall < budget, {
+    diagnostics: dict[str, object] = {
         "wall_s": wall,
         "process_cpu_s": process_cpu,
         "thread_cpu_s": thread_cpu,
@@ -66,6 +67,9 @@ def _assert_bounded(
         "size": size,
         "budget_s": budget,
     }
+    if template_index is not None:
+        diagnostics["template_index"] = template_index
+    assert wall < budget, diagnostics
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -103,14 +107,18 @@ def test_every_template_matches_an_adversarial_input_in_bounded_time(
     """Each template's prefix repeated without its suffix, matched directly
     (past the length cap), at 64 KiB, 1 MiB and 10 MiB. Fails at the first
     slow template: a backtracking matcher takes seconds per template here."""
-    for template in _templates():
+    for template_index, template in enumerate(_templates()):
         head = template.parts[0] + (
             template.parts[1] if len(template.parts) > 2 else ""
         )
         unit = head or "x"
         text = (unit * (size // len(unit) + 1))[:size]
         _assert_bounded(
-            template.fullmatch, text, input_class="template-prefix", size=size
+            template.fullmatch,
+            text,
+            input_class="template-prefix",
+            size=size,
+            template_index=template_index,
         )
 
 
