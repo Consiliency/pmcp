@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pass Context7's optional `CONTEXT7_API_KEY` from the credential store to its child process while preserving anonymous startup (see Consiliency/pmcp#452).
+
 - Remote-emitter tests supervise bounded owned-client cleanup before stopping their server, including assertion failures. On Python 3.10 and later, cancellation leaves the cleanup helper unchanged after bounded supervision, with safe survivor notes and eventual outcome retrieval. Shutdown diagnostics record safe lifecycle and ownership counts; independent real-stream and teardown-mutant checks remain. The hosted shutdown cause remains open (Consiliency/pmcp#445).
 
 - Lock certifi 2026.10.19 to exclude the affected CA bundle identified by PYSEC-2026-4320 (GHSA-6q48-6c7w-9gw2); retain the blocking locked-dependency audit without suppressions.
