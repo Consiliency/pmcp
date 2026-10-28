@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Pass Context7's optional `CONTEXT7_API_KEY` from the credential store to its child process while preserving anonymous startup (see Consiliency/pmcp#452).
+- Pass Context7's optional `CONTEXT7_API_KEY` from the credential store to its child process while preserving anonymous startup. `init` labels the key as optional, and `secrets check` no longer scans optional or relaxed credential values as environment references (see Consiliency/pmcp#452).
 
 - Lock `opentelemetry-api` 1.45.1 to address GHSA-xcq7-p3pf-p88h in the existing dependency set.
 

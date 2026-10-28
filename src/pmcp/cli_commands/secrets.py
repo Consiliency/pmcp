@@ -23,6 +23,7 @@ from pmcp.env_store import (
     write_env_file,
 )
 from pmcp.manifest.loader import (
+    credential_lookup_keys,
     credential_storage_key,
     load_manifest,
     requires_credential,
@@ -128,6 +129,9 @@ def _extract_required_keys(
         manifest_server = manifest_by_name.get(cfg.name)
         env_map = cfg.config.env or {}
         server_keys: set[str] = set()
+        credential_names = (
+            set(credential_lookup_keys(manifest_server)) if manifest_server else set()
+        )
 
         # The credential requirement is INTRINSIC to a configured server that
         # matches a manifest api-key server — it holds whether or not a credential
@@ -159,9 +163,10 @@ def _extract_required_keys(
         manifest_extra_env = getattr(manifest_server, "extra_env", None) or {}
 
         for env_key, env_value in env_map.items():
-            # The credential var is required via the manifest above; don't re-add
-            # its bare runtime name (which would bypass the storage-key mapping).
-            if env_key == credential_var:
+            # Credential values are opaque, even when optional or relaxed.
+            # Never interpret a secret's $NAME substring as an env reference.
+            # Required credentials are listed via the storage-key mapping above.
+            if env_key in credential_names:
                 continue
             if (
                 env_key in manifest_extra_env

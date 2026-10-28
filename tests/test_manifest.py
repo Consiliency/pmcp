@@ -432,7 +432,9 @@ async def test_context7_optional_stored_key_reaches_only_its_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stored_key: str | None
 ) -> None:
     """Stored Context7 credentials survive stripping without gating anonymous use."""
-    monkeypatch.delenv("CONTEXT7_API_KEY", raising=False)
+    # Register an undo even when absent: startup loading writes environ directly.
+    monkeypatch.setenv("CONTEXT7_API_KEY", "")
+    monkeypatch.delenv("CONTEXT7_API_KEY")
     store = Path.home() / ".config" / "pmcp" / "pmcp.env"
     store.parent.mkdir(parents=True, exist_ok=True)
     store.write_text(
@@ -448,6 +450,21 @@ async def test_context7_optional_stored_key_reaches_only_its_child(
         manifest.servers["playwright"], project_root=tmp_path
     )
     assert "CONTEXT7_API_KEY" not in other_env
+
+    from pmcp.config.loader import manifest_server_to_config
+    from pmcp.env_store import sanitized_subprocess_env
+
+    runtime = manifest_server_to_config(context7, project_root=tmp_path)
+    assert (
+        sanitized_subprocess_env(runtime.config.env, tmp_path).get("CONTEXT7_API_KEY")
+        == stored_key
+    )
+    other_runtime = manifest_server_to_config(
+        manifest.servers["playwright"], project_root=tmp_path
+    )
+    assert "CONTEXT7_API_KEY" not in sanitized_subprocess_env(
+        other_runtime.config.env, tmp_path
+    )
 
 
 def test_manifest_remote_server_config():
