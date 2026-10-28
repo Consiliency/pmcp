@@ -8,7 +8,8 @@ on:
   # 1.21.0 could have broken with ZERO commits to this repo: mcp 2.0.0 was
   # published after the last CI run and nothing re-ran to notice. Push/PR
   # triggers cannot catch a dependency that moves underneath a released
-  # package, so run weekly against the released artifact.
+  # package. This weekly lane tests main source with newest admitted dependencies;
+  # published-wheel.yml separately observes the actual current PyPI wheel.
   schedule:
     - cron: "0 8 * * 1"
   workflow_dispatch:
