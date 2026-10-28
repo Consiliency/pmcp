@@ -92,6 +92,11 @@ release-node-removed|1|[release]|remove explicit release Node environment
 release-xml-root|1|[release]|write runner coverage data into the release source tree
 release-history-shallow|1|[release]|remove full release history
 release-suite-env-filter|1|[release]|filter the full suite through environment overrides
+release-bundle-hidden|1|[release]|exclude the hidden verified bundle from upload
+release-verifier-env|1|[release]|override downstream identity verification environment
+release-notes-mutated|1|[release]|replace the step between hash verification and upload
+release-artifact-unverified|1|[release]|remove publish-side archive hash verification
+release-artifact-path-widened|1|[release]|publish manifest/reports alongside distributions
 diagnostics-upload-raw|1|[diagnostics]|upload raw reports instead of reconstructed safe output
 diagnostics-upload-ungated|1|[diagnostics]|upload despite sanitizer failure
 diagnostics-sanitize-not-always|1|[diagnostics]|omit failure-path sanitization
@@ -320,7 +325,7 @@ needs-build-dropped)
 ' ''
 	;;
 needs-publish-to-build)
-	replace "$RELEASE" '    needs: publish' '    needs: build'
+	replace "$RELEASE" '    needs: [publish, build]' '    needs: build'
 	;;
 needs-as-list)
 	replace "$RELEASE" '    needs: build' '    needs: [build]'
@@ -390,10 +395,7 @@ forked-action)
 		'uses: attacker-fork/gh-action-pypi-publish@\1'
 	;;
 permissions-job-widened)
-	replace "$RELEASE" '      id-token: write  # Required for trusted publishing
-' '      id-token: write  # Required for trusted publishing
-      contents: write
-'
+	replace_re "$RELEASE" '(?s)(  publish:.*?    permissions:\n      id-token: write[^\n]*\n)      contents: read\n' '\1      contents: write\n'
 	;;
 permissions-workflow-level)
 	replace "$RELEASE" '
@@ -530,6 +532,21 @@ release-history-shallow)
 	;;
 release-suite-env-filter)
 	replace "$RELEASE" '      - name: Run tests with coverage' $'      - name: Run tests with coverage\n        env:\n          PYTEST_ADDOPTS: "-k nothing"'
+	;;
+release-bundle-hidden)
+	replace "$RELEASE" '          include-hidden-files: true' '          include-hidden-files: false'
+	;;
+release-verifier-env)
+	replace_re "$RELEASE" '(?s)(  publish:.*?      - name: Verify artifact identity)\n' '\1\n        env:\n          GIT_CONFIG_COUNT: "0"\n'
+	;;
+release-notes-mutated)
+	replace_re "$RELEASE" '(?s)(      - name: Extract release notes\n        run: \|\n).*?(?=\n      - name: Create GitHub Release)' '\1          echo bypass\n'
+	;;
+release-artifact-unverified)
+	replace_re "$RELEASE" '(?s)(  publish:.*?)(      - name: Verify artifact identity\n        run: python3 -I -B scripts/verify_release_bundle\.py \.release-bundle\n)' '\1'
+	;;
+release-artifact-path-widened)
+	replace "$RELEASE" '          packages-dir: .release-bundle/dist/' '          packages-dir: .release-bundle/'
 	;;
 diagnostics-upload-raw)
 	replace "$TEST_WF" '          path: .ci-reports/safe/' '          path: .ci-reports/raw/'
