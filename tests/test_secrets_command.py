@@ -14,11 +14,76 @@ import pytest
 
 from pmcp.cli import parse_args
 from pmcp.cli_commands.secrets import (
+    _extract_required_keys,
     run_secrets_check,
     run_secrets_set,
     run_secrets_sync,
 )
 from pmcp.env_store import read_env_file, write_env_file
+from pmcp.manifest.loader import Manifest, ServerConfig
+from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+
+
+@pytest.mark.parametrize(
+    "required,relaxed", [(False, False), (True, True), (True, False)]
+)
+@pytest.mark.parametrize("namespaced", [False, True])
+def test_credential_values_are_not_scanned_for_required_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    required: bool,
+    relaxed: bool,
+    namespaced: bool,
+) -> None:
+    extra_env = {"SERVICE_URL": "http://localhost:3002"} if relaxed else {}
+    storage_key = "PRIVATE_API_TOKEN" if namespaced else "API_TOKEN"
+    server = ServerConfig(
+        name="credential-test",
+        description="Credential diagnostic regression",
+        keywords=[],
+        install={},
+        command="npx",
+        args=[],
+        env_var="API_TOKEN",
+        secret_key=storage_key if namespaced else None,
+        requires_api_key=required,
+        api_key_optional_when=["SERVICE_URL"] if relaxed else [],
+        extra_env=extra_env,
+    )
+    config = ResolvedServerConfig(
+        name=server.name,
+        source="user",
+        config=LocalMcpServerConfig(
+            command="npx",
+            env={
+                **extra_env,
+                "API_TOKEN": "synthetic$SECRET_FRAGMENT",
+                storage_key: "synthetic$SECRET_FRAGMENT",
+                "CONFIG_PATH": "$CONFIG_ROOT",
+            },
+        ),
+    )
+    manifest = Manifest(
+        version="1.0",
+        cli_alternatives={},
+        servers={server.name: server},
+        discovery_queue_path="",
+    )
+    monkeypatch.setattr("pmcp.cli_commands.secrets.load_configs", lambda **_: [config])
+    monkeypatch.setattr(
+        "pmcp.cli_commands.secrets._manifest_for",
+        lambda _: manifest,
+    )
+
+    keys, per_server, _, fallbacks = _extract_required_keys(tmp_path)
+    expected = {"CONFIG_PATH", "CONFIG_ROOT"}
+    if required and not relaxed:
+        expected.add(storage_key)
+    assert set(keys) == expected
+    assert set(per_server[server.name]) == expected
+    assert fallbacks == (
+        {storage_key: "API_TOKEN"} if required and not relaxed and namespaced else {}
+    )
 
 
 class TestSecretsParseArgs:

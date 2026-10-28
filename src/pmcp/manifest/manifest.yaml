@@ -173,6 +173,7 @@ servers:
     command_windows: "cmd"
     args_windows: ["/c", "npx", "-y", "@upstash/context7-mcp"]
     requires_api_key: false
+    env_var: "CONTEXT7_API_KEY"
     # Optional: CONTEXT7_API_KEY for higher rate limits (60 req/hr without)
 
   # === Reference Servers (from modelcontextprotocol/servers) ===

@@ -444,6 +444,32 @@ class TestGate5SecretsCheck:
 
 class TestGate7RunInit:
     @pytest.mark.asyncio
+    async def test_context7_reports_optional_credential(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from pmcp.cli import run_init
+
+        _pin_manifest_path(monkeypatch, SHIPPED_MANIFEST_PATH)
+        monkeypatch.setenv("CONTEXT7_API_KEY", "")
+        project = tmp_path / "project"
+        with patch(
+            "builtins.input",
+            side_effect=lambda prompt: "y" if "context7" in prompt else "",
+        ):
+            await run_init(argparse.Namespace(project=project, force=False))
+
+        output = capsys.readouterr().out
+        assert "Optional credential: CONTEXT7_API_KEY" in output
+        assert "self-hosted" not in output
+        assert "None" not in output
+        assert (
+            "context7" in json.loads((project / ".mcp.json").read_text())["mcpServers"]
+        )
+
+    @pytest.mark.asyncio
     async def test_relaxed_server_prints_no_credential_needed(
         self,
         tmp_path: Path,

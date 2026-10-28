@@ -1796,11 +1796,13 @@ async def run_init(args: argparse.Namespace) -> None:
                             f"`pmcp secrets set {storage_key}` (it prompts for "
                             f"the value)"
                         )
-                else:
+                elif requirement.relaxed_by:
                     print(
                         f"    No credential needed — {requirement.relaxed_by} "
                         f"selects a self-hosted endpoint"
                     )
+                else:
+                    print(f"    Optional credential: {server.env_var}")
 
             selected_servers[name] = config
             print(f"    Added {name}")

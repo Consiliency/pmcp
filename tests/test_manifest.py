@@ -426,6 +426,47 @@ def test_manifest_server_config():
     assert playwright.auto_start is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_key", [None, "context7-test-key"])
+async def test_context7_optional_stored_key_reaches_only_its_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stored_key: str | None
+) -> None:
+    """Stored Context7 credentials survive stripping without gating anonymous use."""
+    # Register an undo even when absent: startup loading writes environ directly.
+    monkeypatch.setenv("CONTEXT7_API_KEY", "")
+    monkeypatch.delenv("CONTEXT7_API_KEY")
+    store = Path.home() / ".config" / "pmcp" / "pmcp.env"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(
+        f"CONTEXT7_API_KEY={stored_key}\n" if stored_key is not None else ""
+    )
+    manifest = load_manifest(_REPO_ROOT / "src/pmcp/manifest/manifest.yaml")
+    context7 = manifest.servers["context7"]
+    assert context7.requires_api_key is False
+    await check_api_key(context7, project_root=tmp_path)
+    env = build_install_child_env(context7, project_root=tmp_path)
+    assert env.get("CONTEXT7_API_KEY") == stored_key
+    other_env = build_install_child_env(
+        manifest.servers["playwright"], project_root=tmp_path
+    )
+    assert "CONTEXT7_API_KEY" not in other_env
+
+    from pmcp.config.loader import manifest_server_to_config
+    from pmcp.env_store import sanitized_subprocess_env
+
+    runtime = manifest_server_to_config(context7, project_root=tmp_path)
+    assert (
+        sanitized_subprocess_env(runtime.config.env, tmp_path).get("CONTEXT7_API_KEY")
+        == stored_key
+    )
+    other_runtime = manifest_server_to_config(
+        manifest.servers["playwright"], project_root=tmp_path
+    )
+    assert "CONTEXT7_API_KEY" not in sanitized_subprocess_env(
+        other_runtime.config.env, tmp_path
+    )
+
+
 def test_manifest_remote_server_config():
     """Test remote server config structure."""
     manifest = load_manifest()
