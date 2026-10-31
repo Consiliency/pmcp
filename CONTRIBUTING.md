@@ -23,7 +23,8 @@ pytest with the same Python interpreter, so use the prepared project environment
 Each invocation creates a private `pmcp-pytest-*` directory under `$TMPDIR`
 (default `/var/tmp`), owns pytest's `--basetemp` and child temp variables, and
 removes that directory after success, failure or interruption once pytest and
-the processes left in its process group have exited.
+the processes it left behind have exited (see `plans/verification-template.md`
+for platform coverage).
 Do not supply a fixed `--basetemp`, including through `PYTEST_ADDOPTS`.
 
 ```bash

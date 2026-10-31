@@ -33,6 +33,18 @@ def runner_env(tmp_path: Path) -> dict[str, str]:
         "  signal.signal(s, lambda *_: sys.exit(result))\n"
         " else:\n"
         "  signal.signal(s, signal.SIG_DFL)\n"
+        "if os.environ.get('DETACHED') == '1':\n"
+        " code = ('import os, pathlib, sys, time\\n'\n"
+        "         'log = pathlib.Path(sys.argv[1])\\n'\n"
+        "         'while True:\\n'\n"
+        "         '    with log.open(\"a\") as f:\\n'\n"
+        '         \'        f.write("ok\\\\n" if os.path.isdir(os.environ["TMPDIR"]) else "missing\\\\n")\\n\'\n'
+        "         '    time.sleep(0.02)\\n')\n"
+        " d = subprocess.Popen([sys.executable, '-c', code, os.environ['DETACHED_LOG']],"
+        " start_new_session=True)\n"
+        " record['detached'] = d.pid\n"
+        " while not pathlib.Path(os.environ['DETACHED_LOG']).exists():\n"
+        "  time.sleep(0.01)\n"
         "if os.environ.get('GRANDCHILD') == '1':\n"
         " g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
         " record['grandchild'] = g.pid\n"
@@ -128,8 +140,12 @@ def _start_waiting(runner_env: dict[str, str]) -> subprocess.Popen[str]:
         stderr=subprocess.PIPE,
         text=True,
     )
-    assert child.stdout is not None
-    assert child.stdout.readline().strip() == "ready"
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "ready"
+    except BaseException:
+        _stop(child, runner_env)
+        raise
     return child
 
 
@@ -137,12 +153,13 @@ def _stop(child: subprocess.Popen[str], runner_env: dict[str, str]) -> None:
     """Never leave the runner or its stand-in pytest behind after a failure."""
     if child.poll() is None:
         child.kill()
-        child.communicate(timeout=10)
     receipt = Path(runner_env["RECEIPT"])
     if receipt.exists():
-        pid = json.loads(receipt.read_text())["pid"]
-        if _pid_alive(pid):
-            os.kill(pid, signal.SIGKILL)
+        record = json.loads(receipt.read_text())
+        for key in ("pid", "grandchild", "detached"):
+            if key in record and _pid_alive(record[key]):
+                os.kill(record[key], signal.SIGKILL)
+    child.communicate(timeout=10)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -211,14 +228,37 @@ def test_group_members_stop_before_scratch_is_removed(
             stderr=subprocess.PIPE,
         )
         child.communicate(timeout=30)
-    grandchild = json.loads(Path(runner_env["RECEIPT"]).read_text())["grandchild"]
     try:
+        grandchild = json.loads(Path(runner_env["RECEIPT"]).read_text())["grandchild"]
         assert child.returncode == 4
         assert not _pid_alive(grandchild)
         assert not list(Path(runner_env["TMPDIR"]).iterdir())
     finally:
-        if _pid_alive(grandchild):
-            os.kill(grandchild, signal.SIGKILL)
+        _stop(child, runner_env)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper")
+def test_detached_descendant_stops_before_scratch_is_removed(
+    runner_env: dict[str, str], tmp_path: Path
+) -> None:
+    log = tmp_path / "detached.log"
+    runner_env.update({"DETACHED": "1", "DETACHED_LOG": str(log), "RESULT": "3"})
+    child = subprocess.Popen(
+        [sys.executable, str(RUNNER), "--", "-q"],
+        env=runner_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        child.communicate(timeout=30)
+        detached = json.loads(Path(runner_env["RECEIPT"]).read_text())["detached"]
+        assert child.returncode == 3
+        # The runner adopted and stopped it, so it never saw scratch missing.
+        assert not _pid_alive(detached)
+        assert "missing" not in log.read_text()
+        assert not list(Path(runner_env["TMPDIR"]).iterdir())
+    finally:
+        _stop(child, runner_env)
 
 
 @pytest.mark.skipif(
