@@ -8,7 +8,8 @@
   change shared tools/environments to run a test.
 - Every new plan's verification commands must use this runner (see
   `plans/verification-template.md`). It creates a unique private directory and
-  removes it after success, failure, SIGINT or SIGTERM, once pytest exits.
+  removes it after success, failure, SIGINT, SIGTERM or SIGHUP, once pytest and
+  the rest of its process group exit. It returns pytest's own exit status.
 - Do not copy fixed `--basetemp` paths from old plans into new runs, including
   `/var/tmp/pmcp-*-bt*`, issue-numbered scratch folders, or `$WORKTREE_ROOT` paths.
   These old commands do not define the current convention.

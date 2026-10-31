@@ -22,14 +22,17 @@ Use the scratch-owning runner below in new plans and local runs. It invokes
 pytest with the same Python interpreter, so use the prepared project environment.
 Each invocation creates a private `pmcp-pytest-*` directory under `$TMPDIR`
 (default `/var/tmp`), owns pytest's `--basetemp` and child temp variables, and
-removes that directory after success, failure or interruption once pytest exits.
+removes that directory after success, failure or interruption once pytest and
+the processes left in its process group have exited.
 Do not supply a fixed `--basetemp`, including through `PYTEST_ADDOPTS`.
 
 ```bash
 # Run all tests (live and slow tests are deselected by default)
 uv run --locked python scripts/pytest_temp.py --
 
-# What CI runs (coverage must stay at or above 60%)
+# Full suite locally, parallel with coverage (coverage must stay at or above 60%).
+# Hosted CI's exact commands, including its extra reporting flags, live in
+# .github/workflows/test.yml, release.yml and windows.yml.
 uv run --locked python scripts/pytest_temp.py -- tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml --cov-report=term-missing
 
 # Run with coverage
