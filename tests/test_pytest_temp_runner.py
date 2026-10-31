@@ -20,11 +20,12 @@ def runner_env(tmp_path: Path) -> dict[str, str]:
     modules = tmp_path / "modules"
     modules.mkdir()
     (modules / "pytest.py").write_text(
-        "import json, os, pathlib, signal, subprocess, sys, time\n"
+        "import json, os, pathlib, signal, subprocess, sys, tempfile, time\n"
         "base = pathlib.Path([a.split('=', 1)[1] for a in sys.argv if a.startswith('--basetemp=')][-1])\n"
         "base.mkdir()\n"
         "(base / 'scratch.txt').write_text('disposable')\n"
-        "record = {'base': str(base), 'tmp': os.environ['TMPDIR']}\n"
+        "record = {'base': str(base), 'tmp': os.environ['TMPDIR'],"
+        " 'gettempdir': tempfile.gettempdir(), 'pid': os.getpid()}\n"
         "result = int(os.environ.get('RESULT', '0'))\n"
         "handled = [s for s in (signal.SIGINT, signal.SIGTERM, getattr(signal, 'SIGHUP', None)) if s]\n"
         "for s in handled:\n"
@@ -42,7 +43,7 @@ def runner_env(tmp_path: Path) -> dict[str, str]:
         " os.chmod(locked / 'inner', 0)\n"
         " os.chmod(locked, 0o500)\n"
         "if os.environ.get('LOCK_PARENT') == '1':\n"
-        " os.chmod(base.parent.parent, 0o500)\n"
+        " os.chmod(pathlib.Path(os.environ['TMPDIR']).parent.parent, 0o500)\n"
         "pathlib.Path(os.environ['RECEIPT']).write_text(json.dumps(record))\n"
         "if os.environ.get('WAIT') == '1':\n"
         " print('ready', flush=True)\n"
@@ -73,8 +74,12 @@ def test_success_and_failure_remove_only_owned_scratch(
     )
     assert completed.returncode == result
     record = json.loads(Path(runner_env["RECEIPT"]).read_text())
-    assert Path(record["base"]).parent == Path(record["tmp"]).parent
-    assert not Path(record["base"]).parent.exists()
+    # tmp_path must sit under tempfile.gettempdir(): pmcp's project-root walk
+    # stops there, so it cannot climb into the shared parent directory.
+    base, tmp = Path(record["base"]), Path(record["tmp"])
+    assert base.parent == tmp
+    assert base.is_relative_to(Path(record["gettempdir"]))
+    assert not tmp.parent.exists()
     assert list(parent.iterdir()) == [sentinel]
 
 
@@ -90,11 +95,12 @@ def test_keep_evidence_is_explicit_and_each_run_is_unique(
         )
         assert result.returncode == 0
         base = Path(json.loads(Path(runner_env["RECEIPT"]).read_text())["base"])
+        root = base.parent.parent
         assert (base / "scratch.txt").read_text() == "disposable"
-        assert str(base.parent).encode() in result.stderr
+        assert str(root).encode() in result.stderr
         if os.name == "posix":
-            assert base.parent.stat().st_mode & 0o777 == 0o700
-        roots.append(base.parent)
+            assert root.stat().st_mode & 0o777 == 0o700
+        roots.append(root)
     assert roots[0] != roots[1]
 
 
@@ -127,6 +133,18 @@ def _start_waiting(runner_env: dict[str, str]) -> subprocess.Popen[str]:
     return child
 
 
+def _stop(child: subprocess.Popen[str], runner_env: dict[str, str]) -> None:
+    """Never leave the runner or its stand-in pytest behind after a failure."""
+    if child.poll() is None:
+        child.kill()
+        child.communicate(timeout=10)
+    receipt = Path(runner_env["RECEIPT"])
+    if receipt.exists():
+        pid = json.loads(receipt.read_text())["pid"]
+        if _pid_alive(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -153,9 +171,7 @@ def test_interruption_waits_for_pytest_then_cleans(
         assert child.returncode == 128 + signum
         assert not list(Path(runner_env["TMPDIR"]).iterdir())
     finally:
-        if child.poll() is None:
-            child.kill()
-            child.communicate(timeout=10)
+        _stop(child, runner_env)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signal forwarding")
@@ -172,9 +188,7 @@ def test_interrupted_pytest_exit_status_is_preserved(
         assert child.returncode == 3
         assert not list(Path(runner_env["TMPDIR"]).iterdir())
     finally:
-        if child.poll() is None:
-            child.kill()
-            child.communicate(timeout=10)
+        _stop(child, runner_env)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups")

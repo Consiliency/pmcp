@@ -424,6 +424,18 @@
       "touched_by_phases": [
         "SEAL"
       ]
+    },
+    "AGENTS.md": {
+      "purpose": "repository agent instructions (pytest scratch runner convention)",
+      "touched_by_phases": []
+    },
+    "CLAUDE.md": {
+      "purpose": "Claude Code entry point; imports AGENTS.md",
+      "touched_by_phases": []
+    },
+    "plans/verification-template.md": {
+      "purpose": "verification-command template for new plans (pytest scratch runner)",
+      "touched_by_phases": []
     }
   }
 }

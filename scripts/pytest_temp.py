@@ -124,7 +124,7 @@ def main() -> int:
     parent = os.environ.get("TMPDIR") or (
         "/var/tmp" if POSIX else tempfile.gettempdir()
     )
-    root = Path(tempfile.mkdtemp(prefix="pmcp-pytest-", dir=parent))
+    root: Path | None = None
     child: subprocess.Popen[bytes] | None = None
     interrupted = 0
     status = 1
@@ -154,9 +154,11 @@ def main() -> int:
         signums.append(signal.SIGHUP)
     handlers = {sig: signal.getsignal(sig) for sig in signums}
     group_drained = True
+    # Install the handlers before creating scratch, so no signal can leave it behind.
+    for sig in handlers:
+        signal.signal(sig, forward)
     try:
-        for sig in handlers:
-            signal.signal(sig, forward)
+        root = Path(tempfile.mkdtemp(prefix="pmcp-pytest-", dir=parent))
         scratch = root / "tmp"
         scratch.mkdir()
         env = {
@@ -167,7 +169,7 @@ def main() -> int:
         }
         print(f"pytest scratch: {root}", file=sys.stderr, flush=True)
         child = subprocess.Popen(
-            [sys.executable, "-m", "pytest", *args, f"--basetemp={root / 'pytest'}"],
+            [sys.executable, "-m", "pytest", *args, f"--basetemp={scratch / 'pytest'}"],
             env=env,
             start_new_session=POSIX,
         )
@@ -186,7 +188,9 @@ def main() -> int:
                 group_drained = _drain_group(child.pid)
         if child is None and interrupted:
             status = 128 + interrupted
-        if options.keep_temp:
+        if root is None:
+            pass
+        elif options.keep_temp:
             print(f"Retained pytest evidence: {root}", file=sys.stderr)
         elif not group_drained:
             print(
