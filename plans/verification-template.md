@@ -28,8 +28,9 @@ pytest's whole process group. Before deleting anything it stops every process
 pytest left behind: on Linux it registers as a child subreaper, so descendants that
 started their own session are adopted and stopped too; on macOS only pytest's
 process group is covered; on Windows only pytest itself. If a left-over process
-will not exit, the scratch is retained and named on stderr. It propagates pytest's
-exit status. If scratch cannot be
+will not exit, the scratch is retained and named on stderr. A signal the caller
+already ignores (for example SIGHUP under `nohup`) stays ignored. It propagates
+pytest's exit status. If scratch cannot be
 removed, the runner names the retained path on stderr and still returns pytest's
 status. Never pipe through `tee` without preserving the test exit status.
 

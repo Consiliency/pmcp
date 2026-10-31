@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 from pathlib import Path
 import shlex
@@ -145,12 +146,24 @@ def _remove_owned(root: Path) -> None:
     """
 
     owned = os.path.abspath(root)
+    granted: set[str] = set()
 
     def grant(target: str) -> None:
         target = os.path.abspath(target)
+        if target in granted:
+            return  # granting again cannot help; let the caller's error stand
         if os.path.commonpath([owned, target]) != owned or os.path.islink(target):
             raise PermissionError(f"not owned scratch: {target}")
-        os.chmod(target, stat.S_IMODE(os.lstat(target).st_mode) | stat.S_IRWXU)
+        granted.add(target)
+        mode = stat.S_IMODE(os.lstat(target).st_mode) | stat.S_IRWXU
+        try:
+            os.chmod(target, mode, follow_symlinks=False)
+        except NotImplementedError:
+            os.chmod(target, mode)  # platform cannot refuse symlinks here
+        except OSError as exc:
+            if exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
+            os.chmod(target, mode)
 
     def retry(func: Callable[..., Any], path: str, error: Any) -> None:
         exc = error[1] if isinstance(error, tuple) else error
@@ -172,6 +185,8 @@ def _remove_owned(root: Path) -> None:
                 os.unlink(path)
             except FileNotFoundError:
                 pass
+        elif os.path.abspath(path) in granted:
+            raise exc  # already granted once: do not recurse again
         else:
             # The directory itself could not be listed or opened.
             grant(path)
@@ -246,7 +261,13 @@ def main() -> int:
     signums = [signal.SIGINT, signal.SIGTERM]
     if POSIX:
         signums.append(signal.SIGHUP)
-    handlers = {sig: signal.getsignal(sig) for sig in signums}
+    # Leave an inherited SIG_IGN alone (nohup, background jobs): pytest inherits
+    # it too, so the run keeps the protection its caller asked for.
+    handlers = {
+        sig: handler
+        for sig in signums
+        if (handler := signal.getsignal(sig)) is not signal.SIG_IGN
+    }
     group_drained = True
     _become_subreaper()
     # Install the handlers before creating scratch, so no signal can leave it behind.
@@ -283,26 +304,30 @@ def main() -> int:
                 _wait_unreaped(child)
                 group_drained = _drain(child.pid)
             child.wait()
-        if child is None and interrupted:
-            status = 128 + interrupted
-        if root is None:
-            pass
-        elif options.keep_temp:
-            print(f"Retained pytest evidence: {root}", file=sys.stderr)
-        elif not group_drained:
-            print(
-                f"Retained pytest scratch {root}: processes pytest started "
-                "did not exit",
-                file=sys.stderr,
-            )
-        else:
-            try:
-                _remove_owned(root)
-            except OSError as exc:
-                print(f"Could not remove pytest scratch {root}: {exc}", file=sys.stderr)
-        # Restore last, so a second interrupt cannot abort the removal midway.
-        for sig, handler in handlers.items():
-            signal.signal(sig, handler)
+        try:
+            if root is None:
+                pass
+            elif options.keep_temp:
+                print(f"Retained pytest evidence: {root}", file=sys.stderr)
+            elif not group_drained:
+                print(
+                    f"Retained pytest scratch {root}: processes pytest started "
+                    "did not exit",
+                    file=sys.stderr,
+                )
+            else:
+                try:
+                    _remove_owned(root)
+                except Exception as exc:  # e.g. RecursionError on a very deep tree
+                    print(
+                        f"Could not remove pytest scratch {root}: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+        finally:
+            # Restore last, so a second interrupt cannot abort the removal midway.
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
     return status
 
 

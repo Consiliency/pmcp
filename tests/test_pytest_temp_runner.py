@@ -28,26 +28,28 @@ def runner_env(tmp_path: Path) -> dict[str, str]:
         " 'gettempdir': tempfile.gettempdir(), 'pid': os.getpid()}\n"
         "result = int(os.environ.get('RESULT', '0'))\n"
         "handled = [s for s in (signal.SIGINT, signal.SIGTERM, getattr(signal, 'SIGHUP', None)) if s]\n"
-        "for s in handled:\n"
+        "for s in handled if os.environ.get('KEEP_DISPOSITION') != '1' else []:\n"
         " if os.environ.get('HANDLE') == '1':\n"
         "  signal.signal(s, lambda *_: sys.exit(result))\n"
         " else:\n"
         "  signal.signal(s, signal.SIG_DFL)\n"
-        "if os.environ.get('DETACHED') == '1':\n"
-        " code = ('import os, pathlib, sys, time\\n'\n"
+        "code = ('import os, pathlib, sys, time\\n'\n"
         "         'log = pathlib.Path(sys.argv[1])\\n'\n"
         "         'while True:\\n'\n"
         "         '    with log.open(\"a\") as f:\\n'\n"
         '         \'        f.write("ok\\\\n" if os.path.isdir(os.environ["TMPDIR"]) else "missing\\\\n")\\n\'\n'
         "         '    time.sleep(0.02)\\n')\n"
+        "if os.environ.get('DETACHED') == '1':\n"
         " d = subprocess.Popen([sys.executable, '-c', code, os.environ['DETACHED_LOG']],"
         " start_new_session=True)\n"
         " record['detached'] = d.pid\n"
         " while not pathlib.Path(os.environ['DETACHED_LOG']).exists():\n"
         "  time.sleep(0.01)\n"
         "if os.environ.get('GRANDCHILD') == '1':\n"
-        " g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        " g = subprocess.Popen([sys.executable, '-c', code, os.environ['GRANDCHILD_LOG']])\n"
         " record['grandchild'] = g.pid\n"
+        " while not pathlib.Path(os.environ['GRANDCHILD_LOG']).exists():\n"
+        "  time.sleep(0.01)\n"
         "if os.environ.get('LOCK') == '1':\n"
         " locked = base / 'locked'\n"
         " (locked / 'inner').mkdir(parents=True)\n"
@@ -59,12 +61,22 @@ def runner_env(tmp_path: Path) -> dict[str, str]:
         " ro.mkdir()\n"
         " (ro / 'via').symlink_to(os.environ['SYMLINK_TARGET'])\n"
         " os.chmod(ro, 0o500)\n"
+        "if os.environ.get('NOSEARCH') == '1':\n"
+        " vault = base / 'vault'\n"
+        " (vault / 'sub').mkdir(parents=True)\n"
+        " (vault / 'sub' / 'file').write_text('x')\n"
+        " os.chmod(vault, 0o600)\n"
+        "if os.environ.get('DEEP'):\n"
+        " d = base\n"
+        " for _ in range(int(os.environ['DEEP'])):\n"
+        "  d = d / 'd'\n"
+        "  os.mkdir(d)\n"
         "if os.environ.get('LOCK_PARENT') == '1':\n"
         " os.chmod(pathlib.Path(os.environ['TMPDIR']).parent.parent, 0o500)\n"
         "pathlib.Path(os.environ['RECEIPT']).write_text(json.dumps(record))\n"
         "if os.environ.get('WAIT') == '1':\n"
         " print('ready', flush=True)\n"
-        " time.sleep(60)\n"
+        " time.sleep(float(os.environ.get('WAIT_SECONDS', '60')))\n"
         "sys.exit(result)\n"
     )
     parent = tmp_path / "scratch-parent"
@@ -218,8 +230,8 @@ def test_interrupted_pytest_exit_status_is_preserved(
 def test_group_members_stop_before_scratch_is_removed(
     runner_env: dict[str, str], interrupt: bool
 ) -> None:
-    runner_env["GRANDCHILD"] = "1"
-    runner_env["RESULT"] = "4"
+    log = Path(runner_env["RECEIPT"]).with_name("grandchild.log")
+    runner_env.update({"GRANDCHILD": "1", "GRANDCHILD_LOG": str(log), "RESULT": "4"})
     if interrupt:
         runner_env["HANDLE"] = "1"
         child = _start_waiting(runner_env)
@@ -238,6 +250,8 @@ def test_group_members_stop_before_scratch_is_removed(
         grandchild = json.loads(Path(runner_env["RECEIPT"]).read_text())["grandchild"]
         assert child.returncode == 4
         assert not _pid_alive(grandchild)
+        # Ordering oracle: it was stopped before the scratch was removed.
+        assert "missing" not in log.read_text()
         assert not list(Path(runner_env["TMPDIR"]).iterdir())
     finally:
         _stop(child, runner_env)
@@ -302,6 +316,86 @@ def test_symlink_in_read_only_dir_is_removed_not_followed(
     assert not list(Path(runner_env["TMPDIR"]).iterdir())
     assert target.read_text() == "keep"
     assert target.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0, reason="POSIX permissions, non-root"
+)
+def test_directory_without_search_permission_is_removed(
+    runner_env: dict[str, str],
+) -> None:
+    runner_env.update({"NOSEARCH": "1", "RESULT": "3"})
+    completed = subprocess.run(
+        [sys.executable, str(RUNNER), "--", "-q"], env=runner_env, capture_output=True
+    )
+    assert completed.returncode == 3, completed.stderr
+    assert not list(Path(runner_env["TMPDIR"]).iterdir())
+
+
+def test_very_deep_scratch_keeps_status_without_traceback(
+    runner_env: dict[str, str],
+) -> None:
+    runner_env.update({"DEEP": "1100", "RESULT": "3"})
+    completed = subprocess.run(
+        [sys.executable, str(RUNNER), "--", "-q"],
+        env=runner_env,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 3
+    assert "Traceback" not in completed.stderr
+    leftovers = list(Path(runner_env["TMPDIR"]).iterdir())
+    # Removed, or retained with a notice naming it (3.10's recursive rmtree).
+    assert not leftovers or f"Could not remove pytest scratch {leftovers[0]}" in (
+        completed.stderr
+    )
+    for leftover in leftovers:
+        _deep_remove(leftover)
+
+
+def _deep_remove(path: Path) -> None:
+    """Remove a tree too deep for recursive helpers on older Pythons."""
+    stack = [str(path)]
+    while stack:
+        current = stack[-1]
+        with os.scandir(current) as entries:
+            subdirs = []
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    subdirs.append(entry.path)
+                else:
+                    os.unlink(entry.path)
+        if subdirs:
+            stack.extend(subdirs)
+        else:
+            os.rmdir(stack.pop())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX nohup semantics")
+def test_inherited_sighup_ignore_is_kept(runner_env: dict[str, str]) -> None:
+    runner_env.update({"KEEP_DISPOSITION": "1", "WAIT_SECONDS": "1"})
+    runner_env["WAIT"] = "1"
+
+    def ignore_hangup() -> None:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    child = subprocess.Popen(
+        [sys.executable, str(RUNNER), "--", "-q"],
+        env=runner_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        preexec_fn=ignore_hangup,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "ready"
+        child.send_signal(signal.SIGHUP)
+        child.communicate(timeout=20)
+        assert child.returncode == 0
+        assert not list(Path(runner_env["TMPDIR"]).iterdir())
+    finally:
+        _stop(child, runner_env)
 
 
 @pytest.mark.skipif(
