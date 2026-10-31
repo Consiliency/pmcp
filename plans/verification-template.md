@@ -25,13 +25,20 @@ uv run --locked python scripts/pytest_temp.py -- tests/test_policy.py -q \
 The runner removes scratch after passing or failing tests, and after interrupt,
 termination or hangup, once pytest exits. On POSIX it forwards those signals to
 pytest's whole process group. Before deleting anything it stops every process
-pytest left behind: on Linux it registers as a child subreaper, so descendants that
-started their own session are adopted and stopped too; on macOS only pytest's
-process group is covered; on Windows only pytest itself. If a left-over process
-will not exit, the scratch is retained and named on stderr. A signal the caller
-already ignores (for example SIGHUP under `nohup`) stays ignored. It propagates
-pytest's exit status. If scratch cannot be
-removed, the runner names the retained path on stderr and still returns pytest's
+pytest left behind:
+
+- Linux: the runner is a child subreaper, so every orphaned descendant (including
+  ones that started their own session) is adopted, reaped as soon as it exits, and
+  stopped after pytest exits. Scratch is removed only once the kernel reports no
+  remaining children. If the subreaper cannot be enabled, or that cannot be
+  confirmed, scratch is retained and the reason is printed.
+- macOS: only pytest's process group is signalled (TERM, then KILL); descendants
+  that started their own session are not tracked.
+- Windows: only pytest itself is stopped.
+
+A signal the caller already ignores (for example SIGHUP under `nohup`) stays
+ignored. The runner returns pytest's exit status. If scratch is retained or
+cannot be removed, the runner names the path on stderr and still returns pytest's
 status. Never pipe through `tee` without preserving the test exit status.
 
 If raw scratch must be reviewed, explicitly opt in before the declared run:

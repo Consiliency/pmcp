@@ -19,9 +19,13 @@ from typing import Any, Callable
 
 POSIX = os.name == "posix"
 LINUX = sys.platform.startswith("linux")
+# Unreaped waits keep pytest's pid and process-group id reserved while
+# left-over processes are signalled (os.waitid reached macOS in 3.13).
+HAVE_WAITID = hasattr(os, "waitid") and hasattr(os, "WNOWAIT")
 # Seconds left-over processes get after SIGTERM before SIGKILL, and after
 # SIGKILL before the runner gives up and retains the scratch.
 GROUP_GRACE = 5.0
+POLL = 0.01
 PR_SET_CHILD_SUBREAPER = 36
 
 
@@ -35,13 +39,17 @@ def _become_subreaper() -> bool:
 
         libc = ctypes.CDLL(None, use_errno=True)
         return bool(libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0)
-    except (OSError, AttributeError):
+    except (ImportError, OSError, AttributeError):
         return False
 
 
-def _processes() -> list[tuple[int, int, int, str]]:
-    """(pid, ppid, pgrp, state) for every process visible in /proc."""
-    rows = []
+def _status(result: int) -> int:
+    return 128 - result if result < 0 else result
+
+
+def _live(predicate: Callable[[int, int, int], bool]) -> list[int]:
+    """Pids of live (non-zombie) processes in /proc matching (pid, ppid, pgrp)."""
+    found = []
     for name in os.listdir("/proc"):
         if not name.isdigit():
             continue
@@ -51,91 +59,142 @@ def _processes() -> list[tuple[int, int, int, str]]:
         except OSError:
             continue
         fields = data[data.rindex(")") + 2 :].split()
-        rows.append((int(name), int(fields[1]), int(fields[2]), fields[0]))
-    return rows
+        pid, state = int(name), fields[0]
+        if state not in ("Z", "X") and predicate(pid, int(fields[1]), int(fields[2])):
+            found.append(pid)
+    return found
 
 
-def _leftovers(leader: int) -> tuple[bool, list[int]]:
-    """Whether pytest's group still has a live member, and our live children.
+def _await_exit_unreaped(pid: int, adopting: bool) -> None:
+    """Wait for pytest to exit without reaping it.
 
-    Reaps adopted zombies. The exited pytest leader stays unreaped throughout.
+    While waiting, reap adopted orphans as soon as they exit, so a killed test
+    process does not linger as a zombie that still looks alive to the tests.
     """
-    me = os.getpid()
-    group_alive = False
-    children = []
-    for pid, ppid, pgrp, state in _processes():
-        if pid == leader:
-            continue
-        if ppid == me and state in ("Z", "X"):
-            try:
-                os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                pass
-            continue
-        if state in ("Z", "X"):
-            continue
-        if pgrp == leader:
-            group_alive = True
-        if ppid == me:
-            children.append(pid)
-    return group_alive, children
+    # getattr: only reached when HAVE_WAITID (absent on macOS before 3.13).
+    waitid: Callable[..., Any] = getattr(os, "waitid")
+    peek = os.WEXITED | os.WNOHANG | getattr(os, "WNOWAIT")
+    while True:
+        if adopting:
+            while True:
+                info = waitid(getattr(os, "P_ALL"), 0, peek)
+                if info is None:
+                    break
+                if info.si_pid == pid:
+                    return
+                try:
+                    os.waitpid(info.si_pid, 0)
+                except ChildProcessError:
+                    pass
+        elif waitid(getattr(os, "P_PID"), pid, peek):
+            return
+        time.sleep(POLL)
 
 
-def _drain(leader: int) -> bool:
-    """Stop processes pytest left behind. Returns True when none remain.
+def _drain_group(pgid: int) -> bool:
+    """Stop members of pytest's process group. Returns True when none remain.
 
-    Must run while the exited pytest leader is still unreaped: its zombie keeps
-    the process-group id reserved, and pids of our own unreaped children cannot
-    be reused, so no signal here can reach an unrelated process.
+    Run while the exited leader is unreaped (HAVE_WAITID), its zombie keeps the
+    group id reserved, so no signal can reach an unrelated group. Membership
+    can only be observed on Linux; elsewhere the group is signalled blindly.
     """
-    if not LINUX:
-        # No portable way to list members: signal the reserved group itself.
-        # Descendants that called setsid are not tracked on this platform.
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(leader, sig)
-            except ProcessLookupError:
-                return True
-            except OSError as exc:
-                print(
-                    f"Could not signal pytest's process group: {exc}", file=sys.stderr
-                )
-            time.sleep(0.2)
-        return True
+
+    def alive() -> bool:
+        return bool(_live(lambda pid, _ppid, pgrp: pgrp == pgid and pid != pgid))
+
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        signalled_group = False
+        if LINUX and not alive():
+            return True
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return True
+        deadline = time.monotonic() + (GROUP_GRACE if LINUX else 0.2)
+        while time.monotonic() < deadline:
+            if LINUX and not alive():
+                return True
+            time.sleep(POLL)
+    return not alive() if LINUX else True
+
+
+def _drain_adopted() -> bool:
+    """Stop every remaining descendant. Returns True once none remain.
+
+    The runner is a subreaper and pytest is already reaped, so every live
+    descendant is a child of the runner or below one. The kernel reporting no
+    children at all (ECHILD) is therefore the proof; /proc is used only to
+    find children to signal, and pids of unreaped children cannot be reused.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
         signalled: set[int] = set()
         deadline = time.monotonic() + GROUP_GRACE
         while True:
-            group_alive, children = _leftovers(leader)
-            if not group_alive and not children:
+            try:
+                while os.waitpid(-1, os.WNOHANG)[0]:
+                    pass
+            except ChildProcessError:
                 return True
             if time.monotonic() >= deadline:
                 break
-            if group_alive and not signalled_group:
-                signalled_group = True
-                try:
-                    os.killpg(leader, sig)
-                except OSError as exc:
-                    print(
-                        f"Could not signal pytest's process group: {exc}",
-                        file=sys.stderr,
-                    )
-            for pid in children:
+            me = os.getpid()
+            for pid in _live(lambda _pid, ppid, _pgrp: ppid == me):
                 if pid not in signalled:
                     signalled.add(pid)
                     try:
                         os.kill(pid, sig)
-                    except OSError:
+                    except ProcessLookupError:
                         pass
-            time.sleep(0.05)
-    group_alive, children = _leftovers(leader)
-    return not group_alive and not children
+            time.sleep(POLL)
+    return False
 
 
-def _wait_unreaped(child: subprocess.Popen[bytes]) -> None:
-    """Wait for pytest to exit but leave it unreaped, reserving its pid/pgid."""
-    os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+def _finish(child: subprocess.Popen[bytes], adopting: bool) -> tuple[int, str]:
+    """Wait for pytest, stop what it left behind; return (status, retain reason)."""
+    if not POSIX:
+        return _status(child.wait()), ""  # Windows: pytest itself only
+    if HAVE_WAITID:
+        _await_exit_unreaped(child.pid, adopting)
+        if adopting:
+            # Reserved group id: one TERM to its members, then confirm below.
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            group_done = True
+        else:
+            group_done = _drain_group(child.pid)
+        status = _status(child.wait())
+    else:
+        # No unreaped wait (macOS before 3.13): the group id is signalled just
+        # after reaping, a documented sub-second reuse window.
+        status = _status(child.wait())
+        group_done = _drain_group(child.pid)
+    if adopting:
+        if not _drain_adopted():
+            return status, "processes pytest started did not exit"
+        return status, ""
+    if LINUX:
+        return (
+            status,
+            "could not become a child subreaper, so detached descendants cannot be confirmed stopped",
+        )
+    if not group_done:
+        return status, "processes in pytest's group did not exit"
+    return status, ""
+
+
+def _finish_safely(
+    child: subprocess.Popen[bytes], adopting: bool, stop: Callable[[], None]
+) -> tuple[int, str]:
+    try:
+        return _finish(child, adopting)
+    except Exception as exc:
+        reason = (
+            f"could not confirm pytest's processes exited ({type(exc).__name__}: {exc})"
+        )
+        if child.returncode is None and child.poll() is None:
+            stop()
+        return _status(child.wait()), reason
 
 
 def _remove_owned(root: Path) -> None:
@@ -158,12 +217,13 @@ def _remove_owned(root: Path) -> None:
         mode = stat.S_IMODE(os.lstat(target).st_mode) | stat.S_IRWXU
         try:
             os.chmod(target, mode, follow_symlinks=False)
-        except NotImplementedError:
-            os.chmod(target, mode)  # platform cannot refuse symlinks here
+        except NotImplementedError as exc:
+            # Linux raises this only when the target is a symlink: refuse.
+            raise PermissionError(f"refusing to chmod a symlink: {target}") from exc
         except OSError as exc:
-            if exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
-                raise
-            os.chmod(target, mode)
+            if exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise PermissionError(f"refusing to chmod: {target}") from exc
+            raise
 
     def retry(func: Callable[..., Any], path: str, error: Any) -> None:
         exc = error[1] if isinstance(error, tuple) else error
@@ -258,6 +318,9 @@ def main() -> int:
         interrupted = signum
         signal_child(signum)
 
+    def stop_pytest() -> None:
+        signal_child(signal.SIGKILL if POSIX else signal.SIGTERM)
+
     signums = [signal.SIGINT, signal.SIGTERM]
     if POSIX:
         signums.append(signal.SIGHUP)
@@ -268,52 +331,58 @@ def main() -> int:
         for sig in signums
         if (handler := signal.getsignal(sig)) is not signal.SIG_IGN
     }
-    group_drained = True
-    _become_subreaper()
+    adopting = _become_subreaper()
+    if LINUX and not adopting:
+        print(
+            "pytest_temp: could not become a child subreaper; scratch will be "
+            "retained because detached descendants cannot be confirmed stopped",
+            file=sys.stderr,
+        )
+    retain_reason = ""
     # Install the handlers before creating scratch, so no signal can leave it behind.
     for sig in handlers:
         signal.signal(sig, forward)
     try:
-        root = Path(tempfile.mkdtemp(prefix="pmcp-pytest-", dir=parent))
-        scratch = root / "tmp"
-        scratch.mkdir()
-        env = {
-            **os.environ,
-            "TMPDIR": str(scratch),
-            "TEMP": str(scratch),
-            "TMP": str(scratch),
-        }
-        print(f"pytest scratch: {root}", file=sys.stderr, flush=True)
-        child = subprocess.Popen(
-            [sys.executable, "-m", "pytest", *args, f"--basetemp={scratch / 'pytest'}"],
-            env=env,
-            start_new_session=POSIX,
-        )
-        if interrupted:
-            signal_child(interrupted)
-        if POSIX:
-            _wait_unreaped(child)
-            group_drained = _drain(child.pid)
-        result = child.wait()
-        status = 128 - result if result < 0 else result
-    finally:
-        if child is not None and child.returncode is None:
-            # An exception escaped before pytest finished: stop it before cleanup.
-            signal_child(signal.SIGTERM)
-            if POSIX:
-                _wait_unreaped(child)
-                group_drained = _drain(child.pid)
-            child.wait()
         try:
+            root = Path(tempfile.mkdtemp(prefix="pmcp-pytest-", dir=parent))
+            scratch = root / "tmp"
+            scratch.mkdir()
+            env = {
+                **os.environ,
+                "TMPDIR": str(scratch),
+                "TEMP": str(scratch),
+                "TMP": str(scratch),
+            }
+            print(f"pytest scratch: {root}", file=sys.stderr, flush=True)
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    *args,
+                    f"--basetemp={scratch / 'pytest'}",
+                ],
+                env=env,
+                start_new_session=POSIX,
+            )
+            if interrupted:
+                signal_child(interrupted)
+            status, retain_reason = _finish_safely(child, adopting, stop_pytest)
+        finally:
+            if child is not None and child.returncode is None:
+                # An exception escaped before pytest finished: stop it first.
+                stop_pytest()
+                status, retain_reason = _finish_safely(child, adopting, stop_pytest)
+                retain_reason = (
+                    retain_reason or "the runner failed before pytest finished"
+                )
             if root is None:
                 pass
             elif options.keep_temp:
                 print(f"Retained pytest evidence: {root}", file=sys.stderr)
-            elif not group_drained:
+            elif retain_reason:
                 print(
-                    f"Retained pytest scratch {root}: processes pytest started "
-                    "did not exit",
-                    file=sys.stderr,
+                    f"Retained pytest scratch {root}: {retain_reason}", file=sys.stderr
                 )
             else:
                 try:
@@ -324,10 +393,10 @@ def main() -> int:
                         f"{type(exc).__name__}: {exc}",
                         file=sys.stderr,
                     )
-        finally:
-            # Restore last, so a second interrupt cannot abort the removal midway.
-            for sig, handler in handlers.items():
-                signal.signal(sig, handler)
+    finally:
+        # Restore last, so a second interrupt cannot abort the shutdown midway.
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
     return status
 
 

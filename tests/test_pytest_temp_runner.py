@@ -4,15 +4,47 @@ from __future__ import annotations
 
 import json
 import os
+import select
 from pathlib import Path
 import signal
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
 
 RUNNER = Path(__file__).resolve().parents[1] / "scripts" / "pytest_temp.py"
+READY_TIMEOUT = 20.0
+
+
+def _default_signals() -> None:
+    """Give the runner default dispositions even if this session ignores some."""
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_DFL)
+
+
+def _launch_options(kwargs: dict[str, Any]) -> dict[str, Any]:
+    if os.name == "posix":
+        kwargs.setdefault("preexec_fn", _default_signals)
+    return kwargs
+
+
+def _run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    return subprocess.run(args, check=False, **_launch_options(kwargs))
+
+
+def _popen(args: list[str], **kwargs: Any) -> subprocess.Popen[Any]:
+    return subprocess.Popen(args, **_launch_options(kwargs))
+
+
+def _readline(child: subprocess.Popen[str], timeout: float = READY_TIMEOUT) -> str:
+    assert child.stdout is not None
+    ready, _, _ = select.select([child.stdout], [], [], timeout)
+    if not ready:
+        raise AssertionError("runner did not report ready in time")
+    return child.stdout.readline().strip()
 
 
 @pytest.fixture
@@ -33,20 +65,14 @@ def runner_env(tmp_path: Path) -> dict[str, str]:
         "  signal.signal(s, lambda *_: sys.exit(result))\n"
         " else:\n"
         "  signal.signal(s, signal.SIG_DFL)\n"
-        "code = ('import os, pathlib, sys, time\\n'\n"
-        "         'log = pathlib.Path(sys.argv[1])\\n'\n"
-        "         'while True:\\n'\n"
-        "         '    with log.open(\"a\") as f:\\n'\n"
-        '         \'        f.write("ok\\\\n" if os.path.isdir(os.environ["TMPDIR"]) else "missing\\\\n")\\n\'\n'
-        "         '    time.sleep(0.02)\\n')\n"
         "if os.environ.get('DETACHED') == '1':\n"
-        " d = subprocess.Popen([sys.executable, '-c', code, os.environ['DETACHED_LOG']],"
+        " d = subprocess.Popen([sys.executable, os.environ['LOGGER'], os.environ['DETACHED_LOG']],"
         " start_new_session=True)\n"
         " record['detached'] = d.pid\n"
         " while not pathlib.Path(os.environ['DETACHED_LOG']).exists():\n"
         "  time.sleep(0.01)\n"
         "if os.environ.get('GRANDCHILD') == '1':\n"
-        " g = subprocess.Popen([sys.executable, '-c', code, os.environ['GRANDCHILD_LOG']])\n"
+        " g = subprocess.Popen([sys.executable, os.environ['LOGGER'], os.environ['GRANDCHILD_LOG']])\n"
         " record['grandchild'] = g.pid\n"
         " while not pathlib.Path(os.environ['GRANDCHILD_LOG']).exists():\n"
         "  time.sleep(0.01)\n"
@@ -61,6 +87,22 @@ def runner_env(tmp_path: Path) -> dict[str, str]:
         " ro.mkdir()\n"
         " (ro / 'via').symlink_to(os.environ['SYMLINK_TARGET'])\n"
         " os.chmod(ro, 0o500)\n"
+        "if os.environ.get('ORPHAN') == '1':\n"
+        " a = subprocess.Popen([sys.executable, '-c', 'import subprocess, sys;"
+        ' p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]);'
+        " print(p.pid, flush=True)'], stdout=subprocess.PIPE, text=True)\n"
+        " orphan = int(a.stdout.readline())\n"
+        " a.wait()\n"
+        " os.kill(orphan, signal.SIGKILL)\n"
+        " deadline = time.monotonic() + 3\n"
+        " gone = False\n"
+        " while time.monotonic() < deadline and not gone:\n"
+        "  try:\n"
+        "   os.kill(orphan, 0)\n"
+        "   time.sleep(0.01)\n"
+        "  except ProcessLookupError:\n"
+        "   gone = True\n"
+        " record['orphan_gone'] = gone\n"
         "if os.environ.get('NOSEARCH') == '1':\n"
         " vault = base / 'vault'\n"
         " (vault / 'sub').mkdir(parents=True)\n"
@@ -79,6 +121,22 @@ def runner_env(tmp_path: Path) -> dict[str, str]:
         " time.sleep(float(os.environ.get('WAIT_SECONDS', '60')))\n"
         "sys.exit(result)\n"
     )
+    (modules / "logger.py").write_text(
+        "import os, pathlib, signal, sys, time\n"
+        "log = pathlib.Path(sys.argv[1])\n"
+        "def note(text):\n"
+        "    with log.open('a') as handle:\n"
+        "        handle.write(text + '\\n')\n"
+        "def scratch():\n"
+        "    return 'ok' if os.path.isdir(os.environ['TMPDIR']) else 'missing'\n"
+        "def on_term(*_):\n"
+        "    note('term-' + scratch())\n"
+        "    os._exit(0)\n"
+        "signal.signal(signal.SIGTERM, on_term)\n"
+        "while True:\n"
+        "    note(scratch())\n"
+        "    time.sleep(0.02)\n"
+    )
     parent = tmp_path / "scratch-parent"
     parent.mkdir()
     return {
@@ -87,6 +145,7 @@ def runner_env(tmp_path: Path) -> dict[str, str]:
         "PYTHONPATH": str(modules),
         "PYTEST_ADDOPTS": "",
         "RECEIPT": str(tmp_path / "receipt.json"),
+        "LOGGER": str(modules / "logger.py"),
     }
 
 
@@ -98,7 +157,7 @@ def test_success_and_failure_remove_only_owned_scratch(
     sentinel = parent / "another-run"
     sentinel.mkdir()
     runner_env["RESULT"] = str(result)
-    completed = subprocess.run(
+    completed = _run(
         [sys.executable, str(RUNNER), "--", "-q"], env=runner_env, capture_output=True
     )
     assert completed.returncode == result
@@ -117,7 +176,7 @@ def test_keep_evidence_is_explicit_and_each_run_is_unique(
 ) -> None:
     roots = []
     for _ in range(2):
-        result = subprocess.run(
+        result = _run(
             [sys.executable, str(RUNNER), "--keep-temp", "--", "-q"],
             env=runner_env,
             capture_output=True,
@@ -141,7 +200,7 @@ def test_fixed_basetemp_rejected_before_creation(
     args = [] if in_environment else [f"--basetemp={fixed}"]
     if in_environment:
         runner_env["PYTEST_ADDOPTS"] = f"--basetemp={fixed}"
-    result = subprocess.run(
+    result = _run(
         [sys.executable, str(RUNNER), "--", *args], env=runner_env, capture_output=True
     )
     assert result.returncode == 2
@@ -150,7 +209,7 @@ def test_fixed_basetemp_rejected_before_creation(
 
 def _start_waiting(runner_env: dict[str, str]) -> subprocess.Popen[str]:
     runner_env["WAIT"] = "1"
-    child = subprocess.Popen(
+    child = _popen(
         [sys.executable, str(RUNNER), "--", "-q"],
         env=runner_env,
         stdout=subprocess.PIPE,
@@ -158,8 +217,7 @@ def _start_waiting(runner_env: dict[str, str]) -> subprocess.Popen[str]:
         text=True,
     )
     try:
-        assert child.stdout is not None
-        assert child.stdout.readline().strip() == "ready"
+        assert _readline(child) == "ready"
     except BaseException:
         _stop(child, runner_env)
         raise
@@ -236,7 +294,7 @@ def test_group_members_stop_before_scratch_is_removed(
         runner_env["HANDLE"] = "1"
         child = _start_waiting(runner_env)
     else:
-        child = subprocess.Popen(
+        child = _popen(
             [sys.executable, str(RUNNER), "--", "-q"],
             env=runner_env,
             stdout=subprocess.PIPE,
@@ -250,8 +308,10 @@ def test_group_members_stop_before_scratch_is_removed(
         grandchild = json.loads(Path(runner_env["RECEIPT"]).read_text())["grandchild"]
         assert child.returncode == 4
         assert not _pid_alive(grandchild)
-        # Ordering oracle: it was stopped before the scratch was removed.
-        assert "missing" not in log.read_text()
+        # Ordering oracle: its SIGTERM handler saw the scratch still present.
+        text = log.read_text()
+        assert "term-ok" in text
+        assert "missing" not in text
         assert not list(Path(runner_env["TMPDIR"]).iterdir())
     finally:
         _stop(child, runner_env)
@@ -263,7 +323,7 @@ def test_detached_descendant_stops_before_scratch_is_removed(
 ) -> None:
     log = tmp_path / "detached.log"
     runner_env.update({"DETACHED": "1", "DETACHED_LOG": str(log), "RESULT": "3"})
-    child = subprocess.Popen(
+    child = _popen(
         [sys.executable, str(RUNNER), "--", "-q"],
         env=runner_env,
         stdout=subprocess.PIPE,
@@ -274,9 +334,11 @@ def test_detached_descendant_stops_before_scratch_is_removed(
         child.communicate(timeout=30)
         detached = json.loads(Path(runner_env["RECEIPT"]).read_text())["detached"]
         assert child.returncode == 3
-        # The runner adopted and stopped it, so it never saw scratch missing.
+        # The runner adopted and stopped it before removing scratch.
         assert not _pid_alive(detached)
-        assert "missing" not in log.read_text()
+        text = log.read_text()
+        assert "term-ok" in text
+        assert "missing" not in text
         assert not list(Path(runner_env["TMPDIR"]).iterdir())
     finally:
         _stop(child, runner_env)
@@ -291,7 +353,7 @@ def test_locked_scratch_is_removed_without_changing_status(
 ) -> None:
     runner_env["LOCK"] = "1"
     runner_env["RESULT"] = str(result)
-    completed = subprocess.run(
+    completed = _run(
         [sys.executable, str(RUNNER), "--", "-q"], env=runner_env, capture_output=True
     )
     assert completed.returncode == result, completed.stderr
@@ -309,7 +371,7 @@ def test_symlink_in_read_only_dir_is_removed_not_followed(
     target.chmod(0o600)
     runner_env["SYMLINK_TARGET"] = str(target)
     runner_env["RESULT"] = "3"
-    completed = subprocess.run(
+    completed = _run(
         [sys.executable, str(RUNNER), "--", "-q"], env=runner_env, capture_output=True
     )
     assert completed.returncode == 3, completed.stderr
@@ -325,32 +387,36 @@ def test_directory_without_search_permission_is_removed(
     runner_env: dict[str, str],
 ) -> None:
     runner_env.update({"NOSEARCH": "1", "RESULT": "3"})
-    completed = subprocess.run(
+    completed = _run(
         [sys.executable, str(RUNNER), "--", "-q"], env=runner_env, capture_output=True
     )
     assert completed.returncode == 3, completed.stderr
     assert not list(Path(runner_env["TMPDIR"]).iterdir())
 
 
+@pytest.mark.skipif(os.name != "posix", reason="path length limits")
 def test_very_deep_scratch_keeps_status_without_traceback(
     runner_env: dict[str, str],
 ) -> None:
     runner_env.update({"DEEP": "1100", "RESULT": "3"})
-    completed = subprocess.run(
-        [sys.executable, str(RUNNER), "--", "-q"],
-        env=runner_env,
-        capture_output=True,
-        text=True,
-    )
-    assert completed.returncode == 3
-    assert "Traceback" not in completed.stderr
-    leftovers = list(Path(runner_env["TMPDIR"]).iterdir())
-    # Removed, or retained with a notice naming it (3.10's recursive rmtree).
-    assert not leftovers or f"Could not remove pytest scratch {leftovers[0]}" in (
-        completed.stderr
-    )
-    for leftover in leftovers:
-        _deep_remove(leftover)
+    try:
+        completed = _run(
+            [sys.executable, str(RUNNER), "--", "-q"],
+            env=runner_env,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 3
+        assert "Traceback" not in completed.stderr
+        leftovers = list(Path(runner_env["TMPDIR"]).iterdir())
+        # Removed, or retained with a notice naming it (3.10's recursive rmtree).
+        assert not leftovers or (
+            f"Could not remove pytest scratch {leftovers[0]}" in completed.stderr
+        )
+    finally:
+        # Never leave a tree that recursive cleanup in later sessions cannot remove.
+        for leftover in list(Path(runner_env["TMPDIR"]).iterdir()):
+            _deep_remove(leftover)
 
 
 def _deep_remove(path: Path) -> None:
@@ -377,9 +443,10 @@ def test_inherited_sighup_ignore_is_kept(runner_env: dict[str, str]) -> None:
     runner_env["WAIT"] = "1"
 
     def ignore_hangup() -> None:
+        _default_signals()
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
-    child = subprocess.Popen(
+    child = _popen(
         [sys.executable, str(RUNNER), "--", "-q"],
         env=runner_env,
         stdout=subprocess.PIPE,
@@ -388,8 +455,7 @@ def test_inherited_sighup_ignore_is_kept(runner_env: dict[str, str]) -> None:
         preexec_fn=ignore_hangup,
     )
     try:
-        assert child.stdout is not None
-        assert child.stdout.readline().strip() == "ready"
+        assert _readline(child) == "ready"
         child.send_signal(signal.SIGHUP)
         child.communicate(timeout=20)
         assert child.returncode == 0
@@ -408,7 +474,7 @@ def test_cleanup_failure_keeps_status_and_names_retained_path(
     runner_env["LOCK_PARENT"] = "1"
     runner_env["RESULT"] = "3"
     try:
-        completed = subprocess.run(
+        completed = _run(
             [sys.executable, str(RUNNER), "--", "-q"],
             env=runner_env,
             capture_output=True,
@@ -427,10 +493,72 @@ def test_cleanup_failure_keeps_status_and_names_retained_path(
 def test_second_separator_cannot_hide_owned_basetemp(
     runner_env: dict[str, str],
 ) -> None:
-    result = subprocess.run(
+    result = _run(
         [sys.executable, str(RUNNER), "--", "--", "-q"],
         env=runner_env,
         capture_output=True,
     )
     assert result.returncode == 2
     assert not list(Path(runner_env["TMPDIR"]).iterdir())
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper")
+def test_adopted_orphan_is_reaped_while_pytest_runs(
+    runner_env: dict[str, str],
+) -> None:
+    """A killed orphan must not linger as a zombie that still looks alive."""
+    runner_env["ORPHAN"] = "1"
+    completed = _run(
+        [sys.executable, str(RUNNER), "--", "-q"], env=runner_env, capture_output=True
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(Path(runner_env["RECEIPT"]).read_text())["orphan_gone"] is True
+
+
+def _run_patched(
+    runner_env: dict[str, str], patch: str
+) -> subprocess.CompletedProcess[str]:
+    """Run the runner's main() with one module global replaced."""
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('pytest_temp', {str(RUNNER)!r})\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m)\n"
+        f"{patch}\n"
+        f"sys.argv = [{str(RUNNER)!r}, '--', '-q']\n"
+        "sys.exit(m.main())\n"
+    )
+    return _run(
+        [sys.executable, "-c", code], env=runner_env, capture_output=True, text=True
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper")
+def test_failed_subreaper_retains_scratch_and_keeps_status(
+    runner_env: dict[str, str],
+) -> None:
+    runner_env["RESULT"] = "3"
+    completed = _run_patched(runner_env, "m._become_subreaper = lambda: False")
+    (root,) = Path(runner_env["TMPDIR"]).iterdir()
+    assert completed.returncode == 3
+    assert "could not become a child subreaper" in completed.stderr
+    assert f"Retained pytest scratch {root}" in completed.stderr
+    assert "Traceback" not in completed.stderr
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux /proc drain")
+def test_drain_failure_retains_scratch_and_keeps_status(
+    runner_env: dict[str, str],
+) -> None:
+    runner_env["RESULT"] = "3"
+    completed = _run_patched(
+        runner_env,
+        "def broken(*_):\n"
+        "    raise PermissionError('synthetic /proc denial')\n"
+        "m._drain_adopted = broken",
+    )
+    (root,) = Path(runner_env["TMPDIR"]).iterdir()
+    assert completed.returncode == 3
+    assert f"Retained pytest scratch {root}" in completed.stderr
+    assert "synthetic /proc denial" in completed.stderr
+    assert "Traceback" not in completed.stderr
