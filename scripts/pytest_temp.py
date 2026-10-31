@@ -140,7 +140,8 @@ def _wait_unreaped(child: subprocess.Popen[bytes]) -> None:
 def _remove_owned(root: Path) -> None:
     """Remove the owned scratch, restoring owner permissions tests may have dropped.
 
-    Symlinks are never followed or chmodded; a failure that remains is raised.
+    Only directories inside the owned root are chmodded; symlinks are removed,
+    never followed or chmodded. A failure that remains is raised.
     """
 
     owned = os.path.abspath(root)
@@ -153,12 +154,24 @@ def _remove_owned(root: Path) -> None:
 
     def retry(func: Callable[..., Any], path: str, error: Any) -> None:
         exc = error[1] if isinstance(error, tuple) else error
-        if not isinstance(exc, PermissionError) or os.path.islink(path):
+        if isinstance(exc, FileNotFoundError):
+            return  # already removed, e.g. by a recursive retry below
+        if not isinstance(exc, PermissionError):
             raise exc
-        if func in (os.unlink, os.remove, os.rmdir):
-            # Removing an entry needs write and search permission on its parent.
+        if os.path.abspath(path) != owned:
+            # Removing or listing an entry needs write and search permission
+            # on its parent, which is always an owned directory here.
             grant(os.path.dirname(path))
-            func(path)
+        if func in (os.unlink, os.remove, os.rmdir):
+            try:
+                func(path)  # unlink never follows a symlink
+            except FileNotFoundError:
+                pass
+        elif os.path.islink(path) or not os.path.isdir(path):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
         else:
             # The directory itself could not be listed or opened.
             grant(path)

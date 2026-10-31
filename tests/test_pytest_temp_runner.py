@@ -54,6 +54,11 @@ def runner_env(tmp_path: Path) -> dict[str, str]:
         " (locked / 'inner' / 'file').write_text('x')\n"
         " os.chmod(locked / 'inner', 0)\n"
         " os.chmod(locked, 0o500)\n"
+        "if os.environ.get('SYMLINK_TARGET'):\n"
+        " ro = base / 'ro'\n"
+        " ro.mkdir()\n"
+        " (ro / 'via').symlink_to(os.environ['SYMLINK_TARGET'])\n"
+        " os.chmod(ro, 0o500)\n"
         "if os.environ.get('LOCK_PARENT') == '1':\n"
         " os.chmod(pathlib.Path(os.environ['TMPDIR']).parent.parent, 0o500)\n"
         "pathlib.Path(os.environ['RECEIPT']).write_text(json.dumps(record))\n"
@@ -218,17 +223,18 @@ def test_group_members_stop_before_scratch_is_removed(
     if interrupt:
         runner_env["HANDLE"] = "1"
         child = _start_waiting(runner_env)
-        child.send_signal(signal.SIGTERM)
-        child.communicate(timeout=30)
     else:
         child = subprocess.Popen(
             [sys.executable, str(RUNNER), "--", "-q"],
             env=runner_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            text=True,
         )
-        child.communicate(timeout=30)
     try:
+        if interrupt:
+            child.send_signal(signal.SIGTERM)
+        child.communicate(timeout=30)
         grandchild = json.loads(Path(runner_env["RECEIPT"]).read_text())["grandchild"]
         assert child.returncode == 4
         assert not _pid_alive(grandchild)
@@ -248,6 +254,7 @@ def test_detached_descendant_stops_before_scratch_is_removed(
         env=runner_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        text=True,
     )
     try:
         child.communicate(timeout=30)
@@ -275,6 +282,26 @@ def test_locked_scratch_is_removed_without_changing_status(
     )
     assert completed.returncode == result, completed.stderr
     assert not list(Path(runner_env["TMPDIR"]).iterdir())
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0, reason="POSIX permissions, non-root"
+)
+def test_symlink_in_read_only_dir_is_removed_not_followed(
+    runner_env: dict[str, str], tmp_path: Path
+) -> None:
+    target = tmp_path / "outside.txt"
+    target.write_text("keep")
+    target.chmod(0o600)
+    runner_env["SYMLINK_TARGET"] = str(target)
+    runner_env["RESULT"] = "3"
+    completed = subprocess.run(
+        [sys.executable, str(RUNNER), "--", "-q"], env=runner_env, capture_output=True
+    )
+    assert completed.returncode == 3, completed.stderr
+    assert not list(Path(runner_env["TMPDIR"]).iterdir())
+    assert target.read_text() == "keep"
+    assert target.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.skipif(
