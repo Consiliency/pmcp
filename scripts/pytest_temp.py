@@ -27,6 +27,11 @@ HAVE_WAITID = hasattr(os, "waitid") and hasattr(os, "WNOWAIT")
 GROUP_GRACE = 5.0
 POLL = 0.01
 PR_SET_CHILD_SUBREAPER = 36
+EXITED_CODES = {
+    getattr(os, name)
+    for name in ("CLD_EXITED", "CLD_KILLED", "CLD_DUMPED")
+    if hasattr(os, name)
+}
 
 
 def _become_subreaper() -> bool:
@@ -78,7 +83,7 @@ def _await_exit_unreaped(pid: int, adopting: bool) -> None:
         if adopting:
             while True:
                 info = waitid(getattr(os, "P_ALL"), 0, peek)
-                if info is None:
+                if info is None or info.si_code not in EXITED_CODES:
                     break
                 if info.si_pid == pid:
                     return
@@ -86,8 +91,11 @@ def _await_exit_unreaped(pid: int, adopting: bool) -> None:
                     os.waitpid(info.si_pid, 0)
                 except ChildProcessError:
                     pass
-        elif waitid(getattr(os, "P_PID"), pid, peek):
-            return
+        else:
+            info = waitid(getattr(os, "P_PID"), pid, peek)
+            # macOS reports a stopped child even with WEXITED: exits only.
+            if info is not None and info.si_code in EXITED_CODES:
+                return
         time.sleep(POLL)
 
 
@@ -165,10 +173,17 @@ def _finish(child: subprocess.Popen[bytes], adopting: bool) -> tuple[int, str]:
             group_done = _drain_group(child.pid)
         status = _status(child.wait())
     else:
-        # No unreaped wait (macOS before 3.13): the group id is signalled just
-        # after reaping, a documented sub-second reuse window.
+        # No unreaped wait (macOS before 3.13): once pytest is reaped its group
+        # id could be reused, so only check for it (signal 0) and never signal.
         status = _status(child.wait())
-        group_done = _drain_group(child.pid)
+        try:
+            os.killpg(child.pid, 0)
+        except ProcessLookupError:
+            group_done = True
+        except OSError:
+            group_done = False
+        else:
+            group_done = False
     if adopting:
         if not _drain_adopted():
             return status, "processes pytest started did not exit"
@@ -179,7 +194,7 @@ def _finish(child: subprocess.Popen[bytes], adopting: bool) -> tuple[int, str]:
             "could not become a child subreaper, so detached descendants cannot be confirmed stopped",
         )
     if not group_done:
-        return status, "processes in pytest's group did not exit"
+        return status, "processes in pytest's group may still be running"
     return status, ""
 
 
@@ -339,9 +354,15 @@ def main() -> int:
             file=sys.stderr,
         )
     retain_reason = ""
+    # An inherited SIGCHLD ignore makes the kernel discard exit statuses, so a
+    # failing pytest would look like success; use the default while running.
+    if POSIX:
+        handlers.setdefault(signal.SIGCHLD, signal.getsignal(signal.SIGCHLD))
     # Install the handlers before creating scratch, so no signal can leave it behind.
     for sig in handlers:
-        signal.signal(sig, forward)
+        signal.signal(
+            sig, signal.SIG_DFL if sig == getattr(signal, "SIGCHLD", None) else forward
+        )
     try:
         try:
             root = Path(tempfile.mkdtemp(prefix="pmcp-pytest-", dir=parent))
@@ -379,7 +400,8 @@ def main() -> int:
             if root is None:
                 pass
             elif options.keep_temp:
-                print(f"Retained pytest evidence: {root}", file=sys.stderr)
+                note = f" (also: {retain_reason})" if retain_reason else ""
+                print(f"Retained pytest evidence: {root}{note}", file=sys.stderr)
             elif retain_reason:
                 print(
                     f"Retained pytest scratch {root}: {retain_reason}", file=sys.stderr

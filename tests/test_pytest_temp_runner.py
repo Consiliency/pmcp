@@ -394,7 +394,7 @@ def test_directory_without_search_permission_is_removed(
     assert not list(Path(runner_env["TMPDIR"]).iterdir())
 
 
-@pytest.mark.skipif(os.name != "posix", reason="path length limits")
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="path length limits")
 def test_very_deep_scratch_keeps_status_without_traceback(
     runner_env: dict[str, str],
 ) -> None:
@@ -562,3 +562,25 @@ def test_drain_failure_retains_scratch_and_keeps_status(
     assert f"Retained pytest scratch {root}" in completed.stderr
     assert "synthetic /proc denial" in completed.stderr
     assert "Traceback" not in completed.stderr
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX SIGCHLD semantics")
+@pytest.mark.parametrize("result", [0, 3])
+def test_inherited_sigchld_ignore_keeps_pytest_status(
+    runner_env: dict[str, str], result: int
+) -> None:
+    """With SIGCHLD ignored the kernel discards statuses; a failure must not pass."""
+    runner_env["RESULT"] = str(result)
+
+    def ignore_sigchld() -> None:
+        _default_signals()
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+
+    completed = _run(
+        [sys.executable, str(RUNNER), "--", "-q"],
+        env=runner_env,
+        capture_output=True,
+        preexec_fn=ignore_sigchld,
+    )
+    assert completed.returncode == result, completed.stderr
+    assert not list(Path(runner_env["TMPDIR"]).iterdir())
