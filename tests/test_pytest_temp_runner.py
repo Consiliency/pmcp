@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import os
 import select
+import shlex
+import shutil
+import time
 from pathlib import Path
 import signal
 import subprocess
@@ -584,3 +587,57 @@ def test_inherited_sigchld_ignore_keeps_pytest_status(
     )
     assert completed.returncode == result, completed.stderr
     assert not list(Path(runner_env["TMPDIR"]).iterdir())
+
+
+BASH = shutil.which("bash")
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or BASH is None, reason="Linux + bash"
+)
+def test_exec_keeps_callers_background_jobs(
+    runner_env: dict[str, str], tmp_path: Path
+) -> None:
+    """A shell that execs the runner hands it its background jobs; never touch them."""
+    bgpid = tmp_path / "bg.pid"
+    runner_env["RESULT"] = "3"
+    script = (
+        # Redirect the job's output so it does not hold the captured pipes open.
+        f"sleep 30 >/dev/null 2>&1 & echo $! > {shlex.quote(str(bgpid))}; "
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(str(RUNNER))} -- -q"
+    )
+    completed = _run(
+        [BASH, "-c", script], env=runner_env, capture_output=True, text=True
+    )
+    pid = int(bgpid.read_text())
+    try:
+        assert completed.returncode == 3, completed.stderr
+        assert _pid_alive(pid), "the caller's background job was killed"
+        assert "already had child processes" in completed.stderr
+        (root,) = Path(runner_env["TMPDIR"]).iterdir()
+        assert f"Retained pytest scratch {root}" in completed.stderr
+    finally:
+        if _pid_alive(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or BASH is None, reason="Linux + bash"
+)
+def test_exec_with_tee_keeps_status_and_evidence_line(
+    runner_env: dict[str, str], tmp_path: Path
+) -> None:
+    log = tmp_path / "run.log"
+    runner_env["RESULT"] = "3"
+    script = (
+        f"exec > >(tee {shlex.quote(str(log))}) 2>&1; "
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(str(RUNNER))} --keep-temp -- -q"
+    )
+    completed = _run(
+        [BASH, "-c", script], env=runner_env, capture_output=True, text=True
+    )
+    assert completed.returncode == 3
+    deadline = time.monotonic() + 10
+    while "Retained pytest evidence" not in (log.read_text() if log.exists() else ""):
+        assert time.monotonic() < deadline, "evidence line never reached the tee log"
+        time.sleep(0.05)

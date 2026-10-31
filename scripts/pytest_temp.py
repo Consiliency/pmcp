@@ -48,6 +48,20 @@ def _become_subreaper() -> bool:
         return False
 
 
+def _has_children() -> bool:
+    """Whether this process already has live children before pytest starts.
+
+    A shell that execs the runner hands it the shell's background jobs (and
+    process-substitution helpers such as `>(tee log)`). Those are not pytest's
+    and must never be adopted, signalled or counted, so their presence turns
+    off descendant supervision for this run.
+    """
+    if not LINUX:
+        return False
+    me = os.getpid()
+    return bool(_live(lambda _pid, ppid, _pgrp: ppid == me))
+
+
 def _status(result: int) -> int:
     return 128 - result if result < 0 else result
 
@@ -156,7 +170,9 @@ def _drain_adopted() -> bool:
     return False
 
 
-def _finish(child: subprocess.Popen[bytes], adopting: bool) -> tuple[int, str]:
+def _finish(
+    child: subprocess.Popen[bytes], adopting: bool, unsupervised: str = ""
+) -> tuple[int, str]:
     """Wait for pytest, stop what it left behind; return (status, retain reason)."""
     if not POSIX:
         return _status(child.wait()), ""  # Windows: pytest itself only
@@ -189,9 +205,9 @@ def _finish(child: subprocess.Popen[bytes], adopting: bool) -> tuple[int, str]:
             return status, "processes pytest started did not exit"
         return status, ""
     if LINUX:
-        return (
-            status,
-            "could not become a child subreaper, so detached descendants cannot be confirmed stopped",
+        return status, unsupervised or (
+            "could not become a child subreaper, so detached descendants "
+            "cannot be confirmed stopped"
         )
     if not group_done:
         return status, "processes in pytest's group may still be running"
@@ -199,10 +215,13 @@ def _finish(child: subprocess.Popen[bytes], adopting: bool) -> tuple[int, str]:
 
 
 def _finish_safely(
-    child: subprocess.Popen[bytes], adopting: bool, stop: Callable[[], None]
+    child: subprocess.Popen[bytes],
+    adopting: bool,
+    stop: Callable[[], None],
+    unsupervised: str = "",
 ) -> tuple[int, str]:
     try:
-        return _finish(child, adopting)
+        return _finish(child, adopting, unsupervised)
     except Exception as exc:
         reason = (
             f"could not confirm pytest's processes exited ({type(exc).__name__}: {exc})"
@@ -346,11 +365,27 @@ def main() -> int:
         for sig in signums
         if (handler := signal.getsignal(sig)) is not signal.SIG_IGN
     }
-    adopting = _become_subreaper()
+    unsupervised = ""
+    try:
+        inherited = _has_children()
+    except Exception as exc:
+        inherited = True
+        unsupervised = f"could not list this process's children ({type(exc).__name__})"
+    if inherited:
+        # Never adopt or signal processes we did not start for pytest.
+        adopting = False
+        unsupervised = unsupervised or (
+            "the runner already had child processes (for example a shell's "
+            "background jobs after exec), so only pytest's process group was "
+            "stopped and its detached descendants cannot be confirmed stopped"
+        )
+    else:
+        adopting = _become_subreaper()
     if LINUX and not adopting:
         print(
-            "pytest_temp: could not become a child subreaper; scratch will be "
-            "retained because detached descendants cannot be confirmed stopped",
+            "pytest_temp: "
+            + (unsupervised or "could not become a child subreaper")
+            + "; scratch will be retained",
             file=sys.stderr,
         )
     retain_reason = ""
@@ -388,12 +423,16 @@ def main() -> int:
             )
             if interrupted:
                 signal_child(interrupted)
-            status, retain_reason = _finish_safely(child, adopting, stop_pytest)
+            status, retain_reason = _finish_safely(
+                child, adopting, stop_pytest, unsupervised
+            )
         finally:
             if child is not None and child.returncode is None:
                 # An exception escaped before pytest finished: stop it first.
                 stop_pytest()
-                status, retain_reason = _finish_safely(child, adopting, stop_pytest)
+                status, retain_reason = _finish_safely(
+                    child, adopting, stop_pytest, unsupervised
+                )
                 retain_reason = (
                     retain_reason or "the runner failed before pytest finished"
                 )

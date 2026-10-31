@@ -31,9 +31,14 @@ pytest left behind:
   ones that started their own session) is adopted, reaped as soon as it exits, and
   stopped after pytest exits. Scratch is removed only once the kernel reports no
   remaining children. If the subreaper cannot be enabled, or that cannot be
-  confirmed, scratch is retained and the reason is printed.
-- macOS: only pytest's process group is signalled (TERM, then KILL); descendants
-  that started their own session are not tracked.
+  confirmed, scratch is retained and the reason is printed. If the runner
+  already has child processes when it starts (a shell that `exec`s it hands over
+  its background jobs or a `>(tee ...)` helper), it never touches them: it stops
+  only pytest's process group and retains the scratch with that reason.
+- macOS: only pytest's process group is covered (TERM, then KILL, on CPython
+  3.13+; before 3.13 the group is only checked after pytest exits and scratch is
+  retained if it still exists); descendants that started their own session are
+  not tracked.
 - Windows: only pytest itself is stopped.
 
 A signal the caller already ignores (for example SIGHUP under `nohup`) stays
