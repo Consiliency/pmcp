@@ -499,7 +499,8 @@ class TestShaPinning:
         # Milestone A adds the safe diagnostic artifact uploader.
         # Release alignment adds its explicit Node setup too.
         # Artifact verification checks out its same trusted tag in publish.
-        assert len(cw.remote_uses(cw.pin_scan_files())) == 37
+        # Separate published-wheel observation uses four read-only actions.
+        assert len(cw.remote_uses(cw.pin_scan_files())) == 41
 
     def test_expected_uses_is_sha_form_without_comments(self) -> None:
         # yaml.safe_load strips comments before _collect_uses runs, so a value
