@@ -18,31 +18,50 @@ pip install -e ".[all]"
 
 ## Running Tests
 
+Use the scratch-owning runner below in new plans and local runs. It invokes
+pytest with the same Python interpreter, so use the prepared project environment.
+Each invocation creates a private `pmcp-pytest-*` directory under `$TMPDIR`
+(default `/var/tmp`), owns pytest's `--basetemp` and child temp variables, and
+removes that directory after success, failure or interruption once pytest and
+the processes it left behind have exited (see `plans/verification-template.md`
+for platform coverage).
+Do not supply a fixed `--basetemp`, including through `PYTEST_ADDOPTS`.
+
 ```bash
 # Run all tests (live and slow tests are deselected by default)
-uv run pytest
+uv run --locked python scripts/pytest_temp.py --
 
-# What CI runs (coverage must stay at or above 60%)
-uv run pytest tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml --cov-report=term-missing
+# Full suite locally, parallel with coverage (coverage must stay at or above 60%).
+# Hosted CI's exact commands, including its extra reporting flags, live in
+# .github/workflows/test.yml, release.yml and windows.yml.
+uv run --locked python scripts/pytest_temp.py -- tests/ -v --tb=short -n auto --dist loadfile --cov --cov-report=xml --cov-report=term-missing
 
 # Run with coverage
-uv run pytest --cov=pmcp --cov-report=term-missing
+uv run --locked python scripts/pytest_temp.py -- --cov=pmcp --cov-report=term-missing
 
 # Run specific test file
-uv run pytest tests/test_policy.py -v
+uv run --locked python scripts/pytest_temp.py -- tests/test_policy.py -v
 
 # Run integration tests (need MCP servers available via config or manifest)
-uv run pytest tests/test_integration.py -v
+uv run --locked python scripts/pytest_temp.py -- tests/test_integration.py -v
 
 # Run the slow tier (excluded by default: the redactor's large
 # differentials and regex sweeps)
-uv run pytest -m 'slow and not live'
+uv run --locked python scripts/pytest_temp.py -- -m 'slow and not live'
 ```
+
+Put required logs, JUnit and coverage reports in an owned evidence directory
+outside scratch. Only if scratch itself is required evidence, opt in with
+`scripts/pytest_temp.py --keep-temp -- ...`; record the printed retained path,
+purpose, owner and retention deadline, then remove it after archiving when no
+active/open thread or PR needs it. See [the plan verification template](plans/verification-template.md).
+Do not use broad cleanup globs. SIGKILL, host crashes and power loss cannot run
+cleanup; those require a later ownership/liveness check of the printed path.
 
 CI runs test files across separate worker processes. `--dist loadfile` keeps
 each file's tests and module fixtures together. Each worker runs its tests
 sequentially, with its own environment, cwd, module globals and temporary files.
-Local `uv run pytest` remains sequential unless you supply `-n`.
+The local runner remains sequential unless you supply `-n`.
 
 ### Timing in tests
 
