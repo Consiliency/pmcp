@@ -71,8 +71,8 @@ permissions-workflow-level|1|[release]|release.yml: workflow-level permissions: 
 job-added|1|[release]|release.yml: an extra exfil job added, carrying a valid timeout so only the job-set rule can see it
 job-deleted|1|[release] [drift]|release.yml: the publish job deleted outright
 file-deleted|1|[release] [drift]|release.yml deleted entirely
-timeout-360|1|[timeout]|release.yml build: timeout-minutes 20 -> 360, re-creating the six-hour default #187 exists to fix
-timeout-1|1|[timeout]|release.yml build: timeout-minutes 20 -> 1, killing a multi-minute job after one minute
+timeout-360|1|[timeout]|release.yml build: timeout-minutes 45 -> 360, re-creating the six-hour default #187 exists to fix
+timeout-1|1|[timeout]|release.yml build: timeout-minutes 45 -> 1, killing a multi-minute job after one minute
 timeout-string|1|[timeout]|release.yml build: timeout-minutes -> "not a number"
 timeout-bool|1|[timeout]|release.yml build: timeout-minutes -> true (a bool is an int in Python)
 timeout-deleted|1|[timeout]|release.yml build: timeout-minutes removed, restoring the 360-minute default
@@ -86,7 +86,7 @@ pypa-rolled-back|1|[release]|release.yml: pypa pinned to v1.9.0's REAL commit wi
 composite-tag-pinned|1|[pin]|.github/actions/pipeline-bootstrap-setup/action.yml: setup-node pin reverted to @v4; proves the composite (id-token: write in scope) is in the scan
 uses-quoted-key|1|[pin]|.github/actions/pipeline-bootstrap-setup/action.yml: the pin reverted to @v4 AND the key written as "uses":; valid YAML that GitHub runs and the line scan cannot see. Caught only by the parsed-inventory cross-check
 needs-as-list|0|-|release.yml: needs: build -> needs: [build]; a legitimate equivalent form that must NOT false-positive
-timeout-below-p100|0|-|NOT COVERED: release.yml build timeout-minutes 20 -> 12, above the floor but potentially below a future p100
+timeout-below-p100|0|-|NOT COVERED: release.yml build timeout-minutes 45 -> 12, inside the 10..45 band but below the release build's observed runtime (24.5 min for v3.0.0); release-diff-ack is the only control
 concurrency-added|0|-|NOT COVERED by invariant: workflow-level concurrency with cancel-in-progress on release.yml; release-diff-ack covers it by label
 guard-self-disabled|1|[ci-gate]|selected workflows job cannot be skipped; the independent full suite also enforces this
 guard-self-disabled-nonconstant|1|[ci-gate]|selected workflows job cannot be conditionally skipped, including a nonconstant expression
@@ -515,22 +515,22 @@ workflows-job-deleted)
 	delete_block "$TEST_WF" '  workflows:' '  release-diff-ack:'
 	;;
 timeout-360)
-	replace "$RELEASE" '    timeout-minutes: 20' '    timeout-minutes: 360'
+	replace "$RELEASE" '    timeout-minutes: 45' '    timeout-minutes: 360'
 	;;
 timeout-1)
-	replace "$RELEASE" '    timeout-minutes: 20' '    timeout-minutes: 1'
+	replace "$RELEASE" '    timeout-minutes: 45' '    timeout-minutes: 1'
 	;;
 timeout-below-p100)
-	replace "$RELEASE" '    timeout-minutes: 20' '    timeout-minutes: 12'
+	replace "$RELEASE" '    timeout-minutes: 45' '    timeout-minutes: 12'
 	;;
 timeout-string)
-	replace "$RELEASE" '    timeout-minutes: 20' '    timeout-minutes: "not a number"'
+	replace "$RELEASE" '    timeout-minutes: 45' '    timeout-minutes: "not a number"'
 	;;
 timeout-bool)
-	replace "$RELEASE" '    timeout-minutes: 20' '    timeout-minutes: true'
+	replace "$RELEASE" '    timeout-minutes: 45' '    timeout-minutes: true'
 	;;
 timeout-deleted)
-	replace "$RELEASE" '    timeout-minutes: 20
+	replace "$RELEASE" '    timeout-minutes: 45
 ' ''
 	;;
 guard-self-disabled)
