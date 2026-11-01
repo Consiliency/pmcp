@@ -46,7 +46,12 @@ REQUIRED_JOB = "ci-required"
 REGISTRY = "ghcr.io"
 IMAGE = "consiliency/pmcp"
 API = "api.github.com"
-SKOPEO_IMAGE = "quay.io/skopeo/stable@sha256:cb18e3ddb78c7ce4c06d53de494e0d83b9a63f58bd205149d2c156d75fdecfe4"
+# quay.io/skopeo/stable:v1.22.3-immutable (OCI index; linux/amd64 manifest
+# sha256:ab4c269c9e2bd11affe2666b860fb651a15afec121c15986b052b02e09d86239;
+# skopeo 1.22.3, built 2026-09-21). Only an -immutable tag's digest may be
+# pinned: the plain version tags are rebuilt every weekday and quay drops the
+# replaced digests. image.yml build-smoke carries the identical string (tested).
+SKOPEO_IMAGE = "quay.io/skopeo/stable@sha256:c0ee1f4edca5c01cb8d5611124f92f3cc47196ecab68aee5d0f90834e00574d5"
 INDEX_TYPE = "application/vnd.oci.image.index.v1+json"
 MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
 CONFIG_TYPE = "application/vnd.oci.image.config.v1+json"

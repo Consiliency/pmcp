@@ -96,8 +96,9 @@ jobs:
         id: inspect
         run: python3 -I -B trusted/scripts/image_publish.py oci-inspect --archive "$RUNNER_TEMP/image.oci.tar"
 
+      # quay.io/skopeo/stable:v1.22.3-immutable; linux/amd64 manifest sha256:ab4c269c9e2bd11affe2666b860fb651a15afec121c15986b052b02e09d86239
       - name: Load the candidate locally
-        run: docker run --rm -v "$RUNNER_TEMP:/work:ro" -v /var/run/docker.sock:/var/run/docker.sock quay.io/skopeo/stable@sha256:cb18e3ddb78c7ce4c06d53de494e0d83b9a63f58bd205149d2c156d75fdecfe4 --insecure-policy copy oci-archive:/work/image.oci.tar docker-daemon:pmcp-image-smoke:candidate
+        run: docker run --rm -v "$RUNNER_TEMP:/work:ro" -v /var/run/docker.sock:/var/run/docker.sock quay.io/skopeo/stable@sha256:c0ee1f4edca5c01cb8d5611124f92f3cc47196ecab68aee5d0f90834e00574d5 --insecure-policy copy oci-archive:/work/image.oci.tar docker-daemon:pmcp-image-smoke:candidate
 
       - name: Smoke the loaded candidate
         run: python3 -I -B trusted/scripts/image_publish.py smoke --archive "$RUNNER_TEMP/image.oci.tar" --image pmcp-image-smoke:candidate --probe-server candidate/.github/probe/p1_probe_server.py

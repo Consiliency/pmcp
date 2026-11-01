@@ -710,3 +710,23 @@ def test_the_inline_gate_heredoc_opens_only_on_exact_enabled(
         timeout=60,
     )
     assert output.read_text() == ("open=yes\n" if opens else "")
+
+
+# --- the skopeo pin (president re-check 1, PA-2a) ---------------------------
+
+
+def test_build_smoke_and_promote_use_the_identical_skopeo_pin() -> None:
+    import re
+
+    import yaml
+
+    doc = yaml.safe_load((ROOT / ".github/workflows/image.yml").read_text())
+    runs = [
+        s["run"]
+        for s in doc["jobs"]["build-smoke"]["steps"]
+        if "skopeo" in str(s.get("run", ""))
+    ]
+    assert len(runs) == 1
+    refs = re.findall(r"quay\.io/skopeo/\S+", runs[0])
+    assert refs == [ip.SKOPEO_IMAGE]
+    assert re.fullmatch(r"quay\.io/skopeo/stable@sha256:[0-9a-f]{64}", ip.SKOPEO_IMAGE)
