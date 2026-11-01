@@ -295,7 +295,20 @@ IMAGE_MUTANTS = (
     "image-ack-image",
     "image-ack-dockerfile",
     "image-ack-baselines",
+    "image-gate-workflow-env",
+    "image-gate-workflow-defaults",
+    "image-docker-image-push",
+    "image-skopeo-smoke-glued",
 )
+
+# Round-1 mutants (PR Consiliency/pmcp#463, president R1, R3, R4) and the
+# specific reason each must produce, not just any [image] reason.
+SPECIFIC_REASONS = {
+    "image-gate-workflow-env": "top-level keys must be a subset of",
+    "image-gate-workflow-defaults": "top-level keys must be a subset of",
+    "image-docker-image-push": "contains docker push",
+    "image-skopeo-smoke-glued": "uses skopeo outside the pinned local load in build-smoke",
+}
 
 # Mutants that only the curl/wget clause of guard (d), or its whole-job
 # exemption pin, can kill (president re-check 1, PA-1c).
@@ -309,6 +322,9 @@ HTTP_MUTANTS = (
     "image-http-wget-post-file",
     "image-http-step-shell",
     "image-http-defaults-shell",
+    "image-http-quoted-separator",
+    "image-http-attached-value",
+    "image-http-quoted-method",
 )
 
 # Every mutant these tests exercise. Asserted EQUAL to the helper's expected-1
@@ -1737,7 +1753,9 @@ class TestImagePublicationInvariants:
         "command",
         [
             "docker push x",
+            "docker image push x",
             "podman push x",
+            "podman image push x",
             "buildah push x",
             "crane copy a b",
             "oras push a b",
@@ -1837,6 +1855,34 @@ class TestMutatingHttpClause:
             "wget --post-file=f u",
             "wget --body-data=x u",
             "wget --body-file=f u",
+            # Round 1 (president R2): read as bash reads it.
+            'curl "$URL?x=1&y=2" -X PUT',
+            'curl "https://h/x;y" -T f',
+            'curl "https://h/x|y" -d x',
+            'curl -T/tmp/payload "$URL"',
+            "curl -T./image.tar u",
+            'curl -d@payload "$URL"',
+            'curl -d\'{"a":1}\' "$URL"',
+            "curl -sfd@f u",
+            'curl -F"x=y" "$URL"',
+            "curl -F'file=@image.tar' u",
+            'curl -X"PUT" u',
+            "curl -X'DELETE' u",
+            'curl --""data @f u',
+            'curl -""X PUT u',
+            'c""url -X PUT u',
+            'wget "http://e.com?a=1&b=2" --post-data=abc',
+            'wget "http://e.com?a=1&b=2" --method=DELETE',
+            'wget --post-""data=x u',
+            # Regression cases, each flagged at 5d416e4.
+            "/usr/bin/curl -T f u",
+            "timeout 5 curl -X PUT u",
+            "X=$(curl -sf -X PUT u)",
+            "X=`curl -T f u`",
+            "env A=1 curl -d x u",
+            'bash -c "curl -X PUT u"',
+            "sh -c 'curl -d x u'",
+            'ssh host "curl -T f u"',
         ],
     )
     def test_the_detector_flags_explicit_and_implied_methods(
@@ -1851,6 +1897,10 @@ class TestMutatingHttpClause:
             "curl -fsSL -o a.tgz https://example.invalid/a.tgz",
             "curl -X GET u",
             "curl -I u",
+            'curl -s "https://h/x?a=1&b=2"',
+            'curl -s "$URL" | grep -F needle',
+            'curl -fsSL -o a.tgz "$URL" && tar -xzf a.tgz -T files.txt',
+            'wget -qO- "https://h/x?a=1&b=2"',
         ],
     )
     def test_the_detector_leaves_reads_alone(self, command: str) -> None:
@@ -1882,3 +1932,38 @@ class TestMutatingHttpClause:
             notify["defaults"] = {"run": {"shell": shell}}
         new = [r for r in cw.image_publication_invariants(docs) if r not in baseline]
         assert any(r.endswith(cw.MUTATING_HTTP_LABEL) for r in new), new
+
+
+class TestRoundOneGuards:
+    """PR Consiliency/pmcp#463 round 1: R1 (top-level keys), R3, R4."""
+
+    @pytest.mark.parametrize("mutant", sorted(SPECIFIC_REASONS))
+    def test_mutant_reports_its_specific_reason(
+        self, tmp_path: Path, mutant: str
+    ) -> None:
+        root = _image_tree(tmp_path)
+        before, _ = _image_reasons(root)
+        _mutate(root, mutant)
+        after, _ = _image_reasons(root)
+        new = [r for r in after if r not in before]
+        assert any(SPECIFIC_REASONS[mutant] in r for r in new), new
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("env", {"BASH_ENV": "$(echo open=yes >>$GITHUB_OUTPUT)"}),
+            ("defaults", {"run": {"shell": "bash {0}"}}),
+            ("concurrency", {"group": "x"}),
+        ],
+    )
+    def test_extra_top_level_keys_in_image_yml_are_refused(
+        self, key: str, value: Any
+    ) -> None:
+        docs = {
+            p.name: yaml.safe_load(p.read_text()) for p in WORKFLOW_DIR.glob("*.y*ml")
+        }
+        reason = "image.yml top-level keys must be a subset of"
+        assert not any(reason in r for r in cw.image_publication_invariants(docs))
+        docs["image.yml"][key] = value
+        new = [r for r in cw.image_publication_invariants(docs) if reason in r]
+        assert new and key in new[0]

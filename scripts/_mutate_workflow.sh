@@ -202,6 +202,13 @@ image-http-data-d|1|[image]|published-wheel.yml: curl -sd (implied POST) in a ne
 image-http-wget-post-file|1|[image]|published-wheel.yml: wget --post-file in a new step
 image-http-step-shell|1|[image]|published-wheel.yml: a step whose shell: holds a mutating curl
 image-http-defaults-shell|1|[image]|published-wheel.yml: a workflow-level defaults.run.shell holding a mutating curl
+image-gate-workflow-env|1|[image]|image.yml: a workflow-level env whose BASH_ENV appends open=yes to $GITHUB_OUTPUT before the gate heredoc runs
+image-gate-workflow-defaults|1|[image]|image.yml: a workflow-level defaults.run.shell that appends open=yes to $GITHUB_OUTPUT
+image-http-quoted-separator|1|[image]|published-wheel.yml: curl with a quoted & in the URL, then -X PUT
+image-http-attached-value|1|[image]|published-wheel.yml: curl -d@file (attached value, implied POST)
+image-http-quoted-method|1|[image]|published-wheel.yml: curl -X"PUT" (quoted attached method)
+image-docker-image-push|1|[image]|published-wheel.yml: docker image push, the long form of docker push
+image-skopeo-smoke-glued|1|[image]|image.yml: a second skopeo glued onto the allowed smoke load with ;
 image-needs-reordered|0|-|image.yml: promote-main needs reordered; an equivalent form that must NOT false-positive
 TSV
 )"
@@ -1009,6 +1016,54 @@ defaults:
   run:
     shell: curl -sf -X PUT --data-binary @{0} "$UPLOAD_URL" --
 jobs:'
+	;;
+image-gate-workflow-env)
+	replace "$IMAGE_WF" '
+permissions: {}
+' '
+permissions: {}
+
+env:
+  BASH_ENV: '"'"'$(echo open=yes >>"$GITHUB_OUTPUT")'"'"'
+'
+	;;
+image-gate-workflow-defaults)
+	replace "$IMAGE_WF" '
+permissions: {}
+' '
+permissions: {}
+
+defaults:
+  run:
+    shell: bash -c '"'"'echo open=yes >> "$GITHUB_OUTPUT"'"'"' {0}
+'
+	;;
+image-http-quoted-separator)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: curl -sf "$UPLOAD_URL?a=1&b=2" -X PUT
+      - name: Retain public compatibility identity
+'
+	;;
+image-http-attached-value)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: curl -sf -d@report.json "$UPLOAD_URL"
+      - name: Retain public compatibility identity
+'
+	;;
+image-http-quoted-method)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: curl -sf -X"PUT" "$UPLOAD_URL"
+      - name: Retain public compatibility identity
+'
+	;;
+image-docker-image-push)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: docker image push "$IMAGE_REF"
+      - name: Retain public compatibility identity
+'
+	;;
+image-skopeo-smoke-glued)
+	replace "$IMAGE_WF" 'docker-daemon:pmcp-image-smoke:candidate' 'docker-daemon:pmcp-image-smoke:candidate;skopeo copy docker://example.invalid/a:t docker://example.invalid/b:t'
 	;;
 image-needs-reordered)
 	replace "$IMAGE_WF" '    needs: [gate, verify-upstream, build-smoke]' '    needs: [build-smoke, gate, verify-upstream]'

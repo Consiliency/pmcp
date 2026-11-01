@@ -1170,6 +1170,7 @@ DOCKER_WORKFLOW = "docker.yml"
 IMAGE_WORKFLOW = "image.yml"
 IMAGE_WATCH_WORKFLOW = "image-watch.yml"
 PROMOTE_JOB = "promote-main"
+IMAGE_TOP_LEVEL_KEYS = {"name", "on", True, "permissions", "jobs"}
 DOCKER_ON = {"pull_request": {"branches": ["main"]}}
 IMAGE_ON = {
     "workflow_run": {
@@ -1222,14 +1223,14 @@ IMAGE_WATCH_CHECKOUT = {
 # verified archive into the runner's daemon, in build-smoke only.
 SKOPEO_SMOKE_LOAD = re.compile(
     r"quay\.io/skopeo/stable@sha256:[0-9a-f]{64} (?:--insecure-policy )?"
-    r"copy oci-archive:\S+ docker-daemon:\S+"
+    r"copy oci-archive:[^\s;&|]+ docker-daemon:[^\s;&|]+"
 )
 PUBLICATION_PATTERNS = {
     "a buildx --push": re.compile(r"(?<![\w-])--push\b"),
     "a type=registry output": re.compile(r"type=registry"),
     "a pushing type=image output": re.compile(r"type=image[^\n]*push=true"),
-    "docker push": re.compile(r"\bdocker\s+push\b"),
-    "podman push": re.compile(r"\bpodman\s+push\b"),
+    "docker push": re.compile(r"\bdocker\s+(?:image\s+)?push\b"),
+    "podman push": re.compile(r"\bpodman\s+(?:image\s+)?push\b"),
     "buildah push": re.compile(r"\bbuildah\s+push\b"),
     "crane": re.compile(r"\bcrane\b"),
     "oras": re.compile(r"\boras\b"),
@@ -1239,51 +1240,172 @@ PUBLICATION_PATTERNS = {
 }
 SKOPEO_DELETE = re.compile(r"\bskopeo\b[^\n]*\bdelete\b", re.IGNORECASE)
 MUTATING_HTTP_LABEL = "a mutating curl/wget"
-_HTTP_COMMAND = re.compile(r"\b(curl|wget)\b([^\n;|&]*)")
 _SAFE_METHODS = {"GET", "HEAD"}
 _CURL_IMPLIED_LONG = ("--data", "--form", "--json", "--upload-file")
 _WGET_IMPLIED_LONG = ("--post-data", "--post-file", "--body-data", "--body-file")
+# curl short options whose value may be attached: the rest of the word after
+# one of these is a value, never further option letters.
+_CURL_VALUE_SHORT = set("AbcCdDeEFHKmoPQrtTuUwxXyYz")
+_SHELL_SEPARATORS = set(";&|()`\n")
+_METHOD_WORD = re.compile(r"\$.*|[A-Za-z][A-Za-z0-9_-]*")
+_MAX_NESTING = 4
+
+
+class _Word:
+    """One shell word after quote removal, with the contents of its quoted parts."""
+
+    def __init__(self) -> None:
+        self.text = ""
+        self.quoted: list[str] = []
+        self.started = False
+
+
+def _shell_commands(text: str) -> list[list[_Word]] | None:
+    """Split text the way bash does: words at unquoted blanks, commands at
+    unquoted ``;``, ``&``, ``|``, ``(``, ``)``, backtick and newline, quotes
+    removed. ``None`` when the quotes do not balance."""
+    commands: list[list[_Word]] = [[]]
+    word = _Word()
+
+    def finish() -> None:
+        nonlocal word
+        if word.started:
+            commands[-1].append(word)
+        word = _Word()
+
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"'):
+            close = i + 1
+            if ch == "'":
+                close = text.find("'", i + 1)
+                if close < 0:
+                    return None
+                inner = text[i + 1 : close]
+            else:
+                parts = []
+                while True:
+                    if close >= n:
+                        return None
+                    if text[close] == "\\" and close + 1 < n:
+                        parts.append(text[close + 1])
+                        close += 2
+                        continue
+                    if text[close] == '"':
+                        break
+                    parts.append(text[close])
+                    close += 1
+                inner = "".join(parts)
+            word.text += inner
+            word.quoted.append(inner)
+            word.started = True
+            i = close + 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            word.text += text[i + 1]
+            word.started = True
+            i += 2
+            continue
+        if ch in _SHELL_SEPARATORS:
+            finish()
+            commands.append([])
+            i += 1
+            continue
+        if ch.isspace():
+            finish()
+            i += 1
+            continue
+        word.text += ch
+        word.started = True
+        i += 1
+    finish()
+    return [command for command in commands if command]
+
+
+def _method_writes(method: str) -> bool:
+    """A method other than GET or HEAD; a ``$`` expansion counts as a write."""
+    return _METHOD_WORD.fullmatch(method) is not None and (
+        method.startswith("$") or method.upper() not in _SAFE_METHODS
+    )
+
+
+def _curl_writes(args: list[str]) -> bool:
+    for index, word in enumerate(args):
+        following = args[index + 1] if index + 1 < len(args) else ""
+        if word.startswith("--"):
+            option, _, attached = word.partition("=")
+            if option == "--request" and _method_writes(attached or following):
+                return True
+            if option.startswith(_CURL_IMPLIED_LONG):
+                return True
+        elif word.startswith("-") and len(word) > 1:
+            for position, letter in enumerate(word[1:], start=1):
+                if not letter.isalnum():
+                    break
+                if letter in "dFT":
+                    return True
+                if letter == "X":
+                    rest = word[position + 1 :]
+                    if _method_writes(rest or following):
+                        return True
+                    break
+                if letter in _CURL_VALUE_SHORT:
+                    break
+    return False
+
+
+def _wget_writes(args: list[str]) -> bool:
+    for index, word in enumerate(args):
+        option, _, attached = word.partition("=")
+        following = args[index + 1] if index + 1 < len(args) else ""
+        if option == "--method" and _method_writes(attached or following):
+            return True
+        if option.startswith(_WGET_IMPLIED_LONG):
+            return True
+    return False
+
+
+def _http_writes(text: str, depth: int) -> bool:
+    if depth > _MAX_NESTING:
+        return False
+    commands = _shell_commands(text)
+    if commands is None:
+        # Unbalanced quotes: classify conservatively, untruncated, with every
+        # quote character removed.
+        flat = [w for w in re.sub("['\"]", "", text).split() if w]
+        commands_words = [flat]
+        quoted: list[str] = []
+    else:
+        commands_words = [[w.text for w in command] for command in commands]
+        quoted = [q for command in commands for w in command for q in w.quoted]
+    for words in commands_words:
+        for index, word in enumerate(words):
+            tool = word.rsplit("/", 1)[-1]
+            if tool == "curl" and _curl_writes(words[index + 1 :]):
+                return True
+            if tool == "wget" and _wget_writes(words[index + 1 :]):
+                return True
+    # A quoted word is classified as a command too (bash -c "...", ssh h "...").
+    return any(_http_writes(inner, depth + 1) for inner in quoted)
 
 
 def mutating_http(text: str) -> bool:
     """A curl or wget that sends a method other than GET or HEAD.
 
-    Explicitly (``-X``/``--request``/``--method``, including ``-XPUT`` and a
-    short group ending in ``X``) or through a flag that implies one: curl
-    ``-d``/``--data*``, ``-F``/``--form*``, ``--json``, ``-T``/``--upload-file``
-    and any short group containing ``d``, ``F`` or ``T`` (``-sd``, ``-sfT``);
-    wget ``--post-data``/``--post-file``/``--body-data``/``--body-file``.
-    Static text only: a command assembled at runtime is out of reach.
+    The text is read as bash reads it (words split at unquoted blanks,
+    commands at unquoted ``; & | ( )``, backtick or newline, quotes removed);
+    the command word is recognised by its basename anywhere in a command
+    (``/usr/bin/curl``, ``timeout 5 curl``, ``env A=1 curl``), and quoted
+    words are classified as commands too (``bash -c "..."``). A method is sent
+    explicitly (``-X``/``--request``/``--method``, attached or not) or
+    implied: curl ``-d``/``--data*``, ``-F``/``--form*``, ``--json``,
+    ``-T``/``--upload-file`` and any short group whose option letters include
+    ``d``, ``F`` or ``T``, whatever value is attached; wget
+    ``--post-data``/``--post-file``/``--body-data``/``--body-file``. Static
+    text only: a command assembled at runtime is out of reach.
     """
-    for match in _HTTP_COMMAND.finditer(_joined(text)):
-        tool, tokens = match[1], match[2].split()
-        for index, token in enumerate(tokens):
-            bare = token.strip("'\"")
-            option, _, attached = bare.partition("=")
-            method = None
-            if tool == "curl":
-                if option == "--request" or re.fullmatch(r"-[A-Za-z]*X", bare):
-                    method = attached or (
-                        tokens[index + 1] if index + 1 < len(tokens) else ""
-                    )
-                elif re.fullmatch(r"-[A-Za-z]*X[A-Za-z]+", bare):
-                    method = bare.split("X", 1)[1]
-                elif option.startswith(_CURL_IMPLIED_LONG):
-                    return True
-                elif re.fullmatch(r"-[A-Za-z0-9]+", bare) and set(bare[1:]) & set(
-                    "dFT"
-                ):
-                    return True
-            else:
-                if option == "--method":
-                    method = attached or (
-                        tokens[index + 1] if index + 1 < len(tokens) else ""
-                    )
-                elif option.startswith(_WGET_IMPLIED_LONG):
-                    return True
-            if method is not None and method.strip("'\"").upper() not in _SAFE_METHODS:
-                return True
-    return False
+    return _http_writes(_joined(text), 0)
 
 
 # The one pinned exemption from the curl/wget clause (plan T7(d), president
@@ -1604,6 +1726,15 @@ def image_publication_invariants(
                     f"{tag} {name}:{job_name} decides on vars.PMCP_IMAGE_PUBLISH in an if:"
                 )
     if isinstance(image, dict):
+        # A workflow-level env (BASH_ENV) or defaults.run.shell reaches the
+        # gate step before its heredoc runs; only these top-level keys may
+        # exist. PyYAML reads a bare `on:` as True.
+        extra = sorted(str(k) for k in image if k not in IMAGE_TOP_LEVEL_KEYS)
+        if extra:
+            reasons.append(
+                f"{tag} {IMAGE_WORKFLOW} top-level keys must be a subset of "
+                f"name, on, permissions and jobs; found {', '.join(extra)}"
+            )
         jobs = _jobs(image)
         gate = jobs.get("gate")
         steps = _steps(gate)
