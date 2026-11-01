@@ -265,3 +265,161 @@ def test_cli_incomplete_evidence_returns_nonzero(
         },
     )
     assert inv.main() == 1
+
+
+# --- CLR1-01: the exit predicate requires an empty non-PR blocker list ------
+
+
+@pytest.mark.parametrize("status", ["in_progress", "future_platform_status"])
+def test_cli_complete_inventory_with_a_non_pr_blocker_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    import sys
+
+    blocker = {
+        "id": 7,
+        "run_attempt": 1,
+        "head_sha": "a" * 40,
+        "event": "push",
+        "status": status,
+        "conclusion": None,
+    }
+    monkeypatch.setattr(
+        sys, "argv", ["inventory", "--output", str(tmp_path / "report.json")]
+    )
+    monkeypatch.setattr(
+        inv,
+        "inventory",
+        lambda: {
+            "complete": True,
+            "activation_allowed": False,
+            "runs": [blocker],
+            "non_pr_not_completed": [blocker],
+        },
+    )
+    assert inv.main() == 1
+
+
+def test_cli_complete_inventory_without_blockers_exits_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    monkeypatch.setattr(
+        sys, "argv", ["inventory", "--output", str(tmp_path / "report.json")]
+    )
+    monkeypatch.setattr(
+        inv,
+        "inventory",
+        lambda: {
+            "complete": True,
+            "activation_allowed": False,
+            "runs": [],
+            "non_pr_not_completed": [],
+        },
+    )
+    assert inv.main() == 0
+
+
+# --- CLR1-02: the reader is a bounded, GET-only gh api call -----------------
+
+INCOMPLETE_TEXT = "inventory incomplete; all new registry writes must remain disabled"
+
+
+def test_reader_argv_is_exactly_a_get_with_bounded_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+    import subprocess
+
+    calls: list[tuple[Any, dict[str, Any]]] = []
+    rows = [row(1)]
+    valid = fixture_read(rows)
+
+    def fake(argv: Any, **kwargs: Any) -> bytes:
+        calls.append((argv, kwargs))
+        return json.dumps(valid(argv[2])).encode()
+
+    monkeypatch.setattr(subprocess, "check_output", fake)
+    result = inv.inventory()
+    assert result["complete"] and calls
+    for argv, kwargs in calls:
+        assert type(argv) is list and argv[:2] == ["gh", "api"] and len(argv) == 3
+        assert not argv[2].startswith("-")
+        assert kwargs == {"timeout": 60, "stderr": subprocess.PIPE}
+        joined = " ".join(argv)
+        for flag in ("--method", "-X", "--field", "-f", "-F", "--input", "--paginate"):
+            assert flag not in argv and f" {flag}" not in joined
+
+
+@pytest.mark.parametrize(
+    "failure", ["oversize", "invalid-json", "called-process-error", "timeout"]
+)
+def test_reader_failures_are_incomplete_with_the_fixed_text(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import subprocess
+
+    def fake(argv: Any, **kwargs: Any) -> bytes:
+        if failure == "oversize":
+            return b" " * (16 * 1024 * 1024 + 1)
+        if failure == "invalid-json":
+            return b"{not json"
+        if failure == "called-process-error":
+            raise subprocess.CalledProcessError(1, argv, stderr=b"private-canary")
+        raise subprocess.TimeoutExpired(argv, 60)
+
+    monkeypatch.setattr(subprocess, "check_output", fake)
+    result = inv.inventory()
+    assert result["complete"] is False
+    assert result["error"] == INCOMPLETE_TEXT
+    assert not result["activation_allowed"]
+
+
+# --- CLR1-05: PR rows count toward stability but never block a drain --------
+
+
+def test_a_pr_row_changing_between_passes_is_unstable() -> None:
+    passes = 0
+    first = [row(1, status="in_progress", event="pull_request"), row(2)]
+    second = [row(1, event="pull_request"), row(2)]
+
+    def read(endpoint: str) -> Any:
+        nonlocal passes
+        if endpoint.endswith(str(inv.WORKFLOW_ID)):
+            passes += 1
+        return fixture_read(first if passes == 1 else second)(endpoint)
+
+    result = inv.inventory(read)
+    assert result["stability_verified"] is False and result["complete"] is False
+
+
+def test_a_stable_nonterminal_pr_row_is_kept_but_never_blocks() -> None:
+    pr_row = row(1, status="queued", event="pull_request")
+    result = inv.inventory(fixture_read([pr_row, row(2)]))
+    assert result["complete"] and result["stability_verified"]
+    assert 1 in {record["id"] for record in result["runs"]}
+    assert 1 not in {record["id"] for record in result["non_pr_not_completed"]}
+
+
+# --- #443 item 4: the listing endpoint is exact and unfiltered --------------
+
+
+def test_listing_endpoint_is_the_exact_unfiltered_workflow_run_page() -> None:
+    import re
+
+    seen: list[str] = []
+    valid = fixture_read([row(i) for i in range(1, 151)])
+
+    def read(endpoint: str) -> Any:
+        seen.append(endpoint)
+        return valid(endpoint)
+
+    assert inv.inventory(read)["complete"]
+    listings = [e for e in seen if "?" in e]
+    assert listings
+    pattern = re.compile(
+        r"repos/Consiliency/pmcp/actions/workflows/219424499/runs\?per_page=100&page=[1-9][0-9]*"
+    )
+    assert all(pattern.fullmatch(e) for e in listings), listings
+    assert [int(e.rsplit("=", 1)[1]) for e in listings] == [1, 2, 1, 2]
