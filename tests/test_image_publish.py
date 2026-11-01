@@ -673,3 +673,40 @@ def test_smoke_refuses_a_loaded_image_that_differs(
     )
     with pytest.raises(ip.Refusal):
         ip.smoke(archive, "pmcp-image-smoke:candidate", tmp_path / "probe.py")
+
+
+# --- the inline gate in image.yml (extracted, run under the same matrix) -----
+
+
+def _gate_step() -> dict[str, Any]:
+    import yaml
+
+    doc = yaml.safe_load((ROOT / ".github/workflows/image.yml").read_text())
+    steps = doc["jobs"]["gate"]["steps"]
+    assert len(steps) == 1 and steps[0]["id"] == "decide"
+    return steps[0]
+
+
+@pytest.mark.parametrize(("value", "opens"), GATE_MATRIX)
+def test_the_inline_gate_heredoc_opens_only_on_exact_enabled(
+    tmp_path: Path, value: bytes | None, opens: bool
+) -> None:
+    import subprocess
+
+    step = _gate_step()
+    assert step["env"] == {"PMCP_IMAGE_PUBLISH": "${{ vars.PMCP_IMAGE_PUBLISH }}"}
+    output = tmp_path / "github_output"
+    output.write_bytes(b"")
+    env = {
+        b"PATH": os.environb.get(b"PATH", b"/usr/bin:/bin"),
+        b"GITHUB_OUTPUT": bytes(output),
+    }
+    if value is not None:
+        env[b"PMCP_IMAGE_PUBLISH"] = value
+    subprocess.run(
+        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]],
+        env=env,
+        check=True,
+        timeout=60,
+    )
+    assert output.read_text() == ("open=yes\n" if opens else "")

@@ -500,7 +500,9 @@ class TestShaPinning:
         # Release alignment adds its explicit Node setup too.
         # Artifact verification checks out its same trusted tag in publish.
         # Separate published-wheel observation uses four read-only actions.
-        assert len(cw.remote_uses(cw.pin_scan_files())) == 41
+        # The guarded image cutover drops docker.yml's login action and adds
+        # eight already-pinned uses: seven in image.yml, one in image-watch.yml.
+        assert len(cw.remote_uses(cw.pin_scan_files())) == 48
 
     def test_expected_uses_is_sha_form_without_comments(self) -> None:
         # yaml.safe_load strips comments before _collect_uses runs, so a value

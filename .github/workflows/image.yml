@@ -1,0 +1,149 @@
+name: Image
+
+# Guarded container image publisher. Every registry write is disabled unless
+# the repository variable PMCP_IMAGE_PUBLISH is exactly `enabled`; activation
+# is a separate owner step. Only `promote-main` holds packages: write, and it
+# writes the immutable sha-<40 hex> tag before moving `main`. The trusted code
+# is scripts/image_publish.py at github.workflow_sha (the default-branch
+# commit running this file); no pull-request code runs here. Guarded by
+# scripts/check_workflows.py image_publication_invariants.
+on:
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    outputs:
+      open: ${{ steps.decide.outputs.open }}
+    steps:
+      - id: decide
+        env:
+          PMCP_IMAGE_PUBLISH: ${{ vars.PMCP_IMAGE_PUBLISH }}
+        run: |
+          python3 -I -B - <<'PY'
+          import os
+          if os.environb.get(b"PMCP_IMAGE_PUBLISH") == b"enabled":
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write("open=yes\n")
+          PY
+
+  verify-upstream:
+    if: github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      head_sha: ${{ steps.verify.outputs.head_sha }}
+    steps:
+      - name: Check out the trusted publisher script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: scripts/image_publish.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Verify the upstream Test run
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: python3 -I -B scripts/image_publish.py verify-upstream --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT"
+
+  build-smoke:
+    needs: verify-upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      manifest_digest: ${{ steps.inspect.outputs.manifest_digest }}
+      config_digest: ${{ steps.inspect.outputs.config_digest }}
+    steps:
+      - name: Check out the trusted publisher script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: scripts/image_publish.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+          path: trusted
+
+      - name: Check out the verified candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify-upstream.outputs.head_sha }}
+          persist-credentials: false
+          path: candidate
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the OCI archive
+        run: docker buildx build --platform linux/amd64 --provenance=false --sbom=false --no-cache --output "type=oci,dest=$RUNNER_TEMP/image.oci.tar" candidate
+
+      - name: Verify the OCI layout
+        id: inspect
+        run: python3 -I -B trusted/scripts/image_publish.py oci-inspect --archive "$RUNNER_TEMP/image.oci.tar"
+
+      - name: Load the candidate locally
+        run: docker run --rm -v "$RUNNER_TEMP:/work:ro" -v /var/run/docker.sock:/var/run/docker.sock quay.io/skopeo/stable@sha256:cb18e3ddb78c7ce4c06d53de494e0d83b9a63f58bd205149d2c156d75fdecfe4 --insecure-policy copy oci-archive:/work/image.oci.tar docker-daemon:pmcp-image-smoke:candidate
+
+      - name: Smoke the loaded candidate
+        run: python3 -I -B trusted/scripts/image_publish.py smoke --archive "$RUNNER_TEMP/image.oci.tar" --image pmcp-image-smoke:candidate --probe-server candidate/.github/probe/p1_probe_server.py
+
+      - name: Keep the verified archive for promotion
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-oci
+          path: ${{ runner.temp }}/image.oci.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  promote-main:
+    needs: [gate, verify-upstream, build-smoke]
+    if: ${{ needs.gate.outputs.open == 'yes' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: pmcp-image-main
+      cancel-in-progress: false
+    steps:
+      - name: Check out the trusted publisher script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: scripts/image_publish.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Download this run's verified archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: candidate-oci
+          path: ${{ runner.temp }}/candidate
+
+      - name: Promote to ghcr.io (sha tag, then main)
+        env:
+          PMCP_IMAGE_PUBLISH: ${{ vars.PMCP_IMAGE_PUBLISH }}
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST_DIGEST: ${{ needs.build-smoke.outputs.manifest_digest }}
+          HEAD_SHA: ${{ needs.verify-upstream.outputs.head_sha }}
+        run: python3 -I -B scripts/image_publish.py promote --archive "$RUNNER_TEMP/candidate/image.oci.tar" --manifest-digest "$MANIFEST_DIGEST" --head-sha "$HEAD_SHA" --authfile "$RUNNER_TEMP/pmcp-registry-auth.json"
+
+      - name: Remove the registry authfile
+        if: always()
+        run: rm -f "$RUNNER_TEMP/pmcp-registry-auth.json"

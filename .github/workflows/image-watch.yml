@@ -1,0 +1,41 @@
+name: Image watch
+
+# Weekly read-only observation of the legacy run inventory and the ghcr.io
+# registry against the owner-committed baselines. Each run writes exactly one
+# outcome marker (COMPLETE, DISCREPANCY, INCOMPLETE or NO_BASELINE) to its job
+# summary; the owner classifies runs by that marker. No write permission.
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    steps:
+      - name: Check out the readers and committed baselines
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            scripts/image_cutover_inventory.py
+            scripts/image_registry_readback.py
+            .consiliency/evidence/image-baselines/*
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Observe the inventory and registry
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PMCP_IMAGE_PUBLISH: ${{ vars.PMCP_IMAGE_PUBLISH }}
+        run: python3 -I -B scripts/image_registry_readback.py watch --commit "$GITHUB_SHA" --baseline-dir .consiliency/evidence/image-baselines --work-dir "$RUNNER_TEMP/image-watch" --summary "$GITHUB_STEP_SUMMARY"

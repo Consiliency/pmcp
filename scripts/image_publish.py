@@ -585,7 +585,7 @@ def skopeo_copy_argv(
     argv = ["docker", "run", "--rm", "-v", f"{auth}:/auth.json:ro"]
     if archive is not None:
         argv += ["-v", f"{archive.parent}:/work:ro"]
-    argv += [SKOPEO_IMAGE, "copy", "--preserve-digests"]
+    argv += [SKOPEO_IMAGE, "--insecure-policy", "copy", "--preserve-digests"]
     if source.startswith("docker://"):
         argv += ["--src-authfile", "/auth.json"]
     argv += [
