@@ -23,6 +23,13 @@ Four independent checks run here:
     Compares the job set of each changed workflow against its base revision
     and fails on any job that disappeared. This is the only guard against a
     job being silently deleted or renamed away.
+``image_publication_invariants``
+    The guarded container image cutover: ``docker.yml`` stays a read-only PR
+    build, every registry write lives in ``image.yml:promote-main`` behind the
+    exact-``enabled`` gate, and ``image-watch.yml`` stays read-only. Every
+    reason it reports is tagged ``[image]``. These are static YAML and string
+    checks: commands assembled at runtime, code inside third-party actions and
+    repository settings are outside their reach.
 
 **The ``uses:`` and ``permissions:`` allowlists below are exact.** Any
 legitimate edit to ``release.yml`` — bumping an action, adding a step that
@@ -116,9 +123,10 @@ PROTECTED_JOBS = ("build", "publish", "github-release")
 # version, so drift passes it; and `release-diff-ack` greps for `release.yml`
 # specifically, so the label is never demanded. It would run arbitrary code at
 # tag push with whatever permissions it grants itself.
-# `docker.yml` is tag-triggered today — it builds and pushes the release image
-# on `v*` — and carries `packages: write`. Adding a file here must be deliberate.
-TAG_TRIGGERED_WORKFLOWS = {"release.yml", "docker.yml"}
+# `docker.yml` left this set with the guarded image cutover: it is a read-only
+# pull-request build now, and a tag caller for image publication needs its own
+# reviewed PR. Adding a file here must be deliberate.
+TAG_TRIGGERED_WORKFLOWS = {"release.yml"}
 
 # Timeouts: a floor stops a job being throttled to death, a ceiling stops the
 # six-hour default being re-created by a large value. Both ends are load
@@ -1155,6 +1163,474 @@ def diagnostic_invariants(doc: Any) -> list[str]:
     return []
 
 
+# --- guarded image publication ----------------------------------------------
+
+IMAGE_TAG = "[image]"
+DOCKER_WORKFLOW = "docker.yml"
+IMAGE_WORKFLOW = "image.yml"
+IMAGE_WATCH_WORKFLOW = "image-watch.yml"
+PROMOTE_JOB = "promote-main"
+DOCKER_ON = {"pull_request": {"branches": ["main"]}}
+IMAGE_ON = {
+    "workflow_run": {
+        "workflows": ["Test"],
+        "types": ["completed"],
+        "branches": ["main"],
+    }
+}
+IMAGE_WATCH_CRON = "0 9 * * 1"
+IMAGE_JOB_PERMISSIONS: dict[str, dict[str, str]] = {
+    "gate": {},
+    "verify-upstream": {"actions": "read", "contents": "read"},
+    "build-smoke": {"contents": "read"},
+    PROMOTE_JOB: {"contents": "read", "packages": "write"},
+}
+IMAGE_WATCH_PERMISSIONS = {"contents": "read", "actions": "read", "packages": "read"}
+GATE_ENV = {"PMCP_IMAGE_PUBLISH": "${{ vars.PMCP_IMAGE_PUBLISH }}"}
+GATE_OUTPUTS = {"open": "${{ steps.decide.outputs.open }}"}
+# sha256 of the gate step's whole `run:` heredoc. Any edit, including a
+# case-folding `.lower()`, needs a deliberate update here.
+GATE_RUN_SHA256 = "19effd6ec3af5fb790c95c80f59d4a237c66724638f74077b665587b24b94115"
+PROMOTE_IF = "${{ needs.gate.outputs.open == 'yes' }}"
+PROMOTE_NEEDS = {"gate", "verify-upstream", "build-smoke"}
+PROMOTE_ENV = {
+    "PMCP_IMAGE_PUBLISH": "${{ vars.PMCP_IMAGE_PUBLISH }}",
+    "GH_TOKEN": "${{ github.token }}",
+    "MANIFEST_DIGEST": "${{ needs.build-smoke.outputs.manifest_digest }}",
+    "HEAD_SHA": "${{ needs.verify-upstream.outputs.head_sha }}",
+}
+PROMOTE_CONCURRENCY = {"group": "pmcp-image-main", "cancel-in-progress": False}
+TRUSTED_CHECKOUT = {
+    "ref": "${{ github.workflow_sha }}",
+    "sparse-checkout": "scripts/image_publish.py",
+    "sparse-checkout-cone-mode": False,
+    "persist-credentials": False,
+}
+CANDIDATE_CHECKOUT = {
+    "ref": "${{ needs.verify-upstream.outputs.head_sha }}",
+    "persist-credentials": False,
+}
+IMAGE_WATCH_CHECKOUT = {
+    "ref": "${{ github.sha }}",
+    "sparse-checkout": "scripts/image_cutover_inventory.py\n"
+    "scripts/image_registry_readback.py\n"
+    ".consiliency/evidence/image-baselines/*\n",
+    "sparse-checkout-cone-mode": False,
+    "persist-credentials": False,
+}
+# The single skopeo form allowed outside promote-main: a local load of the
+# verified archive into the runner's daemon, in build-smoke only.
+SKOPEO_SMOKE_LOAD = re.compile(
+    r"quay\.io/skopeo/stable@sha256:[0-9a-f]{64} (?:--insecure-policy )?"
+    r"copy oci-archive:\S+ docker-daemon:\S+"
+)
+PUBLICATION_PATTERNS = {
+    "a buildx --push": re.compile(r"(?<![\w-])--push\b"),
+    "a type=registry output": re.compile(r"type=registry"),
+    "a pushing type=image output": re.compile(r"type=image[^\n]*push=true"),
+    "docker push": re.compile(r"\bdocker\s+push\b"),
+    "podman push": re.compile(r"\bpodman\s+push\b"),
+    "buildah push": re.compile(r"\bbuildah\s+push\b"),
+    "crane": re.compile(r"\bcrane\b"),
+    "oras": re.compile(r"\boras\b"),
+    "regctl": re.compile(r"\bregctl\b"),
+    "docker login": re.compile(r"\bdocker\s+login\b"),
+    "a mutating curl/wget": re.compile(
+        r"\b(?:curl|wget)\b[^\n]*?(?:-X\s*|--request[\s=]|--method[\s=])"
+        r"['\"]?(?:PUT|POST|PATCH|DELETE)\b"
+    ),
+    "an image_publish.py write": re.compile(r"image_publish\.py\s+(?:promote|tag)\b"),
+}
+SKOPEO_DELETE = re.compile(r"\bskopeo\b[^\n]*\bdelete\b", re.IGNORECASE)
+IMAGE_RUN_FORBIDDEN = {
+    "git clone/fetch/pull/checkout": re.compile(
+        r"\bgit\s+(?:clone|fetch|pull|checkout)\b"
+    ),
+    "gh repo clone": re.compile(r"\bgh\s+repo\s+clone\b"),
+    "curl": re.compile(r"\bcurl\b"),
+    "wget": re.compile(r"\bwget\b"),
+    "raw.githubusercontent": re.compile(r"raw\.githubusercontent"),
+    "a contents API path": re.compile(r"/contents/"),
+    "workflow_run.head_sha": re.compile(r"workflow_run\.head_sha"),
+}
+ACK_REQUIRED_PATHS = (
+    ".github/workflows/docker.yml",
+    ".github/workflows/image.yml",
+    ".github/workflows/image-watch.yml",
+    "Dockerfile",
+    ".consiliency/evidence/image-baselines/inventory-B1.json",
+    ".consiliency/evidence/image-baselines/registry-R2.json",
+    ".consiliency/evidence/image-baselines/retention.json",
+    "scripts/image_publish.py",
+    "scripts/image_registry_readback.py",
+    "scripts/image_cutover_inventory.py",
+)
+
+
+def _strings(node: Any) -> list[str]:
+    """Every string key and value in a parsed YAML subtree."""
+    if isinstance(node, str):
+        return [node]
+    if isinstance(node, dict):
+        found: list[str] = []
+        for key, value in node.items():
+            if isinstance(key, str):
+                found.append(key)
+            found.extend(_strings(value))
+        return found
+    if isinstance(node, list):
+        return [s for item in node for s in _strings(item)]
+    return []
+
+
+def _steps(job: Any) -> list[dict[str, Any]]:
+    steps = job.get("steps") if isinstance(job, dict) else None
+    return [s for s in steps if isinstance(s, dict)] if isinstance(steps, list) else []
+
+
+def _joined(text: str) -> str:
+    """Shell line continuations joined, so a split command is one line."""
+    return re.sub(r"\\\n\s*", " ", text)
+
+
+def _step_text(step: dict[str, Any]) -> str:
+    parts = [step.get("run")] + _strings(step.get("with")) + _strings(step.get("env"))
+    return _joined("\n".join(p for p in parts if isinstance(p, str)))
+
+
+def _with_form(step: dict[str, Any], form: dict[str, Any]) -> bool:
+    given = step.get("with")
+    if not isinstance(given, dict):
+        return False
+    extra = {k: v for k, v in given.items() if k not in form}
+    if set(extra) - {"path"}:
+        return False
+    path = extra.get("path")
+    if path is not None and (not isinstance(path, str) or "${{" in path or not path):
+        return False
+    return {k: given.get(k) for k in form} == form
+
+
+def _ack_regex(workflows: dict[str, Any]) -> str | None:
+    try:
+        job = workflows["test.yml"]["jobs"]["release-diff-ack"]
+        for step in _steps(job):
+            if "Require" in str(step.get("name", "")):
+                match = re.search(r"grep -Eq '([^']+)'", step["run"])
+                return match[1] if match else None
+    except (KeyError, TypeError):
+        return None
+    return None
+
+
+def image_publication_invariants(
+    workflows: dict[str, Any], tag_triggered: set[str] | None = None
+) -> list[str]:
+    """The guarded image cutover, checked across every workflow file."""
+    tag = IMAGE_TAG
+    reasons: list[str] = []
+    allowlist = TAG_TRIGGERED_WORKFLOWS if tag_triggered is None else tag_triggered
+
+    # (b) Only the release path may be tag-triggered.
+    if allowlist != {"release.yml"}:
+        reasons.append(f"{tag} TAG_TRIGGERED_WORKFLOWS must be exactly {{release.yml}}")
+
+    # (a) docker.yml: a read-only pull-request build.
+    docker = workflows.get(DOCKER_WORKFLOW)
+    if not isinstance(docker, dict):
+        reasons.append(f"{tag} {DOCKER_WORKFLOW} is missing or not a mapping")
+    else:
+        if get_on(docker) != DOCKER_ON:
+            reasons.append(
+                f"{tag} {DOCKER_WORKFLOW} on: must be exactly pull_request to main"
+            )
+        jobs = _jobs(docker)
+        if set(jobs) != {"build"}:
+            reasons.append(f"{tag} {DOCKER_WORKFLOW} jobs must be exactly {{build}}")
+        if docker.get("permissions", {"contents": "read"}) != {"contents": "read"}:
+            reasons.append(
+                f"{tag} {DOCKER_WORKFLOW} workflow permissions must be contents: read"
+            )
+        build = jobs.get("build")
+        if isinstance(build, dict) and build.get("permissions") != {"contents": "read"}:
+            reasons.append(
+                f"{tag} {DOCKER_WORKFLOW}:build permissions must be exactly contents: read"
+            )
+        if any("secrets." in s for s in _strings(docker)):
+            reasons.append(f"{tag} {DOCKER_WORKFLOW} must not reference secrets.")
+        for job in jobs.values():
+            for step in _steps(job):
+                uses = str(step.get("uses", ""))
+                if uses.startswith("docker/login-action"):
+                    reasons.append(
+                        f"{tag} {DOCKER_WORKFLOW} must not log in to a registry"
+                    )
+                given = step.get("with") if isinstance(step.get("with"), dict) else {}
+                if "cache-to" in given:
+                    reasons.append(
+                        f"{tag} {DOCKER_WORKFLOW} must not export a build cache"
+                    )
+                if (
+                    uses.startswith("docker/build-push-action")
+                    and given.get("push") is not False
+                ):
+                    reasons.append(
+                        f"{tag} {DOCKER_WORKFLOW} build push: must be literally false"
+                    )
+
+    image = workflows.get(IMAGE_WORKFLOW)
+    watch = workflows.get(IMAGE_WATCH_WORKFLOW)
+    for name, doc in ((IMAGE_WORKFLOW, image), (IMAGE_WATCH_WORKFLOW, watch)):
+        if not isinstance(doc, dict):
+            reasons.append(f"{tag} {name} is missing or not a mapping")
+
+    # (c) Privilege: packages: write / write-all only on image.yml:promote-main.
+    for name, doc in sorted(workflows.items()):
+        if not isinstance(doc, dict):
+            continue
+        scopes = [("<workflow>", doc.get("permissions"))] + [
+            (job_name, job.get("permissions"))
+            for job_name, job in _jobs(doc).items()
+            if isinstance(job, dict)
+        ]
+        for where, perms in scopes:
+            writes = perms == "write-all" or (
+                isinstance(perms, dict)
+                and (perms.get("packages") == "write" or "write-all" in perms.values())
+            )
+            if not writes:
+                continue
+            if (
+                name != IMAGE_WORKFLOW
+                or where != PROMOTE_JOB
+                or perms != IMAGE_JOB_PERMISSIONS[PROMOTE_JOB]
+            ):
+                reasons.append(
+                    f"{tag} {name}:{where} grants packages: write or write-all; only "
+                    f"{IMAGE_WORKFLOW}:{PROMOTE_JOB} may, as exactly contents: read, packages: write"
+                )
+        if name in {DOCKER_WORKFLOW, IMAGE_WORKFLOW, IMAGE_WATCH_WORKFLOW}:
+            for job_name, job in _jobs(doc).items():
+                if not isinstance(job, dict) or "permissions" not in job:
+                    reasons.append(f"{tag} {name}:{job_name} must declare permissions")
+    if isinstance(image, dict):
+        if image.get("permissions") != {}:
+            reasons.append(f"{tag} {IMAGE_WORKFLOW} workflow permissions must be {{}}")
+        for job_name, expected in IMAGE_JOB_PERMISSIONS.items():
+            job = _jobs(image).get(job_name)
+            if not isinstance(job, dict):
+                reasons.append(f"{tag} {IMAGE_WORKFLOW}:{job_name} is missing")
+            elif job.get("permissions") != expected:
+                reasons.append(
+                    f"{tag} {IMAGE_WORKFLOW}:{job_name} permissions must be exactly {expected}"
+                )
+    if isinstance(watch, dict):
+        if watch.get("permissions") != IMAGE_WATCH_PERMISSIONS:
+            reasons.append(f"{tag} {IMAGE_WATCH_WORKFLOW} workflow permissions changed")
+        for job_name, job in _jobs(watch).items():
+            if (
+                isinstance(job, dict)
+                and job.get("permissions") != IMAGE_WATCH_PERMISSIONS
+            ):
+                reasons.append(
+                    f"{tag} {IMAGE_WATCH_WORKFLOW}:{job_name} permissions changed"
+                )
+
+    # (d) Publication commands, in workflow steps outside promote-main.
+    for name, doc in sorted(workflows.items()):
+        if not isinstance(doc, dict):
+            continue
+        for job_name, job in _jobs(doc).items():
+            promote = name == IMAGE_WORKFLOW and job_name == PROMOTE_JOB
+            smoke_job = name == IMAGE_WORKFLOW and job_name == "build-smoke"
+            for step in _steps(job):
+                text = _step_text(step)
+                where = f"{name}:{job_name}"
+                if SKOPEO_DELETE.search(text):
+                    reasons.append(f"{tag} {where} runs skopeo delete")
+                if promote:
+                    continue
+                uses = str(step.get("uses", ""))
+                given = step.get("with") if isinstance(step.get("with"), dict) else {}
+                if (
+                    uses.startswith("docker/build-push-action")
+                    and given.get("push") is not False
+                ):
+                    reasons.append(
+                        f"{tag} {where} build-push-action push: is not literally false"
+                    )
+                for label, pattern in PUBLICATION_PATTERNS.items():
+                    if pattern.search(text):
+                        reasons.append(f"{tag} {where} contains {label}")
+                remaining = SKOPEO_SMOKE_LOAD.sub("", text) if smoke_job else text
+                if re.search(r"skopeo", remaining, re.IGNORECASE):
+                    reasons.append(
+                        f"{tag} {where} uses skopeo outside the pinned local load in build-smoke"
+                    )
+    for name, doc in sorted(workflows.items()):
+        if not isinstance(doc, dict) or name == IMAGE_WATCH_WORKFLOW:
+            continue
+        for key, value in doc.items():
+            if name == DOCKER_WORKFLOW and key == "env":
+                continue
+            if key == "jobs" and isinstance(value, dict):
+                for job_name, job in value.items():
+                    if name == IMAGE_WORKFLOW and job_name == PROMOTE_JOB:
+                        continue
+                    if any("ghcr.io" in s for s in _strings(job)):
+                        reasons.append(f"{tag} {name}:{job_name} names ghcr.io")
+            elif any("ghcr.io" in s for s in _strings(value)):
+                reasons.append(f"{tag} {name} names ghcr.io outside an allowed place")
+
+    # (e) The gate, the promote condition and its phase-1 environment.
+    for name, doc in sorted(workflows.items()):
+        for job_name, job in _jobs(doc).items():
+            if not isinstance(job, dict):
+                continue
+            conditions = [job.get("if")] + [s.get("if") for s in _steps(job)]
+            if any(
+                "vars.PMCP_IMAGE_PUBLISH" in str(c) for c in conditions if c is not None
+            ):
+                reasons.append(
+                    f"{tag} {name}:{job_name} decides on vars.PMCP_IMAGE_PUBLISH in an if:"
+                )
+    if isinstance(image, dict):
+        jobs = _jobs(image)
+        gate = jobs.get("gate")
+        steps = _steps(gate)
+        if (
+            not isinstance(gate, dict)
+            or set(gate)
+            - {"runs-on", "timeout-minutes", "permissions", "outputs", "steps"}
+            or gate.get("permissions") != {}
+            or gate.get("outputs") != GATE_OUTPUTS
+            or len(steps) != 1
+            or len(gate.get("steps") or []) != 1
+            or set(steps[0]) != {"id", "env", "run"}
+            or steps[0].get("id") != "decide"
+            or steps[0].get("env") != GATE_ENV
+            or not isinstance(steps[0].get("run"), str)
+            or hashlib.sha256(steps[0]["run"].encode()).hexdigest() != GATE_RUN_SHA256
+        ):
+            reasons.append(f"{tag} {IMAGE_WORKFLOW}:gate differs from its pinned form")
+        promote_job = jobs.get(PROMOTE_JOB)
+        if isinstance(promote_job, dict):
+            needs = _as_list(promote_job.get("needs"))
+            if promote_job.get("if") != PROMOTE_IF:
+                reasons.append(
+                    f"{tag} {IMAGE_WORKFLOW}:{PROMOTE_JOB} if: differs from the pinned gate test"
+                )
+            if set(needs) != PROMOTE_NEEDS or len(needs) != len(PROMOTE_NEEDS):
+                reasons.append(
+                    f"{tag} {IMAGE_WORKFLOW}:{PROMOTE_JOB} needs must be {sorted(PROMOTE_NEEDS)}"
+                )
+            invokers = [
+                s
+                for s in _steps(promote_job)
+                if PUBLICATION_PATTERNS["an image_publish.py write"].search(
+                    str(s.get("run", ""))
+                )
+            ]
+            if len(invokers) != 1 or invokers[0].get("env") != PROMOTE_ENV:
+                reasons.append(
+                    f"{tag} {IMAGE_WORKFLOW}:{PROMOTE_JOB} phase-1 environment differs"
+                )
+            if any(
+                re.search(r"\bset\s+-[a-wyz]*x", str(s.get("run", "")))
+                for s in _steps(promote_job)
+            ):
+                reasons.append(
+                    f"{tag} {IMAGE_WORKFLOW}:{PROMOTE_JOB} must not trace commands"
+                )
+            # (g) One serialised namespace, never cancelled.
+            if promote_job.get("concurrency") != PROMOTE_CONCURRENCY:
+                reasons.append(
+                    f"{tag} {IMAGE_WORKFLOW}:{PROMOTE_JOB} concurrency must be pmcp-image-main without cancellation"
+                )
+        if any("secrets." in s for s in _strings(image)):
+            reasons.append(f"{tag} {IMAGE_WORKFLOW} must not reference secrets.")
+
+        # (f) Trusted code source and candidate checkout.
+        for job_name, job in jobs.items():
+            for step in _steps(job):
+                uses = str(step.get("uses", ""))
+                where = f"{IMAGE_WORKFLOW}:{job_name}"
+                if uses.startswith("actions/checkout@"):
+                    trusted = _with_form(step, TRUSTED_CHECKOUT)
+                    candidate = job_name == "build-smoke" and _with_form(
+                        step, CANDIDATE_CHECKOUT
+                    )
+                    if job_name == "gate" or not (trusted or candidate):
+                        reasons.append(
+                            f"{tag} {where} checkout is neither the trusted nor the candidate form"
+                        )
+                if uses.startswith("actions/download-artifact@"):
+                    given = (
+                        step.get("with") if isinstance(step.get("with"), dict) else {}
+                    )
+                    if "run-id" in given or "github-token" in given:
+                        reasons.append(
+                            f"{tag} {where} downloads another run's artifact"
+                        )
+                if "run" in step:
+                    text = _joined(
+                        "\n".join(
+                            s
+                            for s in [step.get("run")] + _strings(step.get("env"))
+                            if isinstance(s, str)
+                        )
+                    )
+                    for label, pattern in IMAGE_RUN_FORBIDDEN.items():
+                        if pattern.search(text):
+                            reasons.append(f"{tag} {where} run step contains {label}")
+
+        # (h) Trigger: only the completed Test run on main; nothing calls it.
+        if get_on(image) != IMAGE_ON:
+            reasons.append(
+                f"{tag} {IMAGE_WORKFLOW} on: must be exactly the workflow_run block"
+            )
+    if isinstance(watch, dict):
+        watch_on = get_on(watch)
+        if (
+            not isinstance(watch_on, dict)
+            or set(watch_on) != {"schedule", "workflow_dispatch"}
+            or watch_on.get("schedule") != [{"cron": IMAGE_WATCH_CRON}]
+            or watch_on.get("workflow_dispatch") not in (None, {})
+        ):
+            reasons.append(
+                f"{tag} {IMAGE_WATCH_WORKFLOW} on: must be exactly schedule plus workflow_dispatch"
+            )
+        checkouts = [
+            s
+            for job in _jobs(watch).values()
+            for s in _steps(job)
+            if str(s.get("uses", "")).startswith("actions/checkout@")
+        ]
+        if len(checkouts) != 1 or checkouts[0].get("with") != IMAGE_WATCH_CHECKOUT:
+            reasons.append(
+                f"{tag} {IMAGE_WATCH_WORKFLOW} checkout differs from its pinned form"
+            )
+    for name, doc in sorted(workflows.items()):
+        for job_name, job in _jobs(doc).items():
+            uses = job.get("uses") if isinstance(job, dict) else None
+            if isinstance(uses, str) and re.search(r"(^|/)image\.yml(@|$)", uses):
+                reasons.append(f"{tag} {name}:{job_name} calls {IMAGE_WORKFLOW}")
+
+    # (i) The release acknowledgement covers every image publication input.
+    pattern = _ack_regex(workflows)
+    try:
+        compiled = re.compile(pattern) if pattern else None
+    except re.error:
+        compiled = None
+    if compiled is None:
+        reasons.append(f"{tag} release-diff-ack path regex not found in test.yml")
+    else:
+        for path in ACK_REQUIRED_PATHS:
+            if not compiled.search(path):
+                reasons.append(f"{tag} release-diff-ack does not cover {path}")
+    return reasons
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -1183,11 +1659,13 @@ def main(argv: list[str] | None = None) -> int:
         failures.extend(release_invariants(None))
 
     # 2. timeout invariants — every workflow file.
+    docs: dict[str, Any] = {}
     for path in workflow_files():
         doc, err = _load(path)
         if err:
             failures.append(err)
             continue
+        docs[path.name] = doc
         failures.extend(timeout_invariants(doc, path))
         failures.extend(tag_trigger_invariants(doc, path))
         failures.extend(stable_context_invariants(doc, path))
@@ -1195,6 +1673,9 @@ def main(argv: list[str] | None = None) -> int:
         if path.name == "test.yml":
             failures.extend(diagnostic_invariants(doc))
             failures.extend(full_bootstrap_invariants(doc))
+
+    # 2a. guarded image publication — across every workflow at once.
+    failures.extend(image_publication_invariants(docs))
 
     # 2b. SHA pinning — raw text, every workflow AND every local action. Wired
     # here, not only into pytest: the evidence loop runs this CLI.

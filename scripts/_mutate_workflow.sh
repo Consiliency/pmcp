@@ -37,6 +37,14 @@ RELEASE="${REPO_ROOT}/.github/workflows/release.yml"
 TEST_WF="${REPO_ROOT}/.github/workflows/test.yml"
 MAINTENANCE="${REPO_ROOT}/.github/workflows/maintenance.yml"
 COMPOSITE="${REPO_ROOT}/.github/actions/pipeline-bootstrap-setup/action.yml"
+DOCKER_WF="${REPO_ROOT}/.github/workflows/docker.yml"
+IMAGE_WF="${REPO_ROOT}/.github/workflows/image.yml"
+WATCH_WF="${REPO_ROOT}/.github/workflows/image-watch.yml"
+CHECKER="${REPO_ROOT}/scripts/check_workflows.py"
+# A form-valid 40-hex pin built at runtime: a literal here would trip
+# test_no_pin_anchor_hardcodes_a_real_sha, and the [image] checks never read
+# the commit of an injected action.
+FAKE_SHA="$(printf 'f%.0s' $(seq 1 40))"
 
 MUTANTS="$(
 	cat <<'TSV'
@@ -122,6 +130,69 @@ gate-context-collision|1|[ci-gate]|let another Test job emit the aggregate name
 gate-context-cross-workflow|1|[ci-gate]|let another workflow emit the aggregate name
 integration-cancelled|1|[concurrency]|main validation can be cancelled by a newer event
 integration-shared-group|1|[concurrency]|non-PR validation shares a pending-replacement namespace
+image-docker-main-push|1|[image]|docker.yml: push to main restored; the legacy main writer trigger is back
+image-docker-tag-push|1|[image] [release]|docker.yml: push.tags v* restored; the legacy tag writer trigger is back
+image-docker-pull-request-target|1|[image]|docker.yml: pull_request -> pull_request_target, which runs with a write-capable token
+image-docker-push-expression|1|[image]|docker.yml: build-push-action push: set back to the legacy expression
+image-docker-packages-write|1|[image]|docker.yml: packages: write re-granted to build
+image-docker-login|1|[image]|docker.yml: docker/login-action re-added
+image-docker-cache-to|1|[image]|docker.yml: cache-to re-added
+image-docker-secrets|1|[image]|docker.yml: a secrets. reference added
+image-docker-extra-job|1|[image]|docker.yml: an extra job added beside build
+image-tag-allowlist-docker|1|[image]|check_workflows.py: docker.yml re-added to TAG_TRIGGERED_WORKFLOWS
+image-workflow-packages-write|1|[image]|image.yml: workflow-level packages: write
+image-job-write-all|1|[image]|image.yml: verify-upstream permissions: write-all
+image-promote-contents-dropped|1|[image]|image.yml: contents: read dropped from promote-main
+image-watch-packages-write|1|[image]|image-watch.yml: packages: write on the watch job
+image-job-no-permissions-image|1|[image]|image.yml: build-smoke declares no permissions
+image-job-no-permissions-watch|1|[image]|image-watch.yml: the watch job declares no permissions
+image-job-no-permissions-docker|1|[image]|docker.yml: build declares no permissions
+image-docker-push-step|1|[image]|image.yml: docker push in build-smoke
+image-buildx-push|1|[image]|image.yml: buildx --push in build-smoke
+image-type-registry|1|[image]|image.yml: a type=registry output in build-smoke
+image-curl-put|1|[image]|image.yml: curl -X PUT to ghcr.io in build-smoke
+image-skopeo-delete|1|[image]|image.yml: skopeo delete in build-smoke
+image-crane|1|[image]|image.yml: crane in build-smoke
+image-oras|1|[image]|image.yml: oras in build-smoke
+image-regctl|1|[image]|image.yml: regctl in build-smoke
+image-podman-push|1|[image]|image.yml: podman push in build-smoke
+image-buildah-push|1|[image]|image.yml: buildah push in build-smoke
+image-promote-outside|1|[image]|image.yml: image_publish.py promote invoked from build-smoke
+image-stray-ghcr|1|[image]|image.yml: a stray ghcr.io literal in build-smoke
+image-promote-if-vars|1|[image]|image.yml: promote-main if: vars.PMCP_IMAGE_PUBLISH == 'enabled' (case-insensitive ==)
+image-needs-gate-dropped|1|[image]|image.yml: gate removed from promote-main needs
+image-needs-verify-dropped|1|[image]|image.yml: verify-upstream removed from promote-main needs
+image-gate-lower|1|[image]|image.yml: the gate heredoc case-folds with .lower()
+image-gate-literal-output|1|[image]|image.yml: gate outputs a literal open: 'yes'
+image-gate-extra-step|1|[image]|image.yml: an extra echo open=yes step in gate
+image-gate-literal-env|1|[image]|image.yml: the gate step env is a literal enabled
+image-gate-if|1|[image]|image.yml: an if: on the gate job
+image-candidate-ref-head-sha|1|[image]|image.yml: candidate checkout ref github.event.workflow_run.head_sha
+image-persist-credentials|1|[image]|image.yml: candidate checkout persist-credentials: true
+image-trusted-ref-main|1|[image]|image.yml: trusted checkout ref main instead of workflow_sha
+image-cone-mode|1|[image]|image.yml: trusted checkout sparse-checkout-cone-mode: true
+image-watch-baselines-dropped|1|[image]|image-watch.yml: the baselines sparse pattern dropped
+image-gate-checkout|1|[image]|image.yml: a checkout step in gate
+image-git-clone|1|[image]|image.yml: git clone in verify-upstream
+image-curl-contents|1|[image]|image.yml: a curl of a /contents/ API path
+image-run-head-sha|1|[image]|image.yml: workflow_run.head_sha in a run step
+image-download-run-id|1|[image]|image.yml: download-artifact given a run-id
+image-cancel-in-progress|1|[image]|image.yml: promote-main cancel-in-progress: true
+image-trigger-push-tags|1|[image]|image.yml: push.tags added to on:
+image-trigger-workflow-call|1|[image]|image.yml: workflow_call added to on:
+image-trigger-schedule|1|[image]|image.yml: schedule added to on:
+image-trigger-repository-dispatch|1|[image]|image.yml: repository_dispatch added to on:
+image-trigger-workflow-dispatch|1|[image]|image.yml: workflow_dispatch added to on:
+image-types-requested|1|[image]|image.yml: workflow_run types: [requested]
+image-branches-removed|1|[image]|image.yml: workflow_run branches filter removed
+image-tag-caller|1|[image]|a NEW tag-triggered workflow that calls image.yml
+image-watch-push|1|[image]|image-watch.yml: push added to on:
+image-watch-pull-request|1|[image]|image-watch.yml: pull_request added to on:
+image-ack-docker|1|[image]|test.yml: release-diff-ack regex loses docker.yml
+image-ack-image|1|[image]|test.yml: release-diff-ack regex loses image.yml
+image-ack-dockerfile|1|[image]|test.yml: release-diff-ack regex loses Dockerfile
+image-ack-baselines|1|[image]|test.yml: release-diff-ack regex loses the image-baselines directory
+image-needs-reordered|0|-|image.yml: promote-main needs reordered; an equivalent form that must NOT false-positive
 TSV
 )"
 
@@ -665,6 +736,373 @@ integration-cancelled)
 	;;
 integration-shared-group)
 	replace_re "$TEST_WF" '^  group: .+$' '  group: ${{ github.workflow }}-${{ github.ref }}'
+	;;
+image-docker-main-push)
+	replace "$DOCKER_WF" 'on:
+  pull_request:' 'on:
+  push:
+    branches: [main]
+  pull_request:'
+	;;
+image-docker-tag-push)
+	replace "$DOCKER_WF" 'on:
+  pull_request:' 'on:
+  push:
+    tags:
+      - "v*"
+  pull_request:'
+	;;
+image-docker-pull-request-target)
+	replace "$DOCKER_WF" '  pull_request:
+    branches: [main]' '  pull_request_target:
+    branches: [main]'
+	;;
+image-docker-push-expression)
+	replace "$DOCKER_WF" '          push: false' "          push: \${{ github.event_name != 'pull_request' }}"
+	;;
+image-docker-packages-write)
+	replace "$DOCKER_WF" '      contents: read
+' '      contents: read
+      packages: write
+'
+	;;
+image-docker-login)
+	replace "$DOCKER_WF" '      - name: Extract metadata
+' "      - name: Log in to Container Registry
+        uses: docker/login-action@${FAKE_SHA} # v4.6.0
+        with:
+          registry: \${{ env.REGISTRY }}
+          username: \${{ github.actor }}
+          password: \${{ github.token }}
+
+      - name: Extract metadata
+"
+	;;
+image-docker-cache-to)
+	replace "$DOCKER_WF" '          cache-from: type=gha
+' '          cache-from: type=gha
+          cache-to: type=gha,mode=max
+'
+	;;
+image-docker-secrets)
+	replace "$DOCKER_WF" '  IMAGE_NAME: ${{ github.repository }}
+' '  IMAGE_NAME: ${{ github.repository }}
+  LEAK: ${{ secrets.GITHUB_TOKEN }}
+'
+	;;
+image-docker-extra-job)
+	replace "$DOCKER_WF" 'jobs:
+  build:
+' 'jobs:
+  extra:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - run: echo extra
+  build:
+'
+	;;
+image-tag-allowlist-docker)
+	replace "$CHECKER" 'TAG_TRIGGERED_WORKFLOWS = {"release.yml"}' 'TAG_TRIGGERED_WORKFLOWS = {"release.yml", "docker.yml"}'
+	;;
+image-workflow-packages-write)
+	replace "$IMAGE_WF" '
+permissions: {}
+' '
+permissions:
+  packages: write
+'
+	;;
+image-job-write-all)
+	replace "$IMAGE_WF" '    permissions:
+      actions: read
+      contents: read
+' '    permissions: write-all
+'
+	;;
+image-promote-contents-dropped)
+	replace "$IMAGE_WF" '    permissions:
+      contents: read
+      packages: write
+' '    permissions:
+      packages: write
+'
+	;;
+image-watch-packages-write)
+	replace "$WATCH_WF" '    permissions:
+      contents: read
+      actions: read
+      packages: read
+' '    permissions:
+      contents: read
+      actions: read
+      packages: write
+'
+	;;
+image-job-no-permissions-image)
+	replace "$IMAGE_WF" '    permissions:
+      contents: read
+    outputs:
+' '    outputs:
+'
+	;;
+image-job-no-permissions-watch)
+	replace "$WATCH_WF" '    permissions:
+      contents: read
+      actions: read
+      packages: read
+' ''
+	;;
+image-job-no-permissions-docker)
+	replace "$DOCKER_WF" '    permissions:
+      contents: read
+' ''
+	;;
+image-docker-push-step)
+	replace "$IMAGE_WF" '      - name: Keep the verified archive for promotion
+' '      - run: docker push pmcp-image-smoke:candidate
+      - name: Keep the verified archive for promotion
+'
+	;;
+image-buildx-push)
+	replace "$IMAGE_WF" '--no-cache --output' '--no-cache --push --output'
+	;;
+image-type-registry)
+	replace "$IMAGE_WF" 'type=oci,dest=$RUNNER_TEMP/image.oci.tar' 'type=registry,name=example.invalid/pmcp'
+	;;
+image-curl-put)
+	replace "$IMAGE_WF" '      - name: Keep the verified archive for promotion
+' '      - run: curl -X PUT https://ghcr.io/v2/consiliency/pmcp/manifests/main
+      - name: Keep the verified archive for promotion
+'
+	;;
+image-skopeo-delete)
+	replace "$IMAGE_WF" '      - name: Keep the verified archive for promotion
+' '      - run: skopeo delete docker://example.invalid/pmcp:main
+      - name: Keep the verified archive for promotion
+'
+	;;
+image-crane)
+	replace "$IMAGE_WF" '      - name: Keep the verified archive for promotion
+' '      - run: crane copy example.invalid/a example.invalid/b
+      - name: Keep the verified archive for promotion
+'
+	;;
+image-oras)
+	replace "$IMAGE_WF" '      - name: Keep the verified archive for promotion
+' '      - run: oras push example.invalid/pmcp:main image.oci.tar
+      - name: Keep the verified archive for promotion
+'
+	;;
+image-regctl)
+	replace "$IMAGE_WF" '      - name: Keep the verified archive for promotion
+' '      - run: regctl image copy example.invalid/a example.invalid/b
+      - name: Keep the verified archive for promotion
+'
+	;;
+image-podman-push)
+	replace "$IMAGE_WF" '      - name: Keep the verified archive for promotion
+' '      - run: podman push pmcp-image-smoke:candidate
+      - name: Keep the verified archive for promotion
+'
+	;;
+image-buildah-push)
+	replace "$IMAGE_WF" '      - name: Keep the verified archive for promotion
+' '      - run: buildah push pmcp-image-smoke:candidate
+      - name: Keep the verified archive for promotion
+'
+	;;
+image-promote-outside)
+	replace "$IMAGE_WF" '      - name: Keep the verified archive for promotion
+' '      - run: python3 -I -B trusted/scripts/image_publish.py promote --help
+      - name: Keep the verified archive for promotion
+'
+	;;
+image-stray-ghcr)
+	replace "$IMAGE_WF" '      - name: Keep the verified archive for promotion
+' '      - run: echo ghcr.io
+      - name: Keep the verified archive for promotion
+'
+	;;
+image-promote-if-vars)
+	replace "$IMAGE_WF" "    if: \${{ needs.gate.outputs.open == 'yes' }}" "    if: vars.PMCP_IMAGE_PUBLISH == 'enabled'"
+	;;
+image-needs-gate-dropped)
+	replace "$IMAGE_WF" '    needs: [gate, verify-upstream, build-smoke]' '    needs: [verify-upstream, build-smoke]'
+	;;
+image-needs-verify-dropped)
+	replace "$IMAGE_WF" '    needs: [gate, verify-upstream, build-smoke]' '    needs: [gate, build-smoke]'
+	;;
+image-needs-reordered)
+	replace "$IMAGE_WF" '    needs: [gate, verify-upstream, build-smoke]' '    needs: [build-smoke, gate, verify-upstream]'
+	;;
+image-gate-lower)
+	replace "$IMAGE_WF" 'if os.environb.get(b"PMCP_IMAGE_PUBLISH") == b"enabled":' 'if os.environb.get(b"PMCP_IMAGE_PUBLISH", b"").lower() == b"enabled":'
+	;;
+image-gate-literal-output)
+	replace "$IMAGE_WF" '      open: ${{ steps.decide.outputs.open }}' "      open: 'yes'"
+	;;
+image-gate-extra-step)
+	replace "$IMAGE_WF" '          PY
+
+  verify-upstream:' '          PY
+      - run: echo open=yes >> "$GITHUB_OUTPUT"
+
+  verify-upstream:'
+	;;
+image-gate-literal-env)
+	replace "$IMAGE_WF" '      - id: decide
+        env:
+          PMCP_IMAGE_PUBLISH: ${{ vars.PMCP_IMAGE_PUBLISH }}' '      - id: decide
+        env:
+          PMCP_IMAGE_PUBLISH: enabled'
+	;;
+image-gate-if)
+	replace "$IMAGE_WF" '  gate:
+    runs-on: ubuntu-latest' "  gate:
+    if: github.actor != 'nobody'
+    runs-on: ubuntu-latest"
+	;;
+image-candidate-ref-head-sha)
+	replace "$IMAGE_WF" '          ref: ${{ needs.verify-upstream.outputs.head_sha }}' '          ref: ${{ github.event.workflow_run.head_sha }}'
+	;;
+image-persist-credentials)
+	replace "$IMAGE_WF" '          persist-credentials: false
+          path: candidate' '          persist-credentials: true
+          path: candidate'
+	;;
+image-trusted-ref-main)
+	replace "$IMAGE_WF" '          ref: ${{ github.workflow_sha }}
+          sparse-checkout: scripts/image_publish.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+          path: trusted' '          ref: main
+          sparse-checkout: scripts/image_publish.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+          path: trusted'
+	;;
+image-cone-mode)
+	replace "$IMAGE_WF" '          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Verify the upstream Test run' '          sparse-checkout-cone-mode: true
+          persist-credentials: false
+
+      - name: Verify the upstream Test run'
+	;;
+image-watch-baselines-dropped)
+	replace "$WATCH_WF" '            .consiliency/evidence/image-baselines/*
+' ''
+	;;
+image-gate-checkout)
+	replace "$IMAGE_WF" '      - id: decide
+' "      - uses: actions/checkout@${FAKE_SHA} # v7.0.1
+      - id: decide
+"
+	;;
+image-git-clone)
+	replace "$IMAGE_WF" '        run: python3 -I -B scripts/image_publish.py verify-upstream' '        run: git clone https://github.com/Consiliency/pmcp src && python3 -I -B scripts/image_publish.py verify-upstream'
+	;;
+image-curl-contents)
+	replace "$IMAGE_WF" '      - name: Verify the upstream Test run
+' '      - run: curl -fsSL -o scripts/image_publish.py https://api.github.com/repos/Consiliency/pmcp/contents/scripts/image_publish.py
+      - name: Verify the upstream Test run
+'
+	;;
+image-run-head-sha)
+	replace "$IMAGE_WF" '        run: docker buildx build' '        run: echo "${{ github.event.workflow_run.head_sha }}"; docker buildx build'
+	;;
+image-download-run-id)
+	replace "$IMAGE_WF" '          name: candidate-oci
+          path: ${{ runner.temp }}/candidate
+' '          name: candidate-oci
+          path: ${{ runner.temp }}/candidate
+          run-id: 1
+'
+	;;
+image-cancel-in-progress)
+	replace "$IMAGE_WF" '      cancel-in-progress: false' '      cancel-in-progress: true'
+	;;
+image-trigger-push-tags)
+	replace "$IMAGE_WF" 'on:
+  workflow_run:' 'on:
+  push:
+    tags: ["v*"]
+  workflow_run:'
+	;;
+image-trigger-workflow-call)
+	replace "$IMAGE_WF" 'on:
+  workflow_run:' 'on:
+  workflow_call:
+  workflow_run:'
+	;;
+image-trigger-schedule)
+	replace "$IMAGE_WF" 'on:
+  workflow_run:' 'on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_run:'
+	;;
+image-trigger-repository-dispatch)
+	replace "$IMAGE_WF" 'on:
+  workflow_run:' 'on:
+  repository_dispatch:
+  workflow_run:'
+	;;
+image-trigger-workflow-dispatch)
+	replace "$IMAGE_WF" 'on:
+  workflow_run:' 'on:
+  workflow_dispatch:
+  workflow_run:'
+	;;
+image-types-requested)
+	replace "$IMAGE_WF" '    types: [completed]' '    types: [requested]'
+	;;
+image-branches-removed)
+	replace "$IMAGE_WF" '    types: [completed]
+    branches: [main]
+' '    types: [completed]
+'
+	;;
+image-tag-caller)
+	cat >"${REPO_ROOT}/.github/workflows/image-tag.yml" <<'YAML'
+name: Image tag
+on:
+  push:
+    tags:
+      - "v*"
+jobs:
+  publish:
+    uses: ./.github/workflows/image.yml
+YAML
+	;;
+image-watch-push)
+	replace "$WATCH_WF" 'on:
+  schedule:' 'on:
+  push:
+    branches: [main]
+  schedule:'
+	;;
+image-watch-pull-request)
+	replace "$WATCH_WF" 'on:
+  schedule:' 'on:
+  pull_request:
+  schedule:'
+	;;
+image-ack-docker)
+	replace "$TEST_WF" '(release|test|docker|image|image-watch)\.yml' '(release|test|image|image-watch)\.yml'
+	;;
+image-ack-image)
+	replace "$TEST_WF" '(release|test|docker|image|image-watch)\.yml' '(release|test|docker|image-watch)\.yml'
+	;;
+image-ack-dockerfile)
+	replace "$TEST_WF" '|Dockerfile|' '|'
+	;;
+image-ack-baselines)
+	replace "$TEST_WF" '|\.consiliency/evidence/image-baselines/.+|' '|'
 	;;
 *)
 	echo "unhandled mutant: ${NAME}" >&2

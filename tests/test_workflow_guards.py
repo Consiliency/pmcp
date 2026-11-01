@@ -229,6 +229,74 @@ PIN_MUTANTS: dict[str, tuple[Path, str, str]] = {
     ),
 }
 
+# The guarded image cutover's mutants (G T7). Each is applied by the shell
+# helper itself to a scratch copy of the tree (see TestImagePublicationInvariants),
+# so the edit is single-source, not re-implemented here.
+IMAGE_MUTANTS = (
+    "image-docker-main-push",
+    "image-docker-tag-push",
+    "image-docker-pull-request-target",
+    "image-docker-push-expression",
+    "image-docker-packages-write",
+    "image-docker-login",
+    "image-docker-cache-to",
+    "image-docker-secrets",
+    "image-docker-extra-job",
+    "image-tag-allowlist-docker",
+    "image-workflow-packages-write",
+    "image-job-write-all",
+    "image-promote-contents-dropped",
+    "image-watch-packages-write",
+    "image-job-no-permissions-image",
+    "image-job-no-permissions-watch",
+    "image-job-no-permissions-docker",
+    "image-docker-push-step",
+    "image-buildx-push",
+    "image-type-registry",
+    "image-curl-put",
+    "image-skopeo-delete",
+    "image-crane",
+    "image-oras",
+    "image-regctl",
+    "image-podman-push",
+    "image-buildah-push",
+    "image-promote-outside",
+    "image-stray-ghcr",
+    "image-promote-if-vars",
+    "image-needs-gate-dropped",
+    "image-needs-verify-dropped",
+    "image-gate-lower",
+    "image-gate-literal-output",
+    "image-gate-extra-step",
+    "image-gate-literal-env",
+    "image-gate-if",
+    "image-candidate-ref-head-sha",
+    "image-persist-credentials",
+    "image-trusted-ref-main",
+    "image-cone-mode",
+    "image-watch-baselines-dropped",
+    "image-gate-checkout",
+    "image-git-clone",
+    "image-curl-contents",
+    "image-run-head-sha",
+    "image-download-run-id",
+    "image-cancel-in-progress",
+    "image-trigger-push-tags",
+    "image-trigger-workflow-call",
+    "image-trigger-schedule",
+    "image-trigger-repository-dispatch",
+    "image-trigger-workflow-dispatch",
+    "image-types-requested",
+    "image-branches-removed",
+    "image-tag-caller",
+    "image-watch-push",
+    "image-watch-pull-request",
+    "image-ack-docker",
+    "image-ack-image",
+    "image-ack-dockerfile",
+    "image-ack-baselines",
+)
+
 # Every mutant these tests exercise. Asserted EQUAL to the helper's expected-1
 # rows — in BOTH directions — by TestMutationHelperContract, because the
 # evidence matrix is generated from that TSV: a phantom row there would
@@ -281,6 +349,7 @@ TESTED_MUTANTS = (
         "guard-self-disabled-nonconstant",
     }
     | {"integration-cancelled", "integration-shared-group"}
+    | set(IMAGE_MUTANTS)
 )
 
 
@@ -396,11 +465,14 @@ class TestTagTriggerInvariants:
         assert reasons and reasons[0].startswith("[release]")
         assert "on.push.tags" in reasons[0]
 
-    def test_the_allowlisted_files_are_permitted(self) -> None:
-        # docker.yml really is tag-triggered today: it pushes the release image.
+    def test_only_the_release_workflow_is_allowlisted(self) -> None:
+        # docker.yml left the allowlist with the guarded image cutover: it is a
+        # read-only pull-request build, so a tag trigger on it is a regression.
         doc = yaml.safe_load('on:\n  push:\n    tags:\n      - "v*"\njobs: {}\n')
-        assert cw.tag_trigger_invariants(doc, ".github/workflows/docker.yml") == []
+        assert cw.TAG_TRIGGERED_WORKFLOWS == {"release.yml"}
         assert cw.tag_trigger_invariants(doc, ".github/workflows/release.yml") == []
+        reasons = cw.tag_trigger_invariants(doc, ".github/workflows/docker.yml")
+        assert reasons and reasons[0].startswith("[release]")
 
     def test_a_new_workflow_without_a_tag_trigger_is_fine(self) -> None:
         doc = yaml.safe_load("on:\n  pull_request:\njobs: {}\n")
@@ -1349,6 +1421,7 @@ class TestMutationHelperContract:
             "timeout-below-p100",
             "concurrency-added",
             "guard-step-gutted",
+            "image-needs-reordered",
         ],
     )
     def test_the_uncovered_cases_are_listed_as_expected_green(
@@ -1540,6 +1613,16 @@ def test_release_upload_and_downstream_mapping(mutation: str) -> None:
         "scripts/release-build-constraints.txt",
         ".github/probe/release_installed.py",
         ".github/probe/p1_probe_server.py",
+        ".github/workflows/docker.yml",
+        ".github/workflows/image.yml",
+        ".github/workflows/image-watch.yml",
+        "Dockerfile",
+        ".consiliency/evidence/image-baselines/inventory-B1.json",
+        ".consiliency/evidence/image-baselines/registry-R2.json",
+        ".consiliency/evidence/image-baselines/retention.json",
+        "scripts/image_publish.py",
+        "scripts/image_registry_readback.py",
+        "scripts/image_cutover_inventory.py",
     ],
 )
 def test_release_acknowledgement_covers_invoked_graph(filename: str) -> None:
@@ -1557,3 +1640,127 @@ def test_release_acknowledgement_covers_invoked_graph(filename: str) -> None:
         ).returncode
         == 0
     )
+
+
+# --- guarded image publication (G T7) -----------------------------------------
+
+
+def _image_tree(tmp_path: Path) -> Path:
+    """A scratch copy of everything the checker and the mutation helper touch."""
+    import shutil
+
+    root = tmp_path / "tree"
+    shutil.copytree(REPO_ROOT / ".github", root / ".github")
+    (root / "scripts").mkdir()
+    for name in ("check_workflows.py", "_mutate_workflow.sh"):
+        shutil.copy2(REPO_ROOT / "scripts" / name, root / "scripts" / name)
+    return root
+
+
+def _image_reasons(root: Path) -> tuple[list[str], list[str]]:
+    """(image reasons, release tag-trigger reasons) for the tree at ``root``."""
+    spec = importlib.util.spec_from_file_location(
+        "check_workflows_scratch", root / "scripts" / "check_workflows.py"
+    )
+    assert spec and spec.loader
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    docs = {}
+    release: list[str] = []
+    for path in sorted((root / ".github" / "workflows").glob("*.y*ml")):
+        doc = yaml.safe_load(path.read_text())
+        docs[path.name] = doc
+        release.extend(checker.tag_trigger_invariants(doc, path.name))
+    return checker.image_publication_invariants(docs), release
+
+
+def _mutate(root: Path, mutant: str) -> None:
+    subprocess.run(
+        [str(root / "scripts" / "_mutate_workflow.sh"), mutant],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+class TestImagePublicationInvariants:
+    """Consiliency/pmcp G: every registry write is behind the exact gate."""
+
+    def test_the_committed_tree_passes(self, tmp_path: Path) -> None:
+        image, release = _image_reasons(_image_tree(tmp_path))
+        assert image == [] and release == []
+
+    @pytest.mark.parametrize("mutant", IMAGE_MUTANTS)
+    def test_mutant_is_rejected_with_the_image_tag(
+        self, tmp_path: Path, mutant: str
+    ) -> None:
+        root = _image_tree(tmp_path)
+        before, _ = _image_reasons(root)
+        _mutate(root, mutant)
+        after, release = _image_reasons(root)
+        new = [r for r in after if r not in before]
+        assert new, f"{mutant} was not rejected"
+        assert all(r.startswith("[image] ") for r in after)
+        if mutant == "image-docker-tag-push":
+            assert release and release[0].startswith("[release]")
+
+    def test_reordered_needs_are_an_equivalent_form(self, tmp_path: Path) -> None:
+        root = _image_tree(tmp_path)
+        before, _ = _image_reasons(root)
+        _mutate(root, "image-needs-reordered")
+        after, _ = _image_reasons(root)
+        assert after == before
+
+    def test_the_tag_allowlist_parameter_is_checked(self) -> None:
+        docs = {p.name: yaml.safe_load(p.read_text()) for p in cw.workflow_files()}
+        reasons = cw.image_publication_invariants(docs, {"release.yml", "docker.yml"})
+        assert any("TAG_TRIGGERED_WORKFLOWS" in r for r in reasons)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "docker push x",
+            "podman push x",
+            "buildah push x",
+            "crane copy a b",
+            "oras push a b",
+            "regctl image copy a b",
+            "docker login ghcr.io",
+            "docker buildx build --push .",
+            "docker buildx build --output type=registry .",
+            "docker buildx build --output type=image,push=true .",
+            "curl -X PUT https://example.invalid/v2/x",
+            "curl --request DELETE https://example.invalid/v2/x",
+            "wget --method=PATCH https://example.invalid/v2/x",
+            "curl -X POST \\\n  https://example.invalid/v2/x",
+            "python3 scripts/image_publish.py promote",
+            "python3 scripts/image_publish.py tag --version 3.0.1",
+            "skopeo copy oci-archive:a docker://example.invalid/x",
+            "skopeo delete docker://example.invalid/x",
+        ],
+    )
+    def test_publication_commands_outside_promote_main_fail(self, command: str) -> None:
+        docs = {p.name: yaml.safe_load(p.read_text()) for p in cw.workflow_files()}
+        baseline = cw.image_publication_invariants(docs)
+        docs["extra.yml"] = {
+            "on": {"pull_request": None},
+            "jobs": {
+                "x": {
+                    "runs-on": "ubuntu-latest",
+                    "timeout-minutes": 10,
+                    "steps": [{"run": command}],
+                }
+            },
+        }
+        new = [r for r in cw.image_publication_invariants(docs) if r not in baseline]
+        assert new and all(r.startswith("[image] ") for r in new)
+
+    def test_the_build_smoke_skopeo_load_is_the_only_allowed_form(self) -> None:
+        image = yaml.safe_load((WORKFLOW_DIR / "image.yml").read_text())
+        loads = [
+            s
+            for s in image["jobs"]["build-smoke"]["steps"]
+            if "skopeo" in str(s.get("run", ""))
+        ]
+        assert len(loads) == 1
+        assert cw.SKOPEO_SMOKE_LOAD.fullmatch(loads[0]["run"].split("sock ", 1)[1])
