@@ -1240,6 +1240,8 @@ PUBLICATION_PATTERNS = {
 }
 SKOPEO_DELETE = re.compile(r"\bskopeo\b[^\n]*\bdelete\b", re.IGNORECASE)
 MUTATING_HTTP_LABEL = "a mutating curl/wget"
+# The 5d416e4 detector's command regex, kept for _mutating_http_5d416e4.
+_HTTP_COMMAND = re.compile(r"\b(curl|wget)\b([^\n;|&]*)")
 _SAFE_METHODS = {"GET", "HEAD"}
 _CURL_IMPLIED_LONG = ("--data", "--form", "--json", "--upload-file")
 _WGET_IMPLIED_LONG = ("--post-data", "--post-file", "--body-data", "--body-file")
@@ -1405,7 +1407,53 @@ def mutating_http(text: str) -> bool:
     ``--post-data``/``--post-file``/``--body-data``/``--body-file``. Static
     text only: a command assembled at runtime is out of reach.
     """
-    return _http_writes(_joined(text), 0)
+    # Never weaker than 5d416e4 (president re-check R6): a command is mutating
+    # when either detector flags it.
+    return _mutating_http_5d416e4(text) or _http_writes(_joined(text), 0)
+
+
+# The guard (d) curl/wget detector exactly as it stood at 5d416e4 (PR
+# Consiliency/pmcp#463 round 1), kept verbatim as a second check so that the
+# shell-word classifier can only ever add refusals.
+def _mutating_http_5d416e4(text: str) -> bool:
+    """A curl or wget that sends a method other than GET or HEAD.
+
+    Explicitly (``-X``/``--request``/``--method``, including ``-XPUT`` and a
+    short group ending in ``X``) or through a flag that implies one: curl
+    ``-d``/``--data*``, ``-F``/``--form*``, ``--json``, ``-T``/``--upload-file``
+    and any short group containing ``d``, ``F`` or ``T`` (``-sd``, ``-sfT``);
+    wget ``--post-data``/``--post-file``/``--body-data``/``--body-file``.
+    Static text only: a command assembled at runtime is out of reach.
+    """
+    for match in _HTTP_COMMAND.finditer(_joined(text)):
+        tool, tokens = match[1], match[2].split()
+        for index, token in enumerate(tokens):
+            bare = token.strip("'\"")
+            option, _, attached = bare.partition("=")
+            method = None
+            if tool == "curl":
+                if option == "--request" or re.fullmatch(r"-[A-Za-z]*X", bare):
+                    method = attached or (
+                        tokens[index + 1] if index + 1 < len(tokens) else ""
+                    )
+                elif re.fullmatch(r"-[A-Za-z]*X[A-Za-z]+", bare):
+                    method = bare.split("X", 1)[1]
+                elif option.startswith(_CURL_IMPLIED_LONG):
+                    return True
+                elif re.fullmatch(r"-[A-Za-z0-9]+", bare) and set(bare[1:]) & set(
+                    "dFT"
+                ):
+                    return True
+            else:
+                if option == "--method":
+                    method = attached or (
+                        tokens[index + 1] if index + 1 < len(tokens) else ""
+                    )
+                elif option.startswith(_WGET_IMPLIED_LONG):
+                    return True
+            if method is not None and method.strip("'\"").upper() not in _SAFE_METHODS:
+                return True
+    return False
 
 
 # The one pinned exemption from the curl/wget clause (plan T7(d), president
@@ -1497,6 +1545,12 @@ def _joined(text: str) -> str:
     return re.sub(r"\\\n\s*", " ", text)
 
 
+def _with(step: dict[str, Any]) -> dict[str, Any]:
+    """The step's ``with:`` mapping, or an empty one."""
+    given = step.get("with")
+    return given if isinstance(given, dict) else {}
+
+
 def _step_text(step: dict[str, Any]) -> str:
     parts = (
         [step.get("run"), step.get("shell")]
@@ -1573,7 +1627,7 @@ def image_publication_invariants(
                     reasons.append(
                         f"{tag} {DOCKER_WORKFLOW} must not log in to a registry"
                     )
-                given = step.get("with") if isinstance(step.get("with"), dict) else {}
+                given = _with(step)
                 if "cache-to" in given:
                     reasons.append(
                         f"{tag} {DOCKER_WORKFLOW} must not export a build cache"
@@ -1680,7 +1734,7 @@ def image_publication_invariants(
                 if promote:
                     continue
                 uses = str(step.get("uses", ""))
-                given = step.get("with") if isinstance(step.get("with"), dict) else {}
+                given = _with(step)
                 if (
                     uses.startswith("docker/build-push-action")
                     and given.get("push") is not False
@@ -1805,9 +1859,7 @@ def image_publication_invariants(
                             f"{tag} {where} checkout is neither the trusted nor the candidate form"
                         )
                 if uses.startswith("actions/download-artifact@"):
-                    given = (
-                        step.get("with") if isinstance(step.get("with"), dict) else {}
-                    )
+                    given = _with(step)
                     if "run-id" in given or "github-token" in given:
                         reasons.append(
                             f"{tag} {where} downloads another run's artifact"
@@ -1853,14 +1905,14 @@ def image_publication_invariants(
             )
     for name, doc in sorted(workflows.items()):
         for job_name, job in _jobs(doc).items():
-            uses = job.get("uses") if isinstance(job, dict) else None
-            if isinstance(uses, str) and re.search(r"(^|/)image\.yml(@|$)", uses):
+            called = job.get("uses") if isinstance(job, dict) else None
+            if isinstance(called, str) and re.search(r"(^|/)image\.yml(@|$)", called):
                 reasons.append(f"{tag} {name}:{job_name} calls {IMAGE_WORKFLOW}")
 
     # (i) The release acknowledgement covers every image publication input.
-    pattern = _ack_regex(workflows)
+    ack_pattern = _ack_regex(workflows)
     try:
-        compiled = re.compile(pattern) if pattern else None
+        compiled = re.compile(ack_pattern) if ack_pattern else None
     except re.error:
         compiled = None
     if compiled is None:

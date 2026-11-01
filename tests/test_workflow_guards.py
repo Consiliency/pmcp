@@ -1967,3 +1967,80 @@ class TestRoundOneGuards:
         docs["image.yml"][key] = value
         new = [r for r in cw.image_publication_invariants(docs) if reason in r]
         assert new and key in new[0]
+
+
+def _nested_bash_c(depth: int, *, double: bool) -> str:
+    """``curl -s -X PUT "$URL"`` inside ``depth`` nested ``bash -c`` layers."""
+    import shlex
+
+    text = 'curl -s -X PUT "$URL"'
+    for _ in range(depth):
+        if double:
+            escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+            escaped = escaped.replace("$", "\\$").replace("`", "\\`")
+            text = f'bash -c "{escaped}"'
+        else:
+            text = "bash -c " + shlex.quote(text)
+    return text
+
+
+# Writes that 5d416e4 refused and the round-1 shell-word classifier accepted
+# (president re-check of PR Consiliency/pmcp#463, A1-A23). R6 keeps the
+# 5d416e4 detector as a second check, so each must stay flagged.
+REGRESSION_CASES_5D416E4 = {
+    "A1": 'curl -s $(echo -s) -X PUT "$URL"',
+    "A2": 'curl -s --max-time $((30)) -X PUT "$URL"',
+    "A3": 'curl -s `echo -s` -X PUT "$URL"',
+    "A4": 'curl -s -o >(cat >/dev/null) -X PUT "$URL"',
+    "A5": 'curl -s -u $(echo a:b) -T f "$URL"',
+    "A6": "# don't retry\ncurl -sf '<url>' -X PUT\n# that's all",
+    "A7": "# don't retry\ncurl -s -X 'PUT' \"$URL\"\n# that's all",
+    "A8": '# don\'t log the token\nX=$(curl -s -X PUT "$URL")',
+    "A9": '# it\'s fine\ntrue;curl -s -X PUT "$URL"',
+    "A10": '# it\'s fine\n(curl -s -X PUT "$URL")',
+    "A11": '# it\'s fine\nX=`curl -s -T f "$URL"`',
+    "A12": '# it\'s fine\ntrue&&curl -s -d x "$URL"',
+    "A13": 'cat <<EOF >/dev/null\nit\'s\nEOF\nX=$(curl -s -X PUT "$URL")',
+    "A14-depth5-double": _nested_bash_c(5, double=True),
+    "A14-depth5-single": _nested_bash_c(5, double=False),
+    "A14-depth8-double": _nested_bash_c(8, double=True),
+    "A14-depth8-single": _nested_bash_c(8, double=False),
+    "A15-depth6-double": _nested_bash_c(6, double=True),
+    "A15-depth6-single": _nested_bash_c(6, double=False),
+    "A16": 'curl.exe -s -X PUT "$URL"',
+    "A17": 'curl -s -X "PUT " "$URL"',
+    "A18": '# don\'t log it\nX=$(wget -q -O- --post-data=x "$URL")',
+    "A19": 'wget -q -O /dev/null $(echo -q) --method=PUT "$URL"',
+    "A20": '$(which curl) -s -X PUT "$URL"',
+    "A21": '"$(command -v curl)" -s -X PUT "$URL"',
+    "A22": '${CURL:-curl} -s -X PUT "$URL"',
+    "A23": 'curl -s -X P${EMPTY}UT "$URL"',
+}
+
+
+class TestNeverWeakerThan5d416e4:
+    """R6: the guard's curl/wget clause is the union of both detectors."""
+
+    @pytest.mark.parametrize(
+        "case", sorted(REGRESSION_CASES_5D416E4), ids=sorted(REGRESSION_CASES_5D416E4)
+    )
+    def test_each_5d416e4_refusal_stays_flagged(self, case: str) -> None:
+        assert cw.mutating_http(REGRESSION_CASES_5D416E4[case])
+
+    @pytest.mark.parametrize(
+        "case", sorted(REGRESSION_CASES_5D416E4), ids=sorted(REGRESSION_CASES_5D416E4)
+    )
+    def test_the_kept_5d416e4_detector_flags_each_case(self, case: str) -> None:
+        assert cw._mutating_http_5d416e4(REGRESSION_CASES_5D416E4[case])
+
+    def test_the_union_never_unflags_what_the_old_detector_flags(self) -> None:
+        texts = [
+            cw._step_text(step)
+            for path in WORKFLOW_DIR.glob("*.y*ml")
+            for job in cw._jobs(yaml.safe_load(path.read_text())).values()
+            for step in cw._steps(job)
+        ]
+        assert texts
+        for text in texts:
+            if cw._mutating_http_5d416e4(text):
+                assert cw.mutating_http(text)
