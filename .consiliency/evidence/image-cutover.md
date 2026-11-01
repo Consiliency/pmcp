@@ -1,11 +1,18 @@
 # Legacy image cutover evidence
 
-This preparation adds read-only inventory tooling. It does not remove or replace
-any publisher and never authorizes activation. G must atomically introduce the
-guarded replacement and remove both legacy main and tag paths in its own PR.
-All new registry writes, including SHA/version writes, remain disabled until the
-post-G evidence and activation prerequisites are complete. The positive enable
-control is still absent and must default to disabled when introduced.
+G removes both legacy registry writers from `docker.yml` (workflow 219424499),
+which becomes a read-only pull-request build with `contents: read`, no login,
+literal `push: false` and no cache export, and adds a guarded replacement whose
+registry writes are all disabled by default. `image.yml` listens only to
+completed `Test` runs on `main`; its `gate` job opens only when the repository
+variable `PMCP_IMAGE_PUBLISH` is exactly `enabled`, `verify-upstream` re-checks
+the Test run identity, attempt and `ci-required` result through the API before
+any candidate checkout, `build-smoke` builds one OCI archive and smokes it
+locally, and only `promote-main` holds `packages: write`, writing the immutable
+`sha-<40 lowercase hex>` tag and then moving `main`. Tag mode is implemented but
+has no caller. `image-watch.yml` keeps a weekly read-only observation of both
+the legacy run inventory and the registry. Nothing here authorizes activation:
+the variable stays unset until the owner procedure below is complete.
 
 Run `python scripts/image_cutover_inventory.py --output <fresh-evidence.json>`
 using the existing authenticated gh reader. The correct old Docker workflow ID
@@ -22,9 +29,15 @@ registry API write is implemented. Cancellation requested is never terminal
 quiescence. The report always says activation_allowed=false, even if drained.
 Use a fresh output path: an existing path is refused, and a new incomplete placeholder is written
 before querying, so a crash cannot leave a prior successful report in that path.
-Two matching passes are bounded point observations, not an atomic snapshot or a
-guarantee against an operator replay after the final read. The final pre-activation
-rescan and prohibited-replay detection remain mandatory.
+Two matching passes are bounded point observations, not an atomic snapshot or
+cryptographic replay prevention: an operator replay can still land after each
+run's position is read in the second pass. If the passes differ, repeat the whole
+inventory until stable; PR runs are never excluded from the comparison. The final
+pre-activation rescan and prohibited-replay detection remain mandatory.
+
+`complete=true` means complete enumeration only. A drain observation needs a
+stable complete inventory, exit 0 and an empty `non_pr_not_completed`, and none
+of these authorizes activation.
 
 After G merges, record its exact merge SHA and cutover timestamp, run the complete
 inventory, handle outstanding runs through the owner procedure, then repeat until
@@ -43,9 +56,11 @@ source pin, source workflow and complete tag inventory alongside every baseline.
 
 Historical occupancy is untrusted legacy evidence. In particular, version 3.0.0,
 3.0 and latest currently share a legacy digest; this is not approval to replace,
-remove or move any of them. Differing immutable writes must fail closed. Preserve
-consumer-visible aliases in the reviewed new protocol. Any replacement, deletion
-or tag movement requires specific owner authorization with concrete evidence.
+remove or move any of them. Differing immutable writes must fail closed. The new protocol never writes or
+moves `latest` or `major.minor` (owner decision D1): tag mode writes exact
+version tags only, and the only new SHA target is `sha-<40 lowercase hex>` (D2).
+Any replacement, deletion or tag movement requires specific owner authorization
+with concrete evidence.
 
 Only a later reviewed activation may enable writes after complete drain, registry
 readback, smoke/digest/race rehearsals and exact source/review/CI binding. Re-scan
