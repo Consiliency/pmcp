@@ -297,6 +297,20 @@ IMAGE_MUTANTS = (
     "image-ack-baselines",
 )
 
+# Mutants that only the curl/wget clause of guard (d), or its whole-job
+# exemption pin, can kill (president re-check 1, PA-1c).
+HTTP_MUTANTS = (
+    "image-http-notify-put",
+    "image-http-notify-url-repointed",
+    "image-http-notify-curlrc",
+    "image-http-notify-copied",
+    "image-http-upload-T",
+    "image-http-data-d",
+    "image-http-wget-post-file",
+    "image-http-step-shell",
+    "image-http-defaults-shell",
+)
+
 # Every mutant these tests exercise. Asserted EQUAL to the helper's expected-1
 # rows — in BOTH directions — by TestMutationHelperContract, because the
 # evidence matrix is generated from that TSV: a phantom row there would
@@ -350,6 +364,7 @@ TESTED_MUTANTS = (
     }
     | {"integration-cancelled", "integration-shared-group"}
     | set(IMAGE_MUTANTS)
+    | set(HTTP_MUTANTS)
 )
 
 
@@ -1712,7 +1727,9 @@ class TestImagePublicationInvariants:
         assert after == before
 
     def test_the_tag_allowlist_parameter_is_checked(self) -> None:
-        docs = {p.name: yaml.safe_load(p.read_text()) for p in cw.workflow_files()}
+        docs = {
+            p.name: yaml.safe_load(p.read_text()) for p in WORKFLOW_DIR.glob("*.y*ml")
+        }
         reasons = cw.image_publication_invariants(docs, {"release.yml", "docker.yml"})
         assert any("TAG_TRIGGERED_WORKFLOWS" in r for r in reasons)
 
@@ -1740,8 +1757,11 @@ class TestImagePublicationInvariants:
         ],
     )
     def test_publication_commands_outside_promote_main_fail(self, command: str) -> None:
-        docs = {p.name: yaml.safe_load(p.read_text()) for p in cw.workflow_files()}
+        docs = {
+            p.name: yaml.safe_load(p.read_text()) for p in WORKFLOW_DIR.glob("*.y*ml")
+        }
         baseline = cw.image_publication_invariants(docs)
+        assert baseline == [] and "maintenance.yml" in docs
         docs["extra.yml"] = {
             "on": {"pull_request": None},
             "jobs": {
@@ -1764,3 +1784,101 @@ class TestImagePublicationInvariants:
         ]
         assert len(loads) == 1
         assert cw.SKOPEO_SMOKE_LOAD.fullmatch(loads[0]["run"].split("sock ", 1)[1])
+
+
+class TestMutatingHttpClause:
+    """Guard (d)'s curl/wget clause and its single pinned exemption."""
+
+    def test_the_committed_notify_job_hashes_to_the_pin(self) -> None:
+        doc = yaml.safe_load((WORKFLOW_DIR / "maintenance.yml").read_text())
+        pin = cw.MUTATING_HTTP_EXEMPT[("maintenance.yml", "notify-worker")]
+        actual = cw.job_pin(doc["jobs"]["notify-worker"])
+        assert actual == pin, (
+            f"maintenance.yml:notify-worker hashes to {actual}, but "
+            f"MUTATING_HTTP_EXEMPT pins {pin}; re-review the job before re-pinning"
+        )
+        assert list(cw.MUTATING_HTTP_EXEMPT) == [("maintenance.yml", "notify-worker")]
+
+    def test_a_job_that_does_not_serialize_is_not_exempt(self) -> None:
+        assert cw.job_pin({"steps": [{"run": float("nan")}]}) is None
+        assert cw.job_pin({"steps": [{"run": object()}]}) is None
+
+    @pytest.mark.parametrize("mutant", HTTP_MUTANTS)
+    def test_mutant_is_rejected_by_the_curl_wget_clause(
+        self, tmp_path: Path, mutant: str
+    ) -> None:
+        root = _image_tree(tmp_path)
+        before, _ = _image_reasons(root)
+        _mutate(root, mutant)
+        after, _ = _image_reasons(root)
+        new = [r for r in after if r not in before]
+        assert new and all(r.startswith("[image] ") for r in new)
+        assert any(r.endswith(cw.MUTATING_HTTP_LABEL) for r in new), new
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "curl -X PUT u",
+            "curl -XPUT u",
+            "curl --request PATCH u",
+            "wget --method=DELETE u",
+            "curl -T f u",
+            "curl --upload-file f u",
+            "curl -d x u",
+            "curl -sd x u",
+            "curl -sfT f u",
+            "curl --data-binary @f u",
+            "curl --data-raw x u",
+            "curl --data-urlencode x u",
+            "curl --json x u",
+            "curl -F a=b u",
+            "curl --form a=b u",
+            "wget --post-data=x u",
+            "wget --post-file=f u",
+            "wget --body-data=x u",
+            "wget --body-file=f u",
+        ],
+    )
+    def test_the_detector_flags_explicit_and_implied_methods(
+        self, command: str
+    ) -> None:
+        assert cw.mutating_http(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "curl -sf --max-time 2 http://127.0.0.1:3399/health",
+            "curl -fsSL -o a.tgz https://example.invalid/a.tgz",
+            "curl -X GET u",
+            "curl -I u",
+        ],
+    )
+    def test_the_detector_leaves_reads_alone(self, command: str) -> None:
+        assert not cw.mutating_http(command)
+
+    def test_the_existing_gets_in_test_yml_are_not_flagged(self) -> None:
+        texts = [
+            cw._step_text(step)
+            for job in _TEST_WF["jobs"].values()
+            for step in cw._steps(job)
+            if "curl" in str(step.get("run", ""))
+        ]
+        assert len(texts) == 2
+        assert not any(cw.mutating_http(text) for text in texts)
+
+    @pytest.mark.parametrize("where", ["step", "job", "workflow"])
+    def test_shell_and_defaults_are_scanned_and_never_exempt(self, where: str) -> None:
+        docs = {
+            p.name: yaml.safe_load(p.read_text()) for p in WORKFLOW_DIR.glob("*.y*ml")
+        }
+        baseline = cw.image_publication_invariants(docs)
+        shell = 'curl -sf -X PUT --data-binary @{0} "$URL"'
+        notify = docs["maintenance.yml"]
+        if where == "step":
+            notify["jobs"]["notify-worker"]["steps"][0]["shell"] = shell
+        elif where == "job":
+            notify["jobs"]["notify-worker"]["defaults"] = {"run": {"shell": shell}}
+        else:
+            notify["defaults"] = {"run": {"shell": shell}}
+        new = [r for r in cw.image_publication_invariants(docs) if r not in baseline]
+        assert any(r.endswith(cw.MUTATING_HTTP_LABEL) for r in new), new

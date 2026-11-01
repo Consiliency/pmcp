@@ -1235,13 +1235,95 @@ PUBLICATION_PATTERNS = {
     "oras": re.compile(r"\boras\b"),
     "regctl": re.compile(r"\bregctl\b"),
     "docker login": re.compile(r"\bdocker\s+login\b"),
-    "a mutating curl/wget": re.compile(
-        r"\b(?:curl|wget)\b[^\n]*?(?:-X\s*|--request[\s=]|--method[\s=])"
-        r"['\"]?(?:PUT|POST|PATCH|DELETE)\b"
-    ),
     "an image_publish.py write": re.compile(r"image_publish\.py\s+(?:promote|tag)\b"),
 }
 SKOPEO_DELETE = re.compile(r"\bskopeo\b[^\n]*\bdelete\b", re.IGNORECASE)
+MUTATING_HTTP_LABEL = "a mutating curl/wget"
+_HTTP_COMMAND = re.compile(r"\b(curl|wget)\b([^\n;|&]*)")
+_SAFE_METHODS = {"GET", "HEAD"}
+_CURL_IMPLIED_LONG = ("--data", "--form", "--json", "--upload-file")
+_WGET_IMPLIED_LONG = ("--post-data", "--post-file", "--body-data", "--body-file")
+
+
+def mutating_http(text: str) -> bool:
+    """A curl or wget that sends a method other than GET or HEAD.
+
+    Explicitly (``-X``/``--request``/``--method``, including ``-XPUT`` and a
+    short group ending in ``X``) or through a flag that implies one: curl
+    ``-d``/``--data*``, ``-F``/``--form*``, ``--json``, ``-T``/``--upload-file``
+    and any short group containing ``d``, ``F`` or ``T`` (``-sd``, ``-sfT``);
+    wget ``--post-data``/``--post-file``/``--body-data``/``--body-file``.
+    Static text only: a command assembled at runtime is out of reach.
+    """
+    for match in _HTTP_COMMAND.finditer(_joined(text)):
+        tool, tokens = match[1], match[2].split()
+        for index, token in enumerate(tokens):
+            bare = token.strip("'\"")
+            option, _, attached = bare.partition("=")
+            method = None
+            if tool == "curl":
+                if option == "--request" or re.fullmatch(r"-[A-Za-z]*X", bare):
+                    method = attached or (
+                        tokens[index + 1] if index + 1 < len(tokens) else ""
+                    )
+                elif re.fullmatch(r"-[A-Za-z]*X[A-Za-z]+", bare):
+                    method = bare.split("X", 1)[1]
+                elif option.startswith(_CURL_IMPLIED_LONG):
+                    return True
+                elif re.fullmatch(r"-[A-Za-z0-9]+", bare) and set(bare[1:]) & set(
+                    "dFT"
+                ):
+                    return True
+            else:
+                if option == "--method":
+                    method = attached or (
+                        tokens[index + 1] if index + 1 < len(tokens) else ""
+                    )
+                elif option.startswith(_WGET_IMPLIED_LONG):
+                    return True
+            if method is not None and method.strip("'\"").upper() not in _SAFE_METHODS:
+                return True
+    return False
+
+
+# The one pinned exemption from the curl/wget clause (plan T7(d), president
+# re-check 1): the maintenance-worker event POST that predates the cutover.
+# The pin is the sha256 of canonical JSON of the WHOLE job mapping as
+# yaml.safe_load returns it (json.dumps with sort_keys=True,
+# separators=(",", ":"), ensure_ascii=False, allow_nan=False), so any edit to
+# that job (run block, env, an added step, shell, container, defaults) re-arms
+# the clause. Recompute with exactly that recipe. This file is covered by
+# release-diff-ack, so changing the pin needs the owner's acknowledgement.
+MUTATING_HTTP_EXEMPT = {
+    ("maintenance.yml", "notify-worker"): (
+        "3391171c6bdbd2ba03e5ae24bd0d636d9160141e2495cff6dfb737632de1881b"
+    ),
+}
+
+
+def job_pin(job: Any) -> str | None:
+    """Canonical-JSON sha256 of a job mapping; ``None`` if it does not serialize."""
+    try:
+        canonical = json.dumps(
+            job,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _defaults_shell(node: Any) -> str | None:
+    try:
+        shell = node["defaults"]["run"]["shell"]
+    except (KeyError, TypeError):
+        return None
+    return shell if isinstance(shell, str) else None
+
+
 IMAGE_RUN_FORBIDDEN = {
     "git clone/fetch/pull/checkout": re.compile(
         r"\bgit\s+(?:clone|fetch|pull|checkout)\b"
@@ -1294,7 +1376,11 @@ def _joined(text: str) -> str:
 
 
 def _step_text(step: dict[str, Any]) -> str:
-    parts = [step.get("run")] + _strings(step.get("with")) + _strings(step.get("env"))
+    parts = (
+        [step.get("run"), step.get("shell")]
+        + _strings(step.get("with"))
+        + _strings(step.get("env"))
+    )
     return _joined("\n".join(p for p in parts if isinstance(p, str)))
 
 
@@ -1440,9 +1526,30 @@ def image_publication_invariants(
     for name, doc in sorted(workflows.items()):
         if not isinstance(doc, dict):
             continue
+        # defaults.run.shell wraps every run step: scanned with every (d)
+        # pattern at both levels, and never exempt.
+        shells = [("<workflow>", _defaults_shell(doc))] + [
+            (job_name, _defaults_shell(job)) for job_name, job in _jobs(doc).items()
+        ]
+        for where_name, shell in shells:
+            if shell is None:
+                continue
+            where = f"{name}:{where_name} defaults.run.shell"
+            hits = [
+                label
+                for label, pattern in PUBLICATION_PATTERNS.items()
+                if pattern.search(shell)
+            ]
+            if mutating_http(shell):
+                hits.append(MUTATING_HTTP_LABEL)
+            if re.search(r"skopeo", shell, re.IGNORECASE):
+                hits.append("skopeo")
+            reasons.extend(f"{tag} {where} contains {label}" for label in hits)
         for job_name, job in _jobs(doc).items():
             promote = name == IMAGE_WORKFLOW and job_name == PROMOTE_JOB
             smoke_job = name == IMAGE_WORKFLOW and job_name == "build-smoke"
+            pinned = MUTATING_HTTP_EXEMPT.get((name, job_name))
+            http_exempt = pinned is not None and job_pin(job) == pinned
             for step in _steps(job):
                 text = _step_text(step)
                 where = f"{name}:{job_name}"
@@ -1462,6 +1569,8 @@ def image_publication_invariants(
                 for label, pattern in PUBLICATION_PATTERNS.items():
                     if pattern.search(text):
                         reasons.append(f"{tag} {where} contains {label}")
+                if not http_exempt and mutating_http(text):
+                    reasons.append(f"{tag} {where} contains {MUTATING_HTTP_LABEL}")
                 remaining = SKOPEO_SMOKE_LOAD.sub("", text) if smoke_job else text
                 if re.search(r"skopeo", remaining, re.IGNORECASE):
                     reasons.append(
@@ -1576,7 +1685,8 @@ def image_publication_invariants(
                     text = _joined(
                         "\n".join(
                             s
-                            for s in [step.get("run")] + _strings(step.get("env"))
+                            for s in [step.get("run"), step.get("shell")]
+                            + _strings(step.get("env"))
                             if isinstance(s, str)
                         )
                     )

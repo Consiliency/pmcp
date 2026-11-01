@@ -41,6 +41,7 @@ DOCKER_WF="${REPO_ROOT}/.github/workflows/docker.yml"
 IMAGE_WF="${REPO_ROOT}/.github/workflows/image.yml"
 WATCH_WF="${REPO_ROOT}/.github/workflows/image-watch.yml"
 CHECKER="${REPO_ROOT}/scripts/check_workflows.py"
+WHEEL_WF="${REPO_ROOT}/.github/workflows/published-wheel.yml"
 # A form-valid 40-hex pin built at runtime: a literal here would trip
 # test_no_pin_anchor_hardcodes_a_real_sha, and the [image] checks never read
 # the commit of an injected action.
@@ -192,6 +193,15 @@ image-ack-docker|1|[image]|test.yml: release-diff-ack regex loses docker.yml
 image-ack-image|1|[image]|test.yml: release-diff-ack regex loses image.yml
 image-ack-dockerfile|1|[image]|test.yml: release-diff-ack regex loses Dockerfile
 image-ack-baselines|1|[image]|test.yml: release-diff-ack regex loses the image-baselines directory
+image-http-notify-put|1|[image]|maintenance.yml:notify-worker: -X POST -> -X PUT in the pinned run block; only the whole-job pin re-arms the curl/wget clause
+image-http-notify-url-repointed|1|[image]|maintenance.yml:notify-worker: WORKER_URL pointed at another variable, run block untouched; only the whole-job pin sees it
+image-http-notify-curlrc|1|[image]|maintenance.yml:notify-worker: a step before the notify step writes $HOME/.curlrc (request = PUT); only the whole-job pin sees it
+image-http-notify-copied|1|[image]|maintenance.yml: the notify step copied into a second, unpinned job
+image-http-upload-T|1|[image]|published-wheel.yml: curl -sfT (implied PUT) in a new step
+image-http-data-d|1|[image]|published-wheel.yml: curl -sd (implied POST) in a new step
+image-http-wget-post-file|1|[image]|published-wheel.yml: wget --post-file in a new step
+image-http-step-shell|1|[image]|published-wheel.yml: a step whose shell: holds a mutating curl
+image-http-defaults-shell|1|[image]|published-wheel.yml: a workflow-level defaults.run.shell holding a mutating curl
 image-needs-reordered|0|-|image.yml: promote-main needs reordered; an equivalent form that must NOT false-positive
 TSV
 )"
@@ -934,6 +944,71 @@ image-needs-gate-dropped)
 	;;
 image-needs-verify-dropped)
 	replace "$IMAGE_WF" '    needs: [gate, verify-upstream, build-smoke]' '    needs: [gate, build-smoke]'
+	;;
+image-http-notify-put)
+	replace "$MAINTENANCE" '-X POST "$WORKER_URL/events/github"' '-X PUT "$WORKER_URL/events/github"'
+	;;
+image-http-notify-url-repointed)
+	replace "$MAINTENANCE" '          WORKER_URL: ${{ vars.CONSILIENCY_WORKER_URL }}' '          WORKER_URL: ${{ vars.OTHER_UPLOAD_URL }}'
+	;;
+image-http-notify-curlrc)
+	replace "$MAINTENANCE" '      - name: Notify maintenance worker
+' "      - name: Configure curl
+        run: printf 'request = PUT\\n' > \"\$HOME/.curlrc\"
+      - name: Notify maintenance worker
+"
+	;;
+image-http-notify-copied)
+	MUT_FILE="$MAINTENANCE" python3 - <<'PY'
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(os.environ["MUT_FILE"])
+text = path.read_text()
+marker = "\n  notify-worker:\n"
+if text.count(marker) != 1:
+    sys.exit(f"mutation anchor matched {text.count(marker)} times (expected exactly 1) in {path}")
+job = text.split(marker, 1)[1]
+path.write_text(text.rstrip("\n") + "\n  notify-worker-copy:\n" + job)
+PY
+	;;
+image-http-upload-T)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: curl -sfT "$RUNNER_TEMP/published-wheel/report.json" "$UPLOAD_URL"
+      - name: Retain public compatibility identity
+'
+	;;
+image-http-data-d)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: curl -sd @"$RUNNER_TEMP/published-wheel/report.json" "$UPLOAD_URL"
+      - name: Retain public compatibility identity
+'
+	;;
+image-http-wget-post-file)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: wget --post-file="$RUNNER_TEMP/published-wheel/report.json" "$UPLOAD_URL"
+      - name: Retain public compatibility identity
+'
+	;;
+image-http-step-shell)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - shell: curl -sf -X PUT --data-binary @{0} "$UPLOAD_URL"
+        run: echo report
+      - name: Retain public compatibility identity
+'
+	;;
+image-http-defaults-shell)
+	replace "$WHEEL_WF" 'permissions:
+  contents: read
+
+jobs:' 'permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: curl -sf -X PUT --data-binary @{0} "$UPLOAD_URL" --
+jobs:'
 	;;
 image-needs-reordered)
 	replace "$IMAGE_WF" '    needs: [gate, verify-upstream, build-smoke]' '    needs: [build-smoke, gate, verify-upstream]'
