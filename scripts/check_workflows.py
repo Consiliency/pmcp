@@ -1220,18 +1220,25 @@ IMAGE_WATCH_CHECKOUT = {
     "persist-credentials": False,
 }
 # The single skopeo form allowed outside promote-main: a local load of the
-# verified archive into the runner's daemon, in build-smoke only.
+# verified archive into the runner's daemon, in build-smoke only. Each operand
+# is reference characters only and ends at a blank or the end of the text, so
+# anything glued on (; & | $( ` or a quote) leaves skopeo in the remainder.
 SKOPEO_SMOKE_LOAD = re.compile(
     r"quay\.io/skopeo/stable@sha256:[0-9a-f]{64} (?:--insecure-policy )?"
-    r"copy oci-archive:[^\s;&|]+ docker-daemon:[^\s;&|]+"
+    r"copy oci-archive:[A-Za-z0-9_./:@+-]+(?!\S) docker-daemon:[A-Za-z0-9_./:@+-]+(?!\S)"
 )
+# Global options before a container tool's subcommand: each an option word,
+# optionally followed by one value word (docker --config DIR, -H URL, --tls).
+# The value alternatives are disjoint, so a failed match cannot backtrack
+# exponentially.
+_GLOBAL_OPTIONS = r"""(?:\s+-\S*(?:\s+(?:"[^"\n]*"|'[^'\n]*'|[^\s"'-]\S*))?)*"""
 PUBLICATION_PATTERNS = {
     "a buildx --push": re.compile(r"(?<![\w-])--push\b"),
     "a type=registry output": re.compile(r"type=registry"),
     "a pushing type=image output": re.compile(r"type=image[^\n]*push=true"),
-    "docker push": re.compile(r"\bdocker\s+(?:image\s+)?push\b"),
-    "podman push": re.compile(r"\bpodman\s+(?:image\s+)?push\b"),
-    "buildah push": re.compile(r"\bbuildah\s+push\b"),
+    "docker push": re.compile(rf"\bdocker{_GLOBAL_OPTIONS}\s+(?:image\s+)?push\b"),
+    "podman push": re.compile(rf"\bpodman{_GLOBAL_OPTIONS}\s+(?:image\s+)?push\b"),
+    "buildah push": re.compile(rf"\bbuildah{_GLOBAL_OPTIONS}\s+push\b"),
     "crane": re.compile(r"\bcrane\b"),
     "oras": re.compile(r"\boras\b"),
     "regctl": re.compile(r"\bregctl\b"),
@@ -1245,111 +1252,625 @@ _HTTP_COMMAND = re.compile(r"\b(curl|wget)\b([^\n;|&]*)")
 _SAFE_METHODS = {"GET", "HEAD"}
 _CURL_IMPLIED_LONG = ("--data", "--form", "--json", "--upload-file")
 _WGET_IMPLIED_LONG = ("--post-data", "--post-file", "--body-data", "--body-file")
-# curl short options whose value may be attached: the rest of the word after
-# one of these is a value, never further option letters.
+# --- guard (d), curl/wget: the text read as bash reads it -------------------
+#
+# Consiliency/pmcp#472 (president re-check R7 and R8 of PR
+# Consiliency/pmcp#463). The lexer follows bash's own grammar (bash(1):
+# SHELL GRAMMAR, QUOTING, EXPANSION, REDIRECTION, Here Documents), not a list
+# of known spellings, and it has no path that answers "no write" for text it
+# could not read:
+# - a `#` that starts a word begins a comment to the end of the line;
+# - here-document bodies are read line by line up to their delimiter, so a
+#   quote inside one never opens a region past it;
+# - $(...), $((...)), `...`, <(...), >(...) and ${...} end neither the word nor
+#   the command; the commands inside substitutions are classified too;
+# - a command ends at a newline, ; & && | || |& ;; ;& ;;& and at a ( or ) that
+#   opens or closes a subshell or group, but the & of >& <& &> &>> belongs to
+#   the redirection, and redirections are not arguments;
+# - '...', "...", $'...', $"..." and \x are removed; the content of every
+#   quoted part, every comment, every here-document body, every substitution
+#   and every word holding a backslash-escaped blank is classified as commands
+#   of its own (bash -c "...", ssh host "...", bash <<EOF);
+# - there is no depth cap: every recursion is on strictly shorter text, and a
+#   stack overflow counts as a write; text bash could not finish reading (an
+#   unterminated quote or substitution) is also classified with every
+#   curl/wget word, glued to anything, taking the rest of the text, quotes
+#   removed, as its arguments.
+
+# curl short options that take a value (curl(1)): the rest of the word after
+# one of these is that value. Every other character of a short group,
+# including `#`, `:` and digits, is an option letter of its own.
 _CURL_VALUE_SHORT = set("AbcCdDeEFHKmoPQrtTuUwxXyYz")
-_SHELL_SEPARATORS = set(";&|()`\n")
-_METHOD_WORD = re.compile(r"\$.*|[A-Za-z][A-Za-z0-9_-]*")
-_MAX_NESTING = 4
+# curl long options that send a method: --request names one, the others imply
+# one whatever follows (a longer name, such as --data-binary, too).
+_CURL_LONG_WRITES = (
+    ("data", "implied"),
+    ("form", "implied"),
+    ("json", "implied"),
+    ("upload-file", "implied"),
+    ("request", "method"),
+)
+# curl 8.3.0+ reads --expand-<option> as <option> with variables expanded.
+_CURL_EXPAND = "expand-"
+_CURL_LONG_NAMES = _CURL_LONG_WRITES + tuple(
+    (_CURL_EXPAND + name, kind) for name, kind in _CURL_LONG_WRITES
+)
+# wget long options that send a method; -e/--execute runs a wgetrc command.
+_WGET_LONG_WRITES = (
+    ("post-data", "implied"),
+    ("post-file", "implied"),
+    ("body-data", "implied"),
+    ("body-file", "implied"),
+    ("method", "method"),
+    ("execute", "execute"),
+)
+# wget short options that take a value (wget(1)).
+_WGET_VALUE_SHORT = set("aABDeiIlnoOPQRtTUwX")
+# wgetrc commands that send a method; wgetrc ignores case, `-` and `_`.
+_WGETRC_WRITES = {"postdata", "postfile", "bodydata", "bodyfile"}
+# The command word, by basename (R8a).
+_HTTP_TOOLS = {"curl": "curl", "curl.exe": "curl", "wget": "wget", "wget.exe": "wget"}
+# curl or wget as a word glued to anything but a name character: inside an
+# expansion that builds a command word, and in text that cannot be lexed.
+_TOOL_WORD = re.compile(
+    r"(?<![A-Za-z0-9_.-])(curl|wget)(?:\.exe)?(?![A-Za-z0-9_.-])", re.IGNORECASE
+)
+# bash's redirection operators, longest first.
+_REDIRECTIONS = (
+    "&>>",
+    "&>",
+    "<<<",
+    "<<-",
+    "<<",
+    "<&",
+    "<>",
+    ">>",
+    ">&",
+    ">|",
+    "<",
+    ">",
+)
+# bash's control operators, longest first.
+_CONTROL_OPERATORS = (";;&", ";;", ";&", "||", "|&", "&&", ";", "&", "|")
+_REDIRECTED_FD = re.compile(r"[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\}")
+_SIMPLE_PARAMETER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]")
+# The parameter name and operator that open ${...}; the rest is a word.
+_PARAMETER_HEAD = re.compile(
+    r"[#!]?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])(?:\[[^]]*\])?"
+    r"(?::?[-=+?]|##?|%%?|//?|/[#%]|\^\^?|,,?|@)?"
+)
+_ANSI_C_ESCAPES = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "?": "?",
+}
+_ANSI_C_NUMERIC = re.compile(
+    r"[0-7]{1,3}|x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|c."
+)
+
+
+def _ansi_c(body: str) -> str:
+    """The value of ``$'body'`` (bash(1), QUOTING)."""
+    out: list[str] = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        escape = body[index + 1 : index + 2]
+        if char != "\\" or not escape:
+            out.append(char)
+            index += 1
+            continue
+        if escape in _ANSI_C_ESCAPES:
+            out.append(_ANSI_C_ESCAPES[escape])
+            index += 2
+            continue
+        number = _ANSI_C_NUMERIC.match(body, index + 1)
+        if number is None:
+            out.append(char)
+            index += 1
+            continue
+        token = number[0]
+        if token[0] == "c":
+            out.append(chr(ord(token[1]) & 0x1F))
+        elif token[0] in "xuU":
+            out.append(chr(min(int(token[1:], 16), 0x10FFFF)))
+        else:
+            out.append(chr(int(token, 8) & 0xFF))
+        index += 1 + len(token)
+    return "".join(out)
+
+
+class _Unlexable(Exception):
+    """Text bash could not finish reading: an unterminated quote or expansion."""
+
+
+# The most characters the classifier may lex or scan for one text, counting
+# every nested text, rescan and lookahead (2026-11-03 dev0 incident: the guard's
+# own work must be bounded). Reaching it counts as a write: no bound may fail
+# open (R7f). Committed step texts use well under 1% of it.
+_WORK_LIMIT = 1_000_000
+
+
+class _OverBudget(Exception):
+    """The classifier reached ``_WORK_LIMIT``."""
+
+
+class _Work:
+    """The work spent on one classified text, and the texts already classified."""
+
+    def __init__(self) -> None:
+        self.spent = 0
+        self.seen: set[str] = set()
+
+    def spend(self, amount: int) -> None:
+        self.spent += amount
+        if self.spent > _WORK_LIMIT:
+            raise _OverBudget
 
 
 class _Word:
-    """One shell word after quote removal, with the contents of its quoted parts."""
+    """One shell word: its text after quote removal, expansions kept as written."""
 
-    def __init__(self) -> None:
-        self.text = ""
-        self.quoted: list[str] = []
-        self.started = False
+    def __init__(self, text: str = "", expanded: bool = False) -> None:
+        # Pieces joined on demand: appending to one string would copy it
+        # every time, quadratic in the length of a long word.
+        self._pieces = [text] if text else []
+        self._joined: str | None = text
+        self.started = bool(text)
+        self.quoted = False
+        self.expanded = expanded
+        self.escaped_blank = False
+        self.expansions: list[str] = []
+
+    @property
+    def text(self) -> str:
+        if self._joined is None:
+            self._joined = "".join(self._pieces)
+            self._pieces = [self._joined]
+        return self._joined
+
+    def add(self, piece: str) -> None:
+        self._pieces.append(piece)
+        self._joined = None
+        self.started = True
 
 
-def _shell_commands(text: str) -> list[list[_Word]] | None:
-    """Split text the way bash does: words at unquoted blanks, commands at
-    unquoted ``;``, ``&``, ``|``, ``(``, ``)``, backtick and newline, quotes
-    removed. ``None`` when the quotes do not balance."""
-    commands: list[list[_Word]] = [[]]
-    word = _Word()
+class _ShellLexer:
+    """Simple commands of a bash text, plus the texts bash may run as commands."""
 
-    def finish() -> None:
-        nonlocal word
-        if word.started:
-            commands[-1].append(word)
+    def __init__(self, text: str, work: _Work | None = None) -> None:
+        self.s = text
+        self.n = len(text)
+        self.work = _Work() if work is None else work
+        self.commands: list[list[_Word]] = []
+        # Text that may itself run as commands: quoted parts, comments,
+        # here-document bodies, substitutions, words with an escaped blank.
+        self.nested: list[str] = []
+        # Here-document bodies whose expansions could not be lexed.
+        self.unlexed: list[str] = []
+        # Here-documents waiting for the next newline: delimiter, <<-, expands.
+        self.heredocs: list[tuple[str, bool, bool]] = []
+
+    def run(self) -> bool:
+        """Lex the whole text; False if bash could not finish reading it."""
+        try:
+            self.parse(0, closer=False)
+        except _Unlexable:
+            return False
+        return True
+
+    def parse(self, pos: int, closer: bool) -> int:
+        """A command list from ``pos``; with ``closer``, up to its matching ``)``."""
+        s, n = self.s, self.n
+        command: list[_Word] = []
         word = _Word()
+        redirect: str | None = None
+        depth = 0
+        # One [state, depth] per open case: "head", "pattern" or "body".
+        cases: list[list[Any]] = []
 
-    i, n = 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch in ("'", '"'):
-            close = i + 1
-            if ch == "'":
-                close = text.find("'", i + 1)
+        def finish_word() -> None:
+            nonlocal word, command, redirect
+            current, word = word, _Word()
+            if not current.started:
+                return
+            if current.escaped_blank:
+                self.nested.append(current.text)
+            if redirect is not None:
+                if redirect in ("<<", "<<-"):
+                    self.heredocs.append(
+                        (current.text, redirect == "<<-", not current.quoted)
+                    )
+                redirect = None
+                return
+            reserved = None if current.quoted else current.text
+            if reserved == "case" and not command:
+                cases.append(["head", depth])
+            elif reserved == "esac" and not command and cases:
+                cases.pop()
+            command.append(current)
+            if (
+                reserved == "in"
+                and cases
+                and cases[-1] == ["head", depth]
+                and command[0].text == "case"
+            ):
+                cases[-1][0] = "pattern"
+                self.commands.append(command)
+                command = []
+
+        def finish_command() -> None:
+            nonlocal command, redirect
+            finish_word()
+            redirect = None
+            if command:
+                self.commands.append(command)
+            command = []
+
+        while pos < n:
+            char = s[pos]
+            if char == "\n":
+                finish_command()
+                pos = self.read_heredocs(pos + 1)
+                continue
+            if char in " \t":
+                finish_word()
+                pos += 1
+                continue
+            if char == "#" and not word.started:
+                end = s.find("\n", pos)
+                end = n if end < 0 else end
+                self.nested.append(s[pos + 1 : end])
+                pos = end
+                continue
+            if char == "\\":
+                if pos + 1 >= n:
+                    word.add(char)
+                    pos += 1
+                    continue
+                escaped = s[pos + 1]
+                pos += 2
+                if escaped == "\n":
+                    continue
+                word.add(escaped)
+                word.quoted = True
+                if escaped in " \t":
+                    word.escaped_blank = True
+                continue
+            if char == "'":
+                close = s.find("'", pos + 1)
                 if close < 0:
-                    return None
-                inner = text[i + 1 : close]
-            else:
-                parts = []
-                while True:
-                    if close >= n:
-                        return None
-                    if text[close] == "\\" and close + 1 < n:
-                        parts.append(text[close + 1])
-                        close += 2
+                    raise _Unlexable
+                self.quoted_part(word, s[pos + 1 : close])
+                pos = close + 1
+                continue
+            if char == '"':
+                pos = self.double_quoted(pos + 1, word)
+                continue
+            if char == "$":
+                pos = self.dollar(pos, word, quoted=False)
+                continue
+            if char == "`":
+                pos = self.backtick(pos, word)
+                continue
+            if char in "<>" and s.startswith("(", pos + 1):
+                end = self.parse(pos + 2, closer=True)
+                pos = self.expansion(word, pos, end)
+                continue
+            op = next((o for o in _REDIRECTIONS if s.startswith(o, pos)), None)
+            if op is not None:
+                if (
+                    word.started
+                    and not word.quoted
+                    and not word.expanded
+                    and _REDIRECTED_FD.fullmatch(word.text)
+                ):
+                    word = _Word()
+                else:
+                    finish_word()
+                redirect = op
+                pos += len(op)
+                continue
+            op = next((o for o in _CONTROL_OPERATORS if s.startswith(o, pos)), None)
+            if op is not None:
+                finish_command()
+                if op in (";;", ";&", ";;&") and cases and cases[-1][1] == depth:
+                    cases[-1][0] = "pattern"
+                pos += len(op)
+                continue
+            if char == "(":
+                at_start = not word.started and (
+                    not command or [w.text for w in command] == ["for"]
+                )
+                finish_command()
+                if at_start and s.startswith("((", pos):
+                    arithmetic = self.arithmetic_end(pos + 2)
+                    if arithmetic is not None:
+                        self.nested.append(s[pos + 2 : arithmetic - 2])
+                        pos = arithmetic
                         continue
-                    if text[close] == '"':
-                        break
-                    parts.append(text[close])
-                    close += 1
-                inner = "".join(parts)
-            word.text += inner
-            word.quoted.append(inner)
-            word.started = True
-            i = close + 1
-            continue
-        if ch == "\\" and i + 1 < n:
-            word.text += text[i + 1]
-            word.started = True
-            i += 2
-            continue
-        if ch in _SHELL_SEPARATORS:
-            finish()
-            commands.append([])
-            i += 1
-            continue
-        if ch.isspace():
-            finish()
-            i += 1
-            continue
-        word.text += ch
-        word.started = True
-        i += 1
-    finish()
-    return [command for command in commands if command]
+                if at_start and cases and cases[-1] == ["pattern", depth]:
+                    pos += 1
+                    continue
+                depth += 1
+                pos += 1
+                continue
+            if char == ")":
+                finish_command()
+                pos += 1
+                if cases and cases[-1] == ["pattern", depth]:
+                    cases[-1][0] = "body"
+                elif depth:
+                    depth -= 1
+                elif closer:
+                    return pos
+                continue
+            word.add(char)
+            pos += 1
+        if closer:
+            raise _Unlexable
+        finish_command()
+        return pos
 
+    def quoted_part(self, word: _Word, inner: str) -> None:
+        word.add(inner)
+        word.quoted = True
+        self.nested.append(inner)
 
-def _method_writes(method: str) -> bool:
-    """A method other than GET or HEAD; a ``$`` expansion counts as a write."""
-    return _METHOD_WORD.fullmatch(method) is not None and (
-        method.startswith("$") or method.upper() not in _SAFE_METHODS
-    )
+    def expansion(self, word: _Word, start: int, end: int) -> int:
+        raw = self.s[start:end]
+        word.add(raw)
+        word.expanded = True
+        word.expansions.append(raw)
+        return end
 
+    def double_quoted(self, pos: int, word: _Word) -> int:
+        """``"..."`` from just after its opening quote."""
+        s, inner = self.s, _Word()
+        while True:
+            if pos >= self.n:
+                raise _Unlexable
+            char = s[pos]
+            if char == '"':
+                break
+            if char == "\\" and s[pos + 1 : pos + 2] in ("$", "`", '"', "\\", "\n"):
+                if s[pos + 1] != "\n":
+                    inner.add(s[pos + 1])
+                pos += 2
+                continue
+            if char == "$":
+                pos = self.dollar(pos, inner, quoted=True)
+                continue
+            if char == "`":
+                pos = self.backtick(pos, inner)
+                continue
+            inner.add(char)
+            pos += 1
+        word.expanded = word.expanded or inner.expanded
+        word.expansions += inner.expansions
+        self.quoted_part(word, inner.text)
+        return pos + 1
 
-def _curl_writes(args: list[str]) -> bool:
-    for index, word in enumerate(args):
-        following = args[index + 1] if index + 1 < len(args) else ""
-        if word.startswith("--"):
-            option, _, attached = word.partition("=")
-            if option == "--request" and _method_writes(attached or following):
-                return True
-            if option.startswith(_CURL_IMPLIED_LONG):
-                return True
-        elif word.startswith("-") and len(word) > 1:
-            for position, letter in enumerate(word[1:], start=1):
-                if not letter.isalnum():
+    def dollar(self, pos: int, word: _Word, quoted: bool) -> int:
+        """A ``$`` at ``pos``: an expansion, ``$'...'``, ``$"..."`` or itself."""
+        s = self.s
+        following = s[pos + 1 : pos + 2]
+        if following == "(":
+            if s.startswith("((", pos + 1):
+                end = self.arithmetic_end(pos + 3)
+                if end is not None:
+                    self.nested.append(s[pos + 3 : end - 2])
+                    return self.expansion(word, pos, end)
+            end = self.parse(pos + 2, closer=True)
+            return self.expansion(word, pos, end)
+        if following == "{":
+            end = self.parameter(pos + 2, quoted)
+            content = s[pos + 2 : end - 1]
+            head = _PARAMETER_HEAD.match(content)
+            self.nested.append(content[head.end() :] if head else content)
+            return self.expansion(word, pos, end)
+        if following == "'" and not quoted:
+            close = pos + 2
+            while close < self.n and s[close] != "'":
+                close += 2 if s[close] == "\\" else 1
+            if close >= self.n:
+                raise _Unlexable
+            self.quoted_part(word, _ansi_c(s[pos + 2 : close]))
+            return close + 1
+        if following == '"' and not quoted:
+            return self.double_quoted(pos + 2, word)
+        name = _SIMPLE_PARAMETER.match(s, pos + 1)
+        if name is not None:
+            return self.expansion(word, pos, name.end())
+        word.add("$")
+        return pos + 1
+
+    def parameter(self, pos: int, quoted: bool) -> int:
+        """The end of ``${...}``, from just after its ``{``."""
+        s, scratch = self.s, _Word()
+        while pos < self.n:
+            char = s[pos]
+            if char == "}":
+                return pos + 1
+            if char == "\\":
+                pos += 2
+            elif char == "'" and not quoted:
+                close = s.find("'", pos + 1)
+                if close < 0:
+                    raise _Unlexable
+                self.nested.append(s[pos + 1 : close])
+                pos = close + 1
+            elif char == '"':
+                pos = self.double_quoted(pos + 1, scratch)
+            elif char == "$":
+                pos = self.dollar(pos, scratch, quoted=True)
+            elif char == "`":
+                pos = self.backtick(pos, scratch)
+            else:
+                pos += 1
+        raise _Unlexable
+
+    def backtick(self, pos: int, word: _Word) -> int:
+        """```...``` at ``pos``: its content runs as commands."""
+        s, inner, index = self.s, [], pos + 1
+        while True:
+            if index >= self.n:
+                raise _Unlexable
+            char = s[index]
+            if char == "`":
+                break
+            if char == "\\" and index + 1 < self.n:
+                escaped = s[index + 1]
+                inner.append(escaped if escaped in "$`\\" else char + escaped)
+                index += 2
+                continue
+            inner.append(char)
+            index += 1
+        self.nested.append("".join(inner))
+        return self.expansion(word, pos, index + 1)
+
+    def arithmetic_end(self, pos: int) -> int | None:
+        """The end of ``((...))`` from just after ``((``, or None if it is not one."""
+        end = self._arithmetic_end(pos)
+        # A lookahead that finds no `))` is repeated for every `$((`.
+        self.work.spend((self.n if end is None else end) - pos)
+        return end
+
+    def _arithmetic_end(self, pos: int) -> int | None:
+        s, depth = self.s, 0
+        while pos < self.n:
+            char = s[pos]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    return pos + 2 if s.startswith("))", pos) else None
+                depth -= 1
+            pos += 1
+        return None
+
+    def read_heredocs(self, pos: int) -> int:
+        """The bodies of the pending here-documents, from the line at ``pos``."""
+        s = self.s
+        pending, self.heredocs = self.heredocs, []
+        for delimiter, strip_tabs, expands in pending:
+            body: list[str] = []
+            while pos < self.n:
+                end = s.find("\n", pos)
+                end = self.n if end < 0 else end
+                line = s[pos:end]
+                pos = min(end + 1, self.n)
+                if (line.lstrip("\t") if strip_tabs else line) == delimiter:
                     break
+                body.append(line + "\n")
+            text = "".join(body)
+            # The body may be a script (bash <<EOF): classify it as commands.
+            self.nested.append(text)
+            if expands:
+                self.heredoc_expansions(text)
+        return pos
+
+    def heredoc_expansions(self, body: str) -> None:
+        """The substitutions bash runs in a body whose delimiter is unquoted."""
+        sub = _ShellLexer(body, self.work)
+        scratch = _Word()
+        pos = 0
+        try:
+            while pos < sub.n:
+                char = body[pos]
+                if char == "\\":
+                    pos += 2
+                elif char == "$":
+                    pos = sub.dollar(pos, scratch, quoted=True)
+                elif char == "`":
+                    pos = sub.backtick(pos, scratch)
+                else:
+                    pos += 1
+        except _Unlexable:
+            self.unlexed.append(body)
+        self.commands += sub.commands
+        self.nested += sub.nested
+        self.unlexed += sub.unlexed
+
+
+def _method_writes(method: str, expanded: bool) -> bool:
+    """A method other than GET or HEAD in any letter case (R8e).
+
+    An expansion anywhere in the word counts as a write; an empty or missing
+    word does not (``curl -X ""`` exits 2 without sending a request).
+    """
+    if not method:
+        return False
+    return expanded or method.upper() not in _SAFE_METHODS
+
+
+def _option_value(
+    word: _Word, eq: str, attached: str, following: _Word | None
+) -> tuple[str, bool]:
+    """A long option's value: attached after ``=``, or the next word."""
+    if eq:
+        return attached, word.expanded
+    if following is None:
+        return "", False
+    return following.text, following.expanded
+
+
+def _long_option(
+    name: str, table: tuple[tuple[str, str], ...], abbreviated: bool
+) -> str | None:
+    """The kind of the long option ``--name`` in ``table``, or None.
+
+    A longer spelling of an implied-write name counts (``--data-binary``), and
+    with ``abbreviated`` so does any prefix of a listed name (GNU getopt_long
+    accepts an unambiguous one; an ambiguous one is flagged too).
+    """
+    if not name:
+        return None
+    for full, kind in table:
+        if name == full or (kind == "implied" and name.startswith(full)):
+            return kind
+    if abbreviated:
+        for full, kind in table:
+            if full.startswith(name):
+                return kind
+    return None
+
+
+def _curl_writes(args: list[_Word]) -> bool:
+    for index, word in enumerate(args):
+        text = word.text
+        following = args[index + 1] if index + 1 < len(args) else None
+        if text.startswith("--"):
+            name, eq, attached = text[2:].partition("=")
+            kind = _long_option(name, _CURL_LONG_NAMES, abbreviated=True)
+            if kind == "implied":
+                return True
+            if kind == "method" and _method_writes(
+                *_option_value(word, eq, attached, following)
+            ):
+                return True
+        elif text.startswith("-") and len(text) > 1:
+            for position, letter in enumerate(text[1:], start=1):
                 if letter in "dFT":
                     return True
                 if letter == "X":
-                    rest = word[position + 1 :]
-                    if _method_writes(rest or following):
+                    rest = text[position + 1 :]
+                    method = (
+                        (rest, word.expanded)
+                        if rest
+                        else _option_value(word, "", "", following)
+                    )
+                    if _method_writes(*method):
                         return True
                     break
                 if letter in _CURL_VALUE_SHORT:
@@ -1357,59 +1878,248 @@ def _curl_writes(args: list[str]) -> bool:
     return False
 
 
-def _wget_writes(args: list[str]) -> bool:
+def _wgetrc_writes(command: str, expanded: bool) -> bool:
+    """A wgetrc command (``wget -e``) that sends a method."""
+    name, _, value = command.partition("=")
+    key = re.sub(r"[-_\s]", "", name).lower()
+    if key in _WGETRC_WRITES or (expanded and re.search(r"[$`]", name)):
+        return True
+    return key == "method" and _method_writes(value.strip(), expanded)
+
+
+def _wget_writes(args: list[_Word]) -> bool:
     for index, word in enumerate(args):
-        option, _, attached = word.partition("=")
-        following = args[index + 1] if index + 1 < len(args) else ""
-        if option == "--method" and _method_writes(attached or following):
+        text = word.text
+        following = args[index + 1] if index + 1 < len(args) else None
+        if text.startswith("--"):
+            name, eq, attached = text[2:].partition("=")
+            kind = _long_option(name, _WGET_LONG_WRITES, abbreviated=True)
+            value = _option_value(word, eq, attached, following)
+            if kind == "implied":
+                return True
+            if kind == "method" and _method_writes(*value):
+                return True
+            if kind == "execute" and _wgetrc_writes(*value):
+                return True
+        elif text.startswith("-") and len(text) > 1:
+            for spot, letter in enumerate(text[1:], start=1):
+                if letter == "e":
+                    rest = text[spot + 1 :]
+                    command = (
+                        (rest, word.expanded)
+                        if rest
+                        else _option_value(word, "", "", following)
+                    )
+                    if _wgetrc_writes(*command):
+                        return True
+                    break
+                if letter in _WGET_VALUE_SHORT:
+                    break
+    return False
+
+
+def _http_tools(word: _Word, work: _Work) -> set[str]:
+    """``curl``/``wget`` if the word names one: by basename (``/usr/bin/curl``,
+    ``curl.exe``), or inside an expansion (``$(command -v curl)``)."""
+    text = word.text
+    work.spend(len(text) + sum(len(raw) for raw in word.expansions))
+    base = re.split(r"[/\\]", text)[-1].lower()
+    tools = {_HTTP_TOOLS[base]} if base in _HTTP_TOOLS else set()
+    for raw in word.expansions:
+        tools.update(match[1].lower() for match in _TOOL_WORD.finditer(raw))
+    return tools
+
+
+def _command_writes(words: list[_Word], work: _Work) -> bool:
+    """A simple command with curl or wget anywhere in it (``timeout 5 curl``,
+    ``env A=1 curl``) whose arguments send a method."""
+    for index, word in enumerate(words):
+        tools = _http_tools(word, work)
+        if tools:
+            # The option scans read every following word, letter by letter.
+            work.spend(sum(len(w.text) + 1 for w in words[index + 1 :]))
+        if "curl" in tools and _curl_writes(words[index + 1 :]):
             return True
-        if option.startswith(_WGET_IMPLIED_LONG):
+        if "wget" in tools and _wget_writes(words[index + 1 :]):
             return True
     return False
 
 
-def _http_writes(text: str, depth: int) -> bool:
-    if depth > _MAX_NESTING:
+def _unlexed_writes(text: str, work: _Work) -> bool:
+    """R7f: every curl/wget word glued to anything, with the rest of the text,
+    quotes and backslashes removed, as its arguments."""
+    for match in _TOOL_WORD.finditer(text):
+        work.spend(len(text) - match.end())
+        rest = re.sub(r"[\\'\"]", "", text[match.end() :]).split()
+        args = [
+            _Word(token, expanded=bool(re.search(r"[$`]", token))) for token in rest
+        ]
+        if _command_writes([_Word(match[1].lower()), *args], work):
+            return True
+    return False
+
+
+def _classify(text: str, work: _Work) -> bool:
+    if text in work.seen:
+        # Classified earlier in this call, and found no write (a write ends it).
         return False
-    commands = _shell_commands(text)
-    if commands is None:
-        # Unbalanced quotes: classify conservatively, untruncated, with every
-        # quote character removed.
-        flat = [w for w in re.sub("['\"]", "", text).split() if w]
-        commands_words = [flat]
-        quoted: list[str] = []
-    else:
-        commands_words = [[w.text for w in command] for command in commands]
-        quoted = [q for command in commands for w in command for q in w.quoted]
-    for words in commands_words:
-        for index, word in enumerate(words):
-            tool = word.rsplit("/", 1)[-1]
-            if tool == "curl" and _curl_writes(words[index + 1 :]):
-                return True
-            if tool == "wget" and _wget_writes(words[index + 1 :]):
-                return True
-    # A quoted word is classified as a command too (bash -c "...", ssh h "...").
-    return any(_http_writes(inner, depth + 1) for inner in quoted)
+    work.seen.add(text)
+    work.spend(len(text))
+    lexer = _ShellLexer(text, work)
+    complete = lexer.run()
+    if any(_command_writes(words, work) for words in lexer.commands):
+        return True
+    unlexed = lexer.unlexed if complete else [*lexer.unlexed, text]
+    if any(_unlexed_writes(chunk, work) for chunk in unlexed):
+        return True
+    # Every nested text is strictly shorter, so the recursion ends.
+    return any(
+        _classify(inner, work) for inner in lexer.nested if len(inner) < len(text)
+    )
+
+
+def _http_writes(text: str) -> bool:
+    """The bash-grammar classifier behind :func:`mutating_http` (R7, R8).
+
+    Its work is bounded: past ``_WORK_LIMIT`` characters lexed or scanned, or
+    past Python's stack depth, the text counts as a write (R7f).
+    """
+    try:
+        return _classify(text, _Work())
+    except (_OverBudget, RecursionError):
+        return True
+
+
+def _bash_writes(text: str) -> bool:
+    try:
+        return _http_writes(_joined(text))
+    except RecursionError:
+        # Nesting deeper than Python's stack: never fail open (R7f).
+        return True
 
 
 def mutating_http(text: str) -> bool:
     """A curl or wget that sends a method other than GET or HEAD.
 
-    The text is read as bash reads it (words split at unquoted blanks,
-    commands at unquoted ``; & | ( )``, backtick or newline, quotes removed);
-    the command word is recognised by its basename anywhere in a command
-    (``/usr/bin/curl``, ``timeout 5 curl``, ``env A=1 curl``), and quoted
-    words are classified as commands too (``bash -c "..."``). A method is sent
-    explicitly (``-X``/``--request``/``--method``, attached or not) or
-    implied: curl ``-d``/``--data*``, ``-F``/``--form*``, ``--json``,
-    ``-T``/``--upload-file`` and any short group whose option letters include
-    ``d``, ``F`` or ``T``, whatever value is attached; wget
-    ``--post-data``/``--post-file``/``--body-data``/``--body-file``. Static
-    text only: a command assembled at runtime is out of reach.
+    The union (president re-check R6) of the 5d416e4 detector, kept verbatim,
+    and the bash-grammar classifier (Consiliency/pmcp#472, R7 and R8): the
+    text is lexed as bash lexes it (see the comment above ``_CURL_VALUE_SHORT``),
+    the command word is recognised by its basename (``curl``, ``curl.exe``,
+    ``wget``, ``wget.exe``) anywhere in a command or inside an expansion that
+    builds one, and every text bash may run as commands of its own is
+    classified too. A method is sent explicitly (curl ``-X``/``--request``,
+    wget ``--method``, attached or not, any value but GET or HEAD, an
+    expansion counting as a write) or implied: curl ``-d``, ``-F``, ``-T`` in
+    any short group (``#``, ``:`` and digits are option letters), ``--data*``,
+    ``--form*``, ``--json*``, ``--upload-file*``, each also as ``--expand-*``
+    and as any abbreviation; wget ``--post-data``, ``--post-file``,
+    ``--body-data``, ``--body-file`` and any abbreviation, and a wgetrc
+    command run by ``-e``. Static text only: a command assembled at runtime
+    is out of reach (AC1).
     """
-    # Never weaker than 5d416e4 (president re-check R6): a command is mutating
-    # when either detector flags it.
-    return _mutating_http_5d416e4(text) or _http_writes(_joined(text), 0)
+    return _mutating_http_5d416e4(text) or _bash_writes(text)
+
+
+# --- guard (d), PowerShell web cmdlets ---------------------------------------
+#
+# A run step on windows-latest defaults to pwsh, and `shell: pwsh` or
+# `shell: powershell` select it anywhere. Invoke-WebRequest and
+# Invoke-RestMethod (aliases iwr and irm; curl and wget too under Windows
+# PowerShell 5.1) write with any -Method but GET or HEAD, or with
+# -CustomMethod. Fail closed: the clause reads every step and shell text,
+# whatever its shell, PowerShell's parameter names are case-insensitive and
+# may be abbreviated, and a splatted argument set (@params) counts as a write.
+MUTATING_PWSH_LABEL = "a mutating PowerShell web request"
+_PWSH_WEB = re.compile(
+    r"(?<![\w.$-])(?:invoke-webrequest|invoke-restmethod|iwr|irm|curl|wget)(?![\w.-])",
+    re.IGNORECASE,
+)
+_PWSH_PARAMETER = re.compile(r"-([A-Za-z]+)(:.*)?", re.DOTALL)
+
+
+def _pwsh_arguments(text: str, pos: int) -> tuple[list[str], int]:
+    """The argument tokens of a PowerShell command from ``pos`` to the end of
+    its statement; an unterminated quote or group runs to the end of the text."""
+    tokens: list[str] = []
+    token: list[str] = []
+    depth = 0
+    n = len(text)
+    while pos < n:
+        char = text[pos]
+        if char == "`":
+            if text[pos + 1 : pos + 2] not in ("", "\n"):
+                token.append(text[pos + 1])
+            pos += 2
+            continue
+        if char in "'\"":
+            end = pos + 1
+            while end < n:
+                if text[end] == char:
+                    if text.startswith(char * 2, end):
+                        end += 2
+                        continue
+                    break
+                end += 2 if char == '"' and text[end] == "`" else 1
+            token.append(text[pos : end + 1])
+            pos = end + 1
+            continue
+        if char in "({[":
+            depth += 1
+        elif char in ")}]":
+            if not depth:
+                break
+            depth -= 1
+        elif not depth and (char in ";|\n" or text.startswith("&&", pos)):
+            break
+        elif not depth and char.isspace():
+            if token:
+                tokens.append("".join(token))
+                token = []
+            pos += 1
+            continue
+        token.append(char)
+        pos += 1
+    if token:
+        tokens.append("".join(token))
+    return tokens, pos
+
+
+def _pwsh_method_writes(value: str) -> bool:
+    """A -Method value other than GET or HEAD; any expression counts."""
+    bare = value.strip("()'\" \t")
+    if not bare:
+        return False
+    return bool(re.search(r"[$(\[`@]", bare)) or bare.upper() not in _SAFE_METHODS
+
+
+def mutating_powershell_http(text: str) -> bool:
+    """A PowerShell web cmdlet (or its curl/wget alias) that writes.
+
+    Each command word rescans the rest of its statement; past
+    ``_WORK_LIMIT`` characters scanned the text counts as a write.
+    """
+    spent = 0
+    for match in _PWSH_WEB.finditer(text):
+        args, end = _pwsh_arguments(text, match.end())
+        spent += end - match.end() + 1
+        if spent > _WORK_LIMIT:
+            return True
+        for index, token in enumerate(args):
+            if re.fullmatch(r"@[A-Za-z_]\w*", token):
+                return True
+            parameter = _PWSH_PARAMETER.fullmatch(token)
+            if parameter is None:
+                continue
+            name = parameter[1].lower()
+            if name == "cm" or (len(name) >= 2 and "custommethod".startswith(name)):
+                return True
+            if len(name) >= 2 and "method".startswith(name):
+                value = (parameter[2] or ":")[1:]
+                if not value and index + 1 < len(args):
+                    value = args[index + 1]
+                if _pwsh_method_writes(value):
+                    return True
+    return False
 
 
 # The guard (d) curl/wget detector exactly as it stood at 5d416e4 (PR
@@ -1718,6 +2428,8 @@ def image_publication_invariants(
             ]
             if mutating_http(shell):
                 hits.append(MUTATING_HTTP_LABEL)
+            if mutating_powershell_http(shell):
+                hits.append(MUTATING_PWSH_LABEL)
             if re.search(r"skopeo", shell, re.IGNORECASE):
                 hits.append("skopeo")
             reasons.extend(f"{tag} {where} contains {label}" for label in hits)
@@ -1747,6 +2459,8 @@ def image_publication_invariants(
                         reasons.append(f"{tag} {where} contains {label}")
                 if not http_exempt and mutating_http(text):
                     reasons.append(f"{tag} {where} contains {MUTATING_HTTP_LABEL}")
+                if mutating_powershell_http(text):
+                    reasons.append(f"{tag} {where} contains {MUTATING_PWSH_LABEL}")
                 remaining = SKOPEO_SMOKE_LOAD.sub("", text) if smoke_job else text
                 if re.search(r"skopeo", remaining, re.IGNORECASE):
                     reasons.append(

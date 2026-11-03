@@ -42,6 +42,7 @@ IMAGE_WF="${REPO_ROOT}/.github/workflows/image.yml"
 WATCH_WF="${REPO_ROOT}/.github/workflows/image-watch.yml"
 CHECKER="${REPO_ROOT}/scripts/check_workflows.py"
 WHEEL_WF="${REPO_ROOT}/.github/workflows/published-wheel.yml"
+WINDOWS_WF="${REPO_ROOT}/.github/workflows/windows.yml"
 # A form-valid 40-hex pin built at runtime: a literal here would trip
 # test_no_pin_anchor_hardcodes_a_real_sha, and the [image] checks never read
 # the commit of an injected action.
@@ -209,6 +210,14 @@ image-http-attached-value|1|[image]|published-wheel.yml: curl -d@file (attached 
 image-http-quoted-method|1|[image]|published-wheel.yml: curl -X"PUT" (quoted attached method)
 image-docker-image-push|1|[image]|published-wheel.yml: docker image push, the long form of docker push
 image-skopeo-smoke-glued|1|[image]|image.yml: a second skopeo glued onto the allowed smoke load with ;
+image-http-comment-cmdsubst|1|[image]|published-wheel.yml: a comment with an apostrophe, then curl -d@file inside $(...)
+image-http-arith-mid|1|[image]|published-wheel.yml: curl -d@file after an arithmetic $((...)) argument
+image-http-prefix-hidden|1|[image]|published-wheel.yml: curl $(true) "...&..." -X PUT; the method follows a substitution and a quoted &
+image-http-redirect-before-method|1|[image]|published-wheel.yml: curl "..." 2>&1 -X PUT; the method follows a redirection
+image-http-expand-request|1|[image]|published-wheel.yml: curl --expand-request PUT (curl 8.3.0+)
+image-docker-global-option-push|1|[image]|published-wheel.yml: docker --config DIR push, a global option before push
+image-skopeo-smoke-cmdsubst|1|[image]|image.yml: a second skopeo glued onto the allowed smoke load with $(...)
+image-pwsh-invoke-method|1|[image]|windows.yml: Invoke-RestMethod -Method Put in a step that runs under pwsh on windows-latest
 image-needs-reordered|0|-|image.yml: promote-main needs reordered; an equivalent form that must NOT false-positive
 TSV
 )"
@@ -1064,6 +1073,53 @@ image-docker-image-push)
 	;;
 image-skopeo-smoke-glued)
 	replace "$IMAGE_WF" 'docker-daemon:pmcp-image-smoke:candidate' 'docker-daemon:pmcp-image-smoke:candidate;skopeo copy docker://example.invalid/a:t docker://example.invalid/b:t'
+	;;
+image-http-comment-cmdsubst)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: |
+          # don'"'"'t log the token
+          RESP=$(curl -sf -d@report.json "$UPLOAD_URL")
+      - name: Retain public compatibility identity
+'
+	;;
+image-http-arith-mid)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: curl -sf --max-time $((30)) -d@report.json "$UPLOAD_URL"
+      - name: Retain public compatibility identity
+'
+	;;
+image-http-prefix-hidden)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: curl -sf $(true) "$UPLOAD_URL?a=1&b=2" -X PUT
+      - name: Retain public compatibility identity
+'
+	;;
+image-http-redirect-before-method)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: curl -sf "$UPLOAD_URL" 2>&1 -X PUT
+      - name: Retain public compatibility identity
+'
+	;;
+image-http-expand-request)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: curl -sf --expand-request PUT "$UPLOAD_URL"
+      - name: Retain public compatibility identity
+'
+	;;
+image-docker-global-option-push)
+	replace "$WHEEL_WF" '      - name: Retain public compatibility identity
+' '      - run: docker --config "$RUNNER_TEMP/cfg" push "$IMAGE_REF"
+      - name: Retain public compatibility identity
+'
+	;;
+image-skopeo-smoke-cmdsubst)
+	replace "$IMAGE_WF" 'docker-daemon:pmcp-image-smoke:candidate' 'docker-daemon:pmcp-image-smoke:candidate$(skopeo copy docker://example.invalid/a:t docker://example.invalid/b:t)'
+	;;
+image-pwsh-invoke-method)
+	replace "$WINDOWS_WF" '      - name: Windows-path unit tests
+' '      - run: Invoke-RestMethod -Method Put -Uri "$env:UPLOAD_URL" -InFile report.json
+      - name: Windows-path unit tests
+'
 	;;
 image-needs-reordered)
 	replace "$IMAGE_WF" '    needs: [gate, verify-upstream, build-smoke]' '    needs: [build-smoke, gate, verify-upstream]'

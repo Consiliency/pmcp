@@ -299,6 +299,9 @@ IMAGE_MUTANTS = (
     "image-gate-workflow-defaults",
     "image-docker-image-push",
     "image-skopeo-smoke-glued",
+    "image-docker-global-option-push",
+    "image-skopeo-smoke-cmdsubst",
+    "image-pwsh-invoke-method",
 )
 
 # Round-1 mutants (PR Consiliency/pmcp#463, president R1, R3, R4) and the
@@ -308,6 +311,10 @@ SPECIFIC_REASONS = {
     "image-gate-workflow-defaults": "top-level keys must be a subset of",
     "image-docker-image-push": "contains docker push",
     "image-skopeo-smoke-glued": "uses skopeo outside the pinned local load in build-smoke",
+    # Consiliency/pmcp#472: R8f, R9 and the PowerShell web cmdlets.
+    "image-docker-global-option-push": "contains docker push",
+    "image-skopeo-smoke-cmdsubst": "uses skopeo outside the pinned local load in build-smoke",
+    "image-pwsh-invoke-method": "contains a mutating PowerShell web request",
 }
 
 # Mutants that only the curl/wget clause of guard (d), or its whole-job
@@ -325,6 +332,12 @@ HTTP_MUTANTS = (
     "image-http-quoted-separator",
     "image-http-attached-value",
     "image-http-quoted-method",
+    # Consiliency/pmcp#472 (R7, R8): each passes the 5d416e4 floor.
+    "image-http-comment-cmdsubst",
+    "image-http-arith-mid",
+    "image-http-prefix-hidden",
+    "image-http-redirect-before-method",
+    "image-http-expand-request",
 )
 
 # Every mutant these tests exercise. Asserted EQUAL to the helper's expected-1
@@ -1754,6 +1767,12 @@ class TestImagePublicationInvariants:
         [
             "docker push x",
             "docker image push x",
+            # R8f: global options before push (Consiliency/pmcp#472, D1).
+            'docker --config "$RUNNER_TEMP/cfg" push "$IMAGE_REF"',
+            "docker -H unix:///x.sock image push x",
+            "docker --tls push x",
+            "podman --remote push x",
+            "buildah --root /x push x",
             "podman push x",
             "podman image push x",
             "buildah push x",
@@ -1772,6 +1791,7 @@ class TestImagePublicationInvariants:
             "python3 scripts/image_publish.py tag --version 3.0.1",
             "skopeo copy oci-archive:a docker://example.invalid/x",
             "skopeo delete docker://example.invalid/x",
+            "Invoke-RestMethod -Method Put -Uri $env:URL -InFile f",
         ],
     )
     def test_publication_commands_outside_promote_main_fail(self, command: str) -> None:
@@ -1969,11 +1989,13 @@ class TestRoundOneGuards:
         assert new and key in new[0]
 
 
-def _nested_bash_c(depth: int, *, double: bool) -> str:
-    """``curl -s -X PUT "$URL"`` inside ``depth`` nested ``bash -c`` layers."""
+def _nested_bash_c(
+    depth: int, *, double: bool, inner: str = 'curl -s -X PUT "$URL"'
+) -> str:
+    """``inner`` inside ``depth`` nested ``bash -c`` layers."""
     import shlex
 
-    text = 'curl -s -X PUT "$URL"'
+    text = inner
     for _ in range(depth):
         if double:
             escaped = text.replace("\\", "\\\\").replace('"', '\\"')
@@ -2044,3 +2066,382 @@ class TestNeverWeakerThan5d416e4:
         for text in texts:
             if cw._mutating_http_5d416e4(text):
                 assert cw.mutating_http(text)
+
+    def test_the_floor_is_still_wired_in_when_the_classifier_says_no(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Consiliency/pmcp#472 item 1: the classifier now flags A1-A23 by
+        # itself, so only a stubbed classifier shows that the OR is still there.
+        monkeypatch.setattr(cw, "_http_writes", lambda *a: False)
+        missed = [
+            case
+            for case, text in sorted(REGRESSION_CASES_5D416E4.items())
+            if not cw.mutating_http(text)
+        ]
+        assert missed == []
+
+
+# Consiliency/pmcp#472 (president re-check R7 and R8 of PR Consiliency/pmcp#463).
+# Each sent PUT or POST when run as GitHub runs a bash step (bash --noprofile
+# --norc -eo pipefail, bash 5.3.9, curl 8.18.0, GNU Wget 1.25.0, loopback
+# server), and the 5d416e4 floor misses each one.
+BASH_GRAMMAR_CASES = {
+    "H1": 'curl -s $(true) "$URL?a=1&b=2" -X PUT',
+    "H2": "# don't retry\ncurl -s '<url>' -d@report.json\n# that's all",
+    "H3": "cat <<EOF >a\nit's\nEOF\ncurl -s '<url>' -d@report.json\n"
+    "cat <<EOF >b\nthat's\nEOF",
+    "H4-depth5-double": _nested_bash_c(
+        5, double=True, inner='curl -s -d@report.json "$URL"'
+    ),
+    "H4-depth5-single": _nested_bash_c(
+        5, double=False, inner='curl -s -d@report.json "$URL"'
+    ),
+    "H4-depth8-double": _nested_bash_c(
+        8, double=True, inner='curl -s -d@report.json "$URL"'
+    ),
+    "H4-depth8-single": _nested_bash_c(
+        8, double=False, inner='curl -s -d@report.json "$URL"'
+    ),
+    "H5": 'curl -s $(echo -s) -d@report.json "$URL"',
+    "S1": 'curl -s "$URL" 2>&1 -X PUT',
+    "S2": 'curl -s &>/dev/null -X PUT "$URL"',
+    "S3": 'curl -s -#T f "$URL"',
+    "S4": 'curl -s -#d x "$URL"',
+    "S5": 'bash -c curl\\ -s\\ -X\\ PUT\\ \\"\\$URL\\"',
+    "S6": "curl -s $'-XPUT' \"$URL\"",
+    "S7": 'curl -s --expand-request PUT "$URL"',
+    "S8": 'curl -s --expand-data x "$URL"',
+    "S9": 'curl -s --expand-upload-file f "$URL"',
+    "S10": 'curl -s --expand-json "{}" "$URL"',
+    "S11": 'curl -s --expand-form a=b "$URL"',
+    "S12": 'wget -q -O /dev/null --meth=PUT "$URL"',
+    "S13": 'wget -q -O /dev/null --post-d=x "$URL"',
+    "S14": 'wget -q -O /dev/null --post-f=f "$URL"',
+    "S15": 'wget -q -O /dev/null --meth=PUT --body-d=x "$URL"',
+    # Beyond the issue's list, each also a live PUT or POST missed by the
+    # floor: bash grammar the cases above do not exercise.
+    "X1-case-in-cmdsubst": 'X=$(case a in a) curl -s -d@report.json "$URL";; esac)',
+    "X2-case-paren-hides-args": "curl -s $(case a in a) echo -s;; esac) "
+    '"$URL?a&b" -d@report.json',
+    "X3-bash-heredoc-unquoted": 'bash <<EOF\ncurl -s "$URL?a&b" -d@report.json\nEOF',
+    "X4-bash-heredoc-quoted": "bash <<'EOF'\ncurl -s \"$URL?a&b\" -d@report.json\nEOF",
+    "X5-heredoc-dash-tabs": "cat <<-EOF >/dev/null\n\tit's\n\tEOF\n"
+    'curl -s "$URL?a&b" -d@report.json',
+    "X6-heredoc-cmdsubst-body": "cat <<EOF >/dev/null\n"
+    'it\'s $(curl -s "$URL?a&b" -d@report.json)\nEOF',
+    "X7-herestring": 'bash <<< "curl -s \\"\\$URL?a&b\\" -d@report.json"',
+    "X8-ansi-c-hex": "curl -s $'\\x2dXPUT' \"$URL\"",
+    "X9-noclobber-redirect": 'curl -s >|/dev/null "$URL?a&b" -d@report.json',
+    "X10-fd-var-redirect": 'curl -s {fd}>&2 "$URL?a&b" -d@report.json',
+    "X11-procsub-in": 'curl -s -H @<(echo X-A: 1) "$URL?a&b" -d@report.json',
+    "X12-arith-shift": 'curl -s --max-time $(( 1 << 4 )) "$URL?a&b" -d@report.json',
+    "X13-param-default-cmdsubst": 'X=${Y:-$(curl -s "$URL?a&b" -d@report.json)}',
+    "X14-wget-execute": 'wget -q -O /dev/null -e post_data=x "$URL"',
+    "X16-brace-method": 'curl -s -X{PUT,PUT} "$URL"',
+    "X17-quoted-cmd-in-dquote-cmdsubst": 'echo "$(curl -s "$URL?a&b" -d@report.json)"',
+    "X18-dollar-dquote": 'curl -s $"-dx" "$URL"',
+    "X19-escaped-newline-continued": 'curl -s "$URL?a&b" \\\n  -d@report.json',
+    "X20-group-braces": '{ curl -s "$URL?a&b" -d@report.json; }',
+    "X21-if-condition": 'if curl -s "$URL?a&b" -d@report.json; then :; fi',
+    "X22-time-prefix": 'time curl -s "$URL?a&b" -d@report.json',
+    "X23-wget-exe-abbrev": 'wget.exe -q -O /dev/null --post-d=x "$URL"',
+    "X26-unterminated-later-quote": 'curl -s "$URL?a&b" -d@report.json\necho "oops',
+    "X27-comment-after-cmd": 'curl -s "$URL?a&b" -d@report.json # it\'s done',
+    "X28-subshell-inside-cmdsubst": 'X=$( (curl -s "$URL?a&b" -d@report.json) )',
+    "X29-backtick-in-dquote": 'echo "`curl -s "$URL?a&b" -d@report.json`"',
+    "X30-env-S": 'env -S "curl -s \\"$URL?a&b\\" -d@report.json"',
+    "X31-ansi-escaped-quote": "bash -c $'curl -s \\'<url>?a&b\\' -d@report.json'",
+    "X32-semicolon-ampersand-in-case": "case a in a) true;& b) "
+    'curl -s "$URL?a&b" -d@report.json;; esac',
+}
+
+# Each sent only GET live, and must stay unflagged (N1-N5 and my additions).
+BASH_GRAMMAR_READS = {
+    "N1": "# don't retry\ncurl -s '<url>' -o /dev/null\n# that's all",
+    "N2": 'curl -s $(echo -s) "$URL" -o /dev/null',
+    "N3": 'curl -s "$URL" 2>&1 | grep -c x || true',
+    "N4": 'curl -s -#fLo /dev/null "$URL"',
+    "N5": 'cat <<EOF >notes\nit\'s\nEOF\ncurl -s "$URL" -o /dev/null',
+    "XR1-case-get": 'X=$(case a in a) curl -s "$URL" -o /dev/null;; esac)',
+    "XR3-arith": 'curl -s --max-time $((10 << 1)) "$URL" -o /dev/null',
+    "XR4-get-explicit": 'curl -s -X get "$URL" -o /dev/null',
+    "XR5-wget-execute-robots": 'wget -q -O /dev/null -e robots=off "$URL"',
+    "XR6-curl-H-file": 'curl -s -H @<(echo X-A: 1) "$URL" -o /dev/null',
+}
+
+
+class TestBashGrammar:
+    """Consiliency/pmcp#472: guard (d) reads the step text as bash does."""
+
+    @pytest.mark.parametrize(
+        "case", sorted(BASH_GRAMMAR_CASES), ids=sorted(BASH_GRAMMAR_CASES)
+    )
+    def test_each_write_is_flagged(self, case: str) -> None:
+        assert cw.mutating_http(BASH_GRAMMAR_CASES[case])
+
+    @pytest.mark.parametrize(
+        "case", sorted(BASH_GRAMMAR_CASES), ids=sorted(BASH_GRAMMAR_CASES)
+    )
+    def test_the_5d416e4_floor_alone_misses_each_write(self, case: str) -> None:
+        # So each case shows a rule of the new classifier, not the floor.
+        assert not cw._mutating_http_5d416e4(BASH_GRAMMAR_CASES[case])
+
+    @pytest.mark.parametrize(
+        "case", sorted(BASH_GRAMMAR_READS), ids=sorted(BASH_GRAMMAR_READS)
+    )
+    def test_each_read_is_left_alone(self, case: str) -> None:
+        assert not cw.mutating_http(BASH_GRAMMAR_READS[case])
+
+    @pytest.mark.parametrize(
+        "case", sorted(REGRESSION_CASES_5D416E4), ids=sorted(REGRESSION_CASES_5D416E4)
+    )
+    def test_the_classifier_alone_flags_each_5d416e4_case(self, case: str) -> None:
+        assert cw._http_writes(cw._joined(REGRESSION_CASES_5D416E4[case]))
+
+    @pytest.mark.parametrize("depth", [12, 60, 400])
+    def test_deep_nesting_never_fails_open(self, depth: int) -> None:
+        # `bash <<E1` / `bash <<E2` / ... grows linearly with depth (nested
+        # quoting grows exponentially); 400 levels overflow Python's stack,
+        # which must count as a write too.
+        heads = "".join(f"bash <<E{level}\n" for level in range(depth))
+        tails = "".join(f"E{level}\n" for level in reversed(range(depth)))
+        text = heads + 'curl -s "$URL?a&b" -d@report.json\n' + tails
+        assert not cw._mutating_http_5d416e4(text)
+        assert cw.mutating_http(text)
+
+    # The 2026-11-03 dev0 incident: guard (d)'s own work must stay bounded on
+    # hostile text, and reaching the bound must flag (R7f). Each input is
+    # linear in size; each would be quadratic or worse without the bound.
+    BOUNDED_INPUTS = {
+        "arithmetic-lookahead": "$((" * 60_000,
+        "command-arithmetic-lookahead": "((" * 60_000,
+        "many-curl-words": "curl " * 120_000 + "-s",
+        "long-word": "curl -s " + "a" * 1_200_000,
+        "many-quoted-parts": "curl -s " + "'a'" * 150_000,
+        "many-dquoted-parts": 'curl -s "$URL" ' + '"a"' * 150_000,
+        "nested-cmdsubst": "$(" * 5_000 + "curl -s" + ")" * 5_000,
+        "nested-backticks": "echo " + "`" * 20_001,
+        "unterminated-quotes": "curl " + "'a " * 100_000,
+        "many-heredocs": "cat <<E\n" * 50_000,
+        "many-comments": "curl -s u # x\n" * 80_000,
+        "pwsh-many-words": "iwr " * 150_000,
+    }
+    OVER_BOUND = {
+        "arithmetic-lookahead",
+        "command-arithmetic-lookahead",
+        "many-curl-words",
+        "long-word",
+        "nested-cmdsubst",
+        "many-heredocs",
+        "pwsh-many-words",
+    }
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize("name", sorted(BOUNDED_INPUTS))
+    def test_the_work_is_bounded_and_fails_closed(self, name: str) -> None:
+        import time
+        import tracemalloc
+
+        text = self.BOUNDED_INPUTS[name]
+        tracemalloc.start()
+        started = time.monotonic()
+        try:
+            bash = cw.mutating_http(text)
+            pwsh = cw.mutating_powershell_http(text)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        elapsed = time.monotonic() - started
+        assert elapsed < 30, f"{name} took {elapsed:.1f}s"
+        assert peak < 512 * 2**20, f"{name} peaked at {peak / 2**20:.0f} MiB"
+        if name in self.OVER_BOUND:
+            # Quadratic or deeper without the bound: reaching it must flag.
+            assert bash or pwsh
+
+    def test_reaching_the_work_bound_counts_as_a_write(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        text = 'curl -s "$URL" -o /dev/null'
+        assert not cw.mutating_http(text)
+        monkeypatch.setattr(cw, "_WORK_LIMIT", 10)
+        assert cw.mutating_http(text)
+        assert cw._http_writes(text)
+
+    def test_the_committed_tree_stays_far_below_the_work_bound(self) -> None:
+        for path in sorted(WORKFLOW_DIR.glob("*.y*ml")):
+            for job in cw._jobs(yaml.safe_load(path.read_text())).values():
+                for step in cw._steps(job):
+                    work = cw._Work()
+                    text = cw._joined(cw._step_text(step))
+                    cw._classify(text, work)
+                    assert work.spent < cw._WORK_LIMIT // 100, path.name
+
+    def test_a_stack_overflow_counts_as_a_write(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def overflow(text: str) -> bool:
+            raise RecursionError
+
+        monkeypatch.setattr(cw, "_http_writes", overflow)
+        assert cw.mutating_http('curl -s "$URL"')
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            'X=$(curl -s "$URL?a&b" -d@report.json',
+            'curl -s "$URL?a&b" -d@report.json `',
+            'X=`curl -s "$URL?a&b" -d@report.json',
+            'curl -s "$URL?a&b" ${X -d@report.json',
+            'true;curl -s "$URL?a&b" -d\'@report.json',
+        ],
+    )
+    def test_text_bash_cannot_finish_reading_is_read_conservatively(
+        self, text: str
+    ) -> None:
+        assert not cw._ShellLexer(cw._joined(text)).run()
+        assert cw.mutating_http(text)
+
+    def test_the_committed_tree_lexes_completely_and_only_notify_is_flagged(
+        self,
+    ) -> None:
+        texts = {}
+        for path in sorted(WORKFLOW_DIR.glob("*.y*ml")):
+            doc = yaml.safe_load(path.read_text())
+            shells = [("<workflow>", cw._defaults_shell(doc))] + [
+                (name, cw._defaults_shell(job)) for name, job in cw._jobs(doc).items()
+            ]
+            for where, shell in shells:
+                if shell is not None:
+                    texts[f"{path.name}:{where} defaults.run.shell"] = shell
+            for name, job in cw._jobs(doc).items():
+                for index, step in enumerate(cw._steps(job)):
+                    texts[f"{path.name}:{name}#{index}"] = cw._step_text(step)
+        assert len(texts) == 117
+        assert [w for w, t in texts.items() if not cw._ShellLexer(t).run()] == []
+        assert [w for w, t in texts.items() if cw.mutating_http(t)] == [
+            "maintenance.yml:notify-worker#0"
+        ]
+        assert [w for w, t in texts.items() if cw.mutating_powershell_http(t)] == []
+
+    @pytest.mark.parametrize(
+        ("command", "pattern"),
+        [
+            ('docker --config "$RUNNER_TEMP/cfg" push "$IMAGE_REF"', "docker push"),
+            ("docker -H unix:///x.sock image push x", "docker push"),
+            ("docker --tls push x", "docker push"),
+            ("docker --config=/x --debug image push x", "docker push"),
+            ("podman --remote push x", "podman push"),
+            ("buildah --root /x push x", "buildah push"),
+        ],
+    )
+    def test_global_options_before_push_are_publication(
+        self, command: str, pattern: str
+    ) -> None:
+        assert cw.PUBLICATION_PATTERNS[pattern].search(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "docker tag a push",
+            "docker run --rm x push",
+            "docker --config x run push",
+            "docker buildx build --load .",
+        ],
+    )
+    def test_a_push_word_after_a_subcommand_is_not_publication(
+        self, command: str
+    ) -> None:
+        labels = [
+            label
+            for label in ("docker push", "podman push", "buildah push")
+            if cw.PUBLICATION_PATTERNS[label].search(command)
+        ]
+        assert labels == []
+
+    @pytest.mark.parametrize(
+        "glued",
+        [
+            "$(skopeo copy docker://example.invalid/a:t docker://example.invalid/b:t)",
+            "`skopeo copy docker://example.invalid/a:t docker://example.invalid/b:t`",
+            '"x";skopeo copy docker://example.invalid/a:t docker://example.invalid/b:t',
+            "|skopeo copy docker://example.invalid/a:t docker://example.invalid/b:t",
+        ],
+    )
+    def test_anything_glued_to_the_smoke_load_leaves_skopeo_refused(
+        self, glued: str
+    ) -> None:
+        docs = {
+            p.name: yaml.safe_load(p.read_text()) for p in WORKFLOW_DIR.glob("*.y*ml")
+        }
+        assert cw.image_publication_invariants(docs) == []
+        steps = docs["image.yml"]["jobs"]["build-smoke"]["steps"]
+        load = next(s for s in steps if "skopeo" in str(s.get("run", "")))
+        assert load["run"].endswith("docker-daemon:pmcp-image-smoke:candidate")
+        load["run"] += glued
+        reason = "uses skopeo outside the pinned local load in build-smoke"
+        assert any(reason in r for r in cw.image_publication_invariants(docs))
+
+
+class TestPowerShellWebCmdlets:
+    """Consiliency/pmcp#472: Invoke-WebRequest/Invoke-RestMethod writes."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Invoke-WebRequest -Uri $u -Method Put -InFile f",
+            "iwr $u -Method:Post",
+            "irm -Method 'Delete' $u",
+            "Invoke-RestMethod -CustomMethod PROPFIND $u",
+            "Invoke-RestMethod -Uri $u -CM PATCH",
+            "curl -Method Put u",
+            "wget -Me Patch u",
+            "IWR -METHOD PUT u",
+            "Microsoft.PowerShell.Utility\\Invoke-WebRequest -Method Put u",
+            "iwr @params",
+            "Invoke-WebRequest -Method $m u",
+            "Invoke-RestMethod -Uri $u `\n  -Method Post",
+            "iwr -Method ([Microsoft.PowerShell.Commands.WebRequestMethod]::Put) u",
+        ],
+    )
+    def test_writes_are_flagged(self, text: str) -> None:
+        assert cw.mutating_powershell_http(text)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Invoke-WebRequest -Uri $u -OutFile f",
+            "iwr $u -Method Get",
+            "irm $u -Method HEAD",
+            "Invoke-WebRequest -Uri $u -Method 'GET'",
+            "iwr u; Set-Foo -Method Post",
+            "curl -sf -X GET u",
+            "curl.exe -Method Put u",
+        ],
+    )
+    def test_reads_are_left_alone(self, text: str) -> None:
+        assert not cw.mutating_powershell_http(text)
+
+    @pytest.mark.parametrize(
+        "where", ["windows-default", "step-pwsh", "step-powershell", "job-defaults"]
+    )
+    def test_every_powershell_step_is_read(self, where: str) -> None:
+        docs = {
+            p.name: yaml.safe_load(p.read_text()) for p in WORKFLOW_DIR.glob("*.y*ml")
+        }
+        baseline = cw.image_publication_invariants(docs)
+        job = docs["windows.yml"]["jobs"]["windows-smoke"]
+        assert job["runs-on"] == "windows-latest"
+        step: dict[str, Any] = {"run": "Invoke-RestMethod -Method Put -Uri $env:U"}
+        if where == "step-pwsh":
+            step["shell"] = "pwsh"
+        elif where == "step-powershell":
+            step = {"run": "curl -Method Put $env:U", "shell": "powershell"}
+        elif where == "job-defaults":
+            job["defaults"] = {"run": {"shell": "pwsh"}}
+        job["steps"].append(step)
+        new = [r for r in cw.image_publication_invariants(docs) if r not in baseline]
+        # (The 5d416e4 floor also reads `curl -Method` as a short group with d.)
+        assert (
+            f"[image] windows.yml:windows-smoke contains {cw.MUTATING_PWSH_LABEL}"
+            in new
+        )
