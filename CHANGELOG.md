@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-11-03
+
 ### Changed
 
 - The container image is no longer published by `docker.yml`, which is now a read-only pull-request build; its legacy `main` and `v*` registry writers are removed. A guarded replacement (`image.yml`) is added with every registry write disabled until the repository variable `PMCP_IMAGE_PUBLISH` is exactly `enabled`, and a weekly read-only `image-watch.yml` observes the registry. 3.0.1 therefore ships no new container image until a separate, owner-authorized activation; existing tags are untouched (see Consiliency/pmcp#443).
