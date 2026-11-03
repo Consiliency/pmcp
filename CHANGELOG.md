@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The container image is no longer published by `docker.yml`, which is now a read-only pull-request build; its legacy `main` and `v*` registry writers are removed. A guarded replacement (`image.yml`) is added with every registry write disabled until the repository variable `PMCP_IMAGE_PUBLISH` is exactly `enabled`, and a weekly read-only `image-watch.yml` observes the registry. 3.0.1 therefore ships no new container image until a separate, owner-authorized activation; existing tags are untouched (see Consiliency/pmcp#443).
+
 - CI retains public-safe, run-bound test outcomes and worker phase timings for 14 days. Raw assertion output and parameter values are excluded; unsafe or missing reports prevent diagnostic upload. The full suite and coverage threshold are unchanged.
 
 ### Fixed

@@ -362,10 +362,10 @@ jobs:
         run: uv sync --all-extras
 
       - name: Run ruff check
-        run: uv run ruff check src/ tests/
+        run: uv run ruff check src/ tests/ scripts/image_publish.py scripts/image_registry_readback.py scripts/image_cutover_inventory.py
 
       - name: Run ruff format check
-        run: uv run ruff format --check src/ tests/
+        run: uv run ruff format --check src/ tests/ scripts/image_publish.py scripts/image_registry_readback.py scripts/image_cutover_inventory.py
 
   # PyJWT 2.10.1 sat in the lockfile carrying PYSEC-2026-176, a verifier-side
   # algorithm allow-list bypass in `jwt.decode()` -- the exact call at
@@ -659,7 +659,7 @@ jobs:
           echo "Changed files:"
           echo "$CHANGED"
 
-          if ! echo "$CHANGED" | grep -Eq '^(\.github/workflows/(release|test)\.yml|scripts/(release_artifacts\.py|verify_release_bundle\.py|ci_environment\.py|release-build-constraints\.txt|check_workflows\.py)|\.github/probe/(release_installed\.py|p1_probe_server\.py))$'; then
+          if ! echo "$CHANGED" | grep -Eq '^(\.github/workflows/(release|test|docker|image|image-watch)\.yml|Dockerfile|\.consiliency/evidence/image-baselines/.+|scripts/(release_artifacts\.py|verify_release_bundle\.py|ci_environment\.py|release-build-constraints\.txt|check_workflows\.py|image_(publish|registry_readback|cutover_inventory)\.py)|\.github/probe/(release_installed\.py|p1_probe_server\.py))$'; then
             echo "No release publication files changed; no acknowledgement required."
             exit 0
           fi

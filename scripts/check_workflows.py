@@ -23,6 +23,13 @@ Four independent checks run here:
     Compares the job set of each changed workflow against its base revision
     and fails on any job that disappeared. This is the only guard against a
     job being silently deleted or renamed away.
+``image_publication_invariants``
+    The guarded container image cutover: ``docker.yml`` stays a read-only PR
+    build, every registry write lives in ``image.yml:promote-main`` behind the
+    exact-``enabled`` gate, and ``image-watch.yml`` stays read-only. Every
+    reason it reports is tagged ``[image]``. These are static YAML and string
+    checks: commands assembled at runtime, code inside third-party actions and
+    repository settings are outside their reach.
 
 **The ``uses:`` and ``permissions:`` allowlists below are exact.** Any
 legitimate edit to ``release.yml`` — bumping an action, adding a step that
@@ -116,9 +123,10 @@ PROTECTED_JOBS = ("build", "publish", "github-release")
 # version, so drift passes it; and `release-diff-ack` greps for `release.yml`
 # specifically, so the label is never demanded. It would run arbitrary code at
 # tag push with whatever permissions it grants itself.
-# `docker.yml` is tag-triggered today — it builds and pushes the release image
-# on `v*` — and carries `packages: write`. Adding a file here must be deliberate.
-TAG_TRIGGERED_WORKFLOWS = {"release.yml", "docker.yml"}
+# `docker.yml` left this set with the guarded image cutover: it is a read-only
+# pull-request build now, and a tag caller for image publication needs its own
+# reviewed PR. Adding a file here must be deliberate.
+TAG_TRIGGERED_WORKFLOWS = {"release.yml"}
 
 # Timeouts: a floor stops a job being throttled to death, a ceiling stops the
 # six-hour default being re-created by a large value. Both ends are load
@@ -1155,6 +1163,767 @@ def diagnostic_invariants(doc: Any) -> list[str]:
     return []
 
 
+# --- guarded image publication ----------------------------------------------
+
+IMAGE_TAG = "[image]"
+DOCKER_WORKFLOW = "docker.yml"
+IMAGE_WORKFLOW = "image.yml"
+IMAGE_WATCH_WORKFLOW = "image-watch.yml"
+PROMOTE_JOB = "promote-main"
+IMAGE_TOP_LEVEL_KEYS = {"name", "on", True, "permissions", "jobs"}
+DOCKER_ON = {"pull_request": {"branches": ["main"]}}
+IMAGE_ON = {
+    "workflow_run": {
+        "workflows": ["Test"],
+        "types": ["completed"],
+        "branches": ["main"],
+    }
+}
+IMAGE_WATCH_CRON = "0 9 * * 1"
+IMAGE_JOB_PERMISSIONS: dict[str, dict[str, str]] = {
+    "gate": {},
+    "verify-upstream": {"actions": "read", "contents": "read"},
+    "build-smoke": {"contents": "read"},
+    PROMOTE_JOB: {"contents": "read", "packages": "write"},
+}
+IMAGE_WATCH_PERMISSIONS = {"contents": "read", "actions": "read", "packages": "read"}
+GATE_ENV = {"PMCP_IMAGE_PUBLISH": "${{ vars.PMCP_IMAGE_PUBLISH }}"}
+GATE_OUTPUTS = {"open": "${{ steps.decide.outputs.open }}"}
+# sha256 of the gate step's whole `run:` heredoc. Any edit, including a
+# case-folding `.lower()`, needs a deliberate update here.
+GATE_RUN_SHA256 = "19effd6ec3af5fb790c95c80f59d4a237c66724638f74077b665587b24b94115"
+PROMOTE_IF = "${{ needs.gate.outputs.open == 'yes' }}"
+PROMOTE_NEEDS = {"gate", "verify-upstream", "build-smoke"}
+PROMOTE_ENV = {
+    "PMCP_IMAGE_PUBLISH": "${{ vars.PMCP_IMAGE_PUBLISH }}",
+    "GH_TOKEN": "${{ github.token }}",
+    "MANIFEST_DIGEST": "${{ needs.build-smoke.outputs.manifest_digest }}",
+    "HEAD_SHA": "${{ needs.verify-upstream.outputs.head_sha }}",
+}
+PROMOTE_CONCURRENCY = {"group": "pmcp-image-main", "cancel-in-progress": False}
+TRUSTED_CHECKOUT = {
+    "ref": "${{ github.workflow_sha }}",
+    "sparse-checkout": "scripts/image_publish.py",
+    "sparse-checkout-cone-mode": False,
+    "persist-credentials": False,
+}
+CANDIDATE_CHECKOUT = {
+    "ref": "${{ needs.verify-upstream.outputs.head_sha }}",
+    "persist-credentials": False,
+}
+IMAGE_WATCH_CHECKOUT = {
+    "ref": "${{ github.sha }}",
+    "sparse-checkout": "scripts/image_cutover_inventory.py\n"
+    "scripts/image_registry_readback.py\n"
+    ".consiliency/evidence/image-baselines/*\n",
+    "sparse-checkout-cone-mode": False,
+    "persist-credentials": False,
+}
+# The single skopeo form allowed outside promote-main: a local load of the
+# verified archive into the runner's daemon, in build-smoke only.
+SKOPEO_SMOKE_LOAD = re.compile(
+    r"quay\.io/skopeo/stable@sha256:[0-9a-f]{64} (?:--insecure-policy )?"
+    r"copy oci-archive:[^\s;&|]+ docker-daemon:[^\s;&|]+"
+)
+PUBLICATION_PATTERNS = {
+    "a buildx --push": re.compile(r"(?<![\w-])--push\b"),
+    "a type=registry output": re.compile(r"type=registry"),
+    "a pushing type=image output": re.compile(r"type=image[^\n]*push=true"),
+    "docker push": re.compile(r"\bdocker\s+(?:image\s+)?push\b"),
+    "podman push": re.compile(r"\bpodman\s+(?:image\s+)?push\b"),
+    "buildah push": re.compile(r"\bbuildah\s+push\b"),
+    "crane": re.compile(r"\bcrane\b"),
+    "oras": re.compile(r"\boras\b"),
+    "regctl": re.compile(r"\bregctl\b"),
+    "docker login": re.compile(r"\bdocker\s+login\b"),
+    "an image_publish.py write": re.compile(r"image_publish\.py\s+(?:promote|tag)\b"),
+}
+SKOPEO_DELETE = re.compile(r"\bskopeo\b[^\n]*\bdelete\b", re.IGNORECASE)
+MUTATING_HTTP_LABEL = "a mutating curl/wget"
+# The 5d416e4 detector's command regex, kept for _mutating_http_5d416e4.
+_HTTP_COMMAND = re.compile(r"\b(curl|wget)\b([^\n;|&]*)")
+_SAFE_METHODS = {"GET", "HEAD"}
+_CURL_IMPLIED_LONG = ("--data", "--form", "--json", "--upload-file")
+_WGET_IMPLIED_LONG = ("--post-data", "--post-file", "--body-data", "--body-file")
+# curl short options whose value may be attached: the rest of the word after
+# one of these is a value, never further option letters.
+_CURL_VALUE_SHORT = set("AbcCdDeEFHKmoPQrtTuUwxXyYz")
+_SHELL_SEPARATORS = set(";&|()`\n")
+_METHOD_WORD = re.compile(r"\$.*|[A-Za-z][A-Za-z0-9_-]*")
+_MAX_NESTING = 4
+
+
+class _Word:
+    """One shell word after quote removal, with the contents of its quoted parts."""
+
+    def __init__(self) -> None:
+        self.text = ""
+        self.quoted: list[str] = []
+        self.started = False
+
+
+def _shell_commands(text: str) -> list[list[_Word]] | None:
+    """Split text the way bash does: words at unquoted blanks, commands at
+    unquoted ``;``, ``&``, ``|``, ``(``, ``)``, backtick and newline, quotes
+    removed. ``None`` when the quotes do not balance."""
+    commands: list[list[_Word]] = [[]]
+    word = _Word()
+
+    def finish() -> None:
+        nonlocal word
+        if word.started:
+            commands[-1].append(word)
+        word = _Word()
+
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"'):
+            close = i + 1
+            if ch == "'":
+                close = text.find("'", i + 1)
+                if close < 0:
+                    return None
+                inner = text[i + 1 : close]
+            else:
+                parts = []
+                while True:
+                    if close >= n:
+                        return None
+                    if text[close] == "\\" and close + 1 < n:
+                        parts.append(text[close + 1])
+                        close += 2
+                        continue
+                    if text[close] == '"':
+                        break
+                    parts.append(text[close])
+                    close += 1
+                inner = "".join(parts)
+            word.text += inner
+            word.quoted.append(inner)
+            word.started = True
+            i = close + 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            word.text += text[i + 1]
+            word.started = True
+            i += 2
+            continue
+        if ch in _SHELL_SEPARATORS:
+            finish()
+            commands.append([])
+            i += 1
+            continue
+        if ch.isspace():
+            finish()
+            i += 1
+            continue
+        word.text += ch
+        word.started = True
+        i += 1
+    finish()
+    return [command for command in commands if command]
+
+
+def _method_writes(method: str) -> bool:
+    """A method other than GET or HEAD; a ``$`` expansion counts as a write."""
+    return _METHOD_WORD.fullmatch(method) is not None and (
+        method.startswith("$") or method.upper() not in _SAFE_METHODS
+    )
+
+
+def _curl_writes(args: list[str]) -> bool:
+    for index, word in enumerate(args):
+        following = args[index + 1] if index + 1 < len(args) else ""
+        if word.startswith("--"):
+            option, _, attached = word.partition("=")
+            if option == "--request" and _method_writes(attached or following):
+                return True
+            if option.startswith(_CURL_IMPLIED_LONG):
+                return True
+        elif word.startswith("-") and len(word) > 1:
+            for position, letter in enumerate(word[1:], start=1):
+                if not letter.isalnum():
+                    break
+                if letter in "dFT":
+                    return True
+                if letter == "X":
+                    rest = word[position + 1 :]
+                    if _method_writes(rest or following):
+                        return True
+                    break
+                if letter in _CURL_VALUE_SHORT:
+                    break
+    return False
+
+
+def _wget_writes(args: list[str]) -> bool:
+    for index, word in enumerate(args):
+        option, _, attached = word.partition("=")
+        following = args[index + 1] if index + 1 < len(args) else ""
+        if option == "--method" and _method_writes(attached or following):
+            return True
+        if option.startswith(_WGET_IMPLIED_LONG):
+            return True
+    return False
+
+
+def _http_writes(text: str, depth: int) -> bool:
+    if depth > _MAX_NESTING:
+        return False
+    commands = _shell_commands(text)
+    if commands is None:
+        # Unbalanced quotes: classify conservatively, untruncated, with every
+        # quote character removed.
+        flat = [w for w in re.sub("['\"]", "", text).split() if w]
+        commands_words = [flat]
+        quoted: list[str] = []
+    else:
+        commands_words = [[w.text for w in command] for command in commands]
+        quoted = [q for command in commands for w in command for q in w.quoted]
+    for words in commands_words:
+        for index, word in enumerate(words):
+            tool = word.rsplit("/", 1)[-1]
+            if tool == "curl" and _curl_writes(words[index + 1 :]):
+                return True
+            if tool == "wget" and _wget_writes(words[index + 1 :]):
+                return True
+    # A quoted word is classified as a command too (bash -c "...", ssh h "...").
+    return any(_http_writes(inner, depth + 1) for inner in quoted)
+
+
+def mutating_http(text: str) -> bool:
+    """A curl or wget that sends a method other than GET or HEAD.
+
+    The text is read as bash reads it (words split at unquoted blanks,
+    commands at unquoted ``; & | ( )``, backtick or newline, quotes removed);
+    the command word is recognised by its basename anywhere in a command
+    (``/usr/bin/curl``, ``timeout 5 curl``, ``env A=1 curl``), and quoted
+    words are classified as commands too (``bash -c "..."``). A method is sent
+    explicitly (``-X``/``--request``/``--method``, attached or not) or
+    implied: curl ``-d``/``--data*``, ``-F``/``--form*``, ``--json``,
+    ``-T``/``--upload-file`` and any short group whose option letters include
+    ``d``, ``F`` or ``T``, whatever value is attached; wget
+    ``--post-data``/``--post-file``/``--body-data``/``--body-file``. Static
+    text only: a command assembled at runtime is out of reach.
+    """
+    # Never weaker than 5d416e4 (president re-check R6): a command is mutating
+    # when either detector flags it.
+    return _mutating_http_5d416e4(text) or _http_writes(_joined(text), 0)
+
+
+# The guard (d) curl/wget detector exactly as it stood at 5d416e4 (PR
+# Consiliency/pmcp#463 round 1), kept verbatim as a second check so that the
+# shell-word classifier can only ever add refusals.
+def _mutating_http_5d416e4(text: str) -> bool:
+    """A curl or wget that sends a method other than GET or HEAD.
+
+    Explicitly (``-X``/``--request``/``--method``, including ``-XPUT`` and a
+    short group ending in ``X``) or through a flag that implies one: curl
+    ``-d``/``--data*``, ``-F``/``--form*``, ``--json``, ``-T``/``--upload-file``
+    and any short group containing ``d``, ``F`` or ``T`` (``-sd``, ``-sfT``);
+    wget ``--post-data``/``--post-file``/``--body-data``/``--body-file``.
+    Static text only: a command assembled at runtime is out of reach.
+    """
+    for match in _HTTP_COMMAND.finditer(_joined(text)):
+        tool, tokens = match[1], match[2].split()
+        for index, token in enumerate(tokens):
+            bare = token.strip("'\"")
+            option, _, attached = bare.partition("=")
+            method = None
+            if tool == "curl":
+                if option == "--request" or re.fullmatch(r"-[A-Za-z]*X", bare):
+                    method = attached or (
+                        tokens[index + 1] if index + 1 < len(tokens) else ""
+                    )
+                elif re.fullmatch(r"-[A-Za-z]*X[A-Za-z]+", bare):
+                    method = bare.split("X", 1)[1]
+                elif option.startswith(_CURL_IMPLIED_LONG):
+                    return True
+                elif re.fullmatch(r"-[A-Za-z0-9]+", bare) and set(bare[1:]) & set(
+                    "dFT"
+                ):
+                    return True
+            else:
+                if option == "--method":
+                    method = attached or (
+                        tokens[index + 1] if index + 1 < len(tokens) else ""
+                    )
+                elif option.startswith(_WGET_IMPLIED_LONG):
+                    return True
+            if method is not None and method.strip("'\"").upper() not in _SAFE_METHODS:
+                return True
+    return False
+
+
+# The one pinned exemption from the curl/wget clause (plan T7(d), president
+# re-check 1): the maintenance-worker event POST that predates the cutover.
+# The pin is the sha256 of canonical JSON of the WHOLE job mapping as
+# yaml.safe_load returns it (json.dumps with sort_keys=True,
+# separators=(",", ":"), ensure_ascii=False, allow_nan=False), so any edit to
+# that job (run block, env, an added step, shell, container, defaults) re-arms
+# the clause. Recompute with exactly that recipe. This file is covered by
+# release-diff-ack, so changing the pin needs the owner's acknowledgement.
+MUTATING_HTTP_EXEMPT = {
+    ("maintenance.yml", "notify-worker"): (
+        "3391171c6bdbd2ba03e5ae24bd0d636d9160141e2495cff6dfb737632de1881b"
+    ),
+}
+
+
+def job_pin(job: Any) -> str | None:
+    """Canonical-JSON sha256 of a job mapping; ``None`` if it does not serialize."""
+    try:
+        canonical = json.dumps(
+            job,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _defaults_shell(node: Any) -> str | None:
+    try:
+        shell = node["defaults"]["run"]["shell"]
+    except (KeyError, TypeError):
+        return None
+    return shell if isinstance(shell, str) else None
+
+
+IMAGE_RUN_FORBIDDEN = {
+    "git clone/fetch/pull/checkout": re.compile(
+        r"\bgit\s+(?:clone|fetch|pull|checkout)\b"
+    ),
+    "gh repo clone": re.compile(r"\bgh\s+repo\s+clone\b"),
+    "curl": re.compile(r"\bcurl\b"),
+    "wget": re.compile(r"\bwget\b"),
+    "raw.githubusercontent": re.compile(r"raw\.githubusercontent"),
+    "a contents API path": re.compile(r"/contents/"),
+    "workflow_run.head_sha": re.compile(r"workflow_run\.head_sha"),
+}
+ACK_REQUIRED_PATHS = (
+    ".github/workflows/docker.yml",
+    ".github/workflows/image.yml",
+    ".github/workflows/image-watch.yml",
+    "Dockerfile",
+    ".consiliency/evidence/image-baselines/inventory-B1.json",
+    ".consiliency/evidence/image-baselines/registry-R2.json",
+    ".consiliency/evidence/image-baselines/retention.json",
+    "scripts/image_publish.py",
+    "scripts/image_registry_readback.py",
+    "scripts/image_cutover_inventory.py",
+)
+
+
+def _strings(node: Any) -> list[str]:
+    """Every string key and value in a parsed YAML subtree."""
+    if isinstance(node, str):
+        return [node]
+    if isinstance(node, dict):
+        found: list[str] = []
+        for key, value in node.items():
+            if isinstance(key, str):
+                found.append(key)
+            found.extend(_strings(value))
+        return found
+    if isinstance(node, list):
+        return [s for item in node for s in _strings(item)]
+    return []
+
+
+def _steps(job: Any) -> list[dict[str, Any]]:
+    steps = job.get("steps") if isinstance(job, dict) else None
+    return [s for s in steps if isinstance(s, dict)] if isinstance(steps, list) else []
+
+
+def _joined(text: str) -> str:
+    """Shell line continuations joined, so a split command is one line."""
+    return re.sub(r"\\\n\s*", " ", text)
+
+
+def _with(step: dict[str, Any]) -> dict[str, Any]:
+    """The step's ``with:`` mapping, or an empty one."""
+    given = step.get("with")
+    return given if isinstance(given, dict) else {}
+
+
+def _step_text(step: dict[str, Any]) -> str:
+    parts = (
+        [step.get("run"), step.get("shell")]
+        + _strings(step.get("with"))
+        + _strings(step.get("env"))
+    )
+    return _joined("\n".join(p for p in parts if isinstance(p, str)))
+
+
+def _with_form(step: dict[str, Any], form: dict[str, Any]) -> bool:
+    given = step.get("with")
+    if not isinstance(given, dict):
+        return False
+    extra = {k: v for k, v in given.items() if k not in form}
+    if set(extra) - {"path"}:
+        return False
+    path = extra.get("path")
+    if path is not None and (not isinstance(path, str) or "${{" in path or not path):
+        return False
+    return {k: given.get(k) for k in form} == form
+
+
+def _ack_regex(workflows: dict[str, Any]) -> str | None:
+    try:
+        job = workflows["test.yml"]["jobs"]["release-diff-ack"]
+        for step in _steps(job):
+            if "Require" in str(step.get("name", "")):
+                match = re.search(r"grep -Eq '([^']+)'", step["run"])
+                return match[1] if match else None
+    except (KeyError, TypeError):
+        return None
+    return None
+
+
+def image_publication_invariants(
+    workflows: dict[str, Any], tag_triggered: set[str] | None = None
+) -> list[str]:
+    """The guarded image cutover, checked across every workflow file."""
+    tag = IMAGE_TAG
+    reasons: list[str] = []
+    allowlist = TAG_TRIGGERED_WORKFLOWS if tag_triggered is None else tag_triggered
+
+    # (b) Only the release path may be tag-triggered.
+    if allowlist != {"release.yml"}:
+        reasons.append(f"{tag} TAG_TRIGGERED_WORKFLOWS must be exactly {{release.yml}}")
+
+    # (a) docker.yml: a read-only pull-request build.
+    docker = workflows.get(DOCKER_WORKFLOW)
+    if not isinstance(docker, dict):
+        reasons.append(f"{tag} {DOCKER_WORKFLOW} is missing or not a mapping")
+    else:
+        if get_on(docker) != DOCKER_ON:
+            reasons.append(
+                f"{tag} {DOCKER_WORKFLOW} on: must be exactly pull_request to main"
+            )
+        jobs = _jobs(docker)
+        if set(jobs) != {"build"}:
+            reasons.append(f"{tag} {DOCKER_WORKFLOW} jobs must be exactly {{build}}")
+        if docker.get("permissions", {"contents": "read"}) != {"contents": "read"}:
+            reasons.append(
+                f"{tag} {DOCKER_WORKFLOW} workflow permissions must be contents: read"
+            )
+        build = jobs.get("build")
+        if isinstance(build, dict) and build.get("permissions") != {"contents": "read"}:
+            reasons.append(
+                f"{tag} {DOCKER_WORKFLOW}:build permissions must be exactly contents: read"
+            )
+        if any("secrets." in s for s in _strings(docker)):
+            reasons.append(f"{tag} {DOCKER_WORKFLOW} must not reference secrets.")
+        for job in jobs.values():
+            for step in _steps(job):
+                uses = str(step.get("uses", ""))
+                if uses.startswith("docker/login-action"):
+                    reasons.append(
+                        f"{tag} {DOCKER_WORKFLOW} must not log in to a registry"
+                    )
+                given = _with(step)
+                if "cache-to" in given:
+                    reasons.append(
+                        f"{tag} {DOCKER_WORKFLOW} must not export a build cache"
+                    )
+                if (
+                    uses.startswith("docker/build-push-action")
+                    and given.get("push") is not False
+                ):
+                    reasons.append(
+                        f"{tag} {DOCKER_WORKFLOW} build push: must be literally false"
+                    )
+
+    image = workflows.get(IMAGE_WORKFLOW)
+    watch = workflows.get(IMAGE_WATCH_WORKFLOW)
+    for name, doc in ((IMAGE_WORKFLOW, image), (IMAGE_WATCH_WORKFLOW, watch)):
+        if not isinstance(doc, dict):
+            reasons.append(f"{tag} {name} is missing or not a mapping")
+
+    # (c) Privilege: packages: write / write-all only on image.yml:promote-main.
+    for name, doc in sorted(workflows.items()):
+        if not isinstance(doc, dict):
+            continue
+        scopes = [("<workflow>", doc.get("permissions"))] + [
+            (job_name, job.get("permissions"))
+            for job_name, job in _jobs(doc).items()
+            if isinstance(job, dict)
+        ]
+        for where, perms in scopes:
+            writes = perms == "write-all" or (
+                isinstance(perms, dict)
+                and (perms.get("packages") == "write" or "write-all" in perms.values())
+            )
+            if not writes:
+                continue
+            if (
+                name != IMAGE_WORKFLOW
+                or where != PROMOTE_JOB
+                or perms != IMAGE_JOB_PERMISSIONS[PROMOTE_JOB]
+            ):
+                reasons.append(
+                    f"{tag} {name}:{where} grants packages: write or write-all; only "
+                    f"{IMAGE_WORKFLOW}:{PROMOTE_JOB} may, as exactly contents: read, packages: write"
+                )
+        if name in {DOCKER_WORKFLOW, IMAGE_WORKFLOW, IMAGE_WATCH_WORKFLOW}:
+            for job_name, job in _jobs(doc).items():
+                if not isinstance(job, dict) or "permissions" not in job:
+                    reasons.append(f"{tag} {name}:{job_name} must declare permissions")
+    if isinstance(image, dict):
+        if image.get("permissions") != {}:
+            reasons.append(f"{tag} {IMAGE_WORKFLOW} workflow permissions must be {{}}")
+        for job_name, expected in IMAGE_JOB_PERMISSIONS.items():
+            job = _jobs(image).get(job_name)
+            if not isinstance(job, dict):
+                reasons.append(f"{tag} {IMAGE_WORKFLOW}:{job_name} is missing")
+            elif job.get("permissions") != expected:
+                reasons.append(
+                    f"{tag} {IMAGE_WORKFLOW}:{job_name} permissions must be exactly {expected}"
+                )
+    if isinstance(watch, dict):
+        if watch.get("permissions") != IMAGE_WATCH_PERMISSIONS:
+            reasons.append(f"{tag} {IMAGE_WATCH_WORKFLOW} workflow permissions changed")
+        for job_name, job in _jobs(watch).items():
+            if (
+                isinstance(job, dict)
+                and job.get("permissions") != IMAGE_WATCH_PERMISSIONS
+            ):
+                reasons.append(
+                    f"{tag} {IMAGE_WATCH_WORKFLOW}:{job_name} permissions changed"
+                )
+
+    # (d) Publication commands, in workflow steps outside promote-main.
+    for name, doc in sorted(workflows.items()):
+        if not isinstance(doc, dict):
+            continue
+        # defaults.run.shell wraps every run step: scanned with every (d)
+        # pattern at both levels, and never exempt.
+        shells = [("<workflow>", _defaults_shell(doc))] + [
+            (job_name, _defaults_shell(job)) for job_name, job in _jobs(doc).items()
+        ]
+        for where_name, shell in shells:
+            if shell is None:
+                continue
+            where = f"{name}:{where_name} defaults.run.shell"
+            hits = [
+                label
+                for label, pattern in PUBLICATION_PATTERNS.items()
+                if pattern.search(shell)
+            ]
+            if mutating_http(shell):
+                hits.append(MUTATING_HTTP_LABEL)
+            if re.search(r"skopeo", shell, re.IGNORECASE):
+                hits.append("skopeo")
+            reasons.extend(f"{tag} {where} contains {label}" for label in hits)
+        for job_name, job in _jobs(doc).items():
+            promote = name == IMAGE_WORKFLOW and job_name == PROMOTE_JOB
+            smoke_job = name == IMAGE_WORKFLOW and job_name == "build-smoke"
+            pinned = MUTATING_HTTP_EXEMPT.get((name, job_name))
+            http_exempt = pinned is not None and job_pin(job) == pinned
+            for step in _steps(job):
+                text = _step_text(step)
+                where = f"{name}:{job_name}"
+                if SKOPEO_DELETE.search(text):
+                    reasons.append(f"{tag} {where} runs skopeo delete")
+                if promote:
+                    continue
+                uses = str(step.get("uses", ""))
+                given = _with(step)
+                if (
+                    uses.startswith("docker/build-push-action")
+                    and given.get("push") is not False
+                ):
+                    reasons.append(
+                        f"{tag} {where} build-push-action push: is not literally false"
+                    )
+                for label, pattern in PUBLICATION_PATTERNS.items():
+                    if pattern.search(text):
+                        reasons.append(f"{tag} {where} contains {label}")
+                if not http_exempt and mutating_http(text):
+                    reasons.append(f"{tag} {where} contains {MUTATING_HTTP_LABEL}")
+                remaining = SKOPEO_SMOKE_LOAD.sub("", text) if smoke_job else text
+                if re.search(r"skopeo", remaining, re.IGNORECASE):
+                    reasons.append(
+                        f"{tag} {where} uses skopeo outside the pinned local load in build-smoke"
+                    )
+    for name, doc in sorted(workflows.items()):
+        if not isinstance(doc, dict) or name == IMAGE_WATCH_WORKFLOW:
+            continue
+        for key, value in doc.items():
+            if name == DOCKER_WORKFLOW and key == "env":
+                continue
+            if key == "jobs" and isinstance(value, dict):
+                for job_name, job in value.items():
+                    if name == IMAGE_WORKFLOW and job_name == PROMOTE_JOB:
+                        continue
+                    if any("ghcr.io" in s for s in _strings(job)):
+                        reasons.append(f"{tag} {name}:{job_name} names ghcr.io")
+            elif any("ghcr.io" in s for s in _strings(value)):
+                reasons.append(f"{tag} {name} names ghcr.io outside an allowed place")
+
+    # (e) The gate, the promote condition and its phase-1 environment.
+    for name, doc in sorted(workflows.items()):
+        for job_name, job in _jobs(doc).items():
+            if not isinstance(job, dict):
+                continue
+            conditions = [job.get("if")] + [s.get("if") for s in _steps(job)]
+            if any(
+                "vars.PMCP_IMAGE_PUBLISH" in str(c) for c in conditions if c is not None
+            ):
+                reasons.append(
+                    f"{tag} {name}:{job_name} decides on vars.PMCP_IMAGE_PUBLISH in an if:"
+                )
+    if isinstance(image, dict):
+        # A workflow-level env (BASH_ENV) or defaults.run.shell reaches the
+        # gate step before its heredoc runs; only these top-level keys may
+        # exist. PyYAML reads a bare `on:` as True.
+        extra = sorted(str(k) for k in image if k not in IMAGE_TOP_LEVEL_KEYS)
+        if extra:
+            reasons.append(
+                f"{tag} {IMAGE_WORKFLOW} top-level keys must be a subset of "
+                f"name, on, permissions and jobs; found {', '.join(extra)}"
+            )
+        jobs = _jobs(image)
+        gate = jobs.get("gate")
+        steps = _steps(gate)
+        if (
+            not isinstance(gate, dict)
+            or set(gate)
+            - {"runs-on", "timeout-minutes", "permissions", "outputs", "steps"}
+            or gate.get("permissions") != {}
+            or gate.get("outputs") != GATE_OUTPUTS
+            or len(steps) != 1
+            or len(gate.get("steps") or []) != 1
+            or set(steps[0]) != {"id", "env", "run"}
+            or steps[0].get("id") != "decide"
+            or steps[0].get("env") != GATE_ENV
+            or not isinstance(steps[0].get("run"), str)
+            or hashlib.sha256(steps[0]["run"].encode()).hexdigest() != GATE_RUN_SHA256
+        ):
+            reasons.append(f"{tag} {IMAGE_WORKFLOW}:gate differs from its pinned form")
+        promote_job = jobs.get(PROMOTE_JOB)
+        if isinstance(promote_job, dict):
+            needs = _as_list(promote_job.get("needs"))
+            if promote_job.get("if") != PROMOTE_IF:
+                reasons.append(
+                    f"{tag} {IMAGE_WORKFLOW}:{PROMOTE_JOB} if: differs from the pinned gate test"
+                )
+            if set(needs) != PROMOTE_NEEDS or len(needs) != len(PROMOTE_NEEDS):
+                reasons.append(
+                    f"{tag} {IMAGE_WORKFLOW}:{PROMOTE_JOB} needs must be {sorted(PROMOTE_NEEDS)}"
+                )
+            invokers = [
+                s
+                for s in _steps(promote_job)
+                if PUBLICATION_PATTERNS["an image_publish.py write"].search(
+                    str(s.get("run", ""))
+                )
+            ]
+            if len(invokers) != 1 or invokers[0].get("env") != PROMOTE_ENV:
+                reasons.append(
+                    f"{tag} {IMAGE_WORKFLOW}:{PROMOTE_JOB} phase-1 environment differs"
+                )
+            if any(
+                re.search(r"\bset\s+-[a-wyz]*x", str(s.get("run", "")))
+                for s in _steps(promote_job)
+            ):
+                reasons.append(
+                    f"{tag} {IMAGE_WORKFLOW}:{PROMOTE_JOB} must not trace commands"
+                )
+            # (g) One serialised namespace, never cancelled.
+            if promote_job.get("concurrency") != PROMOTE_CONCURRENCY:
+                reasons.append(
+                    f"{tag} {IMAGE_WORKFLOW}:{PROMOTE_JOB} concurrency must be pmcp-image-main without cancellation"
+                )
+        if any("secrets." in s for s in _strings(image)):
+            reasons.append(f"{tag} {IMAGE_WORKFLOW} must not reference secrets.")
+
+        # (f) Trusted code source and candidate checkout.
+        for job_name, job in jobs.items():
+            for step in _steps(job):
+                uses = str(step.get("uses", ""))
+                where = f"{IMAGE_WORKFLOW}:{job_name}"
+                if uses.startswith("actions/checkout@"):
+                    trusted = _with_form(step, TRUSTED_CHECKOUT)
+                    candidate = job_name == "build-smoke" and _with_form(
+                        step, CANDIDATE_CHECKOUT
+                    )
+                    if job_name == "gate" or not (trusted or candidate):
+                        reasons.append(
+                            f"{tag} {where} checkout is neither the trusted nor the candidate form"
+                        )
+                if uses.startswith("actions/download-artifact@"):
+                    given = _with(step)
+                    if "run-id" in given or "github-token" in given:
+                        reasons.append(
+                            f"{tag} {where} downloads another run's artifact"
+                        )
+                if "run" in step:
+                    text = _joined(
+                        "\n".join(
+                            s
+                            for s in [step.get("run"), step.get("shell")]
+                            + _strings(step.get("env"))
+                            if isinstance(s, str)
+                        )
+                    )
+                    for label, pattern in IMAGE_RUN_FORBIDDEN.items():
+                        if pattern.search(text):
+                            reasons.append(f"{tag} {where} run step contains {label}")
+
+        # (h) Trigger: only the completed Test run on main; nothing calls it.
+        if get_on(image) != IMAGE_ON:
+            reasons.append(
+                f"{tag} {IMAGE_WORKFLOW} on: must be exactly the workflow_run block"
+            )
+    if isinstance(watch, dict):
+        watch_on = get_on(watch)
+        if (
+            not isinstance(watch_on, dict)
+            or set(watch_on) != {"schedule", "workflow_dispatch"}
+            or watch_on.get("schedule") != [{"cron": IMAGE_WATCH_CRON}]
+            or watch_on.get("workflow_dispatch") not in (None, {})
+        ):
+            reasons.append(
+                f"{tag} {IMAGE_WATCH_WORKFLOW} on: must be exactly schedule plus workflow_dispatch"
+            )
+        checkouts = [
+            s
+            for job in _jobs(watch).values()
+            for s in _steps(job)
+            if str(s.get("uses", "")).startswith("actions/checkout@")
+        ]
+        if len(checkouts) != 1 or checkouts[0].get("with") != IMAGE_WATCH_CHECKOUT:
+            reasons.append(
+                f"{tag} {IMAGE_WATCH_WORKFLOW} checkout differs from its pinned form"
+            )
+    for name, doc in sorted(workflows.items()):
+        for job_name, job in _jobs(doc).items():
+            called = job.get("uses") if isinstance(job, dict) else None
+            if isinstance(called, str) and re.search(r"(^|/)image\.yml(@|$)", called):
+                reasons.append(f"{tag} {name}:{job_name} calls {IMAGE_WORKFLOW}")
+
+    # (i) The release acknowledgement covers every image publication input.
+    ack_pattern = _ack_regex(workflows)
+    try:
+        compiled = re.compile(ack_pattern) if ack_pattern else None
+    except re.error:
+        compiled = None
+    if compiled is None:
+        reasons.append(f"{tag} release-diff-ack path regex not found in test.yml")
+    else:
+        for path in ACK_REQUIRED_PATHS:
+            if not compiled.search(path):
+                reasons.append(f"{tag} release-diff-ack does not cover {path}")
+    return reasons
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -1183,11 +1952,13 @@ def main(argv: list[str] | None = None) -> int:
         failures.extend(release_invariants(None))
 
     # 2. timeout invariants — every workflow file.
+    docs: dict[str, Any] = {}
     for path in workflow_files():
         doc, err = _load(path)
         if err:
             failures.append(err)
             continue
+        docs[path.name] = doc
         failures.extend(timeout_invariants(doc, path))
         failures.extend(tag_trigger_invariants(doc, path))
         failures.extend(stable_context_invariants(doc, path))
@@ -1195,6 +1966,9 @@ def main(argv: list[str] | None = None) -> int:
         if path.name == "test.yml":
             failures.extend(diagnostic_invariants(doc))
             failures.extend(full_bootstrap_invariants(doc))
+
+    # 2a. guarded image publication — across every workflow at once.
+    failures.extend(image_publication_invariants(docs))
 
     # 2b. SHA pinning — raw text, every workflow AND every local action. Wired
     # here, not only into pytest: the evidence loop runs this CLI.

@@ -229,6 +229,104 @@ PIN_MUTANTS: dict[str, tuple[Path, str, str]] = {
     ),
 }
 
+# The guarded image cutover's mutants (G T7). Each is applied by the shell
+# helper itself to a scratch copy of the tree (see TestImagePublicationInvariants),
+# so the edit is single-source, not re-implemented here.
+IMAGE_MUTANTS = (
+    "image-docker-main-push",
+    "image-docker-tag-push",
+    "image-docker-pull-request-target",
+    "image-docker-push-expression",
+    "image-docker-packages-write",
+    "image-docker-login",
+    "image-docker-cache-to",
+    "image-docker-secrets",
+    "image-docker-extra-job",
+    "image-tag-allowlist-docker",
+    "image-workflow-packages-write",
+    "image-job-write-all",
+    "image-promote-contents-dropped",
+    "image-watch-packages-write",
+    "image-job-no-permissions-image",
+    "image-job-no-permissions-watch",
+    "image-job-no-permissions-docker",
+    "image-docker-push-step",
+    "image-buildx-push",
+    "image-type-registry",
+    "image-curl-put",
+    "image-skopeo-delete",
+    "image-crane",
+    "image-oras",
+    "image-regctl",
+    "image-podman-push",
+    "image-buildah-push",
+    "image-promote-outside",
+    "image-stray-ghcr",
+    "image-promote-if-vars",
+    "image-needs-gate-dropped",
+    "image-needs-verify-dropped",
+    "image-gate-lower",
+    "image-gate-literal-output",
+    "image-gate-extra-step",
+    "image-gate-literal-env",
+    "image-gate-if",
+    "image-candidate-ref-head-sha",
+    "image-persist-credentials",
+    "image-trusted-ref-main",
+    "image-cone-mode",
+    "image-watch-baselines-dropped",
+    "image-gate-checkout",
+    "image-git-clone",
+    "image-curl-contents",
+    "image-run-head-sha",
+    "image-download-run-id",
+    "image-cancel-in-progress",
+    "image-trigger-push-tags",
+    "image-trigger-workflow-call",
+    "image-trigger-schedule",
+    "image-trigger-repository-dispatch",
+    "image-trigger-workflow-dispatch",
+    "image-types-requested",
+    "image-branches-removed",
+    "image-tag-caller",
+    "image-watch-push",
+    "image-watch-pull-request",
+    "image-ack-docker",
+    "image-ack-image",
+    "image-ack-dockerfile",
+    "image-ack-baselines",
+    "image-gate-workflow-env",
+    "image-gate-workflow-defaults",
+    "image-docker-image-push",
+    "image-skopeo-smoke-glued",
+)
+
+# Round-1 mutants (PR Consiliency/pmcp#463, president R1, R3, R4) and the
+# specific reason each must produce, not just any [image] reason.
+SPECIFIC_REASONS = {
+    "image-gate-workflow-env": "top-level keys must be a subset of",
+    "image-gate-workflow-defaults": "top-level keys must be a subset of",
+    "image-docker-image-push": "contains docker push",
+    "image-skopeo-smoke-glued": "uses skopeo outside the pinned local load in build-smoke",
+}
+
+# Mutants that only the curl/wget clause of guard (d), or its whole-job
+# exemption pin, can kill (president re-check 1, PA-1c).
+HTTP_MUTANTS = (
+    "image-http-notify-put",
+    "image-http-notify-url-repointed",
+    "image-http-notify-curlrc",
+    "image-http-notify-copied",
+    "image-http-upload-T",
+    "image-http-data-d",
+    "image-http-wget-post-file",
+    "image-http-step-shell",
+    "image-http-defaults-shell",
+    "image-http-quoted-separator",
+    "image-http-attached-value",
+    "image-http-quoted-method",
+)
+
 # Every mutant these tests exercise. Asserted EQUAL to the helper's expected-1
 # rows — in BOTH directions — by TestMutationHelperContract, because the
 # evidence matrix is generated from that TSV: a phantom row there would
@@ -281,6 +379,8 @@ TESTED_MUTANTS = (
         "guard-self-disabled-nonconstant",
     }
     | {"integration-cancelled", "integration-shared-group"}
+    | set(IMAGE_MUTANTS)
+    | set(HTTP_MUTANTS)
 )
 
 
@@ -396,11 +496,14 @@ class TestTagTriggerInvariants:
         assert reasons and reasons[0].startswith("[release]")
         assert "on.push.tags" in reasons[0]
 
-    def test_the_allowlisted_files_are_permitted(self) -> None:
-        # docker.yml really is tag-triggered today: it pushes the release image.
+    def test_only_the_release_workflow_is_allowlisted(self) -> None:
+        # docker.yml left the allowlist with the guarded image cutover: it is a
+        # read-only pull-request build, so a tag trigger on it is a regression.
         doc = yaml.safe_load('on:\n  push:\n    tags:\n      - "v*"\njobs: {}\n')
-        assert cw.tag_trigger_invariants(doc, ".github/workflows/docker.yml") == []
+        assert cw.TAG_TRIGGERED_WORKFLOWS == {"release.yml"}
         assert cw.tag_trigger_invariants(doc, ".github/workflows/release.yml") == []
+        reasons = cw.tag_trigger_invariants(doc, ".github/workflows/docker.yml")
+        assert reasons and reasons[0].startswith("[release]")
 
     def test_a_new_workflow_without_a_tag_trigger_is_fine(self) -> None:
         doc = yaml.safe_load("on:\n  pull_request:\njobs: {}\n")
@@ -500,7 +603,9 @@ class TestShaPinning:
         # Release alignment adds its explicit Node setup too.
         # Artifact verification checks out its same trusted tag in publish.
         # Separate published-wheel observation uses four read-only actions.
-        assert len(cw.remote_uses(cw.pin_scan_files())) == 41
+        # The guarded image cutover drops docker.yml's login action and adds
+        # eight already-pinned uses: seven in image.yml, one in image-watch.yml.
+        assert len(cw.remote_uses(cw.pin_scan_files())) == 48
 
     def test_expected_uses_is_sha_form_without_comments(self) -> None:
         # yaml.safe_load strips comments before _collect_uses runs, so a value
@@ -1347,6 +1452,7 @@ class TestMutationHelperContract:
             "timeout-below-p100",
             "concurrency-added",
             "guard-step-gutted",
+            "image-needs-reordered",
         ],
     )
     def test_the_uncovered_cases_are_listed_as_expected_green(
@@ -1538,6 +1644,16 @@ def test_release_upload_and_downstream_mapping(mutation: str) -> None:
         "scripts/release-build-constraints.txt",
         ".github/probe/release_installed.py",
         ".github/probe/p1_probe_server.py",
+        ".github/workflows/docker.yml",
+        ".github/workflows/image.yml",
+        ".github/workflows/image-watch.yml",
+        "Dockerfile",
+        ".consiliency/evidence/image-baselines/inventory-B1.json",
+        ".consiliency/evidence/image-baselines/registry-R2.json",
+        ".consiliency/evidence/image-baselines/retention.json",
+        "scripts/image_publish.py",
+        "scripts/image_registry_readback.py",
+        "scripts/image_cutover_inventory.py",
     ],
 )
 def test_release_acknowledgement_covers_invoked_graph(filename: str) -> None:
@@ -1555,3 +1671,376 @@ def test_release_acknowledgement_covers_invoked_graph(filename: str) -> None:
         ).returncode
         == 0
     )
+
+
+# --- guarded image publication (G T7) -----------------------------------------
+
+
+def _image_tree(tmp_path: Path) -> Path:
+    """A scratch copy of everything the checker and the mutation helper touch."""
+    import shutil
+
+    root = tmp_path / "tree"
+    shutil.copytree(REPO_ROOT / ".github", root / ".github")
+    (root / "scripts").mkdir()
+    for name in ("check_workflows.py", "_mutate_workflow.sh"):
+        shutil.copy2(REPO_ROOT / "scripts" / name, root / "scripts" / name)
+    return root
+
+
+def _image_reasons(root: Path) -> tuple[list[str], list[str]]:
+    """(image reasons, release tag-trigger reasons) for the tree at ``root``."""
+    spec = importlib.util.spec_from_file_location(
+        "check_workflows_scratch", root / "scripts" / "check_workflows.py"
+    )
+    assert spec and spec.loader
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    docs = {}
+    release: list[str] = []
+    for path in sorted((root / ".github" / "workflows").glob("*.y*ml")):
+        doc = yaml.safe_load(path.read_text())
+        docs[path.name] = doc
+        release.extend(checker.tag_trigger_invariants(doc, path.name))
+    return checker.image_publication_invariants(docs), release
+
+
+def _mutate(root: Path, mutant: str) -> None:
+    subprocess.run(
+        [str(root / "scripts" / "_mutate_workflow.sh"), mutant],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+class TestImagePublicationInvariants:
+    """Consiliency/pmcp G: every registry write is behind the exact gate."""
+
+    def test_the_committed_tree_passes(self, tmp_path: Path) -> None:
+        image, release = _image_reasons(_image_tree(tmp_path))
+        assert image == [] and release == []
+
+    @pytest.mark.parametrize("mutant", IMAGE_MUTANTS)
+    def test_mutant_is_rejected_with_the_image_tag(
+        self, tmp_path: Path, mutant: str
+    ) -> None:
+        root = _image_tree(tmp_path)
+        before, _ = _image_reasons(root)
+        _mutate(root, mutant)
+        after, release = _image_reasons(root)
+        new = [r for r in after if r not in before]
+        assert new, f"{mutant} was not rejected"
+        assert all(r.startswith("[image] ") for r in after)
+        if mutant == "image-docker-tag-push":
+            assert release and release[0].startswith("[release]")
+
+    def test_reordered_needs_are_an_equivalent_form(self, tmp_path: Path) -> None:
+        root = _image_tree(tmp_path)
+        before, _ = _image_reasons(root)
+        _mutate(root, "image-needs-reordered")
+        after, _ = _image_reasons(root)
+        assert after == before
+
+    def test_the_tag_allowlist_parameter_is_checked(self) -> None:
+        docs = {
+            p.name: yaml.safe_load(p.read_text()) for p in WORKFLOW_DIR.glob("*.y*ml")
+        }
+        reasons = cw.image_publication_invariants(docs, {"release.yml", "docker.yml"})
+        assert any("TAG_TRIGGERED_WORKFLOWS" in r for r in reasons)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "docker push x",
+            "docker image push x",
+            "podman push x",
+            "podman image push x",
+            "buildah push x",
+            "crane copy a b",
+            "oras push a b",
+            "regctl image copy a b",
+            "docker login ghcr.io",
+            "docker buildx build --push .",
+            "docker buildx build --output type=registry .",
+            "docker buildx build --output type=image,push=true .",
+            "curl -X PUT https://example.invalid/v2/x",
+            "curl --request DELETE https://example.invalid/v2/x",
+            "wget --method=PATCH https://example.invalid/v2/x",
+            "curl -X POST \\\n  https://example.invalid/v2/x",
+            "python3 scripts/image_publish.py promote",
+            "python3 scripts/image_publish.py tag --version 3.0.1",
+            "skopeo copy oci-archive:a docker://example.invalid/x",
+            "skopeo delete docker://example.invalid/x",
+        ],
+    )
+    def test_publication_commands_outside_promote_main_fail(self, command: str) -> None:
+        docs = {
+            p.name: yaml.safe_load(p.read_text()) for p in WORKFLOW_DIR.glob("*.y*ml")
+        }
+        baseline = cw.image_publication_invariants(docs)
+        assert baseline == [] and "maintenance.yml" in docs
+        docs["extra.yml"] = {
+            "on": {"pull_request": None},
+            "jobs": {
+                "x": {
+                    "runs-on": "ubuntu-latest",
+                    "timeout-minutes": 10,
+                    "steps": [{"run": command}],
+                }
+            },
+        }
+        new = [r for r in cw.image_publication_invariants(docs) if r not in baseline]
+        assert new and all(r.startswith("[image] ") for r in new)
+
+    def test_the_build_smoke_skopeo_load_is_the_only_allowed_form(self) -> None:
+        image = yaml.safe_load((WORKFLOW_DIR / "image.yml").read_text())
+        loads = [
+            s
+            for s in image["jobs"]["build-smoke"]["steps"]
+            if "skopeo" in str(s.get("run", ""))
+        ]
+        assert len(loads) == 1
+        assert cw.SKOPEO_SMOKE_LOAD.fullmatch(loads[0]["run"].split("sock ", 1)[1])
+
+
+class TestMutatingHttpClause:
+    """Guard (d)'s curl/wget clause and its single pinned exemption."""
+
+    def test_the_committed_notify_job_hashes_to_the_pin(self) -> None:
+        doc = yaml.safe_load((WORKFLOW_DIR / "maintenance.yml").read_text())
+        pin = cw.MUTATING_HTTP_EXEMPT[("maintenance.yml", "notify-worker")]
+        actual = cw.job_pin(doc["jobs"]["notify-worker"])
+        assert actual == pin, (
+            f"maintenance.yml:notify-worker hashes to {actual}, but "
+            f"MUTATING_HTTP_EXEMPT pins {pin}; re-review the job before re-pinning"
+        )
+        assert list(cw.MUTATING_HTTP_EXEMPT) == [("maintenance.yml", "notify-worker")]
+
+    def test_a_job_that_does_not_serialize_is_not_exempt(self) -> None:
+        assert cw.job_pin({"steps": [{"run": float("nan")}]}) is None
+        assert cw.job_pin({"steps": [{"run": object()}]}) is None
+
+    @pytest.mark.parametrize("mutant", HTTP_MUTANTS)
+    def test_mutant_is_rejected_by_the_curl_wget_clause(
+        self, tmp_path: Path, mutant: str
+    ) -> None:
+        root = _image_tree(tmp_path)
+        before, _ = _image_reasons(root)
+        _mutate(root, mutant)
+        after, _ = _image_reasons(root)
+        new = [r for r in after if r not in before]
+        assert new and all(r.startswith("[image] ") for r in new)
+        assert any(r.endswith(cw.MUTATING_HTTP_LABEL) for r in new), new
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "curl -X PUT u",
+            "curl -XPUT u",
+            "curl --request PATCH u",
+            "wget --method=DELETE u",
+            "curl -T f u",
+            "curl --upload-file f u",
+            "curl -d x u",
+            "curl -sd x u",
+            "curl -sfT f u",
+            "curl --data-binary @f u",
+            "curl --data-raw x u",
+            "curl --data-urlencode x u",
+            "curl --json x u",
+            "curl -F a=b u",
+            "curl --form a=b u",
+            "wget --post-data=x u",
+            "wget --post-file=f u",
+            "wget --body-data=x u",
+            "wget --body-file=f u",
+            # Round 1 (president R2): read as bash reads it.
+            'curl "$URL?x=1&y=2" -X PUT',
+            'curl "https://h/x;y" -T f',
+            'curl "https://h/x|y" -d x',
+            'curl -T/tmp/payload "$URL"',
+            "curl -T./image.tar u",
+            'curl -d@payload "$URL"',
+            'curl -d\'{"a":1}\' "$URL"',
+            "curl -sfd@f u",
+            'curl -F"x=y" "$URL"',
+            "curl -F'file=@image.tar' u",
+            'curl -X"PUT" u',
+            "curl -X'DELETE' u",
+            'curl --""data @f u',
+            'curl -""X PUT u',
+            'c""url -X PUT u',
+            'wget "http://e.com?a=1&b=2" --post-data=abc',
+            'wget "http://e.com?a=1&b=2" --method=DELETE',
+            'wget --post-""data=x u',
+            # Regression cases, each flagged at 5d416e4.
+            "/usr/bin/curl -T f u",
+            "timeout 5 curl -X PUT u",
+            "X=$(curl -sf -X PUT u)",
+            "X=`curl -T f u`",
+            "env A=1 curl -d x u",
+            'bash -c "curl -X PUT u"',
+            "sh -c 'curl -d x u'",
+            'ssh host "curl -T f u"',
+        ],
+    )
+    def test_the_detector_flags_explicit_and_implied_methods(
+        self, command: str
+    ) -> None:
+        assert cw.mutating_http(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "curl -sf --max-time 2 http://127.0.0.1:3399/health",
+            "curl -fsSL -o a.tgz https://example.invalid/a.tgz",
+            "curl -X GET u",
+            "curl -I u",
+            'curl -s "https://h/x?a=1&b=2"',
+            'curl -s "$URL" | grep -F needle',
+            'curl -fsSL -o a.tgz "$URL" && tar -xzf a.tgz -T files.txt',
+            'wget -qO- "https://h/x?a=1&b=2"',
+        ],
+    )
+    def test_the_detector_leaves_reads_alone(self, command: str) -> None:
+        assert not cw.mutating_http(command)
+
+    def test_the_existing_gets_in_test_yml_are_not_flagged(self) -> None:
+        texts = [
+            cw._step_text(step)
+            for job in _TEST_WF["jobs"].values()
+            for step in cw._steps(job)
+            if "curl" in str(step.get("run", ""))
+        ]
+        assert len(texts) == 2
+        assert not any(cw.mutating_http(text) for text in texts)
+
+    @pytest.mark.parametrize("where", ["step", "job", "workflow"])
+    def test_shell_and_defaults_are_scanned_and_never_exempt(self, where: str) -> None:
+        docs = {
+            p.name: yaml.safe_load(p.read_text()) for p in WORKFLOW_DIR.glob("*.y*ml")
+        }
+        baseline = cw.image_publication_invariants(docs)
+        shell = 'curl -sf -X PUT --data-binary @{0} "$URL"'
+        notify = docs["maintenance.yml"]
+        if where == "step":
+            notify["jobs"]["notify-worker"]["steps"][0]["shell"] = shell
+        elif where == "job":
+            notify["jobs"]["notify-worker"]["defaults"] = {"run": {"shell": shell}}
+        else:
+            notify["defaults"] = {"run": {"shell": shell}}
+        new = [r for r in cw.image_publication_invariants(docs) if r not in baseline]
+        assert any(r.endswith(cw.MUTATING_HTTP_LABEL) for r in new), new
+
+
+class TestRoundOneGuards:
+    """PR Consiliency/pmcp#463 round 1: R1 (top-level keys), R3, R4."""
+
+    @pytest.mark.parametrize("mutant", sorted(SPECIFIC_REASONS))
+    def test_mutant_reports_its_specific_reason(
+        self, tmp_path: Path, mutant: str
+    ) -> None:
+        root = _image_tree(tmp_path)
+        before, _ = _image_reasons(root)
+        _mutate(root, mutant)
+        after, _ = _image_reasons(root)
+        new = [r for r in after if r not in before]
+        assert any(SPECIFIC_REASONS[mutant] in r for r in new), new
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("env", {"BASH_ENV": "$(echo open=yes >>$GITHUB_OUTPUT)"}),
+            ("defaults", {"run": {"shell": "bash {0}"}}),
+            ("concurrency", {"group": "x"}),
+        ],
+    )
+    def test_extra_top_level_keys_in_image_yml_are_refused(
+        self, key: str, value: Any
+    ) -> None:
+        docs = {
+            p.name: yaml.safe_load(p.read_text()) for p in WORKFLOW_DIR.glob("*.y*ml")
+        }
+        reason = "image.yml top-level keys must be a subset of"
+        assert not any(reason in r for r in cw.image_publication_invariants(docs))
+        docs["image.yml"][key] = value
+        new = [r for r in cw.image_publication_invariants(docs) if reason in r]
+        assert new and key in new[0]
+
+
+def _nested_bash_c(depth: int, *, double: bool) -> str:
+    """``curl -s -X PUT "$URL"`` inside ``depth`` nested ``bash -c`` layers."""
+    import shlex
+
+    text = 'curl -s -X PUT "$URL"'
+    for _ in range(depth):
+        if double:
+            escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+            escaped = escaped.replace("$", "\\$").replace("`", "\\`")
+            text = f'bash -c "{escaped}"'
+        else:
+            text = "bash -c " + shlex.quote(text)
+    return text
+
+
+# Writes that 5d416e4 refused and the round-1 shell-word classifier accepted
+# (president re-check of PR Consiliency/pmcp#463, A1-A23). R6 keeps the
+# 5d416e4 detector as a second check, so each must stay flagged.
+REGRESSION_CASES_5D416E4 = {
+    "A1": 'curl -s $(echo -s) -X PUT "$URL"',
+    "A2": 'curl -s --max-time $((30)) -X PUT "$URL"',
+    "A3": 'curl -s `echo -s` -X PUT "$URL"',
+    "A4": 'curl -s -o >(cat >/dev/null) -X PUT "$URL"',
+    "A5": 'curl -s -u $(echo a:b) -T f "$URL"',
+    "A6": "# don't retry\ncurl -sf '<url>' -X PUT\n# that's all",
+    "A7": "# don't retry\ncurl -s -X 'PUT' \"$URL\"\n# that's all",
+    "A8": '# don\'t log the token\nX=$(curl -s -X PUT "$URL")',
+    "A9": '# it\'s fine\ntrue;curl -s -X PUT "$URL"',
+    "A10": '# it\'s fine\n(curl -s -X PUT "$URL")',
+    "A11": '# it\'s fine\nX=`curl -s -T f "$URL"`',
+    "A12": '# it\'s fine\ntrue&&curl -s -d x "$URL"',
+    "A13": 'cat <<EOF >/dev/null\nit\'s\nEOF\nX=$(curl -s -X PUT "$URL")',
+    "A14-depth5-double": _nested_bash_c(5, double=True),
+    "A14-depth5-single": _nested_bash_c(5, double=False),
+    "A14-depth8-double": _nested_bash_c(8, double=True),
+    "A14-depth8-single": _nested_bash_c(8, double=False),
+    "A15-depth6-double": _nested_bash_c(6, double=True),
+    "A15-depth6-single": _nested_bash_c(6, double=False),
+    "A16": 'curl.exe -s -X PUT "$URL"',
+    "A17": 'curl -s -X "PUT " "$URL"',
+    "A18": '# don\'t log it\nX=$(wget -q -O- --post-data=x "$URL")',
+    "A19": 'wget -q -O /dev/null $(echo -q) --method=PUT "$URL"',
+    "A20": '$(which curl) -s -X PUT "$URL"',
+    "A21": '"$(command -v curl)" -s -X PUT "$URL"',
+    "A22": '${CURL:-curl} -s -X PUT "$URL"',
+    "A23": 'curl -s -X P${EMPTY}UT "$URL"',
+}
+
+
+class TestNeverWeakerThan5d416e4:
+    """R6: the guard's curl/wget clause is the union of both detectors."""
+
+    @pytest.mark.parametrize(
+        "case", sorted(REGRESSION_CASES_5D416E4), ids=sorted(REGRESSION_CASES_5D416E4)
+    )
+    def test_each_5d416e4_refusal_stays_flagged(self, case: str) -> None:
+        assert cw.mutating_http(REGRESSION_CASES_5D416E4[case])
+
+    @pytest.mark.parametrize(
+        "case", sorted(REGRESSION_CASES_5D416E4), ids=sorted(REGRESSION_CASES_5D416E4)
+    )
+    def test_the_kept_5d416e4_detector_flags_each_case(self, case: str) -> None:
+        assert cw._mutating_http_5d416e4(REGRESSION_CASES_5D416E4[case])
+
+    def test_the_union_never_unflags_what_the_old_detector_flags(self) -> None:
+        texts = [
+            cw._step_text(step)
+            for path in WORKFLOW_DIR.glob("*.y*ml")
+            for job in cw._jobs(yaml.safe_load(path.read_text())).values()
+            for step in cw._steps(job)
+        ]
+        assert texts
+        for text in texts:
+            if cw._mutating_http_5d416e4(text):
+                assert cw.mutating_http(text)
