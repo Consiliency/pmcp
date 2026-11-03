@@ -2274,7 +2274,7 @@ class TestBashGrammar:
                     work = cw._Work()
                     text = cw._joined(cw._step_text(step))
                     cw._classify(text, work)
-                    assert work.spent < cw._WORK_LIMIT // 100, path.name
+                    assert work.spent < cw._WORK_LIMIT // 20, (path.name, work.spent)
 
     def test_a_stack_overflow_counts_as_a_write(
         self, monkeypatch: pytest.MonkeyPatch

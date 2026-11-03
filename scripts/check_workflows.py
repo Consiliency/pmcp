@@ -1397,7 +1397,7 @@ class _Unlexable(Exception):
 # The most characters the classifier may lex or scan for one text, counting
 # every nested text, rescan and lookahead (2026-11-03 dev0 incident: the guard's
 # own work must be bounded). Reaching it counts as a write: no bound may fail
-# open (R7f). Committed step texts use well under 1% of it.
+# open (R7f). Every committed step text uses under 5% of it.
 _WORK_LIMIT = 1_000_000
 
 
