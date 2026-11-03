@@ -90,7 +90,7 @@ log is `~/.pmcp/logs/gateway.log`.
    gateway that is already running, so until you restart it you are still
    looking at 2.7.3. Run `systemctl --user restart pmcp`, or use
    `pmcp upgrade --restart-service` in step 2. Then check `pmcp --version`
-   prints `pmcp 3.0.0`.
+   prints `pmcp 3.0.1` or later.
 
 4. **Check the configuration.** In each checkout you run pmcp from:
 
@@ -1296,7 +1296,7 @@ the auth path and its dependencies.
 so nothing else constrains it, or raise the conflicting pins.
 
 **How to verify.** `pip check` (or `uv pip check`) in pmcp's environment
-reports no broken requirements, and `pmcp --version` prints `pmcp 3.0.0`.
+reports no broken requirements, and `pmcp --version` prints `pmcp 3.0.1` or later.
 
 ### Agent-facing hints
 
