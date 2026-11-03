@@ -85,13 +85,13 @@ EXPECTED_JOB_PERMISSIONS: dict[str, dict[str, str] | None] = {
 EXPECTED_USES = {
     "build": [
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
-        "astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7",
-        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+        "astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2",
+        "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
     ],
     "publish": [
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
         # v1.14.2 == the release/v1 head on the day of pinning. Any re-pin must
         # stay >= 1.13.0: GHSA-vxmw-7h4f-hqxh (injectable expression expansions)
         # affects every earlier release.
@@ -99,7 +99,7 @@ EXPECTED_USES = {
     ],
     "github-release": [
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
     ],
 }
 # Jobs whose execution must not be made conditional or best-effort, at job
