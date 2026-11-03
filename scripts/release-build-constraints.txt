@@ -1,5 +1,5 @@
 # Measured isolated build graph; intentionally separate from runtime uv.lock.
-hatchling==1.32.4
+hatchling==1.33.0
 packaging==26.3
 pathspec==1.1.1
 pluggy==1.7.0
