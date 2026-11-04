@@ -3876,3 +3876,35 @@ def test_child_stdin_and_read_evaluation_refused(text):
 @pytest.mark.timeout(60)
 def test_unterminated_invocation_comments_charge_scanned_suffix():
     assert cw.mutating_powershell_http("&<#" * 40_000)
+
+
+@pytest.mark.parametrize("operator", ["&", "."])
+@pytest.mark.parametrize(
+    "separator",
+    [
+        " # comment\n",
+        " # comment\r\n",
+        "`\r\n",
+        "`\n",
+        "<#note#>",
+        " # first\n<#second#>`\r\n",
+    ],
+)
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "('Invoke-RestXethod' -replace 'X','M')",
+        "([char]73 + 'nvoke-RestMethod')",
+        "'Invoke-RestXethod'.Replace('X','M')",
+    ],
+)
+@pytest.mark.parametrize("method", ["Put", "Get"])
+def test_invocation_operand_separator_classes(operator, separator, expression, method):
+    text = operator + separator + expression + " -Method " + method + " -Uri $u"
+    assert cw.mutating_powershell_http(text) == (method == "Put")
+    docs = {
+        "probe.yml": {"jobs": {"probe": {"steps": [{"shell": "pwsh", "run": text}]}}}
+    }
+    assert any(
+        cw.MUTATING_PWSH_LABEL in r for r in cw.image_publication_invariants(docs)
+    ) == (method == "Put")

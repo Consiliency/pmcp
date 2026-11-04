@@ -2979,8 +2979,19 @@ def _powershell_http_reading(text: str) -> bool:
                 return True
             if text[operand].isspace():
                 operand += 1
+            elif text.startswith("`\r\n", operand):
+                expression_spent += 2
+                operand += 3
             elif text.startswith("`\n", operand):
+                expression_spent += 1
                 operand += 2
+            elif text.startswith("#", operand):
+                end = text.find("\n", operand)
+                end = len(text) if end < 0 else end + 1
+                expression_spent += end - operand
+                if expression_spent > _WORK_LIMIT:
+                    return True
+                operand = end
             elif text.startswith("<#", operand):
                 end = text.find("#>", operand + 2)
                 if end < 0:
@@ -3015,7 +3026,7 @@ def _powershell_http_reading(text: str) -> bool:
                 continue
         try:
             expression_args, cost = _pwsh_arguments(
-                text, invocation.end(), _WORK_LIMIT - expression_spent
+                text, operand, _WORK_LIMIT - expression_spent
             )
         except _UnmodelledExpansion:
             return True
