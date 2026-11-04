@@ -2668,9 +2668,10 @@ class TestLinearPublicationScans:
         assert not re.search(OLD_PUBLICATION_REGEXES[label], text)
         assert not cw.PUBLICATION_PATTERNS[label].search(text)
 
-    # Quadratic for the old regexes: on ai about 18 s for 120 KB of
-    # `docker -x `, 11 s for 550 KB of `type=image ` and 18 s for 210 KB of
-    # `skopeo ` (calibration in the PR evidence); the scanners take < 0.1 s.
+    # Quadratic for the old regexes. Measured on ai: 18.5 s for 120 KB of
+    # `docker -x `, 2.7 s for 264 KB of `type=image ` (550 KB here, about 4x
+    # by the quadratic) and 7.4 s for 140 KB of `skopeo ` (210 KB here); the
+    # scanners take < 0.03 s. Restoring each old regex fails these tests.
     HOSTILE = {
         "docker push": "docker -x " * 12_000,
         "podman push": "podman -x " * 12_000,
