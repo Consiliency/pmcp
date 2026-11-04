@@ -1577,6 +1577,7 @@ class _Word:
         self.quoted = False
         self.expanded = expanded
         self.escaped_blank = False
+        self.brace_candidate = False
         self.expansions: list[str] = []
         # The word as bash may build it: literal text, with each expansion
         # replaced by _MARK, or for ${X:-word} by _MARK, the shape of `word`
@@ -1643,7 +1644,7 @@ class _ShellLexer:
         depth = 0
         # One [state, depth] per open case: "head", "pattern" or "body".
         cases: list[list[Any]] = []
-        raw_words: list[str] = []
+        raw_words: list[tuple[int, int, bool]] = []
         raw_start = pos
 
         def finish_word() -> None:
@@ -1669,8 +1670,7 @@ class _ShellLexer:
             if self.has_braces:
                 # Nested command substitutions can copy overlapping source
                 # spans. Charge before slicing, not after building all words.
-                self.work.spend(pos - raw_start)
-                raw_words.append(s[raw_start:pos])
+                raw_words.append((raw_start, pos, current.brace_candidate))
             if (
                 reserved == "in"
                 and cases
@@ -1688,8 +1688,19 @@ class _ShellLexer:
             redirect = None
             if command:
                 self.commands.append(command)
-                expanded = [_brace_expand(raw, self.work) for raw in raw_words]
-                if any(parts != [raw] for raw, parts in zip(raw_words, expanded)):
+                # Most braces are quoted data or parameter expansions. Keep
+                # source spans until an unquoted brace can expand; only then
+                # copy the command, charging all source copies first.
+                if any(candidate for _, _, candidate in raw_words):
+                    self.work.spend(sum(end - start for start, end, _ in raw_words))
+                    sources = [s[start:end] for start, end, _ in raw_words]
+                    expanded = [
+                        _brace_expand(raw, self.work) if candidate else [raw]
+                        for raw, (_, _, candidate) in zip(sources, raw_words)
+                    ]
+                else:
+                    sources, expanded = [], []
+                if any(parts != [raw] for raw, parts in zip(sources, expanded)):
                     self.work.spend(
                         sum(len(part) + 1 for parts in expanded for part in parts)
                     )
@@ -1810,7 +1821,9 @@ class _ShellLexer:
             # A run of ordinary characters, added at once.
             run = _ORDINARY_RUN.match(s, pos)
             end = run.end() if run else pos + 1
-            word.add(s[pos:end])
+            ordinary = s[pos:end]
+            word.brace_candidate |= "{" in ordinary
+            word.add(ordinary)
             pos = end
         if closer:
             raise _Unlexable
