@@ -2481,6 +2481,15 @@ PANEL_OPTION_READS = {
 
 
 PANEL_GRAMMAR_WRITES = {
+    "NEW1-if-arith-shift-heredoc": 'if (( 1 << true )); then :; fi\ncurl -s $(\ntrue\n) "$URL?a=1&b=2" -d@report.json',
+    "NEW1-while-arith-shift-heredoc": 'while (( 0 << true )); do :; done\ncurl -s $(\ntrue\n) "$URL?a=1&b=2" -d@report.json',
+    "NEW1-bang-arith-shift-heredoc": '! (( 0 << true ))\ncurl -s $(\ntrue\n) "$URL?a=1&b=2" -X PUT',
+    "NEW1-time-p-arith-shift-heredoc": 'time -p (( 1 << true ))\ncurl -s $(\ntrue\n) "$URL?a=1&b=2" -d@report.json',
+    "NEW2-subscript-nested-brace-opt": 'curl -s ${a[${i:-0}]:--d} x "$URL"',
+    "NEW2-subscript-nested-bracket-opt": 'curl -s ${a[b[0]]:--d} x "$URL"',
+    "NEW2-subscript-nested-brace-method": 'curl -s ${a[${i:-0}]:--X} PUT "$URL"',
+    "NEW2-subscript-nested-brace-cmdword": '${a[${i:-0}]:-cu}rl -s -d@report.json "$URL"',
+    "NEW2-subscript-nested-brace-wget": 'wget -q -O /dev/null ${a[${i:-0}]:---post-data=x} "$URL"',
     "prefix-time -p": 'curl -s $(time -p case a in a) echo -s;; esac; wait) "$URL?a=1&b=2" -d x',
     "prefix-time --": 'curl -s $(time -- case a in a) echo -s;; esac; wait) "$URL?a=1&b=2" -d x',
     "prefix-time -p --": 'curl -s $(time -p -- case a in a) echo -s;; esac; wait) "$URL?a=1&b=2" -d x',
@@ -3156,6 +3165,16 @@ class TestPowerShellWebCmdlets:
 
 
 PANEL_FINAL_PS_WRITES = {
+    "NEW3a-colon-herestring-squote": "Invoke-RestMethod -Uri $env:URL -Body:@'\nit's\n'@ -Method Put",
+    "NEW3a-colon-herestring-dquote": 'Invoke-RestMethod -Uri $env:URL -Body:@"\nsay "hi\n"@ -Method Put',
+    "NEW3a-comma-herestring": "Invoke-RestMethod -Uri $env:URL -Body a,@'\nit's\n'@ -Method Put",
+    "NEW3a-colon-block-comment": "Invoke-RestMethod -Uri $env:URL -Body:<# don't retry #>x -Method Put",
+    "NEW3a-rparen-block-comment": "& (Get-Command Invoke-RestMethod)<# don't retry #> -Method Put -Uri $env:URL",
+    "NEW3b-braced-var-squote": "${don't} = 'x'; Invoke-RestMethod -Uri $env:URL -Body ${don't} -Method Put",
+    "NEW3b-dquote-braced-var-quote-semi": 'Invoke-RestMethod -Uri $env:URL -Body "${a";}" -Method Put',
+    "NEW3c-quoted-winpath-iwr": "& 'C:\\Tools\\iwr' -Uri 'https://example.invalid' -Method Put -InFile f",
+    "NEW3c-quoted-alias-provider-irm": "& 'Alias:irm' -Uri 'https://example.invalid' -Method Put -InFile f",
+    "NEW3d-joined-backslash-comment-in-parens": "Invoke-RestMethod -Uri $env:URL -Body (\n  $payload # C:\\temp\\\n) -Method Put",
     "continued-comment": "Invoke-RestMethod -Uri $env:URL `\n# it's a note\n-Method Put -InFile f",
     "continued-here": "Invoke-RestMethod -Uri $env:URL -Body `\n@'\nit's\n'@ -Method Put",
     "quote-block": "Invoke-RestMethod -Uri 'http://example.invalid'<# it's #> -Method Put -InFile f",
@@ -3190,6 +3209,40 @@ PANEL_FINAL_PS_WRITES = {
 
 
 class TestPanelFinalRegressions:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            'if (( 1 << true )); then :; fi\ncurl -s $(\ntrue\n) "$URL?a=1&b=2" -o /dev/null',
+            'curl -s ${a[${i:-0}]:--o} /dev/null "$URL"',
+        ],
+    )
+    def test_compound_arithmetic_and_array_reads(self, text: str) -> None:
+        assert not cw.mutating_http(text)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "${don't} = 'x'; Invoke-RestMethod -Uri $env:URL -Body ${don't} -Method Get",
+            'Invoke-RestMethod -Uri $env:URL -Body "${a";}" -Method Get',
+            "& 'C:\\Tools\\iwr' -Uri 'https://example.invalid' -Method Get -InFile f",
+            "& 'Alias:irm' -Uri 'https://example.invalid' -Method Get -InFile f",
+            "Invoke-RestMethod -Uri $env:URL -Body (\n  $payload # C:\\temp\\\n) -Method Get",
+        ],
+    )
+    def test_variable_qualified_and_raw_reads(self, text: str) -> None:
+        assert not cw.mutating_powershell_http(text)
+
+    @pytest.mark.parametrize(
+        "subscript", ["${i:-0}", "b[0]", "b[c[0]]", "$(echo 0)", '"0"', "'0'", r"0\]0"]
+    )
+    @pytest.mark.parametrize(
+        "operator", [":-", "-", ":=", "=", ":+", "+", "/", "//", "/#", "/%"]
+    )
+    def test_array_operand_shape(self, subscript: str, operator: str) -> None:
+        # Conservative operand readings do not require the default to be taken.
+        text = "curl ${a[" + subscript + "]" + operator + "-d} x $URL"
+        assert cw.mutating_http(text)
+
     @pytest.mark.parametrize(
         "text",
         [

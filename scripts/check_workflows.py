@@ -1461,22 +1461,9 @@ _ORDINARY_RUN = re.compile(r"[^ \t\n'\"\\$`<>&;|()]+")
 _REDIRECTED_FD = re.compile(r"[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\}")
 _SIMPLE_PARAMETER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]")
 # The parameter name and operator that open ${...}; the rest is a word.
-_PARAMETER_HEAD = re.compile(
-    r"[#!]?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])(?:\[[^]]*\])?"
-    r"(?P<op>:?[-=+?]|##?|%%?|/[#%]|//?|\^\^?|,,?|@)?"
-)
-# The ${name<op>word} operators whose word can become the value (bash(1),
-# Parameter Expansion): a default, an assigned default, an alternate value,
-# and a pattern substitution's `pattern/string` (the pattern part only adds
-# false positives).
+_PARAMETER_NAME = re.compile(r"[#!]?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])")
+_PARAMETER_OPERATOR = re.compile(r":?[-=+?]|##?|%%?|/[#%]|//?|\^\^?|,,?|@")
 _VALUE_OPERATORS = {":-", "-", ":=", "=", ":+", "+", "/", "//", "/#", "/%"}
-# _PARAMETER_HEAD read in the whole text, before the closing `}` is known: a
-# subscript also stops at `}`, so no scan runs past the expansion's own text
-# (nested ${ in a subscript recurse, each on its own text).
-_PARAMETER_LEAD = re.compile(
-    r"[#!]?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])(?:\[[^]}]*\])?"
-    r"(?P<op>:?[-=+?]|##?|%%?|/[#%]|//?|\^\^?|,,?|@)?"
-)
 _ANSI_C_ESCAPES = {
     "a": "\a",
     "b": "\b",
@@ -1823,8 +1810,9 @@ class _ShellLexer:
                 pos += len(op)
                 continue
             if char == "(":
+                self.work.spend(len(command))
                 at_start = not word.started and (
-                    not command or [w.text for w in command] == ["for"]
+                    _compound_prefix(command) or [w.text for w in command] == ["for"]
                 )
                 finish_command()
                 if at_start and s.startswith("((", pos):
@@ -1917,18 +1905,14 @@ class _ShellLexer:
             return self.expansion(word, pos, end)
         if following == "{":
             # The word of ${X:-word} and the like may become the value.
-            lead = _PARAMETER_LEAD.match(s, pos + 2)
-            operand = None
-            if lead is not None and lead["op"] in _VALUE_OPERATORS:
-                operand = lead.end()
+            head_end, operator = self.parameter_head(pos + 2)
+            operand = head_end if operator in _VALUE_OPERATORS else None
             value = _Word()
-            substitution = lead is not None and (lead["op"] or "").startswith("/")
+            substitution = operator.startswith("/")
             operand_quoted = quoted and not substitution
             end = self.parameter(pos + 2, operand_quoted, value, operand, substitution)
             self.work.spend(2 * (end - pos))
-            content = s[pos + 2 : end - 1]
-            head = _PARAMETER_HEAD.match(content)
-            self.nested.append(content[head.end() :] if head else content)
+            self.nested.append(s[head_end : end - 1])
             shape = _MARK
             if operand is not None and operand < end:
                 self.work.spend(len(value.shape))
@@ -1949,6 +1933,40 @@ class _ShellLexer:
             return self.expansion(word, pos, name.end())
         word.add("$")
         return pos + 1
+
+    def parameter_head(self, pos: int) -> tuple[int, str]:
+        """Read a name, balanced array subscript, then its outer operator."""
+        start = pos
+        name = _PARAMETER_NAME.match(self.s, pos)
+        if name is None:
+            return pos, ""
+        pos = name.end()
+        if self.s[pos : pos + 1] == "[":
+            depth, scratch = 1, _Word()
+            pos += 1
+            while pos < self.n and depth:
+                char = self.s[pos]
+                if char == "\\":
+                    pos += 2
+                elif char == "$":
+                    pos = self.dollar(pos, scratch, quoted=False)
+                elif char == "`":
+                    pos = self.backtick(pos, scratch)
+                elif char == '"':
+                    pos = self.double_quoted(pos + 1, scratch)
+                elif char == "'":
+                    close = self.s.find("'", pos + 1)
+                    if close < 0:
+                        raise _UnmodelledExpansion
+                    pos = close + 1
+                else:
+                    depth += (char == "[") - (char == "]")
+                    pos += 1
+            if depth:
+                raise _UnmodelledExpansion
+        self.work.spend(pos - start)
+        operator = _PARAMETER_OPERATOR.match(self.s, pos)
+        return (operator.end(), operator[0]) if operator else (pos, "")
 
     def parameter(
         self,
@@ -2583,6 +2601,19 @@ _PWSH_WEB = re.compile(
 _PWSH_PARAMETER = re.compile(r"[-\u2013\u2014\u2015]([A-Za-z]+)(:.*)?", re.DOTALL)
 
 
+def _pwsh_variable_end(text: str, pos: int, limit: int) -> int:
+    """Skip a braced variable name; quotes and semicolons are name bytes."""
+    pos += 2
+    while pos < limit:
+        if text[pos] == "`":
+            pos += 2
+        elif text[pos] == "}":
+            return pos + 1
+        else:
+            pos += 1
+    raise _UnmodelledExpansion
+
+
 def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
     """The argument tokens of a PowerShell command from ``pos`` to the end of
     its statement; an unterminated quote or group runs to the end of the text.
@@ -2620,10 +2651,19 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
                 token.append(text[pos + 1])
             pos += 2
             continue
+        if text.startswith("${", pos):
+            end = _pwsh_variable_end(text, pos, n)
+            token.append(text[pos:end])
+            pos = end
+            at_token_start = False
+            continue
         if char in "'\"":
             at_token_start = False
             end = pos + 1
             while end < n:
+                if char == '"' and text.startswith("${", end):
+                    end = _pwsh_variable_end(text, end, n)
+                    continue
                 if char == '"' and text.startswith("$(", end):
                     raise _UnmodelledExpansion
                 if text[end] == char:
@@ -2660,7 +2700,13 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
             at_token_start = True
             pos += 1
             continue
-        at_token_start = char.isspace() or char in "(){}[];|"
+        parameter_colon = (
+            char == ":"
+            and len(token) > 1
+            and token[0] in "-–—―"
+            and all(token[index].isalpha() for index in range(1, len(token)))
+        )
+        at_token_start = char.isspace() or char in "(){}[];|," or parameter_colon
         token.append(char)
         pos += 1
     if token:
@@ -2802,12 +2848,8 @@ def _powershell_http_reading(text: str) -> bool:
     spent = 0
     for match in _PWSH_WEB.finditer(text):
         start = match.end()
-        if (
-            match.start() > 0
-            and text[match.start() - 1] in "'\""
-            and text[start : start + 1] == text[match.start() - 1]
-        ):
-            start += 1  # & 'Invoke-RestMethod' -Method Put
+        if text[start : start + 1] in {"'", '"'}:
+            start += 1  # Closing quote also follows a qualified command basename.
         try:
             args, end = _pwsh_arguments(text, start, _WORK_LIMIT - spent)
         except _UnmodelledExpansion:
@@ -3193,7 +3235,9 @@ def image_publication_invariants(
                     mutating_http(text) or mutating_http(_raw_step_text(step))
                 ):
                     reasons.append(f"{tag} {where} contains {MUTATING_HTTP_LABEL}")
-                if mutating_powershell_http(text):
+                if mutating_powershell_http(text) or mutating_powershell_http(
+                    _raw_step_text(step)
+                ):
                     reasons.append(f"{tag} {where} contains {MUTATING_PWSH_LABEL}")
                 remaining = "\n".join(
                     SKOPEO_SMOKE_LOAD.sub("", reading) if smoke_job else reading
