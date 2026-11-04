@@ -1397,8 +1397,8 @@ class _Unlexable(Exception):
 # The most characters the classifier may lex or scan for one text, counting
 # every nested text, rescan and lookahead (2026-11-03 dev0 incident: the guard's
 # own work must be bounded). Reaching it counts as a write: no bound may fail
-# open (R7f). Every committed step text uses under 5% of it.
-_WORK_LIMIT = 1_000_000
+# open (R7f). The largest committed step text uses about 4% of it.
+_WORK_LIMIT = 250_000
 
 
 class _OverBudget(Exception):
@@ -2037,13 +2037,14 @@ _PWSH_WEB = re.compile(
 _PWSH_PARAMETER = re.compile(r"-([A-Za-z]+)(:.*)?", re.DOTALL)
 
 
-def _pwsh_arguments(text: str, pos: int) -> tuple[list[str], int]:
+def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
     """The argument tokens of a PowerShell command from ``pos`` to the end of
-    its statement; an unterminated quote or group runs to the end of the text."""
+    its statement; an unterminated quote or group runs to the end of the text.
+    The scan stops after ``limit`` characters."""
     tokens: list[str] = []
     token: list[str] = []
     depth = 0
-    n = len(text)
+    n = min(len(text), pos + limit + 1)
     while pos < n:
         char = text[pos]
         if char == "`":
@@ -2100,7 +2101,7 @@ def mutating_powershell_http(text: str) -> bool:
     """
     spent = 0
     for match in _PWSH_WEB.finditer(text):
-        args, end = _pwsh_arguments(text, match.end())
+        args, end = _pwsh_arguments(text, match.end(), _WORK_LIMIT - spent)
         spent += end - match.end() + 1
         if spent > _WORK_LIMIT:
             return True

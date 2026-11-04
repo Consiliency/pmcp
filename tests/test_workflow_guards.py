@@ -2213,18 +2213,18 @@ class TestBashGrammar:
     # hostile text, and reaching the bound must flag (R7f). Each input is
     # linear in size; each would be quadratic or worse without the bound.
     BOUNDED_INPUTS = {
-        "arithmetic-lookahead": "$((" * 60_000,
-        "command-arithmetic-lookahead": "((" * 60_000,
-        "many-curl-words": "curl " * 120_000 + "-s",
-        "long-word": "curl -s " + "a" * 1_200_000,
-        "many-quoted-parts": "curl -s " + "'a'" * 150_000,
-        "many-dquoted-parts": 'curl -s "$URL" ' + '"a"' * 150_000,
+        "arithmetic-lookahead": "$((" * 20_000,
+        "command-arithmetic-lookahead": "((" * 20_000,
+        "many-curl-words": "curl " * 40_000 + "-s",
+        "long-word": "curl -s " + "a" * 300_000,
+        "many-quoted-parts": "curl -s " + "'a'" * 50_000,
+        "many-dquoted-parts": 'curl -s "$URL" ' + '"a"' * 50_000,
         "nested-cmdsubst": "$(" * 5_000 + "curl -s" + ")" * 5_000,
         "nested-backticks": "echo " + "`" * 20_001,
-        "unterminated-quotes": "curl " + "'a " * 100_000,
-        "many-heredocs": "cat <<E\n" * 50_000,
-        "many-comments": "curl -s u # x\n" * 80_000,
-        "pwsh-many-words": "iwr " * 150_000,
+        "unterminated-quotes": "curl " + "'a " * 40_000,
+        "many-heredocs": "cat <<E\n" * 20_000,
+        "many-comments": "curl -s u # x\n" * 25_000,
+        "pwsh-many-words": "iwr " * 50_000,
     }
     OVER_BOUND = {
         "arithmetic-lookahead",
@@ -2274,7 +2274,7 @@ class TestBashGrammar:
                     work = cw._Work()
                     text = cw._joined(cw._step_text(step))
                     cw._classify(text, work)
-                    assert work.spent < cw._WORK_LIMIT // 20, (path.name, work.spent)
+                    assert work.spent < cw._WORK_LIMIT // 10, (path.name, work.spent)
 
     def test_a_stack_overflow_counts_as_a_write(
         self, monkeypatch: pytest.MonkeyPatch
