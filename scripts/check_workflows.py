@@ -1614,6 +1614,19 @@ def _compound_prefix(words: list[_Word]) -> bool:
             while index < len(words) and words[index].text in {"-p", "--"}:
                 index += 1
             continue
+        if name in {"for", "select"}:
+            # With implicit positional arguments Bash permits `for x do`
+            # without a separator before do (also for select).
+            if (
+                index + 1 >= len(words)
+                or words[index].quoted
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", words[index].text)
+                or words[index + 1].quoted
+                or words[index + 1].text != "do"
+            ):
+                return False
+            index += 2
+            continue
         if name == "function":
             if index >= len(words):
                 return False
@@ -2708,6 +2721,10 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
             # refuse rather than expose its body as command syntax.
             raise _UnmodelledExpansion
         if char == "`":
+            if at_token_start and text[pos + 1 : pos + 2] in {" ", "\t"}:
+                finish_token()
+                pos += 2
+                continue
             at_token_start = text[pos + 1 : pos + 2] == "\n"
             if at_token_start and re.compile(r"[ \t]*#").match(text, pos + 2, n):
                 # Continued comments have ambiguous statement association in
@@ -2780,6 +2797,11 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
         at_token_start = char.isspace() or char in "(){}[];|," or parameter_colon
         token.append(char)
         pos += 1
+        if char in ")]}" and not depth:
+            # End a top-level expression before an adjacent parameter/comment.
+            # Member access and indexing continue the expression itself.
+            if text[pos : pos + 1] not in {".", "["}:
+                finish_token()
     finish_token()
     return tokens, 4 * (pos - start) + token_work
 
@@ -2979,6 +3001,9 @@ def _powershell_http_reading(text: str) -> bool:
                 return True
             if text[operand].isspace():
                 operand += 1
+            elif text[operand : operand + 2] in {"` ", "`\t"}:
+                expression_spent += 1
+                operand += 2
             elif text.startswith("`\r\n", operand):
                 expression_spent += 2
                 operand += 3
@@ -3036,6 +3061,8 @@ def _powershell_http_reading(text: str) -> bool:
         if not expression_args or not any(c in expression_args[0] for c in "(["):
             continue
         for index, token in enumerate(expression_args[1:], 1):
+            if re.fullmatch(r"@[A-Za-z_]\w*", token):
+                return True
             parameter = _PWSH_PARAMETER.fullmatch(token)
             if parameter is None:
                 continue

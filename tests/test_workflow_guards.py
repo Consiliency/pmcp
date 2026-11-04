@@ -3908,3 +3908,69 @@ def test_invocation_operand_separator_classes(operator, separator, expression, m
     assert any(
         cw.MUTATING_PWSH_LABEL in r for r in cw.image_publication_invariants(docs)
     ) == (method == "Put")
+
+
+@pytest.mark.parametrize("header", ["for x do", "! for x do", "select x do"])
+@pytest.mark.parametrize("write", [False, True])
+def test_implicit_positional_loop_header(header, write):
+    text = (
+        "set -- 1\n" + header + " (( 0 << true )); break; done </dev/null\n"
+        'curl -s "$URL"${N+\ntrue\n} ' + ("-d x" if write else "-o /dev/null")
+    )
+    assert cw.mutating_http(text) == write
+
+
+@pytest.mark.parametrize("separator", ["` ", "`\t"])
+@pytest.mark.parametrize("method", ["Put", "Get"])
+@pytest.mark.parametrize(
+    "command", ["Invoke-RestMethod", "& ('Invoke-RestXethod' -replace 'X','M')"]
+)
+def test_powershell_token_start_escaped_whitespace(separator, method, command):
+    text = command + " " + separator + "-Method " + method
+    assert cw.mutating_powershell_http(text) == (method == "Put")
+
+
+@pytest.mark.parametrize("separator", ["` ", "`\t"])
+def test_powershell_invocation_escaped_whitespace(separator):
+    assert cw.mutating_powershell_http(
+        "&" + separator + "('Invoke-RestXethod' -replace 'X','M') -Method Put"
+    )
+    assert cw.mutating_powershell_http("Invoke-RestMethod " + separator + "@params")
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "('Invoke-RestXethod' -replace 'X','M')",
+        "$(('Invoke-RestXethod' -replace 'X','M'))",
+        "@('Invoke-RestXethod' -replace 'X','M')[0]",
+    ],
+)
+@pytest.mark.parametrize("gap", ["", "<#c#>", " "])
+@pytest.mark.parametrize("method", ["Put", "Get"])
+def test_powershell_expression_argument_boundary(expression, gap, method):
+    assert cw.mutating_powershell_http(
+        "& " + expression + gap + "-Method " + method
+    ) == (method == "Put")
+
+
+def test_powershell_expression_splat_tail():
+    assert cw.mutating_powershell_http(
+        "& ('Invoke-RestXethod' -replace 'X','M') @params"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["pwsh ' -Command' 'Write-Output hi'", "powershell.exe '-EncodedCommand ' QQ=="],
+)
+def test_child_switch_whitespace_trim(text):
+    assert cw.mutating_http(text) or cw.mutating_powershell_http(text)
+
+
+def test_command_object_tail_conservative_reading():
+    # The recognized-command reading keeps its tail even without an invocation
+    # operator. This deliberately conservative syntax policy is independent of
+    # the separate expression-name invocation rule; no live execution claimed.
+    assert cw.mutating_powershell_http("(Get-Command iwr) -Method Put")
+    assert not cw.mutating_powershell_http("(Get-Command iwr) -Method Get")
