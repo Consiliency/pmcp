@@ -2816,13 +2816,15 @@ def _powershell_http_reading(text: str) -> bool:
         if spent > _WORK_LIMIT:
             return True
         native = match[0].lower().rsplit("\\", 1)[-1].removesuffix(".exe")
-        if native in {"curl", "wget"}:
+        if native in {"curl", "wget"} and any("(" in arg for arg in args):
             spent += sum(len(arg) for arg in args)
             if spent > _WORK_LIMIT:
                 return True
             native_args = _pwsh_native_arguments(args)
             if (_curl_writes if native == "curl" else _wget_writes)(native_args):
                 return True
+        if match[0].lower().endswith(".exe"):
+            continue  # Explicit native executables have no cmdlet -Method alias.
         for index, token in enumerate(args):
             if re.fullmatch(r"@[A-Za-z_]\w*", token):
                 return True
