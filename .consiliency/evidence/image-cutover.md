@@ -798,3 +798,82 @@ evidence. Durable driver/control sources are at
 `/home/viperjuice/workspace/tmp/pmcp-475-review-7e-fixes/`.
 Completed validation, reconciliation of the outstanding review, a complete
 usable panel and exact-head hosted CI remain required before merge.
+
+### Consolidated b42f1f9 review and validation
+
+Claude delivered a complete native Opus 5.5 review at `b42f1f9`. Claude,
+Codex and Grok all disagreed; Gemini failed for server capacity and supplied
+no review. None of these results is panel approval.
+
+Code `bd4babb` incorporates C15/C16, CL-1–7 and Grok P-ADJACENT,
+P-CALL-CONT, P-STRING-ASM and P-ITEM-ALIAS:
+
+- Bash finishes a word at `(` before recognizing a compound arithmetic
+  command/header. This covers adjacent keywords, negation and time options,
+  including prefixed `for`, with spaced and read controls retained.
+- PowerShell operator boundaries consume letters rather than Python word
+  characters, retaining numeric operands and the dash classes. Invocation
+  sites admit comments and continuations and exclude `&&` as a call operator.
+  Fixed expression operands with write-shaped tails refuse without evaluating
+  their names; parenthesized GET method controls remain reads. Expandable
+  invocation strings containing subexpressions refuse conservatively.
+- Parameter terminators split before grouped arguments. Child command switches
+  recognize slash/doubled-dash forms, `ec`, `ea`, `cwa` and the existing names.
+- Provider item spellings include their built-in aliases; content operations
+  and alias-provider variables refuse too. Static Format/Join/Concat member
+  spellings refuse through type objects and assembly-qualified types.
+  PowerShell type references and AddCommand/AddScript/AddParameter APIs refuse.
+
+The additional conservative refusals include read-only provider variables and
+content operations, static Format/Join/Concat on non-String types, references to
+the PowerShell API without execution, builder API references, and expandable
+invocation-name subexpressions even with GET tails. These are refusals, not
+live-write claims. The narrow scope ruling and its credential condition are
+unchanged. There is still no live PowerShell validation.
+
+Claude disputed the earlier P-TOKEN-QUOTE interpretation: the upstream tokenizer
+may treat `-Method"Put"` as a positional argument and a command glued to a quoted
+suffix as a different name. Retained extra readings only add refusals; those
+texts are now characterized as conservative tests, not confirmed live writes.
+The previously undisclosed `[ -f x ] && ...` false positive is corrected and
+has explicit read controls.
+
+Hosted `b42f1f9` testing passed the former many-curl/many-iwr CPU cases, but
+failed `split-tool-words` at 30.6 seconds against the unchanged 30-second ceiling:
+1 failed, 14815 passed, 60 skipped, 1 xfailed. The aggregate failed its test
+dependency. The release acknowledgement label is also absent. Logs are retained
+under `/home/viperjuice/workspace/tmp/pmcp-475-review-7e-fixes/`.
+
+The long-word case also traverses the PowerShell reader, even after Bash refuses.
+In addition to charging each Bash expansion's allocation, the PowerShell scanner
+now charges four work units per character (including skipped spans), preserving
+that charge in returned/accumulated costs. This bounds a single long argument,
+not only lists of small tokens. Limits still refuse, and CPU/memory/timeout
+assertions remain unchanged. Each charge has a separate negative control.
+
+Intermediate validation (ai, isolated HOME, 4 GiB cap): `5fa8369` passed 1629
+guard tests and three C15/C16 controls; `b047ba0` passed 1703; `d2ee9d7` passed
+1718; `14983f4` passed 1719, also with coverage instrumentation, although the
+standalone coverage command still exits 1 at 0% against 60%. Mypy and workflow
+checks passed. The first integration `8ca941d` failed 35 tests: the expression
+scan was too broad and one imported reviewer case was misclassified as a read
+because its name contained GetType. Both were corrected; that run remains failed.
+
+The `d2ee9d7` controls included one invalid collection-error result
+(NC-CL5-call-separators), not a valid kill. Its mutation quoting is repaired,
+all new mutation sources are parsed before execution, and the control driver now
+marks collection errors INVALID_ERROR. The copied-tree harness has two documented
+baseline entry-point failures because its scratch copy has no Git repository;
+only additional failing test nodes count as kills. The historical `5bdfdf4`
+run finished 170/170 mutation rows and 93 controls with additional failures,
+with exactly those two baseline failures. It does not certify later heads.
+
+The full `bd4babb` battery is running at
+`/tmp/pmcp-ai-viperjuice/475-final-bd4babb/`, with durable driver/control sources
+at `/home/viperjuice/workspace/tmp/pmcp-475-final-bd4/`. It retains the original
+selectors and oracles, adds the Claude adjacent-keyword live texts, and includes
+115 negative controls. The targeted `bd4babb` guard run passed 1733 tests;
+its controls and the full battery are pending, not passing evidence. The older
+`ea5252a` run remains separate. Whole-tree formatting retains its two unchanged
+diagnostics failures. Final-head hosted CI and a complete usable four-vendor
+review remain required; no merge approval or new residual waiver is asserted.
