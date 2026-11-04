@@ -2264,6 +2264,9 @@ class TestBashGrammar:
             # Quadratic or deeper without the bound: reaching it must flag.
             assert bash or pwsh
 
+    def test_long_powershell_argument_charges_character_work(self) -> None:
+        assert cw.mutating_powershell_http("curl " + "x" * 70_000)
+
     def test_many_expansions_charge_allocation_work(self) -> None:
         # No literal write: refusal must come from bounded expansion work.
         assert cw._http_writes("echo " + "$X" * 20_000)
@@ -3769,3 +3772,42 @@ class TestClaudeB42Regressions:
         assert not (
             cw.mutating_http(text) if bash else cw.mutating_powershell_http(text)
         )
+
+
+GROK_B42_ADDITIONS = {
+    "cand-call-backtick": "&`\n('Invoke-{0}' -f 'RestMethod') -Method Put -Uri http://example.invalid",
+    "cand-call-backtick-sub": "&`\n"
+    "$('Invoke-{0}' -f 'RestMethod') -Method Put -Uri "
+    "http://example.invalid",
+    "cand-cpi": "cpi -Path Alias:x -Destination Alias:y",
+    "cand-dot-backtick": ".`\n('Invoke-{0}' -f 'RestMethod') -Method Put -Uri http://example.invalid",
+    "cand-ni": "ni -Path Alias:x -Value Invoke-RestMethod; x -Method Put -Uri http://example.invalid",
+    "cand-si": "si -Path Alias:x -Value Invoke-RestMethod; x -Method Put -Uri http://example.invalid",
+    "cand-string-asm": "& ([System.String, mscorlib]::Format('Invoke-{0}','RestMethod')) -Method Put "
+    "-Uri http://example.invalid",
+    "cand-string-corelib": "& ([System.String, "
+    "System.Private.CoreLib]::Format('Invoke-{0}','RestMethod')) -Method Put "
+    "-Uri http://example.invalid",
+    "cand-string-join-asm": "& ([System.String, mscorlib]::Join('', @('Invoke-','RestMethod'))) "
+    "-Method Put -Uri http://example.invalid",
+}
+
+
+@pytest.mark.parametrize("case", sorted(GROK_B42_ADDITIONS))
+def test_grok_b42_additional_static_spellings(case):
+    text = GROK_B42_ADDITIONS[case]
+    assert cw.mutating_powershell_http(text)
+    assert cw.image_publication_invariants(
+        {"probe.yml": {"jobs": {"probe": {"steps": [{"shell": "pwsh", "run": text}]}}}}
+    )
+
+
+@pytest.mark.parametrize("prefix", ["!(( 0 << true ))", "time -p(( 1 << true ))"])
+@pytest.mark.parametrize("write", [True, False])
+def test_grok_b42_arithmetic_prefix_adjacency(prefix, write):
+    text = (
+        prefix
+        + '\ncurl -s $(\ntrue\n) "$URL" '
+        + ("-X PUT" if write else "-o /dev/null")
+    )
+    assert cw.mutating_http(text) == write

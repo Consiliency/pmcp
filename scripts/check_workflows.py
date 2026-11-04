@@ -2635,19 +2635,19 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
     at_token_start = True
     start = pos
     token_work = 0
-    n = min(len(text), pos + limit + 1)
+    n = min(len(text), pos + limit // 4 + 1)
 
     def finish_token() -> None:
         nonlocal token, token_work
         if token:
             token_work += _TOKEN_WORK
-            if pos - start + token_work > limit:
+            if 4 * (pos - start) + token_work > limit:
                 raise _UnmodelledExpansion
             tokens.append("".join(token))
             token = []
 
     while pos < n:
-        if pos - start + token_work > limit:
+        if 4 * (pos - start) + token_work > limit:
             raise _UnmodelledExpansion
         char = text[pos]
         if at_token_start and text.startswith("<#", pos):
@@ -2740,7 +2740,7 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
         token.append(char)
         pos += 1
     finish_token()
-    return tokens, pos - start + token_work
+    return tokens, 4 * (pos - start) + token_work
 
 
 def _pwsh_native_arguments(args: list[str]) -> list[_Word]:
