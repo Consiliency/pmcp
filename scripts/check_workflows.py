@@ -2625,7 +2625,7 @@ def _pwsh_variable_end(text: str, pos: int, limit: int) -> int:
 def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
     """The argument tokens of a PowerShell command from ``pos`` to the end of
     its statement; an unterminated quote or group runs to the end of the text.
-    The scan stops after ``limit`` characters."""
+    The scan stops after ``limit`` work units; the second result is its cost."""
     tokens: list[str] = []
     token: list[str] = []
     depth = 0
@@ -2734,7 +2734,7 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
         token.append(char)
         pos += 1
     finish_token()
-    return tokens, pos
+    return tokens, pos - start + token_work
 
 
 def _pwsh_native_arguments(args: list[str]) -> list[_Word]:
@@ -2889,12 +2889,12 @@ def _powershell_http_reading(text: str) -> bool:
         r"(?<![\w.-])(?:pwsh|powershell)(?:\.exe)?(?![\w.-])", text, re.IGNORECASE
     ):
         try:
-            child_args, child_end = _pwsh_arguments(
+            child_args, child_cost = _pwsh_arguments(
                 text, child.end(), _WORK_LIMIT - child_spent
             )
         except _UnmodelledExpansion:
             return True
-        child_spent += child_end - child.end() + 1
+        child_spent += child_cost + 1
         if child_spent > _WORK_LIMIT:
             return True
         child_spent += sum(len(argument) for argument in child_args)
@@ -2940,10 +2940,10 @@ def _powershell_http_reading(text: str) -> bool:
             starts.append(match.end() + 1)
         for start in starts:
             try:
-                args, end = _pwsh_arguments(text, start, _WORK_LIMIT - spent)
+                args, argument_cost = _pwsh_arguments(text, start, _WORK_LIMIT - spent)
             except _UnmodelledExpansion:
                 return True
-            spent += end - match.end() + 1
+            spent += argument_cost + 1
             if spent > _WORK_LIMIT:
                 return True
             native = match[0].lower().rsplit("\\", 1)[-1].removesuffix(".exe")
