@@ -48,6 +48,7 @@ older release with an honest comment (``pypa-rolled-back`` in
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import json
 import re
@@ -1227,25 +1228,135 @@ SKOPEO_SMOKE_LOAD = re.compile(
     r"quay\.io/skopeo/stable@sha256:[0-9a-f]{64} (?:--insecure-policy )?"
     r"copy oci-archive:[A-Za-z0-9_./:@+-]+(?!\S) docker-daemon:[A-Za-z0-9_./:@+-]+(?!\S)"
 )
-# Global options before a container tool's subcommand: each an option word,
-# optionally followed by one value word (docker --config DIR, -H URL, --tls).
-# The value alternatives are disjoint, so a failed match cannot backtrack
-# exponentially.
-_GLOBAL_OPTIONS = r"""(?:\s+-\S*(?:\s+(?:"[^"\n]*"|'[^'\n]*'|[^\s"'-]\S*))?)*"""
-PUBLICATION_PATTERNS = {
+class _ToolPush:
+    """``\\b<tool>(?:\\s+-\\S*(?:\\s+VALUE)?)*\\s+(?:image\\s+)?push\\b``, where
+    VALUE is ``"[^"\\n]*"``, ``'[^'\\n]*'`` or ``[^\\s"'-]\\S*``, decided in
+    linear time.
+
+    Global options before a container tool's subcommand: each an option word,
+    optionally followed by one value word (docker --config DIR, -H URL,
+    --tls). As one backtracking regex the search is quadratic: every tool
+    word rescans the option chain after it, about 35 s for 160 KB of
+    ``docker -x `` (PR Consiliency/pmcp#475 F3). This answers the same
+    question with one right-to-left pass over the blank-separated runs:
+    ``chain[r]`` says whether the options from run ``r`` on reach ``push``.
+    The tests check it against the regex on generated texts.
+    """
+
+    _VALUE_QUOTES = "\"'"
+
+    def __init__(self, tool: str, image: bool) -> None:
+        self.tool = re.compile(rf"\b{tool}(?=\s)")
+        self.image = image
+        self.push = re.compile(r"push\b")
+
+    def search(self, text: str) -> bool:
+        tools = [match.end() for match in self.tool.finditer(text)]
+        if not tools:
+            return False
+        runs = [(match.start(), match.end()) for match in re.finditer(r"\S+", text)]
+        begins = [begin for begin, _ in runs]
+        quotes = {
+            char: [m.start() for m in re.finditer(re.escape(char), text)]
+            for char in self._VALUE_QUOTES
+        }
+        newlines = [m.start() for m in re.finditer("\n", text)]
+        count = len(runs)
+        chain = [False] * (count + 1)
+        for index in range(count - 1, -1, -1):
+            begin, end = runs[index]
+            if self._ends_in_push(text, runs, index):
+                chain[index] = True
+                continue
+            if text[begin] != "-" or index + 1 >= count:
+                continue
+            after = self._after_value(text, runs, begins, quotes, newlines, index + 1)
+            chain[index] = chain[index + 1] or (after is not None and chain[after])
+        for end in tools:
+            # The tool word ends at a blank, so the next run follows it.
+            index = bisect.bisect_left(begins, end)
+            if index < count and chain[index]:
+                return True
+        return False
+
+    def _ends_in_push(self, text: str, runs: list[tuple[int, int]], index: int) -> bool:
+        """``(?:image\\s+)?push\\b`` at run ``index``."""
+        begin, end = runs[index]
+        if self.push.match(text, begin):
+            return True
+        return (
+            self.image
+            and text[begin:end] == "image"
+            and index + 1 < len(runs)
+            and self.push.match(text, runs[index + 1][0]) is not None
+        )
+
+    def _after_value(
+        self,
+        text: str,
+        runs: list[tuple[int, int]],
+        begins: list[int],
+        quotes: dict[str, list[int]],
+        newlines: list[int],
+        index: int,
+    ) -> int | None:
+        """The run after a VALUE starting at run ``index``, or None if none
+        starts there. A VALUE must be followed by a blank."""
+        begin, end = runs[index]
+        char = text[begin]
+        if char == "-":
+            return None
+        if char not in self._VALUE_QUOTES:
+            return index + 1
+        positions = quotes[char]
+        spot = bisect.bisect_right(positions, begin)
+        if spot >= len(positions):
+            return None
+        close = positions[spot]
+        newline = bisect.bisect_right(newlines, begin)
+        if newline < len(newlines) and newlines[newline] < close:
+            return None
+        last = bisect.bisect_right(begins, close) - 1
+        if runs[last][1] != close + 1 or close + 1 >= len(text):
+            return None
+        return last + 1
+
+
+class _LinePair:
+    """``FIRST[^\\n]*SECOND``, decided in linear time: on each line, SECOND
+    after the first FIRST (one backtracking regex rescans the line from every
+    FIRST, quadratic on one long line). FIRST must match a fixed length."""
+
+    def __init__(self, first: str, second: str, flags: int = 0) -> None:
+        self.first = re.compile(first, flags)
+        self.second = re.compile(second, flags)
+
+    def search(self, text: str) -> bool:
+        start = 0
+        while start <= len(text):
+            stop = text.find("\n", start)
+            stop = len(text) if stop < 0 else stop
+            first = self.first.search(text, start, stop)
+            if first is not None and self.second.search(text, first.end(), stop):
+                return True
+            start = stop + 1
+        return False
+
+
+PUBLICATION_PATTERNS: dict[str, Any] = {
     "a buildx --push": re.compile(r"(?<![\w-])--push\b"),
     "a type=registry output": re.compile(r"type=registry"),
-    "a pushing type=image output": re.compile(r"type=image[^\n]*push=true"),
-    "docker push": re.compile(rf"\bdocker{_GLOBAL_OPTIONS}\s+(?:image\s+)?push\b"),
-    "podman push": re.compile(rf"\bpodman{_GLOBAL_OPTIONS}\s+(?:image\s+)?push\b"),
-    "buildah push": re.compile(rf"\bbuildah{_GLOBAL_OPTIONS}\s+push\b"),
+    "a pushing type=image output": _LinePair(r"type=image", r"push=true"),
+    "docker push": _ToolPush("docker", image=True),
+    "podman push": _ToolPush("podman", image=True),
+    "buildah push": _ToolPush("buildah", image=False),
     "crane": re.compile(r"\bcrane\b"),
     "oras": re.compile(r"\boras\b"),
     "regctl": re.compile(r"\bregctl\b"),
     "docker login": re.compile(r"\bdocker\s+login\b"),
     "an image_publish.py write": re.compile(r"image_publish\.py\s+(?:promote|tag)\b"),
 }
-SKOPEO_DELETE = re.compile(r"\bskopeo\b[^\n]*\bdelete\b", re.IGNORECASE)
+SKOPEO_DELETE = _LinePair(r"\bskopeo\b", r"\bdelete\b", re.IGNORECASE)
 MUTATING_HTTP_LABEL = "a mutating curl/wget"
 # The 5d416e4 detector's command regex, kept for _mutating_http_5d416e4.
 _HTTP_COMMAND = re.compile(r"\b(curl|wget)\b([^\n;|&]*)")
@@ -1311,10 +1422,21 @@ _WGETRC_WRITES = {"postdata", "postfile", "bodydata", "bodyfile"}
 # The command word, by basename (R8a).
 _HTTP_TOOLS = {"curl": "curl", "curl.exe": "curl", "wget": "wget", "wget.exe": "wget"}
 # curl or wget as a word glued to anything but a name character: inside an
-# expansion that builds a command word, and in text that cannot be lexed.
+# expansion that builds a command word, and in text that cannot be lexed. A
+# `-` before it is glue, not part of the name: it ends the parameter
+# expansion operators `-` and `:-` (`${X:-curl}`, PR Consiliency/pmcp#475 F1).
 _TOOL_WORD = re.compile(
-    r"(?<![A-Za-z0-9_.-])(curl|wget)(?:\.exe)?(?![A-Za-z0-9_.-])", re.IGNORECASE
+    r"(?<![A-Za-z0-9_.])(curl|wget)(?:\.exe)?(?![A-Za-z0-9_.-])", re.IGNORECASE
 )
+# A tool name in a word's shape (see _MARK), matched at every position.
+_TOOL_NAME = re.compile(r"(?=(curl|wget))", re.IGNORECASE)
+# Stands for an expansion in a word's shape: a value the guard cannot know,
+# possibly empty, possibly split into several words (PR
+# Consiliency/pmcp#475 F2). YAML text cannot hold a NUL, and reading one as an
+# expansion only flags more.
+_MARK = "\0"
+# Simple expansions the R7f fallback splits a word at, as $IFS may.
+_FALLBACK_EXPANSION = re.compile(r"\$\{?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])\}?")
 # bash's redirection operators, longest first.
 _REDIRECTIONS = (
     "&>>",
@@ -1339,7 +1461,19 @@ _SIMPLE_PARAMETER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]")
 # The parameter name and operator that open ${...}; the rest is a word.
 _PARAMETER_HEAD = re.compile(
     r"[#!]?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])(?:\[[^]]*\])?"
-    r"(?::?[-=+?]|##?|%%?|//?|/[#%]|\^\^?|,,?|@)?"
+    r"(?P<op>:?[-=+?]|##?|%%?|//?|/[#%]|\^\^?|,,?|@)?"
+)
+# The ${name<op>word} operators whose word can become the value (bash(1),
+# Parameter Expansion): a default, an assigned default, an alternate value,
+# and a pattern substitution's `pattern/string` (the pattern part only adds
+# false positives).
+_VALUE_OPERATORS = {":-", "-", ":=", "=", ":+", "+", "/", "//", "/#", "/%"}
+# _PARAMETER_HEAD read in the whole text, before the closing `}` is known: a
+# subscript also stops at `}`, so no scan runs past the expansion's own text
+# (nested ${ in a subscript recurse, each on its own text).
+_PARAMETER_LEAD = re.compile(
+    r"[#!]?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])(?:\[[^]}]*\])?"
+    r"(?P<op>:?[-=+?]|##?|%%?|//?|/[#%]|\^\^?|,,?|@)?"
 )
 _ANSI_C_ESCAPES = {
     "a": "\a",
@@ -1433,6 +1567,11 @@ class _Word:
         self.expanded = expanded
         self.escaped_blank = False
         self.expansions: list[str] = []
+        # The word as bash may build it: literal text, with each expansion
+        # replaced by _MARK, or for ${X:-word} by _MARK, the shape of `word`
+        # (its blanks as _MARK, since an unquoted value is split) and _MARK.
+        self._shape_pieces = [text] if text else []
+        self._shape: str | None = text
 
     @property
     def text(self) -> str:
@@ -1441,9 +1580,18 @@ class _Word:
             self._pieces = [self._joined]
         return self._joined
 
-    def add(self, piece: str) -> None:
+    @property
+    def shape(self) -> str:
+        if self._shape is None:
+            self._shape = "".join(self._shape_pieces)
+            self._shape_pieces = [self._shape]
+        return self._shape
+
+    def add(self, piece: str, shape: str | None = None) -> None:
         self._pieces.append(piece)
         self._joined = None
+        self._shape_pieces.append(piece if shape is None else shape)
+        self._shape = None
         self.started = True
 
 
@@ -1635,14 +1783,16 @@ class _ShellLexer:
         finish_command()
         return pos
 
-    def quoted_part(self, word: _Word, inner: str) -> None:
-        word.add(inner)
+    def quoted_part(self, word: _Word, inner: str, shape: str | None = None) -> None:
+        word.add(inner, shape)
         word.quoted = True
         self.nested.append(inner)
 
-    def expansion(self, word: _Word, start: int, end: int) -> int:
+    def expansion(
+        self, word: _Word, start: int, end: int, shape: str = _MARK
+    ) -> int:
         raw = self.s[start:end]
-        word.add(raw)
+        word.add(raw, shape)
         word.expanded = True
         word.expansions.append(raw)
         return end
@@ -1671,7 +1821,7 @@ class _ShellLexer:
             pos += 1
         word.expanded = word.expanded or inner.expanded
         word.expansions += inner.expansions
-        self.quoted_part(word, inner.text)
+        self.quoted_part(word, inner.text, inner.shape)
         return pos + 1
 
     def dollar(self, pos: int, word: _Word, quoted: bool) -> int:
@@ -1687,11 +1837,21 @@ class _ShellLexer:
             end = self.parse(pos + 2, closer=True)
             return self.expansion(word, pos, end)
         if following == "{":
-            end = self.parameter(pos + 2, quoted)
+            # The word of ${X:-word} and the like may become the value.
+            lead = _PARAMETER_LEAD.match(s, pos + 2)
+            operand = None
+            if lead is not None and lead["op"] in _VALUE_OPERATORS:
+                operand = lead.end()
+            value = _Word()
+            end = self.parameter(pos + 2, quoted, value, operand)
             content = s[pos + 2 : end - 1]
             head = _PARAMETER_HEAD.match(content)
             self.nested.append(content[head.end() :] if head else content)
-            return self.expansion(word, pos, end)
+            shape = _MARK
+            if operand is not None and operand < end:
+                self.work.spend(len(value.shape))
+                shape += re.sub(r"[ \t\n]+", _MARK, value.shape) + _MARK
+            return self.expansion(word, pos, end, shape)
         if following == "'" and not quoted:
             close = pos + 2
             while close < self.n and s[close] != "'":
@@ -1708,28 +1868,35 @@ class _ShellLexer:
         word.add("$")
         return pos + 1
 
-    def parameter(self, pos: int, quoted: bool) -> int:
-        """The end of ``${...}``, from just after its ``{``."""
+    def parameter(
+        self, pos: int, quoted: bool, value: _Word, operand: int | None
+    ) -> int:
+        """The end of ``${...}``, from just after its ``{``; from ``operand``
+        on, the text is also built into ``value``."""
         s, scratch = self.s, _Word()
         while pos < self.n:
             char = s[pos]
             if char == "}":
                 return pos + 1
+            into = value if operand is not None and pos >= operand else scratch
             if char == "\\":
+                into.add(s[pos + 1 : pos + 2])
                 pos += 2
             elif char == "'" and not quoted:
                 close = s.find("'", pos + 1)
                 if close < 0:
                     raise _Unlexable
                 self.nested.append(s[pos + 1 : close])
+                into.add(s[pos + 1 : close])
                 pos = close + 1
             elif char == '"':
-                pos = self.double_quoted(pos + 1, scratch)
+                pos = self.double_quoted(pos + 1, into)
             elif char == "$":
-                pos = self.dollar(pos, scratch, quoted=True)
+                pos = self.dollar(pos, into, quoted=True)
             elif char == "`":
-                pos = self.backtick(pos, scratch)
+                pos = self.backtick(pos, into)
             else:
+                into.add(char)
                 pos += 1
         raise _Unlexable
 
@@ -1931,30 +2098,76 @@ def _wget_writes(args: list[_Word]) -> bool:
     return False
 
 
-def _http_tools(word: _Word, work: _Work) -> set[str]:
+def _shape_tools(shape: str, work: _Work) -> list[tuple[str, list[_Word]]]:
+    """Each curl/wget a word with expansions may become, with the words that
+    follow it inside the same word (PR Consiliency/pmcp#475 F1, F2).
+
+    Every expansion in ``shape`` (``_MARK``) may be empty and may split the
+    word, so a tool name counts where it starts at the word's start, after a
+    ``/`` or ``\\`` or an expansion, and ends at the word's end or an
+    expansion (``${X}curl``, ``$X""curl``, ``${X:-cu}rl``,
+    ``${X:-/usr/bin/curl}``). What follows it up to the end of the word, split
+    at each expansion, is read as its first arguments (``curl$IFS-d@f``),
+    each counted as holding an expansion.
+    """
+    segments = shape.split(_MARK)
+    stripped = "".join(segments)
+    starts: list[int] = []
+    offset = 0
+    for segment in segments:
+        starts.append(offset)
+        offset += len(segment)
+    cuts = set(starts[1:])
+    found: list[tuple[str, list[_Word]]] = []
+    for match in _TOOL_NAME.finditer(stripped):
+        begin, tool = match.start(), match[1].lower()
+        if not (begin == 0 or begin in cuts or stripped[begin - 1] in "/\\"):
+            continue
+        end = begin + len(tool)
+        if stripped[end : end + 4].lower() == ".exe" and (
+            end + 4 == len(stripped) or end + 4 in cuts
+        ):
+            end += 4
+        elif not (end == len(stripped) or end in cuts):
+            continue
+        work.spend(len(stripped) - end + 1)
+        # The segment holding `end`, cut there, and every later segment.
+        index = bisect.bisect_right(starts, end) - 1
+        rest = [segments[index][end - starts[index] :], *segments[index + 1 :]]
+        found.append((tool, [_Word(part, expanded=True) for part in rest if part]))
+    return found
+
+
+def _http_tools(word: _Word, work: _Work) -> list[tuple[str, list[_Word]]]:
     """``curl``/``wget`` if the word names one: by basename (``/usr/bin/curl``,
-    ``curl.exe``), or inside an expansion (``$(command -v curl)``)."""
+    ``curl.exe``), inside an expansion (``$(command -v curl)``,
+    ``${X:-curl}``), or glued to an expansion (``${X}curl``); each with the
+    arguments it takes from the rest of the word."""
     text = word.text
     work.spend(len(text) + sum(len(raw) for raw in word.expansions))
     base = re.split(r"[/\\]", text)[-1].lower()
     tools = {_HTTP_TOOLS[base]} if base in _HTTP_TOOLS else set()
     for raw in word.expansions:
         tools.update(match[1].lower() for match in _TOOL_WORD.finditer(raw))
-    return tools
+    found: list[tuple[str, list[_Word]]] = [(tool, []) for tool in sorted(tools)]
+    if word.expanded:
+        work.spend(len(word.shape))
+        found += _shape_tools(word.shape, work)
+    return found
 
 
 def _command_writes(words: list[_Word], work: _Work) -> bool:
     """A simple command with curl or wget anywhere in it (``timeout 5 curl``,
     ``env A=1 curl``) whose arguments send a method."""
     for index, word in enumerate(words):
-        tools = _http_tools(word, work)
-        if tools:
+        for tool, inside in _http_tools(word, work):
+            args = inside + words[index + 1 :]
             # The option scans read every following word, letter by letter.
-            work.spend(sum(len(w.text) + 1 for w in words[index + 1 :]))
-        if "curl" in tools and _curl_writes(words[index + 1 :]):
-            return True
-        if "wget" in tools and _wget_writes(words[index + 1 :]):
-            return True
+            work.spend(sum(len(w.text) + 1 for w in args))
+            if tool == "curl" and _curl_writes(args):
+                return True
+            if tool == "wget" and _wget_writes(args):
+                return True
     return False
 
 
@@ -1968,6 +2181,20 @@ def _unlexed_writes(text: str, work: _Work) -> bool:
             _Word(token, expanded=bool(re.search(r"[$`]", token))) for token in rest
         ]
         if _command_writes([_Word(match[1].lower()), *args], work):
+            return True
+        # Also split at simple expansions, as an unquoted $IFS may split
+        # (curl$IFS-d@f, PR Consiliency/pmcp#475 F2); the unsplit reading
+        # above is kept, so this only adds writes.
+        if not any(word.expanded for word in args):
+            continue
+        work.spend(len(text) - match.end())
+        split = [
+            _Word(part, expanded=True)
+            for token in rest
+            for part in _FALLBACK_EXPANSION.split(token)
+            if part
+        ]
+        if _command_writes([_Word(match[1].lower()), *split], work):
             return True
     return False
 
@@ -2027,10 +2254,37 @@ def mutating_http(text: str) -> bool:
     ``--form*``, ``--json*``, ``--upload-file*``, each also as ``--expand-*``
     and as any abbreviation; wget ``--post-data``, ``--post-file``,
     ``--body-data``, ``--body-file`` and any abbreviation, and a wgetrc
-    command run by ``-e``. Static text only: a command assembled at runtime
-    is out of reach (AC1).
+    command run by ``-e``. The command word may also be built with
+    expansions: the word of ``${X:-curl}`` and the other value operators,
+    and a tool name glued to an expansion (``${X}curl``, ``curl$IFS-d@f``).
+    A floor token with more than ``_FLOOR_LETTERS_LIMIT`` letters after its
+    ``-`` counts as a write without running the floor (its regex is
+    quadratic there). Static text only: a command assembled at runtime is out
+    of reach (AC1).
     """
-    return _mutating_http_5d416e4(text) or _bash_writes(text)
+    return (
+        not _floor_input_is_bounded(text)
+        or _mutating_http_5d416e4(text)
+        or _bash_writes(text)
+    )
+
+
+# The 5d416e4 floor runs before, and outside, the classifier's work budget.
+# Its `-[A-Za-z]*X[A-Za-z]+` fullmatch is quadratic in a token's leading run
+# of letters (about 1.5 s for 32,000, PR Consiliency/pmcp#475), so a token
+# with a longer run than this counts as a write without running the floor.
+_FLOOR_LETTERS_LIMIT = 1024
+_FLOOR_LONG_LETTERS = re.compile(rf"-[A-Za-z]{{{_FLOOR_LETTERS_LIMIT + 1}}}")
+
+
+def _floor_input_is_bounded(text: str) -> bool:
+    """No token the floor would test has more than _FLOOR_LETTERS_LIMIT
+    letters after its `-` (the floor's own tokens, read in linear time)."""
+    for match in _HTTP_COMMAND.finditer(_joined(text)):
+        for token in match[2].split():
+            if _FLOOR_LONG_LETTERS.match(token.strip("'\"")):
+                return False
+    return True
 
 
 # --- guard (d), PowerShell web cmdlets ---------------------------------------

@@ -2225,6 +2225,12 @@ class TestBashGrammar:
         "many-heredocs": "cat <<E\n" * 20_000,
         "many-comments": "curl -s u # x\n" * 25_000,
         "pwsh-many-words": "iwr " * 50_000,
+        # PR Consiliency/pmcp#475: word shapes and parameter heads.
+        "glued-tool-words": "${X}curl" * 25_000,
+        "split-tool-words": "curl" + "$IFS-x" * 40_000,
+        "long-default-word": "${X:-" + "a" * 240_000 + "}",
+        "open-subscripts": "${a[" * 50_000,
+        "closed-subscripts": "${a[}" * 40_000,
     }
     OVER_BOUND = {
         "arithmetic-lookahead",
@@ -2380,6 +2386,362 @@ class TestBashGrammar:
         load["run"] += glued
         reason = "uses skopeo outside the pinned local load in build-smoke"
         assert any(reason in r for r in cw.image_publication_invariants(docs))
+
+
+
+# PR Consiliency/pmcp#475 review F1 and F2: the command word built with an
+# expansion. F1 is the ${name<op>word} operator class whose word can become
+# the value (-, :-, =, :=, +, :+ and the pattern substitutions); F2 is a tool
+# name glued to an expansion that may be empty or split the word. Each sent
+# POST or PUT live on ai (bash --noprofile --norc -eo pipefail, bash 5.2.21,
+# curl 8.5.0, GNU Wget 1.21.4, loopback server; evidence in the PR), and the
+# 5d416e4 floor misses each one.
+EXPANSION_WORD_CASES = {
+    "F1-colon-dash": '${X:-curl} -s -d@report.json "$URL"',
+    "F1-quoted-idiom": '"${HTTP_CLIENT:-curl}" -sf -d@report.json "$URL"',
+    "F1-dash": '${X-curl} -s -d@report.json "$URL"',
+    "F1-wget-execute": '${X:-wget} -q -O /dev/null -epost_data=x "$URL"',
+    "F1-wget-abbrev": '${X-wget} -q -O /dev/null --post-d=x "$URL"',
+    "F1-assign-default": '${X:=curl} -s -d@report.json "$URL"',
+    "F1-assign-dash": '${X=curl} -s -d@report.json "$URL"',
+    "F1-alternate": 'X=1; ${X:+curl} -s -d@report.json "$URL"',
+    "F1-alternate-plus": 'X=1; ${X+curl} -s -d@report.json "$URL"',
+    "F1-substitution": 'X=a; ${X/a/curl} -s -d@report.json "$URL"',
+    "F1-substitution-all": 'X=a; ${X//a/curl} -s -d@report.json "$URL"',
+    "F1-default-glued": '${X:-cu}rl -s -d@report.json "$URL"',
+    "F1-default-path": '${X:-/usr/bin/curl} -s -d@report.json "$URL"',
+    "F1-default-exe": '${X:-curl.exe} -s -d@report.json "$URL"',
+    "F1-nested-default": '${X:-${Y:-curl}} -s -d@report.json "$URL"',
+    "F1-quoted-word": "${X:-'curl'} -s -d@report.json \"$URL\"",
+    "F1-after-env": 'env ${X:-curl} -s -d@report.json "$URL"',
+    "F1-default-with-blank": '${X:-env curl} -s -d@report.json "$URL"',
+    "F1-long-name-default": "${" + "A" * 2000 + ':-cu}rl -s -d@report.json "$URL"',
+    "F2-braced-glue": '${X}curl -s -d@report.json "$URL"',
+    "F2-empty-quotes": '$X""curl -s -d@report.json "$URL"',
+    "F2-quoted-glue": '"$X"curl -s -d@report.json "$URL"',
+    "F2-inside-name": 'cu${X}rl -s -d@report.json "$URL"',
+    "F2-trailing": 'curl${X} -s -d@report.json "$URL"',
+    "F2-cmdsubst-glue": '$(true)curl -s -d@report.json "$URL"',
+    "F2-backtick-glue": '`true`curl -s -d@report.json "$URL"',
+    "F2-path-glue": '${X}/usr/bin/curl -s -d@report.json "$URL"',
+    "F2-ifs": 'curl$IFS-s$IFS-d@report.json$IFS"$URL"',
+    "F2-ifs-braced": 'curl${IFS}-d@report.json${IFS}"$URL"',
+    "F2-ifs-wget": 'wget$IFS-q$IFS-O/dev/null$IFS--post-d=x$IFS"$URL"',
+    "F2-ifs-method": 'curl$IFS-X$IFS"PUT"$IFS"$URL"',
+}
+
+# Each sent only GET, or nothing, live, and must stay unflagged.
+EXPANSION_WORD_READS = {
+    "F1R-default-get": '${X:-curl} -s -o /dev/null "$URL"',
+    "F1R-quoted-default-get": '"${HTTP_CLIENT:-curl}" -sf -o /dev/null "$URL"',
+    "F1R-default-path-arg": 'wget -q -O "${TMP:-/tmp}/curl.tar" "$URL"',
+    "F2R-ifs-get": 'curl$IFS-s$IFS-o$IFS/dev/null$IFS"$URL"',
+    "F2R-glue-get": '${X}curl -s -o /dev/null "$URL"',
+    "F2R-longer-name": "curl-config${X} --version || true",
+    "F2R-path-prefix": 'curl -s -o "$HOME/curl-out" "$URL"',
+}
+
+
+class TestExpansionBuiltCommandWords:
+    """PR Consiliency/pmcp#475 F1/F2: the tool word as bash may build it."""
+
+    @pytest.mark.parametrize(
+        "case", sorted(EXPANSION_WORD_CASES), ids=sorted(EXPANSION_WORD_CASES)
+    )
+    def test_each_write_is_flagged(self, case: str) -> None:
+        assert cw.mutating_http(EXPANSION_WORD_CASES[case])
+
+    @pytest.mark.parametrize(
+        "case", sorted(EXPANSION_WORD_CASES), ids=sorted(EXPANSION_WORD_CASES)
+    )
+    def test_the_classifier_alone_flags_each_write(self, case: str) -> None:
+        text = cw._joined(EXPANSION_WORD_CASES[case])
+        assert cw._ShellLexer(text).run()
+        assert cw._http_writes(text)
+
+    @pytest.mark.parametrize(
+        "case", sorted(EXPANSION_WORD_CASES), ids=sorted(EXPANSION_WORD_CASES)
+    )
+    def test_the_5d416e4_floor_alone_misses_each_write(self, case: str) -> None:
+        assert not cw._mutating_http_5d416e4(EXPANSION_WORD_CASES[case])
+
+    @pytest.mark.parametrize(
+        "case", sorted(EXPANSION_WORD_READS), ids=sorted(EXPANSION_WORD_READS)
+    )
+    def test_each_read_is_left_alone(self, case: str) -> None:
+        assert not cw.mutating_http(EXPANSION_WORD_READS[case])
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '${X:-curl} -s -d@report.json "$URL" "oops',
+            '${X-curl} -s -d@report.json "$URL" "oops',
+            'curl$IFS-d@report.json$IFS"$URL" "oops',
+            '${X}curl -s -d@report.json "$URL" "oops',
+        ],
+    )
+    def test_the_unlexable_fallback_reads_the_same_class(self, text: str) -> None:
+        assert not cw._ShellLexer(cw._joined(text)).run()
+        assert not cw._mutating_http_5d416e4(text)
+        assert cw.mutating_http(text)
+
+    @pytest.mark.parametrize(
+        ("expansion", "writes"),
+        [
+            ("${X:-curl}", True),
+            ("${X-curl}", True),
+            ("${X:=curl}", True),
+            ("${X=curl}", True),
+            ("${X:+curl}", True),
+            ("${X+curl}", True),
+            ("${X/a/curl}", True),
+            ("${X//a/curl}", True),
+            ("${X/#a/curl}", True),
+            ("${X/%a/curl}", True),
+            ("${X#curl}", False),
+            ("${X##curl}", False),
+            ("${X%curl}", False),
+            ("${X%%curl}", False),
+            ("${X:?curl}", False),
+            ("${X^curl}", False),
+            ("${X,,curl}", False),
+            ("${X:1:curl}", False),
+        ],
+    )
+    def test_the_operator_class_decides_whether_the_word_is_a_value(
+        self, expansion: str, writes: bool
+    ) -> None:
+        # The word of a value operator is part of the word's shape; the word
+        # of a pattern-removal, error, case or substring operator is not.
+        # (Any curl/wget inside an expansion still counts by the raw-text
+        # rule, which is older and broader, so `${X#curl} -d x` is flagged: a
+        # false positive.)
+        word = cw._Word()
+        cw._ShellLexer(expansion).dollar(0, word, quoted=False)
+        tools = [tool for tool, _ in cw._shape_tools(word.shape, cw._Work())]
+        assert ("curl" in tools) is writes
+
+
+# PR Consiliency/pmcp#475 review F3: the publication patterns as they stood,
+# each a backtracking regex that is quadratic on one hostile line. The linear
+# scanners replacing them must answer exactly as these do.
+_OLD_GLOBAL_OPTIONS = r"""(?:\s+-\S*(?:\s+(?:"[^"\n]*"|'[^'\n]*'|[^\s"'-]\S*))?)*"""
+OLD_PUBLICATION_REGEXES = {
+    "docker push": rf"\bdocker{_OLD_GLOBAL_OPTIONS}\s+(?:image\s+)?push\b",
+    "podman push": rf"\bpodman{_OLD_GLOBAL_OPTIONS}\s+(?:image\s+)?push\b",
+    "buildah push": rf"\bbuildah{_OLD_GLOBAL_OPTIONS}\s+push\b",
+    "a pushing type=image output": r"type=image[^\n]*push=true",
+}
+OLD_SKOPEO_DELETE = r"\bskopeo\b[^\n]*\bdelete\b"
+
+_PUBLICATION_TOKENS = [
+    "docker",
+    "podman",
+    "buildah",
+    "Docker",
+    "x-docker",
+    "/usr/bin/docker",
+    "dockerd",
+    "push",
+    "push;",
+    "pushx",
+    "image",
+    "images",
+    "-x",
+    "--tls",
+    "-",
+    "a",
+    "'a",
+    "a'",
+    '"a',
+    'a"',
+    '"',
+    "'",
+    '"a b"',
+    "''",
+    "type=image",
+    "push=true",
+    "skopeo",
+    "SKOPEO",
+    "delete",
+    "deleted",
+    ";",
+]
+_PUBLICATION_SEPARATORS = [" ", "  ", "\t", "\n", "", " "]
+
+
+def _publication_texts(seed: int, count: int, most: int) -> list[str]:
+    """``count`` texts of at most ``most`` tokens each (bounded, < 200 chars)."""
+    import random
+
+    rng = random.Random(seed)
+    texts = []
+    for _ in range(count):
+        parts = []
+        for _ in range(rng.randint(1, most)):
+            parts.append(rng.choice(_PUBLICATION_TOKENS))
+            parts.append(rng.choice(_PUBLICATION_SEPARATORS))
+        texts.append("".join(parts))
+    return texts
+
+
+def _small_publication_texts() -> list[str]:
+    """Every text of one or two tokens, each followed by any separator."""
+    pieces = [t + sep for t in _PUBLICATION_TOKENS for sep in _PUBLICATION_SEPARATORS]
+    return pieces + [a + b for a in pieces for b in pieces]
+
+
+class TestLinearPublicationScans:
+    """PR Consiliency/pmcp#475 F3: (d)'s publication scans are linear."""
+
+    @pytest.mark.parametrize("label", sorted(OLD_PUBLICATION_REGEXES))
+    def test_each_scanner_answers_as_the_old_regex(self, label: str) -> None:
+        import re
+
+        old = re.compile(OLD_PUBLICATION_REGEXES[label])
+        new = cw.PUBLICATION_PATTERNS[label]
+        texts = _small_publication_texts() + _publication_texts(475, 20_000, 12)
+        differ = [t for t in texts if bool(old.search(t)) != bool(new.search(t))]
+        assert differ == []
+        # The generator reaches both answers, so the comparison is not vacuous.
+        assert any(old.search(t) for t in texts)
+        assert not all(old.search(t) for t in texts)
+
+    def test_skopeo_delete_answers_as_the_old_regex(self) -> None:
+        import re
+
+        old = re.compile(OLD_SKOPEO_DELETE, re.IGNORECASE)
+        texts = _small_publication_texts() + _publication_texts(4750, 20_000, 12)
+        differ = [
+            t for t in texts if bool(old.search(t)) != bool(cw.SKOPEO_DELETE.search(t))
+        ]
+        assert differ == []
+        assert any(old.search(t) for t in texts)
+
+    @pytest.mark.parametrize(
+        ("label", "text"),
+        [
+            ("docker push", 'docker -x "a b" push x'),
+            ("docker push", "docker -x 'a b' image push x"),
+            ("docker push", "docker -x\n-y\tpush"),
+            ("docker push", "/usr/bin/docker --config=/x push"),
+            ("podman push", "podman -x a -y image push"),
+            ("buildah push", "buildah --root /x push x"),
+        ],
+    )
+    def test_the_scanners_still_find_option_chains(self, label: str, text: str) -> None:
+        assert cw.PUBLICATION_PATTERNS[label].search(text)
+
+    @pytest.mark.parametrize(
+        ("label", "text"),
+        [
+            ("docker push", 'docker -x "a\nb" push x'),
+            ("docker push", 'docker -x "a"b push'),
+            ("docker push", "docker -x a b push"),
+            ("buildah push", "buildah image push x"),
+            ("docker push", "docker -x"),
+        ],
+    )
+    def test_the_scanners_refuse_what_the_regex_refused(
+        self, label: str, text: str
+    ) -> None:
+        import re
+
+        assert not re.search(OLD_PUBLICATION_REGEXES[label], text)
+        assert not cw.PUBLICATION_PATTERNS[label].search(text)
+
+    # Quadratic for the old regexes: on ai about 18 s for 120 KB of
+    # `docker -x `, 11 s for 550 KB of `type=image ` and 18 s for 210 KB of
+    # `skopeo ` (calibration in the PR evidence); the scanners take < 0.1 s.
+    HOSTILE = {
+        "docker push": "docker -x " * 12_000,
+        "podman push": "podman -x " * 12_000,
+        "buildah push": "buildah -x " * 12_000,
+        "a pushing type=image output": "type=image " * 50_000,
+    }
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize("label", sorted(HOSTILE))
+    def test_a_hostile_line_is_scanned_in_linear_time(self, label: str) -> None:
+        import time
+
+        text = self.HOSTILE[label]
+        started = time.monotonic()
+        assert not cw.PUBLICATION_PATTERNS[label].search(text)
+        assert cw.PUBLICATION_PATTERNS[label].search(text + " push=true push")
+        elapsed = time.monotonic() - started
+        assert elapsed < 3, f"{label} took {elapsed:.1f}s"
+
+    @pytest.mark.timeout(60)
+    def test_a_hostile_skopeo_line_is_scanned_in_linear_time(self) -> None:
+        import time
+
+        text = "skopeo " * 30_000
+        started = time.monotonic()
+        assert not cw.SKOPEO_DELETE.search(text)
+        assert cw.SKOPEO_DELETE.search(text + "delete")
+        elapsed = time.monotonic() - started
+        assert elapsed < 3, f"skopeo took {elapsed:.1f}s"
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("label", sorted(HOSTILE))
+    def test_the_checker_scans_a_hostile_step_in_bounded_time(self, label: str) -> None:
+        import time
+
+        docs = {
+            p.name: yaml.safe_load(p.read_text()) for p in WORKFLOW_DIR.glob("*.y*ml")
+        }
+        text = self.HOSTILE[label]
+        docs["test.yml"]["jobs"]["hostile"] = {
+            "runs-on": "ubuntu-latest",
+            "defaults": {"run": {"shell": text}},
+            "steps": [{"run": text}],
+        }
+        started = time.monotonic()
+        reasons = cw.image_publication_invariants(docs)
+        elapsed = time.monotonic() - started
+        assert elapsed < 30, f"{label} took {elapsed:.1f}s"
+        assert not any(f"contains {label}" in r for r in reasons)
+
+
+
+class TestFloorInputBound:
+    """PR Consiliency/pmcp#475: the 5d416e4 floor runs outside the classifier's
+    budget, and its `-[A-Za-z]*X[A-Za-z]+` fullmatch is quadratic in a token's
+    run of letters, so a longer run than the limit flags without the floor."""
+
+    def test_a_token_over_the_limit_flags_without_running_the_floor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def floor(text: str) -> bool:
+            raise AssertionError("the floor ran")
+
+        text = "curl -o" + "X" * cw._FLOOR_LETTERS_LIMIT + '1 "$URL"'
+        monkeypatch.setattr(cw, "_mutating_http_5d416e4", floor)
+        assert cw.mutating_http(text)
+
+    def test_a_token_at_the_limit_still_runs_the_floor(self) -> None:
+        text = "curl -o" + "X" * (cw._FLOOR_LETTERS_LIMIT - 1) + '1 "$URL"'
+        assert cw._floor_input_is_bounded(text)
+        assert not cw.mutating_http(text)
+
+    # About 15 s for the floor alone on ai without the bound (quadratic).
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "curl -o" + "X" * 100_000 + '1 "$URL"',
+            ("curl -o" + "X" * 1_023 + '1 "$URL"\n') * 200,
+        ],
+        ids=["one-long-token", "many-tokens-at-the-limit"],
+    )
+    def test_the_floor_input_is_bounded(self, text: str) -> None:
+        import time
+
+        started = time.monotonic()
+        cw.mutating_http(text)
+        elapsed = time.monotonic() - started
+        assert elapsed < 3, f"took {elapsed:.1f}s"
 
 
 class TestPowerShellWebCmdlets:
