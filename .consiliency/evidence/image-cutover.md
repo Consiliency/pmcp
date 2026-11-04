@@ -100,7 +100,7 @@ The curl/wget clause is the union of two detectors: the 5d416e4 detector, kept b
 - **wget options.** `--method`, `--post-data`, `--post-file`, `--body-data`, `--body-file` and any abbreviation (GNU getopt_long). A wgetrc command run by `-e`/`--execute` (`post_data=`, `method=`, ...; wgetrc ignores case, `-` and `_`) is also read.
 - **The method word.** Any value but GET or HEAD, in any letter case after quote removal, is a write; an expansion anywhere in the word counts as a write; an empty or missing word does not (`curl -X ""` exits 2).
 - **Publication spellings (R8f, R9).** `docker`, `podman` and `buildah` are refused when global options (each an option word, optionally followed by one value word) come before `push` or `image push`. As one backtracking regex this search was quadratic on a single hostile line (about 35 s for 160 KB of `docker -x `, below the work bound and then accepted; PR Consiliency/pmcp#475 F3), and so were the older `SKOPEO_DELETE` and `type=image ... push=true` patterns (on `main` too). The replacements avoid quadratic backtracking (`_ToolPush`, a right-to-left pass with binary searches, O(n log n); `_LinePair`, a linear pass per line) and checked against the old regexes on about 55,000 bounded generated texts each. The `build-smoke` load's two operands may contain only `[A-Za-z0-9_./:@+-]` and must each end at a blank or at the end of the text, so anything glued on (`;`, `&`, `|`, `$(`, a backtick or a quote) leaves `skopeo` in the remainder.
-- **PowerShell web cmdlets.** `Invoke-WebRequest`, `Invoke-RestMethod`, `iwr`, `irm`, and `curl`/`wget` as Windows PowerShell 5.1 aliases, are refused (`contains a mutating PowerShell web request`) with any `-Method` but GET or HEAD, with `-CustomMethod`/`-CM`, or with a splatted argument set (`@params`). Parameter names are case-insensitive and may be abbreviated (`-Me`, `-Cu`), and an expression for the method counts as a write. The clause scans statically named commands in every step and `defaults.run.shell` text, whatever its shell. It recognizes ASCII, en, em and horizontal-bar parameter dashes, quoted/module-qualified command names, and the tail after command-object expressions such as `& (gcm iwr)`. Dynamically constructed command names remain outside static analysis. The closing-parenthesis handling conservatively associates a following method even without an invocation operator. That covers `windows-latest`'s default `pwsh`, `shell: pwsh` and `shell: powershell` without resolving the effective shell. The reported static forms are covered; this is not a complete PowerShell evaluator. Unknown runtime state and command construction remain within the AC1 limits below.
+- **PowerShell web cmdlets.** `Invoke-WebRequest`, `Invoke-RestMethod`, `iwr`, `irm`, and `curl`/`wget` as Windows PowerShell 5.1 aliases, are refused (`contains a mutating PowerShell web request`) with any `-Method` but GET or HEAD, with `-CustomMethod`/`-CM`, or with a splatted argument set (`@params`). Parameter names are case-insensitive and may be abbreviated (`-Me`, `-Cu`), and an expression for the method counts as a write. The clause scans statically named commands in every step and `defaults.run.shell` text, whatever its shell. It recognizes ASCII, en, em and horizontal-bar parameter dashes, quoted/module-qualified command names, and the tail after command-object expressions such as `& (gcm iwr)`. Only the runtime-dependent name classes accepted in the scope ruling below remain outside static analysis; literal format/join is refused. The closing-parenthesis handling conservatively associates a following method even without an invocation operator. That covers `windows-latest`'s default `pwsh`, `shell: pwsh` and `shell: powershell` without resolving the effective shell. The reported static forms are covered; this is not a complete PowerShell evaluator. Unknown runtime state and command construction remain within the AC1 limits below.
 - **Bounded work (2026-11-03 dev0 incident).** All lexing, nested classification, rescans and lookaheads of the bash-grammar classifier for one text are charged to `_WORK_LIMIT` (250,000 characters). That budget does not cover the regex scans that run outside the classifier: the publication scans have the bounds described above, and the 5d416e4 floor, which is quadratic in a token's run of letters after its `-` (`-[A-Za-z]*X[A-Za-z]+`, about 1.5 s for 32,000 letters), is not run when such a run is longer than `_FLOOR_LETTERS_LIMIT` (1,024): the text counts as a write instead. The floor itself stays byte-identical. Each PowerShell reading has a scan budget of the same size and stops when it reaches it; at most four static readings are considered, with an input-length check before normalization. Exceeding a budget, or Python's stack depth, counts as a write. Memoisation is per call. The committed-tree regression requires every step to use less than 10% of the budget. Tests run 12 hostile, linear-size inputs (each quadratic or worse without the bound) under a 60 s timeout, with CPU-time and `tracemalloc` peak assertions. CPU time excludes time descheduled on a loaded host; wall-time timeouts are hang guards.
 - **Out of reach (AC1 and follow-ups).** Commands assembled at runtime (`eval "$X"`, an unquoted `$OPTS` that word-splits into options, aliases and functions), `-K`/`--config`, `.curlrc`/`wgetrc` files and `gh api` writes (F-F, Consiliency/pmcp#468).
 
@@ -624,14 +624,26 @@ Code `c9a8908` addresses the consolidated findings:
   positives. The `Invoke-WebRequest` GET cmdlet is distinguished from the
   `WebRequest` type.
 
-Runtime evaluation remains **proposed scope, not an approved waiver** in
-[Consiliency/pmcp#476](https://github.com/Consiliency/pmcp/issues/476): variable
-command names, format/join operators, indirect object/API invocation,
-reflection, and external profile/default/alias state. It requires an explicit
-president ruling under Consiliency/pmcp#472 before merge. Filing the issue alone
-neither disposes of a finding nor approves publishing. Reported static defects
-above are not included in that proposed deferral. There is no live PowerShell
-validation; PowerShell claims remain source-supported and unit-tested.
+The [president ruling](475-powershell-scope-ruling.md), made against
+`b324cee56843bbca2e5f81ef78c5ec4423bcb1cb`, accepts only the narrowed residual
+under [Consiliency/pmcp#476](https://github.com/Consiliency/pmcp/issues/476)
+and Consiliency/pmcp#472: unknown variables and data flow across statements
+(including a literal assigned in an earlier statement), state established
+outside the step, reflection on runtime-dependent targets, and indirect objects
+of unknown/external origin. Examples are `& $cmd`, an imported function or
+profile-established alias, and `$client.SendAsync(...)` where the object's type
+comes from external code. Existing refusals always remain in the union.
+
+Literal request APIs/constructors, in-step aliases/defaults, literal scriptblock
+bodies, fixed evaluation entry points and literal format/join expressions are
+excluded. Literal `-f`/`-join` and `[string]::Format/Join/Concat` must refuse in
+invocation/type/member positions; they are not residual. The accepted boundary
+carries to subsequent heads only without widening, and lapses if guard (c),
+token defaults or secrets allow registry/package write credentials outside
+`image.yml:promote-main`. Publication remains disabled until Consiliency/pmcp#472
+is complete. The ruling is not implementation certification or panel approval.
+This guard is **not a complete PowerShell evaluator**; no live PowerShell
+validation is available, so its semantics remain source-supported/unit-tested.
 
 The initial `fd27262` guard run had 1275 passed and two failed read controls;
 `c9a8908` corrected the overbroad `WebRequest` name match and passed all 1277.
@@ -677,4 +689,53 @@ removes this API-family check. Validation is pending in
 `/tmp/pmcp-ai-viperjuice/475-http-api-1c69b1c/` under the same isolated/capped
 conditions. Consiliency/pmcp#476 now explicitly excludes omitted fixed literal
 request primitives from automatic residual treatment; each needs a fix or an
-individual ruling. The broader proposed evaluation boundary remains unruled.
+individual ruling. The later president ruling below narrows and disposes of the evaluation boundary.
+
+### Consolidated 7af323e objections and scope implementation
+
+All four vendors delivered at `7af323e`, but Claude was explicitly incomplete;
+Codex, Grok and Gemini returned DISAGREE. No complete usable panel exists for
+that head. The president's narrow scope ruling is preserved verbatim above.
+
+Code `5bdfdf4` consolidates C12, Grok P-BOUNDARY/P-GROUP and Gemini GM-NEW-1–3:
+
+- Compound arithmetic uses the same budgeted prefix parser as `case`, retaining
+  arithmetic `for` support. Parameter heads scan balanced subscripts, skipping
+  nested expansions, quotes and escapes before locating the outer operator.
+  Tests include every value operator and nested subscript class, plus GET reads.
+- PowerShell recognizes boundaries after quotes/groups, continuations, commas
+  and parameter colons. Braced variables are lexical units inside and outside
+  expandable strings. Qualified command basenames consume their closing quote.
+  Workflow checks retain both raw and historical joined PowerShell readings.
+- Native curl/wget grouping and arrays get a budgeted additional argument
+  reading, preserving quoted contents. `.exe` is a native executable, not a
+  cmdlet alias. Original Bash readings and the exact maintenance pin remain.
+- Per the ruling, format/join at invocation/type/member sites and static
+  String.Format/Join/Concat calls refuse without evaluating expressions.
+  Fixed scriptblock/evaluation APIs, in-step alias declarations and child
+  PowerShell command/encoded-command forms also refuse conservatively.
+
+Conservative false positives include GET/HEAD format/join invocations, string
+formatting without a request, read-only aliases/evaluation, HTTP API namespace
+references (including response-only types), recognized calls with here-strings
+or expandable subexpressions, continued comments, and URL paths containing a
+refused API name such as `WebRequest`. These are refusals, not live write claims.
+The separate controls for format and join preserve the ruling's required
+independence. Additional controls cover each new lexical/entry correction.
+
+Completed intermediate checks: `1c69b1c` had 1289 guard passes, its C12 control
+killed, mypy/workflows clean. `b324cee` had 1310 guard passes and all four new
+boundary/group controls killed, mypy/workflows clean. The intervening `4509f26`
+run failed 35 tests because the new native reading also classified the pinned
+maintenance call and treated `.exe` as a cmdlet alias; those regressions were
+corrected without altering the pin or existing read tests. That run's control
+driver had malformed paths and ran no controls; it is not control evidence.
+`1a3cb00` had 1406 guard passes and clean mypy/workflows. Its live launch lacked
+`cases.py`, exited 1 without an oracle result, and is not passing evidence.
+
+The complete code `5bdfdf4` battery is running at
+`/tmp/pmcp-ai-viperjuice/475-final-5bdfdf4/` under the same detached 4 GiB cap,
+isolated HOME and prepared interpreter. It includes the complete live harness
+and 93 negative controls; completion is pending. Prior completed counts do not
+certify this new head. The standalone guard coverage command and whole-tree
+format command retain their disclosed failures; no waiver is asserted.
