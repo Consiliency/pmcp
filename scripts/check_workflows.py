@@ -1610,6 +1610,9 @@ class _ShellLexer:
         self.nested: list[str] = []
         # Here-document bodies whose expansions could not be lexed.
         self.unlexed: list[str] = []
+        # Brace expansion may make a command longer. These readings share
+        # the work budget but are not restricted to shorter nested texts.
+        self.braced: list[str] = []
         # Here-documents waiting for the next newline: delimiter, <<-, expands.
         self.heredocs: list[tuple[str, bool, bool]] = []
 
@@ -1630,6 +1633,8 @@ class _ShellLexer:
         depth = 0
         # One [state, depth] per open case: "head", "pattern" or "body".
         cases: list[list[Any]] = []
+        raw_words: list[str] = []
+        raw_start = pos
 
         def finish_word() -> None:
             nonlocal word, command, redirect
@@ -1651,6 +1656,7 @@ class _ShellLexer:
             elif reserved == "esac" and not command and cases:
                 cases.pop()
             command.append(current)
+            raw_words.append(s[raw_start:pos])
             if (
                 reserved == "in"
                 and cases
@@ -1660,6 +1666,7 @@ class _ShellLexer:
                 cases[-1][0] = "pattern"
                 self.commands.append(command)
                 command = []
+                raw_words.clear()
 
         def finish_command() -> None:
             nonlocal command, redirect
@@ -1667,9 +1674,20 @@ class _ShellLexer:
             redirect = None
             if command:
                 self.commands.append(command)
+                expanded = [_brace_expand(raw, self.work) for raw in raw_words]
+                if any(parts != [raw] for raw, parts in zip(raw_words, expanded)):
+                    self.work.spend(
+                        sum(len(part) + 1 for parts in expanded for part in parts)
+                    )
+                    self.braced.append(
+                        " ".join(part for parts in expanded for part in parts)
+                    )
             command = []
+            raw_words.clear()
 
         while pos < n:
+            if not word.started:
+                raw_start = pos
             char = s[pos]
             if char == "\n":
                 finish_command()
@@ -1843,7 +1861,10 @@ class _ShellLexer:
             if lead is not None and lead["op"] in _VALUE_OPERATORS:
                 operand = lead.end()
             value = _Word()
-            end = self.parameter(pos + 2, quoted, value, operand)
+            operand_quoted = quoted and not (
+                lead is not None and (lead["op"] or "").startswith("/")
+            )
+            end = self.parameter(pos + 2, operand_quoted, value, operand)
             content = s[pos + 2 : end - 1]
             head = _PARAMETER_HEAD.match(content)
             self.nested.append(content[head.end() :] if head else content)
@@ -1892,7 +1913,11 @@ class _ShellLexer:
             elif char == '"':
                 pos = self.double_quoted(pos + 1, into)
             elif char == "$":
-                pos = self.dollar(pos, into, quoted=True)
+                # bash's default extquote decodes ANSI-C and locale quotes
+                # in parameter operands even inside an outer double quote.
+                # Nested parameters still inherit the actual quoting context.
+                extended_quote = s[pos + 1 : pos + 2] in ("'", '"')
+                pos = self.dollar(pos, into, quoted=quoted and not extended_quote)
             elif char == "`":
                 pos = self.backtick(pos, into)
             else:
@@ -2199,6 +2224,100 @@ def _unlexed_writes(text: str, work: _Work) -> bool:
     return False
 
 
+_BRACE_SEQUENCE = re.compile(
+    r"(-?[0-9]+|[a-zA-Z])\.\.(-?[0-9]+|[a-zA-Z])(?:\.\.(-?[0-9]+))?"
+)
+
+
+def _brace_expand(raw: str, work: _Work) -> list[str]:
+    """Expand a shell word's unquoted brace lists/sequences before lexing it.
+
+    Quoting and parameter operands are skipped as units: braces produced by
+    parameter expansion do not undergo brace expansion. Every scan and every
+    output allocation is charged, including Cartesian products and ranges.
+    The original command is classified separately, so this only adds refusals.
+    """
+    if "{" not in raw:
+        return [raw]
+    work.spend(len(raw))
+    lexer = _ShellLexer(raw, work)
+    stack: list[tuple[int, list[int]]] = []
+    sites: list[tuple[int, int, list[int]]] = []
+    pos = 0
+    while pos < len(raw):
+        char = raw[pos]
+        if char == "\\":
+            pos += 2
+            continue
+        if char == "'":
+            close = raw.find("'", pos + 1)
+            if close < 0:
+                return [raw]
+            pos = close + 1
+            continue
+        if char in ('"', "$", "`"):
+            scratch = _Word()
+            try:
+                if char == '"':
+                    pos = lexer.double_quoted(pos + 1, scratch)
+                elif char == "$":
+                    pos = lexer.dollar(pos, scratch, quoted=False)
+                else:
+                    pos = lexer.backtick(pos, scratch)
+            except _Unlexable:
+                return [raw]
+            continue
+        if char == "{":
+            stack.append((pos, []))
+        elif char == "," and stack:
+            stack[-1][1].append(pos)
+        elif char == "}" and stack:
+            start, commas = stack.pop()
+            sites.append((start, pos, commas))
+        pos += 1
+    # Outer lists must expand before their children, preserving bash's order.
+    for start, end, commas in sorted(sites):
+        work.spend(end - start)
+        body = raw[start + 1 : end]
+        choices: list[str]
+        if commas:
+            boundaries = [start, *commas, end]
+            choices = [raw[a + 1 : b] for a, b in zip(boundaries, boundaries[1:])]
+        else:
+            sequence = _BRACE_SEQUENCE.fullmatch(body)
+            if sequence is None:
+                continue
+            first, last, increment = sequence.groups()
+            numeric = first.lstrip("-").isdigit() and last.lstrip("-").isdigit()
+            if not numeric and not (first.isalpha() and last.isalpha()):
+                continue
+            # Refuse oversized integers before converting or allocating a range.
+            if any(len(value) > 10 for value in (first, last, increment or "")):
+                raise _OverBudget
+            left, right = (
+                (int(first), int(last)) if numeric else (ord(first), ord(last))
+            )
+            stride = abs(int(increment or "1")) or 1
+            count = abs(right - left) // stride + 1
+            work.spend(count * (len(raw) + 1))
+            step = stride if left <= right else -stride
+            values = range(left, right + (1 if step > 0 else -1), step)
+            padded = numeric and any(
+                value.lstrip("-").startswith("0") for value in (first, last)
+            )
+            width = max(len(first), len(last)) if padded else 0
+            choices = [
+                str(value).zfill(width) if numeric else chr(value) for value in values
+            ]
+        result: list[str] = []
+        for choice in choices:
+            work.spend(start + len(choice) + len(raw) - end)
+            replacement = raw[:start] + choice + raw[end + 1 :]
+            result.extend(_brace_expand(replacement, work))
+        return result
+    return [raw]
+
+
 def _classify(text: str, work: _Work) -> bool:
     if text in work.seen:
         # Classified earlier in this call, and found no write (a write ends it).
@@ -2211,6 +2330,8 @@ def _classify(text: str, work: _Work) -> bool:
         return True
     unlexed = lexer.unlexed if complete else [*lexer.unlexed, text]
     if any(_unlexed_writes(chunk, work) for chunk in unlexed):
+        return True
+    if any(_classify(expanded, work) for expanded in lexer.braced):
         return True
     # Every nested text is strictly shorter, so the recursion ends.
     return any(

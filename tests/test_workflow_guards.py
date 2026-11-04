@@ -2452,6 +2452,74 @@ EXPANSION_WORD_ACCEPTED_FALSE_POSITIVES = {
 }
 
 
+class TestParameterQuotesAndBraces:
+    @pytest.mark.parametrize(
+        "tool",
+        [
+            "${X:-$'cu'rl}",
+            "\"${X:-$'cu'rl}\"",
+            r"${X:-$'\x63url'}",
+            '${X:-$"cu"rl}',
+            "${X:-${Y:-'cu'rl}}",
+            "\"${X/#/'cu'rl}\"",
+            "{cu,}rl",
+            "{cu,{x,}}rl",
+            "c{u..u}rl",
+            "{wge,}t",
+        ],
+    )
+    def test_write_and_read(self, tool: str) -> None:
+        write_option = "--post-data=x" if "wge" in tool else "-d@report.json"
+        assert cw._http_writes(f'{tool} {write_option} "$URL"')
+        assert not cw.mutating_http(f'{tool} "$URL"')
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{curl,-sd@report.json} "$URL"',
+            'curl -s {-d@report.json,"$URL"}',
+            '{curl,-X,POST} "$URL"',
+            '{wget,--post-data=x} "$URL"',
+            'curl --{data,output}=report.json "$URL"',
+        ],
+    )
+    def test_braces_supply_arguments(self, text: str) -> None:
+        assert cw._http_writes(text)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{curl,-s} -o /dev/null "$URL"',
+            'curl -s {-o/dev/null,"$URL"}',
+            '{curl,-X,GET} "$URL"',
+        ],
+    )
+    def test_brace_reads(self, text: str) -> None:
+        assert not cw.mutating_http(text)
+
+    @pytest.mark.parametrize(
+        ("word", "expected"),
+        [
+            ("a{b,c}{d,e}", ["abd", "abe", "acd", "ace"]),
+            ("{a,{b,c}}", ["a", "b", "c"]),
+            ("x{03..01}", ["x03", "x02", "x01"]),
+            ("{d..a..2}", ["d", "b"]),
+            (r"a\{b,c\}", [r"a\{b,c\}"]),
+            ('a"{b,c}"', ['a"{b,c}"']),
+            ("${X:-{a,b}}", ["${X:-{a,b}}"]),
+            ("{a}", ["{a}"]),
+        ],
+    )
+    def test_order_and_quote_protection(self, word: str, expected: list[str]) -> None:
+        assert cw._brace_expand(word, cw._Work()) == expected
+
+    @pytest.mark.parametrize(
+        "word", ["{a,b}" * 30, "{1..999999999}", "{1.." + "9" * 50 + "}"]
+    )
+    def test_expansion_budget_fails_closed(self, word: str) -> None:
+        assert cw._http_writes("echo " + word)
+
+
 class TestExpansionBuiltCommandWords:
     """PR Consiliency/pmcp#475 F1/F2: the tool word as bash may build it."""
 
