@@ -1332,6 +1332,8 @@ _REDIRECTIONS = (
 )
 # bash's control operators, longest first.
 _CONTROL_OPERATORS = (";;&", ";;", ";&", "||", "|&", "&&", ";", "&", "|")
+# Characters with no special meaning to the lexer once a word has started.
+_ORDINARY_RUN = re.compile(r"[^ \t\n'\"\\$`<>&;|()]+")
 _REDIRECTED_FD = re.compile(r"[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\}")
 _SIMPLE_PARAMETER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]")
 # The parameter name and operator that open ${...}; the rest is a word.
@@ -1567,7 +1569,11 @@ class _ShellLexer:
                 end = self.parse(pos + 2, closer=True)
                 pos = self.expansion(word, pos, end)
                 continue
-            op = next((o for o in _REDIRECTIONS if s.startswith(o, pos)), None)
+            op = (
+                next((o for o in _REDIRECTIONS if s.startswith(o, pos)), None)
+                if char in "<>&"
+                else None
+            )
             if op is not None:
                 if (
                     word.started
@@ -1581,7 +1587,11 @@ class _ShellLexer:
                 redirect = op
                 pos += len(op)
                 continue
-            op = next((o for o in _CONTROL_OPERATORS if s.startswith(o, pos)), None)
+            op = (
+                next((o for o in _CONTROL_OPERATORS if s.startswith(o, pos)), None)
+                if char in ";&|"
+                else None
+            )
             if op is not None:
                 finish_command()
                 if op in (";;", ";&", ";;&") and cases and cases[-1][1] == depth:
@@ -1615,8 +1625,11 @@ class _ShellLexer:
                 elif closer:
                     return pos
                 continue
-            word.add(char)
-            pos += 1
+            # A run of ordinary characters, added at once.
+            run = _ORDINARY_RUN.match(s, pos)
+            end = run.end() if run else pos + 1
+            word.add(s[pos:end])
+            pos = end
         if closer:
             raise _Unlexable
         finish_command()
