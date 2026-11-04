@@ -99,9 +99,9 @@ The curl/wget clause is the union of two detectors: the 5d416e4 detector, kept b
 - **curl options.** In a short group, `#`, `:` and digits are option letters, so the scan continues past them; `d`, `F` or `T` imply a method, and `X` takes the rest of the word or the next word. A value-taking letter (`AbcCdDeEFHKmoPQrtTuUwxXyYz`) ends the group, so `-#fLo` stays a read. Long options: `--request`, and names starting with `--data`, `--form`, `--json` or `--upload-file`, each also as `--expand-<name>` (curl 8.3.0+) and as any abbreviation of those names.
 - **wget options.** `--method`, `--post-data`, `--post-file`, `--body-data`, `--body-file` and any abbreviation (GNU getopt_long). A wgetrc command run by `-e`/`--execute` (`post_data=`, `method=`, ...; wgetrc ignores case, `-` and `_`) is also read.
 - **The method word.** Any value but GET or HEAD, in any letter case after quote removal, is a write; an expansion anywhere in the word counts as a write; an empty or missing word does not (`curl -X ""` exits 2).
-- **Publication spellings (R8f, R9).** `docker`, `podman` and `buildah` are refused when global options (each an option word, optionally followed by one value word) come before `push` or `image push`. As one backtracking regex this search was quadratic on a single hostile line (about 35 s for 160 KB of `docker -x `, below the work bound and then accepted; PR Consiliency/pmcp#475 F3), and so were the older `SKOPEO_DELETE` and `type=image ... push=true` patterns (on `main` too). All four are now decided in linear time (`_ToolPush`, a right-to-left pass over blank-separated runs; `_LinePair`, one pass per line) and checked against the old regexes on about 55,000 bounded generated texts each. The `build-smoke` load's two operands may contain only `[A-Za-z0-9_./:@+-]` and must each end at a blank or at the end of the text, so anything glued on (`;`, `&`, `|`, `$(`, a backtick or a quote) leaves `skopeo` in the remainder.
-- **PowerShell web cmdlets.** `Invoke-WebRequest`, `Invoke-RestMethod`, `iwr`, `irm`, and `curl`/`wget` as Windows PowerShell 5.1 aliases, are refused (`contains a mutating PowerShell web request`) with any `-Method` but GET or HEAD, with `-CustomMethod`/`-CM`, or with a splatted argument set (`@params`). Parameter names are case-insensitive and may be abbreviated (`-Me`, `-Cu`), and an expression for the method counts as a write. The clause fails closed: it reads every step and `defaults.run.shell` text, whatever its shell. That covers `windows-latest`'s default `pwsh`, `shell: pwsh` and `shell: powershell` without resolving the effective shell. It flags nothing in the committed tree, so it is not recorded as an AC1 residual.
-- **Bounded work (2026-11-03 dev0 incident).** All lexing, nested classification, rescans and lookaheads of the bash-grammar classifier for one text are charged to `_WORK_LIMIT` (250,000 characters). That budget does not cover the regex scans that run outside the classifier: the publication patterns are linear (above), and the 5d416e4 floor, which is quadratic in a token's run of letters after its `-` (`-[A-Za-z]*X[A-Za-z]+`, about 1.5 s for 32,000 letters), is not run when such a run is longer than `_FLOOR_LETTERS_LIMIT` (1,024): the text counts as a write instead. The floor itself stays byte-identical. The PowerShell scan has its own budget of the same size and stops scanning when it reaches it. Exceeding a budget, or Python's stack depth, counts as a write. Memoisation is per call. The largest committed step uses 10,677 characters of the budget (about 4%). Tests run 12 hostile, linear-size inputs (each quadratic or worse without the bound) under a 60 s timeout, with wall-clock and `tracemalloc` peak assertions.
+- **Publication spellings (R8f, R9).** `docker`, `podman` and `buildah` are refused when global options (each an option word, optionally followed by one value word) come before `push` or `image push`. As one backtracking regex this search was quadratic on a single hostile line (about 35 s for 160 KB of `docker -x `, below the work bound and then accepted; PR Consiliency/pmcp#475 F3), and so were the older `SKOPEO_DELETE` and `type=image ... push=true` patterns (on `main` too). The replacements avoid quadratic backtracking (`_ToolPush`, a right-to-left pass with binary searches, O(n log n); `_LinePair`, a linear pass per line) and checked against the old regexes on about 55,000 bounded generated texts each. The `build-smoke` load's two operands may contain only `[A-Za-z0-9_./:@+-]` and must each end at a blank or at the end of the text, so anything glued on (`;`, `&`, `|`, `$(`, a backtick or a quote) leaves `skopeo` in the remainder.
+- **PowerShell web cmdlets.** `Invoke-WebRequest`, `Invoke-RestMethod`, `iwr`, `irm`, and `curl`/`wget` as Windows PowerShell 5.1 aliases, are refused (`contains a mutating PowerShell web request`) with any `-Method` but GET or HEAD, with `-CustomMethod`/`-CM`, or with a splatted argument set (`@params`). Parameter names are case-insensitive and may be abbreviated (`-Me`, `-Cu`), and an expression for the method counts as a write. The clause scans statically named commands in every step and `defaults.run.shell` text, whatever its shell. It recognizes ASCII, en, em and horizontal-bar parameter dashes, quoted/module-qualified command names, and the tail after command-object expressions such as `& (gcm iwr)`. Dynamically constructed command names remain outside static analysis. The closing-parenthesis handling conservatively associates a following method even without an invocation operator. That covers `windows-latest`'s default `pwsh`, `shell: pwsh` and `shell: powershell` without resolving the effective shell. It flags nothing in the committed tree, so it is not recorded as an AC1 residual.
+- **Bounded work (2026-11-03 dev0 incident).** All lexing, nested classification, rescans and lookaheads of the bash-grammar classifier for one text are charged to `_WORK_LIMIT` (250,000 characters). That budget does not cover the regex scans that run outside the classifier: the publication scans have the bounds described above, and the 5d416e4 floor, which is quadratic in a token's run of letters after its `-` (`-[A-Za-z]*X[A-Za-z]+`, about 1.5 s for 32,000 letters), is not run when such a run is longer than `_FLOOR_LETTERS_LIMIT` (1,024): the text counts as a write instead. The floor itself stays byte-identical. The PowerShell scan has its own budget of the same size and stops scanning when it reaches it. Exceeding a budget, or Python's stack depth, counts as a write. Memoisation is per call. The committed-tree regression requires every step to use less than 10% of the budget. Tests run 12 hostile, linear-size inputs (each quadratic or worse without the bound) under a 60 s timeout, with CPU-time and `tracemalloc` peak assertions. CPU time excludes time descheduled on a loaded host; wall-time timeouts are hang guards.
 - **Out of reach (AC1 and follow-ups).** Commands assembled at runtime (`eval "$X"`, an unquoted `$OPTS` that word-splits into options, aliases and functions), `-K`/`--config`, `.curlrc`/`wgetrc` files and `gh api` writes (F-F, Consiliency/pmcp#468).
 
 The committed tree's classification is unchanged. All 117 step and `defaults.run.shell` texts lex completely, only `maintenance.yml:notify-worker` is flagged (and exempt by its unchanged pin), and the PowerShell clause flags none of them.
@@ -490,3 +490,43 @@ bounded instability or a readback order violation) halts the step, which is reta
     writes. The owner records who receives `image-watch.yml` failure notifications.
 11. **Post-enable:** read back the first promotion. From then on, D3 follows the 5.3 outcome rule (every `DISCREPANCY` run and the second consecutive scheduled `INCOMPLETE`) and every unexpected digest; a single `INCOMPLETE` is retaken by a `workflow_dispatch` run on `main`, without D3. At every release cut and owner review, confirm that the latest `schedule` run of `image-watch.yml` on `main` is at most 8 days old (5.3 liveness; dispatch runs do not count), and repeat the step-1 retention read; if `days` changed, refresh `retention.json` by an owner PR.
 12. **Tag mode:** a tag caller needs its own reviewed PR, which inherits D1 and adds no alias movement.
+
+### Four-vendor review corrections (PR Consiliency/pmcp#475)
+
+At `9a9cfb6`, Claude, Codex and Grok returned DISAGREE. Gemini could not
+start because the approved model had no server capacity; this is an incomplete
+panel, not approval. The owner authorized T3-managed review orchestration only.
+
+Code head `748fad0` addresses the consolidated findings:
+
+- G1/C2/F-OPT: expanded argument words now get bounded join/split shape readings,
+  including whole default operands, nested quotes, substitution replacements,
+  and mixed joins and splits. Literal/original readings remain in the union.
+  An unknown runtime value alone still remains AC1. Read options retain their
+  negative controls. Candidate products are charged before allocation.
+- C1: ANSI-C zero escapes truncate their quoted segment; text outside the quote
+  still concatenates. Octal, hexadecimal, Unicode and control-zero spellings
+  have direct and parameter-context tests. A NUL no longer aliases the internal
+  expansion marker.
+- G2/C3: static PowerShell command-object invocations and Unicode parameter
+  dashes are recognized as described above. Unit tests cover GET, PUT and
+  CustomMethod. No PowerShell runtime is installed on the validation hosts;
+  these semantics remain specification-supported, not live-validated.
+- Nested expansion slices and quoted joins charge before copying. Brace source
+  spans are retained without copying until a command contains an unquoted brace
+  candidate; the existing 10% committed-tree budget assertion stays unchanged.
+  Process substitutions are skipped as units by the brace scan.
+
+Accepted conservative refusals: curl 8.5 rejects `--request=PUT`, but an expanded
+option with that spelling is flagged. Bash 5.2 consumes the remaining parameter
+text after an ANSI-C NUL inside a double-quoted parameter; the guard retains the
+outside-quote concatenation reading and flags it. The loopback oracle records
+these nine cases explicitly as false positives, rather than claiming they sent
+writes. Existing false positives and runtime residuals remain documented above.
+
+The initial `7020580` and `5c5411c` runs completed with 1131 passed and one failed
+committed-tree work-margin assertion. `5c5411c` also exposed the nine oracle
+expectation differences just described. Neither run is cited as passing. At
+`748fad0`, the initial guard run has 1132 passed and the loopback oracle has 241
+texts with no disagreements after explicitly classifying those refusals.
+Full-battery results follow separately; panel approval remains outstanding.
