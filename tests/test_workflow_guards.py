@@ -2536,6 +2536,32 @@ class TestPanelGrammarCorrections:
     def test_reads_stay_reads(self, text: str) -> None:
         assert not cw.mutating_http(text)
 
+    def test_unlexable_remainder_preserves_glue(self) -> None:
+        assert cw._http_writes('curl$IFS-${E}dx "$URL')
+
+    @pytest.mark.parametrize(
+        "tool,tail",
+        [
+            ("docker", "push x"),
+            ("podman", "push x"),
+            ("buildah", "push x"),
+            ("skopeo", "delete x"),
+        ],
+    )
+    @pytest.mark.parametrize("location", ["run", "job-shell", "workflow-shell"])
+    def test_publication_continuations(
+        self, tool: str, tail: str, location: str
+    ) -> None:
+        text = tool[:2] + "\\\n" + tool[2:] + " " + tail
+        doc: dict[str, Any] = {"jobs": {"probe": {"steps": [{"run": "true"}]}}}
+        if location == "run":
+            doc["jobs"]["probe"]["steps"][0]["run"] = text
+        else:
+            node = doc if location == "workflow-shell" else doc["jobs"]["probe"]
+            node["defaults"] = {"run": {"shell": text}}
+        reasons = cw.image_publication_invariants({"probe.yml": doc})
+        assert any(tool in reason for reason in reasons)
+
 
 class TestPanelPowerShellQuoting:
     @pytest.mark.parametrize("opening", list("'‘’‚‛"))
@@ -2586,6 +2612,23 @@ class TestPanelPowerShellQuoting:
             + method
             + "'; Invoke-RestMethod -Uri $u"
         )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "& ('Invoke-Rest'+'Method')",
+            "& ('Inv' + 'oke-Rest' + 'Method')",
+        ],
+    )
+    def test_literal_concatenated_names(self, command: str) -> None:
+        assert cw.mutating_powershell_http(command + " -Method Put")
+        assert not cw.mutating_powershell_http(command + " -Method Get")
+
+    @pytest.mark.parametrize(
+        "type_name", ["System.Net.WebClient", "System.Net.Http.HttpClient"]
+    )
+    def test_dotnet_clients_are_conservatively_refused(self, type_name: str) -> None:
+        assert cw.mutating_powershell_http("$client = New-Object " + type_name)
 
 
 class TestPanelOptionAndNulFindings:

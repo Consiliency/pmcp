@@ -1233,7 +1233,7 @@ SKOPEO_SMOKE_LOAD = re.compile(
 class _ToolPush:
     """``\\b<tool>(?:\\s+-\\S*(?:\\s+VALUE)?)*\\s+(?:image\\s+)?push\\b``, where
     VALUE is ``"[^"\\n]*"``, ``'[^'\\n]*'`` or ``[^\\s"'-]\\S*``, decided in
-    linear time.
+    O(n log n) time.
 
     Global options before a container tool's subcommand: each an option word,
     optionally followed by one value word (docker --config DIR, -H URL,
@@ -2319,6 +2319,12 @@ def _unlexed_writes(text: str, work: _Work) -> bool:
         if not any(word.expanded for word in args):
             continue
         work.spend(len(text) - match.end())
+        shapes = [
+            _Word(_FALLBACK_EXPANSION.sub(_MARK, token), expanded=True)
+            for token in rest
+        ]
+        if _command_writes([_Word(match[1].lower()), *shapes], work):
+            return True
         split = [
             _Word(part, expanded=True)
             for token in rest
@@ -2646,13 +2652,20 @@ def mutating_powershell_http(text: str) -> bool:
     # Do not try to evaluate configuration assignments or their later scope.
     if re.search(r"\$PSDefaultParameterValues\b", text, re.IGNORECASE):
         return True
+    if re.search(r"\b(?:WebClient|HttpClient)\b", text, re.IGNORECASE):
+        return True
     if _powershell_http_reading(text):
         return True
     normalized = text.translate(_PWSH_QUOTES)
     if normalized != text and _powershell_http_reading(normalized):
         return True
     unescaped = re.sub(r"`(?=[A-Za-z-])", "", normalized)
-    return unescaped != normalized and _powershell_http_reading(unescaped)
+    if unescaped != normalized and _powershell_http_reading(unescaped):
+        return True
+    # Static string concatenation in a call expression: retain the original
+    # readings, then join adjacent literal fragments conservatively.
+    joined = re.sub(r"['\"]\s*\+\s*['\"]", "", unescaped)
+    return joined != unescaped and _powershell_http_reading(joined)
 
 
 def _powershell_http_reading(text: str) -> bool:
@@ -2994,17 +3007,20 @@ def image_publication_invariants(
         for where_name, shell in shells:
             if shell is None:
                 continue
+            shell_texts = [shell, shell.replace("\\\n", "")]
             where = f"{name}:{where_name} defaults.run.shell"
             hits = [
                 label
                 for label, pattern in PUBLICATION_PATTERNS.items()
-                if pattern.search(shell)
+                if any(pattern.search(reading) for reading in shell_texts)
             ]
             if mutating_http(shell):
                 hits.append(MUTATING_HTTP_LABEL)
             if mutating_powershell_http(shell):
                 hits.append(MUTATING_PWSH_LABEL)
-            if re.search(r"skopeo", shell, re.IGNORECASE):
+            if any(
+                re.search(r"skopeo", reading, re.IGNORECASE) for reading in shell_texts
+            ):
                 hits.append("skopeo")
             reasons.extend(f"{tag} {where} contains {label}" for label in hits)
         for job_name, job in _jobs(doc).items():
@@ -3014,8 +3030,12 @@ def image_publication_invariants(
             http_exempt = pinned is not None and job_pin(job) == pinned
             for step in _steps(job):
                 text = _step_text(step)
+                # Preserve legacy scans and add Bash's empty continuation
+                # removal for publication tool names and subcommands too.
+                continued = _raw_step_text(step).replace("\\\n", "")
+                texts = [text] if continued == text else [text, continued]
                 where = f"{name}:{job_name}"
-                if SKOPEO_DELETE.search(text):
+                if any(SKOPEO_DELETE.search(reading) for reading in texts):
                     reasons.append(f"{tag} {where} runs skopeo delete")
                 if promote:
                     continue
@@ -3029,7 +3049,7 @@ def image_publication_invariants(
                         f"{tag} {where} build-push-action push: is not literally false"
                     )
                 for label, pattern in PUBLICATION_PATTERNS.items():
-                    if pattern.search(text):
+                    if any(pattern.search(reading) for reading in texts):
                         reasons.append(f"{tag} {where} contains {label}")
                 if not http_exempt and (
                     mutating_http(text) or mutating_http(_raw_step_text(step))
@@ -3037,7 +3057,10 @@ def image_publication_invariants(
                     reasons.append(f"{tag} {where} contains {MUTATING_HTTP_LABEL}")
                 if mutating_powershell_http(text):
                     reasons.append(f"{tag} {where} contains {MUTATING_PWSH_LABEL}")
-                remaining = SKOPEO_SMOKE_LOAD.sub("", text) if smoke_job else text
+                remaining = "\n".join(
+                    SKOPEO_SMOKE_LOAD.sub("", reading) if smoke_job else reading
+                    for reading in texts
+                )
                 if re.search(r"skopeo", remaining, re.IGNORECASE):
                     reasons.append(
                         f"{tag} {where} uses skopeo outside the pinned local load in build-smoke"
