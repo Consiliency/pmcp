@@ -1607,6 +1607,7 @@ class _ShellLexer:
     def __init__(self, text: str, work: _Work | None = None) -> None:
         self.s = text
         self.n = len(text)
+        self.has_braces = "{" in text
         self.work = _Work() if work is None else work
         self.commands: list[list[_Word]] = []
         # Text that may itself run as commands: quoted parts, comments,
@@ -1660,7 +1661,11 @@ class _ShellLexer:
             elif reserved == "esac" and not command and cases:
                 cases.pop()
             command.append(current)
-            raw_words.append(s[raw_start:pos])
+            if self.has_braces:
+                # Nested command substitutions can copy overlapping source
+                # spans. Charge before slicing, not after building all words.
+                self.work.spend(pos - raw_start)
+                raw_words.append(s[raw_start:pos])
             if (
                 reserved == "in"
                 and cases
