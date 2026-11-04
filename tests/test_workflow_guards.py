@@ -3156,6 +3156,18 @@ class TestPowerShellWebCmdlets:
 
 
 PANEL_FINAL_PS_WRITES = {
+    "continued-comment": "Invoke-RestMethod -Uri $env:URL `\n# it's a note\n-Method Put -InFile f",
+    "continued-here": "Invoke-RestMethod -Uri $env:URL -Body `\n@'\nit's\n'@ -Method Put",
+    "quote-block": "Invoke-RestMethod -Uri 'http://example.invalid'<# it's #> -Method Put -InFile f",
+    "group-block": "Invoke-RestMethod -Uri ('http://example.invalid')<# it's #> -Method Put -InFile f",
+    "native-group-short": 'curl ("-d") x $env:URL',
+    "native-group-long": "curl ('--data') x $env:URL",
+    "native-smart-group": "curl (“-d”) x $env:URL",
+    "native-array": "curl @('-d','x',$env:URL)",
+    "native-nested-group": "curl.exe ((('-d'))) x $env:URL",
+    "native-array-method": "curl.exe @('-X','PUT',$env:URL)",
+    "native-wget-group": "wget.exe ('--post-data=x') $env:URL",
+    "native-wget-array": "wget @('--method','PUT',$env:URL)",
     "C12-literal-invoker": "([System.Net.Http.HttpMessageInvoker]::new([System.Net.Http.SocketsHttpHandler]::new())).SendAsync([System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, 'http://127.0.0.1:9/review'), [System.Threading.CancellationToken]::None).GetAwaiter().GetResult()",
     "H1-hash-in-url": "Invoke-RestMethod -Uri https://example.invalid/p#frag -Method Put -InFile f",
     "H1b-hash-iwr": "Invoke-WebRequest -Uri http://h.invalid/#/x -Method Post -Body x",
@@ -3178,6 +3190,27 @@ PANEL_FINAL_PS_WRITES = {
 
 
 class TestPanelFinalRegressions:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Invoke-RestMethod -Uri 'http://example.invalid'<# it's #> -Method Get",
+            "Invoke-RestMethod -Uri ('http://example.invalid')<# it's #> -Method Get",
+            "Invoke-RestMethod -Uri 'http://example.invalid'# -Method Put",
+            'curl ("-o") /dev/null $env:URL',
+            "curl.exe @('--output','/dev/null',$env:URL)",
+            "curl.exe @('-X','GET',$env:URL)",
+            "wget @('--method','GET',$env:URL)",
+            "curl ('-o') ('a,b') $env:URL",
+        ],
+    )
+    def test_native_group_and_boundary_reads(self, text: str) -> None:
+        assert not cw.mutating_powershell_http(text)
+
+    def test_continued_comment_read_is_conservative_refusal(self) -> None:
+        assert cw.mutating_powershell_http(
+            "Invoke-RestMethod -Uri $env:URL `\n# it's a note\n-Method Get -InFile f"
+        )
+
     @pytest.mark.parametrize(
         "reference",
         [

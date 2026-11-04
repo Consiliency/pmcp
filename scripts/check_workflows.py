@@ -2577,7 +2577,7 @@ def _floor_input_is_bounded(text: str) -> bool:
 MUTATING_PWSH_LABEL = "a mutating PowerShell web request"
 _PWSH_WEB = re.compile(
     r"(?<![\w.$-])(?:[\w.-]+\\)?"
-    r"(?:invoke-webrequest|invoke-restmethod|iwr|irm|curl|wget)(?![\w.-])",
+    r"(?:invoke-webrequest|invoke-restmethod|iwr|irm|(?:curl|wget)(?:\.exe)?)(?![\w.-])",
     re.IGNORECASE,
 )
 _PWSH_PARAMETER = re.compile(r"[-\u2013\u2014\u2015]([A-Za-z]+)(:.*)?", re.DOTALL)
@@ -2611,7 +2611,11 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
             # refuse rather than expose its body as command syntax.
             raise _UnmodelledExpansion
         if char == "`":
-            at_token_start = False
+            at_token_start = text[pos + 1 : pos + 2] == "\n"
+            if at_token_start and re.compile(r"[ \t]*#").match(text, pos + 2, n):
+                # Continued comments have ambiguous statement association in
+                # this abstraction. Refuse, including read-only calls.
+                raise _UnmodelledExpansion
             if text[pos + 1 : pos + 2] not in ("", "\n"):
                 token.append(text[pos + 1])
             pos += 2
@@ -2629,6 +2633,7 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
                     break
                 end += 2 if char == '"' and text[end] == "`" else 1
             token.append(text[pos : end + 1])
+            at_token_start = True
             pos = end + 1
             continue
         if char in "({[":
@@ -2655,12 +2660,56 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
             at_token_start = True
             pos += 1
             continue
-        at_token_start = char.isspace() or char in "({[;|"
+        at_token_start = char.isspace() or char in "(){}[];|"
         token.append(char)
         pos += 1
     if token:
         tokens.append("".join(token))
     return tokens, pos
+
+
+def _pwsh_native_arguments(args: list[str]) -> list[_Word]:
+    """Additional native-tool reading: group/array delimiters separate values.
+
+    This is a conservative lexical reading, not expression evaluation. Quotes
+    preserve their contents and adjacent fragments concatenate. Original Bash
+    and cmdlet readings remain in the union. The caller charges input first.
+    """
+    words: list[_Word] = []
+    for arg in args:
+        value: list[str] = []
+        pos = 0
+        while pos < len(arg):
+            char = arg[pos]
+            if char in "'\"":
+                quote = char
+                pos += 1
+                while pos < len(arg):
+                    char = arg[pos]
+                    if char == quote:
+                        if arg[pos : pos + 2] == quote * 2:
+                            value.append(quote)
+                            pos += 2
+                            continue
+                        pos += 1
+                        break
+                    if quote == '"' and char == "`" and pos + 1 < len(arg):
+                        pos += 1
+                        char = arg[pos]
+                    value.append(char)
+                    pos += 1
+                continue
+            if char.isspace() or char in "()," or arg.startswith("@(", pos):
+                if value:
+                    words.append(_Word("".join(value)))
+                    value = []
+                pos += 2 if arg.startswith("@(", pos) else 1
+                continue
+            value.append(char)
+            pos += 1
+        if value:
+            words.append(_Word("".join(value)))
+    return words
 
 
 def _pwsh_method_writes(value: str) -> bool:
@@ -2766,6 +2815,14 @@ def _powershell_http_reading(text: str) -> bool:
         spent += end - match.end() + 1
         if spent > _WORK_LIMIT:
             return True
+        native = match[0].lower().rsplit("\\", 1)[-1].removesuffix(".exe")
+        if native in {"curl", "wget"}:
+            spent += sum(len(arg) for arg in args)
+            if spent > _WORK_LIMIT:
+                return True
+            native_args = _pwsh_native_arguments(args)
+            if (_curl_writes if native == "curl" else _wget_writes)(native_args):
+                return True
         for index, token in enumerate(args):
             if re.fullmatch(r"@[A-Za-z_]\w*", token):
                 return True
