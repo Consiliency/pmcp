@@ -3226,6 +3226,32 @@ PANEL_FINAL_PS_WRITES = {
 
 
 class TestPanelFinalRegressions:
+    @pytest.mark.parametrize("dash", ["-", "–", "—", "―"])
+    @pytest.mark.parametrize("operator", ["f", "join"])
+    @pytest.mark.parametrize(
+        "site", ["& ({})", "& $({})", '& "$({})"', ". ({})", ". $({})"]
+    )
+    @pytest.mark.parametrize("method", ["Put", "Get"])
+    def test_literal_operator_tokens_and_invocation_sites(
+        self, dash: str, operator: str, site: str, method: str
+    ) -> None:
+        expression = (
+            "'Invoke-{0}'" + dash + "f'RestMethod'"
+            if operator == "f"
+            else "('Invoke-','RestMethod')" + dash + "join''"
+        )
+        text = site.format(expression) + " -Method " + method + " -Uri $u"
+        # GET is a documented conservative refusal of expression-built names.
+        assert cw.mutating_powershell_http(text)
+        docs = {
+            "probe.yml": {
+                "jobs": {"probe": {"steps": [{"shell": "pwsh", "run": text}]}}
+            }
+        }
+        assert any(
+            cw.MUTATING_PWSH_LABEL in r for r in cw.image_publication_invariants(docs)
+        )
+
     @pytest.mark.parametrize(
         "text",
         [

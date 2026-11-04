@@ -2826,15 +2826,17 @@ def _powershell_http_reading(text: str) -> bool:
     # unknown runtime value (president scope ruling, Consiliency/pmcp#476).
     # Refuse without evaluating the expression; GET forms are conservative hits.
     expression_site = re.search(
-        r"(?:[&.]\s*\(|(?<![\w-])(?:New-Object|TypeName|GetType|GetMethod|"
+        r"(?:(?<![\w.])[&.](?=\s|[$(\"'])|(?<![\w-])(?:New-Object|TypeName|GetType|GetMethod|"
         r"GetMember|InvokeMember)\b|\[\s*(?:System\.)?(?:type|string)\s*\]|-as\b)",
         text,
         re.IGNORECASE,
     )
-    if expression_site and re.search(r"(?<![\w-])-f(?=\s|[()])", text, re.IGNORECASE):
+    if expression_site and re.search(
+        r"(?<![\w-])[-–—―]f(?![\w-])", text, re.IGNORECASE
+    ):
         return True
     if expression_site and re.search(
-        r"(?<![\w-])-join(?=\s|[()])", text, re.IGNORECASE
+        r"(?<![\w-])[-–—―]join(?![\w-])", text, re.IGNORECASE
     ):
         return True
     if re.search(
