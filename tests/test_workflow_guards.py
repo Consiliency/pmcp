@@ -3712,6 +3712,29 @@ CLAUDE_B42_PS["results.json:P19-gettype-concat"] = CLAUDE_B42_READS.pop(
 
 
 class TestClaudeB42Regressions:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "([type]'System.String')::Format('text {0}', 'value')",
+            "(''.GetType())::Concat('text', 'value')",
+            "[powershell]::Create()",
+            "[System.Management.Automation.PowerShell]::Create()",
+            "$builder.AddCommand('Get-Date')",
+            "$builder.AddScript('Get-Date')",
+            "$builder.AddParameter('Method', 'Get')",
+            "$alias:x = 'Get-Date'",
+            "${alias:x} = 'Get-Date'",
+            "Set-Content Alias:x Get-Date",
+            "sc Alias:x Get-Date",
+            "Add-Content Alias:x Get-Date",
+            "ac Alias:x Get-Date",
+            "&<#note#>('name{0}' -f 0) -Method Get",
+            ".`\n(-join('name','part')) -Method Get",
+        ],
+    )
+    def test_explicit_conservative_refusals(self, text):
+        assert cw.mutating_powershell_http(text)
+
     @pytest.mark.parametrize("case", sorted(CLAUDE_B42_BASH))
     def test_bash_metacharacter_boundary(self, case):
         text = CLAUDE_B42_BASH[case]
