@@ -1812,6 +1812,7 @@ class _ShellLexer:
                 pos += len(op)
                 continue
             if char == "(":
+                finish_word()  # A metacharacter ends even a space-free keyword.
                 self.work.spend(len(command))
                 at_start = not word.started and (
                     _compound_prefix(command)
@@ -2704,6 +2705,9 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
             at_token_start = True
             pos = end + 1
             continue
+        if char in "{}();,|&.[" and token and token[0] in "-–—―":
+            if all(piece.isascii() and piece.isalpha() for piece in token[1:]):
+                finish_token()  # ScanParameter terminators start a new token.
         if char in "({[":
             depth += 1
         elif char in ")}]":
@@ -2849,7 +2853,7 @@ def _powershell_http_reading(text: str) -> bool:
     # unknown runtime value (president scope ruling, Consiliency/pmcp#476).
     # Refuse without evaluating the expression; GET forms are conservative hits.
     expression_site = re.search(
-        r"(?:(?<![\w.])[&.](?=\s|[$(\"'])|(?<![\w-])(?:New-Object|TypeName|GetType|GetMethod|"
+        r"(?:(?<![\w.&])[&.](?![&.])|(?<![\w-])(?:New-Object|TypeName|GetType|GetMethod|"
         r"GetMember|InvokeMember)\b|\[\s*(?:\(|(?:System\.)?(?:type|string)\s*\])|-as\b)",
         text,
         re.IGNORECASE,
@@ -2868,18 +2872,29 @@ def _powershell_http_reading(text: str) -> bool:
         return True
     if re.search(
         r"(?<![\w-])(?:scriptblock|NewScriptBlock|InvokeScript|Add-Type|"
-        r"Set-Alias|New-Alias|sal|nal)\b",
+        r"Set-Alias|New-Alias|sal|nal|AddCommand|AddScript|AddParameter)\b",
         text,
         re.IGNORECASE,
     ):
         return True
+    # Fixed type/member spellings are not unknown runtime reflection.
+    if re.search(
+        r"\[\s*(?:System\.Management\.Automation\.)?PowerShell\s*\]",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(r"::\s*\(?\s*['\"]?(?:Format|Join|Concat)\b", text, re.IGNORECASE):
+        return True
+    if re.search(r"\$\{?alias\s*:", text, re.IGNORECASE):
+        return True  # Provider variables can set aliases; reads also refuse.
     # Alias provider writes can be spelled through item cmdlets as well as
     # Set-Alias. Refuse provider references conservatively, including reads.
     if re.search(r"(?<![\w])Alias\s*:", text, re.IGNORECASE):
         # Qualified invocation names alone are handled by the cmdlet scanner;
         # provider manipulation is the additional refusal here.
         if re.search(
-            r"(?<![\w-])(?:(?:New|Set|Copy|Move|Rename)-Item|ni|si|cpi|cp|copy|mi|mv|move|rni|ren)\b",
+            r"(?<![\w-])(?:(?:New|Set|Copy|Move|Rename|Clear|Remove)-Item|(?:Set|Add|Clear)-Content|ni|si|cpi|cp|copy|mi|mv|move|rni|ren|cli|ri|rm|rmdir|del|erase|rd|sc|ac|clc)\b",
             text,
             re.IGNORECASE,
         ):
@@ -2901,13 +2916,48 @@ def _powershell_http_reading(text: str) -> bool:
         if child_spent > _WORK_LIMIT:
             return True
         for argument in _pwsh_native_arguments(child_args):
-            option = _PWSH_PARAMETER.fullmatch(argument.text)
+            option = re.fullmatch(
+                r"(?:/|[-–—―]{1,2})([A-Za-z]+)(:.*)?", argument.text, re.DOTALL
+            )
             if option and (
                 "command".startswith(option[1].lower())
                 or "encodedcommand".startswith(option[1].lower())
-                or option[1].lower() in {"commandwithargs", "encodedarguments"}
+                or "encodedarguments".startswith(option[1].lower())
+                or option[1].lower() in {"ec", "ea", "cwa", "commandwithargs"}
             ):
                 return True
+    expression_spent = 0
+    for invocation in re.finditer(r"(?<![\w.&])[&.](?![&.])", text):
+        try:
+            expression_args, cost = _pwsh_arguments(
+                text, invocation.end(), _WORK_LIMIT - expression_spent
+            )
+        except _UnmodelledExpansion:
+            return True
+        expression_spent += cost + 1
+        if expression_spent > _WORK_LIMIT:
+            return True
+        if not expression_args or not any(c in expression_args[0] for c in "(["):
+            continue
+        for index, token in enumerate(expression_args[1:], 1):
+            parameter = _PWSH_PARAMETER.fullmatch(token)
+            if parameter is None:
+                continue
+            name = parameter[1].lower()
+            if name == "cm" or (len(name) >= 2 and "custommethod".startswith(name)):
+                return True
+            if len(name) >= 2 and "method".startswith(name):
+                value = (parameter[2] or ":")[1:]
+                if not value and index + 1 < len(expression_args):
+                    value = expression_args[index + 1]
+                if _pwsh_method_writes(value):
+                    return True
+        expression_spent += sum(len(arg) for arg in expression_args)
+        if expression_spent > _WORK_LIMIT:
+            return True
+        native_args = _pwsh_native_arguments(expression_args[1:])
+        if _curl_writes(native_args) or _wget_writes(native_args):
+            return True
     # Defaults can select a write method without an explicit invocation flag.
     # Do not try to evaluate configuration assignments or their later scope.
     if re.search(

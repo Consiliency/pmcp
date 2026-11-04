@@ -3519,3 +3519,221 @@ class TestPanelFinalRegressions:
     def test_compound_prefix_reads(self, name: str) -> None:
         text = PANEL_GRAMMAR_WRITES[name].replace("-d x", "-o /dev/null")
         assert not cw.mutating_http(text)
+
+
+# Exact fixed reviewer texts; no source probes are imported or executed.
+CLAUDE_B42_BASH = {
+    "results.json:B1-for-nospace": "for((i=0;i<1;i++ << true)); do :; done\n"
+    "curl -s $(\n"
+    "true\n"
+    ') "$URL" -d x',
+    "results.json:B2-while-nospace": "i=0; while((i++ << true)); do :; done\n"
+    "curl -s $(\n"
+    "true\n"
+    ') "$URL" -d x',
+    "results.json:B3-if-nospace": 'if((0 << true)); then :; fi\ncurl -s $(\ntrue\n) "$URL" -d x',
+    "results.json:B4-until-nospace": 'until((1 << true)); do :; done\ncurl -s $(\ntrue\n) "$URL" -d x',
+    "results.json:B5-bang-for-nospace": "! for((i=0;i<1;i++ << true)); do :; done\n"
+    "curl -s $(\n"
+    "true\n"
+    ') "$URL" -d x',
+    "results.json:B6-brace-for-nospace": "{ for((i=0;i<1;i++ << true)); do :; done; }\n"
+    "curl -s $(\n"
+    "true\n"
+    ') "$URL" -d x',
+    "results.json:B7-for-spaced-control": "for (( i=0; i<1; i++ << true )); do :; done\n"
+    "curl -s $(\n"
+    "true\n"
+    ') "$URL" -d x',
+    "results.json:B8-elif-nospace": "if false; then :; elif((0 << true)); then :; fi\n"
+    "curl -s $(\n"
+    "true\n"
+    ') "$URL" -d x',
+    "results2.json:C1-for-nospace": "for((i=0;i<1;i++ << true)); do :; done\n"
+    'curl -s "$URL" --da""ta x\n'
+    "true\n",
+    "results2.json:C2-while-nospace": "i=0; while((i++ << true)); do :; done\n"
+    'curl -s "$URL" --da""ta x\n'
+    "true\n",
+    "results2.json:C3-if-nospace": 'if((0 << true)); then :; fi\ncurl -s "$URL" --da""ta x\ntrue\n',
+    "results2.json:C4-until-nospace": "until((1 << true)); do :; done\n"
+    'curl -s "$URL" --da""ta x\n'
+    "true\n",
+    "results2.json:C5-bang-for-nospace": "! for((i=0;i<1;i++ << true)); do :; done\n"
+    'curl -s "$URL" --da""ta x\n'
+    "true\n",
+    "results2.json:C6-elif-nospace": "if false; then :; elif((0 << true)); then :; fi\n"
+    'curl -s "$URL" --da""ta x\n'
+    "true\n",
+    "results2.json:C7-for-spaced-control": "for (( i=0; i<1; i++ << true )); do :; done\n"
+    'curl -s "$URL" --da""ta x\n'
+    "true\n",
+    "results2.json:C8-if-spaced-control": "if (( 0 << true )); then :; fi\n"
+    'curl -s "$URL" --da""ta x\n'
+    "true\n",
+    "results2.json:C9-plain-curl-control": 'curl -s "$URL" --da""ta x\ntrue\n',
+    "results3.json:C1-for-nospace": "for((i=0;i<1;i++ << true)); do :; done\n"
+    'curl -s "$URL"${N+\n'
+    "true\n"
+    "} -d x\n",
+    "results3.json:C10-prior-grok-bang-for-spaced": "! for (( i=0; i<1; i++ << true )); do :; done\n"
+    'curl -s "$URL"${N+\n'
+    "true\n"
+    "} -d x\n",
+    "results3.json:C11-time-for-nospace": "time -p for((i=0;i<1;i++ << true)); do :; done\n"
+    'curl -s "$URL"${N+\n'
+    "true\n"
+    "} -d x\n",
+    "results3.json:C12-brace-for-nospace": "{ for((i=0;i<1;i++ << true)); do :; done; }\n"
+    'curl -s "$URL"${N+\n'
+    "true\n"
+    "} -d x\n",
+    "results3.json:C2-while-nospace": "i=0; while((i++ << true)); do :; done\n"
+    'curl -s "$URL"${N+\n'
+    "true\n"
+    "} -d x\n",
+    "results3.json:C3-if-nospace": 'if((0 << true)); then :; fi\ncurl -s "$URL"${N+\ntrue\n} -d x\n',
+    "results3.json:C4-until-nospace": "until((1 << true)); do :; done\n"
+    'curl -s "$URL"${N+\n'
+    "true\n"
+    "} -d x\n",
+    "results3.json:C5-bang-for-nospace": "! for((i=0;i<1;i++ << true)); do :; done\n"
+    'curl -s "$URL"${N+\n'
+    "true\n"
+    "} -d x\n",
+    "results3.json:C6-elif-nospace": "if false; then :; elif((0 << true)); then :; fi\n"
+    'curl -s "$URL"${N+\n'
+    "true\n"
+    "} -d x\n",
+    "results3.json:C7-for-spaced-control": "for (( i=0; i<1; i++ << true )); do :; done\n"
+    'curl -s "$URL"${N+\n'
+    "true\n"
+    "} -d x\n",
+    "results3.json:C8-if-spaced-control": "if (( 0 << true )); then :; fi\n"
+    'curl -s "$URL"${N+\n'
+    "true\n"
+    "} -d x\n",
+    "results3.json:C9-plain-curl-control": 'curl -s "$URL"${N+\ntrue\n} -d x\n',
+}
+CLAUDE_B42_PS = {
+    "results.json:P1-method-paren": "Invoke-RestMethod -Uri $u -Method('Put')",
+    "results.json:P10-alias-ni": "ni Alias:x -Value Invoke-RestMethod; x -Method Put -Uri $u",
+    "results.json:P11-alias-si": "si Alias:x Invoke-RestMethod; x -Method Put -Uri $u",
+    "results.json:P12-alias-newitem-control": "New-Item -Path Alias:x -Value Invoke-RestMethod; x "
+    "-Method Put -Uri $u",
+    "results.json:P13-replace-op": "& ('Invoke-RestXethod' -replace 'X','M') -Method Put -Uri $u",
+    "results.json:P14-replace-method": "& ('Invoke-RestXethod'.Replace('X','M')) -Method Put -Uri $u",
+    "results.json:P15-char-cast": "& ([char]73 + 'nvoke-RestMethod') -Method Put -Uri $u",
+    "results.json:P16-expandable-subexpr": "& \"Invoke-Rest$('Method')\" -Method Put -Uri $u",
+    "results.json:P17-substring": "& ('Invoke-RestMethodX'.Substring(0,17)) -Method Put -Uri $u",
+    "results.json:P18-type-string-format": "& "
+    "(([type]'System.String')::Format('Invoke-{0}','RestMethod')) "
+    "-Method Put -Uri $u",
+    "results.json:P2-custom-paren": "Invoke-RestMethod -Uri $u -CustomMethod('PROPFIND')",
+    "results.json:P20-powershell-addcommand": "[powershell]::Create().AddCommand('Invoke-RestMethod').AddParameter('Method','Put').AddParameter('Uri',$u).Invoke()",
+    "results.json:P21-chain-control": "& ('Invoke-' + 'Rest' + 'Method') -Method Put -Uri $u",
+    "results.json:P22-format-control": "& ('Invoke-{0}'-f'RestMethod') -Method Put -Uri $u",
+    "results.json:P3-iwr-me-paren": 'iwr $u -Me("Post") -Body x',
+    "results.json:P4-endash-paren": "Invoke-WebRequest -Uri $u –Method('Put') -InFile f",
+    "results.json:P6-colon-paren-control": "Invoke-RestMethod -Uri $u -Method:('Put')",
+    "results.json:P7-alias-var": "$alias:x = 'Invoke-RestMethod'; x -Method Put -Uri $u",
+    "results.json:P8-alias-bracevar": "${alias:x} = 'Invoke-RestMethod'; x -Method Put -Uri $u",
+    "results.json:P9-alias-setcontent": "Set-Content Alias:x Invoke-RestMethod; x -Method Put -Uri $u",
+    "results4.json:S1-amp-backtick-continuation-format": "&`\n"
+    "('Invoke-{0}' -f 'RestMethod') -Method Put "
+    "-Uri $u",
+    "results4.json:S2-amp-blockcomment-format": "&<#c#>('Invoke-{0}' -f 'RestMethod') -Method Put "
+    "-Uri $u",
+    "results4.json:S3-amp-blockcomment-join": "&<#c#>(-join('Invoke-','RestMethod')) -Method Put -Uri "
+    "$u",
+    "results4.json:S4-dot-backtick-continuation-join": ".`\n"
+    "(-join('Invoke-','RestMethod')) -Method Put "
+    "-Uri $u",
+    "results4.json:S5-amp-space-format-control": "& ('Invoke-{0}' -f 'RestMethod') -Method Put -Uri "
+    "$u",
+    "results4.json:S6-amp-tight-format-control": "&('Invoke-{0}' -f 'RestMethod') -Method Put -Uri $u",
+    "results5.json:K1-ec": "pwsh -NoProfile -ec SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "results5.json:K10-endash-ec": "pwsh -NoProfile –ec "
+    "SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "results5.json:K2-slash-encodedcommand": "pwsh -NoProfile /EncodedCommand "
+    "SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "results5.json:K3-doubledash-encodedcommand": "pwsh -NoProfile --encodedcommand "
+    "SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "results5.json:K4-slash-e": "powershell.exe -NoProfile /e "
+    "SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "results5.json:K5-slash-c-readonly": "pwsh -NoProfile /c 'Write-Output hi'",
+    "results5.json:K6-doubledash-command-readonly": "pwsh -NoProfile --command 'Write-Output hi'",
+    "results5.json:K7-cwa-readonly": "pwsh -NoProfile -cwa 'Write-Output $args' x",
+    "results5.json:K8-encodedcommand-control": "pwsh -NoProfile -EncodedCommand "
+    "SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "results5.json:K9-e-control": "pwsh -NoProfile -e "
+    "SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+}
+CLAUDE_B42_READS = {
+    "results.json:B1r-for-nospace-read": (
+        "for((i=0;i<1;i++ << true)); do :; done\n"
+        "curl -s $(\n"
+        "true\n"
+        ') "$URL" -o /dev/null',
+        True,
+    ),
+    "results.json:FP-test-f-and": ("[ -f x ] && echo ok", False),
+    "results.json:FP-test-f-and2": ("test -f go.sum && go mod download", False),
+    "results.json:P19-gettype-concat": (
+        "& ((''.GetType())::Concat('Invoke-','RestMethod')) -Method Put -Uri $u",
+        False,
+    ),
+    "results.json:P23-get-control": ("Invoke-RestMethod -Uri $u -Method Get", False),
+    "results.json:P24-paren-method-get-replace": (
+        "& ('Invoke-RestXethod' -replace 'X','M') -Method Get -Uri $u",
+        False,
+    ),
+    "results.json:P5-paren-get-control": (
+        "Invoke-RestMethod -Uri $u -Method('Get')",
+        False,
+    ),
+    "results2.json:C1r-for-nospace-read": (
+        'for((i=0;i<1;i++ << true)); do :; done\ncurl -s "$URL" -o /dev/n""ull\ntrue\n',
+        True,
+    ),
+    "results3.json:C1r-for-nospace-read": (
+        "for((i=0;i<1;i++ << true)); do :; done\n"
+        'curl -s "$URL"${N+\n'
+        "true\n"
+        "} -o /dev/null\n",
+        True,
+    ),
+}
+
+
+class TestClaudeB42Regressions:
+    @pytest.mark.parametrize("case", sorted(CLAUDE_B42_BASH))
+    def test_bash_metacharacter_boundary(self, case):
+        text = CLAUDE_B42_BASH[case]
+        assert cw.mutating_http(text)
+        assert cw.image_publication_invariants(
+            {
+                "probe.yml": {
+                    "jobs": {"probe": {"steps": [{"shell": "bash", "run": text}]}}
+                }
+            }
+        )
+
+    @pytest.mark.parametrize("case", sorted(CLAUDE_B42_PS))
+    def test_static_powershell_write(self, case):
+        text = CLAUDE_B42_PS[case]
+        assert cw.mutating_powershell_http(text)
+        assert cw.image_publication_invariants(
+            {
+                "probe.yml": {
+                    "jobs": {"probe": {"steps": [{"shell": "pwsh", "run": text}]}}
+                }
+            }
+        )
+
+    @pytest.mark.parametrize("case", sorted(CLAUDE_B42_READS))
+    def test_read_controls(self, case):
+        text, bash = CLAUDE_B42_READS[case]
+        assert not (
+            cw.mutating_http(text) if bash else cw.mutating_powershell_http(text)
+        )
