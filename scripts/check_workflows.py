@@ -2229,7 +2229,7 @@ def _unlexed_writes(text: str, work: _Work) -> bool:
 
 
 _BRACE_SEQUENCE = re.compile(
-    r"(-?[0-9]+|[a-zA-Z])\.\.(-?[0-9]+|[a-zA-Z])(?:\.\.(-?[0-9]+))?"
+    r"([+-]?[0-9]+|[a-zA-Z])\.\.([+-]?[0-9]+|[a-zA-Z])(?:\.\.([+-]?[0-9]+))?"
 )
 
 
@@ -2292,7 +2292,7 @@ def _brace_expand(raw: str, work: _Work) -> list[str]:
             if sequence is None:
                 continue
             first, last, increment = sequence.groups()
-            numeric = first.lstrip("-").isdigit() and last.lstrip("-").isdigit()
+            numeric = first.lstrip("+-").isdigit() and last.lstrip("+-").isdigit()
             if not numeric and not (first.isalpha() and last.isalpha()):
                 continue
             # Refuse oversized integers before converting or allocating a range.

@@ -2465,6 +2465,7 @@ class TestParameterQuotesAndBraces:
             "{cu,}rl",
             "{cu,{x,}}rl",
             "c{u..u}rl",
+            "c{u..z..+2}rl",
             "{wge,}t",
         ],
     )
@@ -2504,6 +2505,8 @@ class TestParameterQuotesAndBraces:
             ("{a,{b,c}}", ["a", "b", "c"]),
             ("x{03..01}", ["x03", "x02", "x01"]),
             ("{d..a..2}", ["d", "b"]),
+            ("{+01..+03}", ["1", "2", "3"]),
+            ("{-1..+2}", ["-1", "0", "1", "2"]),
             (r"a\{b,c\}", [r"a\{b,c\}"]),
             ('a"{b,c}"', ['a"{b,c}"']),
             ("${X:-{a,b}}", ["${X:-{a,b}}"]),
