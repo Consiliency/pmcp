@@ -2223,8 +2223,13 @@ def _argument_shapes(word: _Word, work: _Work) -> list[list[_Word]]:
     if "-" not in word.shape:
         return []  # No statically present option prefix in this word.
     parts = [part for part in word.shape.split(_MARK) if part]
-    if not parts:
+    # An option must start at a segment boundary with a literal dash. Prefix
+    # segments cannot change that: joining them only hides an option, and
+    # splitting them leaves exactly the same suffix for the option reader.
+    first = next((i for i, part in enumerate(parts) if part.startswith("-")), None)
+    if first is None:
         return []  # A completely unknown runtime value remains AC1.
+    parts = parts[first:]
     readings: set[tuple[str, ...]] = {(parts[0],)}
     for part in parts[1:]:
         following: set[tuple[str, ...]] = set()
