@@ -2481,6 +2481,13 @@ PANEL_OPTION_READS = {
 
 
 PANEL_GRAMMAR_WRITES = {
+    "prefix-time -p": 'curl -s $(time -p case a in a) echo -s;; esac; wait) "$URL?a=1&b=2" -d x',
+    "prefix-time --": 'curl -s $(time -- case a in a) echo -s;; esac; wait) "$URL?a=1&b=2" -d x',
+    "prefix-time -p --": 'curl -s $(time -p -- case a in a) echo -s;; esac; wait) "$URL?a=1&b=2" -d x',
+    "prefix-coproc": 'curl -s $(coproc case a in a) echo -s;; esac; wait) "$URL?a=1&b=2" -d x',
+    "prefix-coproc WORKER": 'curl -s $(coproc WORKER case a in a) echo -s;; esac; wait) "$URL?a=1&b=2" -d x',
+    "function-one-line": 'curl -s $(function f { case a in a) echo -s;; esac; }; f) "$URL" -d x',
+    "function-hyphen": 'curl -s $(function f-f { case a in a) echo -s;; esac; }; f-f) "$URL" -d x',
     "GF3-if-case": 'curl $(if case a in a) true;; esac; then echo -s; fi) "$URL?a=1&b=2" -d x',
     "GF3-while-case": 'curl $(while case a in a) false;; esac; do :; done; echo -s) "$URL?a=1&b=2" -d x',
     "GF3-until-case": 'curl $(until case a in a) true;; esac; do :; done; echo -s) "$URL?a=1&b=2" -d x',
@@ -3146,3 +3153,79 @@ class TestPowerShellWebCmdlets:
             f"[image] windows.yml:windows-smoke contains {cw.MUTATING_PWSH_LABEL}"
             in new
         )
+
+
+PANEL_FINAL_PS_WRITES = {
+    "H1-hash-in-url": "Invoke-RestMethod -Uri https://example.invalid/p#frag -Method Put -InFile f",
+    "H1b-hash-iwr": "Invoke-WebRequest -Uri http://h.invalid/#/x -Method Post -Body x",
+    "H2-herestring-apostrophe": "Invoke-RestMethod -Uri $env:URL -Body @'\nit's\n'@ -Method Put",
+    "H2b-herestring-dquote": 'Invoke-RestMethod -Uri $env:URL -Body @"\nsay "hi\n"@ -Method Put',
+    "H3-subexpr-nested-dquote": 'Invoke-RestMethod -Uri $env:URL -Body "$("a;b")" -Method Put',
+    "H4-global-psdefault": "$global:PSDefaultParameterValues['Invoke-RestMethod:Method']='Put'; Invoke-RestMethod -Uri $env:URL -InFile f",
+    "H5-braced-psdefault": "${PSDefaultParameterValues}['Invoke-RestMethod:Method']='Put'; Invoke-RestMethod -Uri $env:URL -InFile f",
+    "H6-backtick-webclient": "(New-Object Net.Web`Client).UploadString($env:URL, 'x')",
+    "H7-concat-webclient": "(New-Object ('Net.Web'+'Client')).UploadString($env:URL, 'x')",
+    "H8-webrequest-create": "$r=[System.Net.WebRequest]::Create($env:URL); $r.Method='PUT'; $s=$r.GetRequestStream(); $s.Close(); $r.GetResponse()",
+    "H9-hash-in-parens": "Invoke-RestMethod -Body (Write-Output a#b) -Method Put -Uri $env:URL",
+    "N1-native-smart-quoted-opt": "curl “-d” x $env:URL",
+    "N4-native-exe-smart-long": "curl.exe ‘--data’ x $env:URL",
+    "mixed-concat": "& ('Invoke-Rest' + \"Method\") -Method Put",
+    "mixed-reverse": "& (\"Invoke-Rest\" + 'Method') -Method Put",
+    "escaped-default": "$PSDefault`ParameterValues['Invoke-RestMethod:Method']='Put'; Invoke-RestMethod -Uri $u",
+    "groksubexpr": 'Invoke-RestMethod -Body "$( \'";\' )" -Method Put',
+}
+
+
+class TestPanelFinalRegressions:
+    @pytest.mark.parametrize("case", sorted(PANEL_FINAL_PS_WRITES))
+    def test_powershell_write_at_workflow_entry(self, case: str) -> None:
+        text = PANEL_FINAL_PS_WRITES[case]
+        assert cw.mutating_powershell_http(text)
+        docs = {
+            "probe.yml": {
+                "jobs": {"probe": {"steps": [{"shell": "pwsh", "run": text}]}}
+            }
+        }
+        assert any(
+            cw.MUTATING_PWSH_LABEL in r for r in cw.image_publication_invariants(docs)
+        )
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Invoke-RestMethod -Uri https://example.invalid/p#frag -Method Get",
+            "Invoke-RestMethod -Body (Write-Output a#b) -Method Get",
+            "Invoke-RestMethod -Uri $u # -Method Put",
+            "Invoke-RestMethod -Body (Write-Output a # comment\n) -Method Get",
+            "curl “-o” /dev/null $env:URL",
+            "curl.exe ‘--output’ /dev/null $env:URL",
+            "& ('Invoke-Rest' + \"Method\") -Method Get",
+            "& (\"Invoke-Rest\" + 'Method') -Method Get",
+        ],
+    )
+    def test_powershell_reads(self, text: str) -> None:
+        assert not cw.mutating_powershell_http(text)
+
+    @pytest.mark.parametrize("method", ["Get", "Put"])
+    @pytest.mark.parametrize("body", ["@'\nplain\n'@", '"$(1)"'])
+    def test_complex_strings_conservatively_refused(
+        self, method: str, body: str
+    ) -> None:
+        assert cw.mutating_powershell_http(
+            f"Invoke-RestMethod -Body {body} -Method {method}"
+        )
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "prefix-time -p",
+            "prefix-time --",
+            "prefix-coproc",
+            "prefix-coproc WORKER",
+            "function-one-line",
+            "function-hyphen",
+        ],
+    )
+    def test_compound_prefix_reads(self, name: str) -> None:
+        text = PANEL_GRAMMAR_WRITES[name].replace("-d x", "-o /dev/null")
+        assert not cw.mutating_http(text)

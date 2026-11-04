@@ -1607,6 +1607,40 @@ class _Word:
         self.started = True
 
 
+def _compound_prefix(words: list[_Word]) -> bool:
+    """Recognize command-prefix productions before a compound command.
+
+    Time options, optional coprocess names and function names are operands of
+    their prefix, rather than arbitrary words allowed everywhere.
+    """
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word.quoted:
+            return False
+        name = word.text
+        index += 1
+        if name in {"if", "then", "while", "until", "do", "else", "elif", "!", "{"}:
+            continue
+        if name == "time":
+            while index < len(words) and words[index].text in {"-p", "--"}:
+                index += 1
+            continue
+        if name == "function":
+            if index >= len(words):
+                return False
+            index += 1  # Bash function names are words, not just identifiers.
+            continue
+        if name == "coproc":
+            if index < len(words) and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*", words[index].text
+            ):
+                index += 1
+            continue
+        return False
+    return True
+
+
 class _ShellLexer:
     """Simple commands of a bash text, plus the texts bash may run as commands."""
 
@@ -1662,25 +1696,10 @@ class _ShellLexer:
                 redirect = None
                 return
             reserved = None if current.quoted else current.text
-            at_command_start = not command or all(
-                w.text
-                in {
-                    "if",
-                    "then",
-                    "while",
-                    "until",
-                    "do",
-                    "else",
-                    "elif",
-                    "!",
-                    "{",
-                    "time",
-                }
-                and not w.quoted
-                for w in command
-            )
-            if reserved == "case" and at_command_start:
-                cases.append(["head", depth])
+            if reserved == "case":
+                self.work.spend(len(command))
+                if _compound_prefix(command):
+                    cases.append(["head", depth])
             elif reserved == "esac" and not command and cases:
                 cases.pop()
             command.append(current)
@@ -2571,29 +2590,38 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
     tokens: list[str] = []
     token: list[str] = []
     depth = 0
+    at_token_start = True
     n = min(len(text), pos + limit + 1)
     while pos < n:
         char = text[pos]
-        if text.startswith("<#", pos):
+        if at_token_start and text.startswith("<#", pos):
             # PowerShell ends a block comment at the first #>; block
             # comments do not nest (tokenizer.cs: ScanBlockComment).
             end = text.find("#>", pos + 2, n)
             pos = n if end < 0 else end + 2
             continue
-        if char == "#":
+        if at_token_start and char == "#":
             if not depth:
                 break
             end = text.find("\n", pos, n)
             pos = n if end < 0 else end
             continue
+        if at_token_start and text[pos : pos + 2] in ("@'", '@"'):
+            # Unsupported multiline string syntax on a recognized HTTP call:
+            # refuse rather than expose its body as command syntax.
+            raise _UnmodelledExpansion
         if char == "`":
+            at_token_start = False
             if text[pos + 1 : pos + 2] not in ("", "\n"):
                 token.append(text[pos + 1])
             pos += 2
             continue
         if char in "'\"":
+            at_token_start = False
             end = pos + 1
             while end < n:
+                if char == '"' and text.startswith("$(", end):
+                    raise _UnmodelledExpansion
                 if text[end] == char:
                     if text.startswith(char * 2, end):
                         end += 2
@@ -2624,8 +2652,10 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
             if token:
                 tokens.append("".join(token))
                 token = []
+            at_token_start = True
             pos += 1
             continue
+        at_token_start = char.isspace() or char in "({[;|"
         token.append(char)
         pos += 1
     if token:
@@ -2649,6 +2679,12 @@ _PWSH_QUOTES = str.maketrans(
 )
 
 
+_PWSH_LITERAL_NAME = re.compile(r"(?:'[A-Za-z0-9_.:/\\-]*'|\"[A-Za-z0-9_.:/\\-]*\")")
+_PWSH_LITERAL_CHAIN = re.compile(
+    _PWSH_LITERAL_NAME.pattern + r"(?:\s*\+\s*" + _PWSH_LITERAL_NAME.pattern + r")+"
+)
+
+
 def mutating_powershell_http(text: str) -> bool:
     """Union of literal and normalized static PowerShell readings.
 
@@ -2658,24 +2694,31 @@ def mutating_powershell_http(text: str) -> bool:
     """
     if len(text) > _WORK_LIMIT:
         return True
-    # Defaults can select a write method without an explicit invocation flag.
-    # Do not try to evaluate configuration assignments or their later scope.
-    if re.search(r"\$PSDefaultParameterValues\b", text, re.IGNORECASE):
-        return True
-    if re.search(r"\b(?:WebClient|HttpClient)\b", text, re.IGNORECASE):
-        return True
     if _powershell_http_reading(text):
         return True
     normalized = text.translate(_PWSH_QUOTES)
-    if normalized != text and _powershell_http_reading(normalized):
+    if normalized != text and (
+        _powershell_http_reading(normalized) or mutating_http(normalized)
+    ):
         return True
     unescaped = re.sub(r"`(?=[A-Za-z-])", "", normalized)
-    if unescaped != normalized and _powershell_http_reading(unescaped):
+    if unescaped != normalized and (
+        _powershell_http_reading(unescaped) or mutating_http(unescaped)
+    ):
         return True
     # Static string concatenation in a call expression: retain the original
     # readings, then join adjacent literal fragments conservatively.
-    joined = re.sub(r"['\"]\s*\+\s*['\"]", "", unescaped)
-    return joined != unescaped and _powershell_http_reading(joined)
+    joined = _PWSH_LITERAL_CHAIN.sub(
+        lambda match: "'"
+        + "".join(
+            fragment[0][1:-1] for fragment in _PWSH_LITERAL_NAME.finditer(match[0])
+        )
+        + "'",
+        unescaped,
+    )
+    return joined != unescaped and (
+        _powershell_http_reading(joined) or mutating_http(joined)
+    )
 
 
 def _powershell_http_reading(text: str) -> bool:
@@ -2684,6 +2727,18 @@ def _powershell_http_reading(text: str) -> bool:
     Each command word rescans the rest of its statement; past
     ``_WORK_LIMIT`` characters scanned the text counts as a write.
     """
+    # Defaults can select a write method without an explicit invocation flag.
+    # Do not try to evaluate configuration assignments or their later scope.
+    if re.search(
+        r"\$\{?(?:[A-Za-z0-9_]+:)?PSDefaultParameterValues\b", text, re.IGNORECASE
+    ):
+        return True
+    if re.search(
+        r"\b(?:WebClient|HttpClient|WebRequest|HttpWebRequest|Start-BitsTransfer|Invoke-Expression|iex)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
     spent = 0
     for match in _PWSH_WEB.finditer(text):
         start = match.end()
@@ -2693,7 +2748,10 @@ def _powershell_http_reading(text: str) -> bool:
             and text[start : start + 1] == text[match.start() - 1]
         ):
             start += 1  # & 'Invoke-RestMethod' -Method Put
-        args, end = _pwsh_arguments(text, start, _WORK_LIMIT - spent)
+        try:
+            args, end = _pwsh_arguments(text, start, _WORK_LIMIT - spent)
+        except _UnmodelledExpansion:
+            return True
         spent += end - match.end() + 1
         if spent > _WORK_LIMIT:
             return True
