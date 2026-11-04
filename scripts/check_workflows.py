@@ -2563,18 +2563,16 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
     while pos < n:
         char = text[pos]
         if text.startswith("<#", pos):
-            # Delimited comments nest; quote characters inside are inert.
-            comment_depth = 1
-            pos += 2
-            while pos < n and comment_depth:
-                if text.startswith("<#", pos):
-                    comment_depth += 1
-                    pos += 2
-                elif text.startswith("#>", pos):
-                    comment_depth -= 1
-                    pos += 2
-                else:
-                    pos += 1
+            # PowerShell ends a block comment at the first #>; block
+            # comments do not nest (tokenizer.cs: ScanBlockComment).
+            end = text.find("#>", pos + 2, n)
+            pos = n if end < 0 else end + 2
+            continue
+        if char == "#":
+            if not depth:
+                break
+            end = text.find("\n", pos, n)
+            pos = n if end < 0 else end
             continue
         if char == "`":
             if text[pos + 1 : pos + 2] not in ("", "\n"):

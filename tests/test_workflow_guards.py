@@ -2594,7 +2594,7 @@ class TestPanelPowerShellQuoting:
         assert not cw.mutating_powershell_http(command + " -Method Get")
 
     @pytest.mark.parametrize(
-        "comment", ["<# don't retry #>", '<# " #>', "<# outer <# ' nested #> tail #>"]
+        "comment", ["<# don't retry #>", '<# " #>', "<# outer <# ' nested #>"]
     )
     def test_block_comments(self, comment: str) -> None:
         assert cw.mutating_powershell_http(
@@ -2602,6 +2602,14 @@ class TestPanelPowerShellQuoting:
         )
         assert not cw.mutating_powershell_http(
             "Invoke-RestMethod " + comment + " -Method Get"
+        )
+
+    def test_block_comment_ends_at_first_terminator(self) -> None:
+        assert cw.mutating_powershell_http(
+            "Invoke-RestMethod <# nested-looking <# #> -Method Put # tail"
+        )
+        assert not cw.mutating_powershell_http(
+            "Invoke-RestMethod <# nested-looking <# #> -Method Get # tail"
         )
 
     @pytest.mark.parametrize("method", ["Put", "Get"])
