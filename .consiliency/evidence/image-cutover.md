@@ -567,7 +567,8 @@ Code head `c50af77` addresses the consolidated findings:
   references are conservatively refused, including read-only configuration or
   construction. These are documented false positives, not claims that every
   reference sends a request. Arbitrary runtime values/configuration still are
-  not evaluated; the reported static forms do not require a new residual waiver.
+  not evaluated. The next review found further static gaps, addressed below;
+  the runtime boundary requires the explicit adjudication recorded below.
 
 PowerShell semantics were checked against Microsoft's [quoting rules](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_quoting_rules),
 [comment rules](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_comments),
@@ -584,16 +585,72 @@ evidence restored from its completed local archive. That run, and the later
 are **interrupted, no result**. Their ai directories contain `INVALID.txt` and
 logs/scratch receipts. Nothing from them is counted as a passing battery.
 
-The final `c50af77` battery is running detached on ai under the 4 GiB scope,
-with isolated HOME and the prepared interpreter. Its durable path is
-`/tmp/pmcp-ai-viperjuice/475-grammar-c50af77/`; local scripts and archives are
-under `/home/viperjuice/workspace/tmp/pmcp-475-grammar-fixes/`.
-All outcomes, including negative controls, must be checked after its sentinel.
-The corrected implementation still requires a new complete four-vendor review
-and exact-head CI. No panel approval or publication activation is asserted.
+The completed `c50af77` battery recorded 1235 guard assertions, 1536 focused
+assertions, 274 live texts with no disagreements, 216 brace words (199 matching
+comparisons and 17 explicit refusals), and 170/170 mutation rows. Negative
+controls killed 67/68; `NC-F2b-word-arguments-dropped` survived. The coverage
+command exited 1 at 0% below 60 despite passing assertions. Whole-repository
+formatting flagged two unchanged diagnostics scripts. This was not a wholly
+passing battery. The completed archive is under
+`/home/viperjuice/workspace/tmp/pmcp-475-grammar-fixes/validation/475-grammar-c50af77/`.
 
-At c50af77, the completed stages so far are 1235 guard assertions, 1536 focused
-assertions, 274 live texts with no disagreements, and 216 brace words (199
-matching comparisons and 17 explicit refusals). The coverage-mode command still
-exits 1 at 0% below60 despite 1235 assertions passing. Mutation/negative-control
-completion remains pending; these counts do not establish complete validation.
+### 775d55f panel findings and prefix/PowerShell corrections
+
+Claude, Codex and Grok returned **DISAGREE** at `775d55f`; Gemini failed before
+review because its requested model had no capacity. This was an incomplete
+panel. Reports are under `/home/viperjuice/workspace/boards/pmcp/475/t3-panel-775d55f/`.
+
+Code `c9a8908` addresses the consolidated findings:
+
+- K1/C7/G-CASE: compound prefixes have a linear parser for `time` options,
+  `coproc` names and `function` names, instead of testing each preceding word
+  against a bare-keyword list. Tests include the original live writes and GET
+  controls, named coprocesses, one-line functions and hyphenated function names.
+- P1/C8: PowerShell comments start only at token boundaries. A URL fragment or
+  `a#b` inside a group no longer hides a later method. Real comments still do
+  not expose their contents as syntax.
+- P2/C9/P-SUBEXPR: a recognized HTTP command with a here-string or a nested
+  subexpression inside an expandable string is conservatively refused. GET
+  uses of these unsupported forms are explicit false positives; this is not
+  a claim to evaluate their contents.
+- P3/C10: normalized PowerShell readings also run through the native curl/wget
+  classifier, so smart-quoted write options are recognized.
+- P4/C11/P-SENTINEL/P-CONCAT: each normalized reading checks scoped/braced
+  default-parameter variables and static .NET references. Literal name chains
+  are assembled from whole quoted fragments and serialized with consistent
+  quotes, including mixed-quote chains. `WebRequest`/`HttpWebRequest`,
+  `Start-BitsTransfer`, and `Invoke-Expression`/`iex` are conservatively refused
+  as well. These references can be read-only and remain documented false
+  positives. The `Invoke-WebRequest` GET cmdlet is distinguished from the
+  `WebRequest` type.
+
+Runtime evaluation remains **proposed scope, not an approved waiver** in
+[Consiliency/pmcp#476](https://github.com/Consiliency/pmcp/issues/476): variable
+command names, format/join operators, indirect object/API invocation,
+reflection, and external profile/default/alias state. It requires an explicit
+president ruling under Consiliency/pmcp#472 before merge. Filing the issue alone
+neither disposes of a finding nor approves publishing. Reported static defects
+above are not included in that proposed deferral. There is no live PowerShell
+validation; PowerShell claims remain source-supported and unit-tested.
+
+The initial `fd27262` guard run had 1275 passed and two failed read controls;
+`c9a8908` corrected the overbroad `WebRequest` name match and passed all 1277.
+The first expanded live oracle used case names containing spaces in URL paths,
+causing four invalid URLs. The corrected harness uses opaque URL keys and
+completed 288 texts with no disagreements. The failed first log is retained;
+only the corrected run is cited. Evidence is at
+`/tmp/pmcp-ai-viperjuice/475-prefix-c9a8908/` (targeted and live-v2 logs).
+
+The full battery at code `c9a8908` is running in
+`/tmp/pmcp-ai-viperjuice/475-prefix-c9a8908-full/`, detached on ai under 4 GiB,
+with isolated HOME and the prepared interpreter. Its 75 negative controls are
+pending, not passing evidence. The previous surviving F2b control now removes
+both the old split and new remainder argument paths, preserving its intent to
+disable tool-word argument detection. The independent N1 control still removes
+only the new remainder path. New controls remove comment-boundary handling,
+here-string/subexpression refusal, native quote normalization, and each compound
+prefix class. Scripts and archives are under
+`/home/viperjuice/workspace/tmp/pmcp-475-prefix-fixes/`.
+
+A new complete four-vendor review, explicit residual adjudication, completed
+validation and exact-head CI remain required. No panel approval is asserted.
