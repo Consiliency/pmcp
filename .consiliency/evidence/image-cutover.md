@@ -100,8 +100,8 @@ The curl/wget clause is the union of two detectors: the 5d416e4 detector, kept b
 - **wget options.** `--method`, `--post-data`, `--post-file`, `--body-data`, `--body-file` and any abbreviation (GNU getopt_long). A wgetrc command run by `-e`/`--execute` (`post_data=`, `method=`, ...; wgetrc ignores case, `-` and `_`) is also read.
 - **The method word.** Any value but GET or HEAD, in any letter case after quote removal, is a write; an expansion anywhere in the word counts as a write; an empty or missing word does not (`curl -X ""` exits 2).
 - **Publication spellings (R8f, R9).** `docker`, `podman` and `buildah` are refused when global options (each an option word, optionally followed by one value word) come before `push` or `image push`. As one backtracking regex this search was quadratic on a single hostile line (about 35 s for 160 KB of `docker -x `, below the work bound and then accepted; PR Consiliency/pmcp#475 F3), and so were the older `SKOPEO_DELETE` and `type=image ... push=true` patterns (on `main` too). The replacements avoid quadratic backtracking (`_ToolPush`, a right-to-left pass with binary searches, O(n log n); `_LinePair`, a linear pass per line) and checked against the old regexes on about 55,000 bounded generated texts each. The `build-smoke` load's two operands may contain only `[A-Za-z0-9_./:@+-]` and must each end at a blank or at the end of the text, so anything glued on (`;`, `&`, `|`, `$(`, a backtick or a quote) leaves `skopeo` in the remainder.
-- **PowerShell web cmdlets.** `Invoke-WebRequest`, `Invoke-RestMethod`, `iwr`, `irm`, and `curl`/`wget` as Windows PowerShell 5.1 aliases, are refused (`contains a mutating PowerShell web request`) with any `-Method` but GET or HEAD, with `-CustomMethod`/`-CM`, or with a splatted argument set (`@params`). Parameter names are case-insensitive and may be abbreviated (`-Me`, `-Cu`), and an expression for the method counts as a write. The clause scans statically named commands in every step and `defaults.run.shell` text, whatever its shell. It recognizes ASCII, en, em and horizontal-bar parameter dashes, quoted/module-qualified command names, and the tail after command-object expressions such as `& (gcm iwr)`. Dynamically constructed command names remain outside static analysis. The closing-parenthesis handling conservatively associates a following method even without an invocation operator. That covers `windows-latest`'s default `pwsh`, `shell: pwsh` and `shell: powershell` without resolving the effective shell. It flags nothing in the committed tree, so it is not recorded as an AC1 residual.
-- **Bounded work (2026-11-03 dev0 incident).** All lexing, nested classification, rescans and lookaheads of the bash-grammar classifier for one text are charged to `_WORK_LIMIT` (250,000 characters). That budget does not cover the regex scans that run outside the classifier: the publication scans have the bounds described above, and the 5d416e4 floor, which is quadratic in a token's run of letters after its `-` (`-[A-Za-z]*X[A-Za-z]+`, about 1.5 s for 32,000 letters), is not run when such a run is longer than `_FLOOR_LETTERS_LIMIT` (1,024): the text counts as a write instead. The floor itself stays byte-identical. The PowerShell scan has its own budget of the same size and stops scanning when it reaches it. Exceeding a budget, or Python's stack depth, counts as a write. Memoisation is per call. The committed-tree regression requires every step to use less than 10% of the budget. Tests run 12 hostile, linear-size inputs (each quadratic or worse without the bound) under a 60 s timeout, with CPU-time and `tracemalloc` peak assertions. CPU time excludes time descheduled on a loaded host; wall-time timeouts are hang guards.
+- **PowerShell web cmdlets.** `Invoke-WebRequest`, `Invoke-RestMethod`, `iwr`, `irm`, and `curl`/`wget` as Windows PowerShell 5.1 aliases, are refused (`contains a mutating PowerShell web request`) with any `-Method` but GET or HEAD, with `-CustomMethod`/`-CM`, or with a splatted argument set (`@params`). Parameter names are case-insensitive and may be abbreviated (`-Me`, `-Cu`), and an expression for the method counts as a write. The clause scans statically named commands in every step and `defaults.run.shell` text, whatever its shell. It recognizes ASCII, en, em and horizontal-bar parameter dashes, quoted/module-qualified command names, and the tail after command-object expressions such as `& (gcm iwr)`. Dynamically constructed command names remain outside static analysis. The closing-parenthesis handling conservatively associates a following method even without an invocation operator. That covers `windows-latest`'s default `pwsh`, `shell: pwsh` and `shell: powershell` without resolving the effective shell. The reported static forms are covered; this is not a complete PowerShell evaluator. Unknown runtime state and command construction remain within the AC1 limits below.
+- **Bounded work (2026-11-03 dev0 incident).** All lexing, nested classification, rescans and lookaheads of the bash-grammar classifier for one text are charged to `_WORK_LIMIT` (250,000 characters). That budget does not cover the regex scans that run outside the classifier: the publication scans have the bounds described above, and the 5d416e4 floor, which is quadratic in a token's run of letters after its `-` (`-[A-Za-z]*X[A-Za-z]+`, about 1.5 s for 32,000 letters), is not run when such a run is longer than `_FLOOR_LETTERS_LIMIT` (1,024): the text counts as a write instead. The floor itself stays byte-identical. Each PowerShell reading has a scan budget of the same size and stops when it reaches it; at most four static readings are considered, with an input-length check before normalization. Exceeding a budget, or Python's stack depth, counts as a write. Memoisation is per call. The committed-tree regression requires every step to use less than 10% of the budget. Tests run 12 hostile, linear-size inputs (each quadratic or worse without the bound) under a 60 s timeout, with CPU-time and `tracemalloc` peak assertions. CPU time excludes time descheduled on a loaded host; wall-time timeouts are hang guards.
 - **Out of reach (AC1 and follow-ups).** Commands assembled at runtime (`eval "$X"`, an unquoted `$OPTS` that word-splits into options, aliases and functions), `-K`/`--config`, `.curlrc`/`wgetrc` files and `gh api` writes (F-F, Consiliency/pmcp#468).
 
 The committed tree's classification is unchanged. All 117 step and `defaults.run.shell` texts lex completely, only `maintenance.yml:notify-worker` is flagged (and exempt by its unchanged pin), and the PowerShell clause flags none of them.
@@ -530,3 +530,70 @@ expectation differences just described. Neither run is cited as passing. At
 `748fad0`, the initial guard run has 1132 passed and the loopback oracle has 241
 texts with no disagreements after explicitly classifying those refusals.
 Full-battery results follow separately; panel approval remains outstanding.
+
+### Completed c9f7634 panel and grammar corrections
+
+All four requested vendors completed the T3-managed panel at `c9f7634` and
+returned **DISAGREE**. Claude N1, Codex C4, Grok F-REMAIN and Gemini GM-1 are the
+same root cause: expansion boundaries in the tool word's remainder were lost.
+Gemini additionally confirmed raw-line continuation, compound `case` and nested
+arithmetic accept gaps (GM-2 through GM-4). PowerShell quote classes, escaped
+static names and block comments were specification-supported findings; no live
+PowerShell runtime was available. Full reports and probes are retained under
+`/home/viperjuice/workspace/boards/pmcp/475/t3-panel-c9f7634/`.
+
+The completed `748fad0` battery killed **53/54** negative controls. The survivor
+was `NC-G1-substitution-boundary`, whose original pattern began with a dash and
+allowed another conservative option reading to mask removal. The new regression
+uses `X=old; curl "${X/#old/-d}" x "$URL"`; the control itself is retained.
+That older battery is not reported as wholly passing.
+
+Code head `c50af77` addresses the consolidated findings:
+
+- The tool-word remainder retains its marker boundaries in an additional
+  budgeted reading, alongside the historical all-split reading. The malformed
+  text fallback likewise retains simple-expansion shapes.
+- Raw Bash text reaches both `mutating_http` and the workflow entry point.
+  `_joined` and the old floor stay byte-identical. Publication scanners also
+  get an additional empty-removal reading of backslash-newline continuations,
+  for steps and both levels of `defaults.run.shell`.
+- `case` state survives the newline before `in` and recognizes compound-command
+  prefixes, including `if`, `while` and `until` conditions. Arithmetic scanning
+  skips quotes, escapes and nested substitutions before counting parentheses.
+- PowerShell retains its original reading and adds normalized smart quotes,
+  static backtick spellings and adjacent literal-string concatenations. Block
+  comments end at the first `#>` and line comments do not expose quoted content
+  as syntax. Explicit `$PSDefaultParameterValues`, `WebClient` and `HttpClient`
+  references are conservatively refused, including read-only configuration or
+  construction. These are documented false positives, not claims that every
+  reference sends a request. Arbitrary runtime values/configuration still are
+  not evaluated; the reported static forms do not require a new residual waiver.
+
+PowerShell semantics were checked against Microsoft's [quoting rules](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_quoting_rules),
+[comment rules](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_comments),
+[default-parameter rules](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_parameters_default_values)
+and [tokenizer source](https://github.com/PowerShell/PowerShell/blob/master/src/System.Management.Automation/engine/parser/tokenizer.cs).
+They remain source-supported rather than live PowerShell evidence.
+
+The early guard-only runs completed: `cc0ce69` had 1214 passed; `0e776ef` had
+1231 passed. They are intermediate results, not final-head certification.
+The driver initially launched for `0e776ef-full` retained an earlier evidence
+path; it was stopped, its affected logs preserved, and the prior `748fad0`
+evidence restored from its completed local archive. That run, and the later
+`0e776ef-battery` and `09d023e` batteries superseded during final corrections,
+are **interrupted, no result**. Their ai directories contain `INVALID.txt` and
+logs/scratch receipts. Nothing from them is counted as a passing battery.
+
+The final `c50af77` battery is running detached on ai under the 4 GiB scope,
+with isolated HOME and the prepared interpreter. Its durable path is
+`/tmp/pmcp-ai-viperjuice/475-grammar-c50af77/`; local scripts and archives are
+under `/home/viperjuice/workspace/tmp/pmcp-475-grammar-fixes/`.
+All outcomes, including negative controls, must be checked after its sentinel.
+The corrected implementation still requires a new complete four-vendor review
+and exact-head CI. No panel approval or publication activation is asserted.
+
+At c50af77, the completed stages so far are 1235 guard assertions, 1536 focused
+assertions, 274 live texts with no disagreements, and 216 brace words (199
+matching comparisons and 17 explicit refusals). The coverage-mode command still
+exits 1 at 0% below60 despite 1235 assertions passing. Mutation/negative-control
+completion remains pending; these counts do not establish complete validation.
