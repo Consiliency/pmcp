@@ -1529,6 +1529,7 @@ class _Unlexable(Exception):
 # own work must be bounded). Reaching it counts as a write: no bound may fail
 # open (R7f). Committed steps must stay below 10% in the regression test.
 _WORK_LIMIT = 250_000
+_TOKEN_WORK = 16  # Fixed allocation/dispatch work per completed lexical word.
 
 
 class _OverBudget(Exception):
@@ -1670,9 +1671,10 @@ class _ShellLexer:
 
         def finish_word() -> None:
             nonlocal word, command, redirect
-            current, word = word, _Word()
-            if not current.started:
+            if not word.started:
                 return
+            self.work.spend(_TOKEN_WORK)
+            current, word = word, _Word()
             if current.escaped_blank:
                 self.nested.append(current.text)
             if redirect is not None:
@@ -2622,8 +2624,22 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
     token: list[str] = []
     depth = 0
     at_token_start = True
+    start = pos
+    token_work = 0
     n = min(len(text), pos + limit + 1)
+
+    def finish_token() -> None:
+        nonlocal token, token_work
+        if token:
+            token_work += _TOKEN_WORK
+            if pos - start + token_work > limit:
+                raise _UnmodelledExpansion
+            tokens.append("".join(token))
+            token = []
+
     while pos < n:
+        if pos - start + token_work > limit:
+            raise _UnmodelledExpansion
         char = text[pos]
         if at_token_start and text.startswith("<#", pos):
             # PowerShell ends a block comment at the first #>; block
@@ -2684,9 +2700,7 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
                     # A statically named command can sit in a command-object
                     # expression, e.g. & (Get-Command iwr) -Method Put.
                     # Retain the tail conservatively even without & or . .
-                    if token:
-                        tokens.append("".join(token))
-                        token = []
+                    finish_token()
                     pos += 1
                     continue
                 break
@@ -2694,9 +2708,7 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
         elif not depth and (char in ";|\n" or text.startswith("&&", pos)):
             break
         elif not depth and char.isspace():
-            if token:
-                tokens.append("".join(token))
-                token = []
+            finish_token()
             at_token_start = True
             pos += 1
             continue
@@ -2709,8 +2721,7 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
         at_token_start = char.isspace() or char in "(){}[];|," or parameter_colon
         token.append(char)
         pos += 1
-    if token:
-        tokens.append("".join(token))
+    finish_token()
     return tokens, pos
 
 

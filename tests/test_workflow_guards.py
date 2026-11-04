@@ -2264,6 +2264,12 @@ class TestBashGrammar:
             # Quadratic or deeper without the bound: reaching it must flag.
             assert bash or pwsh
 
+    def test_many_short_words_charge_allocation_work(self) -> None:
+        # Each small word allocates parser state; input byte count alone is
+        # insufficient. Both classifiers must refuse without reaching a write.
+        assert cw._http_writes("echo " + "a " * 20_000)
+        assert cw.mutating_powershell_http("iwr " + "a " * 20_000)
+
     def test_reaching_the_work_bound_counts_as_a_write(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
