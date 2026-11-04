@@ -877,3 +877,62 @@ its controls and the full battery are pending, not passing evidence. The older
 `ea5252a` run remains separate. Whole-tree formatting retains its two unchanged
 diagnostics failures. Final-head hosted CI and a complete usable four-vendor
 review remain required; no merge approval or new residual waiver is asserted.
+
+### Review round 552663e: subsequent corrections
+
+All four native vendor seats returned DISAGREE at `552663e`; no panel approval
+is claimed. Reports are retained under
+`/home/viperjuice/workspace/boards/pmcp/475/t3-panel-552663e/`.
+Code `a78bf3e` incorporates these dispositions (validation below is separate):
+
+- Claude CL-8 / Codex child quoting: Bash-lexed command and option shapes now
+  recognize child PowerShell evaluation, including quoted and escaped words.
+- CL-9: child argument strings are split conservatively for execution switches.
+  Whitespace-padded switches and explicit stdin `-` / `-File -` are refused
+  (also Gemini GM-552-4). Even read-only child evaluation is refused; this does
+  not add a residual or claim that every such child performs a write.
+- CL-10: expression-name invocation includes quoted member/index expressions
+  and array expressions. CL-11: literal type construction through expressions
+  is refused without evaluating the type, including read-only constructions.
+- CL-12 / C15: independent member-name numeric format/join tests expose removal
+  of each operator rule without the expression invocation-tail rule masking it.
+- Grok G-SEP: line comments and CRLF continuations before invocation operands
+  are skipped, with their scanned spans charged before further processing.
+- Gemini GM-552-1: implicit-positional `for name do` and `select name do`
+  headers participate in compound-command recognition.
+- GM-552-2: backtick-space/tab at token start separates tokens, and is recognized
+  before an invocation operand. Escaped whitespace inside a token is retained.
+- GM-552-3: top-level closing groups finish an argument unless member access
+  or indexing continues it; expression invocation tails now refuse splats.
+  Array expression operands were included in the CL-10 fix.
+- GM-552-5: an independent conservative command-object-tail test exercises
+  retaining arguments after an unmatched closing parenthesis without the
+  generic invocation rule masking it. This test asserts the classifier's
+  conservative syntax policy, not live PowerShell execution.
+
+The unterminated invocation block-comment scan now charges the entire scanned
+suffix; its negative control restores the uncharged scan. The committed-tree
+margin assertion measures the Bash work counter only, not total PowerShell
+work. PowerShell has its own accumulated fail-closed budget; the assertion is
+not evidence of a 10% margin for that separate reader.
+
+Additional conservative false positives remain: expression-site plus format
+operator detection may refuse Bash `docker build -f Dockerfile .`,
+`[ -f ./x ] && ...`, or `[0-9a-f]` patterns. The earlier correction for
+`[ -f x ] && ...` covers that specific form, not all filesystem tests or regex
+ranges. These refusals do not widen the accepted residual.
+
+Targeted validation on ai: `d1949fd` passed 1768 guard tests and eight new
+negative controls (including both C15 controls). `b45f3ac` passed 1840 guard
+tests and all three G-SEP controls. `a78bf3e` passed 1878 guard tests, mypy and
+workflow invariants; its six focused negative controls are still running.
+All used the prepared interpreter, isolated HOME, pytest_temp runner, detached
+4 GiB scopes and durable logs. No guard execution occurred on dev0.
+
+The full `bd4babb` and `d1949fd` batteries are still running. The former has
+recorded three survivors (C15 format, C15 join, command-object tail); neither
+unfinished battery certifies this later code. Coverage-only runs still exit 1
+at 0% against the global 60% threshold, and whole-tree formatting still fails
+on two unchanged diagnostics files. These are disclosed failures, not waivers.
+Hosted tests succeeded at `552663e`; later code still requires its own hosted
+CI and a fresh complete panel. The release acknowledgement gate remains unmet.
