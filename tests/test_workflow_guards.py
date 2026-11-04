@@ -2264,6 +2264,10 @@ class TestBashGrammar:
             # Quadratic or deeper without the bound: reaching it must flag.
             assert bash or pwsh
 
+    def test_many_expansions_charge_allocation_work(self) -> None:
+        # No literal write: refusal must come from bounded expansion work.
+        assert cw._http_writes("echo " + "$X" * 20_000)
+
     def test_many_short_words_charge_allocation_work(self) -> None:
         # Each small word allocates parser state; input byte count alone is
         # insufficient. Both classifiers must refuse without reaching a write.

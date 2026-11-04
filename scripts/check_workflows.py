@@ -1864,7 +1864,9 @@ class _ShellLexer:
         self.nested.append(inner)
 
     def expansion(self, word: _Word, start: int, end: int, shape: str = _MARK) -> int:
-        self.work.spend(end - start)
+        # Each expansion allocates raw text and shape/list entries even when
+        # thousands share a single lexical word. Charge before those copies.
+        self.work.spend(_TOKEN_WORK + end - start)
         raw = self.s[start:end]
         word.add(raw, shape)
         word.expanded = True
