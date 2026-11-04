@@ -3854,7 +3854,7 @@ def test_claude_552_literal_invocations(case):
     reasons = cw.image_publication_invariants(
         {"probe.yml": {"jobs": {"probe": {"steps": [{"run": text}]}}}}
     )
-    assert bool(reasons) != read
+    assert any("mutating" in reason for reason in reasons) != read
 
 
 @pytest.mark.parametrize("operator", ["f", "join"])

@@ -2357,26 +2357,31 @@ def _command_writes(words: list[_Word], work: _Work) -> bool:
     """A simple command with curl or wget anywhere in it (``timeout 5 curl``,
     ``env A=1 curl``) whose arguments send a method."""
     for index, word in enumerate(words):
-        # Bash removes quotes/escapes before starting a child PowerShell.
-        work.spend(len(word.text) + len(word.shape))
-        child_readings = [
-            word.text,
-            word.shape.replace(_MARK, ""),
-            *word.shape.split(_MARK),
-        ]
-        if any(
-            re.split(r"[/\\]", name)[-1].lower()
-            in {"pwsh", "powershell", "pwsh.exe", "powershell.exe"}
-            for name in child_readings
-        ):
-            for arg in words[index + 1 :]:
-                work.spend(len(arg.text) + 1)
-                if _powershell_execution_option(arg.text):
-                    return True
-                for reading in _argument_shapes(arg, work):
-                    work.spend(sum(len(part.text) + 1 for part in reading))
-                    if any(_powershell_execution_option(part.text) for part in reading):
+        # The following _http_tools scan already charges every raw word.
+        # Only expansion/name candidates need additional child-shape copies.
+        if word.expanded or re.search(r"pwsh|powershell", word.text, re.IGNORECASE):
+            # Bash removes quotes/escapes before starting a child PowerShell.
+            work.spend(len(word.text) + len(word.shape))
+            child_readings = [
+                word.text,
+                word.shape.replace(_MARK, ""),
+                *word.shape.split(_MARK),
+            ]
+            if any(
+                re.split(r"[/\\]", name)[-1].lower()
+                in {"pwsh", "powershell", "pwsh.exe", "powershell.exe"}
+                for name in child_readings
+            ):
+                for arg in words[index + 1 :]:
+                    work.spend(len(arg.text) + 1)
+                    if _powershell_execution_option(arg.text):
                         return True
+                    for reading in _argument_shapes(arg, work):
+                        work.spend(sum(len(part.text) + 1 for part in reading))
+                        if any(
+                            _powershell_execution_option(part.text) for part in reading
+                        ):
+                            return True
         for tool, inside in _http_tools(word, work):
             args = inside + words[index + 1 :]
             # The option scans read every following word, letter by letter.
