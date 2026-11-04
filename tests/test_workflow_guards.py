@@ -3156,6 +3156,7 @@ class TestPowerShellWebCmdlets:
 
 
 PANEL_FINAL_PS_WRITES = {
+    "C12-literal-invoker": "([System.Net.Http.HttpMessageInvoker]::new([System.Net.Http.SocketsHttpHandler]::new())).SendAsync([System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, 'http://127.0.0.1:9/review'), [System.Threading.CancellationToken]::None).GetAwaiter().GetResult()",
     "H1-hash-in-url": "Invoke-RestMethod -Uri https://example.invalid/p#frag -Method Put -InFile f",
     "H1b-hash-iwr": "Invoke-WebRequest -Uri http://h.invalid/#/x -Method Post -Body x",
     "H2-herestring-apostrophe": "Invoke-RestMethod -Uri $env:URL -Body @'\nit's\n'@ -Method Put",
@@ -3177,6 +3178,27 @@ PANEL_FINAL_PS_WRITES = {
 
 
 class TestPanelFinalRegressions:
+    @pytest.mark.parametrize(
+        "reference",
+        [
+            "[System.Net.Http.HttpMessageInvoker]",
+            "[Net.Http.HttpMessageInvoker]",
+            "[HttpMessageInvoker]",
+            "[HttpMessageHandler]",
+            "[HttpRequestMessage]",
+            "[SocketsHttpHandler]",
+            "[HttpClientHandler]",
+            "[System.Net.Http.HttpMethod]::Get",
+            "[System.Net.Http.HttpResponseMessage]",
+            "[System.Net.Http.HttpMessage`Invoker]",
+            "New-Object ('System.Net.Http.' + 'HttpMessageInvoker')",
+        ],
+    )
+    def test_http_api_references_conservatively_refused(self, reference: str) -> None:
+        # References/construction alone need not send anything. These are
+        # deliberate refusals, including method GET and response-only objects.
+        assert cw.mutating_powershell_http(reference)
+
     @pytest.mark.parametrize("case", sorted(PANEL_FINAL_PS_WRITES))
     def test_powershell_write_at_workflow_entry(self, case: str) -> None:
         text = PANEL_FINAL_PS_WRITES[case]

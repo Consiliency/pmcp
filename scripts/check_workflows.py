@@ -2739,6 +2739,17 @@ def _powershell_http_reading(text: str) -> bool:
         re.IGNORECASE,
     ):
         return True
+    # Refuse the HTTP message/handler API family, including namespace-qualified
+    # references. This deliberately also refuses construction and read-only use;
+    # it does not attempt to evaluate object lifetimes or request methods.
+    if re.search(
+        r"(?<![\w-])(?:(?:System\.)?Net\.Http\b|"
+        r"(?:HttpMessageInvoker|HttpMessageHandler|HttpRequestMessage|"
+        r"SocketsHttpHandler|HttpClientHandler)\b)",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
     spent = 0
     for match in _PWSH_WEB.finditer(text):
         start = match.end()
