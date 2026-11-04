@@ -1228,6 +1228,8 @@ SKOPEO_SMOKE_LOAD = re.compile(
     r"quay\.io/skopeo/stable@sha256:[0-9a-f]{64} (?:--insecure-policy )?"
     r"copy oci-archive:[A-Za-z0-9_./:@+-]+(?!\S) docker-daemon:[A-Za-z0-9_./:@+-]+(?!\S)"
 )
+
+
 class _ToolPush:
     """``\\b<tool>(?:\\s+-\\S*(?:\\s+VALUE)?)*\\s+(?:image\\s+)?push\\b``, where
     VALUE is ``"[^"\\n]*"``, ``'[^'\\n]*'`` or ``[^\\s"'-]\\S*``, decided in
@@ -1788,9 +1790,7 @@ class _ShellLexer:
         word.quoted = True
         self.nested.append(inner)
 
-    def expansion(
-        self, word: _Word, start: int, end: int, shape: str = _MARK
-    ) -> int:
+    def expansion(self, word: _Word, start: int, end: int, shape: str = _MARK) -> int:
         raw = self.s[start:end]
         word.add(raw, shape)
         word.expanded = True

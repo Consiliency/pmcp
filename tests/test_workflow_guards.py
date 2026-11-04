@@ -2388,7 +2388,6 @@ class TestBashGrammar:
         assert any(reason in r for r in cw.image_publication_invariants(docs))
 
 
-
 # PR Consiliency/pmcp#475 review F1 and F2: the command word built with an
 # expansion. F1 is the ${name<op>word} operator class whose word can become
 # the value (-, :-, =, :=, +, :+ and the pattern substitutions); F2 is a tool
@@ -2424,6 +2423,7 @@ EXPANSION_WORD_CASES = {
     "F2-cmdsubst-glue": '$(true)curl -s -d@report.json "$URL"',
     "F2-backtick-glue": '`true`curl -s -d@report.json "$URL"',
     "F2-path-glue": '${X}/usr/bin/curl -s -d@report.json "$URL"',
+    "F2-split-after-literal": 'env${IFS}curl -s -d@report.json "$URL"',
     "F2-ifs": 'curl$IFS-s$IFS-d@report.json$IFS"$URL"',
     "F2-ifs-braced": 'curl${IFS}-d@report.json${IFS}"$URL"',
     "F2-ifs-wget": 'wget$IFS-q$IFS-O/dev/null$IFS--post-d=x$IFS"$URL"',
@@ -2439,6 +2439,16 @@ EXPANSION_WORD_READS = {
     "F2R-glue-get": '${X}curl -s -o /dev/null "$URL"',
     "F2R-longer-name": "curl-config${X} --version || true",
     "F2R-path-prefix": 'curl -s -o "$HOME/curl-out" "$URL"',
+}
+
+# Accepted false positives (fail closed): each sent nothing live, and each is
+# flagged. Every expansion counts as a possible split point, quoted or not,
+# and the older raw-text rule reads curl/wget anywhere inside an expansion.
+EXPANSION_WORD_ACCEPTED_FALSE_POSITIVES = {
+    "FX-quoted-glue-no-split": '"curl${X}-d@report.json" "$URL" || true',
+    "FX-strip-operator": '${X#curl} -s -d@report.json "$URL" || true',
+    "FX-echo-default": 'echo "${X:-curl}" -d@report.json',
+    "FX-substitution-pattern": 'X=a; ${X/curl/a} -s -d@report.json "$URL" || true',
 }
 
 
@@ -2470,6 +2480,14 @@ class TestExpansionBuiltCommandWords:
     )
     def test_each_read_is_left_alone(self, case: str) -> None:
         assert not cw.mutating_http(EXPANSION_WORD_READS[case])
+
+    @pytest.mark.parametrize(
+        "case",
+        sorted(EXPANSION_WORD_ACCEPTED_FALSE_POSITIVES),
+        ids=sorted(EXPANSION_WORD_ACCEPTED_FALSE_POSITIVES),
+    )
+    def test_each_accepted_false_positive_is_flagged(self, case: str) -> None:
+        assert cw.mutating_http(EXPANSION_WORD_ACCEPTED_FALSE_POSITIVES[case])
 
     @pytest.mark.parametrize(
         "text",
@@ -2702,7 +2720,6 @@ class TestLinearPublicationScans:
         elapsed = time.monotonic() - started
         assert elapsed < 30, f"{label} took {elapsed:.1f}s"
         assert not any(f"contains {label}" in r for r in reasons)
-
 
 
 class TestFloorInputBound:
