@@ -2337,10 +2337,46 @@ def _argument_shapes(word: _Word, work: _Work) -> list[list[_Word]]:
     return [[_Word(part, expanded=True) for part in reading] for reading in readings]
 
 
+def _powershell_execution_option(text: str) -> bool:
+    """Static child evaluation switches, including argument-string readings."""
+    for token in text.split():
+        if token == "-":
+            return True  # Explicit stdin evaluation, including -File -.
+        option = re.fullmatch(r"(?:/|[-–—―]{1,2})([A-Za-z]+)(:.*)?", token, re.DOTALL)
+        if option and (
+            "command".startswith(option[1].lower())
+            or "encodedcommand".startswith(option[1].lower())
+            or "encodedarguments".startswith(option[1].lower())
+            or option[1].lower() in {"ec", "ea", "cwa", "commandwithargs"}
+        ):
+            return True
+    return False
+
+
 def _command_writes(words: list[_Word], work: _Work) -> bool:
     """A simple command with curl or wget anywhere in it (``timeout 5 curl``,
     ``env A=1 curl``) whose arguments send a method."""
     for index, word in enumerate(words):
+        # Bash removes quotes/escapes before starting a child PowerShell.
+        work.spend(len(word.text) + len(word.shape))
+        child_readings = [
+            word.text,
+            word.shape.replace(_MARK, ""),
+            *word.shape.split(_MARK),
+        ]
+        if any(
+            re.split(r"[/\\]", name)[-1].lower()
+            in {"pwsh", "powershell", "pwsh.exe", "powershell.exe"}
+            for name in child_readings
+        ):
+            for arg in words[index + 1 :]:
+                work.spend(len(arg.text) + 1)
+                if _powershell_execution_option(arg.text):
+                    return True
+                for reading in _argument_shapes(arg, work):
+                    work.spend(sum(len(part.text) + 1 for part in reading))
+                    if any(_powershell_execution_option(part.text) for part in reading):
+                        return True
         for tool, inside in _http_tools(word, work):
             args = inside + words[index + 1 :]
             # The option scans read every following word, letter by letter.
@@ -2918,16 +2954,17 @@ def _powershell_http_reading(text: str) -> bool:
         if child_spent > _WORK_LIMIT:
             return True
         for argument in _pwsh_native_arguments(child_args):
-            option = re.fullmatch(
-                r"(?:/|[-–—―]{1,2})([A-Za-z]+)(:.*)?", argument.text, re.DOTALL
-            )
-            if option and (
-                "command".startswith(option[1].lower())
-                or "encodedcommand".startswith(option[1].lower())
-                or "encodedarguments".startswith(option[1].lower())
-                or option[1].lower() in {"ec", "ea", "cwa", "commandwithargs"}
-            ):
+            if _powershell_execution_option(argument.text):
                 return True
+    # Literal type construction through an expression is not an external or
+    # unknown object. Refuse without evaluating its type, including GET uses.
+    if re.search(
+        r"(?i)(?:(?<![\w-])(?:New-Object|TypeName)\b\s*(?:-TypeName\s*)?[([]|"
+        r"\[\s*type\s*\]\s*[(]|(?<![\w])Activator\b|"
+        r"(?:GetType|GetMethod|GetMember|InvokeMember)\s*\(\s*\()",
+        text,
+    ):
+        return True
     expression_spent = 0
     for invocation in re.finditer(r"(?<![\w.&])[&.](?![&.])", text):
         operand = invocation.end()
@@ -2942,6 +2979,9 @@ def _powershell_http_reading(text: str) -> bool:
             elif text.startswith("<#", operand):
                 end = text.find("#>", operand + 2)
                 if end < 0:
+                    expression_spent += len(text) - operand
+                    if expression_spent > _WORK_LIMIT:
+                        return True
                     break
                 expression_spent += end + 2 - operand
                 operand = end + 2
@@ -2951,16 +2991,22 @@ def _powershell_http_reading(text: str) -> bool:
             continue
         candidate = text[operand : operand + 2]
         if not (
-            candidate.startswith("(") or candidate == "$(" or candidate.startswith('"')
+            candidate.startswith("(")
+            or candidate in {"$(", "@("}
+            or candidate[:1] in {"'", '"'}
         ):
             continue
-        if candidate.startswith('"'):
-            end = text.find('"', operand + 1)
+        if candidate[:1] in {"'", '"'}:
+            quote = candidate[0]
+            end = text.find(quote, operand + 1)
             end = len(text) if end < 0 else end
             expression_spent += end - operand
             if expression_spent > _WORK_LIMIT:
                 return True
-            if text.find("$(", operand, end) < 0:
+            if text.find("$(", operand, end) < 0 and text[end + 1 : end + 2] not in {
+                ".",
+                "[",
+            }:
                 continue
         try:
             expression_args, cost = _pwsh_arguments(

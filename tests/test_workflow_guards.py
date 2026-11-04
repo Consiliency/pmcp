@@ -3811,3 +3811,68 @@ def test_grok_b42_arithmetic_prefix_adjacency(prefix, write):
         + ("-X PUT" if write else "-o /dev/null")
     )
     assert cw.mutating_http(text) == write
+
+
+CLAUDE_552_CASES = {
+    "N1-control": "pwsh -NoProfile -ec SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "N1-dq-name": '"pwsh" -NoProfile -ec SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==',
+    "N1-esc-name": "p\\wsh -NoProfile -ec SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "N1-esc-switch": "pwsh -NoProfile -\\ec SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "N1-esc-switch2": "pwsh -NoProfile -e\\c SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "N1-split-name": "pw''sh -NoProfile -ec SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "N1-sq-command": "pwsh -NoProfile -'c' 'Write-Output hi'",
+    "N1-sq-name": "'pwsh' -NoProfile -ec SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "N1-sq-switch": "pwsh -NoProfile -'ec' SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==",
+    "N2-argstring": 'Start-Process pwsh -ArgumentList "-NoProfile -ec '
+    'SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==" -Wait',
+    "N2-argstring-sq": "Start-Process -FilePath pwsh -ArgumentList '-NoProfile -EncodedCommand "
+    "SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==' -Wait",
+    "N2-control-array": "Start-Process pwsh -ArgumentList "
+    "'-ec','SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==' -Wait",
+    "N2-positional": "Start-Process pwsh '-ec SQBuAHYAbwBrAGUALQBSAGUAcwB0AE0AZQB0AGgAbwBkAA==' -Wait",
+    "N3-atparen": "& @('Invoke-RestXethod' -replace 'X','M')[0] -Method Put -Uri $u",
+    "N3-dot-sq-replace": ". 'Invoke-RestXethod'.Replace('X','M') -Method Put -Uri $u",
+    "N3-dq-replace": "& \"Invoke-RestXethod\".Replace('X','M') -Method Put -Uri $u",
+    "N3-paren-control": "& ('Invoke-RestXethod'.Replace('X','M')) -Method Put -Uri $u",
+    "N3-sq-read": "& 'Invoke-RestXethod'.Replace('X','M') -Method Get -Uri $u",
+    "N3-sq-replace": "& 'Invoke-RestXethod'.Replace('X','M') -Method Put -Uri $u",
+    "N3-sq-substring": "& 'Invoke-RestMethodX'.Substring(0,17) -Method Put -Uri $u",
+    "N4-control-format": "(New-Object ('System.Net.Web{0}' -f 'Client')).UploadString($u,'PUT','x')",
+    "N4-newobj-replace": "(New-Object "
+    "('System.Net.WebXlient'.Replace('X','C'))).UploadString($u,'PUT','x')",
+    "N4-newobj-replace-op": "(New-Object ('System.Net.WebXlient' -replace "
+    "'X','C')).UploadString($u,'PUT','x')",
+    "N4-type-replace": "[Activator]::CreateInstance([type]('System.Net.WebXlient'.Replace('X','C'))).UploadString($u,'PUT','x')",
+}
+
+
+@pytest.mark.parametrize("case", sorted(CLAUDE_552_CASES))
+def test_claude_552_literal_invocations(case):
+    text = CLAUDE_552_CASES[case]
+    read = case == "N3-sq-read"
+    assert (cw.mutating_http(text) or cw.mutating_powershell_http(text)) != read
+    reasons = cw.image_publication_invariants(
+        {"probe.yml": {"jobs": {"probe": {"steps": [{"run": text}]}}}}
+    )
+    assert bool(reasons) != read
+
+
+@pytest.mark.parametrize("operator", ["f", "join"])
+@pytest.mark.parametrize("operand", ["0", "0x0", "1,2,3"])
+def test_numeric_operator_member_names(operator, operand):
+    # No invocation write-tail can mask removal of this boundary decision.
+    assert cw.mutating_powershell_http(
+        "$type.GetMethod('name{0}'-" + operator + operand + ")"
+    )
+
+
+@pytest.mark.parametrize(
+    "text", ["pwsh -", "pwsh -File -", "'pwsh' -", "pwsh -'c' 'Write-Output hi'"]
+)
+def test_child_stdin_and_read_evaluation_refused(text):
+    assert cw.mutating_http(text) or cw.mutating_powershell_http(text)
+
+
+@pytest.mark.timeout(60)
+def test_unterminated_invocation_comments_charge_scanned_suffix():
+    assert cw.mutating_powershell_http("&<#" * 40_000)
