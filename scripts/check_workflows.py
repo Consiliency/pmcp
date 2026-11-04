@@ -2734,7 +2734,7 @@ def _powershell_http_reading(text: str) -> bool:
     ):
         return True
     if re.search(
-        r"\b(?:WebClient|HttpClient|WebRequest|HttpWebRequest|Start-BitsTransfer|Invoke-Expression|iex)\b",
+        r"(?<![\w-])(?:WebClient|HttpClient|WebRequest|HttpWebRequest|Start-BitsTransfer|Invoke-Expression|iex)\b",
         text,
         re.IGNORECASE,
     ):
