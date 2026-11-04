@@ -2306,8 +2306,13 @@ def _brace_expand(raw: str, work: _Work) -> list[str]:
                 value.lstrip("-").startswith("0") for value in (first, last)
             )
             width = max(len(first), len(last)) if padded else 0
+            # Sequence-generated backslashes/backticks are literal bytes,
+            # not new shell syntax when the generated word is read again.
             choices = [
-                str(value).zfill(width) if numeric else chr(value) for value in values
+                str(value).zfill(width)
+                if numeric
+                else ("\\" if chr(value) in "\\`" else "") + chr(value)
+                for value in values
             ]
         result: list[str] = []
         for choice in choices:
