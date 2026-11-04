@@ -2461,7 +2461,7 @@ class TestParameterQuotesAndBraces:
             r"${X:-$'\x63url'}",
             '${X:-$"cu"rl}',
             "${X:-${Y:-'cu'rl}}",
-            "\"${X/#/'cu'rl}\"",
+            "\"${X/a/'cu'rl}\"",
             "{cu,}rl",
             "{cu,{x,}}rl",
             "c{u..u}rl",
@@ -2480,7 +2480,7 @@ class TestParameterQuotesAndBraces:
             'curl -s {-d@report.json,"$URL"}',
             '{curl,-X,POST} "$URL"',
             '{wget,--post-data=x} "$URL"',
-            'curl --{data,output}=report.json "$URL"',
+            'curl -{d,o}@report.json "$URL"',
         ],
     )
     def test_braces_supply_arguments(self, text: str) -> None:
@@ -2517,6 +2517,10 @@ class TestParameterQuotesAndBraces:
         "word", ["{a,b}" * 30, "{1..999999999}", "{1.." + "9" * 50 + "}"]
     )
     def test_expansion_budget_fails_closed(self, word: str) -> None:
+        assert cw._http_writes("echo " + word)
+
+    @pytest.mark.parametrize("word", ["{Z..b}", "{Z..b}y", "x{Z..b}{q,r}"])
+    def test_generated_quoting_syntax_is_refused(self, word: str) -> None:
         assert cw._http_writes("echo " + word)
 
 

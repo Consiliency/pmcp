@@ -1543,6 +1543,10 @@ class _OverBudget(Exception):
     """The classifier reached ``_WORK_LIMIT``."""
 
 
+class _UnmodelledExpansion(Exception):
+    """An expansion generates shell quoting syntax; refuse conservatively."""
+
+
 class _Work:
     """The work spent on one classified text, and the texts already classified."""
 
@@ -2306,13 +2310,14 @@ def _brace_expand(raw: str, work: _Work) -> list[str]:
                 value.lstrip("-").startswith("0") for value in (first, last)
             )
             width = max(len(first), len(last)) if padded else 0
-            # Sequence-generated backslashes/backticks are literal bytes,
-            # not new shell syntax when the generated word is read again.
+            # bash treats generated backslashes/backticks differently from
+            # reparsed source (including quote removal and substitution).
+            # Do not approximate that boundary: refuse these rare cross-case
+            # alphabetic ranges, even in an otherwise read-only command.
+            if not numeric and any(value in values for value in (92, 96)):
+                raise _UnmodelledExpansion
             choices = [
-                str(value).zfill(width)
-                if numeric
-                else ("\\" if chr(value) in "\\`" else "") + chr(value)
-                for value in values
+                str(value).zfill(width) if numeric else chr(value) for value in values
             ]
         result: list[str] = []
         for choice in choices:
@@ -2352,7 +2357,7 @@ def _http_writes(text: str) -> bool:
     """
     try:
         return _classify(text, _Work())
-    except (_OverBudget, RecursionError):
+    except (_OverBudget, _UnmodelledExpansion, RecursionError):
         return True
 
 
