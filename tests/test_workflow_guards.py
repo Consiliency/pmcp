@@ -2481,6 +2481,9 @@ PANEL_OPTION_READS = {
 
 
 PANEL_GRAMMAR_WRITES = {
+    "GF3-if-case": 'curl $(if case a in a) true;; esac; then echo -s; fi) "$URL?a=1&b=2" -d x',
+    "GF3-while-case": 'curl $(while case a in a) false;; esac; do :; done; echo -s) "$URL?a=1&b=2" -d x',
+    "GF3-until-case": 'curl $(until case a in a) true;; esac; do :; done; echo -s) "$URL?a=1&b=2" -d x',
     "GF1-ifs-long-default": 'curl$IFS-s$IFS--${X:-data} @report.json "$URL"',
     "GF1-ifs-short-empty": 'curl$IFS-s$IFS-${Y}d@report.json "$URL"',
     "GF1-ifs-short-default": 'curl$IFS-s$IFS-${Y:-d}@report.json "$URL"',

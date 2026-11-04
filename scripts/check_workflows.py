@@ -1663,7 +1663,19 @@ class _ShellLexer:
                 return
             reserved = None if current.quoted else current.text
             at_command_start = not command or all(
-                w.text in {"then", "do", "else", "elif", "!", "{", "time"}
+                w.text
+                in {
+                    "if",
+                    "then",
+                    "while",
+                    "until",
+                    "do",
+                    "else",
+                    "elif",
+                    "!",
+                    "{",
+                    "time",
+                }
                 and not w.quoted
                 for w in command
             )
