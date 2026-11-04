@@ -3706,6 +3706,11 @@ CLAUDE_B42_READS = {
 }
 
 
+CLAUDE_B42_PS["results.json:P19-gettype-concat"] = CLAUDE_B42_READS.pop(
+    "results.json:P19-gettype-concat"
+)[0]
+
+
 class TestClaudeB42Regressions:
     @pytest.mark.parametrize("case", sorted(CLAUDE_B42_BASH))
     def test_bash_metacharacter_boundary(self, case):

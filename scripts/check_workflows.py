@@ -2928,6 +2928,38 @@ def _powershell_http_reading(text: str) -> bool:
                 return True
     expression_spent = 0
     for invocation in re.finditer(r"(?<![\w.&])[&.](?![&.])", text):
+        operand = invocation.end()
+        while operand < len(text):
+            expression_spent += 1
+            if expression_spent > _WORK_LIMIT:
+                return True
+            if text[operand].isspace():
+                operand += 1
+            elif text.startswith("`\n", operand):
+                operand += 2
+            elif text.startswith("<#", operand):
+                end = text.find("#>", operand + 2)
+                if end < 0:
+                    break
+                expression_spent += end + 2 - operand
+                operand = end + 2
+            else:
+                break
+        if operand >= len(text):
+            continue
+        candidate = text[operand : operand + 2]
+        if not (
+            candidate.startswith("(") or candidate == "$(" or candidate.startswith('"')
+        ):
+            continue
+        if candidate.startswith('"'):
+            end = text.find('"', operand + 1)
+            end = len(text) if end < 0 else end
+            expression_spent += end - operand
+            if expression_spent > _WORK_LIMIT:
+                return True
+            if text.find("$(", operand, end) < 0:
+                continue
         try:
             expression_args, cost = _pwsh_arguments(
                 text, invocation.end(), _WORK_LIMIT - expression_spent
