@@ -2487,6 +2487,9 @@ PANEL_OPTION_READS = {
 
 
 PANEL_GRAMMAR_WRITES = {
+    "grok7e-new1-bang-for": '! for (( i=0; i<1; i++ << true )); do :; done\ncurl -s $(\ntrue\n) "$URL" -d x',
+    "grok7e-new1-time-for": 'time -p for (( i=0; i<1; i++ << true )); do :; done\ncurl -s $(\ntrue\n) "$URL" -d x',
+    "grok7e-new1-brace-for": '{ for (( i=0; i<1; i++ << true )); do :; done; }\ncurl -s $(\ntrue\n) "$URL" -d x',
     "NEW1-if-arith-shift-heredoc": 'if (( 1 << true )); then :; fi\ncurl -s $(\ntrue\n) "$URL?a=1&b=2" -d@report.json',
     "NEW1-while-arith-shift-heredoc": 'while (( 0 << true )); do :; done\ncurl -s $(\ntrue\n) "$URL?a=1&b=2" -d@report.json',
     "NEW1-bang-arith-shift-heredoc": '! (( 0 << true ))\ncurl -s $(\ntrue\n) "$URL?a=1&b=2" -X PUT',
@@ -3171,6 +3174,28 @@ class TestPowerShellWebCmdlets:
 
 
 PANEL_FINAL_PS_WRITES = {
+    "grok7e-hole-method-glued-quote": 'Invoke-RestMethod -Uri https://example.invalid -Method"Put" -InFile f',
+    "grok7e-hole-custom-glued": 'Invoke-RestMethod -Uri https://example.invalid -CustomMethod"PROPFIND"',
+    "grok7e-hole-cmd-glued-dquote": 'Invoke-RestMethod"https://example.invalid/p" -Method Put -InFile f',
+    "grok7e-hole-cmd-glued-squote": "Invoke-RestMethod'https://example.invalid/p' -Method Put -InFile f",
+    "grok7e-hole-format-tight": "& ('Invoke-{0}' -f'RestMethod') -Method Put -Uri http://example.invalid",
+    "grok7e-hole-format-var-tight": "& ('Invoke-{0}' -f$cmd) -Method Put -Uri http://example.invalid",
+    "grok7e-hole-join-tight": "& (('Invoke-','RestMethod')-join'') -Method Put -Uri http://example.invalid",
+    "grok7e-hole-type-join": "[(-join ('System.Net.Web','Client'))]::new().UploadString('http://example.invalid','x')",
+    "grok7e-hole-type-format": "[('{0}{1}' -f 'System.Net.Web','Client')]::new().UploadString('http://example.invalid','x')",
+    "grok7e-hole-string-member-quote": "& ([string]::('Format')('Invoke-{0}','RestMethod')) -Method Put -Uri http://example.invalid",
+    "grok7e-hole-string-member-concat": "& ([string]::('For'+'mat')('Invoke-{0}','RestMethod')) -Method Put -Uri http://example.invalid",
+    "grok7e-hole-string-join-quote": "& ([System.String]::('Join')('', @('Invoke-','RestMethod'))) -Method Put",
+    "grok7e-hole-child-array": "pwsh -NoProfile @('-Command','Invoke-RestMethod -Method Put -Uri http://example.invalid')",
+    "grok7e-hole-child-paren": "pwsh -NoProfile ('-Command') 'Invoke-RestMethod -Method Put -Uri http://example.invalid'",
+    "grok7e-hole-child-enc-array": "powershell.exe @('-EncodedCommand','QQ==')",
+    "grok7e-hole-newitem-alias": "New-Item -Path Alias:x -Value Invoke-RestMethod; x -Method Put -Uri http://example.invalid",
+    "grok7e-enc-direct": "powershell.exe -NoProfile -EncodedCommand QQ==",
+    "grok7e-enc-array": "powershell.exe -NoProfile @('-EncodedCommand','QQ==')",
+    "grok7e-enc-paren": "powershell.exe -NoProfile ('-EncodedCommand') 'QQ=='",
+    "grok7e-command-array-plain": "pwsh -NoProfile @('-Command','Write-Output hi')",
+    "grok7e-command-paren-plain": "pwsh -NoProfile ('-Command') 'Write-Output hi'",
+    "grok7e-command-direct-plain": "pwsh -NoProfile -Command 'Write-Output hi'",
     "ruling-format-name": "& ('Invoke-{0}' -f 'RestMethod') -Method Put -Uri $u",
     "ruling-join-name": "& (-join ('Invoke-', 'RestMethod')) -Method Put -Uri $u",
     "ruling-format-type": "New-Object ('System.Net.{0}' -f 'WebClient')",
@@ -3232,6 +3257,29 @@ PANEL_FINAL_PS_WRITES = {
 
 
 class TestPanelFinalRegressions:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "& 'C:\\Tools\\iwr' -Uri 'https://example.invalid' -Method Get",
+            "Invoke-WebRequest -Uri $u -Method Get",
+            'Invoke-RestMethod -Uri https://example.invalid -Method"Get"',
+            'Invoke-RestMethod"https://example.invalid/p" -Method Get',
+        ],
+    )
+    def test_glued_quote_reads(self, text: str) -> None:
+        assert not cw.mutating_powershell_http(text)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '! for (( i=0; i<1; i++ << true )); do :; done\ncurl -s $(\ntrue\n) "$URL" -o /dev/null',
+            'time -p for (( i=0; i<1; i++ << true )); do :; done\ncurl -s $(\ntrue\n) "$URL" -o /dev/null',
+            '{ for (( i=0; i<1; i++ << true )); do :; done; }\ncurl -s $(\ntrue\n) "$URL" -o /dev/null',
+        ],
+    )
+    def test_prefixed_arithmetic_for_reads(self, text: str) -> None:
+        assert not cw.mutating_http(text)
+
     @pytest.mark.parametrize("dash", ["-", "–", "—", "―"])
     @pytest.mark.parametrize("operator", ["f", "join"])
     @pytest.mark.parametrize(

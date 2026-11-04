@@ -1814,7 +1814,13 @@ class _ShellLexer:
             if char == "(":
                 self.work.spend(len(command))
                 at_start = not word.started and (
-                    _compound_prefix(command) or [w.text for w in command] == ["for"]
+                    _compound_prefix(command)
+                    or (
+                        bool(command)
+                        and command[-1].text == "for"
+                        and not command[-1].quoted
+                        and _compound_prefix(command[:-1])
+                    )
                 )
                 finish_command()
                 if at_start and s.startswith("((", pos):
@@ -2674,6 +2680,12 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
             at_token_start = False
             continue
         if char in "'\"":
+            if (
+                token
+                and token[0] in "-–—―"
+                and all(piece.isalpha() or piece == ":" for piece in token[1:])
+            ):
+                finish_token()  # A quote terminates a parameter token.
             at_token_start = False
             end = pos + 1
             while end < n:
@@ -2838,7 +2850,7 @@ def _powershell_http_reading(text: str) -> bool:
     # Refuse without evaluating the expression; GET forms are conservative hits.
     expression_site = re.search(
         r"(?:(?<![\w.])[&.](?=\s|[$(\"'])|(?<![\w-])(?:New-Object|TypeName|GetType|GetMethod|"
-        r"GetMember|InvokeMember)\b|\[\s*(?:System\.)?(?:type|string)\s*\]|-as\b)",
+        r"GetMember|InvokeMember)\b|\[\s*(?:\(|(?:System\.)?(?:type|string)\s*\])|-as\b)",
         text,
         re.IGNORECASE,
     )
@@ -2851,7 +2863,7 @@ def _powershell_http_reading(text: str) -> bool:
     ):
         return True
     if re.search(
-        r"\[\s*(?:System\.)?String\s*\]\s*::\s*(?:Format|Join|Concat)\b",
+        r"\[\s*(?:System\.)?String\s*\]\s*::",
         text,
         re.IGNORECASE,
     ):
@@ -2863,6 +2875,15 @@ def _powershell_http_reading(text: str) -> bool:
         re.IGNORECASE,
     ):
         return True
+    # Alias provider writes can be spelled through item cmdlets as well as
+    # Set-Alias. Refuse provider references conservatively, including reads.
+    if re.search(r"(?<![\w])Alias\s*:", text, re.IGNORECASE):
+        # Qualified invocation names alone are handled by the cmdlet scanner;
+        # provider manipulation is the additional refusal here.
+        if re.search(
+            r"(?<![\w-])(?:New|Set|Copy|Move|Rename)-Item\b", text, re.IGNORECASE
+        ):
+            return True
     child_spent = 0
     for child in re.finditer(
         r"(?<![\w.-])(?:pwsh|powershell)(?:\.exe)?(?![\w.-])", text, re.IGNORECASE
@@ -2876,8 +2897,11 @@ def _powershell_http_reading(text: str) -> bool:
         child_spent += child_end - child.end() + 1
         if child_spent > _WORK_LIMIT:
             return True
-        for argument in child_args:
-            option = _PWSH_PARAMETER.fullmatch(argument)
+        child_spent += sum(len(argument) for argument in child_args)
+        if child_spent > _WORK_LIMIT:
+            return True
+        for argument in _pwsh_native_arguments(child_args):
+            option = _PWSH_PARAMETER.fullmatch(argument.text)
             if option and (
                 "command".startswith(option[1].lower())
                 or "encodedcommand".startswith(option[1].lower())
@@ -2909,41 +2933,44 @@ def _powershell_http_reading(text: str) -> bool:
         return True
     spent = 0
     for match in _PWSH_WEB.finditer(text):
-        start = match.end()
-        if text[start : start + 1] in {"'", '"'}:
-            start += 1  # Closing quote also follows a qualified command basename.
-        try:
-            args, end = _pwsh_arguments(text, start, _WORK_LIMIT - spent)
-        except _UnmodelledExpansion:
-            return True
-        spent += end - match.end() + 1
-        if spent > _WORK_LIMIT:
-            return True
-        native = match[0].lower().rsplit("\\", 1)[-1].removesuffix(".exe")
-        if native in {"curl", "wget"} and any("(" in arg for arg in args):
-            spent += sum(len(arg) for arg in args)
+        starts = [match.end()]
+        if text[match.end() : match.end() + 1] in {"'", '"'}:
+            # Could close a qualified command token or open its first argument.
+            # Retain both readings; neither may suppress the other.
+            starts.append(match.end() + 1)
+        for start in starts:
+            try:
+                args, end = _pwsh_arguments(text, start, _WORK_LIMIT - spent)
+            except _UnmodelledExpansion:
+                return True
+            spent += end - match.end() + 1
             if spent > _WORK_LIMIT:
                 return True
-            native_args = _pwsh_native_arguments(args)
-            if (_curl_writes if native == "curl" else _wget_writes)(native_args):
-                return True
-        if match[0].lower().endswith(".exe"):
-            continue  # Explicit native executables have no cmdlet -Method alias.
-        for index, token in enumerate(args):
-            if re.fullmatch(r"@[A-Za-z_]\w*", token):
-                return True
-            parameter = _PWSH_PARAMETER.fullmatch(token)
-            if parameter is None:
-                continue
-            name = parameter[1].lower()
-            if name == "cm" or (len(name) >= 2 and "custommethod".startswith(name)):
-                return True
-            if len(name) >= 2 and "method".startswith(name):
-                value = (parameter[2] or ":")[1:]
-                if not value and index + 1 < len(args):
-                    value = args[index + 1]
-                if _pwsh_method_writes(value):
+            native = match[0].lower().rsplit("\\", 1)[-1].removesuffix(".exe")
+            if native in {"curl", "wget"} and any("(" in arg for arg in args):
+                spent += sum(len(arg) for arg in args)
+                if spent > _WORK_LIMIT:
                     return True
+                native_args = _pwsh_native_arguments(args)
+                if (_curl_writes if native == "curl" else _wget_writes)(native_args):
+                    return True
+            if match[0].lower().endswith(".exe"):
+                continue  # Explicit native executables have no cmdlet -Method alias.
+            for index, token in enumerate(args):
+                if re.fullmatch(r"@[A-Za-z_]\w*", token):
+                    return True
+                parameter = _PWSH_PARAMETER.fullmatch(token)
+                if parameter is None:
+                    continue
+                name = parameter[1].lower()
+                if name == "cm" or (len(name) >= 2 and "custommethod".startswith(name)):
+                    return True
+                if len(name) >= 2 and "method".startswith(name):
+                    value = (parameter[2] or ":")[1:]
+                    if not value and index + 1 < len(args):
+                        value = args[index + 1]
+                    if _pwsh_method_writes(value):
+                        return True
     return False
 
 
