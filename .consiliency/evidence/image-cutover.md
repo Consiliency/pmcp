@@ -739,3 +739,62 @@ isolated HOME and prepared interpreter. It includes the complete live harness
 and 93 negative controls; completion is pending. Prior completed counts do not
 certify this new head. The standalone guard coverage command and whole-tree
 format command retain their disclosed failures; no waiver is asserted.
+
+### 7e42288 review and CPU-budget corrections
+
+Codex reported C13/C14 (operator token boundaries and invocation operands).
+Grok reported P-FOR-PREFIX, P-TOKEN-QUOTE, P-RULING-FORM and P-NEWITEM.
+Claude again returned an explicitly incomplete review, with no new reproducible
+finding; it is not a usable seat. Gemini's attempt failed with server capacity
+unavailable and delivered no review. These reports do not constitute panel approval.
+
+Implementation `ea5252a` includes the following corrections:
+
+- Format/join recognition accepts quote-adjacent operands and PowerShell's
+  dash classes. Invocation-site recognition includes subexpression and quoted
+  operands; bracket type expressions are included too.
+- Arithmetic `for` headers retain their recognition after compound prefixes.
+  Quoted parameter values begin a separate token. Command-adjacent quotes keep
+  both opening-argument and closing-command readings under one work budget.
+- Child PowerShell options receive the grouped/array native-argument reading.
+  Static String member access is conservatively refused, including quoted or
+  concatenated member selectors. Alias-provider item operations are refused.
+  Read-only String static calls and alias-provider item operations are additional
+  deliberate false positives. The narrowed scope ruling is unchanged.
+
+Hosted Python 3.12 testing at `7e42288` failed two CPU-budget assertions:
+`many-curl-words` took 37.9 seconds and `pwsh-many-words` 41.1 seconds, against
+the unchanged 30-second ceiling. The run reported 2 failed, 14701 passed,
+60 skipped and 1 xfailed. This is a failed resource check, not a wall-time
+flake. The failed log is retained at
+`/home/viperjuice/workspace/tmp/pmcp-475-prefix-fixes/ci-7e42288-failed.log`.
+
+The corrected scanners charge 16 work units before each completed lexical
+token allocation/dispatch. PowerShell returns and accumulates that work across
+candidate commands and alternate quote readings. Excess work refuses. Empty
+Bash word boundaries avoid allocating a new word. The 30-second CPU,
+512-MiB memory and 60-second timeout assertions are unchanged; separate
+negative controls remove each scanner's token charge.
+
+An isolated Python 3.12 measurement at intermediate code `4508d8b` used
+`time.process_time()` and `tracemalloc`, but not the full CI coverage setup.
+Both hostile inputs refused: curl took 0.311 seconds with 2,353,686 traced
+peak bytes, and PowerShell took 0.203 seconds with 1,288,790 bytes. These
+measurements do not certify hosted CI or the later accounting adjustment.
+Artifacts are in `/tmp/pmcp-ai-viperjuice/475-perf-4508d8b/` on ai.
+
+The complete `ea5252a` run is at
+`/tmp/pmcp-ai-viperjuice/475-final-ea5252a/` on ai, detached under 4 GiB with
+isolated HOME and the prepared Python 3.10 interpreter. Completed stages:
+1543 guard tests, 1844 focused tests, 300 live-oracle texts with no
+disagreements, and 216 brace-oracle words (199 comparisons and 17 explicit
+refusals). Ruff, CI-form formatting, single-file mypy, workflow checks and the
+old detector identity check pass. The standalone guard coverage invocation
+still exits 1 at 0% against 60%, despite 1543 passing assertions; whole-tree
+formatting retains its two disclosed diagnostics-file failures.
+
+The mutation loop and 103 negative controls are still running, not passing
+evidence. Durable driver/control sources are at
+`/home/viperjuice/workspace/tmp/pmcp-475-review-7e-fixes/`.
+Completed validation, reconciliation of the outstanding review, a complete
+usable panel and exact-head hosted CI remain required before merge.
