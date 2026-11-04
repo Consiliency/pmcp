@@ -654,3 +654,27 @@ prefix class. Scripts and archives are under
 
 A new complete four-vendor review, explicit residual adjudication, completed
 validation and exact-head CI remain required. No panel approval is asserted.
+
+The `c9a8908` full battery subsequently completed: 170/170 mutation rows,
+75/75 negative controls killed (plus the unchanged baseline), no surviving
+control. The archived final log and JSONL are in the local validation directory
+above. This completion does not certify later code or substitute for review.
+
+At `7af323e`, Claude returned an incomplete review without a new reproducible
+finding; it cannot count as a usable seat. Codex reported C12: a literal
+`HttpMessageInvoker.SendAsync` request is accepted. The classifier result was
+measured on ai; request semantics are supported by Microsoft's
+[HttpMessageInvoker documentation](https://learn.microsoft.com/en-us/dotnet/api/system.net.http.httpmessageinvoker),
+not by live PowerShell execution. Other seats remain outstanding.
+
+Code `1c69b1c` conservatively refuses references to the `System.Net.Http`
+namespace (including the `Net.Http` shorthand) and unqualified HTTP message,
+invoker and handler types. It applies to every normalized reading. References
+to GET methods, response types and construction without a send are deliberate
+false positives. Tests cover C12 at the workflow entry and qualified,
+unqualified, escaped and concatenated references. A new negative control
+removes this API-family check. Validation is pending in
+`/tmp/pmcp-ai-viperjuice/475-http-api-1c69b1c/` under the same isolated/capped
+conditions. Consiliency/pmcp#476 now explicitly excludes omitted fixed literal
+request primitives from automatic residual treatment; each needs a fix or an
+individual ruling. The broader proposed evaluation boundary remains unruled.
