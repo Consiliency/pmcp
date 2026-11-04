@@ -1463,7 +1463,7 @@ _SIMPLE_PARAMETER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]")
 # The parameter name and operator that open ${...}; the rest is a word.
 _PARAMETER_HEAD = re.compile(
     r"[#!]?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])(?:\[[^]]*\])?"
-    r"(?P<op>:?[-=+?]|##?|%%?|//?|/[#%]|\^\^?|,,?|@)?"
+    r"(?P<op>:?[-=+?]|##?|%%?|/[#%]|//?|\^\^?|,,?|@)?"
 )
 # The ${name<op>word} operators whose word can become the value (bash(1),
 # Parameter Expansion): a default, an assigned default, an alternate value,
@@ -1475,7 +1475,7 @@ _VALUE_OPERATORS = {":-", "-", ":=", "=", ":+", "+", "/", "//", "/#", "/%"}
 # (nested ${ in a subscript recurse, each on its own text).
 _PARAMETER_LEAD = re.compile(
     r"[#!]?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])(?:\[[^]}]*\])?"
-    r"(?P<op>:?[-=+?]|##?|%%?|//?|/[#%]|\^\^?|,,?|@)?"
+    r"(?P<op>:?[-=+?]|##?|%%?|/[#%]|//?|\^\^?|,,?|@)?"
 )
 _ANSI_C_ESCAPES = {
     "a": "\a",
@@ -1519,11 +1519,16 @@ def _ansi_c(body: str) -> str:
             continue
         token = number[0]
         if token[0] == "c":
-            out.append(chr(ord(token[1]) & 0x1F))
+            decoded = chr(ord(token[1]) & 0x1F)
         elif token[0] in "xuU":
-            out.append(chr(min(int(token[1:], 16), 0x10FFFF)))
+            decoded = chr(min(int(token[1:], 16), 0x10FFFF))
         else:
-            out.append(chr(int(token, 8) & 0xFF))
+            decoded = chr(int(token, 8) & 0xFF)
+        # Bash terminates this ANSI-C quoted segment at a decoded NUL.
+        # Text after its closing quote still concatenates in the lexer.
+        if decoded == "\0":
+            break
+        out.append(decoded)
         index += 1 + len(token)
     return "".join(out)
 
@@ -1818,6 +1823,7 @@ class _ShellLexer:
         self.nested.append(inner)
 
     def expansion(self, word: _Word, start: int, end: int, shape: str = _MARK) -> int:
+        self.work.spend(end - start)
         raw = self.s[start:end]
         word.add(raw, shape)
         word.expanded = True
@@ -1827,6 +1833,7 @@ class _ShellLexer:
     def double_quoted(self, pos: int, word: _Word) -> int:
         """``"..."`` from just after its opening quote."""
         s, inner = self.s, _Word()
+        start = pos
         while True:
             if pos >= self.n:
                 raise _Unlexable
@@ -1848,6 +1855,7 @@ class _ShellLexer:
             pos += 1
         word.expanded = word.expanded or inner.expanded
         word.expansions += inner.expansions
+        self.work.spend(pos - start)
         self.quoted_part(word, inner.text, inner.shape)
         return pos + 1
 
@@ -1870,10 +1878,10 @@ class _ShellLexer:
             if lead is not None and lead["op"] in _VALUE_OPERATORS:
                 operand = lead.end()
             value = _Word()
-            operand_quoted = quoted and not (
-                lead is not None and (lead["op"] or "").startswith("/")
-            )
-            end = self.parameter(pos + 2, operand_quoted, value, operand)
+            substitution = lead is not None and (lead["op"] or "").startswith("/")
+            operand_quoted = quoted and not substitution
+            end = self.parameter(pos + 2, operand_quoted, value, operand, substitution)
+            self.work.spend(2 * (end - pos))
             content = s[pos + 2 : end - 1]
             head = _PARAMETER_HEAD.match(content)
             self.nested.append(content[head.end() :] if head else content)
@@ -1899,17 +1907,29 @@ class _ShellLexer:
         return pos + 1
 
     def parameter(
-        self, pos: int, quoted: bool, value: _Word, operand: int | None
+        self,
+        pos: int,
+        quoted: bool,
+        value: _Word,
+        operand: int | None,
+        substitution: bool = False,
     ) -> int:
         """The end of ``${...}``, from just after its ``{``; from ``operand``
         on, the text is also built into ``value``."""
         s, scratch = self.s, _Word()
+        replacement = False
         while pos < self.n:
             char = s[pos]
             if char == "}":
                 return pos + 1
             into = value if operand is not None and pos >= operand else scratch
-            if char == "\\":
+            if char == "/" and substitution and into is value and not replacement:
+                # Keep the pattern reading conservatively, but give the
+                # replacement its own boundary: it can be an entire option.
+                into.add(char, _MARK)
+                replacement = True
+                pos += 1
+            elif char == "\\":
                 into.add(s[pos + 1 : pos + 2])
                 pos += 2
             elif char == "'" and not quoted:
@@ -2190,6 +2210,32 @@ def _http_tools(word: _Word, work: _Work) -> list[tuple[str, list[_Word]]]:
     return found
 
 
+def _argument_shapes(word: _Word, work: _Work) -> list[list[_Word]]:
+    """Read an expanded option with each unknown piece empty or splitting.
+
+    Retain all join/split combinations within a word, not just the two
+    extremes: an option name can join across one expansion while its method
+    splits at another. Charge each candidate before copying/allocating it.
+    """
+    if not word.expanded:
+        return []
+    work.spend(len(word.shape))
+    if "-" not in word.shape:
+        return []  # No statically present option prefix in this word.
+    parts = [part for part in word.shape.split(_MARK) if part]
+    if not parts:
+        return []  # A completely unknown runtime value remains AC1.
+    readings: set[tuple[str, ...]] = {(parts[0],)}
+    for part in parts[1:]:
+        following: set[tuple[str, ...]] = set()
+        for reading in readings:
+            work.spend(2 * (sum(len(piece) + 1 for piece in reading) + len(part)))
+            following.add((*reading[:-1], reading[-1] + part))
+            following.add((*reading, part))
+        readings = following
+    return [[_Word(part, expanded=True) for part in reading] for reading in readings]
+
+
 def _command_writes(words: list[_Word], work: _Work) -> bool:
     """A simple command with curl or wget anywhere in it (``timeout 5 curl``,
     ``env A=1 curl``) whose arguments send a method."""
@@ -2202,6 +2248,16 @@ def _command_writes(words: list[_Word], work: _Work) -> bool:
                 return True
             if tool == "wget" and _wget_writes(args):
                 return True
+            for arg_index, arg in enumerate(args):
+                for reading in _argument_shapes(arg, work):
+                    # Readers inspect each option independently and at most
+                    # its following word; avoid a cross-product across argv.
+                    following = args[arg_index + 1 : arg_index + 2]
+                    work.spend(sum(len(w.text) + 1 for w in reading + following))
+                    if tool == "curl" and _curl_writes(reading + following):
+                        return True
+                    if tool == "wget" and _wget_writes(reading + following):
+                        return True
     return False
 
 
@@ -2257,6 +2313,12 @@ def _brace_expand(raw: str, work: _Work) -> list[str]:
         char = raw[pos]
         if char == "\\":
             pos += 2
+            continue
+        if char in "<>" and raw.startswith("(", pos + 1):
+            try:
+                pos = lexer.parse(pos + 2, closer=True)
+            except _Unlexable:
+                return [raw]
             continue
         if char == "'":
             close = raw.find("'", pos + 1)
@@ -2434,10 +2496,11 @@ def _floor_input_is_bounded(text: str) -> bool:
 # may be abbreviated, and a splatted argument set (@params) counts as a write.
 MUTATING_PWSH_LABEL = "a mutating PowerShell web request"
 _PWSH_WEB = re.compile(
-    r"(?<![\w.$-])(?:invoke-webrequest|invoke-restmethod|iwr|irm|curl|wget)(?![\w.-])",
+    r"(?<![\w.$-])(?:[\w.-]+\\)?"
+    r"(?:invoke-webrequest|invoke-restmethod|iwr|irm|curl|wget)(?![\w.-])",
     re.IGNORECASE,
 )
-_PWSH_PARAMETER = re.compile(r"-([A-Za-z]+)(:.*)?", re.DOTALL)
+_PWSH_PARAMETER = re.compile(r"[-\u2013\u2014\u2015]([A-Za-z]+)(:.*)?", re.DOTALL)
 
 
 def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
@@ -2471,6 +2534,15 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
             depth += 1
         elif char in ")}]":
             if not depth:
+                if char == ")":
+                    # A statically named command can sit in a command-object
+                    # expression, e.g. & (Get-Command iwr) -Method Put.
+                    # Retain the tail conservatively even without & or . .
+                    if token:
+                        tokens.append("".join(token))
+                        token = []
+                    pos += 1
+                    continue
                 break
             depth -= 1
         elif not depth and (char in ";|\n" or text.startswith("&&", pos)):
@@ -2504,7 +2576,14 @@ def mutating_powershell_http(text: str) -> bool:
     """
     spent = 0
     for match in _PWSH_WEB.finditer(text):
-        args, end = _pwsh_arguments(text, match.end(), _WORK_LIMIT - spent)
+        start = match.end()
+        if (
+            match.start() > 0
+            and text[match.start() - 1] in "'\""
+            and text[start : start + 1] == text[match.start() - 1]
+        ):
+            start += 1  # & 'Invoke-RestMethod' -Method Put
+        args, end = _pwsh_arguments(text, start, _WORK_LIMIT - spent)
         spent += end - match.end() + 1
         if spent > _WORK_LIMIT:
             return True

@@ -2250,14 +2250,14 @@ class TestBashGrammar:
 
         text = self.BOUNDED_INPUTS[name]
         tracemalloc.start()
-        started = time.monotonic()
+        started = time.process_time()
         try:
             bash = cw.mutating_http(text)
             pwsh = cw.mutating_powershell_http(text)
             _, peak = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
-        elapsed = time.monotonic() - started
+        elapsed = time.process_time() - started
         assert elapsed < 30, f"{name} took {elapsed:.1f}s"
         assert peak < 512 * 2**20, f"{name} peaked at {peak / 2**20:.0f} MiB"
         if name in self.OVER_BOUND:
@@ -2450,6 +2450,88 @@ EXPANSION_WORD_ACCEPTED_FALSE_POSITIVES = {
     "FX-echo-default": 'echo "${X:-curl}" -d@report.json',
     "FX-substitution-pattern": 'X=a; ${X/curl/a} -s -d@report.json "$URL" || true',
 }
+
+
+PANEL_OPTION_WRITES = {
+    "long-default": 'curl -s --${X:-data} @report.json "$URL"',
+    "short-empty": 'curl -s -${Y}d@report.json "$URL"',
+    "short-default": 'curl -s -${Y:-d}@report.json "$URL"',
+    "long-empty": 'curl -s --d${E}ata @report.json "$URL"',
+    "request-default": 'curl -s --${X:-request}=PUT "$URL"',
+    "wget-long": 'wget -q --${X:-post-file}=report.json "$URL"',
+    "quoted-empty": 'curl -s -"$A"d@report.json "$URL"',
+    "whole-option": 'curl "${X:--d@report.json}" "$URL"',
+    "whole-extquote": 'curl "${X:-$\'-XPUT\'}" "$URL"',
+    "whole-split": 'curl ${X:- -X PUT} "$URL"',
+    "wget-whole": 'wget ${OPT:---post-data=x} "$URL"',
+    "nested-extquote": r'''curl "${X:-${OPT:-$'\x2dd@report.json'}}" "$URL"''',
+    "replacement": 'X=-s; curl "${X/#-s/-d@report.json}" "$URL"',
+    "alternate": 'X=v; curl ${X:+--data} x "$URL"',
+    "assigned-default": 'curl ${X:=--data} x "$URL"',
+    "split-and-join": 'curl --${X:-request}${IFS}PUT "$URL"',
+    "wget-execute": 'wget -q ${RC:--e post_data=x} "$URL"',
+}
+PANEL_OPTION_READS = {
+    "long-output": 'curl --${X:-output} /dev/null "$URL"',
+    "output-path": 'curl -o "${F:-/dev/null}" "$URL"',
+    "whole-output": 'curl "${X:--o/dev/null}" "$URL"',
+    "split-output": 'curl ${X:- --output /dev/null} "$URL"',
+    "wget-output": 'wget --${X:-output-document}=/dev/null "$URL"',
+}
+
+
+class TestPanelOptionAndNulFindings:
+    @pytest.mark.parametrize("case", sorted(PANEL_OPTION_WRITES))
+    def test_option_shapes_write(self, case: str) -> None:
+        assert cw._http_writes(PANEL_OPTION_WRITES[case])
+        assert cw.mutating_http(PANEL_OPTION_WRITES[case])
+
+    @pytest.mark.parametrize("case", sorted(PANEL_OPTION_READS))
+    def test_option_shapes_read(self, case: str) -> None:
+        assert not cw.mutating_http(PANEL_OPTION_READS[case])
+
+    @pytest.mark.parametrize(
+        "escape",
+        [r"\0", r"\000", r"\400", r"\x00", r"\u0000", r"\U00000000", r"\c@", r"\c`"],
+    )
+    @pytest.mark.parametrize("context", ["direct", "parameter", "quoted-parameter"])
+    def test_nul_truncates_only_the_quoted_segment(
+        self, escape: str, context: str
+    ) -> None:
+        assert cw._ansi_c("cu" + escape + "ignored") == "cu"
+        tool = "$'cu" + escape + "ignored'rl"
+        if context != "direct":
+            tool = "${X:-" + tool + "}"
+        if context == "quoted-parameter":
+            tool = '"' + tool + '"'
+        assert cw._http_writes(tool + ' --data x "$URL"')
+        assert not cw.mutating_http(tool + ' -o /dev/null "$URL"')
+
+    def test_argument_shape_products_are_bounded(self) -> None:
+        text = "curl -" + "${X}a" * 40 + ' "$URL"'
+        assert len(text) < 1000
+        assert cw._http_writes(text)
+
+
+class TestPanelPowerShellForms:
+    @pytest.mark.parametrize("dash", ["-", "\u2013", "\u2014", "\u2015"])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "Invoke-RestMethod",
+            "& (Get-Command Invoke-RestMethod)",
+            "& (gcm iwr)",
+            ". ((gcm irm))",
+            "& 'Invoke-RestMethod'",
+            '& "Microsoft.PowerShell.Utility\\Invoke-RestMethod"',
+        ],
+    )
+    def test_methods_across_command_expressions(self, dash: str, command: str) -> None:
+        assert cw.mutating_powershell_http(f"{command} {dash}Method Put -Uri $u")
+        assert cw.mutating_powershell_http(
+            f"{command} {dash}CustomMethod PATCH -Uri $u"
+        )
+        assert not cw.mutating_powershell_http(f"{command} {dash}Method Get -Uri $u")
 
 
 class TestParameterQuotesAndBraces:
@@ -2743,6 +2825,8 @@ class TestLinearPublicationScans:
         assert not re.search(OLD_PUBLICATION_REGEXES[label], text)
         assert not cw.PUBLICATION_PATTERNS[label].search(text)
 
+    # CPU budgets exclude time descheduled on a loaded CI host. These are
+    # resource-regression checks, not elapsed-wall-time performance assertions.
     # Quadratic for the old regexes. Measured on ai: 18.5 s for 120 KB of
     # `docker -x `, 2.7 s for 264 KB of `type=image ` (550 KB here, about 4x
     # by the quadratic) and 7.4 s for 140 KB of `skopeo ` (210 KB here); the
@@ -2760,10 +2844,10 @@ class TestLinearPublicationScans:
         import time
 
         text = self.HOSTILE[label]
-        started = time.monotonic()
+        started = time.process_time()
         assert not cw.PUBLICATION_PATTERNS[label].search(text)
         assert cw.PUBLICATION_PATTERNS[label].search(text + " push=true push")
-        elapsed = time.monotonic() - started
+        elapsed = time.process_time() - started
         assert elapsed < 3, f"{label} took {elapsed:.1f}s"
 
     @pytest.mark.timeout(60)
@@ -2771,10 +2855,10 @@ class TestLinearPublicationScans:
         import time
 
         text = "skopeo " * 30_000
-        started = time.monotonic()
+        started = time.process_time()
         assert not cw.SKOPEO_DELETE.search(text)
         assert cw.SKOPEO_DELETE.search(text + "delete")
-        elapsed = time.monotonic() - started
+        elapsed = time.process_time() - started
         assert elapsed < 3, f"skopeo took {elapsed:.1f}s"
 
     @pytest.mark.timeout(120)
@@ -2791,9 +2875,9 @@ class TestLinearPublicationScans:
             "defaults": {"run": {"shell": text}},
             "steps": [{"run": text}],
         }
-        started = time.monotonic()
+        started = time.process_time()
         reasons = cw.image_publication_invariants(docs)
-        elapsed = time.monotonic() - started
+        elapsed = time.process_time() - started
         assert elapsed < 30, f"{label} took {elapsed:.1f}s"
         assert not any(f"contains {label}" in r for r in reasons)
 
@@ -2831,9 +2915,9 @@ class TestFloorInputBound:
     def test_the_floor_input_is_bounded(self, text: str) -> None:
         import time
 
-        started = time.monotonic()
+        started = time.process_time()
         cw.mutating_http(text)
-        elapsed = time.monotonic() - started
+        elapsed = time.process_time() - started
         assert elapsed < 3, f"took {elapsed:.1f}s"
 
 
