@@ -3257,6 +3257,73 @@ PANEL_FINAL_PS_WRITES = {
 
 
 class TestPanelFinalRegressions:
+    @pytest.mark.parametrize("dash", ["-", "–", "—", "―"])
+    @pytest.mark.parametrize("operator", ["f", "join"])
+    @pytest.mark.parametrize("operand", ["0", "0x0", "1,2,3", "-1", "+1", ".5", "$n"])
+    def test_expression_operator_operand_boundaries(self, dash, operator, operand):
+        # Policy refuses these name expressions even if they produce no command.
+        for gap in ("", " "):
+            text = (
+                "& ('i{0:wr}'"
+                + dash
+                + operator
+                + gap
+                + operand
+                + ") -Method Put -Uri $u"
+            )
+            assert cw.mutating_powershell_http(text)
+            docs = {
+                "probe.yml": {
+                    "jobs": {"probe": {"steps": [{"shell": "pwsh", "run": text}]}}
+                }
+            }
+            assert any(
+                cw.MUTATING_PWSH_LABEL in r
+                for r in cw.image_publication_invariants(docs)
+            )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "New-Item",
+            "Set-Item",
+            "Copy-Item",
+            "Move-Item",
+            "Rename-Item",
+            "ni",
+            "si",
+            "cpi",
+            "cp",
+            "copy",
+            "mi",
+            "mv",
+            "move",
+            "rni",
+            "ren",
+        ],
+    )
+    @pytest.mark.parametrize("method", ["Put", "Get"])
+    def test_alias_provider_operation_spellings(self, command, method):
+        text = (
+            command
+            + " -Path Alias:review475 -Value Invoke-RestMethod; review475 -Method "
+            + method
+            + " -Uri $u"
+        )
+        # Alias-provider manipulation is refused even without a later write.
+        assert cw.mutating_powershell_http(text)
+        docs = {
+            "probe.yml": {
+                "jobs": {"probe": {"steps": [{"shell": "pwsh", "run": text}]}}
+            }
+        }
+        assert any(
+            cw.MUTATING_PWSH_LABEL in r for r in cw.image_publication_invariants(docs)
+        )
+        assert not cw.mutating_powershell_http(
+            command + " -Path ./example -Value plain"
+        )
+
     @pytest.mark.parametrize(
         "text",
         [

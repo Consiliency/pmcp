@@ -2854,13 +2854,11 @@ def _powershell_http_reading(text: str) -> bool:
         text,
         re.IGNORECASE,
     )
-    if expression_site and re.search(
-        r"(?<![\w-])[-–—―]f(?![\w-])", text, re.IGNORECASE
-    ):
+    # Expression operators consume ASCII letters, not digits or punctuation.
+    # Keep conservative matches even when an adjacent operand ends in a word.
+    if expression_site and re.search(r"[-–—―]f(?![a-zA-Z])", text, re.IGNORECASE):
         return True
-    if expression_site and re.search(
-        r"(?<![\w-])[-–—―]join(?![\w-])", text, re.IGNORECASE
-    ):
+    if expression_site and re.search(r"[-–—―]join(?![a-zA-Z])", text, re.IGNORECASE):
         return True
     if re.search(
         r"\[\s*(?:System\.)?String\s*\]\s*::",
@@ -2881,7 +2879,9 @@ def _powershell_http_reading(text: str) -> bool:
         # Qualified invocation names alone are handled by the cmdlet scanner;
         # provider manipulation is the additional refusal here.
         if re.search(
-            r"(?<![\w-])(?:New|Set|Copy|Move|Rename)-Item\b", text, re.IGNORECASE
+            r"(?<![\w-])(?:(?:New|Set|Copy|Move|Rename)-Item|ni|si|cpi|cp|copy|mi|mv|move|rni|ren)\b",
+            text,
+            re.IGNORECASE,
         ):
             return True
     child_spent = 0
