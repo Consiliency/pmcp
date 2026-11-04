@@ -2480,6 +2480,114 @@ PANEL_OPTION_READS = {
 }
 
 
+PANEL_GRAMMAR_WRITES = {
+    "GF1-ifs-long-default": 'curl$IFS-s$IFS--${X:-data} @report.json "$URL"',
+    "GF1-ifs-short-empty": 'curl$IFS-s$IFS-${Y}d@report.json "$URL"',
+    "GF1-ifs-short-default": 'curl$IFS-s$IFS-${Y:-d}@report.json "$URL"',
+    "GF1-ifs-quoted-empty": 'curl$IFS-s$IFS-"$A"d@report.json "$URL"',
+    "GF1-ifs-wget-long": 'wget$IFS-q$IFS-O/dev/null$IFS--${X:-post-file}=report.json "$URL"',
+    "GF1-outer-default-short-X": '${Z:-curl -s -${Y:-X}} PUT "$URL"',
+    "GF1-outer-default-long-request": '${Z:-curl -s --${X:-request}} PUT "$URL"',
+    "GF2-continued-curl-name": 'cu\\\nrl -s -d@report.json "$URL"',
+    "GF2-continued-short-dash": 'curl -s -\\\nd@report.json "$URL"',
+    "GF2-continued-long-dashes": 'curl -s --\\\ndata @report.json "$URL"',
+    "GF2-continued-wget-long": 'wget -q -O /dev/null --\\\npost-data=x "$URL"',
+    "GF3-case-newline-in": 'curl -s $(case a\nin a) echo -s;; esac) "$URL?a=1&b=2" -d@report.json',
+    "GF3-if-then-case": 'curl -s $(if true; then case a in a) echo -s;; esac; fi) "$URL?a=1&b=2" -d@report.json',
+    "GF3-brace-group-case": 'curl -s $({ case a in a) echo -s;; esac; }) "$URL?a=1&b=2" -d@report.json',
+    "GF4-arith-cmdsubst-quotes": "curl -s --max-time $(( $(printf ')));' \\' >/dev/null; echo 5) )) \"$URL?a=1&b=2\" -d@report.json",
+    "N1-dash": '${X:-curl -}d x "$URL"',
+    "N1-long": '${X:-curl --}data x "$URL"',
+    "N1-empty": 'curl$IFS-${E}dx$IFS"$URL"',
+    "N1-method": '${X:-curl -}X${E}PUT "$URL"',
+    "N1-wget": '${X:-wget --}post-data=x "$URL"',
+    "replacement-no-dash-pattern": 'X=old; curl "${X/#old/-d}" x "$URL"',
+}
+
+
+class TestPanelGrammarCorrections:
+    @pytest.mark.parametrize("case", sorted(PANEL_GRAMMAR_WRITES))
+    def test_raw_and_workflow_write(self, case: str) -> None:
+        text = PANEL_GRAMMAR_WRITES[case]
+        assert cw._http_writes(text)
+        assert cw.mutating_http(text)
+        # Round-trip a literal YAML block through the production entry point.
+        document = yaml.safe_load(
+            "jobs:\n  probe:\n    steps:\n      - run: |\n"
+            + "".join("          " + line + "\n" for line in text.splitlines())
+        )
+        reasons = cw.image_publication_invariants({"probe.yml": document})
+        assert any(cw.MUTATING_HTTP_LABEL in reason for reason in reasons)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '${X:-curl -}o /dev/null "$URL"',
+            'curl$IFS-${E}o$IFS/dev/null$IFS"$URL"',
+            'wget$IFS--${X:-output-document}=/dev/null "$URL"',
+            'cu\\\nrl -o /dev/null "$URL"',
+            'curl -\\\no /dev/null "$URL"',
+            'curl $(case a\nin a) echo -s;; esac) -o /dev/null "$URL"',
+            'curl $(if true; then case a in a) echo -s;; esac; fi) -o /dev/null "$URL"',
+            'curl $({ case a in a) echo -s;; esac; }) -o /dev/null "$URL"',
+            "curl --max-time $(( $(printf ')));' \\' >/dev/null; echo 5) )) -o /dev/null \"$URL\"",
+        ],
+    )
+    def test_reads_stay_reads(self, text: str) -> None:
+        assert not cw.mutating_http(text)
+
+
+class TestPanelPowerShellQuoting:
+    @pytest.mark.parametrize("opening", list("'‘’‚‛"))
+    @pytest.mark.parametrize("closing", list("'‘’‚‛"))
+    def test_single_quote_class(self, opening: str, closing: str) -> None:
+        text = f"Invoke-RestMethod -Body {opening}a;b{closing} -Method "
+        assert cw.mutating_powershell_http(text + "Put")
+        assert not cw.mutating_powershell_http(text + "Get")
+
+    @pytest.mark.parametrize("opening", list('"“”„'))
+    @pytest.mark.parametrize("closing", list('"“”„'))
+    def test_double_quote_class(self, opening: str, closing: str) -> None:
+        text = f"Invoke-RestMethod -Body {opening}a|b{closing} -Method "
+        assert cw.mutating_powershell_http(text + "Put")
+        assert not cw.mutating_powershell_http(text + "Get")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "i`rm",
+            "Invoke-RestMet`hod",
+            "Invoke-`RestMethod",
+            "& ‘Invoke-RestMethod’",
+            "& “Invoke-RestMethod”",
+            r'& "Microsoft.PowerShell.Utility\Invoke-RestMet`hod"',
+        ],
+    )
+    def test_static_names(self, command: str) -> None:
+        assert cw.mutating_powershell_http(command + " -Method Put")
+        assert not cw.mutating_powershell_http(command + " -Method Get")
+
+    @pytest.mark.parametrize(
+        "comment", ["<# don't retry #>", '<# " #>', "<# outer <# ' nested #> tail #>"]
+    )
+    def test_block_comments(self, comment: str) -> None:
+        assert cw.mutating_powershell_http(
+            "Invoke-RestMethod " + comment + " -Method Put"
+        )
+        assert not cw.mutating_powershell_http(
+            "Invoke-RestMethod " + comment + " -Method Get"
+        )
+
+    @pytest.mark.parametrize("method", ["Put", "Get"])
+    def test_defaults_are_conservatively_refused(self, method: str) -> None:
+        # Even GET defaults are refused: scope and configuration are not evaluated.
+        assert cw.mutating_powershell_http(
+            "$PSDefaultParameterValues['Invoke-RestMethod:Method']='"
+            + method
+            + "'; Invoke-RestMethod -Uri $u"
+        )
+
+
 class TestPanelOptionAndNulFindings:
     @pytest.mark.parametrize("case", sorted(PANEL_OPTION_WRITES))
     def test_option_shapes_write(self, case: str) -> None:

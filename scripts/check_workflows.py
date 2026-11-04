@@ -1662,7 +1662,12 @@ class _ShellLexer:
                 redirect = None
                 return
             reserved = None if current.quoted else current.text
-            if reserved == "case" and not command:
+            at_command_start = not command or all(
+                w.text in {"then", "do", "else", "elif", "!", "{", "time"}
+                and not w.quoted
+                for w in command
+            )
+            if reserved == "case" and at_command_start:
                 cases.append(["head", depth])
             elif reserved == "esac" and not command and cases:
                 cases.pop()
@@ -1671,12 +1676,7 @@ class _ShellLexer:
                 # Nested command substitutions can copy overlapping source
                 # spans. Charge before slicing, not after building all words.
                 raw_words.append((raw_start, pos, current.brace_candidate))
-            if (
-                reserved == "in"
-                and cases
-                and cases[-1] == ["head", depth]
-                and command[0].text == "case"
-            ):
+            if reserved == "in" and cases and cases[-1] == ["head", depth]:
                 cases[-1][0] = "pattern"
                 self.commands.append(command)
                 command = []
@@ -1994,9 +1994,27 @@ class _ShellLexer:
         return end
 
     def _arithmetic_end(self, pos: int) -> int | None:
-        s, depth = self.s, 0
+        s, depth, scratch = self.s, 0, _Word()
         while pos < self.n:
             char = s[pos]
+            if char == "\\":
+                pos += 2
+                continue
+            if char == "$":
+                pos = self.dollar(pos, scratch, quoted=False)
+                continue
+            if char == "`":
+                pos = self.backtick(pos, scratch)
+                continue
+            if char == '"':
+                pos = self.double_quoted(pos + 1, scratch)
+                continue
+            if char == "'":
+                close = s.find("'", pos + 1)
+                if close < 0:
+                    raise _Unlexable
+                pos = close + 1
+                continue
             if char == "(":
                 depth += 1
             elif char == ")":
@@ -2202,6 +2220,11 @@ def _shape_tools(shape: str, work: _Work) -> list[tuple[str, list[_Word]]]:
         index = bisect.bisect_right(starts, end) - 1
         rest = [segments[index][end - starts[index] :], *segments[index + 1 :]]
         found.append((tool, [_Word(part, expanded=True) for part in rest if part]))
+        # Preserve boundaries for the option reader as well as the historical
+        # all-split reading: an empty expansion can join '-' and 'd'.
+        work.spend(sum(len(part) + 1 for part in rest))
+        remainder = _Word(_MARK.join(rest), expanded=True)
+        found.append((tool, [remainder]))
     return found
 
 
@@ -2448,7 +2471,9 @@ def _http_writes(text: str) -> bool:
 
 def _bash_writes(text: str) -> bool:
     try:
-        return _http_writes(_joined(text))
+        # The floor's historical join inserts spaces. Bash removes only the
+        # backslash-newline, including in the middle of a word. Keep both.
+        return _http_writes(text) or ("\\\n" in text and _http_writes(_joined(text)))
     except RecursionError:
         # Nesting deeper than Python's stack: never fail open (R7f).
         return True
@@ -2531,6 +2556,20 @@ def _pwsh_arguments(text: str, pos: int, limit: int) -> tuple[list[str], int]:
     n = min(len(text), pos + limit + 1)
     while pos < n:
         char = text[pos]
+        if text.startswith("<#", pos):
+            # Delimited comments nest; quote characters inside are inert.
+            comment_depth = 1
+            pos += 2
+            while pos < n and comment_depth:
+                if text.startswith("<#", pos):
+                    comment_depth += 1
+                    pos += 2
+                elif text.startswith("#>", pos):
+                    comment_depth -= 1
+                    pos += 2
+                else:
+                    pos += 1
+            continue
         if char == "`":
             if text[pos + 1 : pos + 2] not in ("", "\n"):
                 token.append(text[pos + 1])
@@ -2586,7 +2625,37 @@ def _pwsh_method_writes(value: str) -> bool:
     return bool(re.search(r"[$(\[`@]", bare)) or bare.upper() not in _SAFE_METHODS
 
 
+_PWSH_QUOTES = str.maketrans(
+    {
+        **dict.fromkeys("‘’‚‛", "'"),
+        **dict.fromkeys("“”„", '"'),
+    }
+)
+
+
 def mutating_powershell_http(text: str) -> bool:
+    """Union of literal and normalized static PowerShell readings.
+
+    Smart quotes belong to the ASCII quote classes. Removing backticks before
+    letters adds a conservative static-name reading; retain the original so
+    escaped argument syntax cannot hide an existing refusal.
+    """
+    if len(text) > _WORK_LIMIT:
+        return True
+    # Defaults can select a write method without an explicit invocation flag.
+    # Do not try to evaluate configuration assignments or their later scope.
+    if re.search(r"\$PSDefaultParameterValues\b", text, re.IGNORECASE):
+        return True
+    if _powershell_http_reading(text):
+        return True
+    normalized = text.translate(_PWSH_QUOTES)
+    if normalized != text and _powershell_http_reading(normalized):
+        return True
+    unescaped = re.sub(r"`(?=[A-Za-z-])", "", normalized)
+    return unescaped != normalized and _powershell_http_reading(unescaped)
+
+
+def _powershell_http_reading(text: str) -> bool:
     """A PowerShell web cmdlet (or its curl/wget alias) that writes.
 
     Each command word rescans the rest of its statement; past
@@ -2762,13 +2831,17 @@ def _with(step: dict[str, Any]) -> dict[str, Any]:
     return given if isinstance(given, dict) else {}
 
 
-def _step_text(step: dict[str, Any]) -> str:
+def _raw_step_text(step: dict[str, Any]) -> str:
     parts = (
         [step.get("run"), step.get("shell")]
         + _strings(step.get("with"))
         + _strings(step.get("env"))
     )
-    return _joined("\n".join(p for p in parts if isinstance(p, str)))
+    return "\n".join(p for p in parts if isinstance(p, str))
+
+
+def _step_text(step: dict[str, Any]) -> str:
+    return _joined(_raw_step_text(step))
 
 
 def _with_form(step: dict[str, Any], form: dict[str, Any]) -> bool:
@@ -2958,7 +3031,9 @@ def image_publication_invariants(
                 for label, pattern in PUBLICATION_PATTERNS.items():
                     if pattern.search(text):
                         reasons.append(f"{tag} {where} contains {label}")
-                if not http_exempt and mutating_http(text):
+                if not http_exempt and (
+                    mutating_http(text) or mutating_http(_raw_step_text(step))
+                ):
                     reasons.append(f"{tag} {where} contains {MUTATING_HTTP_LABEL}")
                 if mutating_powershell_http(text):
                     reasons.append(f"{tag} {where} contains {MUTATING_PWSH_LABEL}")
