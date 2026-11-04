@@ -2822,6 +2822,55 @@ def _powershell_http_reading(text: str) -> bool:
     Each command word rescans the rest of its statement; past
     ``_WORK_LIMIT`` characters scanned the text counts as a write.
     """
+    # A literal format/join at an invocation, type or member site is not an
+    # unknown runtime value (president scope ruling, Consiliency/pmcp#476).
+    # Refuse without evaluating the expression; GET forms are conservative hits.
+    expression_site = re.search(
+        r"(?:[&.]\s*\(|(?<![\w-])(?:New-Object|TypeName|GetType|GetMethod|"
+        r"GetMember|InvokeMember)\b|\[\s*(?:System\.)?(?:type|string)\s*\]|-as\b)",
+        text,
+        re.IGNORECASE,
+    )
+    if expression_site and re.search(r"(?<![\w-])-f(?=\s|[()])", text, re.IGNORECASE):
+        return True
+    if expression_site and re.search(
+        r"(?<![\w-])-join(?=\s|[()])", text, re.IGNORECASE
+    ):
+        return True
+    if re.search(
+        r"\[\s*(?:System\.)?String\s*\]\s*::\s*(?:Format|Join|Concat)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(
+        r"(?<![\w-])(?:scriptblock|NewScriptBlock|InvokeScript|Add-Type|"
+        r"Set-Alias|New-Alias|sal|nal)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    child_spent = 0
+    for child in re.finditer(
+        r"(?<![\w.-])(?:pwsh|powershell)(?:\.exe)?(?![\w.-])", text, re.IGNORECASE
+    ):
+        try:
+            child_args, child_end = _pwsh_arguments(
+                text, child.end(), _WORK_LIMIT - child_spent
+            )
+        except _UnmodelledExpansion:
+            return True
+        child_spent += child_end - child.end() + 1
+        if child_spent > _WORK_LIMIT:
+            return True
+        for argument in child_args:
+            option = _PWSH_PARAMETER.fullmatch(argument)
+            if option and (
+                "command".startswith(option[1].lower())
+                or "encodedcommand".startswith(option[1].lower())
+                or option[1].lower() in {"commandwithargs", "encodedarguments"}
+            ):
+                return True
     # Defaults can select a write method without an explicit invocation flag.
     # Do not try to evaluate configuration assignments or their later scope.
     if re.search(

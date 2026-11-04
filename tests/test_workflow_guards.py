@@ -3165,6 +3165,23 @@ class TestPowerShellWebCmdlets:
 
 
 PANEL_FINAL_PS_WRITES = {
+    "ruling-format-name": "& ('Invoke-{0}' -f 'RestMethod') -Method Put -Uri $u",
+    "ruling-join-name": "& (-join ('Invoke-', 'RestMethod')) -Method Put -Uri $u",
+    "ruling-format-type": "New-Object ('System.Net.{0}' -f 'WebClient')",
+    "ruling-join-type": "[type](-join ('System.Net.', 'WebClient'))",
+    "ruling-string-format": "& ([string]::Format('Invoke-{0}', 'RestMethod')) -Method Put",
+    "ruling-string-join": "& ([System.String]::Join('', @('Invoke-', 'RestMethod'))) -Method Put",
+    "ruling-string-concat": "& ([string]::Concat('Invoke-', 'RestMethod')) -Method Put",
+    "ruling-scriptblock": "& ([scriptblock]::Create($text))",
+    "ruling-newscriptblock": "$ExecutionContext.InvokeCommand.NewScriptBlock($text)",
+    "ruling-invokescript": "$ExecutionContext.InvokeCommand.InvokeScript($text)",
+    "ruling-addtype": "Add-Type -TypeDefinition $source",
+    "ruling-setalias": "Set-Alias x Invoke-RestMethod; x -Method Put $u",
+    "ruling-newalias": "New-Alias x Invoke-RestMethod; x -Method Put $u",
+    "ruling-sal": "sal x irm; x -Method Put $u",
+    "ruling-nal": "nal x irm; x -Method Put $u",
+    "ruling-childcommand": "pwsh -NoProfile -Command $text",
+    "ruling-childencoded": "powershell.exe -EncodedCommand $text",
     "NEW3a-colon-herestring-squote": "Invoke-RestMethod -Uri $env:URL -Body:@'\nit's\n'@ -Method Put",
     "NEW3a-colon-herestring-dquote": 'Invoke-RestMethod -Uri $env:URL -Body:@"\nsay "hi\n"@ -Method Put',
     "NEW3a-comma-herestring": "Invoke-RestMethod -Uri $env:URL -Body a,@'\nit's\n'@ -Method Put",
@@ -3209,6 +3226,24 @@ PANEL_FINAL_PS_WRITES = {
 
 
 class TestPanelFinalRegressions:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "& ('Invoke-{0}' -f 'RestMethod') -Method Get -Uri $u",
+            "& (-join ('Invoke-', 'RestMethod')) -Method Head -Uri $u",
+            "[string]::Format('plain {0}', 'text')",
+            "Set-Alias x Get-Date",
+        ],
+    )
+    def test_scope_ruling_conservative_refusals(self, text: str) -> None:
+        assert cw.mutating_powershell_http(text)
+
+    @pytest.mark.parametrize(
+        "text", ["rm -f file", "curl -f $URL", "pwsh -NoProfile -File external.ps1"]
+    )
+    def test_scope_ruling_ordinary_text(self, text: str) -> None:
+        assert not cw.mutating_powershell_http(text)
+
     @pytest.mark.parametrize(
         "text",
         [
