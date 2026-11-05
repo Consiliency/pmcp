@@ -2930,12 +2930,6 @@ def _powershell_http_reading(text: str) -> bool:
     if expression_site and re.search(r"[-–—―]join(?![a-zA-Z])", text, re.IGNORECASE):
         return True
     if re.search(
-        r"\[\s*(?:System\.)?String\s*\]\s*::",
-        text,
-        re.IGNORECASE,
-    ):
-        return True
-    if re.search(
         r"(?<![\w-])(?:scriptblock|NewScriptBlock|InvokeScript|Add-Type|"
         r"Set-Alias|New-Alias|sal|nal|AddCommand|AddScript|AddParameter)\b",
         text,

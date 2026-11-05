@@ -2667,6 +2667,14 @@ class TestPanelPowerShellQuoting:
         assert cw.mutating_powershell_http(command + " -Method Put")
         assert not cw.mutating_powershell_http(command + " -Method Get")
 
+    def test_literal_concatenation_has_an_independent_reading(self) -> None:
+        # Deliberately conservative: this isolates literal-chain normalization
+        # from the separate call-expression rule used by the cases above.
+        assert cw.mutating_powershell_http("'Invoke-'+'RestMethod' -Method Put -Uri $u")
+        assert not cw.mutating_powershell_http(
+            "'Invoke-'+'RestMethod' -Method Get -Uri $u"
+        )
+
     @pytest.mark.parametrize(
         "type_name", ["System.Net.WebClient", "System.Net.Http.HttpClient"]
     )
