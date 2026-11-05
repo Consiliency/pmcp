@@ -925,14 +925,26 @@ ranges. These refusals do not widen the accepted residual.
 Targeted validation on ai: `d1949fd` passed 1768 guard tests and eight new
 negative controls (including both C15 controls). `b45f3ac` passed 1840 guard
 tests and all three G-SEP controls. `a78bf3e` passed 1878 guard tests, mypy and
-workflow invariants; its six focused negative controls are still running.
+workflow invariants; all six focused controls were killed independently.
 All used the prepared interpreter, isolated HOME, pytest_temp runner, detached
 4 GiB scopes and durable logs. No guard execution occurred on dev0.
 
-The full `bd4babb` and `d1949fd` batteries are still running. The former has
-recorded three survivors (C15 format, C15 join, command-object tail); neither
-unfinished battery certifies this later code. Coverage-only runs still exit 1
-at 0% against the global 60% threshold, and whole-tree formatting still fails
-on two unchanged diagnostics files. These are disclosed failures, not waivers.
-Hosted tests succeeded at `552663e`; later code still requires its own hosted
-CI and a fresh complete panel. The release acknowledgement gate remains unmet.
+The full exact-code `a78bf3e` battery completed: 1878 guard tests, 2179 focused
+tests, 338 corrected live-oracle texts with no disagreement, 216 brace-oracle
+words, and 170/170 mutation rows. Of 133 real negative controls, 131 were
+killed; `NC-N3-literal-concatenation` and `NC-RULING-string` survived. The first
+was masked by the newer expression-invocation rule. Code `c187800` adds an
+independent conservative literal-chain reading test, which kills that control.
+The second targeted a redundant broad refusal of every `[string]::` member;
+that redundant decision and stale control were removed. The specific
+`Format`/`Join`/`Concat` member rule required by the ruling remains, and its
+independent `NC-CL7-static-member` control is killed. At `c187800`, 1879 guard
+tests, mypy, workflow invariants and both focused controls pass; a 133-control
+full exact-head battery is running at
+`/tmp/pmcp-ai-viperjuice/475-final-c187800/`.
+
+Coverage-only runs still exit 1 at 0% against the global 60% threshold, and
+whole-tree formatting still fails on two unchanged diagnostics files. These
+are disclosed failures, not waivers. Hosted tests succeeded at `f03f8b3`; the
+current head still requires hosted CI and a fresh complete panel. The release
+acknowledgement gate remains unmet.
