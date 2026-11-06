@@ -339,6 +339,8 @@ MAIN_CHANGED_SNAPSHOT = {
         'password=[REDACTED] https://example.test/watch?v=abc%5C"',
         'password= [REDACTED] https://example.test/watch?v=abc%5C"',
     ),
+    # The Basic credential survives on main: a baseline defect pinned here for
+    # parity, not endorsed (Consiliency/pmcp#478).
     "authorization_after": (
         'https://example.test/watch?v=abc\\" Authorization: Basic Zm9vOmJhcg',
         'https://example.test/watch?v=abc%5C" Authorization: [REDACTED] Zm9vOmJhcg',
@@ -362,29 +364,47 @@ L = [
 ]
 
 
+PRECEDING = L + [
+    p + 'https://example.test/a?v=quokkawombat\\" more'
+    for p in [
+        '"token": "',
+        '"api_key": "',
+        '"password":"',
+        'secret = "',
+        '{"client_secret": "',
+        'token: "',
+    ]
+]
+
+
+def _preceding_case(index: int, depth: int) -> object:
+    # Known baseline leak, identical before and after #401: once the text is
+    # JSON-encoded, the keyword rule no longer matches a secret-named key
+    # followed by a value (Consiliency/pmcp#478). Strict xfail, so fixing #478
+    # turns these into failures that prompt removing the marker.
+    if index >= 3 and depth >= 1:
+        return pytest.param(
+            index,
+            depth,
+            marks=pytest.mark.xfail(
+                reason="baseline leak, Consiliency/pmcp#478", strict=True
+            ),
+        )
+    return pytest.param(index, depth)
+
+
 @pytest.mark.parametrize(
-    "text",
-    L
-    + [
-        p + 'https://example.test/a?v=quokkawombat\\" more'
-        for p in [
-            '"token": "',
-            '"api_key": "',
-            '"password":"',
-            'secret = "',
-            '{"client_secret": "',
-            'token: "',
-        ]
-    ],
+    ("index", "depth"),
+    [_preceding_case(i, d) for i in range(len(PRECEDING)) for d in range(3)],
 )
-def test_preceding_keys(text: str) -> None:
-    p = PolicyManager()
-    for _depth in range(3):
-        for output in [_diag(text), p.redact_secrets(text)]:
-            for secret in (SECRET, "quokkawombat"):
-                if secret not in M.redact_secrets(text):
-                    assert secret not in output
+def test_preceding_keys(index: int, depth: int) -> None:
+    text = PRECEDING[index]
+    secrets = [s for s in (SECRET, "quokkawombat") if s in text]
+    for _ in range(depth):
         text = json.dumps(text)
+    for output in (_diag(text), _policy(text)):
+        for secret in secrets:
+            assert secret not in output
 
 
 @pytest.mark.parametrize("text", L)
@@ -457,9 +477,11 @@ def test_restore_guard() -> None:
 
 
 def test_custom_policy_cancels_restore() -> None:
+    """An operator pattern that changes text outside the URL still cancels the
+    restore: the snapshot no longer matches, so the URL keeps its encoded tail."""
     p = PolicyManager()
-    p._redaction_regexes = [re.compile("abc")]
-    assert "abc" not in p.redact_secrets(U + '\\"')
+    p._redaction_regexes = [re.compile("ZZZ")]
+    assert p.redact_secrets(U + '\\" ZZZ') == U + '%5C" [REDACTED]'
 
 
 def test_url_pass_redaction_does_not_cancel_restore() -> None:
