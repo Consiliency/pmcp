@@ -7,11 +7,13 @@ import re
 import string
 import time
 import asyncio
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from itertools import product
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 from urllib.error import HTTPError
 from urllib.parse import ParseResult, parse_qsl, quote, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -1220,6 +1222,109 @@ def sanitize_url_elicitation_url(
         ) from exc
 
 
+class _UrlTailSpan(NamedTuple):
+    """One URL the URL pass rewrote only by encoding its trailing run.
+
+    ``start``/``end`` are offsets into the URL pass's output (the snapshot),
+    ``canonical`` is exactly what the URL pass emitted there and ``raw`` is
+    the original matched text it replaced."""
+
+    start: int
+    end: int
+    canonical: str
+    raw: str
+
+
+@dataclass
+class _UrlTailRecord:
+    """Per-call side record for restoring escaped URL tails
+    (Consiliency/pmcp#401).
+
+    ``_sanitize_base`` fills it while it runs and never reads it back: its
+    output is byte-for-byte main's. ``claimed`` marks that one
+    ``_sanitize_base`` call has already used the record; a second call under
+    the same record sets ``poisoned`` and the restore then returns its input
+    unchanged (fail closed)."""
+
+    snapshot: str | None = None
+    spans: list[_UrlTailSpan] = field(default_factory=list)
+    claimed: bool = False
+    poisoned: bool = False
+
+
+# Set only by the two public entry points, each with a fresh record, and reset
+# in a ``finally``. A direct ``_sanitize_base`` caller sees ``None``: it records
+# nothing and nothing is restored.
+_URL_TAIL_RECORD: ContextVar[_UrlTailRecord | None] = ContextVar(
+    "_URL_TAIL_RECORD", default=None
+)
+
+# The full-match grammar a URL's core must have before its trailing run may be
+# restored: ASCII scheme and host, an unreserved path and an unreserved query.
+# A conservative proof boundary, not a URL grammar: no ``%``, ``+``, userinfo,
+# port or fragment can reach restoration (Consiliency/pmcp#401).
+_RESTORABLE_URL_CORE_RE = re.compile(
+    r"https?://[A-Za-z0-9.-]+(?:/[A-Za-z0-9._~/-]*)?(?:\?[A-Za-z0-9._~=&-]*)?"
+)
+
+# What `_sanitize_base` strips off a URL match before restoration. Main's own
+# suffix set is `).,;`; the backslash is added here deliberately. A URL in JSON
+# text runs into the `\"` that escapes its closing quote, the URL pass encodes
+# that backslash as `%5C`, and the restore puts the backslash back so the JSON
+# stays parseable (Consiliency/pmcp#401).
+_RESTORABLE_URL_TAIL = ").,;\\"
+
+
+@contextmanager
+def _url_tail_restore() -> Iterator[_UrlTailRecord]:
+    """Record URL tails for the duration of one public redaction call."""
+    record = _UrlTailRecord()
+    token = _URL_TAIL_RECORD.set(record)
+    try:
+        yield record
+    finally:
+        _URL_TAIL_RECORD.reset(token)
+
+
+def _restore_url_tails(
+    text: str, record: _UrlTailRecord, max_length: int | None = None
+) -> str:
+    """Put back the raw trailing run of each recorded URL in ``text``.
+
+    ``text`` is the final output of every redaction pass. Restoration happens
+    only when that output is byte-for-byte the URL pass's snapshot: no later
+    pass (Authorization, Bearer, keyword, JWT, operator patterns, additive)
+    changed anything, so every recorded offset is exact. Any change by a later
+    pass, anywhere in the text, restores nothing. Redactions made by the URL
+    pass itself are inside the snapshot and do not cancel restoration.
+
+    Each span must still hold exactly its canonical bytes; it is replaced by
+    the raw match, which is the canonical core plus its original trailing
+    run. Rebuilt by slicing, never by searching, so a literal canonical URL
+    elsewhere is never touched.
+
+    With a nonnegative ``max_length``, only spans wholly inside main's
+    ``text[:max_length]`` are restored and nothing past that cut is emitted;
+    a span cut by the limit keeps main's partial canonical bytes. A negative
+    ``max_length`` returns ``text`` unchanged for the caller's own slice.
+    """
+    if (
+        record.poisoned
+        or record.snapshot != text
+        or (max_length is not None and max_length < 0)
+    ):
+        return text
+    limit = len(text) if max_length is None else len(text[:max_length])
+    parts: list[str] = []
+    cursor = 0
+    for start, end, canonical, raw in record.spans:
+        if end <= limit and text[start:end] == canonical:
+            parts.extend((text[cursor:start], raw))
+            cursor = end
+    parts.append(text[cursor:limit])
+    return "".join(parts)
+
+
 def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> str:
     """Return a display-safe diagnostic string for auth failures.
 
@@ -1231,20 +1336,60 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> 
     # An exception goes through `exception_text`: a validation error's own
     # text carries the rejected value (Consiliency/pmcp#297).
     raw = exception_text(value) if isinstance(value, BaseException) else str(value)
-    text = redact_additive(_sanitize_base(raw))
+    with _url_tail_restore() as record:
+        text = redact_additive(_sanitize_base(raw))
+        # Last, after every redaction pass and before the cut
+        # (Consiliency/pmcp#401).
+        text = _restore_url_tails(text, record, max_length)
     return text if max_length is None else text[:max_length]
 
 
 def _sanitize_base(text: str) -> str:
     """The redactor's own rules, in order: URLs, Authorization, Bearer, the
-    keyword rule, JWTs."""
+    keyword rule, JWTs.
+
+    Under a public entry point's record (`_url_tail_restore`) it also records
+    which URL matches only had their trailing run encoded, and the exact
+    text after the URL pass. The returned text is unchanged by recording
+    (Consiliency/pmcp#401)."""
+    record = _URL_TAIL_RECORD.get()
+    if record is not None:
+        if record.claimed:
+            # A second call under one record: its offsets would not line up
+            # with the first. Fail closed (main's output, nothing restored).
+            record.poisoned = True
+            record = None
+        else:
+            record.claimed = True
+    # Cumulative length change of the URL pass so far: translates a match's
+    # input offset into its offset in the URL pass's output.
+    shift = 0
 
     def redact_url_match(match: re.Match[str]) -> str:
+        nonlocal shift
         whole = match.group(0)
         raw_url = whole.rstrip(").,;")  # trailing sentence punctuation, in one pass
-        return redact_auth_url(raw_url) + whole[len(raw_url) :]
+        out = redact_auth_url(raw_url) + whole[len(raw_url) :]
+        core = whole.rstrip(_RESTORABLE_URL_TAIL)
+        if (
+            record is not None
+            and core != whole
+            and out != whole
+            and _RESTORABLE_URL_CORE_RE.fullmatch(core)
+            # The core is unchanged by URL redaction and normalization, and
+            # is what the URL pass printed: the only difference a restore can
+            # make is the original trailing run.
+            and redact_auth_url(core) == core
+            and out.startswith(core)
+        ):
+            start = match.start() + shift
+            record.spans.append(_UrlTailSpan(start, start + len(out), out, whole))
+        shift += len(out) - len(whole)
+        return out
 
     text = re.sub(r"https?://[^\s\"'<>]+", redact_url_match, text)
+    if record is not None:
+        record.snapshot = text
     text = re.sub(
         r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?[^\s,;]+",
         r"\1[REDACTED]",
