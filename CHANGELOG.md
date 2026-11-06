@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Redaction no longer damages a benign URL's trailing `\`, `)`, `,` or `;` (for example the `\"` closing a JSON string), so `process_output` keeps such search results as JSON. The run is restored only after every redaction pass, only for URLs whose core main already prints unchanged, and only when no later pass changed the URL pass's output. Secrecy decisions are unchanged; `%XX` and `+` values and any text with a later redaction keep their previous output (see `docs/redaction-401-narrow.md`, Consiliency/pmcp#401).
+- Redaction no longer damages a benign URL's trailing backslash, or a `)`, `,` or `;` run that contains one (for example the `\"` closing a JSON string), so `process_output` keeps such search results as JSON. The run is restored only after every redaction pass, only for URLs whose core the redactor already prints unchanged, and only when no later pass changed the URL pass's output. Secrecy decisions are unchanged; `%XX` and `+` values and any text with a later redaction keep their previous output (see `docs/redaction-401-narrow.md`, Consiliency/pmcp#401).
 
 ## [3.0.1] - 2026-11-03
 

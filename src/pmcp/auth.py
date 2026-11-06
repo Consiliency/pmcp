@@ -1240,8 +1240,8 @@ class _UrlTailRecord:
     """Per-call side record for restoring escaped URL tails
     (Consiliency/pmcp#401).
 
-    ``_sanitize_base`` fills it while it runs and never reads it back: its
-    output is byte-for-byte main's. ``claimed`` marks that one
+    ``_sanitize_base`` fills it while it runs and reads only ``claimed``; its
+    output is byte-for-byte the unrestored redactor output. ``claimed`` marks that one
     ``_sanitize_base`` call has already used the record; a second call under
     the same record sets ``poisoned`` and the restore then returns its input
     unchanged (fail closed)."""
