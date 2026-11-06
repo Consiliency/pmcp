@@ -24,7 +24,11 @@ from pmcp.types import (
     ServerPolicy,
     ToolPolicy,
 )
-from pmcp.auth import _sanitize_base
+from pmcp.auth import (
+    _restore_url_tails,
+    _sanitize_base,
+    _url_tail_restore,
+)
 from pmcp.parsing import load_json, load_yaml
 from pmcp.redaction_additive import (
     REDACTED,
@@ -827,7 +831,19 @@ class PolicyManager:
         (Consiliency/pmcp#234): the engine's, and rev 10's forms of the
         effective patterns (`_additive_spans`). They can only replace more of
         it with the marker.
+
+        Last, a URL whose trailing run (`).,;` or a backslash) the URL rule
+        only encoded gets that run back, and only if no later pass changed
+        the URL rule's output at all (Consiliency/pmcp#401; see
+        `pmcp.auth._restore_url_tails`). An operator pattern that changes
+        anything therefore cancels the restore.
         """
+        with _url_tail_restore() as record:
+            return _restore_url_tails(self._redact_secrets_main(output), record)
+
+    def _redact_secrets_main(self, output: str) -> str:
+        """`redact_secrets` without the #401 restore: the redactor's own
+        rules, the effective patterns, then the additive rules."""
         result = _sanitize_base(output)
 
         for regex in self._redaction_regexes:
