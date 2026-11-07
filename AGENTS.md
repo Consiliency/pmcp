@@ -27,78 +27,67 @@
   collection when a suite can read operator configuration. Scratch cleanup is
   not HOME isolation or permission to use real credentials/services.
 
-## Shared-host resource limits (dev0): owner rule, 2026-11-03
+## Shared-host test limits (dev0)
 
-dev0 is a shared team host. Do not run memory- or CPU-heavy pmcp tests there.
+dev0 is a shared team host used by many concurrent agent sessions. Uncapped
+test runs there have made it unusable for everyone, so these rules are firm.
 
-**Incident.** On 2026-11-03 the #472 implementation agent ran
-`scripts/pytest_temp.py -- tests/test_workflow_guards.py -q -n 2` in a T3
-worktree on dev0 (`t3-72097568`). That worktree held an uncommitted
-workflow-guard lexer rewrite.
-- One xdist worker reached about 12 GiB RSS (about 40% of host RAM).
-- Load passed 117, memory PSI was about 99%, T3 health timed out and dev0
-  dropped off the network.
-- Root had to interrupt the coordinator (SIGINT) and terminate the worker
-  (SIGTERM).
-- The record is at
-  `~/workspace/tmp/pmcp-472-impl-20261103/evidence/incident-2026-11-03-dev0-oom/`.
+**Allowed on dev0:** editing, `ruff`, `mypy` on single files, and a few
+affected test files or node IDs of ordinary unit tests whose footprint is
+known to be small, at most `-n 2` (serial is fine). Run them one batch at a
+time, never several in parallel.
 
-**Never run these on dev0, at any worker count, including `-n 0`:**
-- `tests/test_workflow_guards.py`, and any other workflow-guard or
+**Never on dev0, at any worker count (including `-n 0`), in one run or split
+into batches:**
+- `-n auto` / `--numprocesses=auto`, whether through
+  `scripts/pytest_temp.py` or raw `pytest`;
+- the full or a broad suite (`tests/`), from one worktree or several;
+- `tests/test_workflow_guards.py` and any other workflow-guard or
   shell-parser test, stress test or differential;
-- the `_mutate_workflow.sh` mutant loop and negative-control batteries;
+- the `_mutate_workflow.sh` mutant loop, negative-control batteries and
+  mutation testing;
 - live-oracle batteries (bash, curl or wget against a loopback server);
-- full or broad suites, mutation testing, and anything whose memory use is
-  unmeasured on the current code.
+- anything whose memory use is unmeasured on the current code.
 
-**Where to run them.**
-- On `ai`: run `ssh ai`, use `~/code/pmcp` or a sibling worktree, and sync
-  through GitHub.
-- Or on hosted CI.
-- On ai, always run detached, with logs, under an explicit cap:
+The full suite belongs to the PR or closeout gate, and runs on `ai` or in
+hosted CI. The `CONTRIBUTING.md` full-suite command (`-n auto`) is for those
+hosts only.
 
-  ```bash
-  nohup systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0 \
-    nice -n 10 <command> > /tmp/pmcp-ai-$USER/<job>.log 2>&1 & disown
-  ```
+**Before any test run on dev0,** check the host and defer or move the run if
+`MemAvailable` in `/proc/meminfo` is below 6 GiB or the 1-minute load (field 1
+of `/proc/loadavg`) is at or above `nproc`:
 
-  `prlimit --as=` or `ulimit -v` are fallbacks.
-- Poll for a sentinel line in the log. `pgrep -f` over ssh matches its own
-  command line.
+```bash
+awk '/^MemAvailable:/ {print $2/1048576 " GiB available"}' /proc/meminfo
+echo "load $(cut -d' ' -f1 /proc/loadavg) / cores $(nproc)"
+```
 
-**Fewer workers on dev0 is not a fix.** First establish off-host, under a cap,
-that the workload is bounded. Unexpected memory growth in a classifier or
-parser is a defect in the code, a resource-exhaustion bug in the guard
-itself. Find the input that causes it, bound the work, and add a regression
-test. A work bound in a guard must fail closed: it flags when exceeded.
+**Running on `ai`.** Use `ssh ai`, `~/code/pmcp` or a sibling worktree synced
+through GitHub (push your branch first). Run detached, with a log, under a
+memory cap above the job's measured footprint (for example 4G for a single
+guard file, 16G for the full suite at `-n 8`):
 
-**What dev0 is for:** editing, `ruff`, `mypy` on single files, and a few
-selected node IDs of ordinary unit tests whose footprint is known to be
-small.
+```bash
+mkdir -p "/tmp/pmcp-ai-$USER" && chmod 700 "/tmp/pmcp-ai-$USER"
+nohup systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 \
+  nice -n 10 uv run --locked python scripts/pytest_temp.py -- tests/ -q -n 8 \
+  > "/tmp/pmcp-ai-$USER/full-suite.log" 2>&1 &
+disown
+```
 
-**An interrupted test is not a result.** If a run is killed, OOM-terminated,
+If `systemd-run` cannot apply `MemoryMax`, do not run the job uncapped.
+Poll the log for pytest's final summary line; `pgrep -f` over ssh matches its
+own command line.
+
+**Unexpected memory growth is a bug, not a capacity problem.** For the banned
+workloads, fewer workers is not a fix: first establish off-host, under a cap,
+that the work is bounded. Growth in a classifier or parser is a
+resource-exhaustion defect in the code; find the input that causes it, bound
+the work (a guard's work bound must fail closed and flag when exceeded), and
+add a regression test.
+
+**An interrupted run is not a result.** If a run is killed, OOM-terminated,
 timed out or interrupted by an operator, report it as "interrupted, no
-result". Never report it as passing or as partial evidence. Keep its logs and
-the command line, mark them invalid in the evidence and PR body, and rerun it
-off dev0 under a cap.
-
-## Shared-host test load (dev0): owner direction, 2026-11-07
-
-dev0 is shared by about 40 agent sessions. On 2026-11-07 a #478 delegate ran
-`pytest tests/ -q -n auto --dist loadfile` in a dev0 worktree. It started 24
-xdist workers (about 6 GB) plus pmcp, gcloud and aws subprocesses. RAM filled
-up, 8 GB of swap was in use, load reached 280 on 24 cores, and dev0's T3
-server stopped answering. The run was killed twice and relaunched both times.
-
-On dev0, for any test run:
-- **Never use `pytest -n auto`.** Cap workers at `-n 2` to `-n 4`.
-- **Don't run the full suite from several worktrees at once.**
-- **While iterating, run only the affected test files.** Run the full suite
-  only for the PR or closeout gate, and run it on `ai` or in hosted CI (see
-  above), not on dev0.
-- **Check the host before any heavy run:** `free -h` and `/proc/loadavg`. If
-  available memory is under about 6 GB or the 1-minute load is over about 24,
-  defer the run or move it.
-- If a run has to stay on dev0, split it into small sequential batches.
-- A killed relaunch is a signal to stop, not to retry. Report the run as
-  "interrupted, no result" and move it off dev0.
+result", never as passing or partial evidence. Do not relaunch it on dev0;
+keep its log and command line, mark them invalid in the evidence and PR body,
+and rerun it on `ai` or in CI.
