@@ -28,6 +28,9 @@ for platform coverage).
 Do not supply a fixed `--basetemp`, including through `PYTEST_ADDOPTS`.
 
 ```bash
+# The full-suite commands below are for ai or CI. On the shared dev0 host,
+# never use -n auto or run the full suite: see AGENTS.md.
+
 # Run all tests (live and slow tests are deselected by default)
 uv run --locked python scripts/pytest_temp.py --
 
