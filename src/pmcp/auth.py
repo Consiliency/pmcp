@@ -25,7 +25,12 @@ from jwt import PyJWKSet
 from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
 from pmcp.parsing import load_json
-from pmcp.redaction_additive import redact_additive
+from pmcp.redaction_additive import (
+    Edit,
+    carried_view_spans,
+    make_edit,
+    redact_additive,
+)
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
 
@@ -1244,12 +1249,18 @@ class _UrlTailRecord:
     output is byte-for-byte the unrestored redactor output. ``claimed`` marks that one
     ``_sanitize_base`` call has already used the record; a second call under
     the same record sets ``poisoned`` and the restore then returns its input
-    unchanged (fail closed)."""
+    unchanged (fail closed).
+
+    ``base_edits`` holds each base pass's edits (URL, Authorization, Bearer,
+    keyword, JWT), in that pass's input offsets, so spans found in the raw
+    input can be carried to the base pass's output (Consiliency/pmcp#478).
+    Recording them does not change the output either."""
 
     snapshot: str | None = None
     spans: list[_UrlTailSpan] = field(default_factory=list)
     claimed: bool = False
     poisoned: bool = False
+    base_edits: list[list[Edit]] | None = None
 
 
 # Set only by the two public entry points, each with a fresh record, and reset
@@ -1300,7 +1311,9 @@ def _restore_url_tails(
 
     Each span must still hold exactly its canonical bytes; it is replaced by
     the raw match, which is the canonical core plus its original trailing
-    run. Rebuilt by slicing, never by searching, so a literal canonical URL
+    run. The later passes include the redactions added for
+    Consiliency/pmcp#478 (escaped views and the Authorization credential):
+    they cancel the restore like any other change. Rebuilt by slicing, never by searching, so a literal canonical URL
     elsewhere is never touched.
 
     With a nonnegative ``max_length``, only spans wholly inside main's
@@ -1332,12 +1345,23 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> 
     additive rules (`pmcp.redaction_additive`) then run over that output and
     can only replace more of it with the marker (Consiliency/pmcp#234). The
     cut is taken last, as before.
+
+    The spans of `escape_view_spans`, found in the raw input, are carried
+    through the base pass's recorded edits and applied with the additive
+    rules (Consiliency/pmcp#478).
     """
     # An exception goes through `exception_text`: a validation error's own
     # text carries the rejected value (Consiliency/pmcp#297).
     raw = exception_text(value) if isinstance(value, BaseException) else str(value)
     with _url_tail_restore() as record:
-        text = redact_additive(_sanitize_base(raw))
+        base = _sanitize_base(raw)
+        carried = carried_view_spans(raw, base, _usable_edits(record))
+        # Not merely redundant: with nothing carried (the common case) the
+        # call stays today's one-argument `redact_additive(base)`, which
+        # `test_context_reset_on_exception` replaces with a one-argument stub.
+        text = (
+            redact_additive(base, extra=carried) if carried else redact_additive(base)
+        )
         # Last, after every redaction pass and before the cut
         # (Consiliency/pmcp#401).
         text = _restore_url_tails(text, record, max_length)
@@ -1350,8 +1374,8 @@ def _sanitize_base(text: str) -> str:
 
     Under a public entry point's record (`_url_tail_restore`) it also records
     which URL matches only had their trailing run encoded, and the exact
-    text after the URL pass. The returned text is unchanged by recording
-    (Consiliency/pmcp#401)."""
+    text after the URL pass (Consiliency/pmcp#401), and each pass's edits
+    (Consiliency/pmcp#478). The returned text is unchanged by recording."""
     record = _URL_TAIL_RECORD.get()
     if record is not None:
         if record.claimed:
@@ -1364,6 +1388,12 @@ def _sanitize_base(text: str) -> str:
     # Cumulative length change of the URL pass so far: translates a match's
     # input offset into its offset in the URL pass's output.
     shift = 0
+    # Each pass's edits (Consiliency/pmcp#478); appended to only under a record.
+    url_edits: list[Edit] = []
+    auth_edits: list[Edit] = []
+    bearer_edits: list[Edit] = []
+    keyword_values: list[tuple[int, int]] = []
+    jwt_edits: list[Edit] = []
 
     def redact_url_match(match: re.Match[str]) -> str:
         nonlocal shift
@@ -1385,20 +1415,66 @@ def _sanitize_base(text: str) -> str:
             start = match.start() + shift
             record.spans.append(_UrlTailSpan(start, start + len(out), out, whole))
         shift += len(out) - len(whole)
+        if record is not None and out != whole:
+            url_edits.append(make_edit(match.start(), match.end(), whole, out))
         return out
 
     text = re.sub(r"https?://[^\s\"'<>]+", redact_url_match, text)
     if record is not None:
         record.snapshot = text
+    recording = record is not None
     text = re.sub(
         r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?[^\s,;]+",
-        r"\1[REDACTED]",
+        _recording(r"\1[REDACTED]", auth_edits if recording else None),
         text,
     )
-    text = re.sub(r"(?i)(\bbearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
-    text = redact_keyword_values(text, _KEYWORD_KEY_START)
-    text = _JWT_RE.sub("[REDACTED]", text)
+    text = re.sub(
+        r"(?i)(\bbearer\s+)[^\s,;]+",
+        _recording(r"\1[REDACTED]", bearer_edits if recording else None),
+        text,
+    )
+    before_keywords = text
+    text = redact_keyword_values(
+        text, _KEYWORD_KEY_START, edits=keyword_values if recording else None
+    )
+    text = _JWT_RE.sub(_recording("[REDACTED]", jwt_edits if recording else None), text)
+    if record is not None:
+        record.base_edits = [
+            url_edits,
+            auth_edits,
+            bearer_edits,
+            [
+                make_edit(start, end, before_keywords[start:end], "[REDACTED]")
+                for start, end in keyword_values
+            ],
+            jwt_edits,
+        ]
     return text
+
+
+def _recording(
+    template: str, sink: list[Edit] | None
+) -> Callable[[re.Match[str]], str]:
+    """A replacement function that returns exactly what ``re.sub`` returns for
+    the string ``template`` (`Match.expand`), and appends the edit to
+    ``sink`` when one is given (Consiliency/pmcp#478)."""
+
+    def replace(match: re.Match[str]) -> str:
+        out = match.expand(template)
+        if sink is not None and out != match.group(0):
+            sink.append(make_edit(match.start(), match.end(), match.group(0), out))
+        return out
+
+    return replace
+
+
+def _usable_edits(record: _UrlTailRecord | None) -> list[list[Edit]] | None:
+    """The record's base-pass edits, or None when there is no record or a
+    second base pass poisoned it (callers then fall back to reading the base
+    output)."""
+    if record is None or record.poisoned or record.base_edits is None:
+        return None
+    return record.base_edits
 
 
 def _parse_www_auth_params(raw: str) -> dict[str, str]:
