@@ -2,7 +2,7 @@
 
 from pmcp.argument_errors import install_log_scrubber as _install_log_scrubber
 
-__version__ = "3.0.2"
+__version__ = "3.0.3"
 
 # Every entry point imports this package first -- the gateway, the `pmcp`
 # CLI (`pmcp refresh` talks to downstreams through the MCP SDK's client),
