@@ -203,7 +203,7 @@ Cost: work and memory are linear, counted (the work counter) and measured
 size; on the measured adversarial shapes it stayed under 90 bytes (main, on
 the same shapes: under 60). CPU stays within the slow tier's ratio canary:
 6x the pre-Consiliency/pmcp#478 pipeline on the same input, at 256 KiB. A
-separate probe at 1 MiB measured 1.0-2.5x on every shape it tried.
+separate probe at 1 MiB measured about 0.9-2.6x on every shape it tried.
 
 Percent/`+` normalization and broader structured redaction are separate work
 (Consiliency/pmcp#407, Consiliency/pmcp#423).

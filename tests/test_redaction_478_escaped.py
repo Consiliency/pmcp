@@ -727,6 +727,8 @@ KEPT_RESIDUALS = [
     # auth-params joined by spaces, not commas (not RFC 7616): only the
     # first, quoted, known-name param is taken
     ('Authorization: Digest username="bob" realm="r" response="ab12cd34ef"', "ab12cd34ef"),
+    # a URL as a credential: a token68 run holding `://` is not taken
+    ("Authorization: Basic https://quokkawombat9.test/x", "https://quokkawombat9.test/x"),
 ]  # fmt: skip
 
 #: Benign words the rule redacts, which main keeps (review of f706ab5, B-S5).
@@ -1357,6 +1359,51 @@ def test_operator_patterns_are_consulted_on_a_query_value_in_a_view() -> None:
     ]
     assert policy.redact_secrets(text).endswith('?q=[REDACTED]"}')
     assert A.escape_view_spans(text, policy._pattern_matches) != []
+
+
+#: An operator pattern edits the text before a view span (re-check of
+#: ab3bc8b, S1): carried through that edit, the outer span starts on a
+#: marker and replaces only the run glued to it, so the nested span it
+#: covered in `base` is the one that withholds the credential.
+_EDITED_NESTED = 'apikey:\\"quokka[REDACTED]Authorization:e AKIDEXAMPLE"'
+
+
+def _edited_nested_outputs() -> list[str]:
+    policy = PolicyManager()
+    policy._redaction_regexes = [
+        *policy._redaction_regexes,
+        re.compile("quokka", re.IGNORECASE),
+    ]
+    big = G.BIG
+    as_text = policy.process_output(_EDITED_NESTED, redact=True, max_bytes=big)
+    as_dict = policy.process_output({"t": _EDITED_NESTED}, redact=True, max_bytes=big)
+    return [
+        policy.redact_secrets(_EDITED_NESTED),
+        str(as_text["result"]),
+        json.dumps(as_dict["result"]),
+    ]
+
+
+def test_nested_spans_are_kept_when_a_pattern_edited_the_text() -> None:
+    for out in _edited_nested_outputs():
+        assert "AKIDEXAMPLE" not in out, out
+
+
+def test_mutant_policy_drops_nested_after_an_edit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`drop_nested=not edited` in `PolicyManager.redact_secrets`: dropping
+    in `base` even when a pattern rewrote it shows the credential."""
+    import pmcp.policy.policy as policy_module
+
+    carried = policy_module.carried_view_spans
+
+    def always_drop(*args: object, **kwargs: object) -> list[A.Span]:
+        return carried(*args, **{**kwargs, "drop_nested": True})  # type: ignore[arg-type]
+
+    monkeypatch.setattr(policy_module, "carried_view_spans", always_drop)
+    for out in _edited_nested_outputs():
+        assert "AKIDEXAMPLE" in out, out
 
 
 def test_recorded_pattern_edits_replay_every_pattern(
