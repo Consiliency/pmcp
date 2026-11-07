@@ -70,9 +70,7 @@ def dumps(text: str, depth: int) -> str:
 #: The surfaces the Authorization rule is asserted on, by commit.
 SURFACES: dict[str, Callable[[str], str]] = {"E": E}
 #: The text depths the Authorization rule is asserted at, by commit.
-DEPTHS = (0,)
-#: Whether texts holding a JSON escape are asserted (the escape views).
-ESCAPED = False
+DEPTHS = (0, 1, 2)
 
 
 def _leaks(text: str, secret: str) -> list[str]:
@@ -446,7 +444,7 @@ def test_the_fast_tier_covers_every_pair() -> None:
 
 @pytest.mark.parametrize(
     "row",
-    [r for r in _FAST_ROWS if r[3] in DEPTHS and (ESCAPED or "\\" not in _case(r)[0])],
+    [r for r in _FAST_ROWS if r[3] in DEPTHS],
     ids=_row_id,
 )
 def test_authorization_credential_fast_tier(
@@ -467,8 +465,6 @@ def test_authorization_credential_full_matrix(context: int, depth: int) -> None:
         range(len(SCHEMES)), range(len(SPELLINGS)), range(len(CREDS))
     ):
         text, secret = _case((scheme, spelling, context, depth, cred))
-        if not ESCAPED and "\\" in text:
-            continue
         if leaked := _leaks(text, secret):
             bad.append((SCHEMES[scheme], SPELLINGS[spelling], CREDS[cred][0], leaked))
     assert bad == [], bad[:10]
@@ -579,6 +575,8 @@ NON_JSON_ESCAPE_TAILS = [
     "b'Authorization: Basic {c}\\x00'",
     "Authorization: Basic {c}\\0",
     "Authorization: Basic {c}\\",
+    # a JSON escape (`\\\\`) whose decoded `\\'` no view decodes further
+    "'Authorization: Basic {c}\\\\'",
 ]
 
 
@@ -793,3 +791,447 @@ def test_idempotent_on_the_named_corpora() -> None:
     texts = [_case(r)[0] for r in _FAST_ROWS[::3]] + BENIGN_AUTH
     bad = [t for t in texts for run in SURFACES.values() if run(run(t)) != run(t)]
     assert bad == [], bad[:5]
+
+
+# ============================================== A: keyed values, escaped ==== #
+
+KEYS = [
+    "token",
+    "api_key",
+    "apikey",
+    "password",
+    "secret",
+    "client_secret",
+    "access_token",
+    "refresh_token",
+    "private_key",
+]
+VALUE = "quokkaWombat9"
+KEYED_FORMS = [
+    '"{k}": "{v}"',
+    '"{k}":"{v}"',
+    '{k}: "{v}"',
+    '{k} = "{v}"',
+    '{{"{k}": "{v}"}}',
+    '{{"{k}": ["{v}"]}}',
+    '"{k}": "https://example.test/a?v={v}\\" more',
+    '"{k}": "a\\"{v}"',
+    '{k}: "{v} two"',
+    '"{k}": "{v}\\\\"',
+    # the URL pass runs into the next line's key in escaped text (review A-B1)
+    "see https://a.test/x?q=1\n{k}: {v}",
+]
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2])
+@pytest.mark.parametrize("form", KEYED_FORMS)
+def test_keyed_values_are_withheld_at_every_depth(form: str, depth: int) -> None:
+    bad = []
+    for key in KEYS:
+        text = dumps(form.format(k=key, v=VALUE), depth)
+        bad.extend((key, name) for name in _leaks(text, VALUE))
+    assert bad == []
+
+
+def test_keyed_values_in_other_json_spellings() -> None:
+    """`ensure_ascii=False` and `indent=2` spellings, a non-ASCII value, at
+    depths 1-2 (review B-N6)."""
+    forms = [
+        '"{k}": "{v}"',
+        '{k}: "{v}"',
+        '{{"{k}": "{v}"}}',
+        '"{k}": "https://example.test/a?v={v}\\" more',
+    ]
+    bad = []
+    for key in ["token", "password", "client_secret", "private_key"]:
+        for form in forms:
+            text = form.format(k=key, v="quokkaW\u00f6mbat9\u00e9")
+            for _, ascii_only, indent in G._SPELLINGS:
+                for depth in (1, 2):
+                    x = text
+                    for _ in range(depth):
+                        x = json.dumps(x, ensure_ascii=ascii_only, indent=indent)
+                    bad.extend((key, form, depth, n) for n in _leaks(x, "quokka"))
+    assert bad == [], bad[:5]
+
+
+# ======================================================= B: issue repros ==== #
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ['"token": "', '"api_key": "', '"password": "', '"secret": "', '"client_secret": "', 'token: "'],
+)  # fmt: skip
+def test_issue_repro_keyword_depth_loop(prefix: str) -> None:
+    """Consiliency/pmcp#478, verbatim: the depth loop over both entry points."""
+    text = prefix + 'https://example.test/a?v=quokkawombat\\" more'
+    for depth in range(3):
+        assert _leaks(dumps(text, depth), "quokkawombat") == [], depth
+
+
+def test_issue_repro_password_after_a_url() -> None:
+    text = '{"password": "https://example.test/a?v=1\\"password":"SECRET"}'
+    for depth in range(3):
+        assert _leaks(dumps(text, depth), "SECRET") == [], depth
+
+
+def test_issue_repro_basic_credential() -> None:
+    for name, run in SURFACES.items():
+        assert run("Authorization: Basic Zm9vOmJhcg") == (
+            "Authorization: [REDACTED] [REDACTED]"
+        ), name
+
+
+# ======================================== escape views: layers and gating ==== #
+
+
+def test_a_layer_maps_back_over_whole_escapes() -> None:
+    raw = 'a\\"b\\u00e9c\\\\d'
+    view, layer = A._unescape_layer(raw)  # type: ignore[misc]
+    assert view == 'a"b\u00e9c\\d'
+    # a start on a decoded character maps to its backslash; an end after it
+    # maps past the whole escape
+    assert [layer.to_outer(i) for i in range(len(view) + 1)] == [0, 1, 3, 4, 10, 11, 13, 14]  # fmt: skip
+    assert A._unescape_layer("no escapes \\x here") is None
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ('{\\"\\u0070assword\\": \\"quokkawombat\\"}', "quokkawombat"),
+        ('\\"pass\\u0077ord\\": \\"quokkawombat\\"', "quokkawombat"),
+        ('\\"Authorizatio\\u006e\\": \\"Basic Zm9vOmJhcg\\"', "Zm9vOmJhcg"),
+        ('{"u":"https:\\/\\/example.test\\/cb?ticket=quokkaWombat9"}', "quokkaWombat9"),
+        ('{"a": "password: \\"quokkawombat\\""}', "quokkawombat"),
+        ('"password: \\"quokkawombat\\""', "quokkawombat"),
+    ],
+)
+def test_the_prefilter_reads_each_decoded_view(text: str, secret: str) -> None:
+    """A key spelled with escapes is found at the layer where it decodes
+    (review A-S4, B-N4); an in-text escape layer is one more (A-N1)."""
+    for depth in DEPTHS:
+        assert _leaks(dumps(text, depth), secret) == [], depth
+
+
+def test_non_json_escape_dialects_are_not_decoded() -> None:
+    """Only JSON string escapes are decoded (review A-N5): `\\x`, `\\'`,
+    `\\U` and `\\u{...}` are copied as they are."""
+    for text in ["\\x41\\'\\U0001F600\\u{41}", "\\q\\z"]:
+        assert A._unescape_layer(text) is None
+
+
+# ===================================================== D: #401 composition ==== #
+
+
+def test_a_view_redaction_inside_a_restorable_url_cancels_the_restore() -> None:
+    """The URL was eligible for a restore; a carried span changed the text
+    after the snapshot, so the output is the unrestored text."""
+    text = json.dumps('"token": "https://example.test/watch?v=quokkawombat\\\\" more')
+    with AU._url_tail_restore() as record:
+        base = AU._sanitize_base(text)
+        carried = A.carried_view_spans(text, base, AU._usable_edits(record))
+    assert record.spans and carried
+    out = E(text)
+    assert out == A.redact_additive(base, extra=carried)
+    assert "quokkawombat" not in out
+
+
+def test_restore_certificate_mutant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A restore that trusted the URL pass's snapshot instead of checking the
+    final text would re-expose what the carried spans removed."""
+    real = AU._restore_url_tails
+
+    def from_snapshot(
+        text: str, record: AU._UrlTailRecord, max_length: int | None = None
+    ) -> str:
+        return real(record.snapshot or text, record, max_length)
+
+    text = json.dumps('"token": "https://example.test/watch?v=quokkawombat\\\\" more')
+    assert "quokkawombat" not in E(text)
+    monkeypatch.setattr(AU, "_restore_url_tails", from_snapshot)
+    assert "quokkawombat" in E(text)
+
+
+@pytest.mark.parametrize("depth", [0, 1])
+def test_a_benign_url_beside_a_benign_keyed_sibling_still_restores(depth: int) -> None:
+    text = dumps(
+        '{"href": "https://www.youtube.com/watch?v=kQmXtrmQ5Zg\\"", "token_type": "Bearer"}',
+        depth,
+    )
+    assert E(text) == text
+
+
+ISSUE_417 = [
+    ('{"u":"https:\\/\\/example.test\\/cb?ticket=probe_escaped_query_A7"}', "probe_escaped_query_A7"),
+    ('{"u":"https:\\/\\/example.test\\/cb?key=probe_escaped_query_A7"}', "probe_escaped_query_A7"),
+]  # fmt: skip
+ISSUE_417_CONTROLS = [
+    '{"u":"https:\\/\\/example.test\\/cb?page=2"}',
+    '{"u":"https:\\/\\/www.youtube.com\\/watch?v=kQmXtrmQ5Zg\\\\"}',
+]
+
+
+@pytest.mark.parametrize(("text", "secret"), ISSUE_417)
+def test_issue_417_repro_is_withheld(text: str, secret: str) -> None:
+    """Partly addresses Consiliency/pmcp#417: its repro keys are withheld at
+    every depth, and the document stays a document."""
+    for depth in DEPTHS:
+        x = dumps(text, depth)
+        assert _leaks(x, secret) == [], depth
+        json.loads(E(x))
+
+
+@pytest.mark.parametrize("text", ISSUE_417_CONTROLS)
+def test_issue_417_negative_controls_equal_main(text: str) -> None:
+    for depth in (0, 1, 2):
+        x = dumps(text, depth)
+        for name, run in BENIGN_SURFACES.items():
+            assert run(x) == BENIGN_ORACLES[name](x), (name, depth)
+
+
+# ================================================ F: depth consistency ==== #
+
+#: Excluded from this property (named, review B-N9): the context-free shapes
+#: (`_shape_spans`, which read the base output), the default and operator
+#: policy patterns and their rev-10 forms (owner decision,
+#: Consiliency/pmcp#482), escape depth 5 and more, and non-JSON escape
+#: dialects.
+_SWALLOWED = [
+    "GET https://a.test/x?q=1\nAuthorization: {v}\nHost: a",
+    "GET https://a.test/x#frag\nAuthorization: {v}",
+    "GET https://a.test/x?q=1\nBearer {v}",
+    "GET https://a.test/x?q=1\nX-Api-Key: {v}",
+    "GET https://a.test/x?q=1\ntoken: {v}",
+    "GET https://a.test/x?q=1\npassword: {v}",
+    "GET https://a.test/x?q=1\nauth: {v}",
+]
+_SWALLOWED_VALUES = [
+    "hunter2",
+    "secretvalue",
+    "Zm9vOmJhcg",
+    "qzhunterwombat",
+    "Secretvalue",
+]
+
+
+def _depth_violations(texts: list[str]) -> list[tuple[str, int, str]]:
+    bad = []
+    for text in texts:
+        gone = [
+            w for w in set(re.findall(r"[A-Za-z0-9]{8,}", text)) if w not in E(text)
+        ]
+        if not gone:
+            continue
+        for depth in (1, 2):
+            x = dumps(text, depth)
+            for name, run in SURFACES.items():
+                out = run(x)
+                if any(w in out for w in gone):
+                    bad.append((text[:60], depth, name))
+    return bad
+
+
+#: Escaped-only residuals inside the depth cap (review of f706ab5, A-N1;
+#: documented): withheld at depth 0, kept at depth 1, where main keeps them
+#: too. A second `Authorization` key taken as the first one's quoted value,
+#: and a Bearer value opening with `\\"`, which the view rules stop at.
+ESCAPED_RESIDUALS = [
+    ('Authorization: Basic "Authorization": Basic keyid:QQhP9ZfhpvFq, x', "QQhP9ZfhpvFq"),
+    ('bearer\t\\\\"QRj6hgQwHzFk; x', "QRj6hgQwHzFk"),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(("text", "secret"), ESCAPED_RESIDUALS)
+def test_disclosed_escaped_residuals(text: str, secret: str) -> None:
+    assert secret not in E(text)
+    assert secret in E(dumps(text, 1))
+    assert secret in _main_e(dumps(text, 1))
+
+
+def test_what_depth_0_removes_is_removed_at_depths_1_and_2() -> None:
+    """Whatever `E` removes at depth 0 is absent at depths 1-2, on the
+    credentials, the board rows of four review rounds, and the shapes whose
+    key the URL pass swallows in escaped text (re-check S3)."""
+    from tests.test_redaction_additive import _board_texts
+
+    texts = [c[1] for c in CREDENTIALS] + _board_texts()
+    texts += [t.format(v=v) for t in _SWALLOWED for v in _SWALLOWED_VALUES]
+    assert _depth_violations(texts) == []
+
+
+def test_mutant_swallowed_keys_not_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    texts = [t.format(v=v) for t in _SWALLOWED[:3] for v in _SWALLOWED_VALUES]
+    assert _depth_violations(texts) == []
+    monkeypatch.setattr(A, "_swallowed_key_spans", lambda view, layers, edits: [])
+    assert len(_depth_violations(texts)) >= 10
+
+
+def test_base_rules_in_views_are_the_base_pass_rules() -> None:
+    """`_BASE_AUTHORIZATION_RE` and `_BASE_BEARER_RE` are the base pass's
+    patterns, with a value group that stops at a quote or backslash."""
+    source = inspect.getsource(AU._sanitize_base)
+    for pattern in (A._BASE_AUTHORIZATION_RE, A._BASE_BEARER_RE):
+        base = pattern.pattern.replace(r"""(?P<value>[^\s,;\"'\\]+)""", r"[^\s,;]+")
+        assert base != pattern.pattern
+        assert f'r"{base}"' in source
+
+
+# ========================================== G: the 400-character cut ==== #
+
+
+def _478_corpus() -> list[str]:
+    texts = [f.format(k=k, v=VALUE) for f in KEYED_FORMS for k in KEYS[::2]]
+    texts += [t for t, _ in AUTH_PARAM_CASES] + [t for t, _ in ISSUE_417]
+    texts += ['{"password": "https://example.test/a?v=1\\"password":"SECRET"}']
+    return [dumps(t, d) for t in texts for d in range(3)]
+
+
+def test_floor_with_the_default_400_character_cut() -> None:
+    """The A, B and D corpora under the default cut: every stretch outside a
+    marker occurs, in order, in the frozen redactor's full output."""
+    bad = [
+        t[:80]
+        for t in _478_corpus()
+        if not _is_additive_of(AU.sanitize_auth_diagnostic(t), _main_e(t))
+    ]
+    assert bad == [], bad[:5]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x" * 380 + '"token": "quokkawombatquokkawombat"',
+        "x" * 380 + "Authorization: Basic Zm9vOmJhcgZm9vOmJhcg",
+    ],
+)
+@pytest.mark.parametrize("depth", [1, 2])
+def test_a_secret_straddling_the_cut_is_withheld(text: str, depth: int) -> None:
+    out = AU.sanitize_auth_diagnostic(dumps(text, depth))
+    assert len(out) == 400
+    assert "quokka" not in out and "Zm9v" not in out
+
+
+# ============================================= H: mutants of the views ==== #
+
+_MUTANT_FORMS = [
+    '"{k}": "{v}"',
+    '{k}: "{v}"',
+    '{{"{k}": "{v}"}}',
+    '"{k}": "https://example.test/a?v={v}\\" more',
+    "see https://a.test/x?q=1\n{k}: {v}",
+    '{{"a": "{k}: \\"{v}\\""}}',
+    # the URL pass drops a long fragment: spans after it must shift
+    "GET https://a.test/x#frag-0123456789abcdef\n{k}: {v}",
+]
+
+
+def _mutant_effects() -> tuple[int, int]:
+    """Leaks, and crashes (a span carried past the end of the text), over
+    the mutant forms, counted apart so a test says which it saw."""
+    leaks = crashes = 0
+    for key in ["token", "api_key", "password", "secret", "client_secret"]:
+        for form in _MUTANT_FORMS:
+            for depth in range(3):
+                text = dumps(form.format(k=key, v=VALUE), depth)
+                try:
+                    leaks += len(_leaks(text, VALUE))
+                except IndexError:
+                    crashes += 1
+    return leaks, crashes
+
+
+def _mutant_leaks() -> int:
+    """A mutant is killed by a leak or a crash; the unmutated code has
+    neither (`test_the_mutant_forms_neither_leak_nor_crash`)."""
+    leaks, crashes = _mutant_effects()
+    return leaks + crashes
+
+
+def test_the_mutant_forms_neither_leak_nor_crash() -> None:
+    assert _mutant_effects() == (0, 0)
+
+
+def test_mutant_views_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _mutant_leaks() == 0
+    monkeypatch.setattr(
+        A,
+        "escape_view_spans",
+        lambda raw, covers=None, url_edits=None: A._authorization_credential_spans(raw),
+    )
+    assert _mutant_leaks() >= 50
+
+
+def test_mutant_identity_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(A, "_transport_one", lambda spans, edits: spans)
+    assert _mutant_leaks() >= 10
+
+
+def test_mutant_escape_view_cap_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(A, "_MAX_ESCAPE_VIEWS", 2)
+    assert _mutant_leaks() >= 5
+
+
+def test_mutant_no_bare_value_filter_in_views(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the view filter, `Basic auth is not supported` loses prose at
+    depth 2 that depth 0 keeps (plan section 2.2)."""
+    text = dumps('"Authorization: Basic auth is not supported"', 2)
+    assert E(text) == _main_e(text)
+    monkeypatch.setattr(A, "_authorization_view_spans", A._authorization_spans)
+    assert E(text) != _main_e(text)
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2])
+def test_preceding_rows_of_the_401_file(depth: int) -> None:
+    """Every `PRECEDING` row of `tests/test_redaction_401_restore.py` (its 14
+    strict #478 xfails included) is withheld on these surfaces."""
+    from tests.test_redaction_401_restore import PRECEDING, SECRET
+
+    bad = []
+    for text in PRECEDING:
+        secrets = [s for s in (SECRET, "quokkawombat") if s in text]
+        x = dumps(text, depth)
+        bad.extend((text, s, n) for s in secrets for n in _leaks(x, s))
+    assert bad == []
+
+
+def test_nested_carried_spans_are_dropped_unless_the_outer_starts_on_a_marker() -> None:
+    text = "aaaa [REDACTED]bbbb cccc"
+    on_marker = text.index("[")
+    assert A._drop_nested(text, [(0, 24, "R"), (2, 4, "R"), (0, 24, "R")]) == [
+        (0, 24, "R")
+    ]
+    # an outer span on a marker replaces only the glued run: keep what it nests
+    assert A._drop_nested(text, [(on_marker, 24, "R"), (20, 24, "R")]) == [
+        (on_marker, 24, "R"),
+        (20, 24, "R"),
+    ]
+
+
+def test_mutant_carried_spans_not_deduplicated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The slow sweep's shape: every query value of one long URL after an
+    escape is a view span inside the same URL edit, and all are carried onto
+    one span. Without deduplication the merge walks every marker of that
+    span once per copy: quadratic."""
+    from tests.test_redaction_additive import _work
+
+    def shape(n: int) -> str:
+        return "https://h/?\\\\" + "&token=%2541" * (n // 12)
+
+    def growth() -> float:
+        small, large = (_work(E, shape(n)) for n in (2_048, 8_192))
+        return large / small
+
+    assert growth() < 5
+
+    def undeduplicated(
+        spans: list[A.Span],
+        edit_lists: list[list[A.Edit]],
+        final: str,
+        drop_nested: bool = True,
+    ) -> list[A.Span]:
+        for edits in edit_lists:
+            spans = A._transport_one(spans, edits)
+        return A.widen_over_escapes(final, spans) if spans else []
+
+    monkeypatch.setattr(A, "transport_spans", undeduplicated)
+    assert growth() > 6  # linear is ~4

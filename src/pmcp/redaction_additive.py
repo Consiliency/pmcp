@@ -28,6 +28,7 @@ from __future__ import annotations
 import bisect
 import re
 import string
+from array import array
 from collections.abc import Callable, Iterator
 from typing import NamedTuple
 from urllib.parse import unquote
@@ -1600,13 +1601,216 @@ def _authorization_credential_spans(text: str) -> list[Span]:
 _AUTH_WORD_RE = re.compile(r"authorization", re.IGNORECASE)
 
 
-def escape_view_spans(raw: str, covers: Covers | None = None) -> list[Span]:
-    """Spans over ``raw``, the public entry point's input: the
-    Authorization credential (`_authorization_credential_spans`)."""
+# ------------------------------------------------------ escape views -------- #
+
+#: What each one-character escape of `_JSON_DECODABLE_ESCAPE_RE` decodes to.
+_SIMPLE_ESCAPES = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
+#: Escape depth, counted from the raw input of a public entry point: text
+#: depth 2 through `process_output`'s structured twin (which serializes one
+#: level deeper), plus one escape layer inside the text itself (owner
+#: decision, Consiliency/pmcp#478).
+_MAX_ESCAPE_VIEWS = 4
+
+
+class _EscapeLayer:
+    """Where one decoded layer's escapes were: ``positions`` are the view
+    offsets holding a decoded escape, ``deltas`` the cumulative
+    ``len(escape) - 1`` up to and including each (8 bytes per escape)."""
+
+    __slots__ = ("positions", "deltas")
+
+    def __init__(self, positions: array[int], deltas: array[int]) -> None:
+        self.positions = positions
+        self.deltas = deltas
+
+    def to_outer(self, position: int) -> int:
+        """A view offset in the layer it was decoded from. A start on a
+        decoded character maps to its escape's backslash; an end after it
+        maps past the whole escape."""
+        i = bisect.bisect_left(self.positions, position)
+        return position + (self.deltas[i - 1] if i else 0)
+
+
+def _unescape_layer(text: str) -> tuple[str, _EscapeLayer] | None:
+    """``text`` with one layer of JSON string escapes decoded, left to right
+    over the whole text (string boundaries are not tracked: over-decoding
+    can only add redaction, which the benign guards bound). A `\\uXXXX`
+    escape becomes one code point; a lone surrogate is kept as is. None when
+    there is no escape to decode."""
+    work(len(text))
+    parts: list[str] = []
+    positions: array[int] = array("q")
+    deltas: array[int] = array("q")
+    cursor = view_length = total = 0
+    for match in _JSON_DECODABLE_ESCAPE_RE.finditer(text):
+        plain = text[cursor : match.start()]
+        parts.append(plain)
+        view_length += len(plain)
+        escape = match.group()
+        parts.append(
+            chr(int(escape[2:], 16)) if escape[1] == "u" else _SIMPLE_ESCAPES[escape[1]]
+        )
+        positions.append(view_length)
+        total += len(escape) - 1
+        deltas.append(total)
+        view_length += 1
+        cursor = match.end()
+    if not positions:
+        return None
+    parts.append(text[cursor:])
+    return "".join(parts), _EscapeLayer(positions, deltas)
+
+
+_VIEW_WORD_RE = re.compile(r"authorization|bearer|://", re.IGNORECASE)
+#: A scheme word `_AUTHORIZATION_RE` names, between the key and a bracket.
+_SCHEME_WORD_RE = re.compile(r"bearer|basic|digest|negotiate|ntlm|token", re.IGNORECASE)
+
+
+def _view_may_match(view: str) -> bool:
+    """A necessary condition for a context rule to match in a decoded view:
+    a key word, `authorization`, `bearer` or `://` occurs in the view itself
+    (so an escaped spelling is found at the layer where it decodes)."""
+    work(2 * len(view))
+    return (
+        _ANY_KEY_RE.search(view) is not None or _VIEW_WORD_RE.search(view) is not None
+    )
+
+
+def _authorization_view_spans(text: str) -> list[Span]:
+    """`_authorization_spans` in a decoded view, less what it takes after an
+    UNQUOTED key that the base pass has already rewritten at depth 0: the
+    base pass reads the raw text at every depth and replaces the first word
+    (the scheme), and the credential rule takes the one after it.
+
+    * its bare value: reading the scheme again here took prose (`Basic auth
+      is not supported`) that depth 0 keeps;
+    * its bracketed value after a scheme word (`Basic (none)`): at depth 0
+      the additive pass reads `[REDACTED] (none)`, where it cannot fire, so
+      reading it here changed benign text at depth 2 only (review of
+      f706ab5, A-N2). The credential rule still reads the word inside.
+
+    After a quoted key the base pass does not fire, so both stay."""
+    work(len(text))
+    spans: list[Span] = []
+    for match in _counted(_AUTHORIZATION_RE.finditer(text)):
+        key_end = match.start() + len("authorization")
+        quoted_key = text[key_end : key_end + 1] in ('"', "'")
+        if not quoted_key and (
+            match.group("bare") is not None
+            or (
+                match.group("inner") is not None
+                and _SCHEME_WORD_RE.search(text, key_end, match.start("inner"))
+                is not None
+            )
+        ):
+            continue
+        base = match.start()
+        spans.extend(
+            (base + start, base + end, replacement)
+            for start, end, replacement in _authorization_spans(match.group())
+        )
+    return spans
+
+
+def _context_spans(text: str, covers: Covers | None, view: bool = False) -> list[Span]:
+    """The additive rules that need context (a key, a scheme or a URL), not
+    the context-free shapes (`_shape_spans` reads the base output in
+    `redact_additive`)."""
+    keyed = _may_hold_a_key(text)
+    return [
+        *(_keyword_sep_spans(text) if keyed else ()),
+        *(_keyword_list_spans(text) if keyed else ()),
+        *(_authorization_view_spans(text) if view else _authorization_spans(text)),
+        *_bearer_spans(text),
+        *(_keyword_ws_spans(text) if keyed else ()),
+        *_url_spans(text, 0, covers),
+    ]
+
+
+#: The base pass's own Authorization and Bearer rules (`pmcp.auth.
+#: _sanitize_base`; a test pins them equal), with the value as a group that
+#: stops at a quote or backslash.
+_BASE_AUTHORIZATION_RE = re.compile(
+    r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?(?P<value>[^\s,;\"'\\]+)"
+)
+_BASE_BEARER_RE = re.compile(r"(?i)(\bbearer\s+)(?P<value>[^\s,;\"'\\]+)")
+
+
+def _swallowed_key_spans(
+    view: str, layers: list[_EscapeLayer], url_edits: list[tuple[int, int]]
+) -> list[Span]:
+    """In a decoded view, what the base pass's Authorization and Bearer
+    rules would have taken, for a key whose raw offset lies inside a URL
+    match the URL pass rewrote: it ran into the key (`?q=1\\nAuthorization:`
+    is one URL in escaped text) and re-encoded or dropped its separator, so
+    the base pass could not fire there, though it does at depth 0
+    (re-check S3)."""
+    work(len(view))
+    starts = [start for start, _ in url_edits]
+    spans: list[Span] = []
+    for pattern in (_BASE_AUTHORIZATION_RE, _BASE_BEARER_RE):
+        for match in _counted(pattern.finditer(view)):
+            position = match.start()
+            for layer in reversed(layers):
+                position = layer.to_outer(position)
+            work(len(layers))
+            i = bisect.bisect_right(starts, position) - 1
+            if i >= 0 and position < url_edits[i][1]:
+                spans.append((match.start("value"), match.end("value"), REDACTED))
+    return spans
+
+
+def escape_view_spans(
+    raw: str,
+    covers: Covers | None = None,
+    url_edits: list[tuple[int, int]] | None = None,
+) -> list[Span]:
+    """Spans over ``raw``, the public entry point's input.
+
+    Layer 0 is ``raw`` itself, read only by the Authorization-credential
+    rule (the other rules read the base output in `redact_additive`).
+    Layers 1 to `_MAX_ESCAPE_VIEWS` each decode one more layer of JSON
+    string escapes; when a view may match (`_view_may_match`), the context
+    rules, the credential rule and `_swallowed_key_spans` read it, and each
+    span maps back to ``raw`` over whole escapes. ``url_edits`` are the
+    ``(start, end)`` of the URL matches the URL pass changed, in ``raw``."""
     work(len(raw))
-    if _AUTH_WORD_RE.search(raw) is None:
-        return []
-    return _authorization_credential_spans(raw)
+    out: list[Span] = []
+    if _AUTH_WORD_RE.search(raw) is not None:
+        out.extend(_authorization_credential_spans(raw))
+    if "\\" not in raw:
+        return out
+    current = raw
+    layers: list[_EscapeLayer] = []
+    for _ in range(_MAX_ESCAPE_VIEWS):
+        decoded = _unescape_layer(current)
+        if decoded is None:
+            break
+        current, layer = decoded
+        layers.append(layer)
+        if _view_may_match(current):
+            found = _context_spans(current, covers, view=True)
+            if _AUTH_WORD_RE.search(current) is not None:
+                found.extend(_authorization_credential_spans(current))
+            if url_edits:
+                found.extend(_swallowed_key_spans(current, layers, url_edits))
+            for start, end, replacement in widen_over_escapes(current, found):
+                work(len(layers))
+                for outer in reversed(layers):
+                    start, end = outer.to_outer(start), outer.to_outer(end)
+                out.append((start, end, replacement))
+        if "\\" not in current:
+            break
+    return widen_over_escapes(raw, out)
 
 
 # ----------------------------------------------------- recorded edits ------- #
@@ -1809,6 +2013,10 @@ def carried_view_spans(
     `transport_spans`: False when a later pass still rewrites ``base``."""
     if base_edits is None:
         return escape_view_spans(base, covers)
+    url_edits = [(edit.start, edit.end) for edit in base_edits[0]]
     return transport_spans(
-        escape_view_spans(raw, covers), base_edits, base, drop_nested=drop_nested
+        escape_view_spans(raw, covers, url_edits),
+        base_edits,
+        base,
+        drop_nested=drop_nested,
     )

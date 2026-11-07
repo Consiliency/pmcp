@@ -960,6 +960,21 @@ LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
     "auth-param comma, a fold, a long indent": lambda n: "Authorization: X a=1,\n" + " " * n + '"',
     "auth-param, a long space run, a fold, no comma": lambda n: "Authorization: X a=1" + " " * n + "\n x",
     "auth-params with folds and semicolons": lambda n: ("Authorization: X a=1, b=2;c" + " " * 50 + ",\n  ") * (n // 80),
+    # Consiliency/pmcp#478: escape views over the raw input, carried spans
+    "escaped quotes before a key": lambda n: '\\"' * (n // 2) + '\\"token\\": \\"abc123\\"',
+    "backslash run before an escaped key": lambda n: "\\\\" * (n // 2) + '\\"password\\": \\"x\\"',
+    "unicode escapes around a key": lambda n: "\\u0041" * (n // 12) + "token=x" + "\\u0041" * (n // 12),
+    "dense keyed pairs at depth 3": lambda n: json.dumps(json.dumps(json.dumps('"token": "ab12cd34", ' * (n // 80)))),
+    "dense keyed pairs at depth 4": lambda n: json.dumps(json.dumps(json.dumps(json.dumps('"token": "ab12cd34", ' * (n // 160))))),
+    "escaped keys chained in one URL run": lambda n: "https://a.test/?q=1" + "\\ntoken:x" * (n // 9),
+    "URL lines then Authorization, escaped": lambda n: json.dumps("GET https://a.test/x?q=1\nAuthorization: Basic Zm9vOmJhcg\n" * (n // 60)),
+    "URL lines then swallowed keys, escaped": lambda n: json.dumps("GET https://a.test/x#f\nAuthorization: secretvalue\n" * (n // 50)),
+    "a pure backslash run": lambda n: "\\" * n,
+    # `_drop_nested` reads the string boundaries of text that may be JSON
+    "a JSON document of quotes before an escaped key": lambda n: json.dumps({"t": '"' * (n // 4) + '\\"token\\": \\"abc123\\"'}),
+    # the slow sweep's shapes: many view spans carried into one URL edit
+    "query values in one URL after an escape": lambda n: "https://h/?\\\\" + "&token=%2541" * (n // 12),
+    "escaped query values in one URL": lambda n: "https://h/?password=x" + "&token=%2541\\u00e9" * (n // 18),
 }  # fmt: skip
 
 

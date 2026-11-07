@@ -1423,6 +1423,10 @@ def _sanitize_base(text: str) -> str:
     if record is not None:
         record.snapshot = text
     recording = record is not None
+    # These two patterns are mirrored, with the value stopping at a quote or
+    # a backslash, by `pmcp.redaction_additive._BASE_AUTHORIZATION_RE` and
+    # `_BASE_BEARER_RE`; `test_base_rules_in_views_are_the_base_pass_rules`
+    # pins them to this source text, so change both together.
     text = re.sub(
         r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?[^\s,;]+",
         _recording(r"\1[REDACTED]", auth_edits if recording else None),
