@@ -975,6 +975,8 @@ LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
     # the slow sweep's shapes: many view spans carried into one URL edit
     "query values in one URL after an escape": lambda n: "https://h/?\\\\" + "&token=%2541" * (n // 12),
     "escaped query values in one URL": lambda n: "https://h/?password=x" + "&token=%2541\\u00e9" * (n // 18),
+    "policy-damaged pairs (pattern-edit transport)": lambda n: '"password: \\"x1\\" ' * (n // 18),
+    "policy-damaged pairs at depth 0": lambda n: 'password: "quokka secretwombat" ' * (n // 33),
 }  # fmt: skip
 
 

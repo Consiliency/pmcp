@@ -29,6 +29,7 @@ import pmcp.auth as AU
 import pmcp.redaction_additive as A
 from pmcp.policy.policy import PolicyManager
 from tests import _main_redactor as M
+from tests.test_redaction_401_restore import BENIGN_URLS, _envelope
 from tests.test_redaction_additive import (
     CREDENTIALS,
     PROSE,
@@ -36,6 +37,8 @@ from tests.test_redaction_additive import (
     _is_additive_of,
     _json_fuzz_corpus,
     _main_e,
+    _main_p,
+    _main_process,
     _texts,
 )
 
@@ -61,15 +64,34 @@ def E(text: str) -> str:
     return AU.sanitize_auth_diagnostic(text, max_length=None)
 
 
+def P(text: str) -> str:
+    return _policy().redact_secrets(text)
+
+
+def POs(text: str) -> str:
+    out = _policy().process_output(text, redact=True, max_bytes=G.BIG)["result"]
+    assert isinstance(out, str)
+    return out
+
+
+def _pod(text: str) -> object:
+    return _policy().process_output({"t": text}, redact=True, max_bytes=G.BIG)["result"]
+
+
+def POd(text: str) -> str:
+    out = _pod(text)
+    return out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+
+
 def dumps(text: str, depth: int) -> str:
     for _ in range(depth):
         text = json.dumps(text)
     return text
 
 
-#: The surfaces the Authorization rule is asserted on, by commit.
-SURFACES: dict[str, Callable[[str], str]] = {"E": E}
-#: The text depths the Authorization rule is asserted at, by commit.
+#: The surfaces every #478 assertion runs on.
+SURFACES: dict[str, Callable[[str], str]] = {"E": E, "P": P, "POs": POs, "POd": POd}
+#: The text depths every #478 assertion runs at.
 DEPTHS = (0, 1, 2)
 
 
@@ -625,8 +647,18 @@ BENIGN_AUTH = [
     "Authorization: none; retry later",
 ]  # fmt: skip
 
-BENIGN_ORACLES: dict[str, Callable[[str], object]] = {"E": _main_e}
-BENIGN_SURFACES: dict[str, Callable[[str], object]] = {"E": E}
+BENIGN_ORACLES: dict[str, Callable[[str], object]] = {
+    "E": _main_e,
+    "P": _main_p,
+    "POs": _main_p,
+    "POd": lambda t: _main_process({"t": t}),
+}
+BENIGN_SURFACES: dict[str, Callable[[str], object]] = {
+    "E": E,
+    "P": P,
+    "POs": POs,
+    "POd": _pod,
+}
 
 
 @pytest.mark.parametrize("depth", [0, 1, 2])
@@ -789,7 +821,8 @@ def test_the_floor_holds_for_the_new_corpora() -> None:
 def test_idempotent_on_the_named_corpora() -> None:
     """f(f(t)) == f(t) on these corpora (not a general property: re-check N2)."""
     texts = [_case(r)[0] for r in _FAST_ROWS[::3]] + BENIGN_AUTH
-    bad = [t for t in texts for run in SURFACES.values() if run(run(t)) != run(t)]
+    runs = [run for name, run in SURFACES.items() if name != "POd"]  # POd wraps
+    bad = [t for t in texts for run in runs if run(run(t)) != run(t)]
     assert bad == [], bad[:5]
 
 
@@ -877,9 +910,10 @@ def test_issue_repro_password_after_a_url() -> None:
 
 def test_issue_repro_basic_credential() -> None:
     for name, run in SURFACES.items():
-        assert run("Authorization: Basic Zm9vOmJhcg") == (
-            "Authorization: [REDACTED] [REDACTED]"
-        ), name
+        expected = "Authorization: [REDACTED] [REDACTED]"
+        if name == "POd":
+            expected = json.dumps({"t": expected})
+        assert run("Authorization: Basic Zm9vOmJhcg") == expected, name
 
 
 # ======================================== escape views: layers and gating ==== #
@@ -1171,6 +1205,14 @@ def test_mutant_escape_view_cap_2(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _mutant_leaks() >= 5
 
 
+def test_mutant_escape_view_cap_3(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cap 4 (owner decision): an in-text escape at text depth 2 through the
+    structured twin is escape depth 4."""
+    assert _mutant_leaks() == 0
+    monkeypatch.setattr(A, "_MAX_ESCAPE_VIEWS", 3)
+    assert _mutant_leaks() >= 1
+
+
 def test_mutant_no_bare_value_filter_in_views(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without the view filter, `Basic auth is not supported` loses prose at
     depth 2 that depth 0 keeps (plan section 2.2)."""
@@ -1235,3 +1277,261 @@ def test_mutant_carried_spans_not_deduplicated(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(A, "transport_spans", undeduplicated)
     assert growth() > 6  # linear is ~4
+
+
+# ================================================= policy surface (A-S5) ==== #
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ('password: "quokka secretwombat"', "secretwombat"),
+        ('api_key = "quokka secretwombat"', "secretwombat"),
+        ('pwd: "a quokkawombat"', "quokkawombat"),
+        ('password: "token abc more secretwombat"', "secretwombat"),
+    ],
+)
+def test_policy_damage_at_depth_0_is_repaired(text: str, secret: str) -> None:
+    """A default pattern rewrites `password: "a b"` to `password:
+    [REDACTED]"a b"`; the context rules' spans of the base output are
+    carried through its edits (review A-S5)."""
+    for depth in DEPTHS:
+        assert _leaks(dumps(text, depth), secret) == [], depth
+
+
+def test_base_output_spans_only_when_a_pattern_changed_something(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-check N3: with no pattern edit, `redact_additive` already reads the
+    base output, so its context spans are not computed twice."""
+    from pmcp.policy import policy as policy_module
+
+    def fail(*args: object, **kwargs: object) -> list[A.Span]:
+        raise AssertionError("computed without a pattern edit")
+
+    monkeypatch.setattr(policy_module, "_context_spans", fail)
+    assert P("plain text with nothing to hide") == "plain text with nothing to hide"
+    with pytest.raises(AssertionError):
+        P('password: "quokka secretwombat"')
+
+
+def test_operator_pattern_that_changes_length_before_a_view_span() -> None:
+    """An operator pattern rewrites text before the escaped pair: the span is
+    shifted exactly (owner decision Q1 keeps operator patterns out of the
+    views; their edits are still carried, Consiliency/pmcp#482)."""
+    policy = PolicyManager()
+    policy._redaction_regexes = [
+        *policy._redaction_regexes,
+        re.compile(r"ACCT-[0-9]+", re.IGNORECASE),
+    ]
+    text = 'ACCT-123456789 then \\"token\\": \\"quokkawombat\\"'
+    out = policy.redact_secrets(text)
+    assert out == '[REDACTED] then \\"token\\": \\"[REDACTED]\\"'
+    assert _is_additive_of(out, M.redact_secrets(text, policy._redaction_regexes))
+
+
+def test_operator_pattern_that_overlaps_a_view_span() -> None:
+    policy = PolicyManager()
+    policy._redaction_regexes = [
+        *policy._redaction_regexes,
+        re.compile("quokka", re.IGNORECASE),
+    ]
+    text = '\\"token\\": \\"quokkawombat\\"'
+    out = policy.redact_secrets(text)
+    assert "wombat" not in out
+    assert _is_additive_of(out, M.redact_secrets(text, policy._redaction_regexes))
+
+
+def test_operator_patterns_are_consulted_on_a_query_value_in_a_view() -> None:
+    """Operator patterns are not matched against the decoded views, but, as
+    at depth 0, they are asked about a percent-decoded query value of a URL
+    found in a view (`_url_spans` -> `covers`; review of f706ab5, B-S1,
+    Consiliency/pmcp#482)."""
+    text = '{"u":"https:\\/\\/a.test\\/cb?q=%71uokka1"}'
+    assert P(text) == text
+    assert A.escape_view_spans(text, _policy()._pattern_matches) == []
+    policy = PolicyManager()
+    policy._redaction_regexes = [
+        *policy._redaction_regexes,
+        re.compile("quokka", re.IGNORECASE),
+    ]
+    assert policy.redact_secrets(text).endswith('?q=[REDACTED]"}')
+    assert A.escape_view_spans(text, policy._pattern_matches) != []
+
+
+def test_recorded_pattern_edits_replay_every_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each policy pattern's recorded edits describe that pattern's pass
+    exactly, and the policy output stays additive of the frozen redactor's
+    (re-check S4)."""
+    from pmcp.policy import policy as policy_module
+
+    policy = PolicyManager()
+    log: list[tuple[str, str]] = []
+
+    class _Logged:
+        def __init__(self, regex: re.Pattern[str]) -> None:
+            self.regex = regex
+
+        def sub(self, repl: Callable[[re.Match[str]], str], text: str) -> str:
+            out = self.regex.sub(repl, text)
+            log.append((text, out))
+            return out
+
+        def search(self, text: str) -> re.Match[str] | None:
+            return self.regex.search(text)
+
+    regexes = list(policy._redaction_regexes)
+    policy._redaction_regexes = [_Logged(r) for r in regexes]  # type: ignore[misc]
+    policy._additive_regexes = lambda: [  # type: ignore[method-assign]
+        policy_module._ADDITIVE_FOR_DEFAULT.get(r.pattern, r) for r in regexes
+    ]
+    captured: list[list[list[A.Edit]]] = []
+    real = policy_module.transport_spans
+
+    def capture(
+        spans: list[A.Span],
+        edit_lists: list[list[A.Edit]],
+        final: str,
+        drop_nested: bool = True,
+    ) -> list[A.Span]:
+        captured.append(edit_lists)
+        return real(spans, edit_lists, final, drop_nested=drop_nested)
+
+    monkeypatch.setattr(policy_module, "transport_spans", capture)
+    bad: list[str] = []
+    checked = 0
+    for text in _replay_corpus()[::2]:
+        log.clear()
+        captured.clear()
+        out = policy.redact_secrets(text)
+        if not _is_additive_of(out, _main_p(text)):
+            bad.append(f"not additive: {text[:80]!r}")
+        if not captured:
+            assert all(before == after for before, after in log), text[:80]
+            continue
+        for (before, after), edits in zip(log, captured[0]):
+            checked += 1
+            bad.extend(
+                f"{e}: {text[:80]!r}" for e in _edit_errors(before, after, edits)
+            )
+    assert bad == [], bad[:10]
+    assert checked > 200, checked
+
+
+# ====================================== D: the dict -> string trade (#483) ==== #
+
+
+@pytest.mark.parametrize("url", BENIGN_URLS)
+@pytest.mark.parametrize("depth", [1, 2])
+def test_benign_url_envelopes_still_restore(url: str, depth: int) -> None:
+    payload = {"t": dumps(json.dumps(_envelope(url)), depth - 1)}
+    out = _policy().process_output(payload, redact=True, max_bytes=G.BIG)
+    assert out["result"] == payload
+    assert not out["truncated"]
+
+
+@pytest.mark.parametrize("key", ["token", "password", "client_secret"])
+@pytest.mark.parametrize("depth", [0, 1, 2])
+def test_dict_to_string_trade_is_pinned(
+    key: str, depth: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accepted trade (owner decision; follow-up Consiliency/pmcp#483): a
+    `process_output(dict)` result holding a #401-restorable URL tail AND a
+    value #478 now redacts cancels the restore, so main's encoded `%5C"`
+    stays and the result is a string -- with the secret withheld. A
+    provenance-tracked restore has to flip this test on purpose.
+
+    Without the #478 spans the result is main's: a dict, the value in clear
+    (review of f706ab5, B-N10). So the string comes from those spans."""
+    from pmcp.policy import policy as policy_module
+
+    text = dumps(json.dumps({key: "https://example.test/a?v=1\\", "b": "c"}), depth)
+    out = _pod(text)
+    assert isinstance(out, str)
+    assert "example.test/a?v=1" not in out
+    monkeypatch.setattr(policy_module, "carried_view_spans", lambda *a, **k: [])
+    before = _pod(text)
+    assert isinstance(before, dict)
+    assert "example.test/a?v=1" in json.dumps(before)
+
+
+def test_dict_to_string_trade_on_a_mixed_search_result() -> None:
+    """Review B's document: a snippet with a restorable href beside a field
+    holding a JSON-encoded password. Main returns a dict with the password
+    in clear; this returns main's pre-#401 string, password withheld."""
+    rows = {
+        "results": [
+            {
+                "snippet": '<Card href="https://www.youtube.com/watch?v=kQmXtrmQ5Zg">Person</Card>',
+                "cfg": json.dumps({"password": "quokkaWombat9"}),
+            }
+        ]
+    }
+    out = _policy().process_output(rows, redact=True, max_bytes=G.BIG)
+    assert isinstance(out["result"], str)
+    assert not out["truncated"]
+    assert "%5C" in out["result"]
+    assert "quokkaWombat9" not in out["result"]
+
+
+def test_inner_documents_stay_documents() -> None:
+    text = json.dumps({"password": "v", "a": [1, "b"]})
+    expected = {"password": "[REDACTED]", "a": [1, "b"]}
+    assert json.loads(POs(text)) == expected
+    assert json.loads(POs(json.dumps(text))) == json.dumps(expected)
+    out = _pod(text)
+    assert isinstance(out, dict) and json.loads(out["t"]) == expected
+
+
+# ================================================= cost: the ratio canary ==== #
+
+_CANARY_SHAPES: dict[str, Callable[[int], str]] = {
+    "dense keyed pairs at depth 3": lambda n: dumps(
+        '"token": "ab12cd34", ' * (n // 80), 3
+    ),
+    "URL lines then Authorization, escaped": lambda n: json.dumps(
+        "GET https://a.test/x?q=1\nAuthorization: Basic Zm9vOmJhcg\n" * (n // 60)
+    ),
+    "policy-damaged pairs": lambda n: '"password: \\"x1\\" ' * (n // 18),
+    "a pure backslash run": lambda n: "\\" * n,
+    "escaped keys chained in one URL run": lambda n: "https://a.test/?q=1"
+    + "\\ntoken:x" * (n // 9),
+}
+
+
+def _best_cpu(run: Callable[[str], object], text: str) -> float:
+    import gc
+    import time
+
+    times = []
+    for _ in range(3):
+        gc.collect()
+        started = time.process_time()
+        run(text)
+        times.append(time.process_time() - started)
+    return min(times)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("name", sorted(_CANARY_SHAPES))
+def test_cost_ratio_canary(name: str) -> None:
+    """CPU at 256 KiB, best of 3, against the pre-#478 pipeline on the same
+    input (the base pass, the patterns, then the additive pass without
+    carried spans): at most 6x (measured at most 2.5x). The work counter in
+    `tests/test_redaction_additive.py` stays the hard linearity bound; this
+    catches a large constant factor. (The frozen oracle alone is not the
+    yardstick: it is the pre-additive redactor, 10-100x cheaper than any
+    additive pipeline on these shapes.)"""
+    text = _CANARY_SHAPES[name](262_144)[:262_144]
+    policy = _policy()
+
+    def pre_e(t: str) -> str:
+        return A.redact_additive(AU._sanitize_base(t))
+
+    def pre_p(t: str) -> str:
+        return policy._redact_additive(M.redact_secrets(t, policy._redaction_regexes))
+
+    for ours, before in ((E, pre_e), (P, pre_p)):
+        assert _best_cpu(ours, text) <= 6 * max(_best_cpu(before, text), 0.01), name
