@@ -1146,6 +1146,8 @@ _NOT_HTTP_CLIENTS = frozenset(
         # The standard library, apart from `urllib`.
         "__future__",
         "argparse",
+        # the escape views' offset maps (Consiliency/pmcp#478)
+        "array",
         "ast",
         "asyncio",
         "bisect",

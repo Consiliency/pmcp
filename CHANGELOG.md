@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Redaction now withholds secret values after secret-named keys when the text is JSON-encoded once or twice (`\"token\": \"…\"`), including when an earlier URL in the text ran into the key, on `sanitize_auth_diagnostic`, `PolicyManager.redact_secrets` and both `process_output` forms; JSON documents stay documents. It also withholds the credential in `Authorization: <scheme> <credential>` for Basic, Digest (including RFC 7616's one-parameter-per-line layout), AWS4-HMAC-SHA256 (with any number of signed headers) and other schemes, which was left in clear after the scheme word was redacted. Only JSON string escapes are decoded, up to four layers. A single-case, all-letter word after the scheme is kept as prose when another word follows on its line or it has 7 letters or fewer; a number, date or time is kept; a single `name=value` parameter is kept, and a single `name="value"` field counts as a credential only for a known Digest, OAuth, AWS4 or HTTP Signatures parameter name, so `authorization=none reason="no header"` is unchanged. Some benign text after the scheme word is now redacted: a token68-shaped word (`Authorization: denied user_id`), two or more comma-joined `name=value` fields, and one quoted field with a known parameter name (`authorization=none realm="internal"`). Operator redaction patterns are not matched against the decoded text; as at depth 0, they are still consulted on a percent-decoded query value of a URL found in it (Consiliency/pmcp#482). A `process_output` result that also holds a URL whose trailing run Consiliency/pmcp#401 restores keeps the previous, string, output when one of these new redactions applies (Consiliency/pmcp#483). Partly addresses Consiliency/pmcp#417: its repro is withheld. Residuals and cost are in `docs/redaction-401-narrow.md` (Consiliency/pmcp#478).
+
 ## [3.0.2] - 2026-11-06
 
 ### Fixed

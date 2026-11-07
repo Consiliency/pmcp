@@ -25,16 +25,23 @@ from pmcp.types import (
     ToolPolicy,
 )
 from pmcp.auth import (
+    _URL_TAIL_RECORD,
     _restore_url_tails,
     _sanitize_base,
     _url_tail_restore,
+    _usable_edits,
 )
 from pmcp.parsing import load_json, load_yaml
 from pmcp.redaction_additive import (
     REDACTED,
     URL_RE,
+    Edit,
     Span,
+    _context_spans,
+    carried_view_spans,
+    make_edit,
     redact_additive,
+    transport_spans,
     widen_over_escapes,
     work,
 )
@@ -837,6 +844,12 @@ class PolicyManager:
         the URL rule's output at all (Consiliency/pmcp#401; see
         `pmcp.auth._restore_url_tails`). An operator pattern that changes
         anything therefore cancels the restore.
+
+        The escape views and the Authorization credential
+        (Consiliency/pmcp#478) are found in the raw input and carried through
+        the base pass's and each pattern's recorded edits to the text the
+        additive rules read; when a pattern changed anything, the context
+        rules' spans of the base output are carried through its edits too.
         """
         with _url_tail_restore() as record:
             return _restore_url_tails(self._redact_secrets_main(output), record)
@@ -844,27 +857,55 @@ class PolicyManager:
     def _redact_secrets_main(self, output: str) -> str:
         """`redact_secrets` without the #401 restore: the redactor's own
         rules, the effective patterns, then the additive rules."""
-        result = _sanitize_base(output)
+        record = _URL_TAIL_RECORD.get()
+        base = result = _sanitize_base(output)
+        pattern_edits: list[list[Edit]] = []
 
         for regex in self._redaction_regexes:
+            edits: list[Edit] = []
 
-            def replace_match(match: re.Match[str]) -> str:
+            def replace_match(match: re.Match[str], edits: list[Edit] = edits) -> str:
                 full_match = match.group(0)
+                out = "[REDACTED]"
                 # Find the separator (: or =)
                 for i, char in enumerate(full_match):
                     if char in ":=":
-                        return full_match[: i + 1] + " [REDACTED]"
-                return "[REDACTED]"
+                        out = full_match[: i + 1] + " [REDACTED]"
+                        break
+                # Recorded for Consiliency/pmcp#478; the bytes are unchanged.
+                if out != full_match:
+                    edits.append(make_edit(match.start(), match.end(), full_match, out))
+                return out
 
             result = regex.sub(replace_match, result)
+            pattern_edits.append(edits)
 
-        return self._redact_additive(result)
+        edited = any(pattern_edits)
+        # Nested spans are dropped only in the text the additive rules read
+        # (`transport_spans`): not in `base` when a pattern rewrote it.
+        carried = carried_view_spans(
+            output,
+            base,
+            _usable_edits(record),
+            self._pattern_matches,
+            drop_nested=not edited,
+        )
+        if edited:
+            # A pattern rewrote the text the context rules would read:
+            # `password: "a b"` became `password: [REDACTED]"a b"`. Their
+            # spans of the base output are carried through the patterns'
+            # edits instead (review A-S5), with the escape views'.
+            carried = carried + _context_spans(base, self._pattern_matches)
+            carried = transport_spans(carried, pattern_edits, result)
+        return self._redact_additive(result, carried)
 
-    def _redact_additive(self, text: str) -> str:
+    def _redact_additive(self, text: str, carried: list[Span] | None = None) -> str:
         """The additive pass alone, over text the redactor's own rules have
-        already redacted."""
+        already redacted, plus spans ``carried`` to it (Consiliency/pmcp#478)."""
         return redact_additive(
-            text, covers=self._pattern_matches, extra=self._additive_spans(text)
+            text,
+            covers=self._pattern_matches,
+            extra=self._additive_spans(text) + (carried or []),
         )
 
     def _additive_regexes(self) -> list[re.Pattern[str]]:

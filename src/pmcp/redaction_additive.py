@@ -13,21 +13,31 @@ and Authorization values, secrets in URL query values (percent-decoded),
 and shapes that need no keyword -- JWTs, vendor token shapes, prefixed
 tokens, PEM private-key blocks and high-entropy runs.
 
-Three guarantees, each tested (`tests/test_redaction_additive.py`):
+Four guarantees, each tested (`tests/test_redaction_additive.py`,
+`tests/test_redaction_478_escaped.py`):
 
 * the floor above;
 * JSON: when the text is a JSON document, a replacement is confined to
   string contents, whole escapes at a time, so a document stays a
   document (`_clip_to_json_strings`);
 * linear time and memory: every loop and string build adds what it
-  iterates over or copies to a test-only work counter (`WORK`).
+  iterates over or copies to a test-only work counter (`WORK`);
+* escaped context (Consiliency/pmcp#478): the context rules also read up to
+  four decoded JSON-escape layers of the RAW input, and an
+  Authorization-credential rule reads the raw text and every layer; spans
+  map back over whole escapes and are carried through every earlier pass's
+  recorded edits (`escape_view_spans`, `transport_spans`). Non-JSON escape
+  dialects are not decoded.
 """
 
 from __future__ import annotations
 
 import bisect
 import re
+import string
+from array import array
 from collections.abc import Callable, Iterator
+from typing import NamedTuple
 from urllib.parse import unquote
 
 from pmcp.parsing import load_json
@@ -1401,3 +1411,619 @@ def redact_additive(
     if extra:
         spans.extend(extra)
     return apply_redaction_spans(text, _clip_to_json_strings(text, spans))
+
+
+# ===================================================== Consiliency/pmcp#478 ==== #
+# The redactor's own pass rewrites text before these rules read it: its
+# Authorization rule replaces only the scheme word of `Authorization: Basic
+# <credential>`, and its URL rule re-encodes or drops what follows a URL. So
+# the rules below read the RAW input of the public entry point, and their
+# spans are carried to the final text through the edits each earlier pass
+# recorded (`make_edit`, `transport_spans`). Every carried span is applied by
+# `redact_additive`, after the URL pass's snapshot, so a carried redaction
+# cancels the #401 restore and can never re-expose anything.
+
+# ---------------------------------------------- the Authorization credential -- #
+
+#: An RFC 9110 token character (no quote, no separator): a letter, a digit
+#: or one of these. `_TCHAR` (a regex class) and `_TCHARS` (a set) are both
+#: built from it, so they cannot drift apart.
+_TCHAR_PUNCTUATION = "!#$%&*+.^_`|~-"
+_TCHAR = "[" + re.escape(_TCHAR_PUNCTUATION) + "0-9A-Za-z]"
+_TCHARS = frozenset(_TCHAR_PUNCTUATION + string.ascii_letters + string.digits)
+#: `Authorization: <scheme> ` -- the key (optionally quoted), the operator,
+#: an optional opening quote, the scheme (or a marker a previous pass wrote
+#: in its place) and the space after it, which may be an obs-fold (a line
+#: break followed by indentation).
+_AUTH_CRED_ANCHOR_RE = re.compile(
+    r"authorization[\"']?\s*[:=]\s*[\"']?"
+    r"(?P<scheme>\[REDACTED\]|" + _TCHAR + r"+)"
+    r"(?:[^\S\r\n]*\r?\n)?[^\S\r\n]+",
+    re.IGNORECASE,
+)
+#: An auth-param value: a quoted string (an unterminated one runs to the end
+#: of its line -- a cut-off Digest header still holds its secret), or a bare
+#: run that stops at whitespace, a comma, a quote or a backslash. A `;` does
+#: not stop it: AWS4's `SignedHeaders=host;x-amz-date` is one value, and the
+#: `Signature` after it is still in the list.
+_AUTH_PARAM_VALUE = (
+    r"(?:\"[^\"\\\r\n]*(?:\\.[^\"\\\r\n]*)*(?:\"|(?=[\r\n])|$)|[^\s,\"'\\]*)"
+)
+#: An optional obs-fold: a line break followed by indentation (RFC 9112,
+#: section 5.2).
+_FOLD = r"(?:\r?\n[^\S\r\n]+)?"
+#: The separator between two auth-params: a comma, with spaces and at most
+#: one fold on either side of it (`username="u",\n    realm="r"` as RFC 7616
+#: lays it out, or `username="u"\n    , realm="r"`). Each whitespace run is
+#: followed by a character it cannot match (a line break, the comma, or a
+#: token character), so a failed separator is given up in one step per
+#: character it scanned.
+_AUTH_PARAM_SEP = r"[^\S\r\n]*" + _FOLD + r",[^\S\r\n]*" + _FOLD
+_AUTH_PARAMS_RE = re.compile(
+    r"(?P<name>" + _TCHAR + r"+)=(?P<value>" + _AUTH_PARAM_VALUE + r")"
+    r"(?P<more>(?:" + _AUTH_PARAM_SEP + _TCHAR + r"+=" + _AUTH_PARAM_VALUE + r")*)"
+)
+#: One JSON string escape (RFC 8259, section 7). Other dialects (`\'`,
+#: `\xNN`, `\U0001F600`, `\u{...}`) are not decoded.
+_JSON_DECODABLE_ESCAPE_RE = re.compile(r'\\(?:u[0-9a-fA-F]{4}|["\\/bfnrt])')
+#: The auth-param names a single quoted param must have to count as a
+#: credential (owner decision on Consiliency/pmcp#478): Digest (RFC 7616),
+#: AWS Signature Version 4, HTTP Signatures, and `oauth_*` (RFC 5849). Any
+#: other `name="value"` after a scheme word is a logfmt field
+#: (`authorization=none reason="no header"`), which main keeps.
+_KNOWN_AUTH_PARAMS = frozenset(
+    {
+        "username",
+        "username*",
+        "realm",
+        "nonce",
+        "uri",
+        "response",
+        "cnonce",
+        "opaque",
+        "qop",
+        "nc",
+        "algorithm",
+        "userhash",
+        "credential",
+        "signature",
+        "signedheaders",
+        "keyid",
+        "headers",
+    }
+)
+#: A token68 credential, optionally wrapped in a quote or bracket, and
+#: optionally `id:secret` (`Token keyid:secret`, `SharedKey account:sig=`).
+_TOKEN68 = r"[A-Za-z0-9._~+/-]+=*"
+_TOKEN68_RE = re.compile(
+    r"(?P<open>[\"'(\[{<])?(?P<cred>" + _TOKEN68 + r"(?::" + _TOKEN68 + r")?)"
+)
+_TOKEN68_CLOSE = frozenset("\"')]}>")
+#: A field name (`reason`, `user_id`, `request-id`): with `="…"` after it,
+#: a logfmt field rather than a credential's padding.
+_FIELD_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z_-]*")
+#: A number, a version, a date or a time (`403`, `3.5`, `2026-11-07`, `10:30`).
+_NUMBERISH_RE = re.compile(r"[+-]?[0-9]+(?:[.:/-][0-9]+)*")
+_NEXT_WORD_RE = re.compile(r"[^\S\r\n]+[A-Za-z]")
+#: Owner decision (Consiliency/pmcp#478, narrow prose guard): a single-case
+#: or Titlecase all-letter word after the scheme is prose when it has at
+#: most this many letters, or when another word follows on its line.
+_PROSE_MAX = 7
+
+
+def _credential_shaped(text: str, cred: str, after: int) -> bool:
+    """Is the token68 run ``cred`` (ending at ``after`` in ``text``) a
+    credential? Not a run without a letter or digit (`--`, `...`), not a
+    number (`403`, `3.5`, `10:30`), not a URL, and not a single-case or
+    Titlecase all-letter word that has 7 letters or fewer or is followed by
+    another word on its line (`required for admin`, `auth is not supported`).
+
+    Deliberately not `_is_plain_word_or_number` or
+    `_value_could_be_a_credential`: a mixed-case all-letter run is base64
+    (`dXNlcjpwYXNz`), and an all-letter run of 8+ letters at the end of a
+    line is a credential here. A "consistency" refactor onto those helpers
+    would leak both."""
+    if not any(c.isalnum() for c in cred):
+        return False
+    core = cred.rstrip("=")
+    if _NUMBER_RE.fullmatch(core) or _NUMBERISH_RE.fullmatch(core):
+        return False
+    if "://" in cred:
+        return False
+    if cred.isalpha() and _is_single_case(cred):
+        if len(cred) <= _PROSE_MAX or _NEXT_WORD_RE.match(text, after):
+            return False
+    return True
+
+
+def _authorization_credential_spans(text: str) -> list[Span]:
+    """The credential after `Authorization: <scheme>`, for any scheme: an
+    auth-param list (two or more comma-joined params, or one quoted param
+    with a known auth-param name), or a token68 run (bare, wrapped in a
+    quote or bracket, or `id:secret`) that `_credential_shaped` accepts.
+    Spans cover the credential only, never the key or the scheme.
+
+    Every attempt starts on a literal `authorization`; the params scan is
+    bounded by its line and the token68 scan by its run, and a span moves
+    the next search past itself."""
+    work(len(text))  # the anchor search
+    spans: list[Span] = []
+    position = 0
+    while True:
+        anchor = _AUTH_CRED_ANCHOR_RE.search(text, position)
+        if anchor is None:
+            break
+        work(anchor.end() - anchor.start())
+        position = start = anchor.end()
+        params = _AUTH_PARAMS_RE.match(text, start)
+        if params is not None:
+            work(params.end() - start)
+            name = params.group("name").lower()
+            if params.group("more") or (
+                params.group("value").startswith('"')
+                and (name in _KNOWN_AUTH_PARAMS or name.startswith("oauth_"))
+            ):
+                spans.append((start, params.end(), REDACTED))
+                position = params.end()
+                continue
+        if text.startswith(REDACTED, start):
+            continue  # a previous pass's marker (idempotence)
+        token = _TOKEN68_RE.match(text, start)
+        if token is None:
+            continue
+        work(token.end() - start)
+        cred = token.group("cred")
+        after = token.end()
+        following = text[after : after + 1]
+        if token.group("open"):
+            if following not in _TOKEN68_CLOSE:
+                continue
+            after += 1
+        elif (
+            # a JSON escape: the decoded views read it. Any other backslash
+            # (`\x0d`, `\'`, `\0`, a lone one at the end) is never decoded,
+            # so nothing else would read the credential before it
+            _JSON_DECODABLE_ESCAPE_RE.match(text, after) is not None
+            or following.isalnum()  # a word the run does not cover
+            # `name=value` / `name="value"`: a field, not padding
+            or (
+                cred.endswith("=")
+                and (
+                    following in _TCHARS
+                    or (
+                        following in "\"'"
+                        and _FIELD_NAME_RE.fullmatch(cred.rstrip("=")) is not None
+                    )
+                )
+            )
+        ):
+            continue
+        if not _credential_shaped(text, cred, after):
+            continue
+        spans.append((token.start("cred"), token.end("cred"), REDACTED))
+        position = token.end()
+    return spans
+
+
+_AUTH_WORD_RE = re.compile(r"authorization", re.IGNORECASE)
+
+
+# ------------------------------------------------------ escape views -------- #
+
+#: What each one-character escape of `_JSON_DECODABLE_ESCAPE_RE` decodes to.
+_SIMPLE_ESCAPES = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
+#: Escape depth, counted from the raw input of a public entry point: text
+#: depth 2 through `process_output`'s structured twin (which serializes one
+#: level deeper), plus one escape layer inside the text itself (owner
+#: decision, Consiliency/pmcp#478).
+_MAX_ESCAPE_VIEWS = 4
+
+
+class _EscapeLayer:
+    """Where one decoded layer's escapes were: ``positions`` are the view
+    offsets holding a decoded escape, ``deltas`` the cumulative
+    ``len(escape) - 1`` up to and including each (8 bytes per escape)."""
+
+    __slots__ = ("positions", "deltas")
+
+    def __init__(self, positions: array[int], deltas: array[int]) -> None:
+        self.positions = positions
+        self.deltas = deltas
+
+    def to_outer(self, position: int) -> int:
+        """A view offset in the layer it was decoded from. A start on a
+        decoded character maps to its escape's backslash; an end after it
+        maps past the whole escape."""
+        i = bisect.bisect_left(self.positions, position)
+        return position + (self.deltas[i - 1] if i else 0)
+
+
+def _unescape_layer(text: str) -> tuple[str, _EscapeLayer] | None:
+    """``text`` with one layer of JSON string escapes decoded, left to right
+    over the whole text (string boundaries are not tracked: over-decoding
+    can only add redaction, which the benign guards bound). A `\\uXXXX`
+    escape becomes one code point; a lone surrogate is kept as is. None when
+    there is no escape to decode."""
+    work(len(text))
+    parts: list[str] = []
+    positions: array[int] = array("q")
+    deltas: array[int] = array("q")
+    cursor = view_length = total = 0
+    for match in _JSON_DECODABLE_ESCAPE_RE.finditer(text):
+        plain = text[cursor : match.start()]
+        parts.append(plain)
+        view_length += len(plain)
+        escape = match.group()
+        parts.append(
+            chr(int(escape[2:], 16)) if escape[1] == "u" else _SIMPLE_ESCAPES[escape[1]]
+        )
+        positions.append(view_length)
+        total += len(escape) - 1
+        deltas.append(total)
+        view_length += 1
+        cursor = match.end()
+    if not positions:
+        return None
+    parts.append(text[cursor:])
+    return "".join(parts), _EscapeLayer(positions, deltas)
+
+
+_VIEW_WORD_RE = re.compile(r"authorization|bearer|://", re.IGNORECASE)
+#: A scheme word `_AUTHORIZATION_RE` names, between the key and a bracket.
+_SCHEME_WORD_RE = re.compile(r"bearer|basic|digest|negotiate|ntlm|token", re.IGNORECASE)
+
+
+def _view_may_match(view: str) -> bool:
+    """A necessary condition for a context rule to match in a decoded view:
+    a key word, `authorization`, `bearer` or `://` occurs in the view itself
+    (so an escaped spelling is found at the layer where it decodes)."""
+    work(2 * len(view))
+    return (
+        _ANY_KEY_RE.search(view) is not None or _VIEW_WORD_RE.search(view) is not None
+    )
+
+
+def _authorization_view_spans(text: str) -> list[Span]:
+    """`_authorization_spans` in a decoded view, less what it takes after an
+    UNQUOTED key that the base pass has already rewritten at depth 0: the
+    base pass reads the raw text at every depth and replaces the first word
+    (the scheme), and the credential rule takes the one after it.
+
+    * its bare value: reading the scheme again here took prose (`Basic auth
+      is not supported`) that depth 0 keeps;
+    * its bracketed value after a scheme word (`Basic (none)`): at depth 0
+      the additive pass reads `[REDACTED] (none)`, where it cannot fire, so
+      reading it here changed benign text at depth 2 only (review of
+      f706ab5, A-N2). The credential rule still reads the word inside.
+
+    After a quoted key the base pass does not fire, so both stay."""
+    work(len(text))
+    spans: list[Span] = []
+    for match in _counted(_AUTHORIZATION_RE.finditer(text)):
+        key_end = match.start() + len("authorization")
+        quoted_key = text[key_end : key_end + 1] in ('"', "'")
+        if not quoted_key and (
+            match.group("bare") is not None
+            or (
+                match.group("inner") is not None
+                and _SCHEME_WORD_RE.search(text, key_end, match.start("inner"))
+                is not None
+            )
+        ):
+            continue
+        base = match.start()
+        spans.extend(
+            (base + start, base + end, replacement)
+            for start, end, replacement in _authorization_spans(match.group())
+        )
+    return spans
+
+
+def _context_spans(text: str, covers: Covers | None, view: bool = False) -> list[Span]:
+    """The additive rules that need context (a key, a scheme or a URL), not
+    the context-free shapes (`_shape_spans` reads the base output in
+    `redact_additive`)."""
+    keyed = _may_hold_a_key(text)
+    return [
+        *(_keyword_sep_spans(text) if keyed else ()),
+        *(_keyword_list_spans(text) if keyed else ()),
+        *(_authorization_view_spans(text) if view else _authorization_spans(text)),
+        *_bearer_spans(text),
+        *(_keyword_ws_spans(text) if keyed else ()),
+        *_url_spans(text, 0, covers),
+    ]
+
+
+#: The base pass's own Authorization and Bearer rules (`pmcp.auth.
+#: _sanitize_base`; a test pins them equal), with the value as a group that
+#: stops at a quote or backslash.
+_BASE_AUTHORIZATION_RE = re.compile(
+    r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?(?P<value>[^\s,;\"'\\]+)"
+)
+_BASE_BEARER_RE = re.compile(r"(?i)(\bbearer\s+)(?P<value>[^\s,;\"'\\]+)")
+
+
+def _swallowed_key_spans(
+    view: str, layers: list[_EscapeLayer], url_edits: list[tuple[int, int]]
+) -> list[Span]:
+    """In a decoded view, what the base pass's Authorization and Bearer
+    rules would have taken, for a key whose raw offset lies inside a URL
+    match the URL pass rewrote: it ran into the key (`?q=1\\nAuthorization:`
+    is one URL in escaped text) and re-encoded or dropped its separator, so
+    the base pass could not fire there, though it does at depth 0
+    (re-check S3)."""
+    work(len(view))
+    starts = [start for start, _ in url_edits]
+    spans: list[Span] = []
+    for pattern in (_BASE_AUTHORIZATION_RE, _BASE_BEARER_RE):
+        for match in _counted(pattern.finditer(view)):
+            position = match.start()
+            for layer in reversed(layers):
+                position = layer.to_outer(position)
+            work(len(layers))
+            i = bisect.bisect_right(starts, position) - 1
+            if i >= 0 and position < url_edits[i][1]:
+                spans.append((match.start("value"), match.end("value"), REDACTED))
+    return spans
+
+
+def escape_view_spans(
+    raw: str,
+    covers: Covers | None = None,
+    url_edits: list[tuple[int, int]] | None = None,
+) -> list[Span]:
+    """Spans over ``raw``, the public entry point's input.
+
+    Layer 0 is ``raw`` itself, read only by the Authorization-credential
+    rule (the other rules read the base output in `redact_additive`).
+    Layers 1 to `_MAX_ESCAPE_VIEWS` each decode one more layer of JSON
+    string escapes; when a view may match (`_view_may_match`), the context
+    rules, the credential rule and `_swallowed_key_spans` read it, and each
+    span maps back to ``raw`` over whole escapes. ``url_edits`` are the
+    ``(start, end)`` of the URL matches the URL pass changed, in ``raw``."""
+    work(len(raw))
+    out: list[Span] = []
+    if _AUTH_WORD_RE.search(raw) is not None:
+        out.extend(_authorization_credential_spans(raw))
+    if "\\" not in raw:
+        return out
+    current = raw
+    layers: list[_EscapeLayer] = []
+    for _ in range(_MAX_ESCAPE_VIEWS):
+        decoded = _unescape_layer(current)
+        if decoded is None:
+            break
+        current, layer = decoded
+        layers.append(layer)
+        if _view_may_match(current):
+            found = _context_spans(current, covers, view=True)
+            if _AUTH_WORD_RE.search(current) is not None:
+                found.extend(_authorization_credential_spans(current))
+            if url_edits:
+                found.extend(_swallowed_key_spans(current, layers, url_edits))
+            for start, end, replacement in widen_over_escapes(current, found):
+                work(len(layers))
+                for outer in reversed(layers):
+                    start, end = outer.to_outer(start), outer.to_outer(end)
+                out.append((start, end, replacement))
+        if "\\" not in current:
+            break
+    return widen_over_escapes(raw, out)
+
+
+# ----------------------------------------------------- recorded edits ------- #
+
+
+class Edit(NamedTuple):
+    """One replacement a pass made, in that pass's INPUT offsets.
+    ``kept_prefix`` and ``kept_suffix`` are the bytes the replacement kept
+    from the start and the end of what it replaced (never ending inside a
+    marker it wrote); ``lead`` is the length of the whitespace and markers
+    that open the changed middle."""
+
+    start: int
+    end: int
+    new_len: int
+    kept_prefix: int
+    kept_suffix: int
+    lead: int
+
+
+_LEAD_RE = re.compile(r"(?:\s|\[REDACTED\]|%5BREDACTED%5D)*")
+
+
+def make_edit(start: int, end: int, old: str, new: str) -> Edit:
+    """The edit replacing ``old`` (at ``start:end``) with ``new``."""
+    work(len(old) + len(new) + 1)
+    limit = min(len(old), len(new))
+    kept_prefix = 0
+    while kept_prefix < limit and old[kept_prefix] == new[kept_prefix]:
+        kept_prefix += 1
+    kept_suffix = 0
+    while (
+        kept_suffix < limit - kept_prefix
+        and old[-1 - kept_suffix] == new[-1 - kept_suffix]
+    ):
+        kept_suffix += 1
+    # a kept prefix or suffix never ends inside a marker of the replacement
+    for marker in _MARKER_RE.finditer(new):
+        if marker.start() < kept_prefix < marker.end():
+            kept_prefix = marker.start()
+        if marker.start() < len(new) - kept_suffix < marker.end():
+            kept_suffix = len(new) - marker.end()
+    middle_end = len(new) - kept_suffix
+    lead_match = _LEAD_RE.match(new, kept_prefix, middle_end)
+    assert lead_match is not None  # a starred pattern always matches
+    lead = lead_match.end() - kept_prefix
+    return Edit(start, end, len(new), kept_prefix, kept_suffix, lead)
+
+
+def _transport_one(spans: list[Span], edits: list[Edit]) -> list[Span]:
+    """Map ``spans`` from one pass's input to its output.
+
+    A boundary before an edit, after it, or in the bytes the edit kept maps
+    one to one. A start in the replaced stretch goes past the markers and
+    whitespace the replacement begins with, and an end goes to the end of
+    the replaced stretch: a carried span never covers a key or separator a
+    pass kept, and never starts on a marker the pass wrote. A span that
+    becomes empty is dropped (what it covered is already replaced)."""
+    if not edits or not spans:
+        return spans
+    work(len(edits))
+    starts = [edit[0] for edit in edits]
+    cumulative: list[int] = []
+    delta = 0
+    for start, end, new_len, *_ in edits:
+        delta += new_len - (end - start)
+        cumulative.append(delta)
+
+    def mapped(position: int, is_end: bool) -> int:
+        i = bisect.bisect_right(starts, position) - 1
+        if i < 0:
+            return position
+        start, end, new_len, kept_prefix, kept_suffix, lead = edits[i]
+        if position >= end:
+            return position + cumulative[i]
+        new_start = start + (cumulative[i - 1] if i else 0)
+        if position < start + kept_prefix or (
+            is_end and position == start + kept_prefix
+        ):
+            return new_start + (position - start)
+        if position >= end - kept_suffix:
+            return new_start + new_len - (end - position)
+        if is_end:
+            return new_start + new_len - kept_suffix
+        return new_start + kept_prefix + lead
+
+    work(len(spans) * max(1, len(edits).bit_length()))
+    carried: list[Span] = []
+    for start, end, replacement in spans:
+        new_start, new_end = mapped(start, False), mapped(end, True)
+        if new_start < new_end:
+            carried.append((new_start, new_end, replacement))
+    return carried
+
+
+def transport_spans(
+    spans: list[Span],
+    edit_lists: list[list[Edit]],
+    final: str,
+    *,
+    drop_nested: bool = True,
+) -> list[Span]:
+    """Carry ``spans`` through each pass's edits in order; ``final`` is the
+    last pass's output. With ``drop_nested``, spans the others make
+    redundant in ``final`` are dropped (`_drop_nested`): only for the text
+    `redact_additive` is about to read, never for one that later passes
+    still rewrite."""
+    if not spans:
+        return []
+    for edits in edit_lists:
+        # identical spans give identical pieces: one is enough
+        spans = list(dict.fromkeys(_transport_one(spans, edits)))
+    if not spans:
+        return []
+    spans = widen_over_escapes(final, spans)
+    return _drop_nested(final, spans) if drop_nested else spans
+
+
+def _drop_nested(text: str, spans: list[Span]) -> list[Span]:
+    """Drop each span nested in another one that does not start on a marker:
+    `merge_redaction_spans` already replaces every stretch of the outer span
+    outside its markers, so the nested span adds nothing. Needed for linear
+    cost: many spans found inside one stretch a pass replaced (every query
+    value of a long URL in escaped text) are carried onto one and the same
+    span, and the merge walks the markers inside each span it is given. An
+    outer span that starts ON a marker replaces only the run glued to it,
+    so spans nested in it are kept.
+
+    ``text`` must be the text `redact_additive` applies the spans to: when
+    it is a JSON document, `_clip_to_json_strings` first cuts every span at
+    the string boundaries, and an outer span cut at an opening quote may
+    then start ON a marker (`{"a": "[REDACTED] secret"}`) and stop covering
+    what the nested span did. So in text that may be JSON, a span is only
+    dropped when no unescaped double quote lies between the outer span's
+    start and its own end: both then fall in the same string, and the cut
+    leaves the outer span's start where it was. The result applies exactly
+    as ``spans`` would (`test_drop_nested_applies_as_the_spans_do`)."""
+    work(len(text) + len(spans) * max(1, len(spans).bit_length()))
+    markers = [m.span() for m in _MARKER_RE.finditer(text)]
+    marker_starts = [start for start, _ in markers]
+
+    def on_a_marker(position: int) -> bool:
+        i = bisect.bisect_right(marker_starts, position) - 1
+        return i >= 0 and markers[i][1] > position
+
+    # Where `_clip_to_json_strings` may cut, a holder keeps the position of
+    # the first unescaped double quote (a JSON string delimiter) at or after
+    # its start. Holders are taken in ascending start order, so one forward
+    # cursor finds them all, reading each quote and its backslash run once.
+    may_be_json = text.lstrip()[:1] in ("{", "[", '"')
+    if may_be_json:
+        work(len(text))
+    cursor = [-1, -1]  # [searched from, the first unescaped quote at or after]
+
+    def next_quote(position: int) -> int:
+        if cursor[0] <= position <= cursor[1]:
+            return cursor[1]
+        found = text.find('"', position)
+        while found >= 0:
+            run = found
+            while run and text[run - 1] == "\\":
+                run -= 1
+            if (found - run) % 2 == 0:
+                break
+            found = text.find('"', found + 1)
+        cursor[:] = [position, len(text) if found < 0 else found]
+        return cursor[1]
+
+    def holder(start: int, end: int) -> tuple[int, int]:
+        """The end a span must not pass to be held by this one."""
+        return start, (min(end, next_quote(start)) if may_be_json else end)
+
+    kept: list[Span] = []
+    # the kept span that does not start on a marker and holds furthest, and
+    # the last such span kept (a later start: maybe past a string boundary)
+    widest = last = (-1, -1)
+    for start, end, replacement in sorted(spans, key=lambda s: (s[0], -s[1])):
+        if end <= widest[1] or end <= last[1]:
+            continue
+        kept.append((start, end, replacement))
+        if not on_a_marker(start):
+            last = holder(start, end)
+            if last[1] > widest[1]:
+                widest = last
+    return kept
+
+
+def carried_view_spans(
+    raw: str,
+    base: str,
+    base_edits: list[list[Edit]] | None,
+    covers: Covers | None = None,
+    *,
+    drop_nested: bool = True,
+) -> list[Span]:
+    """`escape_view_spans` of ``raw`` in ``base`` coordinates, carried
+    through the base pass's recorded edits. Without a usable record, the
+    spans of ``base`` itself (fail safe: the rules then read the base pass's
+    output, as every other additive rule does). ``drop_nested`` as in
+    `transport_spans`: False when a later pass still rewrites ``base``."""
+    if base_edits is None:
+        return escape_view_spans(base, covers)
+    url_edits = [(edit.start, edit.end) for edit in base_edits[0]]
+    return transport_spans(
+        escape_view_spans(raw, covers, url_edits),
+        base_edits,
+        base,
+        drop_nested=drop_nested,
+    )

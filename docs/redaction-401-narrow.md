@@ -65,6 +65,12 @@ match replaces them through an ordered slice/join. There is no `str.replace`
 and no search, so a literal canonical `%5C` URL elsewhere in the text is never
 touched.
 
+This includes the redactions added for Consiliency/pmcp#478 (escaped views,
+carried through the base pass's recorded edits, and the Authorization
+credential): they are applied by the additive pass, after the snapshot, so
+they cancel the restore; they never re-expose anything. Recording the base
+pass's edits does not change its output.
+
 Any change made by a **post-URL pass**, anywhere in the text, restores nothing:
 the whole text stays main's output. Redactions made by the URL pass itself
 (a secret query value, userinfo, a fragment) are part of the snapshot. They do
@@ -105,6 +111,99 @@ baseline defect, not something this change fixes.
   where a benign URL elsewhere survived unchanged. Restoring through a changed
   snapshot would need separate, reviewed provenance tracking.
 - Such texts can still fall back from JSON to a string in `process_output`.
+- **The dict-to-string trade (Consiliency/pmcp#478, accepted; follow-up
+  Consiliency/pmcp#483).** When a `process_output(dict)` result holds both an
+  eligible URL tail and a value that Consiliency/pmcp#478 now redacts, the restore is
+  cancelled, main's `%5C"` stays, the document no longer parses and the result
+  is main's pre-Consiliency/pmcp#401 *string*, with the secret withheld.
+  Measured on 324 structured cells (12 forms, 9 keys, depths 0-2): main
+  returns a dict in 279 and Consiliency/pmcp#478 in 252; all 27 changes are
+  the form
+  `{"<key>": "https://example.test/a?v=1\\", "b": "c"}`, where the URL is the
+  secret-keyed value main left in clear. No result went from string to dict.
+  Main already returns a string for the same reason whenever a depth-0 secret
+  sits beside an eligible URL, so callers must handle `str`. The trade is
+  pinned by tests (`tests/test_redaction_478_escaped.py`, which also show
+  main's dict when the Consiliency/pmcp#478 spans are removed), so a
+  provenance-tracked restore has to flip them on purpose.
+
+## Escaped text and Authorization credentials (Consiliency/pmcp#478)
+
+The additive context rules (keyword, keyword list, Authorization, Bearer, URL
+query) also read up to four decoded layers of JSON string escapes of the
+**raw** input, so `\"token\": \"…\"` is read as `"token": "…"`. They read the
+raw input, not the base pass's output, because the URL pass runs over escapes
+in escaped text and re-encodes or drops the next line's key
+(`?q=1\ntoken:` becomes `%5Cntoken%3A`). Each span maps back over whole
+escapes and is carried to the final text through the edits every earlier pass
+recorded (the base pass's, then each policy pattern's). An
+Authorization-credential rule reads the raw text and every view.
+
+The credential rule takes a token68 credential after the scheme word, or an
+auth-param list: two or more comma-joined `name=value` parameters, or one
+quoted parameter with a known Digest, OAuth, AWS4 or HTTP Signatures name. A
+bare value may hold `;` (AWS4's `SignedHeaders=host;x-amz-date`), and a comma
+may have one obs-fold on either side (RFC 7616 lays out one parameter per
+line).
+
+This partly addresses Consiliency/pmcp#417: its repro (a secret-named query
+key in a URL spelled with `\/` inside a JSON string) is withheld at every
+depth, and the document stays a document. Other spellings in that issue are
+not covered here.
+
+What stays out, by design:
+
+- the context-free shapes (`_shape_spans`), which read the base output;
+- the default and operator policy patterns: they are not matched against the
+  decoded views (owner decision; Consiliency/pmcp#482). As at depth 0, the
+  URL query rule still asks them about a percent-decoded query value of a
+  URL found in a view, which can only add redaction;
+- escape depth 5 and more, counted from the raw input of a public entry
+  point, and non-JSON escape dialects (`\'`, `\xNN`, `\U0001F600`, `\u{…}`).
+
+Residuals. Each item is pinned by a test in
+`tests/test_redaction_478_escaped.py` on every entry point at depths 0-2
+(`test_disclosed_residuals`, `test_disclosed_over_redactions`), except where
+noted, so a fix has to flip it on purpose. Main keeps every kept value too:
+
+- an all-letter, single-case or Titlecase credential of 8 or more letters
+  followed by another word on its line
+  (`Authorization: Basic qzhunterwombat was rejected`), and one of 7 letters
+  or fewer (`Authorization: Basic qzhuntr`) (owner decision: the narrow
+  prose guard);
+- a credential that is a number, a date or a time (`Authorization: Pin
+  12345678`, `2026-11-07`, `10:30:15`);
+- a malformed token68 split by a comma (`Basic Zm9v,OmJhcg`: `OmJhcg` reads
+  as the next list item);
+- a single unquoted auth-param after the scheme
+  (`Authorization: Digest response=ab12cd34ef`,
+  `Authorization: AWS4-HMAC-SHA256 Signature=ab12cd34ef`): the owner's rule
+  takes two or more comma-joined parameters, or one quoted parameter with a
+  known name. A truncated header can end up like this;
+- auth-params joined by spaces instead of commas (not RFC 7616):
+  only a first, quoted, known-name parameter is taken, and the rest stay;
+- over-redaction: a token68-shaped word after the scheme is redacted even in
+  prose (`Authorization: denied user_id`), and so are two or more
+  comma-joined `name=value` fields after it
+  (`authorization=none user=bob, retry=2`) and one quoted field with a known
+  auth-param name (`authorization=none realm="internal"`);
+- inside the depth cap, two contrived shapes are withheld at depth 0 but not
+  at depth 1, as on main (`test_disclosed_escaped_residuals`): a second
+  `Authorization` key read as the first one's quoted value
+  (`Authorization: Basic "Authorization": Basic keyid:…, x`), and a Bearer
+  value that opens with `\\"`, where the view rules stop;
+- a URL as a credential: a token68 run holding `://` is not taken;
+- applying a redactor twice is idempotent on the tested corpora
+  (`test_idempotent_on_the_named_corpora`), but not in general: a second pass
+  can merge `[REDACTED][REDACTED]` or re-encode a marker inside a URL.
+  Nothing is re-exposed.
+
+Cost: work and memory are linear, counted (the work counter) and measured
+(`tracemalloc` peaks) to 256 KiB. Peak memory per character is flat with
+size; on the measured adversarial shapes it stayed under 90 bytes (main, on
+the same shapes: under 60). CPU stays within the slow tier's ratio canary:
+6x the pre-Consiliency/pmcp#478 pipeline on the same input, at 256 KiB. A
+separate probe at 1 MiB measured about 0.9-2.6x on every shape it tried.
 
 Percent/`+` normalization and broader structured redaction are separate work
 (Consiliency/pmcp#407, Consiliency/pmcp#423).

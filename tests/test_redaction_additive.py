@@ -498,12 +498,26 @@ def _texts(rows: list[G.Row]) -> list[str]:
     return out
 
 
-def test_the_base_pass_is_the_redactor_unchanged() -> None:
+@pytest.mark.parametrize("recorded", [False, True], ids=["bare", "recorded"])
+def test_the_base_pass_is_the_redactor_unchanged(recorded: bool) -> None:
     """`_sanitize_base` is the vendored redactor, output for output, on every
-    tier-1 text, the prose, the credentials and the JSON fuzz."""
+    tier-1 text, the prose, the credentials and the JSON fuzz -- called bare,
+    and under a public entry point's record, where it also records its edits
+    (Consiliency/pmcp#401, #478)."""
+    from pmcp.auth import _url_tail_restore
+
     texts = _texts(G.corpus(1)) + [PROSE] + [c[1] for c in CREDENTIALS]
     texts += [json.dumps(o, indent=2) for o in _json_fuzz_corpus()]
-    assert [t for t in texts if _sanitize_base(t) != _main_e(t)] == []
+
+    def base(text: str) -> str:
+        if not recorded:
+            return _sanitize_base(text)
+        with _url_tail_restore() as record:
+            out = _sanitize_base(text)
+            assert record.base_edits is not None
+            return out
+
+    assert [t for t in texts if base(t) != _main_e(t)] == []
 
 
 # ================================================================== floor ==== #
@@ -934,6 +948,35 @@ LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
     "long joined keys": lambda n: ("a" * 170 + "_token" * 14 + "=Hunter2abc9 ") * (n // 267),
     "an unterminated keyword list": lambda n: "tokens: [" + " " * n + "x",
     "a list in a JSON leaf": lambda n: json.dumps({"t": "tokens: [" + " " * n}),
+    # Consiliency/pmcp#478: the Authorization-credential rule
+    "many Authorization anchors with params": lambda n: 'Authorization: Digest username="u1", response="ab12" ' * (n // 52),
+    "Authorization anchors inside one bare run": lambda n: "Authorization: s " + "xauthorization=s" * (n // 16),
+    "unterminated auth-params, one per line": lambda n: 'Authorization: Digest response="ab12cd\n' * (n // 40),
+    "Authorization anchors inside a quoted field": lambda n: 'Authorization: s a="' + "authorization: s b=x " * (n // 21),
+    "prose after Authorization anchors": lambda n: "Authorization: Basic required for admin " * (n // 40),
+    "Authorization anchors before long credentials": lambda n: ("Authorization: Basic " + "Zm9vOmJhcg" * 30 + " ") * (n // 321),
+    # the auth-param separator: spaces and one fold on either side of a comma
+    "auth-param comma, then a long space run": lambda n: "Authorization: X a=1," + " " * n + '"',
+    "auth-param comma, a fold, a long indent": lambda n: "Authorization: X a=1,\n" + " " * n + '"',
+    "auth-param, a long space run, a fold, no comma": lambda n: "Authorization: X a=1" + " " * n + "\n x",
+    "auth-params with folds and semicolons": lambda n: ("Authorization: X a=1, b=2;c" + " " * 50 + ",\n  ") * (n // 80),
+    # Consiliency/pmcp#478: escape views over the raw input, carried spans
+    "escaped quotes before a key": lambda n: '\\"' * (n // 2) + '\\"token\\": \\"abc123\\"',
+    "backslash run before an escaped key": lambda n: "\\\\" * (n // 2) + '\\"password\\": \\"x\\"',
+    "unicode escapes around a key": lambda n: "\\u0041" * (n // 12) + "token=x" + "\\u0041" * (n // 12),
+    "dense keyed pairs at depth 3": lambda n: json.dumps(json.dumps(json.dumps('"token": "ab12cd34", ' * (n // 80)))),
+    "dense keyed pairs at depth 4": lambda n: json.dumps(json.dumps(json.dumps(json.dumps('"token": "ab12cd34", ' * (n // 160))))),
+    "escaped keys chained in one URL run": lambda n: "https://a.test/?q=1" + "\\ntoken:x" * (n // 9),
+    "URL lines then Authorization, escaped": lambda n: json.dumps("GET https://a.test/x?q=1\nAuthorization: Basic Zm9vOmJhcg\n" * (n // 60)),
+    "URL lines then swallowed keys, escaped": lambda n: json.dumps("GET https://a.test/x#f\nAuthorization: secretvalue\n" * (n // 50)),
+    "a pure backslash run": lambda n: "\\" * n,
+    # `_drop_nested` reads the string boundaries of text that may be JSON
+    "a JSON document of quotes before an escaped key": lambda n: json.dumps({"t": '"' * (n // 4) + '\\"token\\": \\"abc123\\"'}),
+    # the slow sweep's shapes: many view spans carried into one URL edit
+    "query values in one URL after an escape": lambda n: "https://h/?\\\\" + "&token=%2541" * (n // 12),
+    "escaped query values in one URL": lambda n: "https://h/?password=x" + "&token=%2541\\u00e9" * (n // 18),
+    "policy-damaged pairs (pattern-edit transport)": lambda n: '"password: \\"x1\\" ' * (n // 18),
+    "policy-damaged pairs at depth 0": lambda n: 'password: "quokka secretwombat" ' * (n // 33),
 }  # fmt: skip
 
 

@@ -9,7 +9,9 @@ main's output.
 Expectations named ``MAIN_*`` are literal outputs of pmcp main
 2a13d471ead38d5f9bcac2115b55c9ee029d5a2a, computed from a `git archive` of
 that commit, never from this tree. `tests/_main_redactor.py` is the frozen
-pre-additive oracle and is not modified.
+pre-additive oracle and is not modified. Where Consiliency/pmcp#478 adds
+markers to a main output, the case lives in ``FIXED_478_*`` instead and is
+checked additive against the oracle of its own surface.
 """
 
 from __future__ import annotations
@@ -339,17 +341,22 @@ MAIN_CHANGED_SNAPSHOT = {
         'password=[REDACTED] https://example.test/watch?v=abc%5C"',
         'password= [REDACTED] https://example.test/watch?v=abc%5C"',
     ),
-    # The Basic credential survives on main: a baseline defect pinned here for
-    # parity, not endorsed (Consiliency/pmcp#478).
-    "authorization_after": (
-        'https://example.test/watch?v=abc\\" Authorization: Basic Zm9vOmJhcg',
-        'https://example.test/watch?v=abc%5C" Authorization: [REDACTED] Zm9vOmJhcg',
-        'https://example.test/watch?v=abc%5C" Authorization: [REDACTED] Zm9vOmJhcg',
-    ),
     "json_password_after": (
         '{"u": "https://example.test/watch?v=abc\\"", "password": "Zq9secretwombat"}',
         '{"u": "https://example.test/watch?v=abc%5C"", "password": "[REDACTED]"}',
         '{"u": "https://example.test/watch?v=abc%5C"", "password": "[REDACTED]"}',
+    ),
+}
+
+
+#: Main left the Basic credential in clear (`Authorization: [REDACTED]
+#: Zm9vOmJhcg`); Consiliency/pmcp#478 withholds it. Text, then the expected
+#: output of each surface.
+FIXED_478_CHANGED_SNAPSHOT = {
+    "authorization_after": (
+        'https://example.test/watch?v=abc\\" Authorization: Basic Zm9vOmJhcg',
+        'https://example.test/watch?v=abc%5C" Authorization: [REDACTED] [REDACTED]',
+        'https://example.test/watch?v=abc%5C" Authorization: [REDACTED] [REDACTED]',
     ),
 }
 
@@ -377,32 +384,26 @@ PRECEDING = L + [
 ]
 
 
-def _preceding_case(index: int, depth: int) -> object:
-    # Known baseline leak, identical before and after #401: once the text is
-    # JSON-encoded, the keyword rule no longer matches a secret-named key
-    # followed by a value (Consiliency/pmcp#478). Strict xfail, so fixing #478
-    # turns these into failures that prompt removing the marker.
-    if index >= 3 and depth >= 1:
-        return pytest.param(
-            index,
-            depth,
-            marks=pytest.mark.xfail(
-                reason="baseline leak, Consiliency/pmcp#478", strict=True
-            ),
-        )
-    return pytest.param(index, depth)
-
-
 @pytest.mark.parametrize(
     ("index", "depth"),
-    [_preceding_case(i, d) for i in range(len(PRECEDING)) for d in range(3)],
+    # Rows 3-9 at depths 1-2 were a baseline leak until Consiliency/pmcp#478:
+    # once the text is JSON-encoded, the keyword rule no longer matched a
+    # secret-named key followed by a value.
+    [(i, d) for i in range(len(PRECEDING)) for d in range(3)],
 )
 def test_preceding_keys(index: int, depth: int) -> None:
     text = PRECEDING[index]
     secrets = [s for s in (SECRET, "quokkawombat") if s in text]
     for _ in range(depth):
         text = json.dumps(text)
-    for output in (_diag(text), _policy(text)):
+    policy = PolicyManager()
+    structured = policy.process_output({"t": text}, redact=True, max_bytes=10**6)
+    for output in (
+        _diag(text),
+        _policy(text),
+        policy.process_output(text, redact=True, max_bytes=10**6)["result"],
+        json.dumps(structured["result"]),
+    ):
         for secret in secrets:
             assert secret not in output
 
@@ -467,6 +468,20 @@ def test_changed_snapshot_keeps_main_exactly(name: str) -> None:
     assert "%5C" in main_diag
     assert _diag(text) == main_diag
     assert _policy(text) == main_policy
+
+
+@pytest.mark.parametrize("name", sorted(FIXED_478_CHANGED_SNAPSHOT))
+def test_changed_snapshot_fixed_by_478(name: str) -> None:
+    """The restore stays cancelled, and each surface is its own oracle's
+    output with markers written in (Consiliency/pmcp#478)."""
+    text, expected_diag, expected_policy = FIXED_478_CHANGED_SNAPSHOT[name]
+    diag, policy = _diag(text), _policy(text)
+    assert diag == expected_diag
+    assert policy == expected_policy
+    assert "%5C" in diag and "%5C" in policy
+    assert _is_additive_of(diag, M.sanitize_auth_diagnostic(text, max_length=None))
+    assert _is_additive_of(policy, M.redact_secrets(text))
+    assert "Zm9vOmJhcg" not in diag and "Zm9vOmJhcg" not in policy
 
 
 def test_restore_guard() -> None:

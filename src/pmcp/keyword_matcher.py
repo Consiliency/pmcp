@@ -107,14 +107,23 @@ def keyword_matches(
 
 
 def redact_keyword_values(
-    text: str, key_start: re.Pattern[str], marker: str = "[REDACTED]"
+    text: str,
+    key_start: re.Pattern[str],
+    marker: str = "[REDACTED]",
+    edits: list[tuple[int, int]] | None = None,
 ) -> str:
-    """Main's `re.sub(<keyword rule>, r"\\1\\2[REDACTED]", text)`, linear."""
+    """Main's `re.sub(<keyword rule>, r"\\1\\2[REDACTED]", text)`, linear.
+
+    With ``edits``, each replaced value's ``(start, end)`` in ``text`` is
+    appended to it as well; the returned text is the same either way
+    (Consiliency/pmcp#478 records the base pass's edits)."""
     pieces: list[str] = []
     position = 0
     for _, _, value_start, end in keyword_matches(text, key_start):
         pieces.append(text[position:value_start])
         pieces.append(marker)
+        if edits is not None:
+            edits.append((value_start, end))
         position = end
     pieces.append(text[position:])
     return "".join(pieces)
