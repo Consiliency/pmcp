@@ -1311,10 +1311,10 @@ def _restore_url_tails(
 
     Each span must still hold exactly its canonical bytes; it is replaced by
     the raw match, which is the canonical core plus its original trailing
-    run. The later passes include the redactions added for
-    Consiliency/pmcp#478 (escaped views and the Authorization credential):
-    they cancel the restore like any other change. Rebuilt by slicing, never by searching, so a literal canonical URL
-    elsewhere is never touched.
+    run. Rebuilt by slicing, never by searching, so a literal canonical URL
+    elsewhere is never touched. The later passes include the redactions added
+    for Consiliency/pmcp#478 (escaped views and the Authorization credential):
+    they cancel the restore like any other change.
 
     With a nonnegative ``max_length``, only spans wholly inside main's
     ``text[:max_length]`` are restored and nothing past that cut is emitted;

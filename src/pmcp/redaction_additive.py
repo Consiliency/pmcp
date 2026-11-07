@@ -13,14 +13,21 @@ and Authorization values, secrets in URL query values (percent-decoded),
 and shapes that need no keyword -- JWTs, vendor token shapes, prefixed
 tokens, PEM private-key blocks and high-entropy runs.
 
-Three guarantees, each tested (`tests/test_redaction_additive.py`):
+Four guarantees, each tested (`tests/test_redaction_additive.py`,
+`tests/test_redaction_478_escaped.py`):
 
 * the floor above;
 * JSON: when the text is a JSON document, a replacement is confined to
   string contents, whole escapes at a time, so a document stays a
   document (`_clip_to_json_strings`);
 * linear time and memory: every loop and string build adds what it
-  iterates over or copies to a test-only work counter (`WORK`).
+  iterates over or copies to a test-only work counter (`WORK`);
+* escaped context (Consiliency/pmcp#478): the context rules also read up to
+  four decoded JSON-escape layers of the RAW input, and an
+  Authorization-credential rule reads the raw text and every layer; spans
+  map back over whole escapes and are carried through every earlier pass's
+  recorded edits (`escape_view_spans`, `transport_spans`). Non-JSON escape
+  dialects are not decoded.
 """
 
 from __future__ import annotations
