@@ -6366,11 +6366,15 @@ class GatewayTools:
             # A typed credential failure (the user store became unreadable
             # during the install) is a state, not a crash: no traceback
             # (Consiliency/pmcp#487).
-            typed = isinstance(e, CredentialUnavailableError)
-            logger.error(
-                f"Handoff failed for {job_server_name}: {exception_text(e)}",
-                exc_info=None if typed else safe_exc_info(e),
-            )
+            if isinstance(e, CredentialUnavailableError):
+                logger.error(
+                    f"Handoff failed for {job_server_name}: {exception_text(e)}"
+                )
+            else:
+                logger.error(
+                    f"Handoff failed for {job_server_name}: {exception_text(e)}",
+                    exc_info=safe_exc_info(e),
+                )
             job.status = "failed"
             job.error = f"Handoff failed: {exception_text(e)}"
             # The group, unconditionally (round 10): a refusal before
