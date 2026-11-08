@@ -1,7 +1,7 @@
 # Detailed plan: 1Password secret references for downstream servers (Consiliency/pmcp#487)
 
-Status: PLAN revision 4, for panel review round 4. Revisions 1 (fce5598), 2
-(17b25d9) and 3 (a8ced55) were reviewed by Gemini, Astra, Claude and Grok; section
+Status: PLAN revision 5 (final). Revisions 1 (fce5598), 2 (17b25d9), 3 (a8ced55)
+and 4 (7be474a) were reviewed by Gemini, Astra, Claude and Grok; section
 10 maps every finding to the change below. Owner direction 2026-11-08 (not
 reopened): resolve `op://` references inside pmcp, authenticating with a
 **1Password service account scoped read-only to one gateway-only vault**, whose
@@ -299,10 +299,20 @@ New module `pmcp/secret_refs.py`:
   is replaced (refresh, update, restart, provision). A mismatch after resolution
   releases nothing new: the caller re-resolves once, then returns a typed
   retryable error.
-- Probe spawns that do not run the server (`update_server`'s update probe,
-  `handlers.py:5368-5374`; `get_package_version`, `5295`, `5513-5514`;
-  `verify_installation`'s `--help`, `installer.py:897-912`) omit every key that
-  holds a reference: never resolved, never forwarded.
+- The npm package-identity gate is not a spawn (`server_env` at
+  `handlers.py:5295`, used at `5302`, `5326`, `5513-5514`; `NpmResolver` checks
+  key NAMES, `npm_resolver.py:103-142`). It receives every declared key name with
+  an empty value (as `_identity_env_overlay` does, `refresher.py:326-337`): no
+  `op` call, no secret or reference string, and the gate still sees every key and
+  fails closed.
+- The update probe (`handlers.py:5368-5374`) and `verify_installation`
+  (`installer.py:897-912`) load the server's package (`@brightdata/mcp` throws at
+  load without `API_TOKEN`), so they are credential-injecting spawns like the
+  others: references resolved per 3.2.1 into a fresh env before
+  `sanitized_subprocess_env`, failing closed with `credential_unavailable` before
+  the spawn; own env of non-opted-in servers passed verbatim (3.2.4);
+  `resolved_config.config.env` never mutated, so the post-probe check at
+  `handlers.py:5484-5497` still compares reference strings.
 - `_connect_with_retry` and `_reconnect_loop` (`manager.py:4031-4051`) do not retry
   typed lookup failures (including `rate_limited`). Total resolution time per
   spawn is bounded (20 s).
@@ -349,10 +359,30 @@ Precedence (unchanged): external > `~/.env` > user store > tenant > project file
    (`secret_key` then `env_var`, `manifest/loader.py:313-329`), as today.
 
 Explicit empty values keep their meaning (`env_store.py:899-901`). Typed failures
-(`store_unreadable`, and P2's reference failures) stop the lookup in every
-consumer (`config/loader.py:1120-1129`, `1536-1543`, `installer.py:758-762`), and
-`config/loader.py:1216` propagates them instead of starting the server without its
-credential.
+(`store_unreadable`, and P2's reference failures) stop the lookup for that server
+in every consumer (`config/loader.py:1120-1129`, `1536-1543`, `installer.py:758-762`).
+
+**A typed failure is contained to its own entry** (Consiliency/pmcp#342: one entry
+must never abort loading every other config, `config/loader.py:1207-1211`). It is
+never re-raised out of a config load:
+- at `config/loader.py:1216` the entry is kept with its typed state
+  (`credential_unavailable` and reason) and is not started, replacing today's
+  fallback that starts it without its credential (`1221-1223`);
+- at `config/loader.py:1783` (manifest loop) the entry is kept with its typed state
+  instead of being dropped, so manifest-only servers such as Bright Data report it
+  too;
+- the `is_auth_available` predicates (`server.py:921-923`, `handlers.py:2490-2492`,
+  via `config/loader.py:1684-1686`), the remote-header path (`1716-1719`), the
+  availability checks (`handlers.py:2783`, `2795`), `installer.py:759`, `791` and
+  `cli.py:1786` answer "not available" with the reason and never raise;
+- `connect_server`, status and health report the typed state; every other entry
+  loads, so startup, `gateway.refresh` and every lifecycle call continue.
+Tests: extend the #342 guard (`tests/test_catalog_overlay_discovery.py:1460`) to a
+typed failure; an unreadable store with a configured `brightdata` without env (the
+fleet `-c ~/.pmcp.json` shape) plus a healthy server: initialize, refresh and
+restart of the healthy server succeed and `brightdata` reports `store_unreadable`;
+the same with `BRIGHTDATA_API_TOKEN=op://v/i/f` in the served project's `.env.pmcp`:
+only `brightdata` fails, with `reference_not_allowed_here`.
 
 A key deleted from the store therefore falls through to lower layers or the legacy
 key immediately, exactly as after a restart (`tests/test_credential_parity.py`).
@@ -512,7 +542,7 @@ truncation, escaped forms, formatted log records; inventory tests
 ev=/path/to/owned/run-evidence; mkdir -p "$ev"
 HOME="$(mktemp -d)" uv run --locked python scripts/pytest_temp.py -- \
   tests/test_secret_refs.py tests/test_env_store.py tests/test_store_reader_inventory.py \
-  tests/test_credential_parity.py -q --junitxml="$ev/junit.xml" > "$ev/pytest.log" 2>&1
+  tests/test_credential_parity.py tests/test_catalog_overlay_discovery.py -q --junitxml="$ev/junit.xml" > "$ev/pytest.log" 2>&1
 # Full suite: on ai under systemd-run MemoryMax, or hosted CI (AGENTS.md).
 ```
 
@@ -585,3 +615,12 @@ Round 3:
 | Header containing `op://` (Claude N8) | 3.2.7 |
 | Execute the validated `op` path (Astra N2) | 3.4 (implementation) |
 | `op_path` key, state dir, lowercase proxies, rate-limit breaker (Claude N8) | Implementation, P2 |
+
+Round 4: Astra AGREE, Grok AGREE (both accept the section 9 parity decision;
+Claude withdrew its terminal-removal proposal). Changes:
+
+| Finding (seat) | Change |
+|---|---|
+| Omitting reference keys from probes fails open the npm identity gate and breaks Bright Data's update probe and `verify_installation` (Gemini R4-B1) | 3.5: identity gate gets key names with empty values; update probe and `verify_installation` are credential-injecting spawns |
+| Propagating a typed failure from `config/loader.py:1216` aborts every server's config load, reversing #342 (Claude R4-B1) | 3.6: typed failures contained per entry at every lookup caller; tests |
+| Non-blocking (Gemini NB1-NB3, Claude section 4, Astra revocation wording) | Implementation PRs: `/health` evaluated per request with enum-only token source and names gated when HTTP auth is on; `auth_connect` never overwrites external/`home_dotenv` values; `/opt/homebrew/bin/op`; lowercase proxies; camelCase aliases; docs state that deleting one store entry is not revocation |
