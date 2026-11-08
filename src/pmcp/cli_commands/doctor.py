@@ -146,3 +146,203 @@ def collect_remote_header_diagnostics(
                 )
 
     return checks
+
+
+def _reference_shaped(value: object) -> bool:
+    """Does ``value`` look like a 1Password secret reference (``op://``)?
+
+    Leading ASCII whitespace is ignored and the scheme is matched in any case
+    (Consiliency/pmcp#487 plan 3.3): ``" OP://v/i/f"`` counts.
+    """
+    return isinstance(value, str) and value.lstrip(" \t\r\n\f\v").lower().startswith(
+        "op://"
+    )
+
+
+def _manifest_name(name: object) -> str:
+    from pmcp.manifest.loader import entry_log_name
+
+    return entry_log_name(name, manifest_derived=True)
+
+
+def collect_credential_diagnostics(
+    project_root: Path | None = None,
+) -> list[tuple[str, str, str]]:
+    """Credential-layer checks for ``pmcp doctor`` (Consiliency/pmcp#487 P1).
+
+    Names only, never a value:
+
+    * the user store exists but cannot be read (every lookup that reaches it
+      answers ``credential_unavailable``, reason ``store_unreadable``);
+    * a manifest runtime ``env_var`` (``API_TOKEN``) set in pmcp's environment
+      from OUTSIDE pmcp and not a user-store name: pmcp strips only
+      user-store names and keys it loaded, so every server it starts
+      inherits that value;
+    * every ``op://`` value and every ``OP_*`` key in a server's own ``env``,
+      by server and config source, and every credential lookup that answers
+      with an ``op://`` value, by server and layer;
+    * a credential held in more than one place -- a legacy key next to its
+      namespaced key, or one key in several layers -- so deleting one entry
+      is not mistaken for revoking the credential.
+    """
+    from pmcp.config.loader import load_config_sources
+    from pmcp.env_store import (
+        CredentialUnavailableError,
+        credential_layers,
+        credential_value,
+        environment_holds,
+        operator_managed_secret_keys,
+        user_store_state,
+    )
+    from pmcp.manifest.loader import credential_lookup_keys, load_manifest
+
+    checks: list[tuple[str, str, str]] = []
+
+    if user_store_state() == "unreadable":
+        checks.append(
+            (
+                "credentials",
+                "fail",
+                "The user store ~/.config/pmcp/pmcp.env exists but cannot be read: "
+                "every server whose credential lookup reaches it reports "
+                "credential_unavailable (store_unreadable) and is not started. "
+                "Make it a readable regular file (mode 0600).",
+            )
+        )
+
+    try:
+        manifest = (
+            load_manifest()
+            if project_root is None
+            else load_manifest(project_root=project_root)
+        )
+        servers = dict(manifest.servers)
+    except Exception as exc:
+        checks.append(
+            (
+                "credentials",
+                "warn",
+                f"Manifest unavailable for credential checks ({type(exc).__name__}).",
+            )
+        )
+        servers = {}
+
+    user_names = operator_managed_secret_keys()
+    leaking: dict[str, list[str]] = {}
+    for name, server in sorted(servers.items()):
+        env_var = getattr(server, "env_var", None)
+        if (
+            isinstance(env_var, str)
+            and environment_holds(env_var) == "external"
+            and env_var not in user_names
+        ):
+            leaking.setdefault(env_var, []).append(_manifest_name(name))
+    for env_var, names in sorted(leaking.items()):
+        checks.append(
+            (
+                "credentials",
+                "warn",
+                f"{plain_name(env_var)} (the runtime variable of {', '.join(names)}) "
+                "is set in pmcp's environment from outside pmcp and is not a "
+                "user-store name, so every server pmcp starts inherits it. Store it "
+                "with `pmcp secrets set` and remove it from the launcher's "
+                "environment (EnvironmentFile=, a sourced file, the shell).",
+            )
+        )
+
+    # Own env, by server and config source.
+    for source in load_config_sources(project_root=project_root):
+        config = source.config
+        if config is None or not config.mcpServers:
+            continue
+        for raw_name, server_config in sorted(config.mcpServers.items()):
+            env = getattr(server_config, "env", None) or {}
+            for key, value in sorted(env.items()):
+                what: str | None = None
+                if _reference_shaped(value):
+                    what = "an op:// value"
+                elif isinstance(key, str) and key.upper().startswith("OP_"):
+                    what = "an OP_* key"
+                if what is None:
+                    continue
+                checks.append(
+                    (
+                        "credentials",
+                        "warn",
+                        f"{operator_safe(str(raw_name))}: env {plain_name(key)} is "
+                        f"{what} in the {source.source} config; pmcp passes it to "
+                        "the server verbatim.",
+                    )
+                )
+    for name, server in sorted(servers.items()):
+        extra_env = getattr(server, "extra_env", None) or {}
+        for key, value in sorted(extra_env.items()):
+            what = None
+            if _reference_shaped(value):
+                what = "an op:// value"
+            elif isinstance(key, str) and key.upper().startswith("OP_"):
+                what = "an OP_* key"
+            if what is None:
+                continue
+            checks.append(
+                (
+                    "credentials",
+                    "warn",
+                    f"{_manifest_name(name)}: env {plain_name(key)} is {what} in "
+                    "the manifest or an overlay; pmcp passes it to the server "
+                    "verbatim.",
+                )
+            )
+
+    # Credential lookups: references, and credentials held more than once.
+    for name, server in sorted(servers.items()):
+        keys = credential_lookup_keys(server)
+        if not keys:
+            continue
+        label = _manifest_name(name)
+        layers = {key: credential_layers(key, root=project_root) for key in keys}
+        for key in keys:
+            try:
+                value = credential_value(key, root=project_root)
+            except CredentialUnavailableError:
+                break
+            if value is not None:
+                if _reference_shaped(value):
+                    first = layers[key][0] if layers[key] else "unknown"
+                    checks.append(
+                        (
+                            "credentials",
+                            "warn",
+                            f"{label}: credential {plain_name(key)} is an op:// "
+                            f"reference (from {first}); this pmcp passes it to the "
+                            "server as a literal.",
+                        )
+                    )
+                break
+        held = [key for key in keys if layers[key]]
+        if len(held) > 1:
+            parts = "; ".join(
+                f"{plain_name(key)} in {', '.join(layers[key])}" for key in held
+            )
+            checks.append(
+                (
+                    "credentials",
+                    "warn",
+                    f"{label}: a namespaced key and its legacy key are both set "
+                    f"({parts}). Deleting one does not revoke the credential: pmcp "
+                    "falls back to the other.",
+                )
+            )
+        for key in held:
+            if len(layers[key]) > 1:
+                checks.append(
+                    (
+                        "credentials",
+                        "warn",
+                        f"{label}: {plain_name(key)} is set in more than one place "
+                        f"({', '.join(layers[key])}); the first wins. Deleting it "
+                        "from one place does not revoke the credential while "
+                        "another still holds it.",
+                    )
+                )
+    return checks

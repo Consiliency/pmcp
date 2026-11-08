@@ -34,6 +34,7 @@ GatewayTransport = Literal["stdio", "http"]
 AuthState = Literal[
     "none",
     "missing_auth",
+    "credential_unavailable",
     "insufficient_scope",
     "elicitation_required",
     "policy_denied",
@@ -42,6 +43,7 @@ AuthState = Literal[
 
 AuthEventKind = Literal[
     "missing_credential",
+    "credential_unavailable",
     "credential_stored",
     "remote_auth_challenge",
     "insufficient_scope",
@@ -69,6 +71,20 @@ DEFAULT_AUTH_STATE_SEMANTICS: dict[AuthState, AuthStateSemanticsInfo] = {
         meaning="A required credential or credential-backed header is unavailable.",
         primary_next_action="Provide the missing credential with gateway.auth_connect or configure the named environment variable.",
         evidence_fields=["missing_env_vars", "auth_methods", "auth_metadata"],
+    ),
+    "credential_unavailable": AuthStateSemanticsInfo(
+        meaning=(
+            "PMCP could not determine the server's credential (for example its "
+            "user store exists but cannot be read), so it refuses to start the "
+            "server rather than start it without the credential or with a "
+            "fallback value."
+        ),
+        primary_next_action=(
+            "Fix the condition named by credential_reason (for store_unreadable: "
+            "make ~/.config/pmcp/pmcp.env a readable regular file), then retry "
+            "connect_server or restart_server."
+        ),
+        evidence_fields=["credential_reason", "errors", "next_step"],
     ),
     "insufficient_scope": AuthStateSemanticsInfo(
         meaning="A credential was present but lacks one or more required scopes.",
@@ -335,6 +351,7 @@ class EffectiveConfigEntry(BaseModel):
     startup_env_var: str | None = None
     missing_env_vars: list[str] = Field(default_factory=list)
     auth_state: AuthState = "none"
+    credential_reason: str | None = None
     configured: bool = False
     manifest: bool = False
     provisioned: bool = False
@@ -426,6 +443,12 @@ class ResolvedServerConfig(BaseModel):
     name: str
     source: Literal["project", "user", "custom", "manifest"]
     config: McpServerConfig
+    #: Set when the server's credential lookup gave a typed failure
+    #: (``credential_unavailable``; the value is the reason, e.g.
+    #: ``store_unreadable``). Such an entry is kept so status, health and
+    #: ``connect_server`` can report it, and is never started
+    #: (Consiliency/pmcp#487, #342). Not serialized.
+    credential_unavailable: str | None = Field(default=None, exclude=True)
 
 
 # === Registry Types ===
@@ -1243,6 +1266,7 @@ class LifecycleServerOutput(BaseModel):
     errors: list[str] | None = None
     missing_env_vars: list[str] = Field(default_factory=list)
     auth_state: AuthState = "none"
+    credential_reason: str | None = None
     next_step: str | None = None
     auth_methods: list[str] | None = None
     auth_metadata: AuthMetadataInfo | None = None
@@ -1265,6 +1289,7 @@ class ServerHealthInfo(BaseModel):
     startup_env_var: str | None = None
     missing_env_vars: list[str] = Field(default_factory=list)
     auth_state: AuthState = "none"
+    credential_reason: str | None = None
     next_step: str | None = None
     auth_methods: list[str] | None = None
     auth_metadata: AuthMetadataInfo | None = None
@@ -1681,6 +1706,7 @@ class ProvisionOutput(BaseModel):
     alternative_env_vars: list[str] | None = None
     missing_env_vars: list[str] = Field(default_factory=list)
     auth_state: AuthState = "none"
+    credential_reason: str | None = None
     next_step: str | None = None
     auth_metadata: AuthMetadataInfo | None = None
     auth_challenge: AuthChallengeInfo | None = None

@@ -9,6 +9,7 @@ from typing import Any
 
 from pmcp.config.loader import load_configs
 from pmcp.env_store import (
+    CredentialUnavailableError,
     copyable_from_repository,
     resolve_project_root,
     credential_lookup,
@@ -380,9 +381,16 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
     # The root the runtime answers for: the --project given, else the startup
     # load's directory -- not a re-derived project root.
     lookup = credential_lookup(getattr(args, "project", None))
+    # Typed answers (an unreadable user store), by key: reported as such,
+    # never as "missing" and never as a traceback (Consiliency/pmcp#487).
+    unavailable: dict[str, str] = {}
 
     def _available(key: str) -> bool:
-        return bool(lookup(key))
+        try:
+            return bool(lookup(key))
+        except CredentialUnavailableError as exc:
+            unavailable[key] = exc.reason
+            return False
 
     (
         required_keys,
@@ -394,13 +402,22 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
     def _satisfied(key: str) -> bool:
         if _available(key):
             return True
+        if key in unavailable:
+            # The lookup stops at the first typed answer: the legacy key is
+            # never consulted after it.
+            return False
         fallback = credential_fallbacks.get(key)
         return bool(fallback and _available(fallback))
 
-    missing_keys = sorted(key for key in required_keys if not _satisfied(key))
+    missing_keys = sorted(
+        key for key in required_keys if not _satisfied(key) and key not in unavailable
+    )
+    unavailable_required = {
+        key: unavailable[key] for key in required_keys if key in unavailable
+    }
 
     return {
-        "ok": len(missing_keys) == 0,
+        "ok": len(missing_keys) == 0 and not unavailable_required,
         "command": "secrets.check",
         "project_root": str(project_root),
         "user_scope": {
@@ -424,4 +441,6 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
             if _available(k)
         ),
         "missing_keys": missing_keys,
+        # ``credential_unavailable`` keys and their reason (``store_unreadable``).
+        "unavailable_keys": dict(sorted(unavailable_required.items())),
     }

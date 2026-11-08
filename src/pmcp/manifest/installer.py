@@ -754,7 +754,10 @@ def build_install_child_env(
     env_var = server_config.env_var
     if env_var:
         # For the root the gateway serves, not the working directory
-        # (Consiliency/pmcp#372 round 9).
+        # (Consiliency/pmcp#372 round 9). A typed answer (an unreadable user
+        # store) raises CredentialUnavailableError out of the first key's
+        # lookup: the spawn is refused, never made without the credential or
+        # with the legacy key's (Consiliency/pmcp#487).
         for key in credential_lookup_keys(server_config):
             value = credential_value(key, root=project_root)
             if value:
@@ -775,6 +778,9 @@ async def check_api_key(
 
     Raises:
         MissingApiKeyError: If API key is required but not set
+        CredentialUnavailableError: If the lookup gave a typed failure (an
+            unreadable user store); the walk stops there and never tries
+            the legacy key (Consiliency/pmcp#487)
     """
     if not requires_credential(server_config):
         return

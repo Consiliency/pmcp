@@ -1636,6 +1636,18 @@ Use scope-appropriate values such as `API_TOKEN` and keep the values in the gene
 
 For service users, `~/.config/pmcp/pmcp.env` is ideal for shared tokens used by all sessions.
 
+A credential lookup reads the current user store, so a key you add, rotate or
+delete there is used the next time pmcp starts the server that needs it
+(`gateway.restart_server`, `gateway.connect_server`, `gateway.refresh`); the
+gateway itself need not restart. A variable in the gateway's own environment
+(your shell, systemd `EnvironmentFile=`, a launcher that sources a file) or in
+`~/.env` still wins and stays fixed until the gateway restarts. Deleting one
+store entry is not revocation if a lower layer (the project `.env.pmcp`) or a
+legacy key (`API_TOKEN` for Bright Data) holds the same credential:
+`pmcp doctor` lists such duplicates by name. A store that exists but cannot be
+read makes the servers that depend on it report `credential_unavailable`
+(`store_unreadable`) instead of starting without their credential.
+
 ### Policy File
 
 Create a policy file to control access and limits:

@@ -1933,7 +1933,7 @@ class TestServerLifecycleTools:
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
         monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: manifest)
-        monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
+        monkeypatch.setattr("pmcp.env_store._read_user_store_live", lambda: None)
         policy_manager.is_server_allowed = lambda name: name != "denied"  # type: ignore[method-assign]
         return gateway_tools
 
@@ -3621,8 +3621,8 @@ class TestCapabilityAndProvision:
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        # Prevent _check_api_key_available from loading env vars out of pmcp files on disk
-        monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
+        # Prevent the credential lookup from reading the user store on disk
+        monkeypatch.setattr("pmcp.env_store._read_user_store_live", lambda: None)
 
         result = await gateway_tools.provision({"server_name": "browser-use"})
 
@@ -3837,7 +3837,7 @@ class TestCapabilityAndProvision:
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.chdir(project)
         monkeypatch.delenv("SOAK_TEST_KEY", raising=False)
-        monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
+        monkeypatch.setattr("pmcp.env_store._read_user_store_live", lambda: None)
         gateway_tools = GatewayTools(
             client_manager=MockClientManager(),  # type: ignore
             policy_manager=PolicyManager(),

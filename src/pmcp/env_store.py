@@ -8,10 +8,11 @@ import os
 import re
 import stat
 import sys
+import time
 from dataclasses import dataclass
 from collections.abc import Callable, Collection, Iterable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from dotenv import dotenv_values
 
@@ -22,6 +23,10 @@ from pmcp.atomic_write import (
     read_confined,
 )
 from pmcp.config.loader import find_project_root
+from pmcp.credential_state import (
+    STORE_UNREADABLE as STORE_UNREADABLE,
+    CredentialUnavailableError as CredentialUnavailableError,
+)
 
 if TYPE_CHECKING:
     from pmcp.home_identity import HomePin
@@ -871,6 +876,238 @@ def copyable_from_repository(
     return copyable, refused
 
 
+#: Where each name in ``os.environ`` came from, recorded at every insertion
+#: pmcp makes (Consiliency/pmcp#487 plan 3.6):
+#:
+#: * ``external`` -- present before pmcp ran (the shell, systemd, a launcher);
+#: * ``home_dotenv`` -- the startup load of the operator's ``~/.env``;
+#: * ``user_store`` -- the startup load of ``~/.config/pmcp/pmcp.env``, or a
+#:   user-scope ``gateway.auth_connect`` (which wrote that store);
+#: * ``auth_connect_project`` -- a project-scope ``gateway.auth_connect``.
+#:
+#: A ``user_store`` value is never answered from ``os.environ``: the lookup
+#: reads the CURRENT store, so a rotation takes effect at the next restart of
+#: the server without restarting the gateway. A name in ``os.environ`` with no
+#: record was set by this process after the startup load (library use, a
+#: test) and is answered from the environment, as before.
+EnvOrigin = Literal["external", "home_dotenv", "user_store", "auth_connect_project"]
+_ENV_ORIGINS: dict[str, EnvOrigin] = {}
+
+#: Origins whose ``os.environ`` value is the answer until the next start.
+_STATIC_ORIGINS = frozenset({"external", "home_dotenv", "auth_connect_project"})
+
+
+def record_env_origin(name: str, origin: EnvOrigin) -> None:
+    """Record where ``os.environ[name]`` came from (see ``_ENV_ORIGINS``)."""
+    _ENV_ORIGINS[name] = origin
+
+
+def record_external_environment() -> None:
+    """Record every name already in ``os.environ`` as ``external``.
+
+    Called at the start of the startup load, before any file is read. A name
+    already recorded keeps its origin, so a second load (a library caller, a
+    test) never relabels what pmcp itself inserted.
+    """
+    for name in os.environ:
+        _ENV_ORIGINS.setdefault(name, "external")
+
+
+def env_origin(name: str) -> EnvOrigin | None:
+    """Where ``os.environ[name]`` came from, or ``None`` when not recorded."""
+    return _ENV_ORIGINS.get(name)
+
+
+def env_origins() -> dict[str, EnvOrigin]:
+    """A copy of the origin registry: names only, never values."""
+    return dict(_ENV_ORIGINS)
+
+
+def environment_holds(name: str) -> EnvOrigin | None:
+    """The origin of an ``os.environ`` value that outranks the user store, or ``None``.
+
+    ``external`` (also for a name present with no record), ``home_dotenv`` or
+    ``auth_connect_project``: a lookup answers ``name`` from that value until
+    the gateway restarts, whatever the user store says. ``None`` when the name
+    is not in the environment, or is a (stale) startup copy of a store value.
+    """
+    ensure_startup_load()
+    if name not in os.environ:
+        return None
+    origin = _ENV_ORIGINS.get(name)
+    if origin is None:
+        return "external"
+    if origin == "user_store":
+        return None
+    return origin
+
+
+def publish_auth_connect_value(scope: str, name: str, value: str) -> bool:
+    """Put a credential ``gateway.auth_connect`` just stored into ``os.environ``.
+
+    Never over an ``external`` or ``home_dotenv`` value (Consiliency/pmcp#487):
+    those outrank both stores until the gateway restarts, and overwriting them
+    would make this process answer differently from a restarted one. Returns
+    ``False`` when such a value shadows the write (the caller says so).
+
+    User scope records ``user_store``: the store holds the same value, so later
+    rotations of that store entry apply to it. Project scope records
+    ``auth_connect_project``: its in-process value is the answer until the
+    next start, as before.
+    """
+    held = environment_holds(name)
+    if held in ("external", "home_dotenv"):
+        return False
+    os.environ[name] = value
+    record_env_origin(name, "user_store" if scope == "user" else "auth_connect_project")
+    record_pmcp_introduced_keys([name])
+    return True
+
+
+#: The last live read of the user store: ``(identity, raw values)``. The
+#: identity is the ``os.stat`` AND ``os.lstat`` of the store path, so an edit
+#: of the file, a replaced symlink target and a re-pointed symlink each force
+#: a re-read. Test-only reset: :func:`reset_startup_load`.
+_LIVE_USER_STORE: tuple[object, dict[str, str | None]] | None = None
+
+#: How recent a change must be for a read not to be cached (see
+#: :func:`_read_user_store_live`): generous against coarse timestamps.
+_RACY_WINDOW_NS = 2_000_000_000
+
+
+def _stat_identity(status: os.stat_result) -> tuple[int, ...]:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_mode,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+def _read_user_store_live() -> dict[str, str | None] | None:
+    """The user store's raw (uninterpolated) entries NOW, for a credential lookup.
+
+    ``None``: no store -- the file is absent, a dangling link, or not the
+    operator's (the home directory lies inside a checkout), exactly the cases
+    in which the startup load reads nothing. A store that exists but cannot be
+    read -- no permission, a directory or fifo at the path, a link loop, bytes
+    that are not UTF-8 -- raises :class:`CredentialUnavailableError`
+    (``store_unreadable``): unlike the startup load, which warns and goes on,
+    a lookup cannot know whether the value it would have read was rotated.
+    """
+    global _LIVE_USER_STORE
+    from pmcp.home_identity import HomeInsideCheckoutError
+
+    try:
+        path = resolve_scope_path("user")
+    except HomeInsideCheckoutError:
+        return None
+    except OSError as exc:
+        raise CredentialUnavailableError(STORE_UNREADABLE) from exc
+    try:
+        link = os.lstat(path)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None
+        raise CredentialUnavailableError(STORE_UNREADABLE) from exc
+    try:
+        target = os.stat(path)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None  # a dangling link: no store, as at startup
+        raise CredentialUnavailableError(STORE_UNREADABLE) from exc
+    if not stat.S_ISREG(target.st_mode):
+        raise CredentialUnavailableError(STORE_UNREADABLE)
+    # Judged on every lookup, never remembered (Consiliency/pmcp#372 round
+    # 30): the startup load refuses a store under a home a checkout controls
+    # (load_store), and so does this.
+    if not _operator_owned_directory(path.parent.parent.parent):
+        return None
+    identity = (os.fspath(path), _stat_identity(link), _stat_identity(target))
+    cached = _LIVE_USER_STORE
+    if cached is not None and cached[0] == identity:
+        return cached[1]
+    try:
+        text = read_env_text(path)
+    except (OSError, ValueError) as exc:
+        raise CredentialUnavailableError(STORE_UNREADABLE) from exc
+    if text is None:
+        # Swapped for a non-regular file, or removed, between the stat and
+        # the open: unknown, never "no store".
+        raise CredentialUnavailableError(STORE_UNREADABLE)
+    values = dict(dotenv_values(stream=io.StringIO(text), interpolate=False))
+    # A file changed within the filesystem's timestamp granularity of now can
+    # change again without changing its identity (an in-place edit of the
+    # same length): such a read is not remembered, so the next lookup reads
+    # the file again ("racy" timestamps, as git treats its index).
+    # Content changes move the modification time; the change time is in the
+    # identity, so a link swap or a replaced target still forces a re-read.
+    newest = max(link.st_mtime_ns, target.st_mtime_ns)
+    if time.time_ns() - newest > _RACY_WINDOW_NS:
+        _LIVE_USER_STORE = (identity, values)
+    else:
+        _LIVE_USER_STORE = None
+    return values
+
+
+def user_store_state() -> Literal["absent", "readable", "unreadable"]:
+    """Whether a credential lookup can read the user store now (``pmcp doctor``)."""
+    try:
+        return "absent" if _read_user_store_live() is None else "readable"
+    except CredentialUnavailableError:
+        return "unreadable"
+
+
+def _interpolated_store_values(
+    raw: Mapping[str, str | None],
+) -> dict[str, str | None]:
+    """The store's entries expanded as the startup load expands them.
+
+    python-dotenv's ``dotenv_values`` (``override=True``): each ``${X}`` is
+    looked up in the entries defined earlier in the file, then the process
+    environment. The environment here is the one a fresh start would have
+    seen when it loaded the store -- the external environment and the static
+    ``~/.env`` values -- never a stale startup copy of a store value or a
+    project-scope ``auth_connect`` write.
+    """
+    from dotenv.variables import parse_variables
+
+    base: dict[str, str | None] = {
+        key: value
+        for key, value in os.environ.items()
+        if _ENV_ORIGINS.get(key) not in ("user_store", "auth_connect_project")
+    }
+    resolved: dict[str, str | None] = {}
+    for key, value in raw.items():
+        if value is None:
+            resolved[key] = None
+            continue
+        env = dict(base)
+        env.update(resolved)
+        resolved[key] = "".join(atom.resolve(env) for atom in parse_variables(value))
+    return resolved
+
+
+def _current_user_store_value(key: str) -> str | None | object:
+    """``key``'s value in the CURRENT user store, or ``_ABSENT``.
+
+    Absent: no store, no entry, an entry with no ``=`` (the startup load skips
+    it), or a name no file may set (``HOME``). Raises
+    :class:`CredentialUnavailableError` for a store that cannot be read.
+    """
+    if key.upper() in _NEVER_LOADED:
+        return _ABSENT
+    raw = _read_user_store_live()
+    if raw is None or raw.get(key) is None:
+        return _ABSENT
+    return _interpolated_store_values(raw)[key]
+
+
+_ABSENT = object()
+
+
 def credential_value(
     key: str,
     *,
@@ -888,31 +1125,46 @@ def credential_value(
     map or a store's values (``tests/test_store_reader_inventory.py``).
     Sources, in order:
 
-    1. the process environment (``environ``) -- the shell, then the user store,
-       which the startup load puts there with ``override=False``;
+    1. the environment layer (``environ``): a value pmcp did not take from the
+       user store (``external``, ``home_dotenv``, ``auth_connect_project``,
+       or unrecorded -- see ``_ENV_ORIGINS``) is answered from ``os.environ``;
+       otherwise the CURRENT user store is read (:func:`_read_user_store_live`,
+       cached by file identity) and expanded as the startup load expands it,
+       so a key rotated, added or deleted there, or a store created after
+       startup, is seen at the next lookup (Consiliency/pmcp#487). A store
+       that exists but cannot be read raises
+       :class:`CredentialUnavailableError` (``store_unreadable``), which stops
+       this lookup and the caller's remaining lookup keys;
     2. ``repository`` -- a TENANT store's values (``remote_auth``), the one
        layer between the user store and the project credentials;
     3. the project files of ONE root (``startup_files``): ``root``, else the
        served project root (:func:`serve_project_root`) -- its ``.env``, then
        its ``.env.pmcp``, first wins -- never another root's.
 
+    ``environ=False`` (tenant isolation) never reads the user store.
+
     Precedence is decided by MEMBERSHIP, not truthiness: the first source that
     HAS the name decides, and an empty value there means "unavailable" -- an
     operator's exported ``BRAVE_API_KEY=""`` is never filled from a project file.
+    A name absent from the user store (deleted, or never there) continues to
+    the next layer, exactly as after a restart (plan section 9).
     A name a repository may not supply (:func:`repository_may_supply`: pmcp's
     own variables in any case, any ``*_proxy``, code-loading and package-manager
     families) is never answered from a repository source.
 
-    No answer is given before the startup load has put the user store into
-    the environment (:func:`ensure_startup_load`; idempotent, and it never
-    changes the served root): otherwise a library caller's first lookup --
-    ``GatewayServer.initialize`` building configs before anything loaded --
-    answered from the project file and later lookups from the user store
+    No answer is given before the startup load has run
+    (:func:`ensure_startup_load`; idempotent, and it never changes the served
+    root): it records which names are external, and a library caller's first
+    lookup would otherwise answer from a different map than later ones
     (Consiliency/pmcp#372 round 15, board round 14 codex F001).
     """
     ensure_startup_load()
-    if environ and key in os.environ:
-        return os.environ[key] or None
+    if environ:
+        if key in os.environ and _ENV_ORIGINS.get(key) != "user_store":
+            return os.environ[key] or None
+        stored = _current_user_store_value(key)
+        if stored is not _ABSENT:
+            return cast("str | None", stored) or None
     repository_may_answer = repository_may_supply(key)
     if repository_may_answer and repository is not None and key in repository:
         return repository[key] or None
@@ -921,6 +1173,64 @@ def credential_value(
         if entry is not None and key in entry.values:
             return entry.values[key] or None
     return None
+
+
+def credential_unavailable_reason(
+    keys: Iterable[str], *, root: Path | None = None
+) -> str | None:
+    """The typed reason the first of ``keys`` that decides failed with, or ``None``.
+
+    Walks the keys in lookup order, as every consumer does: a key that answers
+    makes the credential available (``None``); a typed answer stops the walk
+    and is returned; a key not found anywhere moves to the next key.
+    """
+    for key in keys:
+        try:
+            if credential_value(key, root=root):
+                return None
+        except CredentialUnavailableError as exc:
+            return exc.reason
+    return None
+
+
+def first_credential(
+    keys: Iterable[str], lookup: Callable[[str], str | None]
+) -> tuple[str, str] | None:
+    """``(key, value)`` of the first of ``keys`` ``lookup`` answers, or ``None``.
+
+    A :class:`CredentialUnavailableError` from ``lookup`` propagates: the walk
+    stops at the first typed answer and never tries the legacy key after it.
+    """
+    for key in keys:
+        value = lookup(key)
+        if value:
+            return key, value
+    return None
+
+
+def credential_layers(key: str, *, root: Path | None = None) -> list[str]:
+    """Every layer that HOLDS ``key``, for ``pmcp doctor``: names only, never values.
+
+    ``environment (external)``, ``environment (home_dotenv)``,
+    ``environment (auth_connect_project)``, ``user store``, ``user store
+    (unreadable)``, ``project files``. The first is the one a lookup answers
+    from; the rest are what deleting that one would expose.
+    """
+    ensure_startup_load()
+    layers: list[str] = []
+    held = environment_holds(key)
+    if held is not None:
+        layers.append(f"environment ({held})")
+    try:
+        if _current_user_store_value(key) is not _ABSENT:
+            layers.append("user store")
+    except CredentialUnavailableError:
+        layers.append("user store (unreadable)")
+    if repository_may_supply(key):
+        entry = _root_entry(root)
+        if entry is not None and key in entry.values:
+            layers.append("project files")
+    return layers
 
 
 #: Has this process run the startup load (``cli.load_startup_env``)? Set by it;
@@ -936,9 +1246,15 @@ def mark_startup_loaded() -> None:
 
 
 def reset_startup_load() -> None:
-    """Forget that the startup load ran. **Test-only seam.**"""
-    global _STARTUP_LOADED
+    """Forget that the startup load ran, and what it recorded. **Test-only seam.**
+
+    Also clears the origin registry (``_ENV_ORIGINS``) and the cached live
+    read of the user store, which the startup load's state consists of.
+    """
+    global _STARTUP_LOADED, _LIVE_USER_STORE
     _STARTUP_LOADED = False
+    _ENV_ORIGINS.clear()
+    _LIVE_USER_STORE = None
 
 
 def ensure_startup_load() -> None:
@@ -1115,7 +1431,7 @@ def load_store(
                 )
             _warn_store_refused(store_path, message)
             return
-        _load_operator_text(text, store_path.name)
+        _load_operator_text(text, store_path.name, "user_store")
         return
     # A repository file is one of its root's project files: (re)build that
     # root's entry with THE builder (_build_root_entry).
@@ -1146,11 +1462,13 @@ def _identity(path: Path) -> tuple[int, int] | None:
 _NEVER_LOADED = frozenset({"HOME", "USERPROFILE"})
 
 
-def _load_operator_text(text: str, name: str) -> None:
+def _load_operator_text(text: str, name: str, origin: EnvOrigin) -> None:
     """Load an operator file's text into ``os.environ``, never overriding.
 
     ``load_dotenv(override=False)`` as before, except that HOME (and
-    USERPROFILE) are never taken from a file.
+    USERPROFILE) are never taken from a file. ``origin`` is the caller's
+    class (``home_dotenv`` for ``~/.env``, ``user_store`` for the user
+    store), recorded for every name this inserts (Consiliency/pmcp#487).
     """
     from dotenv import dotenv_values
 
@@ -1167,6 +1485,7 @@ def _load_operator_text(text: str, name: str) -> None:
             )
             continue
         os.environ[key] = value
+        record_env_origin(key, origin)
 
 
 def _operator_owned_directory(directory: Path) -> bool:
@@ -1204,7 +1523,7 @@ def load_discovered_dotenv(path: Path) -> None:
         return
     text = _read_user_text(path, verb="load")
     if text is not None:
-        _load_operator_text(text, path.name)
+        _load_operator_text(text, path.name, "home_dotenv")
 
 
 def child_process_env(

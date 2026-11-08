@@ -24,7 +24,10 @@ from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp import package_approvals, trust_store
 from pmcp.atomic_write import atomic_write, is_absent
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
-from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
+from pmcp.cli_commands.doctor import (
+    collect_credential_diagnostics,
+    collect_remote_header_diagnostics,
+)
 from pmcp.cli_commands.install import (
     detect_install_drift,
     detect_install_method,
@@ -40,6 +43,7 @@ from pmcp.config.loader import (
     set_startup_policy,
 )
 from pmcp.env_store import (
+    CredentialUnavailableError,
     credential_value,
     describe_ignored_trust_env_var,
     env_key_is_operator_supplied,
@@ -48,6 +52,7 @@ from pmcp.env_store import (
     load_store,
     mark_startup_loaded,
     pin_user_store_path,
+    record_external_environment,
     ensure_served_project_root,
     resolve_project_root,
     serve_project_root,
@@ -1779,17 +1784,28 @@ async def run_init(args: argparse.Namespace) -> None:
 
                 requirement = credential_requirement(server)
                 if requirement.required:
-                    found_key = next(
-                        (
-                            k
-                            for k in credential_lookup_keys(server)
-                            if credential_value(k, root=project_dir)
-                        ),
-                        None,
-                    )
+                    # Stops at the first typed answer (an unreadable user
+                    # store): the legacy key after it is never consulted
+                    # (Consiliency/pmcp#487).
+                    unavailable: str | None = None
+                    found_key: str | None = None
+                    for k in credential_lookup_keys(server):
+                        try:
+                            if credential_value(k, root=project_dir):
+                                found_key = k
+                                break
+                        except CredentialUnavailableError as exc:
+                            unavailable = exc.reason
+                            break
                     storage_key = credential_storage_key(server) or server.env_var
                     if found_key:
                         print(f"    Found {found_key} in environment")
+                    elif unavailable:
+                        print(
+                            f"    Note: credential_unavailable ({unavailable}): "
+                            "pmcp cannot read your user credential store; run "
+                            "`pmcp doctor`"
+                        )
                     else:
                         print(
                             f"    Note: store the credential with "
@@ -2299,6 +2315,21 @@ async def run_doctor(args: argparse.Namespace) -> None:
         checks.extend(remote_checks)
     else:
         checks.append(("remote", "ok", "No remote downstream header issues detected."))
+
+    credential_checks = collect_credential_diagnostics(
+        args.project if hasattr(args, "project") else None
+    )
+    if credential_checks:
+        checks.extend(credential_checks)
+    else:
+        checks.append(
+            (
+                "credentials",
+                "ok",
+                "No credential-layer issues detected (user store, inherited "
+                "runtime variables, op:// values, duplicate keys).",
+            )
+        )
 
     drift = detect_install_drift()
     if drift.has_drift:
@@ -3275,6 +3306,11 @@ def load_startup_env(
     """
     pin_user_store_path()
     mark_startup_loaded()
+    # Before any file is read: every name already here is the operator's
+    # environment (``external``), which outranks both stores until the next
+    # start; what the loads below insert is recorded with its own class
+    # (``home_dotenv``, ``user_store``; Consiliency/pmcp#487).
+    record_external_environment()
     # An unqualified credential lookup answers for the project this process
     # serves. Loading the environment never CHOOSES it: a root already served
     # (`serve_project_root(B)` in library use, before a lazy load) is kept;
