@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A credential lookup reads the current user store (`~/.config/pmcp/pmcp.env`) instead of the copy loaded at startup, so a key added, rotated or deleted there takes effect at the next restart, connect or refresh of the server that uses it, without restarting the gateway. A deleted key continues to the tenant store, the project files and the legacy key, exactly as after a restart; deleting one store entry is therefore not revocation if a lower layer or a legacy key holds the same credential. Values from the gateway's own environment (shell, systemd `EnvironmentFile=`, a launcher) and from `~/.env` still win and stay fixed until the gateway restarts; pmcp now records the origin of every name it puts into its environment. The availability check no longer reloads the user store into the environment. `gateway.auth_connect` no longer overwrites a value from the environment or `~/.env`; a user-scope write is rotated with the store, and a project-scope write keeps its in-process value (see Consiliency/pmcp#487).
+
+- A user store that exists but cannot be read no longer makes pmcp start servers without their credential, or with a legacy key's. Each server whose lookup reaches the store gets the new auth state `credential_unavailable` (`credential_reason`: `store_unreadable`), reported by `gateway.connect_server`, `gateway.restart_server`, `gateway.provision`, `gateway.health` and status, and is not started; the failure is contained to that server's entry, so every other server loads, starts and refreshes (Consiliency/pmcp#342). `pmcp secrets check` reports such keys under `unavailable_keys` (see Consiliency/pmcp#487).
+
+- `pmcp doctor` warns about a manifest runtime variable (such as `API_TOKEN`) set in the gateway's environment from outside pmcp that is not a user-store name, since every server pmcp starts inherits it; lists every `op://` value and `OP_*` key in a server's own `env`, and every `op://` credential, by server and source; and flags a credential held in more than one place, such as a legacy key next to its namespaced key. It prints names only, never values (see Consiliency/pmcp#487).
+
 ## [3.0.3] - 2026-11-07
 
 ### Fixed

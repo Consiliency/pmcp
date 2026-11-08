@@ -1483,6 +1483,182 @@ def test_guard_configured_default_inheritance_contains_one_entry(
     assert "remote-bad" not in resolved
 
 
+# --- Consiliency/pmcp#487 P1: a TYPED credential failure is contained too ------
+
+
+def _fleet_config(tmp_path: Path) -> Path:
+    """The fleet's ``-c ~/.pmcp.json`` shape: brightdata configured with no env,
+    beside a healthy server."""
+    return _write(
+        tmp_path / "pmcp.json",
+        json.dumps(
+            {
+                "mcpServers": {
+                    "brightdata": {"command": "npx", "args": ["-y", "@brightdata/mcp"]},
+                    "healthy": {"command": "healthy-command"},
+                }
+            }
+        ),
+    )
+
+
+def _unreadable_user_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in ("API_TOKEN", "BRIGHTDATA_API_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    store = Path.home() / ".config" / "pmcp" / "pmcp.env"
+    store.mkdir(parents=True)  # exists, and no uid can read it as a store
+
+
+def test_guard_a_typed_credential_failure_contains_one_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#342's guard, for a typed failure: an unreadable user store fails ONLY
+    brightdata, with ``store_unreadable``; the healthy server loads and starts."""
+    from pmcp.config.loader import StartupSkipReason
+    from pmcp.env_store import credential_value
+
+    _unreadable_user_store(monkeypatch)
+    config = _fleet_config(tmp_path)
+    resolved = {c.name: c for c in load_configs(custom_config_path=config)}
+    assert resolved["healthy"].credential_unavailable is None
+    # Kept with its typed state, never started without its credential (it
+    # used to be started without it, 1221-1223 before #487).
+    assert resolved["brightdata"].credential_unavailable == "store_unreadable"
+    resolution = resolve_startup_configs(
+        list(resolved.values()),
+        manifest_servers=load_manifest().servers,
+        enabled_auto_start={"brightdata", "healthy"},
+        is_auth_available=lambda key: bool(credential_value(key)),
+    )
+    assert [c.name for c in resolution.eager_configs] == ["healthy"]
+    started = {c.name for c in resolution.eager_configs + resolution.lazy_configs}
+    assert "brightdata" not in started
+    (skip,) = [s for s in resolution.skipped if s.name == "brightdata"]
+    assert skip.reason == StartupSkipReason.CREDENTIAL_UNAVAILABLE
+    assert skip.credential_reason == "store_unreadable"
+
+
+def test_guard_a_manifest_only_entry_with_a_typed_failure_is_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The manifest loop (config/loader.py:1783) keeps the entry, typed, rather
+    than dropping it, so a manifest-only Bright Data reports it."""
+    from pmcp.config.loader import StartupSkipReason
+
+    _unreadable_user_store(monkeypatch)
+    resolution = resolve_startup_configs([], manifest_servers=load_manifest().servers)
+    (skip,) = [s for s in resolution.skipped if s.name == "brightdata"]
+    assert skip.reason == StartupSkipReason.CREDENTIAL_UNAVAILABLE
+    assert skip.credential_reason == "store_unreadable"
+    # Servers with no credential lookup are untouched.
+    assert "playwright" in {c.name for c in resolution.lazy_configs}
+
+
+def test_guard_initialize_refresh_and_restart_survive_a_typed_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """initialize, refresh and restart of the healthy server succeed; brightdata
+    reports ``credential_unavailable`` through connect_server and health."""
+    from unittest.mock import AsyncMock
+
+    from pmcp.server import GatewayServer
+
+    _unreadable_user_store(monkeypatch)
+    config = _fleet_config(tmp_path)
+
+    # initialize
+    monkeypatch.setattr(
+        "pmcp.server.load_enabled_auto_start", lambda **_: {"healthy", "brightdata"}
+    )
+    monkeypatch.setattr("pmcp.server.load_disabled_auto_start", lambda **_: set())
+    gateway = GatewayServer(custom_config_path=config, cache_dir=tmp_path / "cache")
+    manager = gateway._client_manager
+    with (
+        patch.object(manager, "register_lazy_configs") as register,
+        patch.object(
+            manager, "connect_all", new_callable=AsyncMock, return_value=[]
+        ) as connect_all,
+        patch.object(manager, "start_health_monitor"),
+        patch.object(manager, "get_all_server_statuses", return_value=[]),
+        patch.object(manager, "get_all_tools", return_value=[]),
+        patch(
+            "pmcp.server.generate_capability_summary",
+            new_callable=AsyncMock,
+            return_value="",
+        ),
+    ):
+        asyncio.run(gateway.initialize())
+    eager = [c.name for c in connect_all.call_args[0][0]]
+    lazy = {c.name for c in register.call_args[0][0]}
+    assert "healthy" in eager and "brightdata" not in eager
+    assert "brightdata" not in lazy
+    observation = gateway._gateway_tools._startup_observations["brightdata"]
+    assert observation.startup_skip_reason == "credential_unavailable"
+    assert observation.credential_reason == "store_unreadable"
+
+    # refresh, restart and connect through the gateway tools
+    tools = GatewayTools(
+        client_manager=RefreshClientManager(),  # type: ignore[arg-type]
+        policy_manager=PolicyManager(),
+        custom_config_path=config,
+    )
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_enabled_auto_start",
+        lambda **_: {"healthy", "brightdata"},
+    )
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_disabled_auto_start", lambda **_: set()
+    )
+    monkeypatch.setattr(tools, "_load_provisioned_registry", lambda: {})
+    assert asyncio.run(tools.refresh({"reason": "test"})).ok is True
+    restarted = asyncio.run(tools.restart_server({"server_name": "healthy"}))
+    assert restarted.ok is True, restarted
+    refused = asyncio.run(tools.connect_server({"server_name": "brightdata"}))
+    assert refused.ok is False
+    assert refused.auth_state == "credential_unavailable"
+    assert refused.credential_reason == "store_unreadable"
+    health = {s.name: s for s in asyncio.run(tools.health()).servers}
+    assert health["brightdata"].auth_state == "credential_unavailable"
+    assert health["brightdata"].credential_reason == "store_unreadable"
+
+
+def test_guard_refresh_leaves_a_running_server_whose_store_became_unreadable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A store that becomes unreadable while brightdata runs: refresh neither
+    tears it down nor respawns it; restart refuses, leaving it running."""
+    from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+
+    config = _fleet_config(tmp_path)
+    manager = RefreshClientManager()
+    manager.add_connected_server(
+        ResolvedServerConfig(
+            name="brightdata",
+            source="custom",
+            config=LocalMcpServerConfig(command="npx", args=["-y", "@brightdata/mcp"]),
+        )
+    )
+    tools = GatewayTools(
+        client_manager=manager,  # type: ignore[arg-type]
+        policy_manager=PolicyManager(),
+        custom_config_path=config,
+    )
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_enabled_auto_start", lambda **_: {"brightdata"}
+    )
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_disabled_auto_start", lambda **_: set()
+    )
+    monkeypatch.setattr(tools, "_load_provisioned_registry", lambda: {})
+    _unreadable_user_store(monkeypatch)
+    assert asyncio.run(tools.refresh({"reason": "test"})).ok is True
+    assert manager.is_server_online("brightdata")
+    assert not any(e.startswith("disconnect_server:brightdata") for e in manager.events)
+    refused = asyncio.run(tools.restart_server({"server_name": "brightdata"}))
+    assert refused.auth_state == "credential_unavailable"
+    assert manager.is_server_online("brightdata")
+
+
 def test_guard_secrets_contains_one_entry(monkeypatch: pytest.MonkeyPatch) -> None:
     """Claude F1: one bad entry dropped every later server's auth metadata."""
     bad = _bad_server(name="aaa-bad", headers=5)

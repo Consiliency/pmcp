@@ -110,7 +110,7 @@ def _gateway_tools_with_configured(
     monkeypatch.setattr(
         "pmcp.tools.handlers.load_configs", lambda **_: configured_configs
     )
-    monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
+    monkeypatch.setattr("pmcp.env_store._read_user_store_live", lambda: None)
     return tools
 
 

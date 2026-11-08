@@ -488,6 +488,28 @@ def _no_live_npm_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]
 
 
 @pytest.fixture(autouse=True)
+def _restore_process_environment() -> Iterator[None]:
+    """Put ``os.environ`` back as it was before the test. **Autouse.**
+
+    ``monkeypatch`` restores only what it touched, and
+    ``monkeypatch.delenv(KEY, raising=False)`` of an ABSENT key records
+    nothing, so a production write the test then drives -- the startup load,
+    ``gateway.auth_connect`` -- leaked into every later test. Since
+    Consiliency/pmcp#487 that leak changes answers: the next test's startup
+    load records the leaked name as ``external`` (present before pmcp ran),
+    which outranks the user store and which ``auth_connect`` never
+    overwrites.
+    """
+    before = dict(os.environ)
+    yield
+    for key in set(os.environ) - set(before):
+        os.environ.pop(key, None)
+    for key, value in before.items():
+        if os.environ.get(key) != value:
+            os.environ[key] = value
+
+
+@pytest.fixture(autouse=True)
 def _reset_process_global_state() -> Iterator[None]:
     """Reset process-global module state around every test. **Autouse.**
 
