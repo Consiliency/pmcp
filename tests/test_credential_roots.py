@@ -383,6 +383,17 @@ def _consumers(
     def lookup(p: Path | None) -> object:
         return env_store.credential_lookup(p)("BRAVE_API_KEY")
 
+    def doctor_credentials(p: Path | None) -> object:
+        from pmcp.cli_commands.doctor import collect_credential_diagnostics
+
+        # Only B's credential is a reference: doctor reporting one means it
+        # read B (Consiliency/pmcp#487).
+        (roots["b"] / ".env.pmcp").write_text("BRAVE_API_KEY=op://v/item/field\n")
+        return any(
+            "credential BRAVE_API_KEY is an op:// reference" in message
+            for _check, _status, message in collect_credential_diagnostics(p)
+        )
+
     return {
         "install child": install_child,
         "provision gate": provision_gate,
@@ -397,6 +408,7 @@ def _consumers(
         "header lookup": header_lookup,
         "tenant headers": tenant_headers,
         "credential_lookup": lookup,
+        "doctor credentials": doctor_credentials,
     }
 
 
@@ -415,6 +427,7 @@ B_ANSWERS: dict[str, object] = {
     "header lookup": "from-b",
     "tenant headers": "tenant-from-b",
     "credential_lookup": "from-b",
+    "doctor credentials": True,
 }
 
 #: Consumers whose project is the one their caller names, never an implicit
@@ -507,7 +520,13 @@ GRID_COVERAGE = {
     "pmcp.manifest.installer:check_api_key": "provision gate",
     "pmcp.config.loader:_credential_value_for": "startup config",
     "pmcp.tools.handlers:GatewayTools._check_api_key_available": "credential check",
-    "pmcp.tools.handlers:GatewayTools.config_status": "config_status availability",
+    # config_status hands resolve_startup_configs this predicate, which may
+    # raise a typed failure for the resolver to contain (Consiliency/pmcp#487).
+    "pmcp.tools.handlers:GatewayTools._credential_present": "config_status availability",
+    # The lifecycle resolver's availability walk and its typed-state query.
+    "pmcp.tools.handlers:GatewayTools._check_any_api_key_available": "lifecycle connect",
+    "pmcp.env_store:credential_unavailable_reason": "lifecycle connect",
+    "pmcp.cli_commands.doctor:collect_credential_diagnostics": "doctor credentials",
     "pmcp.server:GatewayServer.initialize": "gateway availability",
     "pmcp.cli:run_init": "init",
     "pmcp.cli_commands.secrets:run_secrets_check": "secrets check",

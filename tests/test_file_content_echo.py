@@ -677,7 +677,7 @@ def test_an_operator_file_names_a_plain_home_key(
     from pmcp import env_store
 
     monkeypatch.delenv("Home", raising=False)
-    env_store._load_operator_text("Home=/elsewhere\n", "pmcp.env")
+    env_store._load_operator_text("Home=/elsewhere\n", "pmcp.env", "user_store")
     assert "Ignoring Home in pmcp.env" in capsys.readouterr().err
 
 

@@ -918,6 +918,8 @@ class GatewayServer:
             enabled_auto_start=enabled_auto_start,
             disabled_auto_start=disabled_auto_start,
             is_server_allowed=self._policy_manager.is_server_allowed,
+            # May raise a typed CredentialUnavailableError, which the resolver
+            # contains to the entry that asked (Consiliency/pmcp#342, #487).
             is_auth_available=lambda env_var: bool(
                 credential_value(env_var, root=self._project_root)
             ),
@@ -934,6 +936,7 @@ class GatewayServer:
             f"eager={counts['eager']}, lazy={counts['lazy']}, "
             f"skipped={counts['skipped']}, policy_denied={counts['policy_denied']}, "
             f"missing_auth={counts['missing_auth']}, "
+            f"credential_unavailable={counts['credential_unavailable']}, "
             f"unknown_auto_start={counts['unknown_auto_start']}"
         )
         for skipped in resolution.skipped:

@@ -493,8 +493,9 @@ check, a server's credential, `pmcp secrets check`, `pmcp doctor` -- reads
 the same values through the same lookup, so the diagnostics answer what the
 gateway will do. Project files are read per project: a lookup for one
 project never uses another project's `.env` or `.env.pmcp`, and a changed
-project file is read again on the next lookup (your user store, which is in
-the environment, is read at startup). The project is the one pmcp serves:
+project file is read again on the next lookup. After 3.0.3 your user store is
+too: see [a rotated user-store key](#a-rotated-user-store-key-is-used-at-the-next-server-restart).
+The project is the one pmcp serves:
 `--project` when given, otherwise the project root found from the working
 directory -- the root `.mcp.json` is loaded from. So `pmcp --project B` started
 inside project A gives B's servers B's credentials -- and B's `.mcp.json`,
@@ -1477,6 +1478,47 @@ saying another gateway instance is running.
   own `~/.pmcp/manifest.yaml` as a project overlay that needs approval.
 - **`pmcp secrets set` takes the value from a prompt or `--stdin`**, so it
   stays out of your shell history: `pmcp secrets set API_TOKEN --scope user`.
+
+### A rotated user-store key is used at the next server restart
+
+In releases after 3.0.3 (Consiliency/pmcp#487), a credential lookup reads the **current**
+`~/.config/pmcp/pmcp.env` instead of the copy loaded at startup. A key you
+add, change or delete there takes effect the next time pmcp starts that
+server (`gateway.restart_server`, `gateway.connect_server`, `gateway.refresh`),
+without restarting the gateway. A deleted key falls back exactly as after a
+restart: to the tenant store, the project `.env` and `.env.pmcp`, then the
+server's legacy key (for Bright Data, `API_TOKEN` after `BRIGHTDATA_API_TOKEN`).
+
+**Deleting one store entry is not revocation** when a lower layer or a legacy
+key holds the same credential: pmcp then uses that one. `pmcp doctor` flags a
+namespaced key that sits next to its legacy key, and a key held in more than
+one place, by name only.
+
+Values that reach the gateway from outside pmcp are unchanged: a variable
+exported by your shell, set by systemd `EnvironmentFile=` or a launcher that
+sources a file, and anything in `~/.env`, still win over the user store and
+stay as they were until the gateway restarts. If your service loads
+`pmcp.env` with `EnvironmentFile=`, its values are such external values, so a
+rotation still needs a gateway restart. `pmcp doctor` also warns when a
+manifest runtime variable such as `API_TOKEN` is set that way without being a
+user-store name, because every server pmcp starts then inherits it.
+
+`gateway.auth_connect` no longer overwrites a value from your environment or
+`~/.env`; it stores the credential and says the environment value still takes
+precedence.
+
+If the user store exists but cannot be read (wrong permissions, a directory at
+the path), pmcp no longer starts servers without their credential: each server
+whose lookup reaches the store reports `auth_state` `credential_unavailable`
+with `credential_reason` `store_unreadable`, in `gateway.connect_server`,
+`gateway.health` and `pmcp status`, and is not started. Every other server
+loads and starts. `pmcp secrets check` lists such keys under
+`unavailable_keys`. Fix the file's permissions:
+
+```bash
+chmod 600 ~/.config/pmcp/pmcp.env
+pmcp doctor
+```
 
 ## Rolling back to 2.7.3
 

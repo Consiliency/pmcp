@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pmcp.argument_errors import describe_value, exception_text
+from pmcp.credential_state import CredentialUnavailableError
 from pmcp.display import display_safe
 from pmcp.parsing import load_json
 from pmcp.types import (
@@ -98,6 +99,9 @@ class StartupSkipReason(str, Enum):
 
     POLICY_DENIED = "policy_denied"
     MISSING_AUTH = "missing_auth"
+    #: The credential lookup gave a typed failure (Consiliency/pmcp#487); the
+    #: value is also the server's auth state.
+    CREDENTIAL_UNAVAILABLE = "credential_unavailable"
     UNKNOWN_AUTO_START = "unknown_auto_start"
     UNKNOWN_PROVISIONED = "unknown_provisioned"
 
@@ -111,6 +115,8 @@ class StartupSkip:
     source: Literal["configured", "manifest", "auto_start", "provisioned"]
     env_var: str | None = None
     missing_env_vars: list[str] | None = None
+    #: For ``CREDENTIAL_UNAVAILABLE``: the typed reason (``store_unreadable``).
+    credential_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +138,7 @@ class StartupObservation:
     startup_skip_reason: str | None = None
     startup_env_var: str | None = None
     missing_env_vars: list[str] | None = None
+    credential_reason: str | None = None
 
 
 StartupObservationSnapshot = dict[str, StartupObservation]
@@ -182,6 +189,7 @@ def build_startup_observation_snapshot(
             startup_skip_reason=skipped.reason.value,
             startup_env_var=skipped.env_var,
             missing_env_vars=skipped.missing_env_vars or [],
+            credential_reason=skipped.credential_reason,
         )
     return snapshot
 
@@ -201,6 +209,11 @@ def summarize_startup_resolution(resolution: StartupResolution) -> dict[str, int
             1
             for skipped in resolution.skipped
             if skipped.reason == StartupSkipReason.MISSING_AUTH
+        ),
+        "credential_unavailable": sum(
+            1
+            for skipped in resolution.skipped
+            if skipped.reason == StartupSkipReason.CREDENTIAL_UNAVAILABLE
         ),
         "unknown_auto_start": sum(
             1
@@ -1209,21 +1222,51 @@ def load_configs(
             # this configured entry loads without them, exactly as when the
             # manifest is unavailable; the overlay check normally skips such an
             # entry long before this point.
+            unavailable: str | None = None
             try:
                 local_merged = _merge_manifest_defaults(
                     name, normalized, manifest_servers, credentials
+                )
+            except CredentialUnavailableError as exc:
+                # A typed credential failure is contained to THIS entry
+                # (Consiliency/pmcp#342, #487): it is kept with its state, so
+                # status, health and connect_server report it, and it is never
+                # started -- not without its credential, and not with a legacy
+                # key's. Every other entry loads.
+                unavailable = exc.reason
+                logger.warning(
+                    f"Configured server '{display_safe(name)}': "
+                    f"credential_unavailable ({exc.reason}); not started"
+                )
+                local_merged = _merge_manifest_defaults(
+                    name, normalized, manifest_servers, _no_credentials
                 )
             except Exception as exc:
                 logger.warning(
                     f"Configured server '{name}': ignoring its manifest defaults "
                     f"({type(exc).__name__})"
                 )
-                local_merged = _merge_manifest_defaults(
-                    name, normalized, None, credentials
-                )
+                try:
+                    local_merged = _merge_manifest_defaults(
+                        name, normalized, None, credentials
+                    )
+                except CredentialUnavailableError as typed:  # pragma: no cover
+                    # Without a manifest no credential is looked up; kept for
+                    # symmetry with the branch above.
+                    unavailable = typed.reason
+                    local_merged = normalized
             if not local_merged:
                 return None
             resolved_config = local_merged
+            if unavailable is not None:
+                return ResolvedServerConfig(
+                    name=name,
+                    source=cast(
+                        Literal["project", "user", "custom", "manifest"], source
+                    ),
+                    config=resolved_config,
+                    credential_unavailable=unavailable,
+                )
         return ResolvedServerConfig(
             name=name,
             source=cast(Literal["project", "user", "custom", "manifest"], source),
@@ -1452,6 +1495,9 @@ def startup_skip_message(phase: str, skipped: StartupSkip) -> str:
             f"{head}unknown_auto_start; add a matching mcpServers entry or "
             "remove it from autoStart"
         )
+    if skipped.reason == StartupSkipReason.CREDENTIAL_UNAVAILABLE:
+        reason = skipped.credential_reason or "unknown"
+        return f"{head}credential_unavailable ({reason}); not started"
     return f"{head}{skipped.reason.value}"
 
 
@@ -1472,6 +1518,11 @@ def _project_scope_root(project_root: Path | None) -> Path | None:
     from pmcp.env_store import project_scope_root
 
     return project_scope_root(project_root)
+
+
+def _no_credentials(_key: str) -> str | None:
+    """A lookup that finds nothing: rebuilds an entry's config without its credential."""
+    return None
 
 
 def _credential_value_for(root: Path | None) -> Callable[[str], str | None]:
@@ -1665,6 +1716,28 @@ def resolve_startup_configs(
             classified_names.add(config.name)
             return
 
+        def skip_unavailable(reason: str, env_var: str | None = None) -> None:
+            # Kept, typed, and never started (Consiliency/pmcp#342, #487):
+            # lazy as well as eager, since a lazily registered entry would be
+            # spawned without its credential at its first tool call.
+            skipped.append(
+                StartupSkip(
+                    name=config.name,
+                    reason=StartupSkipReason.CREDENTIAL_UNAVAILABLE,
+                    source=source,
+                    env_var=env_var,
+                    credential_reason=reason,
+                )
+            )
+            classified_names.add(config.name)
+
+        if config.credential_unavailable is not None:
+            skip_unavailable(
+                config.credential_unavailable,
+                manifest_server.env_var if manifest_server else None,
+            )
+            return
+
         if (
             eager
             and manifest_server
@@ -1681,9 +1754,19 @@ def resolve_startup_configs(
             # checking only the runtime env_var would skip a namespaced-only
             # credential as MISSING_AUTH.
             lookup_keys = credential_lookup_keys(manifest_server)
-            auth_available = lookup_keys and any(
-                is_auth_available(key) for key in lookup_keys
-            )
+            # Stops at the first typed answer: a predicate that raises
+            # CredentialUnavailableError (an unreadable user store) is
+            # contained to this entry, and the legacy key after it is never
+            # tried (Consiliency/pmcp#487).
+            auth_available = False
+            for key in lookup_keys:
+                try:
+                    if is_auth_available(key):
+                        auth_available = True
+                        break
+                except CredentialUnavailableError as exc:
+                    skip_unavailable(exc.reason, env_var)
+                    return
             # is_auth_available only checks process env / PMCP secret stores
             # BY NAME — it cannot see a concrete credential the user wrote
             # directly into a *configured* (.mcp.json) entry's own env block.
@@ -1717,6 +1800,10 @@ def resolve_startup_configs(
                 config.config.headers,
                 remote_header_env_lookup,
             )
+            if resolution.unavailable_env_vars:
+                first = sorted(resolution.unavailable_env_vars)[0]
+                skip_unavailable(resolution.unavailable_env_vars[first], first)
+                return
             if resolution.missing_env_vars:
                 skipped.append(
                     StartupSkip(
@@ -1780,6 +1867,28 @@ def resolve_startup_configs(
                 server, _credential_value_for(project_root)
             )
             add_config(config, eager=eager, source=source, manifest_server=server)
+        except CredentialUnavailableError as exc:
+            # Kept with its typed state rather than dropped, so a manifest-only
+            # server such as Bright Data reports it (Consiliency/pmcp#487).
+            if is_server_allowed(name):
+                skipped.append(
+                    StartupSkip(
+                        name=name,
+                        reason=StartupSkipReason.CREDENTIAL_UNAVAILABLE,
+                        source=source,
+                        env_var=server.env_var,
+                        credential_reason=exc.reason,
+                    )
+                )
+            else:
+                skipped.append(
+                    StartupSkip(
+                        name=name,
+                        reason=StartupSkipReason.POLICY_DENIED,
+                        source=source,
+                    )
+                )
+            classified_names.add(name)
         except Exception as exc:
             from pmcp.manifest.loader import _server_label
 
