@@ -1,12 +1,13 @@
 # Detailed plan: 1Password secret references for downstream servers (Consiliency/pmcp#487)
 
-Status: PLAN revision 2, for panel review round 2. Revision 1 (fce5598) was reviewed
-by Gemini, Astra, Claude and Grok (all CHANGES-REQUIRED); section 9 maps every
-round-1 finding to the change below. Owner direction 2026-11-08 (not reopened):
-resolve `op://` references inside pmcp, authenticating with a **1Password service
-account scoped read-only to one gateway-only vault**, whose token lives in a
-credential file, never in `pmcp.env` or the gateway environment. Implementation and
-any release follow panel review; a release needs owner approval.
+Status: PLAN revision 3, for panel review round 3. Revisions 1 (fce5598) and 2
+(17b25d9) were reviewed by Gemini, Astra, Claude and Grok; section 10 maps every
+round-1 and round-2 finding to the change below. Owner direction 2026-11-08 (not
+reopened): resolve `op://` references inside pmcp, authenticating with a
+**1Password service account scoped read-only to one gateway-only vault**, whose
+token lives in a credential file, never in `pmcp.env` or the gateway environment.
+Implementation and any release follow panel review; a release needs owner
+approval.
 
 Baseline for citations: origin/main c79d6faff55ec78cee6d6768081912f26e65493d.
 
@@ -15,16 +16,20 @@ Baseline for citations: origin/main c79d6faff55ec78cee6d6768081912f26e65493d.
 1. A revoked key surfaced only at the first tool call: `connect_server` reported
    `auth_state: none`, `missing_env_vars: []`.
 2. Keys live in plain text in `~/.config/pmcp/pmcp.env`, rendered from 1Password
-   by the dotfiles bootstrap and also loaded into the gateway by systemd
-   `EnvironmentFile=`.
+   by the dotfiles bootstrap. On the reporting host systemd also loads that file
+   into the gateway's environment with `EnvironmentFile=`; two other launchers do
+   the same with `set -a; source` (`hosts/workstation-mac/com.user.pmcp.plist`,
+   `claude-config/pmcp-service.sh` in ViperJuice/dotfiles).
 3. Rotation needed a gateway restart. `restart_server` rebuilds the config
    (`tools/handlers.py:2701-2724`, `3146`), but `credential_value` answers from
-   `os.environ` first (`env_store.py:914-915`). User-store values are placed in
-   `os.environ` once at startup and never overwritten (`env_store.py:1149-1169`,
-   `cli.py:3290-3302`), and systemd values win over them.
-4. Children inherit the gateway environment minus pmcp-tracked keys
-   (`sanitized_subprocess_env`, `env_store.py:1731-1780`); values exported by
-   systemd or the shell (Bright Data's runtime name `API_TOKEN`) reach every child.
+   `os.environ` first (`env_store.py:914-915`). Values loaded by systemd sit in
+   `os.environ` from the start; values pmcp loads from the store are inserted once
+   and never overwritten (`env_store.py:1149-1169`; `cli.py:3290-3302`), and an
+   availability check can insert more later (`handlers.py:2792-2794`).
+4. Because systemd loaded `pmcp.env` as external environment, its keys (including
+   Bright Data's runtime name `API_TOKEN`) are inherited by every child;
+   `sanitized_subprocess_env` strips only keys pmcp itself loaded
+   (`env_store.py:1731-1780`).
 5. `gateway.auth_connect` writes the store and `os.environ` and records the key
    (`handlers.py:4886-4954`); it does not restart the server.
 
@@ -36,17 +41,18 @@ Goals:
 - G2. A restart re-resolves, so a rotated key (1Password or plain store) takes
   effect without restarting the gateway.
 - G3. Resolved values and the service-account token never enter the gateway's
-  `os.environ`, a child (other than the dedicated `op` process for the token),
-  logs, diagnostics, errors or tool output.
+  `os.environ`, a downstream child, logs, diagnostics, errors or tool output. Only
+  the dedicated `op` process receives the token.
 - G4. Every failure is typed and fail-closed: no fallback to a stale value, an
   empty value, another lookup key, another store, or the literal reference.
 - G5. A credential the provider rejects is reported as an auth state, on evidence
   specific to that provider.
-- G6. A migration path that cannot break a running gateway.
+- G6. No existing working configuration breaks on upgrade; migration cannot break
+  a running gateway.
 
-Non-goals (v1): remote (HTTP) header references (refused, not ignored, see 3.2);
-Windows production support; 1Password Connect; desktop-app integration; managing
-the vault or token.
+Non-goals (v1): resolving references in remote (HTTP) headers (refused, 3.2);
+Windows support; 1Password Connect; desktop-app integration; managing the vault or
+token.
 
 Security boundary: this protects against secrets being inherited, logged or
 returned, and against repository/agent inputs choosing vault items. It is not a
@@ -57,251 +63,331 @@ token file directly.
 
 ### 3.1 Secret zero (the service-account token)
 
-Sources, checked once at startup, **before** `load_startup_env` reads any dotenv
-or store file:
-1. systemd credentials: `$CREDENTIALS_DIRECTORY/op-service-account-token`, only
-   when the process was started by systemd with that variable set;
-2. `~/.config/pmcp/op-service-account-token` (POSIX).
+Sources, looked up **on demand** (each time a resolution needs the token), in order:
+1. the systemd credential copy `$CREDENTIALS_DIRECTORY/op-service-account-token`.
+   `CREDENTIALS_DIRECTORY` is captured once, at startup, before `load_startup_env`
+   reads any file, then removed from `os.environ`. systemd copies the credential
+   when the unit starts, so rotating a token delivered this way needs a unit
+   restart (documented);
+2. the per-user credstore file `$XDG_CONFIG_HOME/credstore/op-service-account-token`
+   (default `~/.config/credstore/...`, using the pinned home from
+   `home_identity`; `XDG_CONFIG_HOME` only if operator-supplied). This is the file
+   systemd loads for a user unit, so CLI commands (`migrate-op`,
+   `doctor --resolve`) read the same token as the gateway;
+3. `~/.config/pmcp/op-service-account-token` (for hosts without systemd, e.g. macOS).
 
-No environment-variable source (removed: it contradicted the owner decision).
-Neither path present: references are unsupported on this host; any reference is
-`credential_unavailable` (reason `op_not_configured`). A path present but invalid
-is a startup warning and every reference fails closed (reason `token_invalid`).
+No environment-variable source. None present: references are unsupported;
+any reference pmcp would resolve is `credential_unavailable` (reason
+`op_not_configured`). A present but invalid file is a warning and resolution fails
+closed (reason `token_invalid`); pmcp never skips to the next source.
 
-Reading (both paths), by one descriptor: open with `O_NOFOLLOW` (plus a confined
-walk of the parent like `atomic_write`), `fstat` that descriptor, require a regular
-file owned by the gateway's uid with no group/other permission bits (0400 and 0600
-both pass; systemd's credential copy is read-only), read at most 4 KiB from that
-descriptor, strip one trailing newline, require the token's documented prefix
-shape. Never `read_env_text` (it follows symlinks and checks neither owner nor
-mode). Re-read on demand when the file's identity (device, inode, size, mtime)
-changes, so an atomic token replacement is picked up without a restart.
+Reading each path: confined walk of the parent directories (as `atomic_write`
+does), then open the leaf with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`,
+`fstat` that descriptor, require a regular file owned by the gateway's uid with
+no group/other bits (0400 and 0600 both pass), read at most 4 KiB from that
+descriptor, strip one trailing `\n` or `\r\n`, require the documented token prefix
+shape. A FIFO or device is refused without blocking. Cached by
+`(st_dev, st_ino, st_size, st_mtime_ns)` of the descriptor; a change re-reads.
 
-After reading: remove `CREDENTIALS_DIRECTORY` and any `OP_SERVICE_ACCOUNT_TOKEN`
-from `os.environ`. Add `OP_SERVICE_ACCOUNT_TOKEN`, `CREDENTIALS_DIRECTORY`,
-`OP_CONNECT_TOKEN`, `OP_CONNECT_HOST`, `OP_CONFIG_DIR`, `OP_CACHE`, `OP_ACCOUNT`
-and `OP_SESSION_*` to the never-loaded set (`env_store.py:1006`), refuse them in
-`pmcp secrets set/sync` and `gateway.auth_connect`, and strip them unconditionally
-in `sanitized_subprocess_env`, `child_process_env` and `build_install_child_env`
-(including any `own_env` override). The token is registered in the exact-value
-redaction set (3.7) as soon as it is read.
+Never-loaded and stripped names: `OP_SERVICE_ACCOUNT_TOKEN`, `CREDENTIALS_DIRECTORY`,
+`OP_CONNECT_TOKEN`, `OP_CONNECT_HOST`, `OP_CONFIG_DIR`, `OP_CACHE`, `OP_ACCOUNT`,
+`OP_SESSION_*` are added to `_NEVER_LOADED` (`env_store.py:1146`), refused by
+`pmcp secrets set/sync` and `gateway.auth_connect`, removed from `os.environ` at
+startup, and stripped from **inherited** environment in `sanitized_subprocess_env`,
+`child_process_env` and `build_install_child_env`. A server's own explicit env
+(`own_env`) is governed by 3.2.4 instead. The token is registered for exact-value
+redaction (3.7) as soon as it is read.
 
-Platforms: POSIX descriptor checks only. macOS uses path 2. Windows: references
-are unsupported (`credential_unavailable`, reason `platform_unsupported`) until an
-ACL check exists.
+Platforms: POSIX descriptor checks only. Windows: `platform_unsupported`.
 
-### 3.2 Where references are honoured (provenance, not shape)
+### 3.2 Where pmcp resolves references
 
-A reference is honoured only if it comes from an **operator-controlled source**:
+#### 3.2.1 What pmcp resolves
+
+pmcp resolves a reference in exactly two places:
+- **Credential lookups**: the value found for a server's `secret_key`/`env_var`
+  (`manifest/loader.py:313-329`, injected at `config/loader.py:1532-1543` and
+  `1110-1129`, `installer.py:759`).
+- **Opted-in own env**: values in a server's explicit `env` block, only for a
+  server whose operator config sets `resolve_secret_refs: true` (3.2.4).
+
+Any other `op://` value is left exactly as today (3.2.4). This keeps existing
+configurations working (G6).
+
+#### 3.2.2 Trusted sources
+
+A reference found by a credential lookup, or in an opted-in `env` block, is
+resolved only if its source is one of:
 - the user store `~/.config/pmcp/pmcp.env`;
-- the user-scope config files (`~/.mcp.json`, `~/.claude/.mcp.json`) and configs
-  named by `-c`/`PMCP_CONFIG`;
-- the shipped manifest and the operator manifest overlay under `~/.pmcp/`.
+- user-scope config files (`~/.mcp.json`, `~/.claude/.mcp.json`) and configs
+  named by `-c`/`PMCP_CONFIG` (operator-supplied, `env_key_is_operator_supplied`);
+- the shipped manifest, the operator overlay `~/.pmcp/manifest.yaml`, and
+  `$PMCP_MANIFEST_PATH` when operator-supplied.
 
-Not honoured, ever: project `.env`, project `.env.pmcp`, tenant stores, project
-`.mcp.json`, project manifest overlays, discovered servers, tool arguments. There
-is no opt-in in v1 (revision 1's `allow_project_references` is dropped). A
-reference-shaped value from those sources is refused (`credential_unavailable`,
-reason `reference_not_allowed_here`) and never forwarded as a literal.
+Refused, with `credential_unavailable` (reason `reference_not_allowed_here`), never
+resolved and never forwarded: the **process environment, whoever set it** (pmcp
+cannot tell who did; an `EnvironmentFile=`/`source` launcher is the common case),
+`~/.env`, project `.env` and `.env.pmcp`, tenant stores, project `.mcp.json`,
+project manifest overlays, discovered servers, tool arguments, and values written
+by `gateway.auth_connect`. `doctor` lists such keys by name and source.
 
-To enforce this, credential lookup and config merging carry provenance: the
-lookup returns a small record `(value, source_kind, root)` instead of a bare
-string, the config merge keeps a per-env-key source, and `ResolvedServerConfig`
-carries a `credential_sources` map. Spawn sites consult that map; shape alone is
-never enough.
+#### 3.2.3 Provenance
 
-Write paths:
-- `gateway.auth_connect` refuses reference-shaped credentials (agents must not be
-  able to point the gateway at vault items). Operators write references with the
-  CLI only.
-- `pmcp secrets set NAME op://...` is allowed only into the user store, only for
-  names that `repository_may_supply()` accepts (`env_store.py:731-778`; excludes
-  the `PMCP_` namespace, code-loading and package-manager names).
-- `pmcp secrets sync` refuses to copy reference-shaped values in either
-  direction.
-- pmcp's own variables are never references: at startup, a reference-shaped
-  value for any name pmcp reads itself (`is_pmcp_environment_name`, e.g.
-  `PMCP_AUTH_TOKEN`) is refused with a value-free error; for `PMCP_AUTH_TOKEN`
-  the gateway refuses to start.
+Credential lookup returns `(value, source_kind, root)`. Config merging keeps a
+per-env-key source. `Manifest.ServerConfig` gains `extra_env_sources`, updated per
+key wherever `_build_manifest` merges an overlay (`manifest/loader.py:2112`,
+`2170-2188`); `_merge_manifest_defaults`, `_manifest_server_to_config` and
+`build_install_child_env` carry it. `ResolvedServerConfig` carries a
+`credential_sources` map. Spawn sites decide from that map; shape alone never
+decides.
 
-Remote servers: a reference-shaped value reaching a remote header lookup is
-refused with `credential_unavailable` (reason `remote_reference_unsupported`),
-never sent. Migration preflight lists remote consumers of each key and refuses
-to migrate a key a remote server uses.
+#### 3.2.4 Existing child-side resolution
+
+Some servers resolve their own references today: `op run` wrappers, or a server
+given its own `OP_SERVICE_ACCOUNT_TOKEN` (the agent-board pattern,
+`plans/agent-board-overlay.template.jsonc`). Local `env` values are passed as
+written today (`config/loader.py:1110-1115`).
+- Without `resolve_secret_refs: true`, pmcp keeps passing a server's own `env`
+  values verbatim, including `op://` strings and an explicit
+  `OP_SERVICE_ACCOUNT_TOKEN`. Only inherited environment is stripped.
+- With `resolve_secret_refs: true` (operator sources only: user configs, `-c`,
+  `~/.pmcp` overlay), pmcp resolves that server's `op://` env values, and
+  refuses to pass an `OP_*` name in its env.
+- Credential lookups (3.2.1) always resolve trusted references; before this
+  feature a reference there would have reached the child as a literal key, which
+  never worked, so no working configuration changes.
+- P1's `doctor` lists every `op://` env value and every `OP_*` own-env key by
+  server and source, so operators see the situation before P2.
+
+#### 3.2.5 Write paths and pmcp's own variables
+
+- `gateway.auth_connect` refuses reference-shaped credentials.
+- `pmcp secrets set NAME op://...` writes only to the user store and only names
+  `copy_allowed` accepts. `pmcp secrets sync` refuses reference-shaped values.
+- pmcp's own variables (`is_pmcp_environment_name`, e.g. `PMCP_AUTH_TOKEN`) are
+  never references: a reference-shaped value is refused with a value-free error,
+  and for `PMCP_AUTH_TOKEN` the gateway refuses to start.
+- The user-store load never publishes a reference-shaped value into `os.environ`
+  (`_load_operator_text` skips it and records its user-store origin), so no
+  `child_process_env` probe inherits it.
+
+#### 3.2.6 Remote servers
+
+A reference-shaped value that would be sent in a remote header is refused with
+`credential_unavailable` (reason `remote_reference_unsupported`) and the server is
+not connected. This covers both `${VAR}` lookups (`remote_auth.py:46-76`) and a
+header whose literal value is reference-shaped, and the refused value is not kept
+on `ManagedClient.resolved_remote_headers`. `migrate-op` refuses keys a remote
+server uses.
 
 ### 3.3 Reference grammar (v1 subset)
 
-Three classes, decided by `re.fullmatch` on the whole value after rejecting any
-control, NUL, bidi or whitespace character:
-- **plain**: does not start with `op://` (case-insensitive). Unchanged behaviour.
-- **supported reference**: `op://<vault>/<item>/<field>` or
-  `op://<vault>/<item>/<section>/<field>`. Each segment is 1-64 characters from
-  `[A-Za-z0-9 _.-]` (space allowed inside, not leading or trailing), not `.` or
-  `..`. No query, fragment, `%`, `@`, `:`, `$` or `\`. Vault and item may be names
-  or IDs; IDs are recommended (1 read instead of 3, see 3.9).
-- **reference-shaped but unsupported**: starts with `op://` and is not
-  supported (queries such as `?attribute=otp`, `?ssh-format=`, file content,
-  `$VAR` expansion, extra segments). Refused, `credential_unavailable`, reason
-  `reference_unsupported`. Never resolved, never forwarded.
+Classification happens first, on the raw value:
+- **plain**: does not start with `op://` after stripping leading ASCII
+  whitespace, case-insensitively. Existing behaviour and validation unchanged
+  (plain values may contain spaces as today).
+- **reference-shaped**: everything else, including `" op://..."` and `OP://...`.
 
-No recursive resolution: a resolved value that itself looks like a reference is
-used as a literal secret only if it is plain; otherwise refused.
+Reference-shaped values are then parsed with one grammar (`re.fullmatch`):
+- no leading or trailing whitespace, no control, NUL or bidi characters;
+- scheme `op://` in any case;
+- `op://<vault>/<item>/<field>` or `op://<vault>/<item>/<section>/<field>`;
+- each segment 1-64 characters from `[A-Za-z0-9 _.-]`, with spaces allowed only
+  inside (not leading or trailing), not `.` or `..`;
+- no query, fragment, `%`, `@`, `:`, `$`, `\`.
+
+Passing: a **supported reference** (examples: `op://PMCP Gateway/BrightData/credential`,
+`op://abc123def456/xyz789/password`). Failing: **unsupported**, refused with
+`credential_unavailable` (reason `reference_unsupported`), never resolved, never
+forwarded (examples: `" op://v/i/f"`, `op://v/i/f?attribute=otp`,
+`op://v/i/f?ssh-format=openssh`, `op://$ENV/i/f`, `op://v/i`, `op://v/i/s/f/x`).
+
+No recursive resolution: a resolved value that is itself reference-shaped is
+refused (`output_invalid`).
 
 ### 3.4 Resolution and the `op` process
 
 New module `pmcp/secret_refs.py`:
-- Executable: an absolute path chosen by the operator config (`op_path` in the
-  user config) or, by default, the first of `~/.local/bin/op`, `/usr/local/bin/op`,
-  `/usr/bin/op` that is a regular executable owned by root or the gateway uid and
-  not writable by group/other. Never a `PATH` search, never the project cwd.
-- Argv: `op read --no-newline --no-color --cache=false --config <dir> -- <ref>`.
-  The 2.42.0 flags were checked with `op --help`/`op read --help`; the
-  implementation PR records a live compatibility check (3.10).
-- Environment: a new builder `op_subprocess_env()`, registered in `ENV_BUILDERS`
-  (`tests/test_store_reader_inventory.py:650-653`): `PATH` (fixed system dirs),
-  `HOME`, `OP_SERVICE_ACCOUNT_TOKEN`, `OP_CACHE=false`, and the proxy/TLS variables
-  `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR` only when
-  operator-supplied. Nothing else.
-- Process: cwd and `--config` dir are a private 0700 directory under the user
-  state dir (owner/mode checked); stdin is `/dev/null`; started through
-  `spawn_owned`; stdout and stderr read concurrently with bounded readers (64 KiB
-  stdout, 8 KiB stderr). Timeout (10 s), cap overflow, cancellation or shutdown:
-  kill the process group, reap, discard every byte read, fail. Non-zero exit or
-  empty output fails. Stdout is never truncated into a value.
+- Executable: `op_path` from operator config, or the first of `/usr/bin/op`,
+  `/usr/local/bin/op`, `~/.local/bin/op` that passes the trust check. Trust check
+  (on every spawn): resolve symlinks; the final file and **every ancestor
+  directory** are owned by root or the gateway uid and not writable by group or
+  other (sticky world-writable directories refused); the file is a regular
+  executable. An invalid explicit `op_path` fails closed (`op_untrusted`); no
+  fallback to the search list. Never a `PATH` search, never the project cwd.
+- Argv: `op read --no-newline --no-color --cache=false --config <dir> -- <ref>`
+  (flags confirmed on the installed 2.42.0 with `op --help`, `op read --help`).
+- Environment: new builder `op_subprocess_env()`, added to `ENV_BUILDERS`
+  (`tests/test_store_reader_inventory.py:650-653`): fixed system `PATH`, `HOME`,
+  `OP_SERVICE_ACCOUNT_TOKEN`, `OP_CACHE=false`, and `HTTP_PROXY`, `HTTPS_PROXY`,
+  `NO_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR` only when operator-supplied.
+- Process: cwd and `--config` dir a private 0700 directory under the user state
+  dir (owner/mode checked); stdin `/dev/null`; started with `spawn_owned`; stdout
+  and stderr read concurrently with bounded readers (64 KiB, 8 KiB). Timeout
+  (10 s), overflow, cancellation or shutdown: kill the process group, reap,
+  discard every byte read, fail. Non-zero exit or empty output fails.
 - Failure classes from exit status and stderr: `auth_failed`, `not_found`,
-  `rate_limited`, `network`, `timeout`, `op_missing`, `output_invalid`. Raw
-  stderr and argv are never echoed; the class is.
-- Concurrency: at most 2 `op` processes at once (below the spawn cap of 8,
-  `cli.py:2520`); identical in-flight references are single-flighted. No cache
-  across spawns (each spawn reads current values; G2).
-- Values shorter than 8 characters are refused (`output_invalid`), so exact-value
-  redaction (3.7) never has to match common short strings.
+  `rate_limited`, `network`, `timeout`, `op_missing`, `op_untrusted`,
+  `output_invalid`. Raw stderr and argv are never echoed.
+- Concurrency: at most 2 `op` processes; identical in-flight references
+  single-flighted (a cancelled waiter never cancels another caller's lookup);
+  semaphore wait counts against the per-spawn deadline. No cache across spawns.
+- Values shorter than 8 characters are refused (`output_invalid`).
 
 ### 3.5 Where resolution happens
 
-- Configs keep the reference string; a resolved value is never written onto
-  `ResolvedServerConfig`, `config.env`, `os.environ` or any store.
-- Resolution runs **before** an existing instance is torn down and **outside**
-  the manager-wide lifecycle lock (`manager.py:1625`): the caller resolves, then
-  passes a per-spawn env copy down. A failed lookup during `restart_server`
-  leaves the running instance as it is and returns the typed error (no new spawn
-  uses an old value, so this is not a fallback).
-- Every credential-injecting spawn path uses it: `ClientManager._connect_stdio`
-  (`manager.py:3244`), reconnect (`_reconnect_loop`, `manager.py:3992-4066`,
-  resolves again from the stored reference), the install-and-run provision path
-  (`installer.py:242-252, 451-461, 722-765`, which Bright Data uses), installer
-  verification, and `update_server` (`handlers.py:5368`).
-- `_connect_with_retry` does not retry typed lookup failures; total resolution
+- Configs keep reference strings; a resolved value is never written onto
+  `ResolvedServerConfig`, `config.env`, `os.environ` or a store. Each spawn gets a
+  fresh env dict.
+- Resolution runs before teardown and outside the manager-wide lifecycle lock
+  (`manager.py:1625`). The teardown site is `ClientManager.restart_server`
+  (`manager.py:2096-2107`), which `update_server` reaches through
+  `_restart_resolved_server`; resolution moves in front of its
+  `disconnect_server`. Callers that take the lock before connecting (`connect_all`
+  at `manager.py:1663`, lazy start at `1901-1903`, reconnect at `4044-4051`)
+  resolve first, then take the lock, then re-check the server's config
+  generation before spawning; a changed generation discards the resolution.
+- A failed lookup during restart leaves the running instance up and returns the
+  typed error (no new spawn uses an old value, so this is not a fallback).
+- Every credential-injecting spawn path: `_connect_stdio` (`manager.py:3244`),
+  reconnect (`_reconnect_loop`, resolving again from the stored reference), and
+  `build_install_child_env` (`installer.py:722-765`), which covers the spawns at
+  `installer.py:243` (install-and-run, Bright Data's provision path), `841`
+  (`install_server`) and `907` (`verify_installation`).
+- `_connect_with_retry` does not retry typed lookup failures. Total resolution
   time per spawn is bounded (20 s).
 
 ### 3.6 Rotation of plain store values (P1)
 
-- At startup, record an origin snapshot: for each credential name, whether its
-  `os.environ` value came from the external environment (present before pmcp
-  ran), the user store (inserted by `_load_operator_text`), or
-  `gateway.auth_connect` (inserted later).
-- Precedence is unchanged: external environment > user store > project files.
-- For names whose winning value came from the user store, `credential_value`
-  re-reads the user store with the strict reader (`_read_env_file_strict`,
-  `env_store.py:1306-1352`), identity-cached like the project files
-  (`env_store.py:385-390`). Present: return it. Removed from the store: the name
-  is unavailable (`missing_auth`), not the startup copy. Read failure:
-  `credential_unavailable` (reason `store_unreadable`), not the startup copy.
-  Explicit empty values keep their current meaning (`env_store.py:899-901`).
-- Names last written by `gateway.auth_connect` keep the `os.environ` value it
-  wrote until the next process start (its documented, existing behaviour).
-- Lookup key order is unchanged (`secret_key` then `env_var`,
-  `manifest/loader.py:313-329`), but a typed failure on the preferred key stops
-  the lookup; it never falls through to the legacy key or another store.
-- Tests: `BRIGHTDATA_API_TOKEN` vs legacy `API_TOKEN`; store edit in place and
-  by atomic replace; removal; unreadable store; external env still wins;
-  project-scope `auth_connect` still wins in-process.
+Origin registry: one map `name -> origin`, recorded at **every** insertion into
+`os.environ`: `external` (present before pmcp ran), `home_dotenv` (startup `~/.env`
+load, `cli.py:3290-3294`), `user_store` (startup store load, `cli.py:3299-3302`),
+`auth_connect` (`handlers.py:4921-4933`). The availability reload
+(`handlers.py:2792-2794`) is removed: `credential_value` reads the current user
+store directly (below), which makes it redundant.
+
+Precedence (unchanged): external > `~/.env` > user store > tenant > project files.
+
+`credential_value(name)`:
+1. origin `external` or `home_dotenv`: the `os.environ` value, as today (static
+   until restart, as today).
+2. origin `auth_connect`: the `os.environ` value it wrote, until the next start.
+3. otherwise, the **current** user store: read with the strict reader, using the
+   same parse and interpolation rules as the startup load (interpolation of
+   `${OTHER}` against a context of the current store and the external
+   environment only, never against stale startup copies). Cached by the identity
+   of both `os.stat` and `os.lstat` of the store path (so a symlinked store edited
+   in place or replaced is seen). Results:
+   - present: that value (this covers keys added after startup, and a store created
+     after startup);
+   - absent from a readable store: **removed** (a terminal result; the lookup does
+     not continue to the legacy key or another store), reported `missing_auth`;
+   - store unreadable: `credential_unavailable` (reason `store_unreadable`); the
+     loader propagates it instead of treating it as missing
+     (`config/loader.py:1216`).
+4. then tenant and project files, as today.
+Explicit empty values keep their meaning (`env_store.py:899-901`). Lookup key order
+is unchanged (`secret_key` then `env_var`); a removed or typed failure on the
+preferred key stops the lookup.
+
+Tests: `BRIGHTDATA_API_TOKEN` vs legacy `API_TOKEN`; key added after start then
+rotated then removed; store created after start; symlinked store edited and
+target replaced; interpolated plain value; key only in `~/.env`; key in both
+`~/.env` and store; external wins; project-scope `auth_connect` still wins
+in-process; unreadable store.
 
 ### 3.7 Redaction
 
 - A process-local registry holds the token and every resolved value, registered
-  before any child is spawned, kept for the lifetime of the process (values are
-  few; old values stay protected across rotation and in-flight calls).
-- Exact-value redaction is **unconditional** (independent of
-  `options.redact_secrets`) and runs **before** truncation and serialization in:
-  `PolicyManager.process_output` including `summary` (`policy.py:974-995`),
+  before any child is spawned, kept for the process lifetime.
+- Exact-value redaction is unconditional (independent of
+  `options.redact_secrets`) and runs before truncation and serialization in:
+  `PolicyManager.process_output` including `summary` (`policy/policy.py:958`),
   `resources_read`, `prompts_get`, `tasks_result`, `_sanitize_error`,
-  `sanitize_auth_diagnostic`, installer job output, child stderr logging
-  (`manager.py:3764`), and a `logging.Filter` on every gateway log handler
-  (including the rotating file log, `cli.py:110-117`).
-- Each value is matched raw and in its JSON-string-escaped form; overlapping
-  values are matched longest first. Transformed forms (base64, split) are out of
-  scope and documented.
+  `sanitize_auth_diagnostic` (before its other passes), update-probe output before
+  it is sliced (`handlers.py:5398-5405`), installer output, child stderr logging
+  (`manager.py:3764`), and a `logging.Filter` on the root logger that redacts the
+  fully formatted message including `exc_text`.
+- Each value is matched raw and JSON-string-escaped, longest first. Transformed
+  forms (base64, split) are out of scope and documented.
 
 ### 3.8 Auth states
 
-- `credential_unavailable` (new): a lookup or policy failure from 3.1-3.6, with a
-  reason class. The server is not (re)started.
+- `credential_unavailable` (new, P1 for `store_unreadable`, P2 for the rest).
 - `credential_rejected` (new, P3): set only by (a) a shipped-manifest `auth_check`
-  returning the provider's documented authentication failure, or (b) a
-  provider-specific classifier with a named, documented error signature for that
-  provider. No generic substring heuristic; a bare 401/403 or "unauthorized" is
-  never enough. Cleared by a successful check, a successful tool call, or a
-  restart with a new value. Precedence: `credential_unavailable` >
-  `credential_rejected` > `insufficient_scope` > `none`.
-- `auth_check` is a shipped-manifest field only (refused from overlays, project
-  configs, discovered servers and tool arguments). Form: HTTPS GET to a pinned
-  host and path, credential in a header (never the URL), no redirects, TLS
-  verified, 5 s timeout, 4 KiB response cap. Only the documented auth-failure
-  status sets `credential_rejected`; timeouts, 5xx and 429 leave the state
-  unchanged. Bright Data's check (`GET https://api.brightdata.com/zone/get_active_zones`
-  with `Authorization: Bearer`, 401 on a bad key, as observed on 2026-11-08) is
-  verified live before P3 merges.
+  returning the provider's documented authentication failure, or (b) a named
+  provider-specific signature. No generic substring heuristic. Cleared only by a
+  successful `auth_check` or an authenticated call to that provider made with the
+  same credential generation, or a restart with a new value; an in-flight result
+  from an older generation never clears a newer rejection.
+- Precedence: `policy_denied` > `credential_unavailable` > `credential_rejected` >
+  `missing_auth` > `elicitation_required` > `insufficient_scope` > `unknown` > `none`.
+- `auth_check`: shipped manifest only (refused from overlays, project configs,
+  discovered servers, tool arguments). HTTPS GET to a pinned host and path,
+  credential in a header (never the URL), no redirects, TLS verified, 5 s timeout,
+  4 KiB response cap. Runs after a successful spawn, outside the lifecycle lock;
+  it never aborts the connect. Only the documented auth-failure status sets
+  `credential_rejected`; timeouts, 5xx and 429 change nothing. Bright Data:
+  `GET https://api.brightdata.com/zone/get_active_zones`, `Authorization: Bearer`,
+  401 on a bad key (observed 2026-11-08); verified live before P3 merges.
 - `AuthState`, `AuthEventKind`, `DEFAULT_AUTH_STATE_SEMANTICS` and
   `_auth_event_for_state` (`types.py:34-92`, `handlers.py:1104-1111`) are
   extended in the PR that first returns each state.
 
 ### 3.9 Rate limits
 
-1Password service-account limits are per token per hour and per account per day
-(official rate-limit docs); a name-based reference costs about 3 reads, an
-ID-based one 1. Expected volume: one read per reference per spawn, restart or
-reconnect. Mitigations: ID-based references recommended by `doctor` and
-`migrate-op`; concurrency cap and single-flight (3.4); reconnect backoff already
-bounds retries; `rate_limited` is `credential_unavailable` with no stale fallback;
-`doctor` resolves references only with `--resolve`.
+1Password service-account limits are per token per hour and per account per day;
+a name-based reference costs about 3 reads, an ID-based one 1. Expected volume:
+one read per reference per spawn, restart or reconnect. Mitigations: ID-based
+references recommended by `doctor` and `migrate-op`; concurrency cap and
+single-flight (3.4); `rate_limited` is `credential_unavailable` with no fallback;
+`doctor` resolves only with `--resolve`. The account tier is an owner input.
 
 ### 3.10 Migration and operator commands
 
+- Health capability: P2 adds `secret_refs` to
+  `GatewayDiagnosticsInfo.capabilities` (`types.py:152-180`) when the serving
+  process resolves references, has a usable token, and saw none of the user
+  store's credential names arrive as external environment. The token source and
+  state (never values) are reported too.
 - `pmcp secrets migrate-op --map NAME=op://... [...] (--check | --backup)`:
-  refuses unless the running gateway version supports references (checked via
-  the gateway's health/version endpoint) and the token is configured; resolves
-  every reference first and compares with the current value (match/mismatch,
-  never printing either); refuses all changes on any failure or mismatch unless
-  `--accept-mismatch NAME`; refuses keys used by remote servers (3.2); rewrites
-  the user store atomically with a compare-and-swap on the file identity it read
-  (a concurrent rotation aborts the migration); `--backup` writes a 0600 copy
-  next to the store first. One of `--check` or `--backup` is required.
-- `pmcp doctor`: per server, credential source (plain / reference / external
-  environment), reference class, and plain keys that could be migrated; warns
-  when a manifest runtime `env_var` (e.g. `API_TOKEN`) is set in `os.environ` by
-  something other than pmcp (it leaks to every child). `--resolve` performs
-  lookups.
-- A live compatibility check script (operator-run, value-free output) confirms
-  the installed `op` honours the flags in 3.4 and that `--cache=false` reads the
-  current value after an item edit.
+  refuses unless the running gateway reports `secret_refs` (never the CLI's own
+  version) and the CLI finds the token (3.1 path 2 or 3); resolves every
+  reference first and compares with the current value (match/mismatch, never
+  printing either); refuses all changes on any failure or mismatch unless
+  `--accept-mismatch NAME`; refuses names with external origin and keys used by
+  remote servers. The rewrite uses a cooperating-writer lock (a flock on a
+  sibling lock file taken by every pmcp store writer: `secrets set/sync`,
+  `auth_connect`, `migrate-op`), re-checks the file identity under the lock, then
+  replaces atomically. Editors that do not take the lock are not covered
+  (documented). `--backup` writes a 0600 copy first.
+- `pmcp doctor`: per server, credential source and class; references refused by
+  3.2; `op://` and `OP_*` values in own env (3.2.4); manifest runtime `env_var`
+  names (e.g. `API_TOKEN`) present as external environment (they leak to every
+  child); the gateway's `secret_refs` capability and token state from `/health`.
+  `--resolve` performs lookups from the CLI.
+- Live compatibility script (operator-run, value-free output): the installed `op`
+  honours the 3.4 flags and `--cache=false` reads the current value after an item
+  edit. Its result is a **P2 merge gate**.
 
 ## 4. Phases and PRs
 
 | Phase | Content | Repo | Safe alone? |
 |---|---|---|---|
-| P1 | Origin snapshot and plain-store rotation (3.6); `doctor` env-leak warning; `credential_unavailable` state for `store_unreadable`. | pmcp | Yes: no references. |
-| P2 | Token loading and stripping (3.1), provenance (3.2), grammar (3.3), `op` resolver (3.4), all spawn paths (3.5), unconditional redaction (3.7), refusal paths. Requires P1. | pmcp | Yes: references are honoured only when the operator writes them and installs a token. |
+| P1 | Origin registry and plain-store rotation (3.6); availability reload removed; `credential_unavailable`/`store_unreadable`; `doctor` leak and `op://`/`OP_*` listing. | pmcp | Yes: no references. |
+| P2 | Token (3.1), provenance and resolution scope (3.2), grammar (3.3), `op` (3.4), spawn paths and placement (3.5), redaction (3.7), `secret_refs` capability. Requires P1. Gate: live compatibility evidence. | pmcp | Yes: resolves only trusted credential lookups and opted-in servers; existing own-env `op://` values pass through as before. |
 | P3 | `credential_rejected`, `auth_check`, Bright Data check (3.8). | pmcp | Yes. |
-| P4 | `migrate-op`, `doctor --resolve`, compatibility script (3.10). | pmcp | Yes: refuses on unsupported gateways. |
-| P5 | Release pmcp (owner approval); upgrade pmcp on the target hosts. | pmcp | Gate for P6. |
-| P6a | Dotfiles: install the token with `systemd-creds`-style credstore path `%h/.config/credstore/op-service-account-token` and `LoadCredential=op-service-account-token` (no `:PATH`, so an absent file does not fail the unit); stop `EnvironmentFile=` for `pmcp.env`. | dotfiles | Only after P5 on that host. |
-| P6b | Dotfiles: bootstrap writes references instead of values, only when the installed pmcp supports them. Canary Display-Server-01, then the fleet; retire `pmcp.env.bak` after evidence. | dotfiles | Only after P6a. |
+| P4 | `migrate-op`, `doctor --resolve`, writer lock (3.10). | pmcp | Yes: refuses without the capability. |
+| P5 | Release pmcp (owner approval); upgrade the target hosts. | pmcp | Gate for P6. |
+| P6a | Dotfiles: install the token at `$XDG_CONFIG_HOME/credstore/op-service-account-token` (user manager) with `LoadCredential=op-service-account-token` (identifier form, so a missing file does not fail the unit); stop loading `pmcp.env` into the gateway environment in **all three** launchers (`pmcp.service` `EnvironmentFile=`, the macOS plist, `pmcp-service.sh`); restart the unit. | dotfiles | Only after P5 on that host. |
+| P6b | Dotfiles: bootstrap writes references instead of values, per host, only when that host's gateway reports `secret_refs`. Canary Display-Server-01, then the fleet; retire `pmcp.env.bak` after evidence. | dotfiles | Only after P6a on that host. |
 
-Rollback: P6b can be reverted by restoring the backup store; P6a by restoring the
-unit; pmcp releases keep reading plain values.
+Rollback: P6b restore the backup store; P6a restore the launchers; pmcp keeps
+reading plain values.
 
-Each PR gets the cross-vendor panel and exact-head CI before merge.
+Each PR gets the cross-vendor panel and exact-head CI before merge. Docs
+(`README.md`, `MIGRATING.md`, `SECURITY.md`) are updated in the PR that changes the
+behaviour they describe.
 
 ## 5. Owner steps
 
@@ -314,68 +400,77 @@ Each PR gets the cross-vendor panel and exact-head CI before merge.
 
 ## 6. Security properties to verify
 
-- Token: read by descriptor with owner/mode checks; never in `os.environ`, a
-  downstream child, a store, logs or output; only the dedicated `op` process
-  receives it; redacted if it ever appears.
-- References: provenance-gated; agents and repositories cannot choose vault
-  items; pmcp's own variables can never be references.
-- `op`: trusted absolute path, minimal env, no shell, no stdin, bounded time and
-  output, killed and reaped on any abnormal end, cache off.
-- Every failure is typed and fail-closed (G4).
+- Token: read by non-blocking descriptor with owner/mode checks; only the
+  dedicated `op` process receives it; never in `os.environ`, a downstream child's
+  inherited env, a store, logs or output; redacted if it ever appears.
+- References: resolved only from trusted sources for credential lookups and
+  opted-in servers; the process environment is never trusted; agents and
+  repositories cannot choose vault items; pmcp's own variables can never be
+  references.
+- `op`: trusted path with ancestor checks, minimal env, no shell, no stdin,
+  bounded time and output, killed and reaped on any abnormal end, cache off.
+- Every failure is typed and fail-closed (G4); existing configurations unchanged
+  (G6).
 - Known limits: same-user processes can read the token file; transformed
-  secrets are not redacted; Windows unsupported.
+  secrets are not redacted; Windows unsupported; editors that bypass the writer
+  lock.
 
 ## 7. Verification
 
-Fake `op` executables on a controlled path (record argv/env, return fixed output,
-hang, overflow, fail with each stderr class). CI never calls 1Password. Tests per
-phase include: precedence and rotation cases (3.6); strict-read failure does not
-return the startup copy; provenance refusals for each untrusted source;
-`auth_connect`/`sync` refusals; `PMCP_AUTH_TOKEN` reference refusal; grammar
-classes; token absent from child env and `os.environ`, `CREDENTIALS_DIRECTORY`
-stripped; `op` timeout/overflow kill and discard; concurrency cap; resolution
-outside the lock and before teardown; reconnect re-resolves; install-and-run path;
-redaction before truncation, JSON-escaped forms, log filter, summary; new auth
-states in every output schema; `credential_rejected` false-positive fixtures.
+Fake `op` executables in a trusted temporary directory (record argv/env, return
+fixed output, hang, overflow, fail with each stderr class). CI never calls
+1Password. Tests cover every case named in 3.1-3.10, including: FIFO token file;
+untrusted `op` ancestor; environment reference refused with zero `op` calls;
+`resolve_secret_refs` off keeps own-env `op://` and `OP_SERVICE_ACCOUNT_TOKEN`
+verbatim; overlay `extra_env` provenance; grammar examples in 3.3; restart failure
+leaves the running instance; config generation re-check; redaction before
+truncation, escaped forms, formatted log records; inventory tests
+(`tests/test_store_reader_inventory.py`, `tests/test_credential_parity.py`).
 
 ```bash
-# dev0: affected files only, at most -n 2, after the AGENTS.md headroom check.
-uv run --locked python scripts/pytest_temp.py -- tests/test_secret_refs.py tests/test_env_store.py -q
-# Full suite: on ai under systemd-run MemoryMax, or hosted CI (AGENTS.md),
-# with isolated HOME and evidence outside scratch (plans/verification-template.md).
+# dev0: affected files only, at most -n 2, after the AGENTS.md headroom check,
+# with an isolated HOME and evidence outside scratch (plans/verification-template.md).
+ev=/path/to/owned/run-evidence; mkdir -p "$ev"
+HOME="$(mktemp -d)" uv run --locked python scripts/pytest_temp.py -- \
+  tests/test_secret_refs.py tests/test_env_store.py tests/test_store_reader_inventory.py \
+  tests/test_credential_parity.py -q --junitxml="$ev/junit.xml" > "$ev/pytest.log" 2>&1
+# Full suite: on ai under systemd-run MemoryMax, or hosted CI (AGENTS.md).
 ```
 
 Live check on Display-Server-01 after P6b: Bright Data through a reference;
 rotate the item; `restart_server`; the new key is used without a gateway restart;
 a revoked key gives `credential_rejected`.
 
-## 8. Open questions for the panel
+## 8. Open questions
 
-- Is refusing references in remote headers (rather than resolving them) the right
-  v1 boundary?
-- Is the default `op` executable search list acceptable, or should `op_path` be
-  required?
+None outstanding. Round 2 answered both: refuse references in remote headers in
+v1 (all seats), and keep a default `op` search list with root-owned paths first
+and ancestor checks, `op_path` as an override (Astra, Grok, Gemini, Claude).
 
-## 9. Round-1 findings and their disposition
+## 9. Decisions taken in revision 3 without the owner
+
+- Existing child-side resolution keeps working (3.2.4): pmcp resolves only
+  credential lookups and servers that opt in. Chosen over declaring child-side
+  resolution unsupported, because it keeps G6 and needs no migration.
+
+## 10. Findings and their disposition
+
+Round 1 (all four seats) is mapped in revision 2's section 9; those changes are
+kept. Round 2:
 
 | Finding (seat) | Change |
 |---|---|
-| Rotation keyed on membership, not origin; auth_connect misdescribed (Astra 1, Grok B1, Gemini B6, Claude B7, N9) | 3.6 origin snapshot, strict re-read, no stale fallback, auth_connect semantics stated; 1.5 corrected |
-| Env-var token source contradicts the decision (Astra 2, Claude B6) | Removed (3.1) |
-| Token-file read checks (Astra 2, Grok B3, Gemini B4, Claude N11) | Descriptor read, owner/mode, 0400 allowed, identity reload (3.1) |
-| `CREDENTIALS_DIRECTORY` leak; store files planting `OP_*` (Gemini B1) | Stripped and never-loaded (3.1) |
-| Project/tenant provenance unenforceable; opt-in conflict (Astra 3, Grok B2, Claude B1) | Provenance carried to spawn; untrusted sources refused; no opt-in (3.2) |
-| Agent and sync write paths as confused deputy (Claude B2, Gemini B2) | `auth_connect` and `sync` refuse references (3.2) |
-| pmcp's own variables (Claude B5) | Refused; `PMCP_AUTH_TOKEN` stops startup (3.2) |
-| Malformed/unsupported references passed through; remote headers (Astra 4, Grok B4, Claude B4, Gemini NB1) | Three-class grammar, refusal, remote refusal (3.2, 3.3) |
-| `op` executable, lifecycle, caching, daemon (Astra 5, Gemini B5, Claude N4) | Trusted path, `--cache=false`, bounded readers, kill/reap (3.4) |
-| Install-and-run provision path, reconnect, update_server (Gemini B5, Claude B3) | All spawn paths (3.5) |
-| Restart outage and global lock (Claude N2) | Resolve before teardown, outside the lock (3.5) |
-| Redaction off by default, after truncation, escaped forms, sinks (Gemini B3, Astra 8, Claude N6) | Unconditional, before truncation, escaped forms, log filter (3.7) |
-| `credential_rejected` heuristic false positives; auth_check exfiltration (Astra 6, Grok B5, Gemini B7-B8, Claude B8, N7) | Provider-specific evidence only; shipped-manifest pinned check (3.8) |
-| Phasing and release order; LoadCredential absent file (Astra 7, Grok B6, Gemini B9, Claude N10) | P5 release before P6 dotfiles; credstore without `:PATH`; migrate-op refuses unsupported gateways (3.10, 4) |
-| Windows/macOS (Grok N3, Gemini B10) | POSIX only; Windows unsupported in v1 (3.1) |
-| Rate limits (all seats) | 3.9 |
-| Env-builder inventory test (Grok N1) | `op_subprocess_env` in `ENV_BUILDERS` (3.4) |
-| Doctor leak check uses runtime name (Grok N2) | 3.10 |
-| Short values vs `otp` (Gemini B3) | Queries unsupported in v1; <8 chars refused (3.3, 3.4) |
+| Rotation: keys added after start, availability reload, `~/.env`, lstat identity, interpolation, removed-key result, loader swallowing errors (Astra B1, Gemini R2-B2, Claude R2-B1) | 3.6 rewritten: origin at every insertion, reload removed, `home_dotenv` class, stat+lstat identity, interpolation context, terminal removal, propagation |
+| References through the process environment; launchers that source `pmcp.env`; capability gate (Grok B1, Claude R2-B2, Gemini NB1) | 3.2.2 refuses environment references; P6a changes all three launchers; 3.10 `secret_refs` capability gates migration and P6b |
+| P2 breaks child-side resolution (Claude R2-B3) | 3.2.1, 3.2.4: resolve only lookups and opted-in servers |
+| CLI cannot find the token on P6a hosts; on-demand lookup; credential snapshot (Gemini R2-B1, Claude R2-B4) | 3.1: on-demand, credstore path 2 shared by CLI and unit, snapshot documented |
+| Overlay `extra_env` provenance; unclassified sources (Gemini R2-B3) | 3.2.3 `extra_env_sources`; 3.2.2 classifies environment, `~/.env`, `$PMCP_MANIFEST_PATH` |
+| Grammar contradiction; leading-space spoof (Astra B2, Gemini R2-B4, Grok N1) | 3.3: classify first, one reference grammar, examples |
+| Token FIFO; `op` ancestor trust; search order (Astra B3, Grok open question) | 3.1 `O_NONBLOCK`; 3.4 ancestor checks, root paths first, explicit path fails closed |
+| Teardown site and lock callers (Grok B1, Astra N1, Gemini NB3) | 3.5 names `restart_server`, generation re-check, semaphore and single-flight rules |
+| Don't publish references into `os.environ` (Grok N2) | 3.2.5 |
+| Redaction sinks and ordering (Astra N2, Grok N3, Claude R2-N7) | 3.7 |
+| `credential_rejected` clearing and precedence (Astra N3, Gemini NB2) | 3.8 |
+| Real compare-and-swap (Astra N4) | 3.10 writer lock |
+| Verification command; compatibility gate; docs; inventory tests (Astra N5, Gemini NB4, NB5) | 7, 3.10, 4 |
+| Citations: policy, installer, `repository_may_supply`, `_NEVER_LOADED`, credstore search (Grok N3-N6) | Corrected in 3.1, 3.2.5, 3.5, 3.7, P6a |
