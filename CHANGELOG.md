@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Lock `opentelemetry-api` (pulled in by `mcp`) at 1.45.2 for GHSA-mf5v-w3w3-f6cg; the locked-dependency audit failed on 1.45.1.
+
 ## [3.0.3] - 2026-11-07
 
 ### Fixed
