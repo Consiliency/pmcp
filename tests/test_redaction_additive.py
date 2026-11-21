@@ -960,6 +960,13 @@ LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
     "auth-param comma, a fold, a long indent": lambda n: "Authorization: X a=1,\n" + " " * n + '"',
     "auth-param, a long space run, a fold, no comma": lambda n: "Authorization: X a=1" + " " * n + "\n x",
     "auth-params with folds and semicolons": lambda n: ("Authorization: X a=1, b=2;c" + " " * 50 + ",\n  ") * (n // 80),
+    # Consiliency/pmcp#485: bare credential params and space-joined runs
+    "bare credential params after many anchors": lambda n: "Authorization: Digest response=ab12cd34 " * (n // 40),
+    "one long space-joined run": lambda n: 'Authorization: X response="a"' + " nonce=x" * (n // 8),
+    "space-joined runs not taken, one line": lambda n: "authorization=none username=bob realm=corp " * (n // 43),
+    "space-joined names without a value": lambda n: 'Authorization: X response="a"' + " nonce" * (n // 6),
+    "a known param, then a long space run": lambda n: "Authorization: X response=ab1" + " " * n + "x",
+    "space-joined runs before an unterminated quote": lambda n: "authorization=none username=bob x=\"" + "authorization: s username=bob y=\"" * (n // 33),
     # Consiliency/pmcp#478: escape views over the raw input, carried spans
     "escaped quotes before a key": lambda n: '\\"' * (n // 2) + '\\"token\\": \\"abc123\\"',
     "backslash run before an escaped key": lambda n: "\\\\" * (n // 2) + '\\"password\\": \\"x\\"',

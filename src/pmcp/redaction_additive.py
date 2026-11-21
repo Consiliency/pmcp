@@ -1492,6 +1492,19 @@ _KNOWN_AUTH_PARAMS = frozenset(
         "headers",
     }
 )
+#: The auth-param names whose value is the credential itself: Digest's
+#: `response`, AWS4's `Credential` and `Signature`, HTTP Signatures'
+#: `signature`, and OAuth 1's `oauth_signature` and `oauth_token`. One BARE
+#: param counts as a credential only under one of these names, and only
+#: when `_bare_value_shaped` accepts its value (Consiliency/pmcp#485): a
+#: truncated header can keep just `response=ab12cd34ef`.
+_CREDENTIAL_AUTH_PARAMS = frozenset(
+    {"response", "credential", "signature", "oauth_signature", "oauth_token"}
+)
+#: The start of a space-joined auth-param: whitespace on the same line, a
+#: name and `=`. Only the name is read before the name is checked, so a
+#: param that is not taken costs its name, never its value.
+_SPACE_JOINED_NAME_RE = re.compile(r"[^\S\r\n]+(?P<name>" + _TCHAR + r"+)=")
 #: A token68 credential, optionally wrapped in a quote or bracket, and
 #: optionally `id:secret` (`Token keyid:secret`, `SharedKey account:sig=`).
 _TOKEN68 = r"[A-Za-z0-9._~+/-]+=*"
@@ -1536,16 +1549,54 @@ def _credential_shaped(text: str, cred: str, after: int) -> bool:
     return True
 
 
+def _is_known_auth_param(name: str) -> bool:
+    """``name`` (lowercased) is a Digest, AWS4, HTTP Signatures or OAuth 1
+    auth-param name."""
+    return name in _KNOWN_AUTH_PARAMS or name.startswith("oauth_")
+
+
+def _bare_value_shaped(text: str, value: str, after: int) -> bool:
+    """Is the bare value of a `_CREDENTIAL_AUTH_PARAMS` param a credential?
+    What `_credential_shaped` accepts, less any single-case or Titlecase
+    all-letter word: a log's `signature=mismatch` or `response=rejected` is
+    a status, while a Digest response, a signature or an access key id holds
+    a digit or mixed case."""
+    if value.isalpha() and _is_single_case(value):
+        return False
+    return _credential_shaped(text, value, after)
+
+
+def _param_counts(text: str, params: re.Match[str]) -> bool:
+    """Does one auth-param on its own make the run it is in a credential:
+    a quoted value under a known name, or a bare value under a credential
+    name that `_bare_value_shaped` accepts?"""
+    name = params.group("name").lower()
+    value = params.group("value")
+    if value.startswith('"'):
+        return _is_known_auth_param(name)
+    return name in _CREDENTIAL_AUTH_PARAMS and _bare_value_shaped(
+        text, value, params.end("value")
+    )
+
+
 def _authorization_credential_spans(text: str) -> list[Span]:
     """The credential after `Authorization: <scheme>`, for any scheme: an
-    auth-param list (two or more comma-joined params, or one quoted param
-    with a known auth-param name), or a token68 run (bare, wrapped in a
-    quote or bracket, or `id:secret`) that `_credential_shaped` accepts.
-    Spans cover the credential only, never the key or the scheme.
+    auth-param list, or a token68 run (bare, wrapped in a quote or bracket,
+    or `id:secret`) that `_credential_shaped` accepts. Spans cover the
+    credential only, never the key or the scheme.
+
+    An auth-param list is two or more comma-joined params; or a run of
+    known-name params, joined by commas or (not RFC 7616, but hand-written
+    logs and some clients do it) by spaces on the same line, in which one
+    param counts on its own (`_param_counts`: a quoted known-name param,
+    or a bare `response=`, `Signature=`, ... value that is credential-
+    shaped; Consiliency/pmcp#485). A run stops at the first space-joined
+    param with another name (`realm="r" status=200`).
 
     Every attempt starts on a literal `authorization`; the params scan is
     bounded by its line and the token68 scan by its run, and a span moves
-    the next search past itself."""
+    the next search past itself. A space-joined param's value is read only
+    after its name is known."""
     work(len(text))  # the anchor search
     spans: list[Span] = []
     position = 0
@@ -1558,13 +1609,25 @@ def _authorization_credential_spans(text: str) -> list[Span]:
         params = _AUTH_PARAMS_RE.match(text, start)
         if params is not None:
             work(params.end() - start)
-            name = params.group("name").lower()
-            if params.group("more") or (
-                params.group("value").startswith('"')
-                and (name in _KNOWN_AUTH_PARAMS or name.startswith("oauth_"))
-            ):
-                spans.append((start, params.end(), REDACTED))
-                position = params.end()
+            end = params.end()
+            counts = bool(params.group("more")) or _param_counts(text, params)
+            if _is_known_auth_param(params.group("name").lower()):
+                # the known-name params space-joined after it, on its line
+                while (joined := _SPACE_JOINED_NAME_RE.match(text, end)) is not None:
+                    work(joined.end() - end)
+                    if not _is_known_auth_param(joined.group("name").lower()):
+                        break
+                    more = _AUTH_PARAMS_RE.match(text, joined.start("name"))
+                    if more is None:  # pragma: no cover - the name and `=` matched
+                        break
+                    work(more.end() - joined.end())
+                    counts = (
+                        counts or bool(more.group("more")) or _param_counts(text, more)
+                    )
+                    end = more.end()
+            if counts:
+                spans.append((start, end, REDACTED))
+                position = end
                 continue
         if text.startswith(REDACTED, start):
             continue  # a previous pass's marker (idempotence)
