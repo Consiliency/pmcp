@@ -140,11 +140,19 @@ recorded (the base pass's, then each policy pattern's). An
 Authorization-credential rule reads the raw text and every view.
 
 The credential rule takes a token68 credential after the scheme word, or an
-auth-param list: two or more comma-joined `name=value` parameters, or one
-quoted parameter with a known Digest, OAuth, AWS4 or HTTP Signatures name. A
-bare value may hold `;` (AWS4's `SignedHeaders=host;x-amz-date`), and a comma
-may have one obs-fold on either side (RFC 7616 lays out one parameter per
-line).
+auth-param list: two or more comma-joined `name=value` parameters, or a run
+of parameters with known Digest, OAuth, AWS4 or HTTP Signatures names in
+which one parameter counts on its own. A parameter counts when its value is
+quoted, or when it is bare under a credential name (`response`,
+`Credential`, `Signature`, `oauth_signature`, `oauth_token`) and its value
+is credential-shaped: not a number, date or time, not a run without a letter
+or digit, not a URL, and not a single-case or Titlecase all-letter word
+(`signature=mismatch` is a log's status). The run may be joined by commas
+or, as hand-written logs and some clients do (not RFC 7616), by spaces on
+the same line; it stops at the first space-joined parameter with another
+name (Consiliency/pmcp#485). A bare value may hold `;` (AWS4's
+`SignedHeaders=host;x-amz-date`), and a comma may have one obs-fold on
+either side (RFC 7616 lays out one parameter per line).
 
 This partly addresses Consiliency/pmcp#417: its repro (a secret-named query
 key in a URL spelled with `\/` inside a JSON string) is withheld at every
@@ -175,18 +183,21 @@ noted, so a fix has to flip it on purpose. Main keeps every kept value too:
   12345678`, `2026-11-07`, `10:30:15`);
 - a malformed token68 split by a comma (`Basic Zm9v,OmJhcg`: `OmJhcg` reads
   as the next list item);
-- a single unquoted auth-param after the scheme
-  (`Authorization: Digest response=ab12cd34ef`,
-  `Authorization: AWS4-HMAC-SHA256 Signature=ab12cd34ef`): the owner's rule
-  takes two or more comma-joined parameters, or one quoted parameter with a
-  known name. A truncated header can end up like this;
-- auth-params joined by spaces instead of commas (not RFC 7616):
-  only a first, quoted, known-name parameter is taken, and the rest stay;
+- a single bare auth-param under a credential name whose value is one
+  single-case all-letter word (`Authorization: Digest
+  response=qzhunterwombat`), so that `signature=mismatch` stays a status;
+- space-joined auth-params after a parameter with another name
+  (`username="bob" x-trace=…`: the run stops there), and space-joined
+  parameters on the next line after an obs-fold without a comma;
 - over-redaction: a token68-shaped word after the scheme is redacted even in
   prose (`Authorization: denied user_id`), and so are two or more
   comma-joined `name=value` fields after it
-  (`authorization=none user=bob, retry=2`) and one quoted field with a known
-  auth-param name (`authorization=none realm="internal"`);
+  (`authorization=none user=bob, retry=2`), one quoted field with a known
+  auth-param name (`authorization=none realm="internal"`), one bare
+  credential-named field with a credential-shaped value
+  (`authorization=ok signature=ab12cd34ef`), and the known-name fields
+  space-joined after a field that counts
+  (`authorization=denied username=bob response=ab12cd34ef` withholds `bob`);
 - inside the depth cap, two contrived shapes are withheld at depth 0 but not
   at depth 1, as on main (`test_disclosed_escaped_residuals`): a second
   `Authorization` key read as the first one's quoted value

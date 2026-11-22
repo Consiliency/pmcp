@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Redaction now withholds the credential in `Authorization: <scheme> …` (and `Proxy-Authorization`) when it is a single bare parameter under a credential name (`Digest response=…`, `AWS4-HMAC-SHA256 Signature=…` or `Credential=…`, `oauth_signature=…`, `oauth_token=…`), as a truncated header can leave it, and when known Digest, OAuth, AWS4 or HTTP Signatures parameters are joined by spaces instead of commas (`Digest username="bob" realm="r" response="…"`), on `sanitize_auth_diagnostic`, `PolicyManager.redact_secrets` and both `process_output` forms, including JSON-escaped text. A bare value that is a number, a date, a time, a URL or a single-case or Titlecase word is kept (`signature=mismatch`), a space-joined run stops at the first parameter with another name, and `authorization=none reason="no header"` is unchanged. Benign log fields that are now redacted: one bare credential-named field with a credential-shaped value (`authorization=ok signature=ab12cd34ef`), and known-name fields space-joined after a field that counts. See `docs/redaction-401-narrow.md` (Consiliency/pmcp#485).
+
 ### Security
 
 - Lock `opentelemetry-api` (pulled in by `mcp`) at 1.45.2 for GHSA-mf5v-w3w3-f6cg; the locked-dependency audit failed on 1.45.1.

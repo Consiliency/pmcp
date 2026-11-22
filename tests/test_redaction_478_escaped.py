@@ -545,7 +545,40 @@ AUTH_PARAM_CASES = [
         '  headers="(request-target) date",\n  signature="quokkaWombat9"',
         ["quokkaWombat9"],
     ),
-]
+    # Consiliency/pmcp#485: one bare param under a credential name (a
+    # truncated header can keep just one), and params joined by spaces
+    ("Authorization: Digest response=ab12cd34ef", ["ab12cd34ef"]),
+    ("Authorization: AWS4-HMAC-SHA256 Signature=ab12cd34ef", ["ab12cd34ef"]),
+    (f"Authorization: Digest response={_RESPONSE}", [_RESPONSE]),
+    (
+        "Authorization: AWS4-HMAC-SHA256 Credential=AKIAQZHUNTER/20261107/us-east-1/s3/aws4_request",
+        ["AKIAQZHUNTER"],
+    ),
+    ("Authorization: OAuth oauth_signature=quokkaWombat9", ["quokkaWombat9"]),
+    ("Authorization: OAuth oauth_token=quokkaWombat9", ["quokkaWombat9"]),
+    ("Proxy-Authorization: Digest response=ab12cd34ef", ["ab12cd34ef"]),
+    ("Authorization: Digest response=ab12cd34ef was rejected", ["ab12cd34ef"]),
+    ('Authorization: Digest username="bob" realm="r" response="ab12cd34ef"', ["bob", "ab12cd34ef"]),
+    ('Proxy-Authorization: Digest username="bob" realm="r" response="ab12cd34ef"', ["ab12cd34ef"]),
+    (
+        f'Authorization: Digest username=bob realm=r nonce=n1 uri=/x cnonce={_CNONCE} response={_RESPONSE}',
+        ["bob", _CNONCE, _RESPONSE],
+    ),
+    (
+        f'Authorization: Digest username="bob", realm="r" nc=00000001 cnonce="{_CNONCE}", response="{_RESPONSE}"',
+        [_CNONCE, _RESPONSE],
+    ),
+    (
+        f"Authorization: AWS4-HMAC-SHA256 Credential=AKIAQZHUNTER/20261107/us-east-1/s3/aws4_request "
+        f"SignedHeaders=host;x-amz-date Signature={_SIGV4}",
+        ["AKIAQZHUNTER", _SIGV4],
+    ),
+    (
+        'Authorization: Signature keyId="k1" algorithm="hmac-sha256" signature="quokkaWombat9"',
+        ["quokkaWombat9"],
+    ),
+    ('Authorization: Digest username="bob"\tresponse="ab12cd34ef"', ["ab12cd34ef"]),
+]  # fmt: skip
 
 
 @pytest.mark.parametrize("depth", DEPTHS)
@@ -645,6 +678,25 @@ BENIGN_AUTH = [
     "Authorization: Basic (none)",
     "Authorization: Basic [empty]",
     "Authorization: none; retry later",
+    # Consiliency/pmcp#485 look-alikes: a bare credential-named field whose
+    # value is a status word, a number or empty; a bare field under another
+    # known name; known-name fields joined by spaces with no quoted value and
+    # no credential; and a space-joined run that starts on another name
+    "authorization=failed signature=mismatch",
+    "authorization=failed signature=Mismatch request_id=abc123",
+    "authorization=ok response=rejected",
+    "authorization=none credential=EXPIRED",
+    "authorization=none signature=missing",
+    "authorization=denied response=403",
+    "Authorization: Digest response=2026-11-07",
+    "authorization=none response=-- retry",
+    "authorization=none realm=corp-1",
+    "authorization=none algorithm=SHA-256",
+    "authorization=none realm=internal",
+    "ts=1 authorization=denied username=bob realm=corp",
+    "authorization=denied username=bob realm=corp nonce=abc123",
+    "authorization=none user=bob response=ab12cd34ef",
+    "authorization=none reason=\"no header\" signature=ab12cd34ef",
 ]  # fmt: skip
 
 BENIGN_ORACLES: dict[str, Callable[[str], object]] = {
@@ -721,12 +773,13 @@ KEPT_RESIDUALS = [
     ("Authorization: Pin 10:30:15", "10:30:15"),
     # a malformed token68 split by a comma: the rest reads as a list item
     ("Authorization: Basic Zm9v,OmJhcg", "OmJhcg"),
-    # one unquoted auth-param (owner Q2: two or more, or a quoted known name)
-    ("Authorization: Digest response=ab12cd34ef", "ab12cd34ef"),
-    ("Authorization: AWS4-HMAC-SHA256 Signature=ab12cd34ef", "ab12cd34ef"),
-    # auth-params joined by spaces, not commas (not RFC 7616): only the
-    # first, quoted, known-name param is taken
-    ('Authorization: Digest username="bob" realm="r" response="ab12cd34ef"', "ab12cd34ef"),
+    # one bare param under a credential name whose value is one single-case
+    # word (Consiliency/pmcp#485: `signature=mismatch` is a log's status)
+    ("Authorization: Digest response=qzhunterwombat", "qzhunterwombat"),
+    # a space-joined param under another name ends the run
+    ('Authorization: Digest username="bob" x-trace=ab12cd34ef', "ab12cd34ef"),
+    # space-joined params on the next line, after an obs-fold without a comma
+    ('Authorization: Digest username="bob"\n  response="ab12cd34ef"', "ab12cd34ef"),
     # a URL as a credential: a token68 run holding `://` is not taken
     ("Authorization: Basic https://quokkawombat9.test/x", "https://quokkawombat9.test/x"),
 ]  # fmt: skip
@@ -739,6 +792,12 @@ OVER_REDACTED_RESIDUALS = [
     ("authorization=none user=bob, retry=2", "bob"),
     # one quoted field with a known auth-param name (owner r2 decision)
     ('authorization=none realm="internal"', "internal"),
+    # Consiliency/pmcp#485: one bare credential-named field with a
+    # credential-shaped value, and the known-name fields space-joined
+    # after a field that counts
+    ("authorization=ok signature=ab12cd34ef", "ab12cd34ef"),
+    ('authorization=none realm="internal" nonce=n1', "n1"),
+    ("authorization=denied username=bob response=ab12cd34ef", "bob"),
 ]
 
 
@@ -791,7 +850,10 @@ def test_mutant_params_gate_accepts_one_bare_param(
 ) -> None:
     """A source-patched rule that accepts any single param: the logfmt
     guards change (`authorization=none user=bob status=200`)."""
-    mutant = _patched_rule('if params.group("more") or (', "if True or (")
+    mutant = _patched_rule(
+        'counts = bool(params.group("more")) or _param_counts(text, params)',
+        "counts = True",
+    )
     monkeypatch.setattr(A, "_authorization_credential_spans", mutant)
     assert E("authorization=none user=bob status=200") != _main_e(
         "authorization=none user=bob status=200"
@@ -801,12 +863,63 @@ def test_mutant_params_gate_accepts_one_bare_param(
 def test_mutant_any_quoted_param_counts(monkeypatch: pytest.MonkeyPatch) -> None:
     """The r2 prototype's rule (any single quoted value): re-check S1's
     quoted logfmt fields change."""
-    mutant = _patched_rule(
-        'and (name in _KNOWN_AUTH_PARAMS or name.startswith("oauth_"))', "and True"
+    real = A._param_counts
+    monkeypatch.setattr(
+        A,
+        "_param_counts",
+        lambda text, params: params.group("value").startswith('"')
+        or real(text, params),
     )
-    monkeypatch.setattr(A, "_authorization_credential_spans", mutant)
     text = 'authorization=none reason="no header"'
     assert E(text) != _main_e(text)
+
+
+#: Consiliency/pmcp#485 guards, each flipped by the mutant that drops it.
+_485_GUARD_MUTANTS = [
+    # a bare credential-named value that is one single-case word is a status
+    ("_bare_value_shaped", lambda: A._credential_shaped, "authorization=failed signature=mismatch"),
+    # a bare param counts only under a credential name
+    ("_CREDENTIAL_AUTH_PARAMS", lambda: A._KNOWN_AUTH_PARAMS, "authorization=none realm=corp-1"),
+    # a space-joined run holds known names only
+    ("_is_known_auth_param", lambda: (lambda name: True), "authorization=none user=bob response=ab12cd34ef"),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(("attr", "replacement", "text"), _485_GUARD_MUTANTS)
+def test_mutant_485_guards(
+    monkeypatch: pytest.MonkeyPatch,
+    attr: str,
+    replacement: Callable[[], object],
+    text: str,
+) -> None:
+    assert text in BENIGN_AUTH
+    assert E(text) == _main_e(text)
+    monkeypatch.setattr(A, attr, replacement())
+    assert E(text) != _main_e(text)
+
+
+def test_mutant_space_joined_run_ignores_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A source-patched rule whose space-joined run takes any name: a
+    logfmt field after a quoted known-name field is withheld."""
+    mutant = _patched_rule(
+        'if not _is_known_auth_param(joined.group("name").lower()):', "if False:"
+    )
+    text = 'authorization=none realm="internal" status=200'
+    assert "status=200" in E(text)
+    monkeypatch.setattr(A, "_authorization_credential_spans", mutant)
+    assert "status=200" not in E(text)
+
+
+def test_mutant_no_space_joined_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A source-patched rule without the space-joined run: the #485 shape
+    leaks again."""
+    mutant = _patched_rule(
+        'if _is_known_auth_param(params.group("name").lower()):', "if False:"
+    )
+    text = 'Authorization: Digest username="bob" realm="r" response="ab12cd34ef"'
+    assert "ab12cd34ef" not in E(text)
+    monkeypatch.setattr(A, "_authorization_credential_spans", mutant)
+    assert "ab12cd34ef" in E(text)
 
 
 # ======================================================== composition ==== #
