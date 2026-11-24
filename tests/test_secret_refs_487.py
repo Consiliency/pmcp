@@ -1941,8 +1941,8 @@ def test_gateway_refresh_keeps_a_running_server_whose_lookup_fails(
     real = ClientManager(project_root=host.root)
 
     class Manager(MockClientManager):
-        async def prepare_configs(self, configs: list[Any]) -> Any:
-            return await real.prepare_configs(configs)
+        async def prepare_validated(self, configs: list[Any]) -> Any:
+            return await real.prepare_validated(configs)
 
     manager = Manager()
     manager.add_connected_server(
@@ -2449,3 +2449,140 @@ def test_doctor_says_the_systemd_copy_is_not_visible(host: Host) -> None:
     host.write_token()
     text = _doctor_text()
     assert "not visible from this process" in text
+
+
+# =========================================================================== #
+# Round 3 of the panel on Consiliency/pmcp#499
+# =========================================================================== #
+
+
+def _refresh_with_a_concurrent_replacement(
+    host: Host,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    replacement_fails: bool,
+) -> tuple[Any, Any, ResolvedServerConfig]:
+    """``gateway.refresh`` through the real handler and the real manager's
+    preparation; while the disk config resolves, ANOTHER path publishes a
+    different config for the same name (R3-N1)."""
+    from pmcp.client.manager import ClientManager
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+    from tests.test_tools import MockClientManager
+
+    host.write_token()
+    host.write_store(f"{NAMESPACED}={REF}\n")
+    _start(host)
+    cfg = host.home / "pmcp.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "brightdata": {"command": "npx", "args": ["-y", "@brightdata/mcp"]}
+                }
+            }
+        )
+    )
+    real = ClientManager(project_root=host.root)
+    replacement = ResolvedServerConfig(
+        name="brightdata",
+        source="custom",
+        config=LocalMcpServerConfig(
+            command="npx", args=["-y", "@brightdata/mcp@2"], env={LEGACY: REF}
+        ),
+        credential_sources={LEGACY: "user_store"},
+    )
+    original = real.prepare_spawn
+
+    async def racing(config: Any) -> Any:
+        if config is replacement:
+            if replacement_fails:
+                raise CredentialUnavailableError(cs.AUTH_FAILED)
+            return await original(config)
+        result = await original(config)
+        real.publish_config(replacement)  # e.g. a restart_server meanwhile
+        return result
+
+    monkeypatch.setattr(real, "prepare_spawn", racing)
+
+    class Manager(MockClientManager):
+        async def prepare_validated(self, configs: list[Any]) -> Any:
+            return await real.prepare_validated(configs)
+
+        async def connect_all(
+            self, configs: list[Any], retry: bool = True, *, prepared: Any = None
+        ) -> list[str]:
+            return await super().connect_all(configs, retry)
+
+    manager = Manager()
+    manager.add_connected_server(
+        ResolvedServerConfig(
+            name="brightdata",
+            source="custom",
+            config=LocalMcpServerConfig(
+                command="npx", args=["-y", "@brightdata/mcp@0.9"]
+            ),
+        )
+    )
+    tools = GatewayTools(
+        client_manager=manager, policy_manager=PolicyManager(), custom_config_path=cfg
+    )
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_enabled_auto_start", lambda **_: {"brightdata"}
+    )
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_disabled_auto_start", lambda **_: set()
+    )
+    monkeypatch.setattr(tools, "_load_provisioned_registry", lambda: {})
+    out = _run(tools.refresh({"reason": "test"}))
+    return manager, out, replacement
+
+
+def test_gateway_refresh_validates_before_teardown_and_keeps_on_failure(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3-N1: the replacement published during preparation fails its lookup:
+    nothing is torn down, the server stays online, the typed reason is
+    returned."""
+    manager, out, _replacement = _refresh_with_a_concurrent_replacement(
+        host, monkeypatch, replacement_fails=True
+    )
+    assert manager.is_server_online("brightdata")
+    assert not any("disconnect" in str(event) for event in manager.events)
+    assert any("auth_failed" in e for e in out.errors)
+
+
+def test_gateway_refresh_starts_the_replacement_when_it_resolves(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3-N1 success case: the replacement resolves, so it is what starts."""
+    manager, out, replacement = _refresh_with_a_concurrent_replacement(
+        host, monkeypatch, replacement_fails=False
+    )
+    assert not any("credential_unavailable" in e for e in out.errors or [])
+    assert manager.connected_configs[-1] is replacement
+
+
+def test_the_lifecycle_rechecks_a_stored_host_reason(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3-N2: ``gateway.connect_server`` for a manifest entry loaded without
+    its token reports the typed refusal; once the token is installed the
+    lifecycle proceeds to connect."""
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+    from tests.test_tools import MockClientManager
+
+    host.write_store(f"{NAMESPACED}={REF}\n")
+    _start(host)
+    manager = MockClientManager()
+    tools = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
+    monkeypatch.setattr(tools, "_load_provisioned_registry", lambda: {})
+    refused = _run(tools.connect_server({"server_name": "brightdata"}))
+    assert not refused.ok
+    assert refused.auth_state == "credential_unavailable"
+    assert "op_not_configured" in json.dumps(refused.model_dump(mode="json"))
+    assert not any(str(e).startswith("connect_server:") for e in manager.events)
+    host.write_token()
+    _run(tools.connect_server({"server_name": "brightdata"}))
+    assert "connect_server:brightdata" in manager.events

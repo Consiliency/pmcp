@@ -2304,11 +2304,22 @@ class GatewayTools:
             prepare_errors: list[str] = []
             prepare_failed: set[str] = set()
             if with_references:
-                (
-                    prepared,
-                    prepare_errors,
-                    prepare_failed,
-                ) = await self._client_manager.prepare_configs(with_references)
+                # The shared pre-teardown discipline (#499 r3 R3-N1): each
+                # resolution is checked under the lifecycle lock against the
+                # config published now, BEFORE the disconnect loop below; a
+                # replaced config is re-resolved once against its replacement.
+                # A name held (a lookup failure, or changed twice) keeps its
+                # running instance and is not connected.
+                validated = await self._client_manager.prepare_validated(
+                    with_references
+                )
+                prepared = validated.secrets
+                prepare_errors = validated.errors
+                prepare_failed = set(validated.held)
+                replacements = {config.name: config for config in validated.configs}
+                to_connect = [
+                    replacements.get(config.name, config) for config in to_connect
+                ]
             if prepare_failed:
                 to_disconnect = [
                     name

@@ -322,6 +322,20 @@ def _log_abandoned_owner_failure(name: str, task: asyncio.Future[Any]) -> None:
     )
 
 
+class ValidatedSpawns(NamedTuple):
+    """What :meth:`ClientManager.prepare_validated` hands a replacing path."""
+
+    #: The configs to start: each replacement in place of what it superseded.
+    configs: list[ResolvedServerConfig]
+    #: Their resolutions, by name.
+    secrets: dict[str, SpawnSecrets]
+    #: Value-free error messages.
+    errors: list[str]
+    #: Names whose running instance is KEPT and that are not started:
+    #: name -> typed reason (a lookup failure, or ``config_changed``).
+    held: dict[str, str]
+
+
 def _with_overlay(
     secrets: dict[str, SpawnSecrets] | None, name: str
 ) -> SpawnSecrets | None:
@@ -1777,6 +1791,12 @@ class ClientManager:
         value-free). A config the loader marked ``credential_unavailable``
         fails with that reason -- except a host reason (the token file, the
         platform), which is looked up again now (plan 3.1, #499 r1 N5).
+
+        When that host reason no longer holds, it is CLEARED on ``config``
+        itself -- the shared published or lazy object -- so the spawn check
+        proceeds (#499 r2 A6, r3 R3-N3). Harmless: a token lost again fails
+        this resolution with the same host reason, a config-intrinsic reason
+        is never cleared, and the fingerprint does not include it.
         """
         generation = self._config_generations.get(config.name, 0)
         fingerprint = self._fingerprint(config)
@@ -1833,12 +1853,12 @@ class ClientManager:
         self,
         configs: list[ResolvedServerConfig],
         prepared: dict[str, SpawnSecrets] | None = None,
-    ) -> tuple[dict[str, SpawnSecrets], list[str], set[str]]:
+    ) -> tuple[dict[str, SpawnSecrets], list[str], dict[str, str]]:
         """Resolve every config (concurrently, bounded by the ``op`` cap).
 
         ``prepared``: resolutions a caller already made (``gateway.refresh``
         resolves before its disconnect loop). Returns
-        ``(secrets by name, error messages, names that failed)``.
+        ``(secrets by name, error messages, failed name -> typed reason)``.
         """
         secrets: dict[str, SpawnSecrets] = {}
         todo: list[ResolvedServerConfig] = []
@@ -1860,24 +1880,71 @@ class ClientManager:
 
         results = await asyncio.gather(*(prepare_one(config) for config in todo))
         errors: list[str] = []
-        failed: set[str] = set()
+        failed: dict[str, str] = {}
         for config, result in zip(todo, results):
             if isinstance(result, str):
                 errors.append(self._record_unavailable(config.name, result))
-                failed.add(config.name)
+                failed[config.name] = result
             else:
                 secrets[config.name] = result
         return secrets, errors, failed
 
-    async def prepare_configs(
-        self, configs: list[ResolvedServerConfig]
-    ) -> tuple[dict[str, SpawnSecrets], list[str], set[str]]:
-        """Publish ``configs`` and resolve them now, outside the lifecycle
-        lock, for a later ``connect_all(..., prepared=...)``
-        (``gateway.refresh``)."""
-        for config in configs:
-            self.publish_config(config)
-        return await self._prepare_configs(configs)
+    async def prepare_validated(
+        self, configs: list[ResolvedServerConfig], *, publish: bool = True
+    ) -> ValidatedSpawns:
+        """THE pre-teardown discipline of every lifecycle path that replaces a
+        running server: ``gateway.refresh``, ``ClientManager.refresh`` and
+        ``restart_server`` (plan 3.5; #499 r2 A5, r3 R3-N1).
+
+        Publishes ``configs`` (unless ``publish`` is false), resolves them
+        outside the lifecycle lock, then -- under the lock, BEFORE the caller
+        tears anything down -- checks each resolution against the config
+        published now. A config replaced while it resolved is re-resolved
+        once, outside the lock, against the CURRENT published config, and
+        checked again. A second change (``config_changed``) or a failed
+        lookup puts the name in ``held``: the caller keeps its running
+        instance up and spawns nothing for it. The returned ``configs`` carry
+        each replacement in place of the config it superseded.
+        """
+        if publish:
+            for config in configs:
+                self.publish_config(config)
+        current = list(configs)
+        secrets, errors, failed = await self._prepare_configs(current)
+        held: dict[str, str] = dict(failed)
+        for attempt in range(2):
+            async with self._lifecycle_lock:
+                stale = {
+                    config.name
+                    for config in current
+                    if config.name not in held
+                    and config.name in secrets
+                    and self._stale(config, secrets[config.name])
+                }
+            if not stale:
+                break
+            if attempt == 1:
+                for name in sorted(stale):
+                    errors.append(self._record_unavailable(name, CONFIG_CHANGED))
+                    held[name] = CONFIG_CHANGED
+                break
+            replaced: list[ResolvedServerConfig] = []
+            for index, config in enumerate(current):
+                if config.name not in stale:
+                    continue
+                secrets.pop(config.name, None)
+                replacement = self._current_config(config.name)
+                if replacement is None:
+                    errors.append(self._record_unavailable(config.name, CONFIG_CHANGED))
+                    held[config.name] = CONFIG_CHANGED
+                    continue
+                current[index] = replacement
+                replaced.append(replacement)
+            more, more_errors, more_failed = await self._prepare_configs(replaced)
+            secrets.update(more)
+            errors += more_errors
+            held.update(more_failed)
+        return ValidatedSpawns(current, secrets, errors, held)
 
     async def _run_prepared(
         self,
@@ -2463,28 +2530,14 @@ class ClientManager:
         typed error -- no new spawn uses an old value, so this is not a
         fallback.
         """
-        self.publish_config(config)
         name = config.name
-        target = config
-        prepared: SpawnSecrets | None = None
-        for attempt in range(2):
-            try:
-                prepared = await self.prepare_spawn(target)
-            except CredentialUnavailableError as exc:
-                return self._restart_refused(name, exc.reason)
-            # Validated under the lifecycle lock BEFORE anything destructive
-            # (#499 r2 A5): a config replaced while it resolved leaves the
-            # running instance up; the CURRENT replacement is resolved once,
-            # outside the lock, and validated again.
-            async with self._lifecycle_lock:
-                stale = self._stale(target, prepared)
-            if not stale:
-                break
-            current = self._current_config(name)
-            if attempt == 1 or current is None:
-                return self._restart_refused(name, CONFIG_CHANGED)
-            target = current
-        assert prepared is not None
+        # Validated BEFORE anything destructive (#499 r2 A5): the shared
+        # discipline of every replacing path (prepare_validated).
+        validated = await self.prepare_validated([config])
+        if name in validated.held:
+            return self._restart_refused(name, validated.held[name])
+        target = validated.configs[0]
+        prepared = validated.secrets[name]
         disconnected, cancelled, error = await self.disconnect_server(name, force)
         if not disconnected:
             return (False, cancelled, [error or "Restart refused."])
@@ -5177,40 +5230,11 @@ class ClientManager:
         Every config's references are resolved first, outside the lock; the
         teardown follows only then (Consiliency/pmcp#487 plan 3.5).
         """
-        for config in configs:
-            self.publish_config(config)
-        secrets, errors, failed = await self._prepare_configs(configs)
-        configs = list(configs)
-        for attempt in range(2):
-            async with self._lifecycle_lock:
-                # Validated BEFORE the teardown (#499 r2 A5): a config replaced
-                # while it resolved is not torn down on this pass.
-                stale = {
-                    config.name
-                    for config in configs
-                    if config.name not in failed
-                    and self._stale(config, secrets[config.name])
-                }
-                if stale and attempt == 0:
-                    pass  # re-resolve the replacements outside the lock
-                else:
-                    for name in sorted(stale):
-                        errors.append(self._record_unavailable(name, CONFIG_CHANGED))
-                    return errors + await self._refresh_locked(
-                        configs, secrets, failed | stale
-                    )
-            replaced: list[ResolvedServerConfig] = []
-            for index, config in enumerate(configs):
-                if config.name in stale:
-                    current = self._current_config(config.name)
-                    if current is not None:
-                        configs[index] = current
-                        replaced.append(current)
-            more, more_errors, more_failed = await self._prepare_configs(replaced)
-            secrets.update(more)
-            errors += more_errors
-            failed |= more_failed
-        return errors  # pragma: no cover - the second pass always returns
+        validated = await self.prepare_validated(configs)
+        async with self._lifecycle_lock:
+            return validated.errors + await self._refresh_locked(
+                validated.configs, validated.secrets, set(validated.held)
+            )
 
     async def _refresh_locked(
         self,
