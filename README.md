@@ -1704,6 +1704,18 @@ at the next restart of the server, without restarting the gateway.
   empty one, or the literal reference.
 - **Remote servers**: a reference in a remote header is refused in this
   release.
+- **Agent-registered servers** (`gateway.register_discovered_server`) never
+  receive a resolved reference: their credential lookup refuses it
+  (`reference_not_allowed_here`). Plain values behave as before.
+- **Values**: a resolved value must be at least 8 characters, a single line
+  (no newline or NUL) and not itself a reference; anything else is
+  `output_invalid`. Multi-line secrets (PEM keys, JSON documents) cannot be
+  passed through a reference in this release.
+- `pmcp doctor` lists the token paths it searched, the one it uses (an
+  invalid file stops the search), and whether the systemd credential copy
+  differs from the credstore file (restart the unit after editing it) --
+  never the token or a digest -- and reports each `op://` credential and
+  each refused one by name, layer and reason.
 - `pmcp secrets set NAME op://...` writes only to the user store, and only
   once the serving HTTP gateway's `/health` reports the `secret_refs`
   capability (a token is usable and the gateway does not load `pmcp.env`

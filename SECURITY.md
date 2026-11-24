@@ -106,7 +106,10 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   covers raw and JSON-escaped forms only; a value a downstream server
   transforms (base64, split across messages) is not redacted. Windows is
   unsupported (`platform_unsupported`). A reference in a remote header is
-  refused, not resolved.
+  refused, not resolved. An agent-registered (discovered) server never
+  receives a resolved reference, whatever store holds it; it receives plain
+  values exactly as before, so consent and provisioning policy remain the
+  controls for those.
 
 - **The auth-URL host check filters IP literals only**: a public auth metadata
   or JWKS URL is rejected when its host is a non-public IP literal — private,

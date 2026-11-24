@@ -1550,7 +1550,7 @@ you write one:
   `OP_SERVICE_ACCOUNT_TOKEN`, `OP_CONNECT_TOKEN`, `OP_CONNECT_HOST`,
   `OP_CONFIG_DIR`, `OP_CACHE`, `OP_ACCOUNT`, `OP_SESSION_*` and
   `CREDENTIALS_DIRECTORY` are removed from pmcp's environment at startup,
-  ignored in `~/.env` and the user store, refused by `pmcp secrets set/sync`
+  ignored in `~/.env` and the user store, refused by `pmcp secrets set` and `pmcp secrets sync`
   and `gateway.auth_connect`, and no longer inherited by the servers pmcp
   starts. A server that needs its own token must name it in its own `env`.
 - A reference-shaped value in the user store or `~/.env` is no longer put
