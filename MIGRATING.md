@@ -1530,6 +1530,40 @@ chmod 600 ~/.config/pmcp/pmcp.env
 pmcp doctor
 ```
 
+### 1Password secret references (optional)
+
+In releases after 3.0.3 a user-store credential may be an `op://` reference,
+resolved by pmcp with a 1Password service account whose token is read from a
+file (see the README, "1Password secret references"). Nothing changes until
+you write one:
+
+- `op://` values already in a server's own `env` block (for example an
+  `op run` wrapper or a server given its own `OP_SERVICE_ACCOUNT_TOKEN`) are
+  passed through unchanged unless that server's entry in your own config sets
+  `"resolve_secret_refs": true`. A project `.mcp.json` cannot opt in.
+- A reference reached by a credential lookup was previously passed to the
+  server as a literal key, which never worked; it is now resolved when it is
+  in your user store and refused otherwise (`credential_unavailable`,
+  `reference_not_allowed_here`).
+- **pmcp never takes the service-account token, or any `OP_*` control
+  variable, from the environment or a file it loads**:
+  `OP_SERVICE_ACCOUNT_TOKEN`, `OP_CONNECT_TOKEN`, `OP_CONNECT_HOST`,
+  `OP_CONFIG_DIR`, `OP_CACHE`, `OP_ACCOUNT`, `OP_SESSION_*` and
+  `CREDENTIALS_DIRECTORY` are removed from pmcp's environment at startup,
+  ignored in `~/.env` and the user store, refused by `pmcp secrets set/sync`
+  and `gateway.auth_connect`, and no longer inherited by the servers pmcp
+  starts. A server that needs its own token must name it in its own `env`.
+- A reference-shaped value in the user store or `~/.env` is no longer put
+  into pmcp's environment, so no server inherits it. pmcp's own variables are
+  never references: a reference-shaped `PMCP_*` value is ignored with a
+  warning, and an HTTP gateway whose `PMCP_AUTH_TOKEN` (or `--auth-token`,
+  `--auth-token-file`) is a reference refuses to start.
+- If your gateway service loads `pmcp.env` with `EnvironmentFile=` (or a
+  launcher sources it), references written there arrive through the
+  environment and are refused, and `/health` does not report `secret_refs`.
+  Stop loading `pmcp.env` into the gateway's environment before writing
+  references; `pmcp secrets set` refuses until then.
+
 ## Rolling back to 2.7.3
 
 Rolling back works, but do the first step **before** you reinstall 2.7.3:

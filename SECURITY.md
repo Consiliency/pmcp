@@ -96,6 +96,18 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 
 ### Known limitations
 
+- **1Password secret references** (Consiliency/pmcp#487): the service-account
+  token is read from a file with descriptor, owner and mode checks and is
+  given only to pmcp's own `op` process; resolved values reach only the child
+  they were resolved for. This protects against secrets being inherited,
+  logged or returned, and against repository or agent inputs choosing vault
+  items. It is **not** a sandbox against a hostile process running as the
+  same user, which can read the token file directly. Exact-value redaction
+  covers raw and JSON-escaped forms only; a value a downstream server
+  transforms (base64, split across messages) is not redacted. Windows is
+  unsupported (`platform_unsupported`). A reference in a remote header is
+  refused, not resolved.
+
 - **The auth-URL host check filters IP literals only**: a public auth metadata
   or JWKS URL is rejected when its host is a non-public IP literal — private,
   CGNAT, link-local, loopback, multicast, site-local or unspecified, including
