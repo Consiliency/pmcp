@@ -363,6 +363,33 @@ def test_a_fifo_token_file_is_refused_without_blocking(host: Host) -> None:
     assert time.monotonic() - started < 5
 
 
+def test_a_fifo_swapped_in_after_the_walk_never_blocks(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk's ``lstat`` saw a regular file; a FIFO took its place before
+    the open. ``O_NONBLOCK`` keeps the open from blocking, and ``fstat`` of
+    the descriptor refuses it (plan 3.1)."""
+    from pmcp import atomic_write
+
+    directory = _private_dir(host.home / ".config" / "credstore")
+    regular = directory / "regular"
+    regular.write_text(TOKEN)
+    fifo = directory / secret_refs.TOKEN_FILE_NAME
+    os.mkfifo(fifo, 0o600)
+
+    def swapped_walk(
+        path: Path, confine_to: Path, label: str, verb: str = "write"
+    ) -> Any:
+        return atomic_write._Confined(str(directory), fifo.name, os.lstat(regular), [])
+
+    monkeypatch.setattr(atomic_write, "_walk_confined", swapped_walk)
+    started = time.monotonic()
+    with pytest.raises(CredentialUnavailableError) as raised:
+        secret_refs.read_service_account_token()
+    assert raised.value.reason == cs.TOKEN_INVALID
+    assert time.monotonic() - started < 5
+
+
 def test_a_symlinked_token_file_is_refused(host: Host) -> None:
     real = host.home / "real-token"
     real.write_text(TOKEN)
@@ -536,6 +563,9 @@ def test_op_argv_env_cwd_and_stdin(host: Host, monkeypatch: pytest.MonkeyPatch) 
     assert env["OP_SERVICE_ACCOUNT_TOKEN"] == TOKEN
     assert env["OP_CACHE"] == "false"
     assert "CANARY_SECRET" not in env
+    # The token reaches only op: never the gateway's own environment.
+    assert TOKEN not in os.environ.values()
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in env_store.child_process_env()
 
 
 def test_a_proxy_not_exported_by_the_operator_is_not_passed(
