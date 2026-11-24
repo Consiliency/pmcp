@@ -1787,6 +1787,11 @@ class ClientManager:
             current = _secret_refs.static_failure(config)
             if current is not None:
                 raise CredentialUnavailableError(current)
+            # The host condition is fixed: the cached host-only reason no
+            # longer stands, so the spawn check proceeds (#499 r2 A6). A
+            # config-intrinsic reason (trust, grammar) is never cleared, and
+            # the spawn still needs this fresh resolution.
+            config.credential_unavailable = None
         if not isinstance(config.config, LocalMcpServerConfig):
             return SpawnSecrets({}, generation, fingerprint)
         overlay = await _secret_refs.resolve_spawn_env(config)
@@ -2459,27 +2464,45 @@ class ClientManager:
         fallback.
         """
         self.publish_config(config)
-        try:
-            prepared = await self.prepare_spawn(config)
-        except CredentialUnavailableError as exc:
-            message = (
-                f"Restart of {config.name} refused: "
-                f"credential_unavailable ({exc.reason})"
-            )
-            logger.warning(message)
-            return (False, 0, [message])
-        disconnected, cancelled, error = await self.disconnect_server(
-            config.name, force
-        )
+        name = config.name
+        target = config
+        prepared: SpawnSecrets | None = None
+        for attempt in range(2):
+            try:
+                prepared = await self.prepare_spawn(target)
+            except CredentialUnavailableError as exc:
+                return self._restart_refused(name, exc.reason)
+            # Validated under the lifecycle lock BEFORE anything destructive
+            # (#499 r2 A5): a config replaced while it resolved leaves the
+            # running instance up; the CURRENT replacement is resolved once,
+            # outside the lock, and validated again.
+            async with self._lifecycle_lock:
+                stale = self._stale(target, prepared)
+            if not stale:
+                break
+            current = self._current_config(name)
+            if attempt == 1 or current is None:
+                return self._restart_refused(name, CONFIG_CHANGED)
+            target = current
+        assert prepared is not None
+        disconnected, cancelled, error = await self.disconnect_server(name, force)
         if not disconnected:
             return (False, cancelled, [error or "Restart refused."])
 
-        errors = (
-            await self.connect_server(config, prepared=prepared)
-            if prepared.overlay
-            else await self.connect_server(config)
-        )
+        # The resolution -- its generation and fingerprint, even with an empty
+        # overlay -- always goes with the connect (#499 r2 A4): a replacement
+        # published during the teardown is then detected and resolved, never
+        # overwritten by republishing this config.
+        errors = await self.connect_server(target, prepared=prepared)
         return (len(errors) == 0, cancelled, errors)
+
+    def _restart_refused(self, name: str, reason: str) -> tuple[bool, int, list[str]]:
+        """A restart that tore nothing down: the running instance stays up."""
+        if reason not in REASONS:
+            reason = OUTPUT_INVALID
+        message = f"Restart of {name} refused: credential_unavailable ({reason})"
+        logger.warning(message)
+        return (False, 0, [message])
 
     def is_lazy_server(self, name: str) -> bool:
         """Check if server is registered for lazy start but not yet connected."""
@@ -4455,10 +4478,8 @@ class ClientManager:
                     # A crashed config that a newer one has replaced is never
                     # respawned, and never re-published (#499 r1 G1).
                     if self._superseded(config):
-                        logger.warning(
-                            f"[{name}] reconnect stopped: credential_unavailable "
-                            f"({CONFIG_CHANGED}); its config was replaced"
-                        )
+                        # Recorded on the status, not only logged (#499 r2 N4).
+                        self._record_unavailable(name, CONFIG_CHANGED)
                         return
                     # Resolved again from the stored reference, before the
                     # lock (Consiliency/pmcp#487 plan 3.5).
@@ -4471,10 +4492,7 @@ class ClientManager:
                             )
                             return
                         if self._superseded(config) or self._stale(config, secrets):
-                            logger.warning(
-                                f"[{name}] reconnect stopped: credential_unavailable "
-                                f"({CONFIG_CHANGED}); its config was replaced"
-                            )
+                            self._record_unavailable(name, CONFIG_CHANGED)
                             return
                         resolved = _nonempty(secrets)
                         if resolved is None:
@@ -4489,6 +4507,7 @@ class ClientManager:
                         f"credential_unavailable ({e.reason})"
                     )
                     if not _secret_refs.is_retryable_reason(e.reason):
+                        self._record_unavailable(name, e.reason)
                         # A typed lookup failure is not retried (plan 3.5).
                         logger.error(
                             f"[{name}] reconnect stopped: the credential is "
@@ -5161,33 +5180,62 @@ class ClientManager:
         for config in configs:
             self.publish_config(config)
         secrets, errors, failed = await self._prepare_configs(configs)
-        async with self._lifecycle_lock:
-            # A running server whose lookup failed is KEPT (plan 3.5, #499 r1
-            # A2): nothing new is spawned with an old value, and tearing it
-            # down would turn a credential problem into an outage. Every other
-            # server is torn down as before.
-            keep = {name for name in failed if self.is_server_online(name)}
-            if keep:
-                for name in [n for n in list(self._clients) if n not in keep]:
-                    await self._disconnect_server_locked(name, 0)
-            else:
-                await self._disconnect_all_unlocked()
-            ready = [
-                config
-                for config in configs
-                if config.name not in failed
-                and not self._stale(config, secrets[config.name])
-            ]
-            stale = [
-                config
-                for config in configs
-                if config.name not in failed and config not in ready
-            ]
-            for config in stale:
-                errors.append(self._record_unavailable(config.name, CONFIG_CHANGED))
-            if any(_nonempty(found) for found in secrets.values()):
-                return errors + await self._connect_all_unlocked(ready, secrets=secrets)
-            return errors + await self._connect_all_unlocked(ready)
+        configs = list(configs)
+        for attempt in range(2):
+            async with self._lifecycle_lock:
+                # Validated BEFORE the teardown (#499 r2 A5): a config replaced
+                # while it resolved is not torn down on this pass.
+                stale = {
+                    config.name
+                    for config in configs
+                    if config.name not in failed
+                    and self._stale(config, secrets[config.name])
+                }
+                if stale and attempt == 0:
+                    pass  # re-resolve the replacements outside the lock
+                else:
+                    for name in sorted(stale):
+                        errors.append(self._record_unavailable(name, CONFIG_CHANGED))
+                    return errors + await self._refresh_locked(
+                        configs, secrets, failed | stale
+                    )
+            replaced: list[ResolvedServerConfig] = []
+            for index, config in enumerate(configs):
+                if config.name in stale:
+                    current = self._current_config(config.name)
+                    if current is not None:
+                        configs[index] = current
+                        replaced.append(current)
+            more, more_errors, more_failed = await self._prepare_configs(replaced)
+            secrets.update(more)
+            errors += more_errors
+            failed |= more_failed
+        return errors  # pragma: no cover - the second pass always returns
+
+    async def _refresh_locked(
+        self,
+        configs: list[ResolvedServerConfig],
+        secrets: dict[str, SpawnSecrets],
+        held: set[str],
+    ) -> list[str]:
+        """``refresh``'s teardown and connect, with the lifecycle lock held.
+
+        A running server in ``held`` (its lookup failed, or its config changed
+        twice while it resolved) is KEPT (plan 3.5, #499 r1 A2): nothing new
+        is spawned with an old value, and tearing it down would turn a
+        credential problem into an outage. Every other server is torn down as
+        before.
+        """
+        keep = {name for name in held if self.is_server_online(name)}
+        if keep:
+            for name in [n for n in list(self._clients) if n not in keep]:
+                await self._disconnect_server_locked(name, 0)
+        else:
+            await self._disconnect_all_unlocked()
+        ready = [config for config in configs if config.name not in held]
+        if any(_nonempty(secrets.get(config.name)) for config in ready):
+            return await self._connect_all_unlocked(ready, secrets=secrets)
+        return await self._connect_all_unlocked(ready)
 
     async def adopt_process(
         self,

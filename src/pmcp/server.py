@@ -44,7 +44,11 @@ from pmcp.argument_errors import (
     safe_exc_info,
 )
 from pmcp.env_store import bind_project_root, credential_value
-from pmcp.secret_registry import install_log_redaction, redact_registered_in
+from pmcp.secret_registry import (
+    install_log_redaction,
+    redact_registered,
+    redact_registered_in,
+)
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
 from pmcp.config.loader import (
@@ -623,7 +627,9 @@ class GatewayServer:
                     described = exception_text(e)
                     logger.error("Tool execution error: unknown gateway tool")
                 else:
-                    described = exception_text(e)
+                    # Exact-value redaction before the log line, the audit and
+                    # the cut below (#499 r2 R2-2).
+                    described = redact_registered(exception_text(e))
                     logger.error(f"Tool execution error: {described}")
                 try:
                     failure_status = (
@@ -669,7 +675,8 @@ class GatewayServer:
                         text=json.dumps(
                             {
                                 "error": True,
-                                "message": described[:400],
+                                # Redacted BEFORE the truncation (plan 3.7).
+                                "message": redact_registered(described)[:400],
                             }
                         ),
                     )

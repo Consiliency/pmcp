@@ -929,12 +929,17 @@ def env_origins() -> dict[str, EnvOrigin]:
 
 
 def environment_holds(name: str) -> EnvOrigin | None:
-    """The origin of an ``os.environ`` value that outranks the user store, or ``None``.
+    """The layer that holds ``name`` ahead of the user store, or ``None``.
 
-    ``external`` (also for a name present with no record), ``home_dotenv`` or
-    ``auth_connect_project``: a lookup answers ``name`` from that value until
-    the gateway restarts, whatever the user store says. ``None`` when the name
-    is not in the environment, or is a (stale) startup copy of a store value.
+    In precedence order: ``external`` (also for a name present with no
+    record) or ``home_dotenv`` -- a value in ``os.environ`` -- then a
+    reference the startup load SKIPPED from ``~/.env`` (``home_dotenv``,
+    plan 3.2.5): it is held at its layer although it is not in
+    ``os.environ``, and its lookup is refused; then ``auth_connect_project``.
+    A lookup answers ``name`` from that layer until the gateway restarts,
+    whatever the user store says. ``None`` when no such layer holds it: the
+    name is absent, or ``os.environ`` holds a (stale) startup copy of a store
+    value.
     """
     ensure_startup_load()
     origin = _ENV_ORIGINS.get(name) if name in os.environ else None

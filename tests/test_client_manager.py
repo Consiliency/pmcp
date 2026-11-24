@@ -1149,8 +1149,11 @@ class TestTargetServerLifecycle:
             return (True, 0, None)
 
         async def connect(
-            config: ResolvedServerConfig, retry: bool = True
+            config: ResolvedServerConfig, retry: bool = True, *, prepared: Any = None
         ) -> list[str]:
+            # The restart's resolution always goes with the connect
+            # (Consiliency/pmcp#499 r2 A4).
+            assert prepared is not None
             events.append(f"connect:{config.name}:{retry}")
             return []
 

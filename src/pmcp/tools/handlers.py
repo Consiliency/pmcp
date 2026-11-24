@@ -238,6 +238,7 @@ from pmcp.secret_refs import (
     is_reference_shaped,
     resolve_spawn_env,
     spawn_plan,
+    static_failure,
 )
 from pmcp.secret_registry import (
     redact_registered,
@@ -3730,6 +3731,21 @@ class GatewayTools:
                         command=server_config.command, args=server_config.args
                     ),
                 )
+            if resolved.credential_unavailable is not None and action != "disconnect":
+                # A host reason stored at load (#499 r2): looked up again now.
+                current = static_failure(resolved)
+                if current is not None:
+                    return (
+                        None,
+                        self._credential_unavailable_lifecycle_output(
+                            server_name,
+                            current,
+                            action=action,
+                            prior_status=prior_status,
+                        ),
+                        source,
+                    )
+                resolved.credential_unavailable = None
             unavailable = self._unavailable_remote_header_reason(resolved)
             if unavailable is not None and action != "disconnect":
                 return (
@@ -7099,6 +7115,11 @@ class GatewayTools:
                 parsed.force,
                 requestor_context=parsed.requestor_context,
             )
+            # Sanitized like every other task surface, before it is audited
+            # (#499 r1 A1/F2, r2 R2-3).
+            if task is not None:
+                task = self._sanitize_task_for_output(task)
+            message = redact_registered(message)
             self._audit(
                 method="gateway.tasks_cancel",
                 action="tasks_cancel",
@@ -7108,9 +7129,6 @@ class GatewayTools:
                 task_id=parsed.task_id,
                 error=None if ok else message,
             )
-            # Sanitized like every other task surface (#499 r1 A1/F2).
-            if task is not None:
-                task = self._sanitize_task_for_output(task)
             return TasksCancelOutput(
                 ok=ok,
                 task=task,

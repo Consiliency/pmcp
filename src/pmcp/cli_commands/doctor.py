@@ -442,6 +442,19 @@ def collect_token_diagnostics() -> list[tuple[str, str, str]]:
                 "references cannot be resolved.",
             )
         )
+    if not any(entry.get("source") == "systemd_credential" for entry in searched):
+        # Not silence that reads as "the copies match" (#499 r2 R2-N2):
+        # systemd sets CREDENTIALS_DIRECTORY only inside the unit.
+        checks.append(
+            (
+                "secret_refs",
+                "ok",
+                "1Password token: the systemd credential copy is not visible from "
+                "this process ($CREDENTIALS_DIRECTORY is set only inside the "
+                "unit), so it cannot be compared with the credstore file here; "
+                "restart the unit after editing the credstore file.",
+            )
+        )
     for entry in report:
         if entry.get("source") == "comparison" and entry.get(
             "systemd_and_credstore_differ"

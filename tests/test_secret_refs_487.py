@@ -814,11 +814,13 @@ def test_an_unsupported_store_reference_is_refused_statically(
 
 
 def test_without_a_token_a_store_reference_is_op_not_configured(host: Host) -> None:
+    """A host reason is stored on the manifest entry (looked up again on
+    demand, #499 r2 R2-N1), never resolved, and the entry is not started."""
     host.write_store(f"{NAMESPACED}={REF}\n")
     _start(host)
-    with pytest.raises(CredentialUnavailableError) as raised:
-        manifest_server_to_config(_brightdata(), host.root)
-    assert raised.value.reason == cs.OP_NOT_CONFIGURED
+    config = manifest_server_to_config(_brightdata(), host.root)
+    assert config.credential_unavailable == cs.OP_NOT_CONFIGURED
+    assert host.op.calls() == []
 
 
 def test_own_env_without_opt_in_passes_verbatim(host: Host) -> None:
@@ -1843,6 +1845,8 @@ def test_reconnect_never_respawns_a_superseded_crashed_config(
     assert spawned == []
     assert manager._config_fingerprints["srv"] == manager._fingerprint(new)
     assert host.op.calls() == []
+    # The reason is recorded on the status, not only logged (#499 r2 N4).
+    assert cs.CONFIG_CHANGED in (manager.get_server_status("srv").last_error or "")
 
 
 def test_prepare_spawn_never_publishes(host: Host) -> None:
@@ -2153,3 +2157,295 @@ def test_pmcp_doctor_runs_the_token_diagnostics() -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert "collect_token_diagnostics" in called
+
+
+# =========================================================================== #
+# Round 2 of the panel on Consiliency/pmcp#499
+# =========================================================================== #
+
+
+def _named(command: str, *, reference: bool = False) -> ResolvedServerConfig:
+    return ResolvedServerConfig(
+        name="srv",
+        source="user",
+        config=LocalMcpServerConfig(
+            command=command, env={"K": f"op://v/i/{command}"} if reference else {}
+        ),
+        credential_sources={"K": "user_store"} if reference else {},
+    )
+
+
+@pytest.mark.parametrize("reference", [False, True], ids=["plain", "reference"])
+def test_restart_never_republishes_a_config_replaced_during_teardown(
+    host: Host, monkeypatch: pytest.MonkeyPatch, reference: bool
+) -> None:
+    """A4: a replacement published while the restart's teardown is pending is
+    the config that starts, for a plain server and a reference server."""
+    host.write_token()
+    manager = _manager(host)
+    old, new = _named("old", reference=reference), _named("new", reference=reference)
+    spawned: list[str] = []
+
+    async def disconnect(*_args: Any) -> Any:
+        manager.publish_config(new)  # e.g. gateway.refresh during the teardown
+        return True, 0, None
+
+    async def spawn(cfg: Any, **_kwargs: Any) -> None:
+        spawned.append(cfg.config.command)
+
+    monkeypatch.setattr(manager, "disconnect_server", disconnect)
+    monkeypatch.setattr(manager, "_connect_singleflight", spawn)
+    _run(manager.restart_server(old))
+    assert spawned == ["new"]
+    assert manager._current_config("srv") is new
+
+
+def test_restart_validates_the_replacement_before_tearing_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A5: the config is replaced while it resolves and the replacement's
+    lookup fails: nothing is torn down, the typed reason is returned."""
+    from pmcp.client.manager import ClientManager
+    from pmcp.secret_refs import SpawnSecrets
+
+    manager = ClientManager()
+    old, new = _named("old", reference=True), _named("new", reference=True)
+    torn: list[str] = []
+
+    async def prepare(cfg: Any) -> Any:
+        if cfg is new:
+            raise CredentialUnavailableError(cs.AUTH_FAILED)
+        result = SpawnSecrets(
+            {"K": "fake-secret-value"},
+            manager._config_generations["srv"],
+            manager._fingerprint(cfg),
+        )
+        manager.publish_config(new)  # replaced while the op read was in flight
+        return result
+
+    async def disconnect(*_args: Any) -> Any:
+        torn.append("srv")
+        return True, 0, None
+
+    monkeypatch.setattr(manager, "prepare_spawn", prepare)
+    monkeypatch.setattr(manager, "disconnect_server", disconnect)
+    ok, _cancelled, errors = _run(manager.restart_server(old))
+    assert not ok and torn == []
+    assert any("auth_failed" in message for message in errors)
+
+
+def test_restart_whose_replacement_changes_again_tears_nothing_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pmcp.client.manager import ClientManager
+    from pmcp.secret_refs import SpawnSecrets
+
+    manager = ClientManager()
+    replacements = [_named(f"v{i}") for i in range(3)]
+    torn: list[str] = []
+
+    async def prepare(cfg: Any) -> Any:
+        result = SpawnSecrets(
+            {}, manager._config_generations["srv"], manager._fingerprint(cfg)
+        )
+        manager.publish_config(replacements.pop())  # replaced on every resolve
+        return result
+
+    async def disconnect(*_args: Any) -> Any:
+        torn.append("srv")
+        return True, 0, None
+
+    monkeypatch.setattr(manager, "prepare_spawn", prepare)
+    monkeypatch.setattr(manager, "disconnect_server", disconnect)
+    ok, _cancelled, errors = _run(manager.restart_server(_named("first")))
+    assert not ok and torn == []
+    assert any(cs.CONFIG_CHANGED in message for message in errors)
+
+
+def test_manager_refresh_validates_replacements_before_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A5 for the manager-level refresh: a config replaced while it resolved,
+    whose replacement's lookup fails, is kept running, not torn down."""
+    from pmcp.client.manager import ClientManager
+    from pmcp.secret_refs import SpawnSecrets
+
+    manager = ClientManager()
+    old, new = _named("old", reference=True), _named("new", reference=True)
+    torn: list[str] = []
+
+    async def prepare(cfg: Any) -> Any:
+        if cfg is new:
+            raise CredentialUnavailableError(cs.AUTH_FAILED)
+        result = SpawnSecrets(
+            {"K": "fake-secret-value"},
+            manager._config_generations["srv"],
+            manager._fingerprint(cfg),
+        )
+        manager.publish_config(new)
+        return result
+
+    async def teardown_all() -> None:
+        torn.append("*")
+
+    async def teardown_one(name: str, cancelled: int) -> Any:
+        torn.append(name)
+        return (True, 0, None)
+
+    monkeypatch.setattr(manager, "prepare_spawn", prepare)
+    monkeypatch.setattr(manager, "_disconnect_all_unlocked", teardown_all)
+    monkeypatch.setattr(manager, "_disconnect_server_locked", teardown_one)
+    monkeypatch.setattr(manager, "is_server_online", lambda name: name == "srv")
+    manager._clients["srv"] = MagicMock()
+    manager._clients["other"] = MagicMock()
+    errors = _run(manager.refresh([old]))
+    assert "srv" not in torn and "*" not in torn
+    assert torn == ["other"]
+    assert any("auth_failed" in e for e in errors)
+
+
+NUMERIC = "7351948260315792"
+
+
+def test_a_numeric_secret_is_redacted_everywhere() -> None:
+    """A7: a registered value that a child returns as a JSON NUMBER (or a
+    numeric key) is redacted; the result stays valid JSON."""
+    assert secret_refs._validated_value(NUMERIC) == NUMERIC
+    secret_registry.register_secret_value(NUMERIC)
+    payload = {
+        "credential": int(NUMERIC),
+        int(NUMERIC): "k",
+        "nested": [float(NUMERIC + ".5"), {"x": int(NUMERIC) * 10}],
+        "fine": [1, 2.5, True, None],
+    }
+    out = secret_registry.redact_registered_in(payload)
+    rendered = json.dumps(out)
+    assert NUMERIC not in rendered
+    assert out["fine"] == [1, 2.5, True, None]
+    json.loads(rendered)
+
+
+def test_a_numeric_secret_in_task_metadata_is_redacted() -> None:
+    from pmcp.types import McpTaskInfo
+
+    secret_registry.register_secret_value(NUMERIC)
+    gt, _cm = _task_gateway()
+    task = McpTaskInfo(task_id="t", raw={"credential": int(NUMERIC)})
+    assert NUMERIC not in gt._sanitize_task_for_output(task).model_dump_json()
+
+
+def _dispatch(srv: Any, name: str, arguments: dict[str, Any]) -> str:
+    from mcp.server.connection import Connection
+    from mcp.server.context import ServerRequestContext
+    from mcp.server.session import ServerSession
+    from mcp.types import CallToolRequestParams
+
+    srv._create_server(instructions="test")
+    entry = srv._server.get_request_handler("tools/call")
+    ctx = ServerRequestContext(
+        session=ServerSession(
+            MagicMock(), Connection.from_envelope("2025-11-25", None, None)
+        ),
+        lifespan_context={},
+        protocol_version="2025-11-25",
+        method="test",
+    )
+    result = _run(
+        entry.handler(ctx, CallToolRequestParams(name=name, arguments=arguments))
+    )
+    return json.dumps(result.model_dump(mode="json"))
+
+
+def test_the_dispatcher_redacts_a_numeric_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A7 through the real dispatcher (Astra's probe)."""
+    from pmcp.server import GatewayServer
+
+    secret_registry.register_secret_value(NUMERIC)
+    srv = GatewayServer()
+
+    async def leaky(arguments: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True, "task": {"raw": {"credential": int(NUMERIC)}}}
+
+    monkeypatch.setattr(srv._gateway_tools, "tasks_list", leaky)
+    assert NUMERIC not in _dispatch(srv, "gateway.tasks_list", {"server_name": "s"})
+
+
+def test_the_dispatcher_redacts_a_tool_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2-2: an exception whose text carries a registered value."""
+    from pmcp.server import GatewayServer
+
+    secret_registry.register_secret_value(OPAQUE)
+    srv = GatewayServer()
+
+    async def failing(arguments: dict[str, Any]) -> Any:
+        raise RuntimeError("x" * 395 + OPAQUE)  # straddles the 400-char cut
+
+    monkeypatch.setattr(srv._gateway_tools, "tasks_list", failing)
+    text = _dispatch(srv, "gateway.tasks_list", {"server_name": "s"})
+    assert OPAQUE not in text and OPAQUE[:5] not in text.replace("x" * 395, "")
+
+
+def test_over_deep_values_are_redacted_fail_closed() -> None:
+    secret_registry.register_secret_value(OPAQUE)
+    deep: dict[str, Any] = {}
+    cursor = deep
+    for _ in range(3000):
+        cursor["k"] = {}
+        cursor = cursor["k"]
+    cursor["v"] = OPAQUE
+    out = secret_registry.redact_registered_in(deep)
+    assert OPAQUE not in json.dumps(out)
+
+
+def test_a_repaired_token_reaches_the_spawn_end_to_end(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A6/N5 end to end: the cached host-only reason does not block the spawn
+    once the token is fixed; an intrinsic reason still does."""
+    manager = _manager(host)
+    cfg = _local({"K": REF}, {"K": "user_store"}).model_copy(
+        update={"credential_unavailable": cs.OP_NOT_CONFIGURED}
+    )
+    host.write_token()
+    manager.publish_config(cfg)
+    prepared = _run(manager.prepare_spawn(cfg))
+    assert prepared.overlay == {"K": VALUE}
+
+    class ReachedTheSpawnGate(Exception):
+        pass
+
+    def gate(*_args: Any) -> Any:
+        raise ReachedTheSpawnGate
+
+    monkeypatch.setattr(secret_refs, "require_resolved", gate)
+    with pytest.raises(ReachedTheSpawnGate):
+        _run(manager._connect_stdio(cfg, prepared))
+    intrinsic = cfg.model_copy(
+        update={"credential_unavailable": cs.REFERENCE_UNSUPPORTED}
+    )
+    with pytest.raises(CredentialUnavailableError):
+        _run(manager._connect_stdio(intrinsic, prepared))
+
+
+def test_a_manifest_entry_without_its_token_recovers_on_demand(host: Host) -> None:
+    """R2-N1: a manifest server whose token was missing at load is stored
+    with the host reason, and resolves once the token is installed."""
+    host.write_store(f"{NAMESPACED}={REF}\n")
+    _start(host)
+    config = manifest_server_to_config(_brightdata(), host.root)
+    assert config.credential_unavailable == cs.OP_NOT_CONFIGURED
+    host.write_token()
+    manager = _manager(host)
+    assert _run(manager.prepare_spawn(config)).overlay == {LEGACY: VALUE}
+    assert config.credential_unavailable is None
+
+
+def test_doctor_says_the_systemd_copy_is_not_visible(host: Host) -> None:
+    """R2-N2: outside the unit the comparison is impossible, and says so."""
+    host.write_token()
+    text = _doctor_text()
+    assert "not visible from this process" in text

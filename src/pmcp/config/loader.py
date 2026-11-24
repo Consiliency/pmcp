@@ -1652,7 +1652,14 @@ def _manifest_server_to_config(
     # (Consiliency/pmcp#487 plan 3.5).
     reason = _static_reference_failure(resolved)
     if reason is not None:
-        raise CredentialUnavailableError(reason)
+        from pmcp.secret_refs import HOST_REASONS
+
+        if reason not in HOST_REASONS:
+            raise CredentialUnavailableError(reason)
+        # A host reason (the token file, the platform) is stored on the entry,
+        # as for a configured entry, and looked up again on demand when the
+        # server is resolved (plan 3.1, #499 r2 R2-N1).
+        resolved.credential_unavailable = reason
     return resolved
 
 

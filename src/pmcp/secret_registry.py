@@ -100,25 +100,59 @@ def redact_registered(text: str) -> str:
     return "".join(out)
 
 
-def redact_registered_in(value: Any) -> Any:
-    """Redact every string inside ``value`` (str, list, tuple, dict), recursively.
+#: Nesting beyond this is replaced by the marker (fail closed), never walked
+#: into a ``RecursionError`` (#499 r2).
+_MAX_DEPTH = 200
 
-    Keys of a mapping are redacted too. Other objects are returned as they are.
+
+def redact_registered_in(value: Any) -> Any:
+    """Redact every registered value inside ``value``, recursively.
+
+    Strings are redacted in place; mapping keys too. A non-string scalar
+    (a number, an unknown object) is judged by its rendering -- a JSON
+    number is the same digits as the registered value it came from -- and
+    replaced by its redacted rendering, a string, when it holds one (#499 r2
+    A7): the result stays valid JSON. Nesting deeper than ``_MAX_DEPTH`` is
+    replaced by :data:`REDACTION_MARKER`. When nothing registered occurs in
+    the value's JSON rendering it is returned untouched.
     """
-    if _pattern is None:
+    pattern = _pattern
+    if pattern is None:
         return value
+    try:
+        rendered: str | None = json.dumps(value, default=str, ensure_ascii=False)
+    except (TypeError, ValueError, RecursionError):
+        rendered = None
+    if rendered is not None and pattern.search(rendered) is None:
+        return value
+    return _redact_in(value, 0)
+
+
+def _redact_scalar(value: Any) -> Any:
+    rendered = json.dumps(value) if isinstance(value, (int, float)) else str(value)
+    redacted = redact_registered(rendered)
+    return value if redacted == rendered else redacted
+
+
+def _redact_in(value: Any, depth: int) -> Any:
+    if depth > _MAX_DEPTH:
+        return REDACTION_MARKER
     if isinstance(value, str):
         return redact_registered(value)
+    if value is None or isinstance(value, bool):
+        return value
     if isinstance(value, list):
-        return [redact_registered_in(item) for item in value]
+        return [_redact_in(item, depth + 1) for item in value]
     if isinstance(value, tuple):
-        return tuple(redact_registered_in(item) for item in value)
+        return tuple(_redact_in(item, depth + 1) for item in value)
     if isinstance(value, dict):
         return {
-            redact_registered_in(key): redact_registered_in(item)
+            (
+                redact_registered(key) if isinstance(key, str) else _redact_scalar(key)
+            ): _redact_in(item, depth + 1)
             for key, item in value.items()
         }
-    return value
+    return _redact_scalar(value)
 
 
 def redact_registered_in_place(value: dict[str, Any]) -> None:
