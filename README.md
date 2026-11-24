@@ -1713,7 +1713,9 @@ at the next restart of the server, without restarting the gateway.
   passed through a reference in this release.
 - `pmcp doctor` lists the token paths it searched, the one it uses (an
   invalid file stops the search), and whether the systemd credential copy
-  differs from the credstore file (restart the unit after editing it) --
+  differs from the credstore file (restart the unit after editing it; the
+  systemd copy is visible only to a process inside the unit, and `pmcp
+  doctor` says so when it is run from a shell) --
   never the token or a digest -- and reports each `op://` credential and
   each refused one by name, layer and reason.
 - `pmcp secrets set NAME op://...` writes only to the user store, and only
