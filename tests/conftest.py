@@ -559,6 +559,13 @@ def _reset_process_global_state() -> Iterator[None]:
         transport_http.reset_request_metrics()
         npm_resolver.reset_resolver_for_tests()
         manifest_loader.clear_manifest_cache()
+        # Consiliency/pmcp#487 P2: the captured CREDENTIALS_DIRECTORY, the
+        # token cache, the op resolvers and test seams, and the redaction
+        # registry (a registered value would redact a later test's output).
+        from pmcp import secret_refs, secret_registry
+
+        secret_refs.reset_for_tests()
+        secret_registry.reset_registered_secrets()
 
     _reset()
     yield

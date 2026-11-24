@@ -656,7 +656,15 @@ SPAWN_CALLS = frozenset(
 #: The env builders. ``build_install_child_env`` and ``sanitized_subprocess_env``
 #: both build on ``env_store.child_process_env``.
 ENV_BUILDERS = frozenset(
-    {"child_process_env", "sanitized_subprocess_env", "build_install_child_env"}
+    {
+        "child_process_env",
+        "sanitized_subprocess_env",
+        "build_install_child_env",
+        # The ONLY environment `op` runs with (Consiliency/pmcp#487 plan 3.4):
+        # fixed PATH, HOME, the token, OP_CACHE=false, operator-supplied
+        # proxy/CA variables -- nothing else of the gateway's environment.
+        "op_subprocess_env",
+    }
 )
 
 
@@ -822,6 +830,15 @@ NOT_A_CREDENTIAL_LOOKUP = {
     ),
     ("pmcp.tools.handlers", "_refresh_config_unchanged"): (
         "compares a config's env overrides with the environment a spawn inherits"
+    ),
+    ("pmcp.cli", "_refuse_reference_shaped_pmcp_variables"): (
+        "classifies pmcp's OWN variables' values as reference-shaped or not "
+        "(Consiliency/pmcp#487 plan 3.2.5); never a credential lookup"
+    ),
+    ("pmcp.secret_refs", "op_subprocess_env"): (
+        "copies the operator-exported proxy and CA variables into op's own "
+        "environment, each gated by env_key_is_operator_supplied "
+        "(Consiliency/pmcp#487 plan 3.4)"
     ),
 }
 
