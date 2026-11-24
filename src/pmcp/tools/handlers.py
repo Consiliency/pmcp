@@ -61,13 +61,14 @@ from pmcp.config.loader import (
 from pmcp.errors import ErrorCode, GatewayException, make_error
 from pmcp.home_identity import home_path
 from pmcp.env_store import (
+    CredentialUnavailableError,
     bind_project_root,
-    record_dotenv_keys,
     child_process_env,
+    credential_unavailable_reason,
     credential_value,
-    load_store,
+    env_origin,
+    publish_auth_connect_value,
     repository_may_supply,
-    record_pmcp_introduced_keys,
     sanitized_subprocess_env,
     scope_store_name,
     set_env_value,
@@ -191,6 +192,7 @@ from pmcp.types import (
     SearchRegistryOutput,
     SearchRegistryResult,
     ServerHealthInfo,
+    ServerStatusEnum,
     StartupPolicyOperation,
     StartupPolicyOutput,
     StartupPolicyPreview,
@@ -333,10 +335,17 @@ def _refresh_config_unchanged(
 
         def _effective_env(env: dict[str, str] | None) -> dict[str, str]:
             # Only overrides that actually change the spawned environment.
+            # A startup copy of a user-store value is NOT the ambient
+            # baseline: a child never inherits it (sanitized_subprocess_env
+            # strips it) and it goes stale at the first rotation. Treating it
+            # as the baseline made a config that dropped a deleted same-name
+            # key (EXA_API_KEY) compare equal to the one that still carried
+            # it, so gateway.refresh kept the child running with the deleted
+            # credential (Consiliency/pmcp#489 round 1, GROK-B2 / GEMINI-G2).
             return {
                 key: value
                 for key, value in (env or {}).items()
-                if os.environ.get(key) != value
+                if env_origin(key) == "user_store" or os.environ.get(key) != value
             }
 
         return (
@@ -1102,6 +1111,8 @@ class GatewayTools:
 
     @staticmethod
     def _auth_event_for_state(auth_state: str) -> AuthEventKind | None:
+        if auth_state == "credential_unavailable":
+            return "credential_unavailable"
         if auth_state == "insufficient_scope":
             return "insufficient_scope"
         if auth_state == "elicitation_required":
@@ -2074,7 +2085,7 @@ class GatewayTools:
                 disabled_auto_start=disabled_auto_start,
                 provisioned_server_names=set(provisioned),
                 is_server_allowed=self._policy_manager.is_server_allowed,
-                is_auth_available=self._check_api_key_available,
+                is_auth_available=self._credential_present,
                 legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
                 project_root=self._project_root,
             )
@@ -2086,6 +2097,7 @@ class GatewayTools:
                 f"skipped={counts['skipped']}, "
                 f"policy_denied={counts['policy_denied']}, "
                 f"missing_auth={counts['missing_auth']}, "
+                f"credential_unavailable={counts['credential_unavailable']}, "
                 f"unknown_auto_start={counts['unknown_auto_start']}"
             )
             for skipped in resolution.skipped:
@@ -2216,7 +2228,24 @@ class GatewayTools:
                     )
                 )
 
-            to_disconnect = [name for name in current_configs if not _live_keep(name)]
+            # A running server whose credential lookup now gives a typed
+            # failure (an unreadable user store) is left running: nothing new
+            # is spawned with an old value, and tearing it down would turn a
+            # store problem into an outage (Consiliency/pmcp#487 plan 3.5).
+            typed_unavailable = {
+                skip.name
+                for skip in resolution.skipped
+                if skip.reason == StartupSkipReason.CREDENTIAL_UNAVAILABLE
+            }
+            to_disconnect = [
+                name
+                for name in current_configs
+                if not _live_keep(name)
+                and not (
+                    name in typed_unavailable
+                    and self._client_manager.is_server_online(name)
+                )
+            ]
             to_connect = [
                 config
                 for name, config in eager_by_name.items()
@@ -2317,6 +2346,24 @@ class GatewayTools:
                 mcp_tasks_cancelled=active_tasks_cancelled,
             )
 
+    @staticmethod
+    def _apply_credential_observation(info: ServerHealthInfo, observation: Any) -> None:
+        """Report a startup ``credential_unavailable`` skip on a health entry."""
+        if (
+            observation.startup_skip_reason
+            != StartupSkipReason.CREDENTIAL_UNAVAILABLE.value
+        ):
+            return
+        reason = getattr(observation, "credential_reason", None) or "unknown"
+        info.auth_state = "credential_unavailable"
+        info.credential_reason = reason
+        info.next_step = (
+            "Make ~/.config/pmcp/pmcp.env a readable regular file, then "
+            "gateway.refresh or gateway.connect_server."
+            if reason == "store_unreadable"
+            else None
+        )
+
     async def health(self) -> HealthOutput:
         """gateway.health - Get gateway health status."""
         revision_id, last_refresh_ts = self._client_manager.get_registry_meta()
@@ -2341,6 +2388,7 @@ class GatewayTools:
                 info.startup_skip_reason = observation.startup_skip_reason
                 info.startup_env_var = observation.startup_env_var
                 info.missing_env_vars = observation.missing_env_vars or []
+                self._apply_credential_observation(info, observation)
                 if observation.startup_skip_reason in {
                     StartupSkipReason.MISSING_AUTH.value,
                     StartupSkipReason.POLICY_DENIED.value,
@@ -2381,6 +2429,7 @@ class GatewayTools:
                 info.startup_skip_reason = observation.startup_skip_reason
                 info.startup_env_var = observation.startup_env_var
                 info.missing_env_vars = observation.missing_env_vars or []
+                self._apply_credential_observation(info, observation)
                 if observation.startup_skip_reason in {
                     StartupSkipReason.MISSING_AUTH.value,
                     StartupSkipReason.POLICY_DENIED.value,
@@ -2399,6 +2448,22 @@ class GatewayTools:
 
         for name, observation in self._startup_observations.items():
             if name in known_names or observation.startup_policy != "skipped":
+                continue
+            if (
+                observation.startup_skip_reason
+                == StartupSkipReason.CREDENTIAL_UNAVAILABLE.value
+            ):
+                info = ServerHealthInfo(
+                    name=name,
+                    status="offline",
+                    tool_count=0,
+                    startup_policy=observation.startup_policy,
+                    startup_source=observation.startup_source,
+                    startup_skip_reason=observation.startup_skip_reason,
+                    startup_env_var=observation.startup_env_var,
+                )
+                self._apply_credential_observation(info, observation)
+                servers.append(info)
                 continue
             servers.append(
                 ServerHealthInfo(
@@ -2487,9 +2552,7 @@ class GatewayTools:
             disabled_auto_start=disabled,
             provisioned_server_names=provisioned,
             is_server_allowed=self._policy_manager.is_server_allowed,
-            is_auth_available=lambda env_var: bool(
-                credential_value(env_var, root=self._project_root)
-            ),
+            is_auth_available=self._credential_present,
             legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
             project_root=self._project_root,
         )
@@ -2540,6 +2603,7 @@ class GatewayTools:
                     startup_env_var=env_var,
                     missing_env_vars=missing_env_vars,
                     auth_state=auth_state,
+                    credential_reason=health.credential_reason if health else None,
                     configured=any(config.name == name for config in configured),
                     manifest=name in manifest,
                     provisioned=name in provisioned,
@@ -2593,7 +2657,9 @@ class GatewayTools:
             server_name, action="connect", prior_status=prior_status
         )
         if failure is not None:
-            return failure
+            return await self._stop_without_credential(
+                server_name, failure, force=False
+            )
         if config is None:
             return self._lifecycle_output(
                 ok=False,
@@ -2708,7 +2774,9 @@ class GatewayTools:
             server_name, action="restart", prior_status=prior_status
         )
         if failure is not None:
-            return failure
+            return await self._stop_without_credential(
+                server_name, failure, force=parsed.force
+            )
         if config is None:
             return self._lifecycle_output(
                 ok=False,
@@ -2722,6 +2790,56 @@ class GatewayTools:
         return await self._restart_resolved_server(
             server_name, config, force=parsed.force, prior_status=prior_status
         )
+
+    async def _stop_without_credential(
+        self,
+        server_name: str,
+        failure: LifecycleServerOutput,
+        *,
+        force: bool,
+    ) -> LifecycleServerOutput:
+        """Stop a running server whose required credential is now MISSING.
+
+        A key deleted from the user store, with nothing left in the tenant
+        store, the project files or the legacy key, resolves ``missing_auth``.
+        A freshly started gateway would not run that server, so ``connect``
+        and ``restart`` stop the running instance and spawn nothing
+        (Consiliency/pmcp#487 plan 3.6, #489 round 1 GROK-B1). Its lazy
+        registration is dropped too: it still holds the config resolved
+        before the deletion, and ``ensure_connected`` would respawn it with
+        that old value; the next ``gateway.refresh`` registers it again.
+
+        Only ``missing_auth``: a typed ``credential_unavailable`` (an
+        unreadable store) leaves the running instance up (plan 3.5), and a
+        policy or package refusal is not a credential answer.
+        """
+        if failure.auth_state != "missing_auth":
+            return failure
+        status = self._client_manager.get_server_status(server_name)
+        if status is None or status.status in (
+            ServerStatusEnum.OFFLINE,
+            ServerStatusEnum.LAZY,
+        ):
+            return failure
+        disconnected, cancelled, error = await self._client_manager.disconnect_server(
+            server_name, force=force
+        )
+        if disconnected:
+            self._client_manager.prune_lazy_configs(
+                set(self._client_manager.get_lazy_server_names()) - {server_name}
+            )
+            failure.message = (
+                f"{failure.message} The running instance was stopped: its "
+                "credential is no longer available."
+            )
+        else:
+            failure.errors = [
+                *(failure.errors or []),
+                error or f"Server '{server_name}' could not be disconnected.",
+            ]
+        failure.cancelled_request_count = cancelled
+        failure.new_status = self._status_value(server_name)
+        return failure
 
     async def _restart_resolved_server(
         self,
@@ -2763,43 +2881,117 @@ class GatewayTools:
         )
 
     def _check_api_key_available(self, env_var: str | None) -> bool:
-        """Check if an API key is available in environment or any pmcp env store.
+        """Is a credential available under ``env_var``? Never raises.
 
-        This answers a boolean question by loading whole files into the
-        gateway's ``os.environ`` -- every key in them, not just the one asked
-        about. The load stays exactly as it was (so this predicate's answer is
-        bit-for-bit unchanged, interpolation and ``override=False`` precedence
-        included); what is new is that the keys each load INTRODUCES are
-        recorded, so ``sanitized_subprocess_env`` keeps them out of the servers
-        PMCP spawns (Consiliency/pmcp#229). Recording the delta rather than the
-        file's contents is what makes that strip safe -- see
-        ``env_store.record_dotenv_keys``.
+        The one gate (``env_store.credential_value``): the environment, the
+        CURRENT user store, then the served project's files. The reload of the
+        user store into ``os.environ`` that used to follow a miss is gone
+        (Consiliency/pmcp#487): the lookup reads the store itself, so a key
+        added after startup is seen without planting a copy that would
+        outlive its rotation. A typed failure (an unreadable store) answers
+        "not available". This boolean cannot tell "missing" from "cannot be
+        read": a caller that reports an auth state must ask
+        :meth:`_credential_unavailable_reason` first and report
+        ``credential_unavailable`` for a typed answer, never ``missing_auth``.
         """
         if not env_var:
             return False
+        try:
+            return bool(credential_value(env_var, root=self._project_root))
+        except CredentialUnavailableError:
+            return False
 
-        # The process environment, then credentials repository files supplied
-        # (env_store.credential_value) -- fast path.
-        if credential_value(env_var, root=self._project_root):
-            return True
+    def _credential_present(self, env_var: str) -> bool:
+        """``is_auth_available`` for ``resolve_startup_configs``: raises a typed failure.
 
-        # The project's files need no load of their own: the lookup above
-        # builds the served (or given) project's entry with the one builder
-        # (env_store._build_root_entry), confined and outside the gateway's
-        # environment (Consiliency/pmcp#367, #372 rounds 2 and 12). What may
-        # still be missing is the user store, which follows its link and loads
-        # into the environment.
-        before = set(os.environ)
-        load_store("user")
-        record_dotenv_keys(set(os.environ) - before)
-        if credential_value(env_var, root=self._project_root):
-            return True
-
-        return False
+        The resolver contains a :class:`CredentialUnavailableError` to the
+        entry that asked and reports it as ``credential_unavailable``
+        (Consiliency/pmcp#342, #487).
+        """
+        return bool(credential_value(env_var, root=self._project_root))
 
     def _check_any_api_key_available(self, env_vars: list[str]) -> bool:
-        """Check if any auth env var is available."""
-        return any(self._check_api_key_available(env_var) for env_var in env_vars)
+        """Is any of ``env_vars`` available, in order? Never raises.
+
+        Stops at the first typed answer: an unreadable store makes the
+        credential unavailable, and the legacy key after it is never tried
+        (Consiliency/pmcp#487).
+        """
+        for env_var in env_vars:
+            try:
+                if credential_value(env_var, root=self._project_root):
+                    return True
+            except CredentialUnavailableError:
+                return False
+        return False
+
+    def _credential_unavailable_reason(self, env_vars: list[str]) -> str | None:
+        """The typed reason ``env_vars``' lookup fails with, or ``None``."""
+        return credential_unavailable_reason(env_vars, root=self._project_root)
+
+    def _credential_unavailable_provision_output(
+        self, server_name: str, reason: str
+    ) -> ProvisionOutput:
+        self._record_feedback_event(
+            "provision_failure",
+            {"server": server_name, "reason": "credential_unavailable"},
+        )
+        return ProvisionOutput(
+            ok=False,
+            server=server_name,
+            status="failed",
+            message=self._credential_unavailable_message(server_name, reason),
+            auth_state="credential_unavailable",
+            credential_reason=reason,
+            next_step=(
+                "Make ~/.config/pmcp/pmcp.env a readable regular file, then retry."
+                if reason == "store_unreadable"
+                else None
+            ),
+            feedback_hint=self._feedback_hint(),
+        )
+
+    @staticmethod
+    def _credential_unavailable_message(server_name: str, reason: str) -> str:
+        if reason == "store_unreadable":
+            detail = (
+                "the user credential store (~/.config/pmcp/pmcp.env) exists but "
+                "cannot be read"
+            )
+        else:
+            detail = "its credential cannot be determined"
+        return (
+            f"Server '{server_name}' was not started: credential_unavailable "
+            f"({reason}) -- {detail}. pmcp does not start it without its "
+            "credential or with a fallback value."
+        )
+
+    def _credential_unavailable_lifecycle_output(
+        self,
+        server_name: str,
+        reason: str,
+        *,
+        action: Literal["connect", "disconnect", "restart"],
+        prior_status: str,
+    ) -> LifecycleServerOutput:
+        message = self._credential_unavailable_message(server_name, reason)
+        output = self._lifecycle_output(
+            ok=False,
+            server=server_name,
+            action=action,
+            prior_status=prior_status,
+            message=message,
+            errors=[message],
+            auth_state="credential_unavailable",
+            auth_event="credential_unavailable",
+            next_step=(
+                "Make ~/.config/pmcp/pmcp.env a readable regular file, then retry."
+                if reason == "store_unreadable"
+                else None
+            ),
+        )
+        output.credential_reason = reason
+        return output
 
     def _auth_env_options(self, server_name: str, env_var: str | None) -> list[str]:
         """Return acceptable secret-store keys for a server.
@@ -2830,7 +3022,7 @@ class GatewayTools:
 
     def _configured_duplicate_missing_credential(
         self, server_name: str, configured: ResolvedServerConfig
-    ) -> tuple[ServerConfig, list[str]] | None:
+    ) -> tuple[ServerConfig, list[str], str | None] | None:
         """Credential gate for a *configured* (.mcp.json) entry that also
         matches a manifest server.
 
@@ -2839,8 +3031,11 @@ class GatewayTools:
         `None` for this path, so a genuinely-required server with no
         credential reached `ensure_connected`/`connect_server` unauthenticated
         (Consiliency/pmcp#114 board review finding 1). Returns
-        `(manifest_server, auth_env_options)` when the credential is still
-        required and unavailable, else `None`.
+        `(manifest_server, auth_env_options, unavailable)` when the credential
+        is still required and unavailable, else `None`. ``unavailable`` is the
+        typed reason (``store_unreadable``) when the lookup failed rather than
+        found nothing, so a caller reports ``credential_unavailable`` and never
+        collapses it into ``missing_auth`` (Consiliency/pmcp#489 round 1).
         """
         manifest_server = _manifest_for(self._project_root).get_server(server_name)
         if not manifest_server or not manifest_server.env_var:
@@ -2869,15 +3064,14 @@ class GatewayTools:
             return None
 
         auth_env_options = self._auth_env_options(server_name, manifest_server.env_var)
-        if self._check_any_api_key_available(auth_env_options):
-            return None
 
-        # _check_any_api_key_available only checks process env and the PMCP
-        # secret stores BY VARIABLE NAME — it cannot see a concrete
-        # credential the user wrote directly into the configured entry's own
-        # `env` block (board review finding 2). An empty string or
-        # unexpanded `${VAR}` placeholder does NOT satisfy it — same
-        # usability rule as a relaxer value.
+        # The store lookups only check process env and the PMCP secret stores
+        # BY VARIABLE NAME — they cannot see a concrete credential the user
+        # wrote directly into the configured entry's own `env` block (board
+        # review finding 2). An empty string or unexpanded `${VAR}`
+        # placeholder does NOT satisfy it — same usability rule as a relaxer
+        # value. Checked first: the literal is what the child receives, so an
+        # unreadable user store must not refuse it (Consiliency/pmcp#489).
         if (
             isinstance(configured.config, LocalMcpServerConfig)
             and configured.config.env
@@ -2886,7 +3080,13 @@ class GatewayTools:
                 if is_usable_credential_value(configured.config.env.get(key)):
                     return None
 
-        return (manifest_server, auth_env_options)
+        unavailable = self._credential_unavailable_reason(auth_env_options)
+        if unavailable is not None:
+            return (manifest_server, auth_env_options, unavailable)
+        if self._check_any_api_key_available(auth_env_options):
+            return None
+
+        return (manifest_server, auth_env_options, None)
 
     def _write_secret(self, scope: str, key: str, value: str) -> Path:
         """Persist a secret in PMCP env storage."""
@@ -3103,6 +3303,23 @@ class GatewayTools:
             url_elicitations=url_elicitations,
         )
 
+    def _unavailable_remote_header_reason(
+        self,
+        config: ResolvedServerConfig,
+    ) -> str | None:
+        """The typed reason a remote header variable's lookup failed with, or ``None``."""
+        if not isinstance(config.config, RemoteMcpServerConfig):
+            return None
+        resolution = resolve_remote_headers(
+            config.config.headers,
+            build_remote_header_env_lookup(self._project_root),
+        )
+        if not resolution.unavailable_env_vars:
+            return None
+        return resolution.unavailable_env_vars[
+            sorted(resolution.unavailable_env_vars)[0]
+        ]
+
     def _missing_remote_header_env_vars(
         self,
         config: ResolvedServerConfig,
@@ -3191,6 +3408,34 @@ class GatewayTools:
                     "configured",
                 )
             configured = configured_servers[server_name]
+            if action == "disconnect":
+                # Disconnect spawns nothing and needs no credential: refusing
+                # it for a missing or unreadable one would strand a running
+                # server (Consiliency/pmcp#489 round 1, GROK-B1).
+                return (configured, None, "configured")
+            if configured.credential_unavailable is not None:
+                return (
+                    None,
+                    self._credential_unavailable_lifecycle_output(
+                        server_name,
+                        configured.credential_unavailable,
+                        action=action,
+                        prior_status=prior_status,
+                    ),
+                    "configured",
+                )
+            unavailable = self._unavailable_remote_header_reason(configured)
+            if unavailable is not None:
+                return (
+                    None,
+                    self._credential_unavailable_lifecycle_output(
+                        server_name,
+                        unavailable,
+                        action=action,
+                        prior_status=prior_status,
+                    ),
+                    "configured",
+                )
             missing_env_vars = self._missing_remote_header_env_vars(configured)
             if missing_env_vars:
                 return (
@@ -3211,7 +3456,18 @@ class GatewayTools:
                 server_name, configured
             )
             if credential_gap:
-                manifest_server, auth_env_options = credential_gap
+                manifest_server, auth_env_options, gap_unavailable = credential_gap
+                if gap_unavailable is not None:
+                    return (
+                        None,
+                        self._credential_unavailable_lifecycle_output(
+                            server_name,
+                            gap_unavailable,
+                            action=action,
+                            prior_status=prior_status,
+                        ),
+                        "configured",
+                    )
                 env_names = ", ".join(auth_env_options)
                 return (
                     None,
@@ -3304,7 +3560,24 @@ class GatewayTools:
                 auth_env_options = self._auth_env_options(
                     server_name, server_config.env_var
                 )
-                if not self._check_any_api_key_available(auth_env_options):
+                unavailable = self._credential_unavailable_reason(auth_env_options)
+                if unavailable is not None:
+                    if action != "disconnect":
+                        return (
+                            None,
+                            self._credential_unavailable_lifecycle_output(
+                                server_name,
+                                unavailable,
+                                action=action,
+                                prior_status=prior_status,
+                            ),
+                            source,
+                        )
+                elif action != "disconnect" and not self._check_any_api_key_available(
+                    auth_env_options
+                ):
+                    # Disconnect is exempt, as it is from the typed failure
+                    # above (Consiliency/pmcp#489 round 1, GROK-B1).
                     env_names = ", ".join(auth_env_options)
                     return (
                         None,
@@ -3330,9 +3603,43 @@ class GatewayTools:
                         source,
                     )
 
-            resolved = manifest_server_to_config(server_config, self._project_root)
+            try:
+                resolved = manifest_server_to_config(server_config, self._project_root)
+            except CredentialUnavailableError as exc:
+                if action != "disconnect":
+                    return (
+                        None,
+                        self._credential_unavailable_lifecycle_output(
+                            server_name,
+                            exc.reason,
+                            action=action,
+                            prior_status=prior_status,
+                        ),
+                        source,
+                    )
+                # Disconnect spawns nothing: a config without the credential
+                # names the server well enough to stop it.
+                resolved = ResolvedServerConfig(
+                    name=server_name,
+                    source="manifest",
+                    config=LocalMcpServerConfig(
+                        command=server_config.command, args=server_config.args
+                    ),
+                )
+            unavailable = self._unavailable_remote_header_reason(resolved)
+            if unavailable is not None and action != "disconnect":
+                return (
+                    None,
+                    self._credential_unavailable_lifecycle_output(
+                        server_name,
+                        unavailable,
+                        action=action,
+                        prior_status=prior_status,
+                    ),
+                    source,
+                )
             missing_env_vars = self._missing_remote_header_env_vars(resolved)
-            if missing_env_vars:
+            if missing_env_vars and action != "disconnect":
                 return (
                     None,
                     self._remote_header_missing_lifecycle_output(
@@ -4197,6 +4504,19 @@ class GatewayTools:
         # User/project configured servers are lazy-started via ClientManager.
         if server_name in configured_servers:
             configured = configured_servers[server_name]
+            # The same typed checks as _resolve_lifecycle_target, before any
+            # missing-auth answer and before ensure_connected: a typed lookup
+            # failure is credential_unavailable, never missing_auth, and never
+            # spawns (Consiliency/pmcp#489 round 1, GEMINI-G1 / CLAUDE-C2).
+            if configured.credential_unavailable is not None:
+                return self._credential_unavailable_provision_output(
+                    server_name, configured.credential_unavailable
+                )
+            unavailable = self._unavailable_remote_header_reason(configured)
+            if unavailable is not None:
+                return self._credential_unavailable_provision_output(
+                    server_name, unavailable
+                )
             missing_env_vars = self._missing_remote_header_env_vars(configured)
             if missing_env_vars:
                 env_names = ", ".join(missing_env_vars)
@@ -4218,7 +4538,11 @@ class GatewayTools:
                 server_name, configured
             )
             if credential_gap:
-                manifest_server, auth_env_options = credential_gap
+                manifest_server, auth_env_options, gap_unavailable = credential_gap
+                if gap_unavailable is not None:
+                    return self._credential_unavailable_provision_output(
+                        server_name, gap_unavailable
+                    )
                 return ProvisionOutput(
                     ok=False,
                     server=server_name,
@@ -4354,6 +4678,11 @@ class GatewayTools:
             auth_env_options = self._auth_env_options(
                 server_name, server_config.env_var
             )
+            unavailable = self._credential_unavailable_reason(auth_env_options)
+            if unavailable is not None:
+                return self._credential_unavailable_provision_output(
+                    server_name, unavailable
+                )
             if not self._check_any_api_key_available(auth_env_options):
                 return ProvisionOutput(
                     ok=False,
@@ -4383,6 +4712,11 @@ class GatewayTools:
                 resolved_config = manifest_server_to_config(
                     server_config, self._project_root
                 )
+                unavailable = self._unavailable_remote_header_reason(resolved_config)
+                if unavailable is not None:
+                    return self._credential_unavailable_provision_output(
+                        server_name, unavailable
+                    )
                 missing_env_vars = self._missing_remote_header_env_vars(resolved_config)
                 if missing_env_vars:
                     env_names = ", ".join(missing_env_vars)
@@ -4552,6 +4886,11 @@ class GatewayTools:
                 message=f"Installation started for '{server_name}'. Poll gateway.provision_status('{job_id}') for progress.",
                 feedback_hint=None,
             )
+
+        except CredentialUnavailableError as e:
+            # check_api_key and build_install_child_env refuse the spawn with
+            # the typed state; nothing was started (Consiliency/pmcp#487).
+            return self._credential_unavailable_provision_output(server_name, e.reason)
 
         except MissingApiKeyError as e:
             self._record_feedback_event(
@@ -4918,7 +5257,9 @@ class GatewayTools:
                 # Not echoed: the caller's rejected value (rev 12).
                 env_var=None,
             )
-        os.environ[env_var] = parsed.credential
+        shadowed = not publish_auth_connect_value(
+            parsed.scope, env_var, parsed.credential
+        )
         # Recorded in the SAME statement group as the write, with no await between:
         # no other task may observe the environment write without the record. Store
         # membership is not durable evidence: the entry can vanish while the variable
@@ -4930,7 +5271,8 @@ class GatewayTools:
         # and this one never saw it. (`write_env_file`'s old truncate-then-write route
         # is closed -- it is now atomic, Consiliency/pmcp#248.) See
         # `env_store.record_pmcp_introduced_keys` (Consiliency/pmcp#230).
-        record_pmcp_introduced_keys([env_var])
+        # `publish_auth_connect_value` records it, and never overwrites a value
+        # the operator's environment or ~/.env supplied (Consiliency/pmcp#487).
 
         self._audit(
             method="gateway.auth_connect",
@@ -4947,6 +5289,12 @@ class GatewayTools:
             message=(
                 f"Stored credential for '{server_name}' in {parsed.scope} scope. "
                 "You can now call gateway.provision."
+                if not shadowed
+                else f"Stored credential for '{server_name}' in {parsed.scope} "
+                f"scope, but {env_var} is also set in the gateway's own "
+                "environment (or ~/.env), which takes precedence over pmcp's "
+                "stores: the stored value is not used until that is removed "
+                "and the gateway restarted."
             ),
             env_var=env_var,
             env_path=str(path),
@@ -6126,10 +6474,18 @@ class GatewayTools:
             release(process)
             raise
         except Exception as e:
-            logger.error(
-                f"Handoff failed for {job_server_name}: {exception_text(e)}",
-                exc_info=safe_exc_info(e),
-            )
+            # A typed credential failure (the user store became unreadable
+            # during the install) is a state, not a crash: no traceback
+            # (Consiliency/pmcp#487).
+            if isinstance(e, CredentialUnavailableError):
+                logger.error(
+                    f"Handoff failed for {job_server_name}: {exception_text(e)}"
+                )
+            else:
+                logger.error(
+                    f"Handoff failed for {job_server_name}: {exception_text(e)}",
+                    exc_info=safe_exc_info(e),
+                )
             job.status = "failed"
             job.error = f"Handoff failed: {exception_text(e)}"
             # The group, unconditionally (round 10): a refusal before

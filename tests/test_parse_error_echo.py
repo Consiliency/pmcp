@@ -111,6 +111,10 @@ _EXEMPT: dict[str, tuple[str, str]] = {
     "env_store.py::read_store": ("dotenv", "dotenv_values"),
     "env_store.py::_repository_values": ("dotenv", "dotenv_values, parse_variables"),
     "env_store.py::_load_operator_text": ("dotenv", "dotenv_values"),
+    # The live user-store read and its startup-identical expansion
+    # (Consiliency/pmcp#487): a stream each, and a failure is typed, never echoed.
+    "env_store.py::_read_user_store_live": ("dotenv", "dotenv_values"),
+    "env_store.py::_interpolated_store_values": ("dotenv", "parse_variables"),
     # `find_dotenv` locates the file; it reads none of it.
     "cli.py::load_startup_env": ("dotenv", "find_dotenv"),
     "manifest/version_checker.py::get_npm_version": ("response-decode", "aiohttp"),

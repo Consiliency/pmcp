@@ -76,6 +76,9 @@ ENTRY_POINT_INTERNALS = frozenset(
         ("pmcp.env_store", "read_env_text"),
         ("pmcp.env_store", "_read_env_file_strict"),
         ("pmcp.env_store", "_load_operator_text"),
+        # The live read of the user store for a credential lookup
+        # (Consiliency/pmcp#487): the strict counterpart of _read_user_text.
+        ("pmcp.env_store", "_read_user_store_live"),
     }
 )
 
@@ -295,12 +298,15 @@ def test_the_inventory_sees_the_readers_it_governs() -> None:
     inv = inventory(_src_sources())
     callers = {key for key, facts in inv.items() if facts.entry_calls}
     modules = {module for module, _ in callers}
+    # The gateway handlers no longer read a store themselves: the availability
+    # check's reload of the user store into the environment is gone, and the
+    # lookup reads the current store through the one gate (Consiliency/pmcp#487).
     assert {
         "pmcp.cli",
         "pmcp.cli_commands.secrets",
-        "pmcp.tools.handlers",
         "pmcp.env_store",
     } <= modules, sorted(callers)
+    assert "pmcp.tools.handlers" not in modules, sorted(callers)
     internals_with_reads = {
         key
         for key in ENTRY_POINT_INTERNALS
@@ -2056,6 +2062,13 @@ HOME_MEMO_EXEMPT = {
         "the default lock's path, kept only to name it; the lock file is never "
         "removed or otherwise acted on by name after acquisition "
         "(Consiliency/pmcp#372 round 32)"
+    ),
+    ("pmcp.env_store", "_LIVE_USER_STORE"): (
+        "the parsed user store, keyed by the path the home gate resolves AND "
+        "judges (ownership) on every lookup plus that path's stat and lstat "
+        "identity; a hit needs all of them to match, so no remembered answer "
+        "outlives a change of home, ownership, file or link "
+        "(Consiliency/pmcp#487 plan 3.6)"
     ),
 }
 

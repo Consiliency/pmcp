@@ -17,6 +17,11 @@ class RemoteHeaderAuthResolution:
     resolved_headers: dict[str, str]
     missing_env_vars: list[str] = field(default_factory=list)
     referenced_env_vars_by_header: dict[str, list[str]] = field(default_factory=dict)
+    #: Variables whose lookup gave a typed failure, with its reason
+    #: (``credential_unavailable``, Consiliency/pmcp#487). Each is also in
+    #: ``missing_env_vars``, so a caller that knows only "missing" still
+    #: refuses to connect; a caller that knows the state reports it.
+    unavailable_env_vars: dict[str, str] = field(default_factory=dict)
 
 
 class MissingRemoteHeaderAuthError(Exception):
@@ -51,9 +56,12 @@ def resolve_remote_headers(
     if not headers:
         return RemoteHeaderAuthResolution(resolved_headers={})
 
+    from pmcp.credential_state import CredentialUnavailableError
+
     resolved_headers: dict[str, str] = {}
     referenced_env_vars_by_header: dict[str, list[str]] = {}
     missing: set[str] = set()
+    unavailable: dict[str, str] = {}
 
     for header_name, header_value in headers.items():
         referenced = REMOTE_HEADER_ENV_PATTERN.findall(header_value)
@@ -62,7 +70,15 @@ def resolve_remote_headers(
 
         resolved = header_value
         for env_var in sorted(set(referenced)):
-            value = env_lookup(env_var)
+            # A typed failure is contained to this variable: the header keeps
+            # its placeholder, the server is not connected, and no other
+            # server's lookup is affected (Consiliency/pmcp#342, #487).
+            try:
+                value = env_lookup(env_var)
+            except CredentialUnavailableError as exc:
+                unavailable[env_var] = exc.reason
+                missing.add(env_var)
+                continue
             if value:
                 resolved = resolved.replace(f"${{{env_var}}}", value)
             else:
@@ -73,6 +89,7 @@ def resolve_remote_headers(
         resolved_headers=resolved_headers,
         missing_env_vars=sorted(missing),
         referenced_env_vars_by_header=referenced_env_vars_by_header,
+        unavailable_env_vars=unavailable,
     )
 
 

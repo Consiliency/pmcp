@@ -221,7 +221,7 @@ class TestProvisionRoutingAllServers:
 
         monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda **_k: _manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
-        monkeypatch.setattr("pmcp.tools.handlers.load_store", lambda *a, **kw: None)
+        monkeypatch.setattr("pmcp.env_store._read_user_store_live", lambda: None)
         # Force all env-var checks to miss
         monkeypatch.setattr(
             tools,
