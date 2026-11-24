@@ -26,6 +26,7 @@ from pmcp.atomic_write import atomic_write, is_absent
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import (
     collect_credential_diagnostics,
+    collect_token_diagnostics,
     collect_remote_header_diagnostics,
 )
 from pmcp.cli_commands.install import (
@@ -2365,6 +2366,9 @@ async def run_doctor(args: argparse.Namespace) -> None:
             )
         )
 
+    # The 1Password service-account token (Consiliency/pmcp#487 plan 3.1).
+    checks.extend(collect_token_diagnostics())
+
     drift = detect_install_drift()
     if drift.has_drift:
         checks.append(
@@ -3381,6 +3385,11 @@ def load_startup_env(
     _refuse_reference_shaped_pmcp_variables()
 
 
+#: Set by the startup load when ``PMCP_AUTH_TOKEN`` was a reference (it is
+#: then removed from the environment): the HTTP gateway refuses to start.
+_AUTH_TOKEN_WAS_REFERENCE = False
+
+
 def _refuse_reference_shaped_pmcp_variables() -> None:
     """pmcp's own variables are never secret references (plan 3.2.5).
 
@@ -3393,10 +3402,15 @@ def _refuse_reference_shaped_pmcp_variables() -> None:
     from pmcp.env_store import is_pmcp_environment_name, skipped_references
     from pmcp.secret_refs import is_reference_shaped
 
+    global _AUTH_TOKEN_WAS_REFERENCE
     for name in sorted(os.environ):
         if is_pmcp_environment_name(name) and is_reference_shaped(os.environ[name]):
-            if name.upper() != "PMCP_AUTH_TOKEN":
-                os.environ.pop(name, None)
+            if name.upper() == "PMCP_AUTH_TOKEN":
+                # Remembered for the HTTP gateway's refusal to start, and
+                # removed for every transport: no child inherits the
+                # reference string (#499 r1 G2).
+                _AUTH_TOKEN_WAS_REFERENCE = True
+            os.environ.pop(name, None)
             print(
                 f"pmcp: refusing {operator_safe(name)}: pmcp's own variables are "
                 "never secret references (op://...)",
@@ -3425,10 +3439,14 @@ def _refuse_reference_auth_token(args: argparse.Namespace) -> None:
     if getattr(args, "transport", None) != "http":
         return
     token = getattr(args, "auth_token", None)
-    if (token and is_reference_shaped(token)) or (
-        "PMCP_AUTH_TOKEN" in skipped_references()
-        and "PMCP_AUTH_TOKEN" not in os.environ
-        and not token
+    if (
+        (token and is_reference_shaped(token))
+        or (_AUTH_TOKEN_WAS_REFERENCE and not token)
+        or (
+            "PMCP_AUTH_TOKEN" in skipped_references()
+            and "PMCP_AUTH_TOKEN" not in os.environ
+            and not token
+        )
     ):
         print(
             "error: PMCP_AUTH_TOKEN (or --auth-token/--auth-token-file) is a "

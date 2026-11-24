@@ -1630,8 +1630,8 @@ def _manifest_server_to_config(
             env_value = env_lookup(lookup_key)
             if env_value:
                 env[server.env_var] = str(env_value)
-                credential_sources[server.env_var] = getattr(
-                    env_value, "source", "unknown"
+                credential_sources[server.env_var] = consumer_source_kind(
+                    server, getattr(env_value, "source", "unknown")
                 )
                 break
 
@@ -1654,6 +1654,19 @@ def _manifest_server_to_config(
     if reason is not None:
         raise CredentialUnavailableError(reason)
     return resolved
+
+
+def consumer_source_kind(server: object, kind: str) -> str:
+    """The source kind recorded for a credential looked up FOR ``server``.
+
+    An agent-registered (discovered) server never receives a resolved
+    reference, whatever layer held it (#499 r1 N3): its lookups are recorded
+    as ``discovered``, which is never trusted. Plain values are unaffected:
+    the kind decides only whether a reference is resolved.
+    """
+    return (
+        "discovered" if getattr(server, "entry_origin", None) == "discovered" else kind
+    )
 
 
 #: Manifest entries that may opt in to own-env resolution: the operator's

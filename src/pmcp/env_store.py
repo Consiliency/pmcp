@@ -937,14 +937,19 @@ def environment_holds(name: str) -> EnvOrigin | None:
     is not in the environment, or is a (stale) startup copy of a store value.
     """
     ensure_startup_load()
-    if name not in os.environ:
-        return None
-    origin = _ENV_ORIGINS.get(name)
-    if origin is None:
-        return "external"
-    if origin == "user_store":
-        return None
-    return origin
+    origin = _ENV_ORIGINS.get(name) if name in os.environ else None
+    if name in os.environ and origin not in ("user_store", "auth_connect_project"):
+        return "external" if origin is None else origin
+    skipped = _SKIPPED_REFERENCES.get(name)
+    if skipped in ("home_dotenv", "external"):
+        # A reference the startup load skipped (plan 3.2.5) is still HELD at
+        # its layer: it outranks the user store and a project-scope
+        # auth_connect, and its lookup is refused (reference_not_allowed_here),
+        # never answered from a lower layer (Consiliency/pmcp#499 r1 F1).
+        return skipped
+    if name in os.environ and origin == "auth_connect_project":
+        return origin
+    return None
 
 
 def publish_auth_connect_value(scope: str, name: str, value: str) -> bool:
@@ -1244,17 +1249,23 @@ def credential_value_sourced(
     """
     ensure_startup_load()
     if environ:
-        if key in os.environ and _ENV_ORIGINS.get(key) != "user_store":
+        if key in os.environ and _ENV_ORIGINS.get(key) not in (
+            "user_store",
+            "auth_connect_project",
+        ):
             value = os.environ[key]
             if not value:
                 return None
             return SourcedValue(
                 value, _ORIGIN_SOURCE.get(_ENV_ORIGINS.get(key), "environment")
             )
-        if _SKIPPED_REFERENCES.get(key) == "home_dotenv":
+        if _SKIPPED_REFERENCES.get(key) in ("home_dotenv", "external"):
             # ``~/.env`` held a reference for this name: it outranks the user
             # store (plan 3.6), so it is the answer -- refused (plan 3.2.2).
             raise CredentialUnavailableError(REFERENCE_NOT_ALLOWED_HERE)
+        if key in os.environ and _ENV_ORIGINS.get(key) == "auth_connect_project":
+            value = os.environ[key]
+            return SourcedValue(value, "auth_connect_project") if value else None
         stored = _current_user_store_value_sourced(key)
         if stored is not _ABSENT:
             stored_value, kind = cast("tuple[str | None, str]", stored)
@@ -1603,7 +1614,12 @@ _NEVER_LOADED = frozenset(
 def _never_loaded_name(key: str) -> bool:
     """``_NEVER_LOADED``, plus every ``OP_SESSION_*``."""
     upper = key.upper()
-    return upper in _NEVER_LOADED or upper.startswith("OP_SESSION_")
+    return upper in _NEVER_LOADED or _OP_SESSION_NAMESPACE.match(upper) is not None
+
+
+#: ``OP_SESSION_*`` (a regex: the store modules' AST ban reads ``startswith``
+#: as a path containment test).
+_OP_SESSION_NAMESPACE = re.compile(r"OP_SESSION_")
 
 
 def _is_reference_shaped(value: str) -> bool:
@@ -1734,15 +1750,18 @@ def child_process_env(
     any spawn in ``src/pmcp`` whose ``env=`` does not come from a builder.
     """
     env = dict(os.environ if base is None else base)
-    # The 1Password control names are never inherited (Consiliency/pmcp#487
-    # plan 3.1): only ``op`` itself gets the token, from its own builder.
-    # An explicit overlay (a server's own env) is governed by plan 3.2.4.
-    for name in [
-        n
-        for n in env
-        if _never_loaded_name(n) and n.upper() not in ("HOME", "USERPROFILE")
-    ]:
-        env.pop(name, None)
+    if base is None:
+        # The 1Password control names are never INHERITED from pmcp's own
+        # environment (Consiliency/pmcp#487 plan 3.1): only ``op`` gets the
+        # token, from its own builder. An explicit ``base`` is an environment
+        # the caller already built -- a server's own env included (the update
+        # probe, #499 r1 N4) -- and an overlay is governed by plan 3.2.4.
+        for name in [
+            n
+            for n in env
+            if _never_loaded_name(n) and n.upper() not in ("HOME", "USERPROFILE")
+        ]:
+            env.pop(name, None)
     if overlay:
         env.update(overlay)
     return env

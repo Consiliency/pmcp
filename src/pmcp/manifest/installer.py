@@ -28,6 +28,7 @@ from pmcp.env_store import (
     resolve_scope_path,
     sanitized_subprocess_env,
 )
+from pmcp.config.loader import consumer_source_kind
 from pmcp.credential_state import CredentialUnavailableError
 from pmcp.manifest.environment import Platform
 from pmcp.secret_refs import (
@@ -820,7 +821,7 @@ def _install_spawn_config(
             value = credential_value_sourced(key, root=project_root)
             if value:
                 own_env[env_var] = str(value)
-                sources[env_var] = value.source
+                sources[env_var] = consumer_source_kind(server_config, value.source)
                 break
     spawn = ResolvedServerConfig(
         name=server_config.name,

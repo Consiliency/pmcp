@@ -1663,6 +1663,7 @@ class ClientManager:
         # ``config_changed``).
         self._config_generations: dict[str, int] = {}
         self._config_fingerprints: dict[str, str] = {}
+        self._published_configs: dict[str, ResolvedServerConfig] = {}
         # Set once by `abandon_all_now()` and never cleared: see
         # `_connect_server`.
         self._abandoned = False
@@ -1715,15 +1716,11 @@ class ClientManager:
 
     # --- Secret references: resolve outside the lock (plan 3.5) -------------
 
-    def _note_config(self, config: ResolvedServerConfig) -> int:
-        """Record ``config`` as the one for its name; the name's generation.
-
-        A config that differs from the last one noted for the name -- in its
-        server config, its credential sources or its opt-in -- bumps the
-        generation, so a resolution made for the old one is discarded.
-        """
+    @staticmethod
+    def _fingerprint(config: ResolvedServerConfig) -> str:
+        """What makes two configs for one name the same spawn (plan 3.5)."""
         try:
-            fingerprint = json.dumps(
+            return json.dumps(
                 [
                     config.config.model_dump(mode="json"),
                     sorted(config.credential_sources.items()),
@@ -1732,37 +1729,79 @@ class ClientManager:
                 sort_keys=True,
                 default=str,
             )
-        except (TypeError, ValueError):
-            fingerprint = repr(config)
+        except (TypeError, ValueError, AttributeError):
+            return repr(config)
+
+    def publish_config(self, config: ResolvedServerConfig) -> int:
+        """Publish ``config`` as THE config for its name; the name's generation.
+
+        Called where the manager is handed a replacement -- connect, connect
+        all, restart, refresh, lazy registration, adoption, and
+        ``prepare_configs`` for ``gateway.refresh`` -- never by a resolution
+        or a reconnect (#499 r1 G1). A config whose fingerprint differs from
+        the published one bumps the generation, so every resolution in
+        flight for the old one is discarded.
+        """
         name = config.name
+        fingerprint = self._fingerprint(config)
         if self._config_fingerprints.get(name) != fingerprint:
             self._config_fingerprints[name] = fingerprint
             self._config_generations[name] = self._config_generations.get(name, 0) + 1
+        self._published_configs[name] = config
         return self._config_generations.get(name, 0)
 
     def bump_config_generation(self, name: str) -> None:
-        """Invalidate any resolution in flight for ``name`` (its config was replaced)."""
-        self._config_fingerprints.pop(name, None)
+        """Invalidate any resolution in flight for ``name`` without a new config.
+
+        The published config stays; a resolution started before this is
+        re-resolved against it (plan 3.5).
+        """
         self._config_generations[name] = self._config_generations.get(name, 0) + 1
+
+    def _superseded(self, config: ResolvedServerConfig) -> bool:
+        """Has a different config been published for ``config``'s name?"""
+        published = self._config_fingerprints.get(config.name)
+        return published is not None and published != self._fingerprint(config)
+
+    def _current_config(self, name: str) -> ResolvedServerConfig | None:
+        """The config published for ``name`` now, if any."""
+        return self._published_configs.get(name)
 
     async def prepare_spawn(self, config: ResolvedServerConfig) -> SpawnSecrets:
         """Resolve ``config``'s secret references, OUTSIDE the lifecycle lock.
 
-        Returns the fresh overlay and the generation it was resolved for.
-        Raises :class:`CredentialUnavailableError` (typed, value-free). A
-        config the loader already marked ``credential_unavailable`` fails
-        with that reason: such an entry is never started.
+        Never publishes ``config`` (#499 r1 G1): it records the generation
+        current when the resolution started and ``config``'s fingerprint,
+        and the lock-time check discards it if either no longer matches the
+        published config. Raises :class:`CredentialUnavailableError` (typed,
+        value-free). A config the loader marked ``credential_unavailable``
+        fails with that reason -- except a host reason (the token file, the
+        platform), which is looked up again now (plan 3.1, #499 r1 N5).
         """
-        generation = self._note_config(config)
-        if isinstance(config.credential_unavailable, str):
-            raise CredentialUnavailableError(config.credential_unavailable)
+        generation = self._config_generations.get(config.name, 0)
+        fingerprint = self._fingerprint(config)
+        stored = config.credential_unavailable
+        if isinstance(stored, str):
+            if stored not in _secret_refs.HOST_REASONS:
+                raise CredentialUnavailableError(stored)
+            current = _secret_refs.static_failure(config)
+            if current is not None:
+                raise CredentialUnavailableError(current)
         if not isinstance(config.config, LocalMcpServerConfig):
-            return SpawnSecrets({}, generation)
+            return SpawnSecrets({}, generation, fingerprint)
         overlay = await _secret_refs.resolve_spawn_env(config)
-        return SpawnSecrets(overlay, generation)
+        return SpawnSecrets(overlay, generation, fingerprint)
 
     def _stale(self, config: ResolvedServerConfig, secrets: SpawnSecrets) -> bool:
-        return self._config_generations.get(config.name, 0) != secrets.generation
+        """Was ``secrets`` resolved for a config that is no longer published?"""
+        name = config.name
+        if name not in self._config_fingerprints:
+            return False  # nothing published for the name: nothing replaced it
+        return (
+            self._config_generations.get(name, 0) != secrets.generation
+            or self._config_fingerprints[name] != secrets.fingerprint
+            or self._fingerprint(config) != secrets.fingerprint
+        )
 
     def _record_unavailable(self, name: str, reason: str) -> str:
         """Report a typed resolution failure on ``name`` (never over a live instance).
@@ -1828,8 +1867,11 @@ class ClientManager:
     async def prepare_configs(
         self, configs: list[ResolvedServerConfig]
     ) -> tuple[dict[str, SpawnSecrets], list[str], set[str]]:
-        """Resolve ``configs`` now, outside the lifecycle lock, for a later
-        ``connect_all(..., prepared=...)`` (``gateway.refresh``)."""
+        """Publish ``configs`` and resolve them now, outside the lifecycle
+        lock, for a later ``connect_all(..., prepared=...)``
+        (``gateway.refresh``)."""
+        for config in configs:
+            self.publish_config(config)
         return await self._prepare_configs(configs)
 
     async def _run_prepared(
@@ -1839,13 +1881,19 @@ class ClientManager:
         *,
         prepared: dict[str, SpawnSecrets] | None = None,
     ) -> list[str]:
-        """Resolve ``configs`` outside the lock, then run ``body`` under it.
+        """Publish ``configs``, resolve them outside the lock, then run ``body`` under it.
 
-        A config whose generation changed while it was resolved is
-        re-resolved once; a second change is a typed retryable
-        ``config_changed``. ``body`` receives the configs still current and
-        their resolutions, and returns error messages.
+        A config not already resolved by the caller (``prepared``) is
+        published first: the caller is handing it over as the config for its
+        name. A config whose published config changed while it was resolved
+        is never spawned (#499 r1 G1): the CURRENT published config is
+        re-resolved once and spawned in its place; a second change is a
+        typed retryable ``config_changed``. ``body`` receives the configs
+        still current and their resolutions, and returns error messages.
         """
+        for config in configs:
+            if prepared is None or config.name not in prepared:
+                self.publish_config(config)
         secrets, errors, failed = await self._prepare_configs(configs, prepared)
         pending = [config for config in configs if config.name not in failed]
         for attempt in range(2):
@@ -1861,13 +1909,21 @@ class ClientManager:
                     errors += await body(ready, secrets)
             if not stale:
                 break
-            pending = [config for config in pending if config.name in stale]
             if attempt == 1:
-                for config in pending:
-                    errors.append(self._record_unavailable(config.name, CONFIG_CHANGED))
+                for name in sorted(stale):
+                    errors.append(self._record_unavailable(name, CONFIG_CHANGED))
                 break
-            for config in pending:
-                secrets.pop(config.name, None)
+            # Re-resolve against the config published NOW, never the
+            # caller's superseded object.
+            replaced: list[ResolvedServerConfig] = []
+            for name in sorted(stale):
+                secrets.pop(name, None)
+                current = self._current_config(name)
+                if current is None:
+                    errors.append(self._record_unavailable(name, CONFIG_CHANGED))
+                else:
+                    replaced.append(current)
+            pending = replaced
             more, more_errors, more_failed = await self._prepare_configs(pending)
             secrets.update(more)
             errors += more_errors
@@ -2060,6 +2116,8 @@ class ClientManager:
                 continue
 
             self._lazy_configs[name] = config
+            # Its config is now THE one for the name (plan 3.5, #499 r1 G1).
+            self.publish_config(config)
             # Create LAZY status entry so server appears in status listings
             self._servers[name] = ServerStatus(
                 name=name,
@@ -2192,9 +2250,12 @@ class ClientManager:
         ) -> list[str]:
             if not ready:
                 return []
+            # The config still published for the name: the caller's, or the
+            # replacement it was re-resolved for (#499 r1 G1).
+            current = ready[0]
             try:
                 await self._connect_singleflight(
-                    config, retry=retry, secrets=_with_overlay(secrets, config.name)
+                    current, retry=retry, secrets=_with_overlay(secrets, current.name)
                 )
                 if self.is_server_online(config.name):
                     self._lazy_configs.pop(config.name, None)
@@ -2397,6 +2458,7 @@ class ClientManager:
         typed error -- no new spawn uses an old value, so this is not a
         fallback.
         """
+        self.publish_config(config)
         try:
             prepared = await self.prepare_spawn(config)
         except CredentialUnavailableError as exc:
@@ -4390,6 +4452,14 @@ class ClientManager:
                     return
                 logger.info(f"[{name}] reconnect attempt {attempt}/{len(delays)} ...")
                 try:
+                    # A crashed config that a newer one has replaced is never
+                    # respawned, and never re-published (#499 r1 G1).
+                    if self._superseded(config):
+                        logger.warning(
+                            f"[{name}] reconnect stopped: credential_unavailable "
+                            f"({CONFIG_CHANGED}); its config was replaced"
+                        )
+                        return
                     # Resolved again from the stored reference, before the
                     # lock (Consiliency/pmcp#487 plan 3.5).
                     secrets = await self.prepare_spawn(config)
@@ -4398,6 +4468,12 @@ class ClientManager:
                         if managed and managed.status.status == ServerStatusEnum.ONLINE:
                             logger.debug(
                                 f"[{name}] already online; skipping reconnect attempt {attempt}"
+                            )
+                            return
+                        if self._superseded(config) or self._stale(config, secrets):
+                            logger.warning(
+                                f"[{name}] reconnect stopped: credential_unavailable "
+                                f"({CONFIG_CHANGED}); its config was replaced"
                             )
                             return
                         resolved = _nonempty(secrets)
@@ -5082,9 +5158,20 @@ class ClientManager:
         Every config's references are resolved first, outside the lock; the
         teardown follows only then (Consiliency/pmcp#487 plan 3.5).
         """
+        for config in configs:
+            self.publish_config(config)
         secrets, errors, failed = await self._prepare_configs(configs)
         async with self._lifecycle_lock:
-            await self._disconnect_all_unlocked()
+            # A running server whose lookup failed is KEPT (plan 3.5, #499 r1
+            # A2): nothing new is spawned with an old value, and tearing it
+            # down would turn a credential problem into an outage. Every other
+            # server is torn down as before.
+            keep = {name for name in failed if self.is_server_online(name)}
+            if keep:
+                for name in [n for n in list(self._clients) if n not in keep]:
+                    await self._disconnect_server_locked(name, 0)
+            else:
+                await self._disconnect_all_unlocked()
             ready = [
                 config
                 for config in configs
@@ -5139,6 +5226,9 @@ class ClientManager:
             Exception: If MCP initialization fails
         """
         self._refuse_adoption_if_abandoned(name)
+        # The adopted process runs this config: it is THE one for the name
+        # (plan 3.5, #499 r1 G1).
+        self.publish_config(config)
         # Read the group now, while the leader is alive (or an unreaped
         # zombie): a leader that exits during the wait can then still have
         # its descendants killed through the retained id (codex round 7).

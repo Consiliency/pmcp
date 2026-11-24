@@ -78,6 +78,14 @@ if entry.get("hang"):
 if entry.get("overflow"):
     sys.stdout.write("x" * entry["overflow"])
     sys.stdout.flush()
+if entry.get("detach_after") is not None:
+    # Close both pipes, then stay alive: op "finished" its output but not
+    # its exit.
+    time.sleep(entry["detach_after"])
+    sys.stdout.flush()
+    os.close(1)
+    os.close(2)
+    time.sleep(30)
 record["end"] = time.time()
 with open(os.path.join(HERE, "calls.jsonl"), "a") as f:
     f.write(json.dumps(record) + "\n")
@@ -144,7 +152,16 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Host:
     (root / ".git").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.chdir(root)
-    for key in (NAMESPACED, LEGACY, "CANARY_SECRET", "OP_SERVICE_ACCOUNT_TOKEN"):
+    # The runner's own proxy and CA variables would reach op legitimately
+    # (operator-supplied); the env tests assume none (#499 r1 F4).
+    for key in (
+        *secret_refs._OP_PASSTHROUGH,
+        NAMESPACED,
+        LEGACY,
+        "CANARY_SECRET",
+        "OP_SERVICE_ACCOUNT_TOKEN",
+        "PMCP_AUTH_TOKEN",
+    ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
@@ -1131,36 +1148,6 @@ def test_a_restart_whose_lookup_fails_leaves_the_running_instance(
     assert "credential_unavailable (auth_failed)" in errors[0]
 
 
-def test_a_config_change_during_resolution_re_resolves_then_is_typed(
-    host: Host, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    host.write_token()
-    manager = _manager(host)
-    config = _local({"K": REF}, {"K": "user_store"})
-    calls = {"n": 0}
-    real = secret_refs.resolve_spawn_env
-
-    async def racing(cfg: Any, **kw: Any) -> dict[str, str]:
-        calls["n"] += 1
-        result = await real(cfg, **kw)
-        manager.bump_config_generation(cfg.name)  # replaced meanwhile
-        return result
-
-    import pmcp.client.manager as manager_module
-
-    monkeypatch.setattr(manager_module._secret_refs, "resolve_spawn_env", racing)
-    spawned: list[str] = []
-
-    async def no_spawn(cfg: Any, secrets: Any = None) -> None:
-        spawned.append(cfg.name)
-
-    monkeypatch.setattr(manager, "_connect_stdio", no_spawn)
-    errors = _run(manager.connect_server(config, retry=False))
-    assert calls["n"] == 2  # re-resolved once
-    assert spawned == []  # nothing released
-    assert any(cs.CONFIG_CHANGED in e for e in errors)
-
-
 def test_a_typed_failure_is_not_retried(
     host: Host, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1592,3 +1579,577 @@ def test_other_pmcp_variables_are_never_references(
     _start(host)
     assert "PMCP_GATEWAY_URL" not in os.environ
     assert "op://v/i/f" not in capsys.readouterr().err
+
+
+# =========================================================================== #
+# Round 1 of the panel on Consiliency/pmcp#499
+# =========================================================================== #
+
+OPAQUE = "opaque-resolved-value-48151623"  # matches no secret pattern
+
+
+def _task_gateway() -> tuple[Any, Any]:
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+    from pmcp.types import RiskHint, ToolInfo
+    from tests.test_tools import MockClientManager
+
+    tool = ToolInfo(
+        tool_id="svc::do_thing",
+        server_name="svc",
+        tool_name="do_thing",
+        description="t",
+        short_description="t",
+        input_schema={"type": "object", "properties": {}},
+        tags=[],
+        risk_hint=RiskHint.LOW,
+        execution={"taskSupport": "optional"},
+    )
+    cm = MockClientManager([tool])
+    cm.set_server_online("svc")
+    return GatewayTools(client_manager=cm, policy_manager=PolicyManager()), cm
+
+
+def test_task_metadata_is_exact_redacted_on_every_task_surface() -> None:
+    """A1/F2: a child that echoes its resolved credential into task metadata
+    (statusMessage, raw values AND keys) never shows it, on invoke-with-task,
+    tasks list/get/result and cancel."""
+    from pmcp.types import McpTaskRecord
+
+    secret_registry.register_secret_value(OPAQUE)
+    gt, cm = _task_gateway()
+
+    async def call_tool(tool_id: str, args: Any, timeout_ms: int, **_: Any) -> Any:
+        cm.tasks[("svc", "t1")] = McpTaskRecord(
+            task_id="t1",
+            status="working",
+            status_message=f"working with {OPAQUE}",
+            raw={"statusMessage": OPAQUE, "meta": {OPAQUE: [f"x{OPAQUE}y"]}},
+            server_name="svc",
+            tool_id=tool_id,
+        )
+        return {"task": {"taskId": "t1", "status": "working"}}
+
+    cm.call_tool = call_tool
+
+    async def main() -> list[Any]:
+        return [
+            await gt.invoke({"tool_id": "svc::do_thing", "arguments": {}, "task": {}}),
+            await gt.tasks_list({"server_name": "svc"}),
+            await gt.tasks_get({"server_name": "svc", "task_id": "t1"}),
+            await gt.tasks_result({"server_name": "svc", "task_id": "t1"}),
+            await gt.tasks_cancel({"server_name": "svc", "task_id": "t1"}),
+        ]
+
+    outputs = _run(main())
+    for output in outputs:
+        dumped = output.model_dump_json()
+        assert OPAQUE not in dumped, type(output).__name__
+    assert outputs[4].task is not None  # cancel returned the (sanitized) task
+
+
+def test_every_gateway_tool_response_is_redacted_before_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A1 safety net: whatever a gateway tool returns, the dispatcher redacts
+    registered values (keys and values) before audit and serialization."""
+    from mcp.server.connection import Connection
+    from mcp.server.context import ServerRequestContext
+    from mcp.server.session import ServerSession
+    from mcp.types import CallToolRequestParams
+
+    from pmcp.server import GatewayServer
+
+    secret_registry.register_secret_value(OPAQUE)
+    srv = GatewayServer()
+
+    async def leaky(arguments: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True, "note": f"a {OPAQUE} b", OPAQUE: [OPAQUE]}
+
+    monkeypatch.setattr(srv._gateway_tools, "tasks_list", leaky)
+    srv._create_server(instructions="test")
+    assert srv._server is not None
+    entry = srv._server.get_request_handler("tools/call")
+    assert entry is not None
+    ctx = ServerRequestContext(
+        session=ServerSession(
+            MagicMock(), Connection.from_envelope("2025-11-25", None, None)
+        ),
+        lifespan_context={},
+        protocol_version="2025-11-25",
+        method="test",
+    )
+    result = _run(
+        entry.handler(
+            ctx,
+            CallToolRequestParams(
+                name="gateway.tasks_list", arguments={"server_name": "s"}
+            ),
+        )
+    )
+    text = json.dumps(result.model_dump(mode="json"))
+    assert OPAQUE not in text
+    assert "[REDACTED]" in text
+
+
+def test_feedback_text_is_exact_redacted() -> None:
+    secret_registry.register_secret_value(OPAQUE)
+    gt, _cm = _task_gateway()
+    assert OPAQUE not in gt._scrub_sensitive_text(f"crash: {OPAQUE}")
+
+
+def test_a_skipped_home_dotenv_reference_is_held_at_its_layer(host: Host) -> None:
+    """F1: ~/.env held KEY=op://...: it is skipped (never in os.environ) and
+    still HELD at the home_dotenv layer -- a project-scope auth_connect and
+    the user store never answer KEY; the lookup is refused typed."""
+    (host.home / ".env").write_text(f"{NAMESPACED}={REF}\n")
+    host.write_store(f"{NAMESPACED}=store-value-plain\n")
+    _start(host)
+    assert env_store.environment_holds(NAMESPACED) == "home_dotenv"
+    assert env_store.credential_layers(NAMESPACED)[0] == "environment (home_dotenv)"
+    assert (
+        env_store.publish_auth_connect_value(
+            "project", NAMESPACED, "project-value-plain"
+        )
+        is False
+    )
+    assert (
+        env_store.publish_auth_connect_value("user", NAMESPACED, "user-value-plain")
+        is False
+    )
+    assert NAMESPACED not in os.environ
+    with pytest.raises(CredentialUnavailableError) as raised:
+        env_store.credential_value(NAMESPACED)
+    assert raised.value.reason == cs.REFERENCE_NOT_ALLOWED_HERE
+
+
+def test_auth_connect_says_a_skipped_home_dotenv_reference_shadows_it(
+    host: Host,
+) -> None:
+    (host.home / ".env").write_text(f"{NAMESPACED}={REF}\n")
+    _start(host)
+    out = _run(
+        _tools(host).auth_connect(
+            {
+                "server_name": "brightdata",
+                "credential": "plain-new-value-1",
+                "scope": "project",
+            }
+        )
+    )
+    assert "takes precedence" in out.message
+    with pytest.raises(CredentialUnavailableError):
+        env_store.credential_value(NAMESPACED, root=host.root)
+
+
+# --- config generation (plan 3.5; #499 r1 G1/N1) ---------------------------
+
+
+def _gen_manager(host: Host, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[Any]]:
+    """A manager whose spawn records the config object it would start."""
+    manager = _manager(host)
+    spawned: list[Any] = []
+
+    async def record(cfg: Any, secrets: Any = None) -> None:
+        overlay = secret_refs.require_resolved(cfg, secrets)
+        spawned.append((cfg.config.env, overlay))
+
+    monkeypatch.setattr(manager, "_connect_server", record)
+    return manager, spawned
+
+
+def _ref_config(field_name: str) -> ResolvedServerConfig:
+    return _local({"K": f"op://v/item/{field_name}"}, {"K": "user_store"})
+
+
+def test_a_replacement_published_during_resolution_is_never_lost(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single external replacement while the old config resolves: the old
+    config is never spawned; the published replacement is re-resolved and
+    spawned in its place."""
+    host.write_token()
+    host.op.table({"*": {"stdout": VALUE, "sleep": 0.3}})
+    manager, spawned = _gen_manager(host, monkeypatch)
+    old, new = _ref_config("oldfield"), _ref_config("newfield")
+
+    async def main() -> list[str]:
+        connecting = asyncio.ensure_future(manager.connect_server(old, retry=False))
+        await asyncio.sleep(0.1)  # old is resolving
+        manager.publish_config(new)  # e.g. gateway.refresh replaced it
+        return await connecting
+
+    errors = _run(main())
+    assert errors == []
+    assert [env["K"] for env, _ in spawned] == ["op://v/item/newfield"]
+
+
+def test_overlapping_resolutions_never_spawn_the_superseded_config(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """prepare_spawn(old) in flight, new published and prepared, then
+    connect(old) with old's resolution: old is not spawned."""
+    host.write_token()
+    manager, spawned = _gen_manager(host, monkeypatch)
+    old, new = _ref_config("oldfield"), _ref_config("newfield")
+
+    async def main() -> list[str]:
+        manager.publish_config(old)
+        old_secrets = await manager.prepare_spawn(old)
+        manager.publish_config(new)
+        await manager.prepare_spawn(new)
+        return await manager.connect_server(old, retry=False, prepared=old_secrets)
+
+    _run(main())
+    assert all(env["K"] != "op://v/item/oldfield" for env, _ in spawned)
+
+
+def test_a_second_change_during_the_re_resolve_is_typed_config_changed(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host.write_token()
+    manager, spawned = _gen_manager(host, monkeypatch)
+    configs = [_ref_config(f"f{i}") for i in range(4)]
+    real = secret_refs.resolve_spawn_env
+    import pmcp.client.manager as manager_module
+
+    async def racing(cfg: Any, **kw: Any) -> dict[str, str]:
+        result = await real(cfg, **kw)
+        manager.publish_config(configs.pop())  # replaced on every resolve
+        return result
+
+    monkeypatch.setattr(manager_module._secret_refs, "resolve_spawn_env", racing)
+    errors = _run(manager.connect_server(_ref_config("first"), retry=False))
+    assert spawned == []
+    assert any(cs.CONFIG_CHANGED in e for e in errors)
+
+
+def test_reconnect_never_respawns_a_superseded_crashed_config(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pmcp.client.manager as manager_module
+
+    host.write_token()
+    manager, spawned = _gen_manager(host, monkeypatch)
+    old, new = _ref_config("oldfield"), _ref_config("newfield")
+    manager.publish_config(old)
+    manager.publish_config(new)  # newer fingerprint stored; server offline
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(manager_module.asyncio, "sleep", no_sleep)
+    _run(manager._reconnect_loop("srv", old))
+    assert spawned == []
+    assert manager._config_fingerprints["srv"] == manager._fingerprint(new)
+    assert host.op.calls() == []
+
+
+def test_prepare_spawn_never_publishes(host: Host) -> None:
+    host.write_token()
+    manager = _manager(host)
+    new = _ref_config("newfield")
+    manager.publish_config(new)
+    _run(manager.prepare_spawn(_ref_config("oldfield")))
+    assert manager._config_fingerprints["srv"] == manager._fingerprint(new)
+
+
+def test_a_token_fixed_after_config_load_is_found_on_demand(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N5: a config loaded while the token was missing (op_not_configured)
+    starts once the token file exists, without reloading the config."""
+    host.write_store(f"{NAMESPACED}={REF}\n")
+    _start(host)
+    user = host.home / ".mcp.json"
+    user.write_text(json.dumps({"mcpServers": {"brightdata": {"type": "local"}}}))
+    (config,) = [
+        c
+        for c in load_configs(project_root=host.root, user_config_paths=[user])
+        if c.name == "brightdata"
+    ]
+    assert config.credential_unavailable == cs.OP_NOT_CONFIGURED
+    host.write_token()
+    manager = _manager(host)
+    secrets_ = _run(manager.prepare_spawn(config))
+    assert secrets_.overlay == {LEGACY: VALUE}
+    # A config-intrinsic reason still sticks.
+    stuck = config.model_copy(
+        update={"credential_unavailable": cs.REFERENCE_UNSUPPORTED}
+    )
+    with pytest.raises(CredentialUnavailableError):
+        _run(manager.prepare_spawn(stuck))
+
+
+# --- refresh keeps a server whose lookup fails (plan 3.5; A2, N2) ----------
+
+
+def test_manager_refresh_keeps_a_running_server_whose_lookup_fails(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(host)
+    config = _ref_config("f")
+    torn: list[str] = []
+
+    async def failing(cfg: Any) -> Any:
+        raise CredentialUnavailableError(cs.AUTH_FAILED)
+
+    async def teardown_all() -> None:
+        torn.append("*")
+
+    async def teardown_one(name: str, cancelled: int) -> Any:
+        torn.append(name)
+        return (True, 0, None)
+
+    monkeypatch.setattr(manager, "prepare_spawn", failing)
+    monkeypatch.setattr(manager, "_disconnect_all_unlocked", teardown_all)
+    monkeypatch.setattr(manager, "_disconnect_server_locked", teardown_one)
+    monkeypatch.setattr(manager, "is_server_online", lambda name: name == "srv")
+    manager._clients["srv"] = MagicMock()
+    manager._clients["other"] = MagicMock()
+    errors = _run(manager.refresh([config]))
+    assert torn == ["other"]  # the failing running server is kept
+    assert any("auth_failed" in e for e in errors)
+
+
+def test_gateway_refresh_keeps_a_running_server_whose_lookup_fails(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.client.manager import ClientManager
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+    from tests.test_tools import MockClientManager
+
+    host.write_token()
+    host.write_store(f"{NAMESPACED}={REF}\n")
+    host.op.table({"*": {"exit": 1, "stderr": "401 Unauthorized"}})
+    _start(host)
+    cfg = host.home / "pmcp.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "brightdata": {"command": "npx", "args": ["-y", "@brightdata/mcp"]}
+                }
+            }
+        )
+    )
+    real = ClientManager(project_root=host.root)
+
+    class Manager(MockClientManager):
+        async def prepare_configs(self, configs: list[Any]) -> Any:
+            return await real.prepare_configs(configs)
+
+    manager = Manager()
+    manager.add_connected_server(
+        ResolvedServerConfig(
+            name="brightdata",
+            source="custom",
+            config=LocalMcpServerConfig(
+                command="npx", args=["-y", "@brightdata/mcp@0.9"]
+            ),
+        )
+    )
+    tools = GatewayTools(
+        client_manager=manager, policy_manager=PolicyManager(), custom_config_path=cfg
+    )
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_enabled_auto_start", lambda **_: {"brightdata"}
+    )
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_disabled_auto_start", lambda **_: set()
+    )
+    monkeypatch.setattr(tools, "_load_provisioned_registry", lambda: {})
+    out = _run(tools.refresh({"reason": "test"}))
+    assert manager.is_server_online("brightdata")
+    assert not any("disconnect" in str(event) for event in manager.events)
+    assert any("auth_failed" in e for e in out.errors)
+    assert len(host.op.calls()) == 1
+
+
+# --- discovered servers (N3) --------------------------------------------------
+
+
+def test_a_discovered_server_never_receives_a_resolved_reference(host: Host) -> None:
+    from pmcp.manifest.installer import _install_spawn_config
+    from pmcp.manifest.loader import ServerConfig
+
+    host.write_token()
+    host.write_store(f"{NAMESPACED}={REF}\nPLAIN_API_KEY=plain-value-123\n")
+    _start(host)
+
+    def discovered(env_var: str) -> ServerConfig:
+        return ServerConfig(
+            name="agent-pkg",
+            description="d",
+            keywords=[],
+            install={},
+            command="npx",
+            args=["-y", "agent-pkg@1.0.0"],
+            requires_api_key=True,
+            env_var=env_var,
+            entry_origin="discovered",
+        )
+
+    with pytest.raises(CredentialUnavailableError) as raised:
+        _install_spawn_config(discovered(NAMESPACED), host.root)
+    assert raised.value.reason == cs.REFERENCE_NOT_ALLOWED_HERE
+    with pytest.raises(CredentialUnavailableError):
+        manifest_server_to_config(discovered(NAMESPACED), host.root)
+    assert host.op.calls() == []
+    # A plain value keeps today's behaviour.
+    env = build_install_child_env(discovered("PLAIN_API_KEY"), host.root)
+    assert env["PLAIN_API_KEY"] == "plain-value-123"
+
+
+def test_register_discovered_server_marks_the_entry_discovered() -> None:
+    import inspect
+
+    from pmcp.tools.handlers import GatewayTools
+
+    source = inspect.getsource(GatewayTools.register_discovered_server)
+    assert 'entry_origin="discovered"' in source
+
+
+# --- smaller round-1 items ------------------------------------------------------
+
+
+def test_an_explicit_base_keeps_a_servers_own_op_token() -> None:
+    """N4: the update probe passes the server's already-built env as ``base``;
+    its own OP_SERVICE_ACCOUNT_TOKEN is kept (plan 3.2.4)."""
+    env = env_store.child_process_env(base={"OP_SERVICE_ACCOUNT_TOKEN": "own-token-x"})
+    assert env["OP_SERVICE_ACCOUNT_TOKEN"] == "own-token-x"
+
+
+def test_a_short_token_is_refused(host: Host) -> None:
+    host.write_token("ops_abc")  # 7 characters: below the redaction floor
+    with pytest.raises(CredentialUnavailableError) as raised:
+        secret_refs.read_service_account_token()
+    assert raised.value.reason == cs.TOKEN_INVALID
+
+
+def test_the_exit_wait_uses_only_the_remaining_budget(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G3: op closes its pipes after ~1 s and stays alive; with a 1.5 s
+    budget the whole read ends near 1.5 s, not 1 s + another 1.5 s."""
+    host.write_token()
+    host.op.table({REF: {"stdout": VALUE, "detach_after": 1.0}})
+    monkeypatch.setattr(secret_refs, "OP_TIMEOUT_SECONDS", 1.5)
+    started = time.monotonic()
+    with pytest.raises(CredentialUnavailableError) as raised:
+        _run(secret_refs.resolve_reference(REF, time.monotonic() + 10))
+    assert raised.value.reason == cs.TIMEOUT
+    assert time.monotonic() - started < 2.3
+
+
+def test_overlapping_registered_values_leave_no_residue() -> None:
+    secret_registry.register_secret_value("abcdefgh12")
+    secret_registry.register_secret_value("xxabcdefgh")
+    assert (
+        secret_registry.redact_registered("pre xxabcdefgh12 post")
+        == "pre [REDACTED] post"
+    )
+
+
+def test_a_reference_auth_token_is_removed_on_stdio_too(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G2: never inherited by a child, whatever the transport; the HTTP
+    gateway still refuses to start."""
+    monkeypatch.setenv("PMCP_AUTH_TOKEN", REF)
+    _start(host)
+    assert "PMCP_AUTH_TOKEN" not in os.environ
+    assert REF not in env_store.child_process_env().values()
+    cli._refuse_reference_auth_token(
+        argparse.Namespace(transport="stdio", auth_token=None)
+    )
+    with pytest.raises(SystemExit):
+        cli._refuse_reference_auth_token(
+            argparse.Namespace(transport="http", auth_token=None)
+        )
+
+
+# --- pmcp doctor (A3, F3) ------------------------------------------------------
+
+
+def _doctor_text() -> str:
+    from pmcp.cli_commands.doctor import collect_token_diagnostics
+
+    return "\n".join(
+        f"{level} {message}" for _c, level, message in collect_token_diagnostics()
+    )
+
+
+def test_doctor_reports_no_token(host: Host) -> None:
+    text = _doctor_text()
+    assert "op_not_configured" in text
+    assert "credstore" in text and "pmcp_config" in text
+
+
+def test_doctor_reports_an_invalid_token_and_never_the_value(host: Host) -> None:
+    host.write_token().chmod(0o644)
+    text = _doctor_text()
+    assert "fail" in text and "token_invalid" in text
+    assert TOKEN not in text
+
+
+def test_doctor_reports_differing_copies_value_free(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    host.write_token()
+    creds = _private_dir(host.home.parent / "creds")
+    other = TOKEN.replace("T0k3n", "0ld0n")
+    (creds / secret_refs.TOKEN_FILE_NAME).write_text(other)
+    (creds / secret_refs.TOKEN_FILE_NAME).chmod(0o400)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(creds))
+    secret_refs.capture_startup_environment()
+    text = _doctor_text()
+    assert "using systemd_credential" in text
+    assert "differs" in text
+    for secret in (TOKEN, other):
+        assert secret not in text
+        digest = hashlib.sha256(secret.encode()).hexdigest()
+        assert digest[:8] not in text
+
+
+def test_doctor_reports_store_references_and_refused_references(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.cli_commands.doctor import collect_credential_diagnostics
+
+    host.write_token()
+    host.write_store(f"{NAMESPACED}={REF}\n")
+    _start(host)
+    text = "\n".join(m for _c, _l, m in collect_credential_diagnostics(host.root))
+    assert "resolves it" in text and "as a literal" not in text
+    (host.root / ".env.pmcp").write_text(f"EXA_API_KEY={REF}\n")
+    env_store.reset_startup_load()
+    _start(host)
+    text = "\n".join(m for _c, _l, m in collect_credential_diagnostics(host.root))
+    assert "EXA_API_KEY is an op:// reference (from project files)" in text
+    assert "refuses it there (reference_not_allowed_here)" in text
+    # A lookup that raises is reported by name and reason, never dropped.
+    (host.home / ".env").write_text(f"EXA_API_KEY={REF}\n")
+    env_store.reset_startup_load()
+    _start(host)
+    text = "\n".join(m for _c, _l, m in collect_credential_diagnostics(host.root))
+    assert "EXA_API_KEY is unavailable" in text
+    assert REF not in text
+    assert REF not in text
+
+
+def test_pmcp_doctor_runs_the_token_diagnostics() -> None:
+    """A3: the token report is part of ordinary ``pmcp doctor`` output."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(cli.run_doctor))
+    called = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "collect_token_diagnostics" in called

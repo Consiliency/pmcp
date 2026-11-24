@@ -305,7 +305,7 @@ async def run_secrets_set(args: argparse.Namespace) -> dict[str, object]:
             "command": "secrets.set",
             "scope": args.scope,
             "error": (
-                f"refusing {args.key}: the 1Password service account is "
+                f"{args.key} not written: the 1Password service account is "
                 "configured by its credential file, never through pmcp's stores"
             ),
         }

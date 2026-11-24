@@ -70,7 +70,34 @@ def redact_registered(text: str) -> str:
     pattern = _pattern
     if pattern is None or not isinstance(text, str) or not text:
         return text
-    return pattern.sub(REDACTION_MARKER, text)
+    if pattern.search(text) is None:
+        return text
+    # Every occurrence of every registered form, overlapping ones included,
+    # merged into spans: two registered values that overlap in the text
+    # leave no residue of either (#499 r1 T1).
+    with _lock:
+        forms = list(_values)
+    spans: list[tuple[int, int]] = []
+    for form in forms:
+        start = text.find(form)
+        while start != -1:
+            spans.append((start, start + len(form)))
+            start = text.find(form, start + 1)
+    spans.sort()
+    merged: list[list[int]] = []
+    for begin, end in spans:
+        if merged and begin <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([begin, end])
+    out: list[str] = []
+    cursor = 0
+    for begin, end in merged:
+        out.append(text[cursor:begin])
+        out.append(REDACTION_MARKER)
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out)
 
 
 def redact_registered_in(value: Any) -> Any:
@@ -92,6 +119,16 @@ def redact_registered_in(value: Any) -> Any:
             for key, item in value.items()
         }
     return value
+
+
+def redact_registered_in_place(value: dict[str, Any]) -> None:
+    """:func:`redact_registered_in` applied to ``value`` itself (keys too)."""
+    if _pattern is None:
+        return
+    items = list(value.items())
+    value.clear()
+    for key, item in items:
+        value[redact_registered_in(key)] = redact_registered_in(item)
 
 
 def reset_registered_secrets() -> None:

@@ -239,7 +239,11 @@ from pmcp.secret_refs import (
     resolve_spawn_env,
     spawn_plan,
 )
-from pmcp.secret_registry import redact_registered
+from pmcp.secret_registry import (
+    redact_registered,
+    redact_registered_in,
+    redact_registered_in_place,
+)
 from pmcp.waits import bounded_wait
 
 logger = logging.getLogger(__name__)
@@ -4058,7 +4062,8 @@ class GatewayTools:
 
     def _scrub_sensitive_text(self, text: str) -> str:
         """Remove obvious secrets and personal identifiers from feedback text."""
-        scrubbed = self._policy_manager.redact_secrets(text)
+        # Resolved secrets exactly, first (Consiliency/pmcp#487 plan 3.7).
+        scrubbed = self._policy_manager.redact_secrets(redact_registered(text))
         # Starts only where a local part can start: without the lookbehind
         # every position of a long run of local-part characters is tried, each
         # to the run's end -- quadratic in a caller's text (round 1 codex
@@ -6382,6 +6387,9 @@ class GatewayTools:
             discovery_diagnostics=[
                 "registered_discovery_metadata_is_read_only_until_provisioned"
             ],
+            # Agent-registered: never a consumer of a resolved op:// reference
+            # (Consiliency/pmcp#487, #499 r1 N3); plain values as before.
+            entry_origin="discovered",
         )
         self._discovered_server_configs[server_name] = server_config
         self._discovered_server_identities[server_name] = resolved
@@ -7039,7 +7047,12 @@ class GatewayTools:
             return TasksResultOutput(ok=False, errors=[self._sanitize_error(e)])
 
     def _sanitize_task_for_output(self, task: McpTaskInfo) -> McpTaskInfo:
+        # Exact-value redaction of resolved secrets FIRST, over the whole
+        # task -- every string, keys and values, recursively -- before the
+        # pattern rules (Consiliency/pmcp#487 plan 3.7, #499 r1 A1/F2): a
+        # child may echo its credential into statusMessage or raw.
         task_data = task.model_dump(mode="json")
+        redact_registered_in_place(task_data)
         if isinstance(task_data.get("status_message"), str):
             task_data["status_message"] = self._policy_manager.redact_secrets(
                 task_data["status_message"]
@@ -7048,6 +7061,7 @@ class GatewayTools:
         return McpTaskInfo.model_validate(task_data)
 
     def _sanitize_task_raw(self, value: Any) -> Any:
+        value = redact_registered_in(value)
         if isinstance(value, str):
             return self._policy_manager.redact_secrets(value)
         if isinstance(value, dict):
@@ -7094,6 +7108,9 @@ class GatewayTools:
                 task_id=parsed.task_id,
                 error=None if ok else message,
             )
+            # Sanitized like every other task surface (#499 r1 A1/F2).
+            if task is not None:
+                task = self._sanitize_task_for_output(task)
             return TasksCancelOutput(
                 ok=ok,
                 task=task,

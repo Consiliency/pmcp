@@ -554,6 +554,11 @@ class GatewayServer:
                 # Convert Pydantic model to dict if needed
                 if hasattr(result, "model_dump"):
                     result = result.model_dump()
+                # Safety net (Consiliency/pmcp#487 plan 3.7, #499 r1 A1): every
+                # gateway tool response is exact-value redacted of resolved
+                # secrets, keys and values recursively, before it is audited
+                # or serialized -- whatever path built it.
+                result = redact_registered_in(result)
 
                 terminal_status = "success"
                 if isinstance(result, dict) and result.get("ok") is False:

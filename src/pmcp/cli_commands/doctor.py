@@ -189,7 +189,7 @@ def collect_credential_diagnostics(
     from pmcp.env_store import (
         CredentialUnavailableError,
         credential_layers,
-        credential_value,
+        credential_value_sourced,
         environment_holds,
         operator_managed_secret_keys,
         user_store_state,
@@ -266,13 +266,21 @@ def collect_credential_diagnostics(
                     what = "an OP_* key"
                 if what is None:
                     continue
+                opted_in = bool(
+                    getattr(server_config, "resolve_secret_refs", False)
+                ) and source.source in ("user", "custom")
                 checks.append(
                     (
                         "credentials",
                         "warn",
                         f"{operator_safe(str(raw_name))}: env {plain_name(key)} is "
-                        f"{what} in the {source.source} config; pmcp passes it to "
-                        "the server verbatim.",
+                        f"{what} in the {source.source} config; "
+                        + (
+                            "the server opts in (resolve_secret_refs), so pmcp "
+                            "resolves op:// values and refuses OP_* keys."
+                            if opted_in
+                            else "pmcp passes it to the server verbatim."
+                        ),
                     )
                 )
     for name, server in sorted(servers.items()):
@@ -303,20 +311,39 @@ def collect_credential_diagnostics(
         label = _manifest_name(name)
         layers = {key: credential_layers(key, root=project_root) for key in keys}
         for key in keys:
+            first = layers[key][0] if layers[key] else "unknown"
             try:
-                value = credential_value(key, root=project_root)
-            except CredentialUnavailableError:
+                value = credential_value_sourced(key, root=project_root)
+            except CredentialUnavailableError as exc:
+                # A refused reference (or an unreadable store) is reported by
+                # name, layer and reason, never dropped (plan 3.2.2,
+                # #499 r1 F3).
+                checks.append(
+                    (
+                        "credentials",
+                        "fail",
+                        f"{label}: credential {plain_name(key)} is unavailable "
+                        f"(credential_unavailable: {exc.reason}; layer: {first}); "
+                        "the server is not started.",
+                    )
+                )
                 break
             if value is not None:
                 if _reference_shaped(value):
-                    first = layers[key][0] if layers[key] else "unknown"
+                    trusted = value.source == "user_store"
                     checks.append(
                         (
                             "credentials",
-                            "warn",
+                            "ok" if trusted else "fail",
                             f"{label}: credential {plain_name(key)} is an op:// "
-                            f"reference (from {first}); this pmcp passes it to the "
-                            "server as a literal.",
+                            f"reference (from {first}); "
+                            + (
+                                "pmcp resolves it with the 1Password service "
+                                "account for each spawn."
+                                if trusted
+                                else "pmcp refuses it there "
+                                "(reference_not_allowed_here)."
+                            ),
                         )
                     )
                 break
@@ -346,4 +373,86 @@ def collect_credential_diagnostics(
                         "another still holds it.",
                     )
                 )
+    return checks
+
+
+def collect_token_diagnostics() -> list[tuple[str, str, str]]:
+    """The 1Password service-account token, for ``pmcp doctor`` (plan 3.1).
+
+    Every path searched, in order, whether each is absent, invalid or
+    usable, which one pmcp uses (the first present one decides; an invalid
+    one is NOT skipped), and whether the systemd credential copy differs
+    from the credstore file -- an edited credstore needs a unit restart.
+    Value-free: never the token, never a digest.
+    """
+    from pmcp.secret_refs import token_path_report
+
+    checks: list[tuple[str, str, str]] = []
+    report = token_path_report()
+    searched = [entry for entry in report if entry.get("source") != "comparison"]
+    if not searched:
+        return [
+            (
+                "secret_refs",
+                "ok",
+                "1Password token: no path to search (no operator home directory).",
+            )
+        ]
+    decided = False
+    for entry in searched:
+        state = entry.get("state")
+        path = operator_safe(str(entry.get("path")))
+        source = entry.get("source")
+        if decided or state == "absent":
+            note = "not used" if decided and state != "absent" else state
+            checks.append(
+                (
+                    "secret_refs",
+                    "ok",
+                    f"1Password token: searched {source} {path}: {note}.",
+                )
+            )
+            continue
+        decided = True
+        if state == "usable":
+            checks.append(
+                (
+                    "secret_refs",
+                    "ok",
+                    f"1Password token: using {source} {path} (owner-only, valid).",
+                )
+            )
+        else:
+            checks.append(
+                (
+                    "secret_refs",
+                    "fail",
+                    f"1Password token: {source} {path} exists but is invalid "
+                    "(token_invalid: it must be a regular file you own, mode 0600 "
+                    "or 0400, not a symlink, starting ops_); op:// references "
+                    "fail and later paths are not tried.",
+                )
+            )
+    if not decided:
+        checks.append(
+            (
+                "secret_refs",
+                "ok",
+                "1Password token: none found (op_not_configured); op:// "
+                "references cannot be resolved.",
+            )
+        )
+    for entry in report:
+        if entry.get("source") == "comparison" and entry.get(
+            "systemd_and_credstore_differ"
+        ):
+            checks.append(
+                (
+                    "secret_refs",
+                    "warn",
+                    "1Password token: the systemd credential copy differs from the "
+                    "credstore file; systemd copies it when the unit starts, so "
+                    "restart the unit after editing the credstore file.",
+                )
+            )
     return checks

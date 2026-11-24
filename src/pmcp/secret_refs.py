@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pmcp import credential_state as cs
 from pmcp.credential_state import CredentialUnavailableError
 from pmcp.secret_registry import register_secret_value
+from pmcp.waits import bounded_wait
 
 if TYPE_CHECKING:
     from pmcp.types import ResolvedServerConfig
@@ -162,6 +163,8 @@ _test_overrides: dict[str, Any] = {}
 TOKEN_FILE_NAME = "op-service-account-token"
 _TOKEN_MAX_BYTES = 4096
 _TOKEN_PATTERN = re.compile(r"ops_[\x21-\x7e]+")
+#: The shortest token accepted: the redaction registry's floor (8).
+MIN_TOKEN_LENGTH = 8
 
 TokenSource = Literal["systemd_credential", "credstore", "pmcp_config"]
 
@@ -327,7 +330,10 @@ def _read_candidate(candidate: _TokenCandidate) -> TokenRead:
         token = raw.decode("ascii")
     except UnicodeDecodeError:
         raise CredentialUnavailableError(cs.TOKEN_INVALID) from None
-    if not _TOKEN_PATTERN.fullmatch(token):
+    if not _TOKEN_PATTERN.fullmatch(token) or len(token) < MIN_TOKEN_LENGTH:
+        # Shorter than the redaction registry's floor: refused, so every
+        # accepted token is registered for exact-value redaction
+        # (#499 r1 G4). Real service-account tokens are far longer.
         raise CredentialUnavailableError(cs.TOKEN_INVALID)
     # Registered for exact-value redaction the moment it is read (plan 3.7).
     register_secret_value(token)
@@ -674,7 +680,7 @@ async def _kill_and_reap(process: Any) -> None:
     group = process.pid if isinstance(getattr(process, "pid", None), int) else None
     kill_process_tree_now(process, group_pgid=group)
     try:
-        await asyncio.wait_for(asyncio.shield(process.wait()), timeout=5.0)
+        await bounded_wait(asyncio.shield(process.wait()), timeout=5.0)
     except asyncio.TimeoutError:
         pass
     finally:
@@ -716,13 +722,21 @@ async def run_op_read(reference: str, timeout: float) -> str:
     stdout_task = asyncio.ensure_future(_read_bounded(process.stdout, STDOUT_CAP))
     stderr_task = asyncio.ensure_future(_read_bounded(process.stderr, STDERR_CAP))
     finished = False
+    ends = time.monotonic() + timeout
     try:
         try:
-            stdout, stderr = await asyncio.wait_for(
-                asyncio.gather(stdout_task, stderr_task), timeout=timeout
-            )
-            returncode = await asyncio.wait_for(
-                process.wait(), timeout=max(0.1, timeout)
+            # A coroutine, not the gather future itself: on 3.10 a cancelled
+            # gather stores CancelledError as its exception instead of being
+            # cancelled, which bounded_wait would re-raise as a cancellation.
+            async def _both() -> Any:
+                return await asyncio.gather(stdout_task, stderr_task)
+
+            stdout, stderr = await bounded_wait(_both(), timeout=timeout)
+            # The exit wait gets what is LEFT of the budget, not a second
+            # full one (#499 r1 G3); a short grace for a child that closed
+            # its pipes as it exits.
+            returncode = await bounded_wait(
+                process.wait(), timeout=max(0.1, ends - time.monotonic())
             )
         except asyncio.TimeoutError:
             raise CredentialUnavailableError(cs.TIMEOUT) from None
@@ -775,7 +789,7 @@ class _Resolver:
         if remaining <= 0:
             raise CredentialUnavailableError(cs.TIMEOUT)
         try:
-            await asyncio.wait_for(self.semaphore.acquire(), timeout=remaining)
+            await bounded_wait(self.semaphore.acquire(), timeout=remaining)
         except asyncio.TimeoutError:
             raise CredentialUnavailableError(cs.TIMEOUT) from None
         try:
@@ -802,7 +816,7 @@ class _Resolver:
             raise CredentialUnavailableError(cs.TIMEOUT)
         # A cancelled or timed-out waiter never cancels the shared lookup.
         try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            return await bounded_wait(asyncio.shield(task), timeout=remaining)
         except asyncio.TimeoutError:
             raise CredentialUnavailableError(cs.TIMEOUT) from None
 
@@ -940,6 +954,9 @@ class SpawnSecrets:
 
     overlay: dict[str, str] = field(repr=False)
     generation: int = 0
+    #: The fingerprint of the config object it was resolved for (plan 3.5):
+    #: a resolution is valid only for that config at that generation.
+    fingerprint: str = ""
 
 
 EMPTY_SECRETS = SpawnSecrets({}, 0)
@@ -1002,6 +1019,14 @@ def require_resolved(
     return dict(secrets.overlay)
 
 
+#: Static reasons that depend on the HOST (the token file, the platform), not
+#: on the config: looked up again on demand at resolution time, so fixing the
+#: token file works without reloading the config (plan 3.1, #499 r1 N5).
+HOST_REASONS = frozenset(
+    {cs.OP_NOT_CONFIGURED, cs.TOKEN_INVALID, cs.PLATFORM_UNSUPPORTED}
+)
+
+
 def is_retryable_reason(reason: str) -> bool:
     """Only a config change mid-resolution is retryable by the caller."""
     return reason == cs.CONFIG_CHANGED
@@ -1014,6 +1039,34 @@ def is_retryable_reason(reason: str) -> bool:
 SECRET_REFS_CAPABILITY = "secret_refs"
 
 
+def _credential_name_check() -> Any:
+    """``copy_allowed`` with the manifest's declared names loaded only when
+    a name is not credential-shaped by itself: a health check with nothing
+    to classify never loads the manifest (or logs its load)."""
+    from pmcp.env_store import (
+        copy_allowed,
+        declared_credential_names,
+        repository_may_supply,
+    )
+    from pmcp.validation import is_credential_shaped
+
+    declared: list[frozenset[str]] = []
+
+    def allowed(name: str) -> bool:
+        if not repository_may_supply(name):
+            return False
+        if is_credential_shaped(name):
+            return True
+        if not declared:
+            try:
+                declared.append(frozenset(declared_credential_names()))
+            except Exception:  # noqa: BLE001 - names only; manifest unreadable
+                declared.append(frozenset())
+        return copy_allowed(name, declared[0])
+
+    return allowed
+
+
 def shadowing_credential_names() -> list[str]:
     """Credential-shaped names (never values) a reference write would not reach.
 
@@ -1023,23 +1076,15 @@ def shadowing_credential_names() -> list[str]:
     such a name would never be the answer, or would arrive through an
     untrusted source.
     """
-    from pmcp.env_store import (
-        copy_allowed,
-        declared_credential_names,
-        env_origins,
-        skipped_references,
-    )
+    from pmcp.env_store import env_origins, skipped_references
 
-    try:
-        declared = declared_credential_names()
-    except Exception:  # noqa: BLE001 - names only; the manifest may be unreadable
-        declared = frozenset()
+    allowed = _credential_name_check()
     names = {
         name
         for name, origin in env_origins().items()
         if origin in ("external", "home_dotenv")
         and name in os.environ
-        and copy_allowed(name, declared)
+        and allowed(name)
     }
     names.update(
         name for name, origin in skipped_references().items() if origin == "home_dotenv"
@@ -1058,22 +1103,14 @@ def secret_refs_health(*, include_names: bool) -> dict[str, Any]:
     adds per-name origins (names only); the HTTP gateway passes ``False``
     while HTTP auth is on.
     """
-    from pmcp.env_store import (
-        copy_allowed,
-        declared_credential_names,
-        env_origin,
-        startup_user_store_names,
-    )
+    from pmcp.env_store import env_origin, startup_user_store_names
 
     state, source = token_status()
-    try:
-        declared = declared_credential_names()
-    except Exception:  # noqa: BLE001 - names only
-        declared = frozenset()
+    allowed = _credential_name_check()
     external_store_names = sorted(
         name
         for name in startup_user_store_names()
-        if env_origin(name) == "external" and copy_allowed(name, declared)
+        if env_origin(name) == "external" and allowed(name)
     )
     capable = _platform_supported() and state == "usable" and not external_store_names
     report: dict[str, Any] = {

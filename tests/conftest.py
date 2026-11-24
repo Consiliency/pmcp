@@ -566,6 +566,9 @@ def _reset_process_global_state() -> Iterator[None]:
 
         secret_refs.reset_for_tests()
         secret_registry.reset_registered_secrets()
+        import pmcp.cli as pmcp_cli
+
+        pmcp_cli._AUTH_TOKEN_WAS_REFERENCE = False
 
     _reset()
     yield
