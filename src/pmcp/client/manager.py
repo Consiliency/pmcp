@@ -51,7 +51,16 @@ from pmcp.argument_errors import (
 )
 from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
+from pmcp.credential_state import (
+    CONFIG_CHANGED,
+    OUTPUT_INVALID,
+    REASONS,
+    CredentialUnavailableError,
+)
 from pmcp.env_store import bind_project_root, sanitized_subprocess_env
+from pmcp import secret_refs as _secret_refs
+from pmcp.secret_refs import SpawnSecrets
+from pmcp.secret_registry import redact_registered, redact_registered_in
 from pmcp.manifest.installer import _operator_safe, _render_install_argv
 from pmcp.parsing import load_json
 from pmcp.remote_auth import (
@@ -311,6 +320,19 @@ def _log_abandoned_owner_failure(name: str, task: asyncio.Future[Any]) -> None:
         f"cancellation: {describe_exception(exc)}\n"
         f"{sanitize_auth_diagnostic(traceback_text, max_length=None)}"
     )
+
+
+def _with_overlay(
+    secrets: dict[str, SpawnSecrets] | None, name: str
+) -> SpawnSecrets | None:
+    """The resolution for ``name`` when it resolved something, else ``None``
+    (a config without references spawns exactly as before)."""
+    return _nonempty(None if secrets is None else secrets.get(name))
+
+
+def _nonempty(secrets: SpawnSecrets | None) -> SpawnSecrets | None:
+    """``secrets`` when it resolved something, else ``None``."""
+    return secrets if secrets is not None and secrets.overlay else None
 
 
 def _handshake_error(exc: BaseException) -> str:
@@ -1253,7 +1275,11 @@ def _parse_tool_entries(
     `_reconcile_once` run it *before* removing anything and decide from the
     result whether the listing is usable at all -- see its "offered but none
     parseable" rule. `_index_tools` does the writing.
+
+    Downstream catalog text never carries a resolved secret: the listing is
+    exact-value redacted first (Consiliency/pmcp#487 plan 3.7).
     """
+    tools = redact_registered_in(tools)
     entries: list[tuple[str, ToolInfo]] = []
     known_fields = {
         "name",
@@ -1325,6 +1351,7 @@ def _parse_resource_entries(
     name: str, resources: list[dict[str, Any]]
 ) -> list[tuple[str, ResourceInfo]]:
     """Parse one server's `resources/list` payload. Pure, per `_parse_tool_entries`."""
+    resources = redact_registered_in(resources)
     entries: list[tuple[str, ResourceInfo]] = []
     known_fields = {
         "uri",
@@ -1366,6 +1393,7 @@ def _parse_prompt_entries(
     name: str, prompts: list[dict[str, Any]]
 ) -> list[tuple[str, PromptInfo]]:
     """Parse one server's `prompts/list` payload. Pure, per `_parse_tool_entries`."""
+    prompts = redact_registered_in(prompts)
     entries: list[tuple[str, PromptInfo]] = []
     known_prompt_fields = {
         "name",
@@ -1440,6 +1468,10 @@ def _remote_headers(
         tenant_id=tenant_id,
         project_root=project_root,
     )
+    if "remote_reference_unsupported" in resolution.unavailable_env_vars.values():
+        # A reference in a remote header (Consiliency/pmcp#487 plan 3.2.7):
+        # typed, and the refused value is never kept.
+        raise CredentialUnavailableError("remote_reference_unsupported")
     if resolution.missing_env_vars:
         raise MissingRemoteHeaderAuthError(server_name, resolution.missing_env_vars)
     return resolution.resolved_headers
@@ -1623,6 +1655,14 @@ class ClientManager:
         self._project_root: Path = bind_project_root(project_root)
         self._spawn_semaphore = asyncio.Semaphore(max_concurrent_spawns)
         self._lifecycle_lock = asyncio.Lock()
+        # Config generation per server (Consiliency/pmcp#487 plan 3.5):
+        # bumped whenever a lifecycle call brings a DIFFERENT config for the
+        # name. References are resolved outside the lifecycle lock; the
+        # generation is re-checked once the lock is held, and a changed one
+        # discards the resolution (re-resolved once, then a typed retryable
+        # ``config_changed``).
+        self._config_generations: dict[str, int] = {}
+        self._config_fingerprints: dict[str, str] = {}
         # Set once by `abandon_all_now()` and never cleared: see
         # `_connect_server`.
         self._abandoned = False
@@ -1646,7 +1686,11 @@ class ClientManager:
         self._tasks = TaskRegistry()
 
     async def connect_all(
-        self, configs: list[ResolvedServerConfig], retry: bool = True
+        self,
+        configs: list[ResolvedServerConfig],
+        retry: bool = True,
+        *,
+        prepared: dict[str, SpawnSecrets] | None = None,
     ) -> list[str]:
         """Connect to all configured servers in parallel.
 
@@ -1659,12 +1703,184 @@ class ClientManager:
         """
         if not configs:
             return []
+        return await self._run_prepared(
+            configs,
+            lambda ready, secrets: (
+                self._connect_all_unlocked(ready, retry=retry, secrets=secrets)
+                if any(_nonempty(found) for found in secrets.values())
+                else self._connect_all_unlocked(ready, retry=retry)
+            ),
+            prepared=prepared,
+        )
 
-        async with self._lifecycle_lock:
-            return await self._connect_all_unlocked(configs, retry=retry)
+    # --- Secret references: resolve outside the lock (plan 3.5) -------------
+
+    def _note_config(self, config: ResolvedServerConfig) -> int:
+        """Record ``config`` as the one for its name; the name's generation.
+
+        A config that differs from the last one noted for the name -- in its
+        server config, its credential sources or its opt-in -- bumps the
+        generation, so a resolution made for the old one is discarded.
+        """
+        try:
+            fingerprint = json.dumps(
+                [
+                    config.config.model_dump(mode="json"),
+                    sorted(config.credential_sources.items()),
+                    config.resolve_secret_refs,
+                ],
+                sort_keys=True,
+                default=str,
+            )
+        except (TypeError, ValueError):
+            fingerprint = repr(config)
+        name = config.name
+        if self._config_fingerprints.get(name) != fingerprint:
+            self._config_fingerprints[name] = fingerprint
+            self._config_generations[name] = self._config_generations.get(name, 0) + 1
+        return self._config_generations.get(name, 0)
+
+    def bump_config_generation(self, name: str) -> None:
+        """Invalidate any resolution in flight for ``name`` (its config was replaced)."""
+        self._config_fingerprints.pop(name, None)
+        self._config_generations[name] = self._config_generations.get(name, 0) + 1
+
+    async def prepare_spawn(self, config: ResolvedServerConfig) -> SpawnSecrets:
+        """Resolve ``config``'s secret references, OUTSIDE the lifecycle lock.
+
+        Returns the fresh overlay and the generation it was resolved for.
+        Raises :class:`CredentialUnavailableError` (typed, value-free). A
+        config the loader already marked ``credential_unavailable`` fails
+        with that reason: such an entry is never started.
+        """
+        generation = self._note_config(config)
+        if isinstance(config.credential_unavailable, str):
+            raise CredentialUnavailableError(config.credential_unavailable)
+        if not isinstance(config.config, LocalMcpServerConfig):
+            return SpawnSecrets({}, generation)
+        overlay = await _secret_refs.resolve_spawn_env(config)
+        return SpawnSecrets(overlay, generation)
+
+    def _stale(self, config: ResolvedServerConfig, secrets: SpawnSecrets) -> bool:
+        return self._config_generations.get(config.name, 0) != secrets.generation
+
+    def _record_unavailable(self, name: str, reason: str) -> str:
+        """Report a typed resolution failure on ``name`` (never over a live instance).
+
+        ``reason`` is a ``credential_state`` constant; the text is value-free.
+        """
+        if reason not in REASONS:
+            reason = OUTPUT_INVALID
+        state = f"credential_unavailable ({reason})"
+        message = f"Failed to connect to {name}: {state}"
+        status = self._servers.get(name)
+        if status is None or status.status != ServerStatusEnum.ONLINE:
+            if status is None:
+                status = ServerStatus(
+                    name=name, status=ServerStatusEnum.ERROR, tool_count=0
+                )
+                self._servers[name] = status
+            status.status = ServerStatusEnum.ERROR
+            status.last_error = state
+        logger.warning(message)
+        return message
+
+    async def _prepare_configs(
+        self,
+        configs: list[ResolvedServerConfig],
+        prepared: dict[str, SpawnSecrets] | None = None,
+    ) -> tuple[dict[str, SpawnSecrets], list[str], set[str]]:
+        """Resolve every config (concurrently, bounded by the ``op`` cap).
+
+        ``prepared``: resolutions a caller already made (``gateway.refresh``
+        resolves before its disconnect loop). Returns
+        ``(secrets by name, error messages, names that failed)``.
+        """
+        secrets: dict[str, SpawnSecrets] = {}
+        todo: list[ResolvedServerConfig] = []
+        for config in configs:
+            if prepared is not None and config.name in prepared:
+                secrets[config.name] = prepared[config.name]
+            elif config.name not in secrets and config not in todo:
+                todo.append(config)
+
+        async def prepare_one(config: ResolvedServerConfig) -> SpawnSecrets | str:
+            # A failure is its reason (value-free); anything else untyped is
+            # ``output_invalid`` -- never a spawn without its resolution.
+            try:
+                return await self.prepare_spawn(config)
+            except CredentialUnavailableError as exc:
+                return exc.reason
+            except Exception:  # noqa: BLE001 - typed below, never rendered
+                return OUTPUT_INVALID
+
+        results = await asyncio.gather(*(prepare_one(config) for config in todo))
+        errors: list[str] = []
+        failed: set[str] = set()
+        for config, result in zip(todo, results):
+            if isinstance(result, str):
+                errors.append(self._record_unavailable(config.name, result))
+                failed.add(config.name)
+            else:
+                secrets[config.name] = result
+        return secrets, errors, failed
+
+    async def prepare_configs(
+        self, configs: list[ResolvedServerConfig]
+    ) -> tuple[dict[str, SpawnSecrets], list[str], set[str]]:
+        """Resolve ``configs`` now, outside the lifecycle lock, for a later
+        ``connect_all(..., prepared=...)`` (``gateway.refresh``)."""
+        return await self._prepare_configs(configs)
+
+    async def _run_prepared(
+        self,
+        configs: list[ResolvedServerConfig],
+        body: Callable[[list[ResolvedServerConfig], dict[str, SpawnSecrets]], Any],
+        *,
+        prepared: dict[str, SpawnSecrets] | None = None,
+    ) -> list[str]:
+        """Resolve ``configs`` outside the lock, then run ``body`` under it.
+
+        A config whose generation changed while it was resolved is
+        re-resolved once; a second change is a typed retryable
+        ``config_changed``. ``body`` receives the configs still current and
+        their resolutions, and returns error messages.
+        """
+        secrets, errors, failed = await self._prepare_configs(configs, prepared)
+        pending = [config for config in configs if config.name not in failed]
+        for attempt in range(2):
+            async with self._lifecycle_lock:
+                stale = {
+                    config.name
+                    for config in pending
+                    if config.name in secrets
+                    and self._stale(config, secrets[config.name])
+                }
+                ready = [config for config in pending if config.name not in stale]
+                if ready or not stale:
+                    errors += await body(ready, secrets)
+            if not stale:
+                break
+            pending = [config for config in pending if config.name in stale]
+            if attempt == 1:
+                for config in pending:
+                    errors.append(self._record_unavailable(config.name, CONFIG_CHANGED))
+                break
+            for config in pending:
+                secrets.pop(config.name, None)
+            more, more_errors, more_failed = await self._prepare_configs(pending)
+            secrets.update(more)
+            errors += more_errors
+            pending = [config for config in pending if config.name not in more_failed]
+            if not pending:
+                break
+        return errors
 
     async def _connect_all_unlocked(
-        self, configs: list[ResolvedServerConfig], retry: bool = True
+        self,
+        configs: list[ResolvedServerConfig],
+        retry: bool = True,
+        secrets: dict[str, SpawnSecrets] | None = None,
     ) -> list[str]:
         """Connect to all configured servers while caller owns lifecycle lock."""
         if not configs:
@@ -1682,7 +1898,13 @@ class ClientManager:
             task = tasks_by_name.get(config.name)
             if task is None:
                 task = self._track_background_task(
-                    asyncio.create_task(self._connect_singleflight(config, retry)),
+                    asyncio.create_task(
+                        self._connect_singleflight(
+                            config,
+                            retry,
+                            _with_overlay(secrets, config.name),
+                        )
+                    ),
                     config.name,
                 )
                 tasks_by_name[config.name] = task
@@ -1706,7 +1928,10 @@ class ClientManager:
         return errors
 
     async def _connect_singleflight(
-        self, config: ResolvedServerConfig, retry: bool = True
+        self,
+        config: ResolvedServerConfig,
+        retry: bool = True,
+        secrets: SpawnSecrets | None = None,
     ) -> None:
         """Share concurrent connection attempts for the same server name."""
         name = config.name
@@ -1716,10 +1941,20 @@ class ClientManager:
 
         task = self._connect_tasks.get(name)
         if task is None:
+            # ``secrets`` only when a resolution exists: the one-argument
+            # call is unchanged for every config without references.
             if retry:
-                task = asyncio.create_task(self._connect_with_retry(config))
+                task = asyncio.create_task(
+                    self._connect_with_retry(config)
+                    if secrets is None
+                    else self._connect_with_retry(config, secrets)
+                )
             else:
-                task = asyncio.create_task(self._connect_server(config))
+                task = asyncio.create_task(
+                    self._connect_server(config)
+                    if secrets is None
+                    else self._connect_server(config, secrets)
+                )
             task = self._track_background_task(task, name)
             self._connect_tasks[name] = task
 
@@ -1862,24 +2097,55 @@ class ClientManager:
         Raises:
             ValueError: If server is not registered (neither connected nor lazy)
         """
-        async with self._lifecycle_lock:
-            if self.is_server_online(server_name):
-                return True
+        # Resolve the server's references BEFORE taking the lifecycle lock
+        # (Consiliency/pmcp#487 plan 3.5); re-checked under it.
+        secrets: SpawnSecrets | None = None
+        for attempt in range(2):
+            candidate = self._lazy_configs.get(server_name)
+            if (
+                candidate is not None
+                and not self.is_server_online(server_name)
+                and server_name not in self._connect_tasks
+            ):
+                try:
+                    secrets = await self.prepare_spawn(candidate)
+                except CredentialUnavailableError as exc:
+                    self._record_unavailable(server_name, exc.reason)
+                    return False
+            async with self._lifecycle_lock:
+                if self.is_server_online(server_name):
+                    return True
 
-            if server_name not in self._lazy_configs:
-                if server_name not in self._servers:
-                    raise ValueError(f"Unknown server: {server_name}")
-                return False
+                if server_name not in self._lazy_configs:
+                    if server_name not in self._servers:
+                        raise ValueError(f"Unknown server: {server_name}")
+                    return False
 
-            config = self._lazy_configs[server_name]
-            logger.info(f"Lazy-starting server: {server_name}")
-            task = self._connect_tasks.get(server_name)
-            if task is None:
-                task = self._track_background_task(
-                    asyncio.create_task(self._connect_with_lifecycle_lock(config)),
-                    server_name,
-                )
-                self._connect_tasks[server_name] = task
+                config = self._lazy_configs[server_name]
+                task = self._connect_tasks.get(server_name)
+                if task is None and (
+                    secrets is None
+                    or config is not candidate
+                    or self._stale(config, secrets)
+                ):
+                    if attempt == 0:
+                        continue
+                    self._record_unavailable(server_name, CONFIG_CHANGED)
+                    return False
+                logger.info(f"Lazy-starting server: {server_name}")
+                if task is None:
+                    task = self._track_background_task(
+                        asyncio.create_task(
+                            self._connect_with_lifecycle_lock(
+                                config, _nonempty(secrets)
+                            )
+                        ),
+                        server_name,
+                    )
+                    self._connect_tasks[server_name] = task
+                break
+        else:  # pragma: no cover - the second attempt always returns or breaks
+            return False
 
         try:
             await task
@@ -1898,17 +2164,38 @@ class ClientManager:
                 if self._connect_tasks.get(server_name) is task:
                     self._connect_tasks.pop(server_name, None)
 
-    async def _connect_with_lifecycle_lock(self, config: ResolvedServerConfig) -> None:
+    async def _connect_with_lifecycle_lock(
+        self, config: ResolvedServerConfig, secrets: SpawnSecrets | None = None
+    ) -> None:
         async with self._lifecycle_lock:
-            await self._connect_with_retry(config)
+            if secrets is None:
+                await self._connect_with_retry(config)
+            else:
+                await self._connect_with_retry(config, secrets)
 
     async def connect_server(
-        self, config: ResolvedServerConfig, retry: bool = True
+        self,
+        config: ResolvedServerConfig,
+        retry: bool = True,
+        *,
+        prepared: SpawnSecrets | None = None,
     ) -> list[str]:
-        """Connect one server through same-server single-flight startup."""
-        async with self._lifecycle_lock:
+        """Connect one server through same-server single-flight startup.
+
+        Its secret references are resolved first, outside the lifecycle lock
+        (``prepared``: already resolved by the caller, e.g. a restart that
+        resolved before its teardown).
+        """
+
+        async def body(
+            ready: list[ResolvedServerConfig], secrets: dict[str, SpawnSecrets]
+        ) -> list[str]:
+            if not ready:
+                return []
             try:
-                await self._connect_singleflight(config, retry=retry)
+                await self._connect_singleflight(
+                    config, retry=retry, secrets=_with_overlay(secrets, config.name)
+                )
                 if self.is_server_online(config.name):
                     self._lazy_configs.pop(config.name, None)
                 self._revision_id = _generate_revision_id()
@@ -1919,6 +2206,12 @@ class ClientManager:
                     self._servers[config.name].status = ServerStatusEnum.ERROR
                     self._servers[config.name].last_error = describe_exception(e)
                 return [f"Failed to connect to {config.name}: {describe_exception(e)}"]
+
+        return await self._run_prepared(
+            [config],
+            body,
+            prepared=None if prepared is None else {config.name: prepared},
+        )
 
     def cancel_pending_requests(self, server: str) -> int:
         """Cancel pending requests for one server and return newly cancelled count."""
@@ -2096,14 +2389,34 @@ class ClientManager:
     async def restart_server(
         self, config: ResolvedServerConfig, force: bool = False
     ) -> tuple[bool, int, list[str]]:
-        """Restart one server by disconnecting then connecting the same config."""
+        """Restart one server by disconnecting then connecting the same config.
+
+        The new instance's secret references are resolved FIRST, before the
+        teardown and outside the lifecycle lock (Consiliency/pmcp#487 plan
+        3.5): a failed lookup leaves the running instance up and returns the
+        typed error -- no new spawn uses an old value, so this is not a
+        fallback.
+        """
+        try:
+            prepared = await self.prepare_spawn(config)
+        except CredentialUnavailableError as exc:
+            message = (
+                f"Restart of {config.name} refused: "
+                f"credential_unavailable ({exc.reason})"
+            )
+            logger.warning(message)
+            return (False, 0, [message])
         disconnected, cancelled, error = await self.disconnect_server(
             config.name, force
         )
         if not disconnected:
             return (False, cancelled, [error or "Restart refused."])
 
-        errors = await self.connect_server(config)
+        errors = (
+            await self.connect_server(config, prepared=prepared)
+            if prepared.overlay
+            else await self.connect_server(config)
+        )
         return (len(errors) == 0, cancelled, errors)
 
     def is_lazy_server(self, name: str) -> bool:
@@ -2114,16 +2427,27 @@ class ClientManager:
         """Get list of servers registered for lazy start."""
         return list(self._lazy_configs.keys())
 
-    async def _connect_with_retry(self, config: ResolvedServerConfig) -> None:
-        """Connect to a server with exponential backoff retry."""
+    async def _connect_with_retry(
+        self, config: ResolvedServerConfig, secrets: SpawnSecrets | None = None
+    ) -> None:
+        """Connect to a server with exponential backoff retry.
+
+        A typed credential failure is never retried (plan 3.5), including
+        ``rate_limited``: retrying cannot change its answer.
+        """
         last_error: Exception | None = None
 
         for attempt in range(MAX_CONNECTION_RETRIES):
             try:
-                await self._connect_server(config)
+                if secrets is None:
+                    await self._connect_server(config)
+                else:
+                    await self._connect_server(config, secrets)
                 return  # Success
             except _ManagerAbandoned:
                 raise  # Not a failure to retry: the gateway is shutting down.
+            except CredentialUnavailableError:
+                raise
             except Exception as e:
                 last_error = e
                 if attempt < MAX_CONNECTION_RETRIES - 1:
@@ -2139,7 +2463,9 @@ class ClientManager:
         if last_error:
             raise last_error
 
-    async def _connect_server(self, config: ResolvedServerConfig) -> None:
+    async def _connect_server(
+        self, config: ResolvedServerConfig, secrets: SpawnSecrets | None = None
+    ) -> None:
         """Connect to a single MCP server.
 
         Every connect path -- startup, `connect_server`, `refresh`, lazy
@@ -2158,7 +2484,7 @@ class ClientManager:
                 await self._connect_sse(config)
             return
 
-        await self._connect_stdio(config)
+        await self._connect_stdio(config, secrets)
 
     def _publish_catalog_change(self, kind: str) -> None:
         """Publish one catalog-kind change to the sink, unconditionally."""
@@ -3193,9 +3519,23 @@ class ClientManager:
             if before[kind] != after[kind]:
                 self._publish_catalog_change(kind)
 
-    async def _connect_stdio(self, config: ResolvedServerConfig) -> None:
-        """Connect to a local stdio MCP server."""
+    async def _connect_stdio(
+        self, config: ResolvedServerConfig, secrets: SpawnSecrets | None = None
+    ) -> None:
+        """Connect to a local stdio MCP server.
+
+        ``secrets``: the overlay its references resolved to, made by the
+        caller outside the lifecycle lock (``prepare_spawn``). A config that
+        has references to resolve and arrives without it -- or with one made
+        for an older generation -- is refused (``resolution_required``,
+        ``config_changed``), never spawned with the literal reference.
+        """
         name = config.name
+        if config.credential_unavailable is not None:
+            raise CredentialUnavailableError(config.credential_unavailable)
+        overlay = _secret_refs.require_resolved(config, secrets)
+        if overlay and secrets is not None and self._stale(config, secrets):
+            raise CredentialUnavailableError(CONFIG_CHANGED)
 
         # Clean up any existing live connection before spawning a replacement
         if name in self._clients:
@@ -3244,7 +3584,12 @@ class ClientManager:
         # Build environment: inherit the gateway env MINUS PMCP-managed secrets
         # (so this server never receives another server's stored credentials),
         # then apply this server's own resolved credentials.
-        env = sanitized_subprocess_env(local_config.env, self._project_root)
+        # A fresh dict per spawn: the resolved values go only into this
+        # child's environment, never onto the config (plan 3.5).
+        env = sanitized_subprocess_env(
+            _secret_refs.apply_overlay(local_config.env, overlay), self._project_root
+        )
+        del overlay
 
         # Spawn process (semaphore caps concurrent spawns to avoid FD exhaustion)
         async with self._spawn_semaphore:
@@ -3761,7 +4106,11 @@ class ClientManager:
                     continue
                 if not line:
                     break
-                logger.debug(f"[{name}] stderr: {line.decode().strip()}")
+                # Exact-value redaction before the line is logged (plan 3.7).
+                logger.debug(
+                    f"[{name}] stderr: "
+                    f"{redact_registered(line.decode('utf-8', 'replace').strip())}"
+                )
         except Exception as e:
             logger.debug(f"[{name}] stderr reader error: {describe_exception(e)}")
 
@@ -4041,6 +4390,9 @@ class ClientManager:
                     return
                 logger.info(f"[{name}] reconnect attempt {attempt}/{len(delays)} ...")
                 try:
+                    # Resolved again from the stored reference, before the
+                    # lock (Consiliency/pmcp#487 plan 3.5).
+                    secrets = await self.prepare_spawn(config)
                     async with self._lifecycle_lock:
                         managed = self._clients.get(name)
                         if managed and managed.status.status == ServerStatusEnum.ONLINE:
@@ -4048,9 +4400,25 @@ class ClientManager:
                                 f"[{name}] already online; skipping reconnect attempt {attempt}"
                             )
                             return
-                        await self._connect_singleflight(config)
+                        resolved = _nonempty(secrets)
+                        if resolved is None:
+                            await self._connect_singleflight(config)
+                        else:
+                            await self._connect_singleflight(config, secrets=resolved)
                     logger.info(f"[{name}] reconnected successfully")
                     return
+                except CredentialUnavailableError as e:
+                    logger.warning(
+                        f"[{name}] reconnect attempt {attempt} failed: "
+                        f"credential_unavailable ({e.reason})"
+                    )
+                    if not _secret_refs.is_retryable_reason(e.reason):
+                        # A typed lookup failure is not retried (plan 3.5).
+                        logger.error(
+                            f"[{name}] reconnect stopped: the credential is "
+                            "unavailable; server remains offline"
+                        )
+                        return
                 except Exception as e:
                     safe_error = describe_exception(e)
                     logger.warning(
@@ -4709,10 +5077,30 @@ class ClientManager:
                 release(managed.process)  # its pipes, now (round 10)
 
     async def refresh(self, configs: list[ResolvedServerConfig]) -> list[str]:
-        """Refresh connections (disconnect + reconnect)."""
+        """Refresh connections (disconnect + reconnect).
+
+        Every config's references are resolved first, outside the lock; the
+        teardown follows only then (Consiliency/pmcp#487 plan 3.5).
+        """
+        secrets, errors, failed = await self._prepare_configs(configs)
         async with self._lifecycle_lock:
             await self._disconnect_all_unlocked()
-            return await self._connect_all_unlocked(configs)
+            ready = [
+                config
+                for config in configs
+                if config.name not in failed
+                and not self._stale(config, secrets[config.name])
+            ]
+            stale = [
+                config
+                for config in configs
+                if config.name not in failed and config not in ready
+            ]
+            for config in stale:
+                errors.append(self._record_unavailable(config.name, CONFIG_CHANGED))
+            if any(_nonempty(found) for found in secrets.values()):
+                return errors + await self._connect_all_unlocked(ready, secrets=secrets)
+            return errors + await self._connect_all_unlocked(ready)
 
     async def adopt_process(
         self,
@@ -5366,7 +5754,7 @@ class ClientManager:
             timeout_ms=timeout_ms,
         )
 
-        return result
+        return redact_registered_in(result)
 
     async def get_prompt(
         self,
@@ -5403,7 +5791,7 @@ class ClientManager:
             timeout_ms=timeout_ms,
         )
 
-        return result
+        return redact_registered_in(result)
 
     def get_tool(self, tool_id: str) -> ToolInfo | None:
         """Get tool info by ID."""

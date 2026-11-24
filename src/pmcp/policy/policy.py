@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pmcp.argument_errors import exception_text
 from pmcp.home_identity import spelled_home as _spelled_home
 from pmcp.project_consent import log_refusal, read_and_gate
+from pmcp.secret_registry import redact_registered
 from pmcp.types import (
     GatewayPolicy,
     PackagePolicy,
@@ -972,6 +973,13 @@ class PolicyManager:
             output_str = output
         else:
             output_str = json.dumps(output, indent=2)
+
+        # Exact-value redaction of every resolved secret and the service-account
+        # token: UNCONDITIONAL (independent of ``redact``) and BEFORE the
+        # truncation and the summary, so a value cut by the size cap is never
+        # half-shown (Consiliency/pmcp#487 plan 3.7). Raw and JSON-escaped
+        # forms are matched.
+        output_str = redact_registered(output_str)
 
         raw_size = len(output_str.encode("utf-8"))
 

@@ -44,6 +44,7 @@ from pmcp.argument_errors import (
     safe_exc_info,
 )
 from pmcp.env_store import bind_project_root, credential_value
+from pmcp.secret_registry import install_log_redaction, redact_registered_in
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
 from pmcp.config.loader import (
@@ -210,6 +211,9 @@ class GatewayServer:
         required_scopes: list[str] | None = None,
         allowed_origins: list[str] | None = None,
     ) -> None:
+        # Exact-value redaction of resolved secrets on every log record
+        # (Consiliency/pmcp#487 plan 3.7); idempotent.
+        install_log_redaction()
         # Idempotent; again here in case a record factory was replaced since
         # import (Consiliency/pmcp#297).
         install_log_scrubber()
@@ -768,6 +772,9 @@ class GatewayServer:
                 raise ValueError(f"Resource blocked by policy: {uri_str}")
 
             result = await self._client_manager.read_resource(resource_info.resource_id)
+            # Exact-value redaction of resolved secrets (Consiliency/pmcp#487
+            # plan 3.7), unconditional.
+            result = redact_registered_in(result)
             contents = result.get("contents", [])
 
             # Convert to TextResourceContents
@@ -838,6 +845,7 @@ class GatewayServer:
                 raise ValueError(f"Prompt blocked by policy: {name}")
 
             result = await self._client_manager.get_prompt(name, arguments)
+            result = redact_registered_in(result)
 
             # Convert result to GetPromptResult
             messages = result.get("messages", [])

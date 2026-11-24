@@ -56,7 +56,11 @@ def resolve_remote_headers(
     if not headers:
         return RemoteHeaderAuthResolution(resolved_headers={})
 
-    from pmcp.credential_state import CredentialUnavailableError
+    from pmcp.credential_state import (
+        REMOTE_REFERENCE_UNSUPPORTED,
+        CredentialUnavailableError,
+    )
+    from pmcp.secret_refs import is_reference_shaped
 
     resolved_headers: dict[str, str] = {}
     referenced_env_vars_by_header: dict[str, list[str]] = {}
@@ -79,10 +83,24 @@ def resolve_remote_headers(
                 unavailable[env_var] = exc.reason
                 missing.add(env_var)
                 continue
+            if value and is_reference_shaped(value):
+                # References are never resolved into a remote header in v1
+                # (Consiliency/pmcp#487 plan 3.2.7): refused, never forwarded.
+                unavailable[env_var] = REMOTE_REFERENCE_UNSUPPORTED
+                missing.add(env_var)
+                continue
             if value:
                 resolved = resolved.replace(f"${{{env_var}}}", value)
             else:
                 missing.add(env_var)
+        if "op://" in resolved.lower():
+            # A header whose FINAL value carries a reference anywhere
+            # (``Bearer op://...``, written literally or assembled): refused,
+            # and its value is not kept on the resolution.
+            pseudo = f"<header:{header_name}>"
+            unavailable[pseudo] = REMOTE_REFERENCE_UNSUPPORTED
+            missing.add(pseudo)
+            continue
         resolved_headers[header_name] = resolved
 
     return RemoteHeaderAuthResolution(

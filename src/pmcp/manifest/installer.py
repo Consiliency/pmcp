@@ -10,6 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Literal
 
 from pmcp.child_output import (
@@ -23,10 +24,20 @@ from pmcp.child_output import (
 from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.env_store import (
     credential_value,
+    credential_value_sourced,
     resolve_scope_path,
     sanitized_subprocess_env,
 )
+from pmcp.credential_state import CredentialUnavailableError
 from pmcp.manifest.environment import Platform
+from pmcp.secret_refs import (
+    SpawnSecrets,
+    require_resolved,
+    resolve_spawn_env,
+    static_failure,
+)
+from pmcp.secret_registry import redact_registered
+from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
 from pmcp.manifest.loader import (
     ServerConfig,
     credential_lookup_keys,
@@ -239,13 +250,18 @@ class JobManager:
             # Start subprocess with stdin/stdout/stderr pipes
             # stdin is needed for JSON-RPC communication after server starts
             # stderr is separate so ClientManager can read it independently
+            # References resolved first, outside any lock, failing closed
+            # before the spawn (Consiliency/pmcp#487 plan 3.5).
+            secrets = await resolve_install_secrets(server_config, project_root)
             process = await spawn_owned(
                 lambda: asyncio.create_subprocess_exec(
                     *install_cmd,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    env=build_install_child_env(server_config, project_root),
+                    env=build_install_child_env(
+                        server_config, project_root, secrets=secrets
+                    ),
                     # No controlling terminal (Consiliency/pmcp#388 round 5).
                     **detached(),
                 )
@@ -429,6 +445,9 @@ class JobManager:
                                 decoded = line.decode().strip()
                             except Exception:
                                 decoded = str(line)
+                            # Exact-value redaction of resolved secrets before
+                            # the line is kept, logged or shown (plan 3.7).
+                            decoded = redact_registered(decoded)
 
                             if decoded:
                                 job.output_lines.append(f"[{stream_name}] {decoded}")
@@ -720,7 +739,10 @@ def get_job_manager() -> JobManager:
 
 
 def build_install_child_env(
-    server_config: ServerConfig, project_root: Path | None = None
+    server_config: ServerConfig,
+    project_root: Path | None = None,
+    *,
+    secrets: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build the subprocess environment for a server's install/run command.
 
@@ -748,9 +770,45 @@ def build_install_child_env(
     ``tests/test_install_child_env_project_root.py`` asserts that no production
     call omits it.
     """
-    # Declared non-secret vars first (e.g. a self-hosted base URL), so the
-    # credential resolved below always wins if the two name the same key.
+    spawn = _install_spawn_config(server_config, project_root)
+    own_env = (
+        dict(spawn.config.env or {})
+        if isinstance(spawn.config, LocalMcpServerConfig)
+        else {}
+    )
+    # ``secrets``: the values its references resolved to
+    # (:func:`resolve_install_secrets`, awaited before the spawn). A reference
+    # due for resolution with no resolved value fails CLOSED
+    # (``resolution_required``): the child never gets the literal reference.
+    own_env.update(
+        require_resolved(
+            spawn, None if secrets is None else SpawnSecrets(dict(secrets))
+        )
+    )
+    # Inherit the gateway env minus PMCP-managed secrets (no cross-server bleed),
+    # then apply this server's own resolved credential.
+    return sanitized_subprocess_env(own_env, project_root)
+
+
+def _install_spawn_config(
+    server_config: ServerConfig, project_root: Path | None
+) -> ResolvedServerConfig:
+    """The install child's own env, as a config with its provenance (plan 3.2.3).
+
+    Declared non-secret vars first (e.g. a self-hosted base URL), then the
+    credential, which always wins a collision. Raises
+    :class:`CredentialUnavailableError` for a typed lookup failure or a static
+    reference failure (grammar, source, token file).
+    """
     own_env: dict[str, str] = dict(getattr(server_config, "extra_env", {}) or {})
+    sources: dict[str, str] = {}
+    opted_in = bool(getattr(server_config, "resolve_secret_refs", False)) and (
+        getattr(server_config, "entry_origin", None)
+        in ("operator_overlay", "env_overlay")
+    )
+    if opted_in:
+        extra_sources = getattr(server_config, "extra_env_sources", {}) or {}
+        sources.update({key: extra_sources.get(key, "unknown") for key in own_env})
     env_var = server_config.env_var
     if env_var:
         # For the root the gateway serves, not the working directory
@@ -759,13 +817,35 @@ def build_install_child_env(
         # lookup: the spawn is refused, never made without the credential or
         # with the legacy key's (Consiliency/pmcp#487).
         for key in credential_lookup_keys(server_config):
-            value = credential_value(key, root=project_root)
+            value = credential_value_sourced(key, root=project_root)
             if value:
-                own_env[env_var] = value
+                own_env[env_var] = str(value)
+                sources[env_var] = value.source
                 break
-    # Inherit the gateway env minus PMCP-managed secrets (no cross-server bleed),
-    # then apply this server's own resolved credential.
-    return sanitized_subprocess_env(own_env, project_root)
+    spawn = ResolvedServerConfig(
+        name=server_config.name,
+        source="manifest",
+        config=LocalMcpServerConfig(
+            command=server_config.command, args=list(server_config.args), env=own_env
+        ),
+        credential_sources=sources,
+        resolve_secret_refs=opted_in,
+    )
+    reason = static_failure(spawn)
+    if reason is not None:
+        raise CredentialUnavailableError(reason)
+    return spawn
+
+
+async def resolve_install_secrets(
+    server_config: ServerConfig, project_root: Path | None = None
+) -> dict[str, str]:
+    """Resolve the install child's references BEFORE its spawn (plan 3.5).
+
+    Covers install-and-run (Bright Data's provision path), ``install_server``
+    and ``verify_installation``. Raises :class:`CredentialUnavailableError`.
+    """
+    return await resolve_spawn_env(_install_spawn_config(server_config, project_root))
 
 
 async def check_api_key(
@@ -843,13 +923,16 @@ async def install_server(
             f"Installing {_operator_safe(server_config.name)}: "
             f"{_render_install_argv(install_cmd)}"
         )
+        secrets = await resolve_install_secrets(server_config, project_root)
         process = await spawn_owned(
             lambda: asyncio.create_subprocess_exec(
                 *install_cmd,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=build_install_child_env(server_config, project_root),
+                env=build_install_child_env(
+                    server_config, project_root, secrets=secrets
+                ),
                 **detached(),
             )
         )
@@ -863,7 +946,9 @@ async def install_server(
             )
 
         if process.returncode != 0:
-            error_output = stderr.decode() or stdout.decode()
+            error_output = redact_registered(
+                stderr.decode("utf-8", "replace") or stdout.decode("utf-8", "replace")
+            )
             raise InstallError(
                 f"Installation of {server_config.name} failed: {error_output[:500]}"
             )
@@ -909,13 +994,16 @@ async def verify_installation(
             f"Verifying installation of {_operator_safe(server_config.name)}: "
             f"{_render_install_argv(verify_cmd)}"
         )
+        secrets = await resolve_install_secrets(server_config, project_root)
         process = await spawn_owned(
             lambda: asyncio.create_subprocess_exec(
                 *verify_cmd,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=build_install_child_env(server_config, project_root),
+                env=build_install_child_env(
+                    server_config, project_root, secrets=secrets
+                ),
                 **detached(),
             )
         )

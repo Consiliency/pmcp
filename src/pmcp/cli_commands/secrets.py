@@ -214,10 +214,114 @@ def _extract_required_keys(
     )
 
 
+async def fetch_gateway_health(timeout_s: float = 5.0) -> dict[str, Any] | None:
+    """The serving gateway's ``/health`` JSON, or ``None`` when unreachable.
+
+    A seam: tests replace it. Never sends a credential.
+    """
+    import httpx
+
+    from pmcp.cli import _get_gateway_health_url
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout=timeout_s), follow_redirects=False
+        ) as client:
+            response = await client.get(_get_gateway_health_url())
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+    except Exception:  # noqa: BLE001 - unreachable or not JSON: no report
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+async def _reference_write_refusal(scope: str, key: str, value: str) -> str | None:
+    """Why ``pmcp secrets set KEY op://...`` must not write, or ``None``.
+
+    Consiliency/pmcp#487 plan 3.2.5: user scope only; a supported reference
+    (plan 3.3); a credential name (``copy_allowed``); and the SERVING gateway
+    -- never this CLI's own version -- reports ``secret_refs`` and does not
+    report KEY as coming from its environment or ``~/.env`` (a reference
+    written under such a name would never be the answer, or would arrive
+    through an untrusted source). Value-free.
+    """
+    from pmcp.env_store import copy_allowed, declared_credential_names
+    from pmcp.secret_refs import SECRET_REFS_CAPABILITY, parse_reference
+
+    if scope != "user":
+        return (
+            "a secret reference (op://...) is written only to the user store "
+            "(--scope user)"
+        )
+    if parse_reference(value) is None:
+        return (
+            "the secret reference is not in the supported form "
+            "op://<vault>/<item>/[<section>/]<field> (reference_unsupported)"
+        )
+    try:
+        declared = declared_credential_names()
+    except Exception:  # noqa: BLE001
+        declared = frozenset()
+    if not copy_allowed(key, declared):
+        return f"{key} is not a credential name a reference may be written under"
+    health = await fetch_gateway_health()
+    diagnostics = (health or {}).get("gateway_diagnostics") or {}
+    capabilities = diagnostics.get("capabilities") or []
+    report = diagnostics.get("secret_refs") or {}
+    if SECRET_REFS_CAPABILITY not in capabilities or not report.get("capable"):
+        return (
+            "the serving gateway does not report the secret_refs capability "
+            "(it must run a pmcp that resolves references, have its "
+            "service-account token, and not load pmcp.env into its "
+            "environment); nothing was written"
+        )
+    shadowed = report.get("shadowed_names")
+    from_environment = report.get("store_names_from_environment_names")
+    if not isinstance(shadowed, list) or not isinstance(from_environment, list):
+        return (
+            "the serving gateway does not list name origins (its /health hides "
+            "them while HTTP auth is on), so it cannot confirm that "
+            f"{key} is not shadowed; nothing was written"
+        )
+    if key in shadowed or key in from_environment:
+        return (
+            f"the serving gateway answers {key} from its environment or "
+            "~/.env, which outranks the user store; remove it there first"
+        )
+    return None
+
+
 async def run_secrets_set(args: argparse.Namespace) -> dict[str, object]:
     """Set one secret in user or project PMCP env file."""
+    from pmcp.env_store import is_pmcp_environment_name
+    from pmcp.secret_refs import is_op_control_name, is_reference_shaped
+
     project = getattr(args, "project", None)
     path = Path(scope_store_name(args.scope))
+    if is_op_control_name(args.key):
+        return {
+            "ok": False,
+            "command": "secrets.set",
+            "scope": args.scope,
+            "error": (
+                f"refusing {args.key}: the 1Password service account is "
+                "configured by its credential file, never through pmcp's stores"
+            ),
+        }
+    if is_reference_shaped(args.value or ""):
+        refusal = (
+            f"{args.key} is pmcp's own variable, which is never a secret reference"
+            if is_pmcp_environment_name(args.key)
+            else await _reference_write_refusal(args.scope, args.key, args.value)
+        )
+        if refusal is not None:
+            return {
+                "ok": False,
+                "command": "secrets.set",
+                "scope": args.scope,
+                "error": f"refusing to write a secret reference: {refusal}",
+            }
     # The read sits inside the same boundary as the write, and for the project
     # store it goes through the write's confined walk: a link the write would
     # refuse is refused before anything is read (read_store_for_update).
@@ -309,6 +413,19 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
             "error": store_refusal(target_path, exc),
         }
 
+    # Secret references and the 1Password control names never move between
+    # stores (Consiliency/pmcp#487 plan 3.1, 3.2.5): a reference is written
+    # only by `pmcp secrets set --scope user`, behind the gateway's gate.
+    from pmcp.secret_refs import is_op_control_name, is_reference_shaped
+
+    reference_refused = sorted(
+        key
+        for key, value in source_values.items()
+        if is_op_control_name(key) or is_reference_shaped(value)
+    )
+    for key in reference_refused:
+        source_values.pop(key, None)
+
     # A project store is the repository's; what it may hand to another store --
     # the user store, which loads into pmcp's environment at every start -- is
     # decided by the same rule a lookup uses (env_store.copyable_from_repository,
@@ -359,7 +476,7 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
         "added": sorted(added),
         "updated": sorted(updated),
         "skipped": sorted(skipped),
-        "refused": sorted(refused),
+        "refused": sorted({*refused, *reference_refused}),
         "target_key_count": len(target_values),
     }
 

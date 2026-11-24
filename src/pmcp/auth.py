@@ -22,6 +22,7 @@ import aiohttp
 import jwt
 from jwt import PyJWKSet
 
+from pmcp.secret_registry import redact_registered
 from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
 from pmcp.parsing import load_json
@@ -1353,6 +1354,10 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> 
     # An exception goes through `exception_text`: a validation error's own
     # text carries the rejected value (Consiliency/pmcp#297).
     raw = exception_text(value) if isinstance(value, BaseException) else str(value)
+    # Exact-value redaction of resolved secrets and the service-account token
+    # first, before every other pass and the cut (Consiliency/pmcp#487 plan
+    # 3.7): unconditional, raw and JSON-escaped forms.
+    raw = redact_registered(raw)
     with _url_tail_restore() as record:
         base = _sanitize_base(raw)
         carried = carried_view_spans(raw, base, _usable_edits(record))

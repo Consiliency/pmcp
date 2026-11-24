@@ -68,7 +68,9 @@ from pmcp.env_store import (
     credential_value,
     env_origin,
     publish_auth_connect_value,
+    read_store_for_update,
     repository_may_supply,
+    resolve_scope_path,
     sanitized_subprocess_env,
     scope_store_name,
     set_env_value,
@@ -229,9 +231,30 @@ from pmcp.manifest.loader import (
     requires_credential,
 )
 from pmcp.parsing import load_json, load_json_file
+from pmcp.secret_refs import (
+    apply_health_capability,
+    apply_overlay,
+    is_op_control_name,
+    is_reference_shaped,
+    resolve_spawn_env,
+    spawn_plan,
+)
+from pmcp.secret_registry import redact_registered
 from pmcp.waits import bounded_wait
 
 logger = logging.getLogger(__name__)
+
+
+def _has_references(config: ResolvedServerConfig) -> bool:
+    """Does ``config`` carry a secret reference pmcp resolves (plan 3.5)?
+
+    A static failure counts: the manager reports it typed.
+    """
+    try:
+        return not spawn_plan(config).empty
+    except CredentialUnavailableError:
+        return True
+
 
 FEEDBACK_TOKEN_LIMIT = 4000
 
@@ -2263,7 +2286,38 @@ class GatewayTools:
                 )
             ]
 
-            disconnect_errors: list[str] = []
+            # Every config this refresh will connect has its secret references
+            # resolved BEFORE the disconnect loop (Consiliency/pmcp#487 plan
+            # 3.5). A server whose lookup fails is kept running -- nothing new
+            # is spawned with an old value -- and reported.
+            # Only configs with something to resolve need it; the rest spawn
+            # exactly as before.
+            with_references = [
+                config for config in to_connect if _has_references(config)
+            ]
+            prepared: dict[str, Any] = {}
+            prepare_errors: list[str] = []
+            prepare_failed: set[str] = set()
+            if with_references:
+                (
+                    prepared,
+                    prepare_errors,
+                    prepare_failed,
+                ) = await self._client_manager.prepare_configs(with_references)
+            if prepare_failed:
+                to_disconnect = [
+                    name
+                    for name in to_disconnect
+                    if not (
+                        name in prepare_failed
+                        and self._client_manager.is_server_online(name)
+                    )
+                ]
+                to_connect = [
+                    config for config in to_connect if config.name not in prepare_failed
+                ]
+
+            disconnect_errors: list[str] = list(prepare_errors)
             for name in to_disconnect:
                 # Pending/active work was already gated (and force-cancelled)
                 # above, so force the per-server disconnect here. A failure is
@@ -2291,7 +2345,13 @@ class GatewayTools:
 
             errors: list[str] = list(disconnect_errors)
             if to_connect:
-                errors += await self._client_manager.connect_all(to_connect)
+                errors += (
+                    await self._client_manager.connect_all(
+                        to_connect, prepared=prepared
+                    )
+                    if prepared
+                    else await self._client_manager.connect_all(to_connect)
+                )
             pending_remaining = len(self._client_manager.get_pending_requests())
 
             revision_id, _ = self._client_manager.get_registry_meta()
@@ -2377,7 +2437,9 @@ class GatewayTools:
                 tool_count=status.tool_count,
                 protocol_version=status.protocol_version,
                 server_capabilities=status.server_capabilities,
-                error=status.last_error
+                # Exact-value redaction where last_error is surfaced
+                # (Consiliency/pmcp#487 plan 3.7).
+                error=redact_registered(status.last_error)
                 if status.status.value == "error" and status.last_error
                 else None,
             )
@@ -2506,6 +2568,9 @@ class GatewayTools:
             server.protocol_version for server in servers
         )
         diagnostics.npm_identity = get_resolver().status_summary()
+        # Evaluated now (Consiliency/pmcp#487 plan 3.10): enums only here --
+        # the agent-facing tool never lists names.
+        diagnostics = apply_health_capability(diagnostics, include_names=False)
 
         servers.sort(key=lambda server: server.name)
         return HealthOutput(
@@ -3087,6 +3152,41 @@ class GatewayTools:
             return None
 
         return (manifest_server, auth_env_options, None)
+
+    def _auth_connect_reference_refusal(
+        self, scope: str, key: str, value: str
+    ) -> str | None:
+        """Why ``gateway.auth_connect`` must not store this, or ``None``.
+
+        Value-free (Consiliency/pmcp#487 plan 3.1, 3.2.5): a 1Password control
+        name (``OP_SERVICE_ACCOUNT_TOKEN``, ...) is never stored; a
+        reference-shaped credential is refused -- values written by
+        ``auth_connect`` are never a trusted reference source; and a store
+        entry that already holds a reference is never overwritten (the
+        operator wrote it with ``pmcp secrets set``).
+        """
+        if is_op_control_name(key):
+            return (
+                f"Refusing to store {key}: the 1Password service account is "
+                "configured by its credential file, never through pmcp's stores."
+            )
+        if is_reference_shaped(value):
+            return (
+                f"Refusing to store {key}: gateway.auth_connect does not accept "
+                "a secret reference (op://...). An operator writes references "
+                "with `pmcp secrets set --scope user`."
+            )
+        try:
+            path = resolve_scope_path(scope, self._project_root)
+            existing = read_store_for_update(scope, path).get(key)
+        except (OSError, ValueError):
+            return None  # the write below reports the store's own refusal
+        if existing is not None and is_reference_shaped(existing):
+            return (
+                f"Refusing to overwrite {key}: the store entry holds a secret "
+                "reference the operator wrote. Change it with `pmcp secrets set`."
+            )
+        return None
 
     def _write_secret(self, scope: str, key: str, value: str) -> Path:
         """Persist a secret in PMCP env storage."""
@@ -5196,6 +5296,28 @@ class GatewayTools:
                 env_var=None,
             )
 
+        reference_refusal = self._auth_connect_reference_refusal(
+            parsed.scope, env_var, parsed.credential
+        )
+        if reference_refusal is not None:
+            self._audit(
+                method="gateway.auth_connect",
+                action="auth_connect",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=server_name,
+                auth_state="missing_auth",
+                auth_event="policy_denied",
+                error=reference_refusal,
+            )
+            return AuthConnectOutput(
+                ok=False,
+                server=server_name,
+                message=reference_refusal,
+                auth_state="missing_auth",
+                env_var=env_var,
+            )
+
         if "${" in parsed.credential:
             # The store is loaded with python-dotenv's expansion, so a stored
             # `${GITHUB_TOKEN}` would become the operator's secret under this
@@ -5640,7 +5762,15 @@ class GatewayTools:
             # overlay onto `os.environ` for the probe below; the merged result
             # must NOT be passed here, since every process has PATH and HOME and
             # the gate would refuse every npm server.)
-            server_env: Mapping[str, str] | None = resolved_config.config.env
+            # Key NAMES with empty values (Consiliency/pmcp#487 plan 3.5): the
+            # gate checks names only, never needs a secret's value, and never
+            # sees a reference string or calls op; every declared key still
+            # reaches it, so it still fails closed.
+            server_env: Mapping[str, str] | None = (
+                None
+                if resolved_config.config.env is None
+                else {key: "" for key in resolved_config.config.env}
+            )
             server_cwd = resolved_config.config.cwd
         else:
             # Remote servers have no local package for this tool to update.
@@ -5713,12 +5843,35 @@ class GatewayTools:
             # scan); for a .mcp.json server it's whatever that entry declares.
             # Using it here means the probe's env can never diverge from the
             # restart's env either, for the same reason command/args can't.
+            #
+            # The probe loads the server's package (``@brightdata/mcp`` throws
+            # at load without API_TOKEN), so it is a credential-injecting spawn
+            # like the others (Consiliency/pmcp#487 plan 3.5): its references
+            # are resolved into a FRESH env, failing closed before the spawn;
+            # resolved_config.config.env is never mutated, so the post-probe
+            # check below still compares reference strings.
+            probe_overlay: dict[str, str] = {}
+            if isinstance(resolved_config.config, LocalMcpServerConfig):
+                try:
+                    probe_overlay = await resolve_spawn_env(resolved_config)
+                except CredentialUnavailableError as exc:
+                    return UpdateServerOutput(
+                        ok=False,
+                        server=server_name,
+                        package_type=package_type,
+                        package_name=package_name,
+                        message=(
+                            "Update probe not started: "
+                            f"credential_unavailable ({exc.reason})"
+                        ),
+                    )
             probe_env = sanitized_subprocess_env(
-                resolved_config.config.env
+                apply_overlay(resolved_config.config.env, probe_overlay)
                 if isinstance(resolved_config.config, LocalMcpServerConfig)
                 else None,
                 self._project_root,
             )
+            del probe_overlay
             ok, output = await self._run_update_probe_command(update_cmd, env=probe_env)
         except (asyncio.TimeoutError, TimeoutError):
             # Both classes, though the helper normalises to the builtin: on the
@@ -5740,11 +5893,13 @@ class GatewayTools:
                 server=server_name,
                 package_type=package_type,
                 package_name=package_name,
-                message=f"Failed to run update probe: {exception_text(e)}",
+                message=f"Failed to run update probe: {redact_registered(exception_text(e))}",
             )
 
         if not ok:
-            short_output = output[-300:] if output else "no output"
+            # Exact-value redaction BEFORE the slice (plan 3.7): a cut value
+            # must not survive half-shown.
+            short_output = redact_registered(output)[-300:] if output else "no output"
             return UpdateServerOutput(
                 ok=False,
                 server=server_name,

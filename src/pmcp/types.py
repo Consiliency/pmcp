@@ -9,6 +9,7 @@ import re
 from typing import Annotated, Any, Literal
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -193,6 +194,12 @@ class GatewayDiagnosticsInfo(BaseModel):
     # That is announced by exactly one WARNING, which is easy to miss in a
     # gateway that runs for days, so it is answerable here on demand.
     npm_identity: str | None = None
+    # 1Password secret references (Consiliency/pmcp#487 plan 3.10): token
+    # state and source (enums), and -- unless HTTP auth is on -- the names
+    # (never values) whose origin keeps a reference write from taking
+    # effect. ``capabilities`` lists ``secret_refs`` only when this process
+    # can actually resolve. Evaluated per request.
+    secret_refs: dict[str, Any] | None = None
 
 
 class AuthMetadataInfo(BaseModel):
@@ -289,6 +296,15 @@ class LocalMcpServerConfig(_DictLikeModel):
     args: list[str] = Field(default_factory=list)
     cwd: str | None = None
     env: dict[str, str] | None = None
+    #: Opt in to pmcp resolving this server's own ``op://`` env values
+    #: (Consiliency/pmcp#487 plan 3.2.4). Honoured only from an operator
+    #: source (user-scope config, ``-c``); a project ``.mcp.json`` setting it
+    #: is ignored. Not serialized.
+    resolve_secret_refs: bool = Field(
+        default=False,
+        exclude=True,
+        validation_alias=AliasChoices("resolve_secret_refs", "resolveSecretRefs"),
+    )
 
 
 class RemoteMcpServerConfig(_DictLikeModel):
@@ -322,6 +338,13 @@ class McpConfigFile(BaseModel):
     mcpServers: dict[str, McpServerConfig] = Field(default_factory=dict)
     autoStart: list[str] = Field(default_factory=list)
     disableAutoStart: list[str] = Field(default_factory=list)
+    #: The ``op`` executable for secret references (Consiliency/pmcp#487 plan
+    #: 3.4). Honoured only from a user-scope or ``-c`` config.
+    op_path: str | None = Field(
+        default=None,
+        exclude=True,
+        validation_alias=AliasChoices("op_path", "opPath"),
+    )
 
 
 ConfigSourceName = Literal["project", "user", "custom"]
@@ -449,6 +472,15 @@ class ResolvedServerConfig(BaseModel):
     #: ``connect_server`` can report it, and is never started
     #: (Consiliency/pmcp#487, #342). Not serialized.
     credential_unavailable: str | None = Field(default=None, exclude=True)
+    #: Where each env value pmcp may resolve came from (plan 3.2.3):
+    #: ``env key -> source kind`` (``secret_refs.SOURCE_KINDS``). A credential
+    #: lookup's key always has an entry; an opted-in server's own-env keys do
+    #: too. A key with no entry is never resolved (passed through verbatim);
+    #: a reference whose source is not trusted is refused. Not serialized.
+    credential_sources: dict[str, str] = Field(default_factory=dict, exclude=True)
+    #: The server opted in to own-env resolution from an operator source
+    #: (plan 3.2.4). Not serialized.
+    resolve_secret_refs: bool = Field(default=False, exclude=True)
 
 
 # === Registry Types ===

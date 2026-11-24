@@ -1067,8 +1067,13 @@ def _merge_manifest_defaults(
     config: LocalMcpServerConfig,
     manifest_servers: dict[str, "ManifestServerConfig"] | None,
     env_lookup: Callable[[str], str | None],
+    sources: dict[str, str] | None = None,
 ) -> LocalMcpServerConfig | None:
     """Merge a partial config with manifest defaults when possible.
+
+    ``sources`` (an out-parameter) receives the provenance of every value
+    this merge took from a credential lookup or the manifest's ``extra_env``
+    (Consiliency/pmcp#487 plan 3.2.3): ``env key -> source kind``.
 
     Also injects the credential for a configured local server that matches a
     manifest api-key server: without this, a ``.mcp.json`` entry (or one that
@@ -1114,6 +1119,10 @@ def _merge_manifest_defaults(
             if merged is config:
                 merged = config.model_copy(deep=True)
             merged.env = {**(merged.env or {}), **missing}
+            if sources is not None:
+                extra_sources = getattr(manifest_server, "extra_env_sources", {}) or {}
+                for key in missing:
+                    sources[f"extra_env:{key}"] = extra_sources.get(key, "unknown")
 
     if manifest_server and manifest_server.env_var:
         from pmcp.manifest.loader import credential_lookup_keys
@@ -1138,7 +1147,9 @@ def _merge_manifest_defaults(
                 if value:
                     if merged is config:
                         merged = config.model_copy(deep=True)
-                    merged.env = {**(merged.env or {}), env_var: value}
+                    merged.env = {**(merged.env or {}), env_var: str(value)}
+                    if sources is not None:
+                        sources[env_var] = getattr(value, "source", "unknown")
                     break
 
     return merged
@@ -1223,9 +1234,10 @@ def load_configs(
             # manifest is unavailable; the overlay check normally skips such an
             # entry long before this point.
             unavailable: str | None = None
+            merge_sources: dict[str, str] = {}
             try:
                 local_merged = _merge_manifest_defaults(
-                    name, normalized, manifest_servers, credentials
+                    name, normalized, manifest_servers, credentials, merge_sources
                 )
             except CredentialUnavailableError as exc:
                 # A typed credential failure is contained to THIS entry
@@ -1258,15 +1270,21 @@ def load_configs(
             if not local_merged:
                 return None
             resolved_config = local_merged
-            if unavailable is not None:
-                return ResolvedServerConfig(
-                    name=name,
-                    source=cast(
-                        Literal["project", "user", "custom", "manifest"], source
-                    ),
-                    config=resolved_config,
-                    credential_unavailable=unavailable,
-                )
+            opted_in = _opted_in(name, normalized, source)
+            credential_sources = _configured_credential_sources(
+                normalized, local_merged, merge_sources, source, opted_in
+            )
+            entry = ResolvedServerConfig(
+                name=name,
+                source=cast(Literal["project", "user", "custom", "manifest"], source),
+                config=resolved_config,
+                credential_unavailable=unavailable,
+                credential_sources=credential_sources,
+                resolve_secret_refs=opted_in,
+            )
+            if entry.credential_unavailable is None:
+                entry.credential_unavailable = _static_reference_failure(entry)
+            return entry
         return ResolvedServerConfig(
             name=name,
             source=cast(Literal["project", "user", "custom", "manifest"], source),
@@ -1310,8 +1328,11 @@ def load_configs(
         if user_config_paths is not None
         else default_user_config_paths()
     )
+    operator_op_path: str | None = None
     for user_path in user_paths:
         user_config = _parse_config_or_warn(user_path)
+        if user_config and user_config.op_path and operator_op_path is None:
+            operator_op_path = user_config.op_path
 
         if user_config and user_config.mcpServers:
             logger.info(f"Loaded user config from {user_path}")
@@ -1340,6 +1361,8 @@ def load_configs(
 
     if resolved_custom_path:
         custom_config = _parse_config_or_warn(resolved_custom_path)
+        if custom_config and custom_config.op_path and operator_op_path is None:
+            operator_op_path = custom_config.op_path
 
         if custom_config and custom_config.mcpServers:
             logger.info(f"Loaded custom config from {resolved_custom_path}")
@@ -1354,6 +1377,12 @@ def load_configs(
                     if resolved:
                         configs.append(resolved)
                         seen_servers.add(name)
+
+    # ``op_path`` only from the operator's own configs (user scope, ``-c``),
+    # never a project ``.mcp.json`` (Consiliency/pmcp#487 plan 3.4).
+    from pmcp.secret_refs import set_operator_op_path
+
+    set_operator_op_path(operator_op_path)
 
     logger.info(
         f"Loaded {len(configs)} server configs from {len(seen_servers)} unique servers"
@@ -1532,14 +1561,16 @@ def _credential_value_for(root: Path | None) -> Callable[[str], str | None]:
     the first lookup and kept for the rest: one config build reads one
     project, and resolving it per key re-discovered it for every server.
     """
-    from pmcp.env_store import credential_value, resolve_project_root
+    from pmcp.env_store import credential_value_sourced, resolve_project_root
 
     resolved: list[Path] = []
 
     def lookup(key: str) -> str | None:
         if not resolved:
             resolved.append(resolve_project_root(root))
-        return credential_value(key, root=resolved[0])
+        # A ``str`` that remembers its layer (``env_store.SourcedValue``):
+        # the config records it in ``credential_sources`` (plan 3.2.3).
+        return credential_value_sourced(key, root=resolved[0])
 
     return lookup
 
@@ -1584,16 +1615,27 @@ def _manifest_server_to_config(
     # The credential is looked up under its (optionally namespaced) storage key,
     # with the runtime env_var as a legacy fallback, but is always injected into
     # the subprocess under the runtime env_var the downstream server reads.
+    credential_sources: dict[str, str] = {}
+    opted_in = bool(getattr(server, "resolve_secret_refs", False)) and (
+        getattr(server, "entry_origin", None) in _OPERATOR_MANIFEST_ORIGINS
+    )
+    if opted_in:
+        extra_sources = getattr(server, "extra_env_sources", {}) or {}
+        for key in env:
+            credential_sources[key] = extra_sources.get(key, "unknown")
     if server.env_var:
         from pmcp.manifest.loader import credential_lookup_keys
 
         for lookup_key in credential_lookup_keys(server):
             env_value = env_lookup(lookup_key)
             if env_value:
-                env[server.env_var] = env_value
+                env[server.env_var] = str(env_value)
+                credential_sources[server.env_var] = getattr(
+                    env_value, "source", "unknown"
+                )
                 break
 
-    return ResolvedServerConfig(
+    resolved = ResolvedServerConfig(
         name=server.name,
         source="manifest",
         config=LocalMcpServerConfig(
@@ -1602,7 +1644,73 @@ def _manifest_server_to_config(
             # Preserve the previous None-when-nothing-to-inject shape.
             env=env or None,
         ),
+        credential_sources=credential_sources,
+        resolve_secret_refs=opted_in,
     )
+    # Static reference failures (grammar, source, token file) are known
+    # without calling op, and are typed like an unreadable store
+    # (Consiliency/pmcp#487 plan 3.5).
+    reason = _static_reference_failure(resolved)
+    if reason is not None:
+        raise CredentialUnavailableError(reason)
+    return resolved
+
+
+#: Manifest entries that may opt in to own-env resolution: the operator's
+#: overlay (``~/.pmcp/manifest.yaml``) and an operator-exported
+#: ``$PMCP_MANIFEST_PATH`` (plan 3.2.4).
+_OPERATOR_MANIFEST_ORIGINS = frozenset({"operator_overlay", "env_overlay"})
+
+
+def _opted_in(name: str, config: LocalMcpServerConfig, source: str) -> bool:
+    """Does this configured server opt in to own-env resolution (plan 3.2.4)?
+
+    Only from an operator source (user scope, ``-c``); a project
+    ``.mcp.json`` asking for it is ignored with a warning.
+    """
+    if not getattr(config, "resolve_secret_refs", False):
+        return False
+    if source in ("user", "custom"):
+        return True
+    logger.warning(
+        f"Configured server '{display_safe(name)}': resolve_secret_refs is "
+        "honoured only in your own configs (user scope or -c); ignored here"
+    )
+    return False
+
+
+def _configured_credential_sources(
+    own: LocalMcpServerConfig,
+    merged: LocalMcpServerConfig,
+    merge_sources: Mapping[str, str],
+    source: str,
+    opted_in: bool,
+) -> dict[str, str]:
+    """``credential_sources`` of a configured server (plan 3.2.3).
+
+    Every key a credential lookup filled; for an opted-in server, also every
+    own-env key (from its config file) and every key merged from the
+    manifest's ``extra_env`` (with the overlay that set it).
+    """
+    sources = {k: v for k, v in merge_sources.items() if not k.startswith("extra_env:")}
+    if not opted_in:
+        return sources
+    own_kind = "user_config" if source == "user" else "custom_config"
+    own_env = own.env or {}
+    for key in merged.env or {}:
+        if key in sources:
+            continue
+        if key in own_env:
+            sources[key] = own_kind
+        else:
+            sources[key] = merge_sources.get(f"extra_env:{key}", "unknown")
+    return sources
+
+
+def _static_reference_failure(config: ResolvedServerConfig) -> str | None:
+    from pmcp.secret_refs import static_failure
+
+    return static_failure(config)
 
 
 def manifest_server_to_config(
