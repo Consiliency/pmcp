@@ -1754,19 +1754,6 @@ def resolve_startup_configs(
             # checking only the runtime env_var would skip a namespaced-only
             # credential as MISSING_AUTH.
             lookup_keys = credential_lookup_keys(manifest_server)
-            # Stops at the first typed answer: a predicate that raises
-            # CredentialUnavailableError (an unreadable user store) is
-            # contained to this entry, and the legacy key after it is never
-            # tried (Consiliency/pmcp#487).
-            auth_available = False
-            for key in lookup_keys:
-                try:
-                    if is_auth_available(key):
-                        auth_available = True
-                        break
-                except CredentialUnavailableError as exc:
-                    skip_unavailable(exc.reason, env_var)
-                    return
             # is_auth_available only checks process env / PMCP secret stores
             # BY NAME — it cannot see a concrete credential the user wrote
             # directly into a *configured* (.mcp.json) entry's own env block.
@@ -1778,11 +1765,30 @@ def resolve_startup_configs(
             # checking it here for manifest-sourced entries would silently
             # re-derive the same os.environ read through a second path and
             # defeat a caller's deliberate is_auth_available override.
-            if not auth_available and source == "configured":
+            #
+            # Checked BEFORE any store lookup: the literal is what the child
+            # receives, whatever the store says, so an unreadable user store
+            # must not refuse an entry that never depends on it
+            # (Consiliency/pmcp#489 round 1, ASTRA-1).
+            auth_available = False
+            if source == "configured":
                 own_env = _local_env(config) or {}
                 auth_available = any(
                     is_usable_credential_value(own_env.get(key)) for key in lookup_keys
                 )
+            # Stops at the first typed answer: a predicate that raises
+            # CredentialUnavailableError (an unreadable user store) is
+            # contained to this entry, and the legacy key after it is never
+            # tried (Consiliency/pmcp#487).
+            if not auth_available:
+                for key in lookup_keys:
+                    try:
+                        if is_auth_available(key):
+                            auth_available = True
+                            break
+                    except CredentialUnavailableError as exc:
+                        skip_unavailable(exc.reason, env_var)
+                        return
             if lookup_keys and not auth_available:
                 skipped.append(
                     StartupSkip(

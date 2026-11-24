@@ -1639,7 +1639,11 @@ For service users, `~/.config/pmcp/pmcp.env` is ideal for shared tokens used by 
 A credential lookup reads the current user store, so a key you add, rotate or
 delete there is used the next time pmcp starts the server that needs it
 (`gateway.restart_server`, `gateway.connect_server`, `gateway.refresh`); the
-gateway itself need not restart. A variable in the gateway's own environment
+gateway itself need not restart. Only those calls read the store again: a lazy
+server's first start and the automatic reconnect after a crash reuse the
+credential resolved at the gateway's start or its last `gateway.refresh`, and
+`gateway.connect_server` leaves an already-running server as it is, so run
+`gateway.refresh` or `gateway.restart_server` after a rotation. A variable in the gateway's own environment
 (your shell, systemd `EnvironmentFile=`, a launcher that sources a file) or in
 `~/.env` still wins and stays fixed until the gateway restarts. Deleting one
 store entry is not revocation if a lower layer (the project `.env.pmcp`) or a

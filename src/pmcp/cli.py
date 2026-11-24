@@ -1159,6 +1159,9 @@ def _format_auth_evidence(
         return None
 
     parts = [f"auth={sanitize_auth_diagnostic(auth_state)}"]
+    credential_reason = payload.get("credential_reason")
+    if credential_reason:
+        parts.append(f"reason={sanitize_auth_diagnostic(str(credential_reason))}")
     auth_event = payload.get("auth_event")
     if auth_event:
         parts.append(f"event={sanitize_auth_diagnostic(auth_event)}")
@@ -1485,11 +1488,31 @@ async def run_status(args: argparse.Namespace) -> None:
     allowed_configs = [c for c in configs if policy_manager.is_server_allowed(c.name)]
     env_lookup = build_remote_header_env_lookup(project_root)
     missing_env_vars_by_server: dict[str, list[str]] = {}
+    # A typed credential failure (an unreadable user store) is reported as
+    # credential_unavailable with its reason, and the entry is never probed:
+    # connecting it would spawn it without its credential
+    # (Consiliency/pmcp#487, #489 round 1 CLAUDE-C1).
+    unavailable_reason_by_server: dict[str, str] = {}
     for config in allowed_configs:
+        if config.credential_unavailable is not None:
+            unavailable_reason_by_server[config.name] = config.credential_unavailable
+            continue
         if isinstance(config.config, RemoteMcpServerConfig):
             resolution = resolve_remote_headers(config.config.headers, env_lookup)
-            if resolution.missing_env_vars:
+            if resolution.unavailable_env_vars:
+                first = sorted(resolution.unavailable_env_vars)[0]
+                unavailable_reason_by_server[config.name] = (
+                    resolution.unavailable_env_vars[first]
+                )
+            elif resolution.missing_env_vars:
                 missing_env_vars_by_server[config.name] = resolution.missing_env_vars
+
+    def _auth_state(name: str) -> str:
+        if name in unavailable_reason_by_server:
+            return "credential_unavailable"
+        if missing_env_vars_by_server.get(name):
+            return "missing_auth"
+        return "none"
 
     if not allowed_configs:
         if args.json:
@@ -1504,9 +1527,20 @@ async def run_status(args: argparse.Namespace) -> None:
 
     try:
         if getattr(args, "probe", False):
-            logger.info(f"Connecting to {len(allowed_configs)} servers...")
-            await client_manager.connect_all(allowed_configs)
+            from pmcp.types import ServerStatus
+
+            probe_configs = [
+                c for c in allowed_configs if c.name not in unavailable_reason_by_server
+            ]
+            logger.info(f"Connecting to {len(probe_configs)} servers...")
+            await client_manager.connect_all(probe_configs)
             statuses = client_manager.get_all_server_statuses()
+            reported = {s.name for s in statuses}
+            statuses.extend(
+                ServerStatus(name=name, status=ServerStatusEnum.OFFLINE, tool_count=0)
+                for name in unavailable_reason_by_server
+                if name not in reported
+            )
             tools = client_manager.get_all_tools()
         else:
             # Default: lazy view. `status` is a read-only command, so it must not
@@ -1549,9 +1583,8 @@ async def run_status(args: argparse.Namespace) -> None:
                         if s.last_error
                         else None,
                         "missing_env_vars": missing_env_vars_by_server.get(s.name, []),
-                        "auth_state": "missing_auth"
-                        if missing_env_vars_by_server.get(s.name)
-                        else "none",
+                        "auth_state": _auth_state(s.name),
+                        "credential_reason": unavailable_reason_by_server.get(s.name),
                         "pending_requests": s.pending_request_count,
                         "avg_response_time_ms": s.avg_response_time_ms,
                     }
@@ -1603,9 +1636,10 @@ async def run_status(args: argparse.Namespace) -> None:
                     missing_env_vars = missing_env_vars_by_server.get(s.name, [])
                     auth_detail = _format_auth_evidence(
                         {
-                            "auth_state": "missing_auth"
-                            if missing_env_vars
-                            else "none",
+                            "auth_state": _auth_state(s.name),
+                            "credential_reason": unavailable_reason_by_server.get(
+                                s.name
+                            ),
                             "missing_env_vars": missing_env_vars,
                             "next_step": f"gateway.auth_connect(server_name='{s.name}')"
                             if missing_env_vars

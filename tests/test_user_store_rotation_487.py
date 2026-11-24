@@ -36,10 +36,21 @@ from pmcp.manifest.loader import load_manifest
 from pmcp.policy.policy import PolicyManager
 from pmcp.remote_auth import resolve_remote_headers_for_tenant
 from pmcp.tools.handlers import GatewayTools
+from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+from tests.test_tools import MockClientManager
 
 NAMESPACED = "BRIGHTDATA_API_TOKEN"
 LEGACY = "API_TOKEN"
-KEYS = (NAMESPACED, LEGACY, "BRAVE_API_KEY", "ROT_BASE", "ROT_DERIVED", "ROT_ONLY")
+EXA = "EXA_API_KEY"
+KEYS = (
+    NAMESPACED,
+    LEGACY,
+    EXA,
+    "BRAVE_API_KEY",
+    "ROT_BASE",
+    "ROT_DERIVED",
+    "ROT_ONLY",
+)
 
 
 @dataclass
@@ -559,4 +570,398 @@ def test_doctor_reports_an_unreadable_store(host: Host) -> None:
     assert any(
         status == "fail" and "cannot be read" in message
         for _c, status, message in checks
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Consiliency/pmcp#489 round 1
+# --------------------------------------------------------------------------- #
+
+
+def _live_tools(
+    host: Host, *, config: Path | None = None
+) -> tuple[GatewayTools, MockClientManager]:
+    manager = MockClientManager()
+    tools = GatewayTools(
+        client_manager=manager,  # type: ignore[arg-type]
+        policy_manager=PolicyManager(),
+        project_root=host.root,
+        custom_config_path=config,
+    )
+    return tools, manager
+
+
+def _write_config(host: Host, servers: dict[str, Any]) -> Path:
+    import json
+
+    path = host.home / "pmcp.json"
+    path.write_text(json.dumps({"mcpServers": servers}))
+    return path
+
+
+def _startup_config(host: Host, name: str) -> ResolvedServerConfig:
+    """The config the gateway connected ``name`` with at startup."""
+    server = load_manifest().get_server(name)
+    assert server is not None
+    return manifest_server_to_config(server, host.root)
+
+
+def _no_auto_start(
+    monkeypatch: pytest.MonkeyPatch, tools: GatewayTools, enabled: set[str]
+) -> None:
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_enabled_auto_start", lambda **_: set(enabled)
+    )
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_disabled_auto_start", lambda **_: set()
+    )
+    monkeypatch.setattr(tools, "_load_provisioned_registry", lambda: {})
+
+
+# ASTRA-1: a configured literal credential never depends on the user store.
+
+
+def test_a_configured_literal_credential_starts_with_an_unreadable_store(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmcp.config.loader import (
+        StartupSkipReason,
+        load_configs,
+        resolve_startup_configs,
+    )
+
+    config = _write_config(
+        host,
+        {
+            "brightdata": {
+                "command": "npx",
+                "args": ["-y", "@brightdata/mcp"],
+                "env": {LEGACY: "literal-token"},
+            }
+        },
+    )
+    _start(host)
+    _unreadable(host)
+    configs = load_configs(project_root=host.root, custom_config_path=config)
+    (brightdata,) = [c for c in configs if c.name == "brightdata"]
+    assert brightdata.credential_unavailable is None
+    resolution = resolve_startup_configs(
+        configs,
+        manifest_servers=load_manifest().servers,
+        enabled_auto_start={"brightdata", "exa"},
+        is_auth_available=lambda key: bool(
+            env_store.credential_value(key, root=host.root)
+        ),
+        project_root=host.root,
+    )
+    assert "brightdata" in {c.name for c in resolution.eager_configs}
+    # A server that really depends on the store is still refused, typed.
+    (exa,) = [s for s in resolution.skipped if s.name == "exa"]
+    assert exa.reason == StartupSkipReason.CREDENTIAL_UNAVAILABLE
+    assert exa.credential_reason == "store_unreadable"
+
+    # refresh starts it too, and connect_server accepts it.
+    tools, manager = _live_tools(host, config=config)
+    _no_auto_start(monkeypatch, tools, {"brightdata"})
+    assert asyncio.run(tools.refresh({"reason": "test"})).ok is True
+    assert "brightdata" in {c.name for c in manager.connected_configs}
+    asyncio.run(manager.disconnect_server("brightdata"))
+    connected = asyncio.run(tools.connect_server({"server_name": "brightdata"}))
+    assert connected.ok is True, connected
+
+
+# CLAUDE-C1: pmcp status --probe never starts a credential_unavailable entry.
+
+
+@pytest.mark.parametrize("probe", [True, False])
+def test_status_reports_credential_unavailable_and_never_probes_it(
+    capsys: pytest.CaptureFixture[str], probe: bool
+) -> None:
+    import json
+    from unittest.mock import AsyncMock, patch
+
+    unavailable = ResolvedServerConfig(
+        name="brightdata",
+        source="user",
+        config=LocalMcpServerConfig(command="npx", args=["-y", "@brightdata/mcp"]),
+        credential_unavailable="store_unreadable",
+    )
+    healthy = ResolvedServerConfig(
+        name="healthy",
+        source="user",
+        config=LocalMcpServerConfig(command="healthy-command"),
+    )
+    args = argparse.Namespace(
+        json=True,
+        server=None,
+        pending=False,
+        verbose=False,
+        probe=probe,
+        project=None,
+        config=None,
+        policy=None,
+        log_level="warn",
+    )
+    with (
+        patch(
+            "pmcp.cli._query_running_gateway_status", new=AsyncMock(return_value=None)
+        ),
+        patch("pmcp.config.loader.load_configs", return_value=[unavailable, healthy]),
+        patch(
+            "pmcp.client.manager.ClientManager.connect_all", new=AsyncMock()
+        ) as connect_all,
+        patch("pmcp.client.manager.ClientManager.disconnect_all", new=AsyncMock()),
+    ):
+        asyncio.run(cli.run_status(args))
+    if probe:
+        (probed,) = connect_all.await_args.args
+        assert [c.name for c in probed] == ["healthy"]
+    else:
+        connect_all.assert_not_awaited()
+    servers = {s["name"]: s for s in json.loads(capsys.readouterr().out)["servers"]}
+    assert servers["brightdata"]["auth_state"] == "credential_unavailable"
+    assert servers["brightdata"]["credential_reason"] == "store_unreadable"
+    if not probe:  # a mocked connect_all registers no status for it
+        assert servers["healthy"]["auth_state"] == "none"
+
+
+# GEMINI-G1 / CLAUDE-C2: provision reports credential_unavailable, never spawns.
+
+
+def test_provision_of_the_fleet_brightdata_reports_credential_unavailable(
+    host: Host,
+) -> None:
+    config = _write_config(
+        host, {"brightdata": {"command": "npx", "args": ["-y", "@brightdata/mcp"]}}
+    )
+    _start(host)
+    _unreadable(host)
+    tools, manager = _live_tools(host, config=config)
+    result = asyncio.run(tools.provision({"server_name": "brightdata"}))
+    assert result.ok is False
+    assert result.auth_state == "credential_unavailable"
+    assert result.credential_reason == "store_unreadable"
+    assert manager.ensure_connected_calls == []
+
+
+def test_provision_never_starts_a_lazily_registered_unavailable_entry(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured entry with a relaxed credential, registered lazily before
+    the store became unreadable: provision must not reach ensure_connected."""
+    _start(host)
+    tools, manager = _live_tools(host)
+    manager.add_lazy_server("relaxed")
+    entry = ResolvedServerConfig(
+        name="relaxed",
+        source="user",
+        config=LocalMcpServerConfig(command="relaxed-command"),
+        credential_unavailable="store_unreadable",
+    )
+    monkeypatch.setattr(tools, "_load_configured_servers", lambda: {"relaxed": entry})
+    result = asyncio.run(tools.provision({"server_name": "relaxed"}))
+    assert result.auth_state == "credential_unavailable"
+    assert manager.ensure_connected_calls == []
+
+
+def test_a_remote_configured_duplicate_reports_credential_unavailable(
+    host: Host,
+) -> None:
+    """No manifest defaults are merged into a remote entry, so only the gate's
+    own lookup sees the unreadable store: it must not answer missing_auth."""
+    config = _write_config(host, {"brightdata": {"url": "https://example.invalid/mcp"}})
+    _start(host)
+    _unreadable(host)
+    tools, manager = _live_tools(host, config=config)
+    provisioned = asyncio.run(tools.provision({"server_name": "brightdata"}))
+    assert provisioned.auth_state == "credential_unavailable"
+    assert provisioned.credential_reason == "store_unreadable"
+    connected = asyncio.run(tools.connect_server({"server_name": "brightdata"}))
+    assert connected.auth_state == "credential_unavailable"
+    assert connected.credential_reason == "store_unreadable"
+    assert manager.ensure_connected_calls == []
+    assert manager.connected_configs == []
+
+
+def test_a_configured_remote_header_with_an_unreadable_store(host: Host) -> None:
+    config = _write_config(
+        host,
+        {
+            "remote": {
+                "url": "https://example.invalid/mcp",
+                "headers": {"Authorization": "Bearer ${ROT_ONLY}"},
+            }
+        },
+    )
+    _start(host)
+    _unreadable(host)
+    tools, manager = _live_tools(host, config=config)
+    result = asyncio.run(tools.provision({"server_name": "remote"}))
+    assert result.auth_state == "credential_unavailable"
+    assert result.credential_reason == "store_unreadable"
+    assert manager.ensure_connected_calls == []
+
+
+# GROK-B1: a key deleted from every layer stops the running instance.
+
+_DELETED_CASES = [
+    pytest.param("brightdata", NAMESPACED, False, id="namespaced"),
+    pytest.param("exa", EXA, False, id="same-name"),
+    pytest.param("brightdata", NAMESPACED, True, id="configured-fleet"),
+]
+
+
+def _online_then_deleted(
+    host: Host, name: str, key: str, configured: bool
+) -> tuple[GatewayTools, MockClientManager]:
+    config = (
+        _write_config(
+            host, {name: {"command": "npx", "args": ["-y", "@brightdata/mcp"]}}
+        )
+        if configured
+        else None
+    )
+    host.write_store(f"{key}=before-deletion\n")
+    _start(host)
+    tools, manager = _live_tools(host, config=config)
+    manager.add_connected_server(_startup_config(host, name))
+    manager.register_lazy_configs([_startup_config(host, name)])
+    host.write_store("ROT_ONLY=x\n")  # the key is gone from every layer
+    return tools, manager
+
+
+@pytest.mark.parametrize(("name", "key", "configured"), _DELETED_CASES)
+@pytest.mark.parametrize("action", ["restart", "connect"])
+def test_a_deleted_key_stops_the_running_instance(
+    host: Host, name: str, key: str, configured: bool, action: str
+) -> None:
+    tools, manager = _online_then_deleted(host, name, key, configured)
+    handler = tools.restart_server if action == "restart" else tools.connect_server
+    result = asyncio.run(handler({"server_name": name}))
+    assert result.ok is False
+    assert result.auth_state == "missing_auth"
+    assert not manager.is_server_online(name)
+    assert result.new_status != "online"
+    assert f"disconnect_server:{name}:False" in manager.events
+    assert not any(
+        e.startswith(("connect_server:", "restart_server:")) for e in manager.events
+    )
+    # Not respawned on the next tool call with the value it was started with.
+    assert name not in manager.get_lazy_server_names()
+
+
+@pytest.mark.parametrize(("name", "key", "configured"), _DELETED_CASES)
+def test_disconnect_is_never_refused_for_a_deleted_key(
+    host: Host, name: str, key: str, configured: bool
+) -> None:
+    tools, manager = _online_then_deleted(host, name, key, configured)
+    result = asyncio.run(tools.disconnect_server({"server_name": name}))
+    assert result.ok is True, result
+    assert not manager.is_server_online(name)
+
+
+def test_an_unreadable_store_still_leaves_the_running_instance_up(host: Host) -> None:
+    host.write_store(f"{EXA}=running\n")
+    _start(host)
+    tools, manager = _live_tools(host)
+    manager.add_connected_server(_startup_config(host, "exa"))
+    _unreadable(host)
+    for handler in (tools.restart_server, tools.connect_server):
+        result = asyncio.run(handler({"server_name": "exa"}))
+        assert result.auth_state == "credential_unavailable"
+        assert manager.is_server_online("exa")
+    assert not any(e.startswith("disconnect_server:") for e in manager.events)
+
+
+# GROK-B2 / GEMINI-G2: refresh applies a deletion or rotation of a same-name
+# store key to a lazy (not auto-started) server.
+
+
+def _lazy_exa_online(
+    host: Host, monkeypatch: pytest.MonkeyPatch, startup_store: str
+) -> tuple[GatewayTools, MockClientManager]:
+    host.write_store(startup_store)
+    _start(host)
+    tools, manager = _live_tools(host)
+    _no_auto_start(monkeypatch, tools, set())
+    manager.add_connected_server(_startup_config(host, "exa"))
+    return tools, manager
+
+
+def test_refresh_stops_a_lazy_server_whose_same_name_key_was_deleted(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tools, manager = _lazy_exa_online(host, monkeypatch, f"{EXA}=at-start\n")
+    assert os.environ[EXA] == "at-start"  # the stale startup copy
+    host.write_store("ROT_ONLY=x\n")
+    assert asyncio.run(tools.refresh({"reason": "test"})).ok is True
+    assert "disconnect_server:exa:True" in manager.events
+    assert not manager.is_server_online("exa")
+    assert "exa" not in {c.name for c in manager.connected_configs}
+
+
+def test_refresh_restarts_a_lazy_server_whose_same_name_key_was_rotated(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tools, manager = _lazy_exa_online(host, monkeypatch, f"{EXA}=at-start\n")
+    host.write_store(f"{EXA}=rotated\n")
+    assert asyncio.run(tools.refresh({"reason": "test"})).ok is True
+    assert "disconnect_server:exa:True" in manager.events
+    (lazy,) = [c for c in manager.lazy_configs if c.name == "exa"]
+    assert (lazy.config.env or {})[EXA] == "rotated"  # its next start
+
+
+def test_refresh_restarts_a_server_whose_key_came_back_with_its_startup_value(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Started while the key was deleted, then restored to the value the
+    gateway started with: the running child has no credential."""
+    host.write_store(f"{EXA}=at-start\n")
+    _start(host)
+    tools, manager = _live_tools(host)
+    _no_auto_start(monkeypatch, tools, set())
+    host.write_store("ROT_ONLY=x\n")
+    manager.add_connected_server(_startup_config(host, "exa"))  # no EXA_API_KEY
+    host.write_store(f"{EXA}=at-start\n")
+    assert asyncio.run(tools.refresh({"reason": "test"})).ok is True
+    assert "disconnect_server:exa:True" in manager.events
+
+
+def test_refresh_keeps_an_unchanged_lazy_server(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The #79 guard: an unchanged store key never tears the server down."""
+    tools, manager = _lazy_exa_online(host, monkeypatch, f"{EXA}=at-start\n")
+    assert asyncio.run(tools.refresh({"reason": "test"})).ok is True
+    assert manager.is_server_online("exa")
+    assert not any(e.startswith("disconnect_server:") for e in manager.events)
+
+
+# ASTRA-2 / GROK-N2: doctor's layer checks.
+
+
+def test_doctor_never_reports_an_unreadable_store_as_holding_a_key(host: Host) -> None:
+    (host.root / ".env.pmcp").write_text(f"{NAMESPACED}=from-project\n")
+    _start(host)
+    _unreadable(host)
+    messages = _messages(host)
+    assert any("cannot be read" in m for m in messages)
+    assert not any("both set" in m for m in messages), messages
+    assert not any("more than one place" in m for m in messages), messages
+    assert not any("user store (unreadable)" in m for m in messages), messages
+
+
+def test_doctor_names_a_tenant_store_layer(host: Host) -> None:
+    tenant = host.root / ".pmcp" / "tenants" / "t1" / "pmcp.env"
+    tenant.parent.mkdir(parents=True)
+    tenant.write_text(f"{NAMESPACED}=from-tenant\n")
+    host.write_store(f"{NAMESPACED}=from-store\n")
+    _start(host)
+    assert env_store.credential_layers(NAMESPACED, root=host.root) == [
+        "user store",
+        "tenant store",
+    ]
+    assert any(
+        f"{NAMESPACED} is set in more than one place (user store, tenant store)" in m
+        for m in _messages(host)
     )

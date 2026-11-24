@@ -206,7 +206,8 @@ def collect_credential_diagnostics(
                 "The user store ~/.config/pmcp/pmcp.env exists but cannot be read: "
                 "every server whose credential lookup reaches it reports "
                 "credential_unavailable (store_unreadable) and is not started. "
-                "Make it a readable regular file (mode 0600).",
+                "Its contents are unknown, so the duplicate-credential checks "
+                "below cannot see it. Make it a readable regular file (mode 0600).",
             )
         )
 

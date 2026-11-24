@@ -1488,6 +1488,16 @@ server (`gateway.restart_server`, `gateway.connect_server`, `gateway.refresh`),
 without restarting the gateway. A deleted key falls back exactly as after a
 restart: to the tenant store, the project `.env` and `.env.pmcp`, then the
 server's legacy key (for Bright Data, `API_TOKEN` after `BRIGHTDATA_API_TOKEN`).
+If the key is gone from every layer, `gateway.restart_server` and
+`gateway.connect_server` stop a running instance of that server and report
+`missing_auth`, and `gateway.refresh` stops it too.
+
+Only those three calls read the store again. In this release a lazy server's
+first start (its first tool call) and the automatic reconnect after a crash
+reuse the credential resolved at the gateway's start or its last
+`gateway.refresh`, and `gateway.connect_server` leaves an already-running
+server as it is. After rotating or deleting a key, run `gateway.refresh` or
+`gateway.restart_server` for the servers that use it.
 
 **Deleting one store entry is not revocation** when a lower layer or a legacy
 key holds the same credential: pmcp then uses that one. `pmcp doctor` flags a

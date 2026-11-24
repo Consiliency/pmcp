@@ -1212,9 +1212,16 @@ def credential_layers(key: str, *, root: Path | None = None) -> list[str]:
     """Every layer that HOLDS ``key``, for ``pmcp doctor``: names only, never values.
 
     ``environment (external)``, ``environment (home_dotenv)``,
-    ``environment (auth_connect_project)``, ``user store``, ``user store
-    (unreadable)``, ``project files``. The first is the one a lookup answers
-    from; the rest are what deleting that one would expose.
+    ``environment (auth_connect_project)``, ``user store``, ``tenant store``,
+    ``project files``. The first is the one a lookup answers from; the rest
+    are what deleting that one would expose.
+
+    An unreadable user store is NOT a layer: whether it holds ``key`` is
+    unknown, so it is never reported as confirmed membership (a duplicate or
+    a fallback). ``pmcp doctor`` reports the unreadable store on its own
+    (Consiliency/pmcp#489 round 1, ASTRA-2). A tenant store is a layer when
+    any tenant of the project holds ``key`` (GROK-N2): a remote header
+    lookup for that tenant answers from it after the user store.
     """
     ensure_startup_load()
     layers: list[str] = []
@@ -1225,12 +1232,30 @@ def credential_layers(key: str, *, root: Path | None = None) -> list[str]:
         if _current_user_store_value(key) is not _ABSENT:
             layers.append("user store")
     except CredentialUnavailableError:
-        layers.append("user store (unreadable)")
+        pass
     if repository_may_supply(key):
+        if any(
+            key in repository_values("tenant", project=root, tenant_id=tenant_id)
+            for tenant_id in _tenant_ids(root)
+        ):
+            layers.append("tenant store")
         entry = _root_entry(root)
         if entry is not None and key in entry.values:
             layers.append("project files")
     return layers
+
+
+def _tenant_ids(root: Path | None) -> list[str]:
+    """The valid tenant ids with a directory under ``<root>/.pmcp/tenants``: names only."""
+    tenants = resolve_project_root(root) / ".pmcp" / "tenants"
+    try:
+        with os.scandir(tenants) as entries:
+            names = sorted(entry.name for entry in entries)
+    except OSError:
+        return []
+    return [
+        name for name in names if TENANT_ID_PATTERN.fullmatch(name) and name.strip(".")
+    ]
 
 
 #: Has this process run the startup load (``cli.load_startup_env``)? Set by it;
