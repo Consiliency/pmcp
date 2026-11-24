@@ -295,6 +295,18 @@ class ServerConfig:
     # of every `install` argv. ``None`` means unpinned -- including a pin that
     # was refused, so "version is set" always means "the argv is pinned".
     version: str | None = None
+    # Opt in to pmcp resolving this entry's own ``op://`` ``extra_env`` values
+    # (Consiliency/pmcp#487 plan 3.2.4). Honoured only for an entry from an
+    # operator source (``entry_origin`` operator_overlay/env_overlay).
+    resolve_secret_refs: bool = False
+    # Where this entry came from (plan 3.2.3): shipped_manifest,
+    # operator_overlay (~/.pmcp/manifest.yaml), project_overlay, env_overlay
+    # (an operator-exported $PMCP_MANIFEST_PATH), or unknown (an explicit
+    # manifest path). Set by the manifest build, never by the file.
+    entry_origin: str = "unknown"
+    # Per extra_env key, the source that set it (same kinds): an overlay's
+    # server_env patch changes the source of the keys it patches.
+    extra_env_sources: dict[str, str] = field(default_factory=dict)
 
 
 def credential_storage_key(server: Any) -> str | None:
@@ -853,6 +865,7 @@ _SERVER_SCHEMA_KEYS = frozenset(
         "source",
         "replacement",
         "version",
+        "resolve_secret_refs",
     }
 )
 _CLI_SCHEMA_KEYS = frozenset(
@@ -1604,6 +1617,7 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         source=data.get("source"),
         replacement=data.get("replacement"),
         version=_parse_version_pin(name, data.get("version"), "version"),
+        resolve_secret_refs=data.get("resolve_secret_refs", False) is True,
     )
 
 
@@ -2085,6 +2099,25 @@ def load_manifest(
         return manifest
 
 
+#: Overlay label -> source kind (Consiliency/pmcp#487 plan 3.2.2). The env
+#: overlay is only ever applied when the operator exported
+#: ``$PMCP_MANIFEST_PATH`` (``_overlay_manifest_paths``).
+_OVERLAY_ORIGINS = {
+    "user": "operator_overlay",
+    "project": "project_overlay",
+    "env": "env_overlay",
+}
+
+
+def _with_origin(entry: ServerConfig, origin: str) -> ServerConfig:
+    """``entry`` stamped with where it came from, every extra_env key too."""
+    return replace(
+        entry,
+        entry_origin=origin,
+        extra_env_sources={key: origin for key in entry.extra_env},
+    )
+
+
 def _build_manifest(
     manifest_path: Path,
     base: bytes,
@@ -2108,8 +2141,11 @@ def _build_manifest(
 
     # Parse servers
     servers: dict[str, ServerConfig] = {}
+    base_origin = "shipped_manifest" if trusted else "unknown"
     for name, server_data in data.get("servers", {}).items():
-        servers[name] = _parse_server_config(name, server_data)
+        servers[name] = _with_origin(
+            _parse_server_config(name, server_data), base_origin
+        )
 
     # Weights come from the base alone, before any overlay
     # (Consiliency/pmcp#342): an overlay may add or replace servers, but it
@@ -2167,7 +2203,13 @@ def _build_manifest(
                         f"Manifest overlay ({label}) from {overlay_path} overrides "
                         f"existing {_server_label(name)}"
                     )
-            servers.update(overlay_servers)
+            origin = _OVERLAY_ORIGINS.get(label, "unknown")
+            servers.update(
+                {
+                    name: _with_origin(entry, origin)
+                    for name, entry in overlay_servers.items()
+                }
+            )
             cli_alternatives.update(overlay_clis)
             overlay_cli_names.update(overlay_clis)
 
@@ -2184,7 +2226,12 @@ def _build_manifest(
                     )
                     continue
                 servers[name] = replace(
-                    existing, extra_env={**existing.extra_env, **patch}
+                    existing,
+                    extra_env={**existing.extra_env, **patch},
+                    extra_env_sources={
+                        **existing.extra_env_sources,
+                        **{key: origin for key in patch},
+                    },
                 )
 
             # Same rules as server_env: after this source's replaces, and never

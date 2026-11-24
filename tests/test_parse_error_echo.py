@@ -122,6 +122,10 @@ _EXEMPT: dict[str, tuple[str, str]] = {
     "manifest/version_checker.py::get_cargo_version": ("response-decode", "aiohttp"),
     "manifest/version_checker.py::get_docker_version": ("response-decode", "aiohttp"),
     "cli.py::_probe_http_health": ("response-decode", "httpx"),
+    # `pmcp secrets set NAME op://...` asks the serving gateway's /health for
+    # the secret_refs capability (Consiliency/pmcp#487 plan 3.10); any
+    # failure is "no report", never echoed.
+    "cli_commands/secrets.py::fetch_gateway_health": ("response-decode", "httpx"),
 }
 
 _DOTENV = frozenset({"dotenv_values", "load_dotenv"})
@@ -1752,6 +1756,12 @@ async def _drive_http_probe(port: int) -> Any:
     return await _probe_http_health(10)
 
 
+async def _drive_secrets_health(port: int) -> Any:
+    from pmcp.cli_commands.secrets import fetch_gateway_health
+
+    return await fetch_gateway_health(10)
+
+
 async def _drive_remote(transport: str, port: int) -> Any:
     from pmcp.client.manager import ClientManager
     from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
@@ -1788,6 +1798,7 @@ _HTTP_SITE_DRIVERS: dict[str, list[Any]] = {
     "feedback_egress.py::submit_feedback_issue": [_drive_feedback_submit],
     "cli.py::_probe_sse_endpoint": [_drive_sse_probe],
     "cli.py::_probe_http_health": [_drive_http_probe],
+    "cli_commands/secrets.py::fetch_gateway_health": [_drive_secrets_health],
     "client/manager.py::_connect_streamable_http": [
         functools.partial(_drive_remote, "http")
     ],

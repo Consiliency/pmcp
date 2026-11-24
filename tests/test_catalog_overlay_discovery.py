@@ -3025,6 +3025,13 @@ DIAGNOSTIC_SITES_OUTSIDE_D9 = {
     ("parsing.py", "load_yaml"): _PARSE_SOURCE,
     ("parsing.py", "load_json"): _PARSE_SOURCE,
     ("parsing.py", "parse_timestamp"): _PARSE_SOURCE,
+    # Consiliency/pmcp#487 P2: a static secret-reference failure raises with a
+    # reason constant only (CredentialUnavailableError maps anything outside
+    # credential_state.REASONS to output_invalid), never a config field's text.
+    ("config/loader.py", "_manifest_server_to_config"): (
+        "raises CredentialUnavailableError with a credential_state reason constant"
+    ),
+    ("manifest/installer.py", "_install_spawn_config"): _PROVISION,
 }
 
 

@@ -1144,7 +1144,11 @@ def exception_text(error: BaseException) -> str:
     # Any other exception's own text, with every character a terminal acts
     # on escaped (Consiliency/pmcp#388 round 2): it reaches CLI lines, logs
     # and responses, and may carry text pmcp read from a file or a peer.
-    return display_safe(str(error), keep=LOG_LAYOUT)
+    # Resolved secrets and the service-account token are redacted exactly
+    # first (Consiliency/pmcp#487 plan 3.7).
+    from pmcp.secret_registry import redact_registered
+
+    return display_safe(redact_registered(str(error)), keep=LOG_LAYOUT)
 
 
 def _chained_value_bearing(error: BaseException) -> BaseException | None:
@@ -1914,11 +1918,16 @@ def _install_display_escaping() -> None:
     (:func:`pmcp.display.display_safe`). A record's text is pmcp's, a
     library's, or a value read from a file or a peer; whichever it is, it
     cannot rewrite the operator's terminal. Idempotent."""
+    from pmcp.secret_registry import redact_registered
+
     get_message = logging.LogRecord.getMessage
     if not getattr(get_message, "pmcp_display_escaped", False):
 
         def escaped_message(self: logging.LogRecord) -> str:
-            return display_safe(get_message(self), keep=LOG_LAYOUT)
+            # Resolved secrets and the service-account token are redacted
+            # exactly from the FULLY formatted message (Consiliency/pmcp#487
+            # plan 3.7), whatever logger or path produced the record.
+            return display_safe(redact_registered(get_message(self)), keep=LOG_LAYOUT)
 
         escaped_message.pmcp_display_escaped = True  # type: ignore[attr-defined]
         escaped_message.original = get_message  # type: ignore[attr-defined]
@@ -1927,11 +1936,25 @@ def _install_display_escaping() -> None:
     if not getattr(format_exception, "pmcp_display_escaped", False):
 
         def escaped_exception(self: logging.Formatter, ei: Any) -> str:
-            return display_safe(format_exception(self, ei), keep=LOG_LAYOUT)
+            return display_safe(
+                redact_registered(format_exception(self, ei)), keep=LOG_LAYOUT
+            )
 
         escaped_exception.pmcp_display_escaped = True  # type: ignore[attr-defined]
         escaped_exception.original = format_exception  # type: ignore[attr-defined]
         logging.Formatter.formatException = escaped_exception  # type: ignore[method-assign]
+    # The formatter's whole output too -- message, a precomputed
+    # ``exc_text`` and ``stack_info`` -- so nothing a formatter assembles
+    # carries a registered value (plan 3.7).
+    formatter_format = logging.Formatter.format
+    if not getattr(formatter_format, "pmcp_secret_redacted", False):
+
+        def redacted_format(self: logging.Formatter, record: logging.LogRecord) -> str:
+            return redact_registered(formatter_format(self, record))
+
+        redacted_format.pmcp_secret_redacted = True  # type: ignore[attr-defined]
+        redacted_format.original = formatter_format  # type: ignore[attr-defined]
+        logging.Formatter.format = redacted_format  # type: ignore[method-assign]
 
 
 def _install_filter_scrubbing() -> None:

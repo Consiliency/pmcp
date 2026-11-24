@@ -184,6 +184,27 @@ async def _update_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     await tools._run_update_probe_command([sys.executable, "--help"], env=None)
 
 
+async def _op_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The 1Password ``op`` child (Consiliency/pmcp#487 plan 3.4): its env is
+    its own builder's (``op_subprocess_env``). Only the token file, the
+    executable and the state directory are stood in for."""
+    import tempfile
+
+    from pmcp import secret_refs
+
+    state = tempfile.mkdtemp()
+    monkeypatch.setattr(
+        secret_refs,
+        "read_service_account_token",
+        lambda: secret_refs.TokenRead(
+            token="ops_" + "x" * 20, source="credstore", digest="d"
+        ),
+    )
+    monkeypatch.setattr(secret_refs, "trusted_op_executable", lambda: sys.executable)
+    monkeypatch.setattr(secret_refs, "op_state_dir", lambda: Path(state))
+    await secret_refs.run_op_read("op://v/i/f", 5.0)
+
+
 #: (module, function) -> how to reach that spawn through its real function.
 DRIVERS: dict[tuple[str, str], Callable[[pytest.MonkeyPatch], Awaitable[None]]] = {
     # The CLI's service checks, through the owned probe runner (round 8).
@@ -199,6 +220,7 @@ DRIVERS: dict[tuple[str, str], Callable[[pytest.MonkeyPatch], Awaitable[None]]] 
     ("pmcp.manifest.npm_resolver", "_spawn"): _npm_spawn,
     ("pmcp.manifest.refresher", "refresh_server"): _refresh,
     ("pmcp.tools.handlers", "_run_update_probe_command"): _update_probe,
+    ("pmcp.secret_refs", "run_op_read"): _op_read,
 }
 
 SITES = sorted(
@@ -307,6 +329,13 @@ def test_no_repository_file_removes_an_operator_value_from_a_spawn(
         from mcp.client.stdio import get_default_environment
 
         expected &= set(get_default_environment())
+    if site == ("pmcp.secret_refs", "run_op_read"):
+        # op's environment is an allowlist of its own (plan 3.4): a fixed
+        # PATH, HOME, the token, OP_CACHE, and the operator's proxy/CA
+        # variables. Only those are expected to survive.
+        from pmcp.secret_refs import _OP_PASSTHROUGH
+
+        expected &= set(_OP_PASSTHROUGH)
     lost = {k for k in expected if env.get(k) != OPERATOR}
     assert lost == set(), (
         f"{site} lost the operator's own {sorted(lost)}: a repository file "

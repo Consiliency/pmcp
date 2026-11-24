@@ -1082,9 +1082,15 @@ def test_no_redacting_log_hook_in_the_source() -> None:
     # test above shows every auth message passes through it intact. Its
     # `logging.Filterer.filter` wrap (round 1 N-2 of Consiliency/pmcp#388)
     # scrubs again, the same way, after a filter passes a record.
+    # Consiliency/pmcp#487 plan 3.7: the root-logger filter of
+    # `secret_registry` rewrites only a record whose formatted message holds
+    # a REGISTERED value (the 1Password token or a resolved secret, exact
+    # match); an auth message never is one, so every one passes intact.
     assert hits == [
         "argument_errors.py: logging.Filter",
         "argument_errors.py: setLogRecordFactory(",
+        "secret_registry.py: addFilter(",
+        "secret_registry.py: logging.Filter",
     ]
 
 

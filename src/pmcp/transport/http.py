@@ -48,6 +48,7 @@ from pmcp.auth import (
 )
 from pmcp.argument_errors import exception_text
 from pmcp.parsing import load_json
+from pmcp.secret_refs import apply_health_capability
 from pmcp.types import GatewayDiagnosticsInfo
 from pmcp.waits import bounded_wait
 
@@ -655,12 +656,18 @@ def create_http_app(
 
     async def handle_health(request: Request) -> Response:
         """Unauthenticated health check — safe for load-balancers and container probes."""
+        # The secret_refs capability is evaluated per request
+        # (Consiliency/pmcp#487 plan 3.10); names are listed only while HTTP
+        # auth is off -- this endpoint is unauthenticated.
+        current = apply_health_capability(
+            diagnostics, include_names=effective_auth_mode == "none"
+        )
         return JSONResponse(
             {
                 "ok": True,
                 "version": __version__,
                 "transport": "http",
-                "gateway_diagnostics": diagnostics.model_dump(exclude_none=True),
+                "gateway_diagnostics": current.model_dump(exclude_none=True),
             }
         )
 

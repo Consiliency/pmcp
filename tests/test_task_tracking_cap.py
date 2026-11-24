@@ -768,7 +768,9 @@ async def test_restart_survives_a_record_evicted_mid_teardown(
     config = manager._clients["tasks"].config
     connected: list[str] = []
 
-    async def connect(cfg: Any) -> list[str]:
+    async def connect(cfg: Any, *, prepared: Any = None) -> list[str]:
+        # A restart always hands its resolution to the connect
+        # (Consiliency/pmcp#499 r2 A4).
         connected.append(cfg.name)
         return []
 

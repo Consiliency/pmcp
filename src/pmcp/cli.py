@@ -26,6 +26,7 @@ from pmcp.atomic_write import atomic_write, is_absent
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import (
     collect_credential_diagnostics,
+    collect_token_diagnostics,
     collect_remote_header_diagnostics,
 )
 from pmcp.cli_commands.install import (
@@ -2365,6 +2366,9 @@ async def run_doctor(args: argparse.Namespace) -> None:
             )
         )
 
+    # The 1Password service-account token (Consiliency/pmcp#487 plan 3.1).
+    checks.extend(collect_token_diagnostics())
+
     drift = detect_install_drift()
     if drift.has_drift:
         checks.append(
@@ -2574,6 +2578,7 @@ async def run_server(args: argparse.Namespace) -> None:
     elif not args.auth_token and os.environ.get("PMCP_AUTH_TOKEN"):
         args.auth_token = os.environ["PMCP_AUTH_TOKEN"]
         auth_token_from_cli = False
+    _refuse_reference_auth_token(args)
 
     # Resolve tunables with a clear precedence: an explicitly-passed CLI flag
     # (default=None sentinel) wins, then the environment variable, then the
@@ -3338,6 +3343,13 @@ def load_startup_env(
     so none can set ``HOME``, a proxy, ``LD_PRELOAD`` or any other variable pmcp,
     its libraries or its children read (Consiliency/pmcp#372 rounds 1-3).
     """
+    # Before ANY file is read (Consiliency/pmcp#487 plan 3.1): capture
+    # CREDENTIALS_DIRECTORY (systemd's credential copy) once, then drop it and
+    # the other 1Password control names from this process's environment, so
+    # no child inherits them and no file can set them afterwards.
+    from pmcp.secret_refs import capture_startup_environment
+
+    capture_startup_environment()
     pin_user_store_path()
     mark_startup_loaded()
     # Before any file is read: every name already here is the operator's
@@ -3370,6 +3382,79 @@ def load_startup_env(
     load_store("user")
     _load_project_store_at_startup(served / ".env.pmcp")
     record_pmcp_introduced_keys(set(os.environ) - before)
+    _refuse_reference_shaped_pmcp_variables()
+
+
+#: Set by the startup load when ``PMCP_AUTH_TOKEN`` was a reference (it is
+#: then removed from the environment): the HTTP gateway refuses to start.
+_AUTH_TOKEN_WAS_REFERENCE = False
+
+
+def _refuse_reference_shaped_pmcp_variables() -> None:
+    """pmcp's own variables are never secret references (plan 3.2.5).
+
+    A reference-shaped value of a variable pmcp reads itself
+    (``is_pmcp_environment_name``) -- exported, or one a file would have set
+    -- is removed from this process's environment with a value-free line on
+    stderr. ``PMCP_AUTH_TOKEN`` is checked again when the HTTP gateway
+    starts, which then refuses to start (:func:`_refuse_reference_auth_token`).
+    """
+    from pmcp.env_store import is_pmcp_environment_name, skipped_references
+    from pmcp.secret_refs import is_reference_shaped
+
+    global _AUTH_TOKEN_WAS_REFERENCE
+    for name in sorted(os.environ):
+        if is_pmcp_environment_name(name) and is_reference_shaped(os.environ[name]):
+            if name.upper() == "PMCP_AUTH_TOKEN":
+                # Remembered for the HTTP gateway's refusal to start, and
+                # removed for every transport: no child inherits the
+                # reference string (#499 r1 G2).
+                _AUTH_TOKEN_WAS_REFERENCE = True
+            os.environ.pop(name, None)
+            print(
+                f"pmcp: refusing {operator_safe(name)}: pmcp's own variables are "
+                "never secret references (op://...)",
+                file=sys.stderr,
+            )
+    for name in sorted(skipped_references()):
+        if is_pmcp_environment_name(name):
+            print(
+                f"pmcp: refusing {operator_safe(name)} from a file: pmcp's own "
+                "variables are never secret references (op://...)",
+                file=sys.stderr,
+            )
+
+
+def _refuse_reference_auth_token(args: argparse.Namespace) -> None:
+    """Exit non-zero, before binding, when the HTTP gateway's token is a reference.
+
+    The token may come from ``--auth-token``, ``--auth-token-file`` or
+    ``PMCP_AUTH_TOKEN``; a store or ``~/.env`` entry that held a reference was
+    skipped at load, which would otherwise start the gateway WITHOUT the token
+    the operator meant to set (Consiliency/pmcp#487 plan 3.2.5).
+    """
+    from pmcp.env_store import skipped_references
+    from pmcp.secret_refs import is_reference_shaped
+
+    if getattr(args, "transport", None) != "http":
+        return
+    token = getattr(args, "auth_token", None)
+    if (
+        (token and is_reference_shaped(token))
+        or (_AUTH_TOKEN_WAS_REFERENCE and not token)
+        or (
+            "PMCP_AUTH_TOKEN" in skipped_references()
+            and "PMCP_AUTH_TOKEN" not in os.environ
+            and not token
+        )
+    ):
+        print(
+            "error: PMCP_AUTH_TOKEN (or --auth-token/--auth-token-file) is a "
+            "secret reference (op://...); pmcp's own token is never resolved. "
+            "Refusing to start.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def _load_project_store_at_startup(path: Path) -> None:
@@ -3449,6 +3534,11 @@ def main() -> None:
     # Every line pmcp writes to stderr is for a person or a log file, never
     # a protocol: escaped from the first line on (Consiliency/pmcp#388 round 3).
     restore = _install_display_streams(stdout=False)
+    # Exact-value redaction of resolved secrets on every log record
+    # (Consiliency/pmcp#487 plan 3.7), before anything is logged.
+    from pmcp.secret_registry import install_log_redaction
+
+    install_log_redaction()
     try:
         # Load .env from the current directory or project root, plus the PMCP
         # credential stores -- recording which keys the plain .env introduced

@@ -44,6 +44,11 @@ from pmcp.argument_errors import (
     safe_exc_info,
 )
 from pmcp.env_store import bind_project_root, credential_value
+from pmcp.secret_registry import (
+    install_log_redaction,
+    redact_registered,
+    redact_registered_in,
+)
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
 from pmcp.config.loader import (
@@ -210,6 +215,9 @@ class GatewayServer:
         required_scopes: list[str] | None = None,
         allowed_origins: list[str] | None = None,
     ) -> None:
+        # Exact-value redaction of resolved secrets on every log record
+        # (Consiliency/pmcp#487 plan 3.7); idempotent.
+        install_log_redaction()
         # Idempotent; again here in case a record factory was replaced since
         # import (Consiliency/pmcp#297).
         install_log_scrubber()
@@ -550,6 +558,11 @@ class GatewayServer:
                 # Convert Pydantic model to dict if needed
                 if hasattr(result, "model_dump"):
                     result = result.model_dump()
+                # Safety net (Consiliency/pmcp#487 plan 3.7, #499 r1 A1): every
+                # gateway tool response is exact-value redacted of resolved
+                # secrets, keys and values recursively, before it is audited
+                # or serialized -- whatever path built it.
+                result = redact_registered_in(result)
 
                 terminal_status = "success"
                 if isinstance(result, dict) and result.get("ok") is False:
@@ -614,7 +627,9 @@ class GatewayServer:
                     described = exception_text(e)
                     logger.error("Tool execution error: unknown gateway tool")
                 else:
-                    described = exception_text(e)
+                    # Exact-value redaction before the log line, the audit and
+                    # the cut below (#499 r2 R2-2).
+                    described = redact_registered(exception_text(e))
                     logger.error(f"Tool execution error: {described}")
                 try:
                     failure_status = (
@@ -660,7 +675,8 @@ class GatewayServer:
                         text=json.dumps(
                             {
                                 "error": True,
-                                "message": described[:400],
+                                # Redacted BEFORE the truncation (plan 3.7).
+                                "message": redact_registered(described)[:400],
                             }
                         ),
                     )
@@ -768,6 +784,9 @@ class GatewayServer:
                 raise ValueError(f"Resource blocked by policy: {uri_str}")
 
             result = await self._client_manager.read_resource(resource_info.resource_id)
+            # Exact-value redaction of resolved secrets (Consiliency/pmcp#487
+            # plan 3.7), unconditional.
+            result = redact_registered_in(result)
             contents = result.get("contents", [])
 
             # Convert to TextResourceContents
@@ -838,6 +857,7 @@ class GatewayServer:
                 raise ValueError(f"Prompt blocked by policy: {name}")
 
             result = await self._client_manager.get_prompt(name, arguments)
+            result = redact_registered_in(result)
 
             # Convert result to GetPromptResult
             messages = result.get("messages", [])

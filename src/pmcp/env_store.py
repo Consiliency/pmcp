@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from collections.abc import Callable, Collection, Iterable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from dotenv import dotenv_values
 
@@ -24,6 +24,7 @@ from pmcp.atomic_write import (
 )
 from pmcp.config.loader import find_project_root
 from pmcp.credential_state import (
+    REFERENCE_NOT_ALLOWED_HERE as REFERENCE_NOT_ALLOWED_HERE,
     STORE_UNREADABLE as STORE_UNREADABLE,
     CredentialUnavailableError as CredentialUnavailableError,
 )
@@ -659,6 +660,10 @@ PATH_AND_TRUST_ENV_VARS: frozenset[str] = frozenset(
         "TEMP",
         "TMP",
         "UV_TOOL_DIR",
+        # systemd's credential directory: where the 1Password service-account
+        # token is read from (Consiliency/pmcp#487 plan 3.1). Captured once at
+        # startup, then removed from the environment.
+        "CREDENTIALS_DIRECTORY",
         "PMCP_AUDIT_JSONL",
         "PMCP_LOCK_DIR",
         # Which executable runs (shutil.which, every spawn).
@@ -924,22 +929,32 @@ def env_origins() -> dict[str, EnvOrigin]:
 
 
 def environment_holds(name: str) -> EnvOrigin | None:
-    """The origin of an ``os.environ`` value that outranks the user store, or ``None``.
+    """The layer that holds ``name`` ahead of the user store, or ``None``.
 
-    ``external`` (also for a name present with no record), ``home_dotenv`` or
-    ``auth_connect_project``: a lookup answers ``name`` from that value until
-    the gateway restarts, whatever the user store says. ``None`` when the name
-    is not in the environment, or is a (stale) startup copy of a store value.
+    In precedence order: ``external`` (also for a name present with no
+    record) or ``home_dotenv`` -- a value in ``os.environ`` -- then a
+    reference the startup load SKIPPED from ``~/.env`` (``home_dotenv``,
+    plan 3.2.5): it is held at its layer although it is not in
+    ``os.environ``, and its lookup is refused; then ``auth_connect_project``.
+    A lookup answers ``name`` from that layer until the gateway restarts,
+    whatever the user store says. ``None`` when no such layer holds it: the
+    name is absent, or ``os.environ`` holds a (stale) startup copy of a store
+    value.
     """
     ensure_startup_load()
-    if name not in os.environ:
-        return None
-    origin = _ENV_ORIGINS.get(name)
-    if origin is None:
-        return "external"
-    if origin == "user_store":
-        return None
-    return origin
+    origin = _ENV_ORIGINS.get(name) if name in os.environ else None
+    if name in os.environ and origin not in ("user_store", "auth_connect_project"):
+        return "external" if origin is None else origin
+    skipped = _SKIPPED_REFERENCES.get(name)
+    if skipped in ("home_dotenv", "external"):
+        # A reference the startup load skipped (plan 3.2.5) is still HELD at
+        # its layer: it outranks the user store and a project-scope
+        # auth_connect, and its lookup is refused (reference_not_allowed_here),
+        # never answered from a lower layer (Consiliency/pmcp#499 r1 F1).
+        return skipped
+    if name in os.environ and origin == "auth_connect_project":
+        return origin
+    return None
 
 
 def publish_auth_connect_value(scope: str, name: str, value: str) -> bool:
@@ -1097,12 +1112,30 @@ def _current_user_store_value(key: str) -> str | None | object:
     it), or a name no file may set (``HOME``). Raises
     :class:`CredentialUnavailableError` for a store that cannot be read.
     """
-    if key.upper() in _NEVER_LOADED:
+    stored = _current_user_store_value_sourced(key)
+    if stored is _ABSENT:
+        return _ABSENT
+    return cast("tuple[str | None, str]", stored)[0]
+
+
+def _current_user_store_value_sourced(key: str) -> tuple[str | None, str] | object:
+    """``(value, source kind)`` of ``key`` in the CURRENT user store, or ``_ABSENT``.
+
+    The kind is ``user_store``, except for a value that only BECAME
+    reference-shaped by interpolation (``X=${Y}`` with ``Y`` an
+    ``op://`` string from the environment or ``~/.env``): ``interpolated``,
+    which is never trusted (plan 3.6: classification after interpolation).
+    """
+    if _never_loaded_name(key):
         return _ABSENT
     raw = _read_user_store_live()
     if raw is None or raw.get(key) is None:
         return _ABSENT
-    return _interpolated_store_values(raw)[key]
+    value = _interpolated_store_values(raw)[key]
+    kind = "user_store"
+    if value is not None and _is_reference_shaped(value) and value != raw[key]:
+        kind = "interpolated"
+    return value, kind
 
 
 _ABSENT = object()
@@ -1159,19 +1192,98 @@ def credential_value(
     (Consiliency/pmcp#372 round 15, board round 14 codex F001).
     """
     ensure_startup_load()
+    sourced = credential_value_sourced(
+        key,
+        environ=environ,
+        repository=repository,
+        startup_files=startup_files,
+        root=root,
+    )
+    return None if sourced is None else str(sourced)
+
+
+class SourcedValue(str):
+    """A credential value that remembers which layer answered it (plan 3.2.3).
+
+    A ``str`` -- every caller that treats a lookup's answer as a string keeps
+    working -- with ``source``, one of ``secret_refs.SOURCE_KINDS``. Consumers
+    that inject the value into a config record ``source`` in
+    ``ResolvedServerConfig.credential_sources`` and store ``str(value)``.
+    """
+
+    source: str
+
+    def __new__(cls, value: str, source: str) -> SourcedValue:
+        instance = super().__new__(cls, value)
+        instance.source = source
+        return instance
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (SourcedValue, (str(self), self.source))
+
+
+#: ``os.environ`` origin -> credential source kind.
+_ORIGIN_SOURCE: dict[str | None, str] = {
+    None: "environment",
+    "external": "environment",
+    "home_dotenv": "home_dotenv",
+    "auth_connect_project": "auth_connect_project",
+}
+
+
+def credential_value_sourced(
+    key: str,
+    *,
+    environ: bool = True,
+    repository: Mapping[str, str] | None = None,
+    startup_files: bool = True,
+    root: Path | None = None,
+) -> SourcedValue | None:
+    """:func:`credential_value`, with the layer that answered (``value.source``).
+
+    Source kinds: ``environment`` (the process environment, whoever set it),
+    ``home_dotenv``, ``auth_connect_project``, ``user_store`` (the live user
+    store), ``interpolated`` (a store value whose ``${...}`` expansion made it
+    reference-shaped: the reference text came from elsewhere), ``tenant``,
+    ``project_files``. Only ``user_store`` is a trusted source for a secret
+    reference (plan 3.2.2).
+
+    A reference-shaped ``~/.env`` value is never put into the environment
+    (plan 3.2.5); its name still shadows the user store, and a lookup of it
+    raises ``reference_not_allowed_here``.
+    """
+    ensure_startup_load()
     if environ:
-        if key in os.environ and _ENV_ORIGINS.get(key) != "user_store":
-            return os.environ[key] or None
-        stored = _current_user_store_value(key)
+        if key in os.environ and _ENV_ORIGINS.get(key) not in (
+            "user_store",
+            "auth_connect_project",
+        ):
+            value = os.environ[key]
+            if not value:
+                return None
+            return SourcedValue(
+                value, _ORIGIN_SOURCE.get(_ENV_ORIGINS.get(key), "environment")
+            )
+        if _SKIPPED_REFERENCES.get(key) in ("home_dotenv", "external"):
+            # ``~/.env`` held a reference for this name: it outranks the user
+            # store (plan 3.6), so it is the answer -- refused (plan 3.2.2).
+            raise CredentialUnavailableError(REFERENCE_NOT_ALLOWED_HERE)
+        if key in os.environ and _ENV_ORIGINS.get(key) == "auth_connect_project":
+            value = os.environ[key]
+            return SourcedValue(value, "auth_connect_project") if value else None
+        stored = _current_user_store_value_sourced(key)
         if stored is not _ABSENT:
-            return cast("str | None", stored) or None
+            stored_value, kind = cast("tuple[str | None, str]", stored)
+            return SourcedValue(stored_value, kind) if stored_value else None
     repository_may_answer = repository_may_supply(key)
     if repository_may_answer and repository is not None and key in repository:
-        return repository[key] or None
+        value = repository[key]
+        return SourcedValue(value, "tenant") if value else None
     if repository_may_answer and startup_files:
         entry = _root_entry(root)
         if entry is not None and key in entry.values:
-            return entry.values[key] or None
+            value = entry.values[key]
+            return SourcedValue(value, "project_files") if value else None
     return None
 
 
@@ -1279,6 +1391,8 @@ def reset_startup_load() -> None:
     global _STARTUP_LOADED, _LIVE_USER_STORE
     _STARTUP_LOADED = False
     _ENV_ORIGINS.clear()
+    _SKIPPED_REFERENCES.clear()
+    _STARTUP_USER_STORE_NAMES.clear()
     _LIVE_USER_STORE = None
 
 
@@ -1484,30 +1598,106 @@ def _identity(path: Path) -> tuple[int, int] | None:
 #: by the real environment (or the passwd database when HOME is unset) before
 #: any file is read (Consiliency/pmcp#372 round 21, board round 20 grok F001:
 #: a shipped ``HOME=.`` was honoured).
-_NEVER_LOADED = frozenset({"HOME", "USERPROFILE"})
+_NEVER_LOADED = frozenset(
+    {
+        "HOME",
+        "USERPROFILE",
+        # The 1Password service account and its family (Consiliency/pmcp#487
+        # plan 3.1): never from a file, so no store or ``~/.env`` can choose
+        # the account, the token, or where ``op`` keeps its state.
+        "OP_SERVICE_ACCOUNT_TOKEN",
+        "CREDENTIALS_DIRECTORY",
+        "OP_CONNECT_TOKEN",
+        "OP_CONNECT_HOST",
+        "OP_CONFIG_DIR",
+        "OP_CACHE",
+        "OP_ACCOUNT",
+    }
+)
+
+
+def _never_loaded_name(key: str) -> bool:
+    """``_NEVER_LOADED``, plus every ``OP_SESSION_*``."""
+    upper = key.upper()
+    return upper in _NEVER_LOADED or _OP_SESSION_NAMESPACE.match(upper) is not None
+
+
+#: ``OP_SESSION_*`` (a regex: the store modules' AST ban reads ``startswith``
+#: as a path containment test).
+_OP_SESSION_NAMESPACE = re.compile(r"OP_SESSION_")
+
+
+def _is_reference_shaped(value: str) -> bool:
+    from pmcp.secret_refs import is_reference_shaped
+
+    return is_reference_shaped(value)
+
+
+#: Names whose reference-shaped value the startup load SKIPPED (plan 3.2.5),
+#: with the class of the file that held it. Never published into
+#: ``os.environ``: no child inherits a reference, and a ``~/.env`` reference
+#: still shadows the store (its lookup is ``reference_not_allowed_here``).
+_SKIPPED_REFERENCES: dict[str, EnvOrigin] = {}
+
+
+#: Every name the startup load found in the user store, whether or not it
+#: was inserted (an external value of the same name wins). ``secret_refs``
+#: withholds its capability when such a credential name arrived as external
+#: environment: the launcher loads the store into the environment
+#: (``EnvironmentFile=``), so a reference written there would reach pmcp
+#: through the untrusted environment (plan 3.10).
+_STARTUP_USER_STORE_NAMES: set[str] = set()
+
+
+def startup_user_store_names() -> frozenset[str]:
+    """Names (never values) the startup load found in the user store."""
+    return frozenset(_STARTUP_USER_STORE_NAMES)
+
+
+def skipped_references() -> dict[str, EnvOrigin]:
+    """Names (never values) whose reference the startup load skipped, by class."""
+    return dict(_SKIPPED_REFERENCES)
 
 
 def _load_operator_text(text: str, name: str, origin: EnvOrigin) -> None:
     """Load an operator file's text into ``os.environ``, never overriding.
 
     ``load_dotenv(override=False)`` as before, except that HOME (and
-    USERPROFILE) are never taken from a file. ``origin`` is the caller's
-    class (``home_dotenv`` for ``~/.env``, ``user_store`` for the user
-    store), recorded for every name this inserts (Consiliency/pmcp#487).
+    USERPROFILE, and the 1Password control names) are never taken from a
+    file. ``origin`` is the caller's class (``home_dotenv`` for ``~/.env``,
+    ``user_store`` for the user store), recorded for every name this inserts
+    (Consiliency/pmcp#487).
+
+    A reference-shaped value (after interpolation) is never published into
+    ``os.environ`` (plan 3.2.5): the name is recorded in
+    ``_SKIPPED_REFERENCES`` with ``origin``. A credential lookup resolves a
+    store reference from the live store; a ``~/.env`` reference is refused.
     """
     from dotenv import dotenv_values
 
     for key, value in dotenv_values(stream=io.StringIO(text)).items():
+        if origin == "user_store" and value is not None:
+            _STARTUP_USER_STORE_NAMES.add(key)
         if value is None or key in os.environ:
             continue
-        if key.upper() in _NEVER_LOADED:
+        if _SKIPPED_REFERENCES.get(key) == "home_dotenv":
+            continue  # a skipped ``~/.env`` reference still shadows the store
+        if _never_loaded_name(key):
             from pmcp.argument_errors import plain_name
 
             print(
-                f"pmcp: Ignoring {plain_name(key)} in {name}: where the operator's files "
-                "are is never set by a file pmcp loads",
+                f"pmcp: Ignoring {plain_name(key)} in {name}: "
+                + (
+                    "the 1Password service account is never configured by a "
+                    "file pmcp loads"
+                    if key.upper() not in ("HOME", "USERPROFILE")
+                    else "where the operator's files are is never set by a file pmcp loads"
+                ),
                 file=sys.stderr,
             )
+            continue
+        if _is_reference_shaped(value):
+            _SKIPPED_REFERENCES.setdefault(key, origin)
             continue
         os.environ[key] = value
         record_env_origin(key, origin)
@@ -1565,6 +1755,18 @@ def child_process_env(
     any spawn in ``src/pmcp`` whose ``env=`` does not come from a builder.
     """
     env = dict(os.environ if base is None else base)
+    if base is None:
+        # The 1Password control names are never INHERITED from pmcp's own
+        # environment (Consiliency/pmcp#487 plan 3.1): only ``op`` gets the
+        # token, from its own builder. An explicit ``base`` is an environment
+        # the caller already built -- a server's own env included (the update
+        # probe, #499 r1 N4) -- and an overlay is governed by plan 3.2.4.
+        for name in [
+            n
+            for n in env
+            if _never_loaded_name(n) and n.upper() not in ("HOME", "USERPROFILE")
+        ]:
+            env.pop(name, None)
     if overlay:
         env.update(overlay)
     return env

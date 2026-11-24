@@ -39,7 +39,11 @@ class TestRealSymbolsRealArity:
 
     def test_build_install_child_env_arity(self) -> None:
         sig = inspect.signature(build_install_child_env)
-        assert list(sig.parameters) == ["server_config", "project_root"]
+        assert list(sig.parameters) == ["server_config", "project_root", "secrets"]
+        # ``secrets``: the values its op:// references resolved to, keyword-only
+        # (Consiliency/pmcp#487 plan 3.5); omitted, a reference fails closed.
+        assert sig.parameters["secrets"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert sig.parameters["secrets"].default is None
         # ``project_root`` is optional by deliberate design (SEAL SL-0,
         # Consiliency/pmcp#230): a required parameter would have rewritten call
         # sites across three merged phases' evidence files, including this one at
@@ -64,7 +68,10 @@ class TestRealSymbolsRealArity:
             "config",
             "manifest_servers",
             "env_lookup",
+            # Out-parameter for provenance (Consiliency/pmcp#487 plan 3.2.3).
+            "sources",
         ]
+        assert sig.parameters["sources"].default is None
         # The credential lookup of the project the config is loaded for
         # (Consiliency/pmcp#372 round 9), required: no implicit project.
         assert sig.parameters["env_lookup"].default is inspect.Parameter.empty

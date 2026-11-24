@@ -508,15 +508,23 @@ def test_the_grid_covers_every_consumer_in_the_inventory() -> None:
                 if isinstance(node, ast.Call):
                     f = node.func
                     called = getattr(f, "id", getattr(f, "attr", ""))
-                    if called in ("credential_value", "credential_lookup"):
+                    if called in (
+                        "credential_value",
+                        "credential_value_sourced",
+                        "credential_lookup",
+                    ):
                         consumers.add(f"{module}:{name}")
+    # The gate itself delegates to its provenance variant: not a consumer.
+    consumers.discard("pmcp.env_store:credential_value")
     assert consumers == set(GRID_COVERAGE)
 
 
-#: Every function in src/pmcp that calls credential_value or credential_lookup,
+#: Every function in src/pmcp that calls credential_value (or its provenance
+#: variant credential_value_sourced) or credential_lookup,
 #: and the grid row that runs it.
 GRID_COVERAGE = {
-    "pmcp.manifest.installer:build_install_child_env": "install child",
+    # build_install_child_env's lookup, with provenance (Consiliency/pmcp#487).
+    "pmcp.manifest.installer:_install_spawn_config": "install child",
     "pmcp.manifest.installer:check_api_key": "provision gate",
     "pmcp.config.loader:_credential_value_for": "startup config",
     "pmcp.tools.handlers:GatewayTools._check_api_key_available": "credential check",

@@ -1652,6 +1652,79 @@ legacy key (`API_TOKEN` for Bright Data) holds the same credential:
 read makes the servers that depend on it report `credential_unavailable`
 (`store_unreadable`) instead of starting without their credential.
 
+#### 1Password secret references (`op://`)
+
+A credential in your user store may be a 1Password secret reference instead
+of a value (Consiliency/pmcp#487):
+
+```bash
+pmcp secrets set BRIGHTDATA_API_TOKEN 'op://PMCP Gateway/BrightData/credential' --scope user
+```
+
+pmcp resolves it each time it starts the server that uses it (start, restart,
+reconnect, refresh, install and verify), with its own `op` process, and gives
+the value only to that server. Nothing resolved is written to a config, a
+store or pmcp's environment, and every resolved value (and the token) is
+redacted from tool output, errors and logs. A rotated 1Password item is used
+at the next restart of the server, without restarting the gateway.
+
+- **Authentication**: a 1Password *service account* scoped read-only to one
+  gateway-only vault. Its token is read from a file, never from the
+  environment: `$CREDENTIALS_DIRECTORY/op-service-account-token` (systemd
+  `LoadCredential=op-service-account-token`; rotating it needs a unit
+  restart), then `~/.config/credstore/op-service-account-token`, then
+  `~/.config/pmcp/op-service-account-token`. The file must be yours, mode
+  `0600` or `0400`, a regular file (no symlink), starting `ops_`.
+- **`op`**: `/usr/bin/op`, `/usr/local/bin/op`, `/opt/homebrew/bin/op`, then
+  `~/.local/bin/op`; or `"op_path": "/path/to/op"` at the top level of your
+  user `.mcp.json` or `-c` config. The binary and every directory above it
+  must be owned by root or you and not group- or world-writable. Never a
+  `PATH` search.
+- **Where references are resolved**: the credential a server looks up (its
+  `secret_key`/`env_var`) when it comes from your user store, and the own
+  `env` of a server whose entry in YOUR config (user scope or `-c`, or your
+  `~/.pmcp/manifest.yaml` overlay) sets `"resolve_secret_refs": true`. A
+  reference from the process environment (including systemd
+  `EnvironmentFile=`), `~/.env`, a project `.env`/`.env.pmcp`, a tenant store,
+  a project config or overlay, or `gateway.auth_connect` is refused with
+  `credential_unavailable` (`reference_not_allowed_here`). Without
+  `resolve_secret_refs`, `op://` values in a server's own `env` (and its own
+  `OP_SERVICE_ACCOUNT_TOKEN`) are passed to it exactly as before.
+- **Supported form**: `op://<vault>/<item>/<field>` or
+  `op://<vault>/<item>/<section>/<field>`, each part 1-64 of
+  `[A-Za-z0-9 _.-]`; no query (`?attribute=`), `%`, `@`, `:` or `$`. Prefer
+  item IDs (fewer 1Password reads).
+- **Failures** are typed and fail closed: the server reports `auth_state`
+  `credential_unavailable` with a `credential_reason` (`op_not_configured`,
+  `token_invalid`, `op_missing`, `op_untrusted`, `auth_failed`, `not_found`,
+  `rate_limited`, `network`, `timeout`, `output_invalid`,
+  `reference_unsupported`, `reference_not_allowed_here`,
+  `remote_reference_unsupported`), is not started, and a running instance
+  is left running by a failed restart or refresh. Never a stale value, an
+  empty one, or the literal reference.
+- **Remote servers**: a reference in a remote header is refused in this
+  release.
+- **Agent-registered servers** (`gateway.register_discovered_server`) never
+  receive a resolved reference: their credential lookup refuses it
+  (`reference_not_allowed_here`). Plain values behave as before.
+- **Values**: a resolved value must be at least 8 characters, a single line
+  (no newline or NUL) and not itself a reference; anything else is
+  `output_invalid`. Multi-line secrets (PEM keys, JSON documents) cannot be
+  passed through a reference in this release.
+- `pmcp doctor` lists the token paths it searched, the one it uses (an
+  invalid file stops the search), and whether the systemd credential copy
+  differs from the credstore file (restart the unit after editing it; the
+  systemd copy is visible only to a process inside the unit, and `pmcp
+  doctor` says so when it is run from a shell) --
+  never the token or a digest -- and reports each `op://` credential and
+  each refused one by name, layer and reason.
+- `pmcp secrets set NAME op://...` writes only to the user store, and only
+  once the serving HTTP gateway's `/health` reports the `secret_refs`
+  capability (a token is usable and the gateway does not load `pmcp.env`
+  into its environment) and does not answer `NAME` from its environment or
+  `~/.env`. `gateway.health` and `/health` report the token's state and
+  source, never its value.
+
 ### Policy File
 
 Create a policy file to control access and limits:

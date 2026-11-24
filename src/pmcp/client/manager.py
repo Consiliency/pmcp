@@ -51,7 +51,16 @@ from pmcp.argument_errors import (
 )
 from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
+from pmcp.credential_state import (
+    CONFIG_CHANGED,
+    OUTPUT_INVALID,
+    REASONS,
+    CredentialUnavailableError,
+)
 from pmcp.env_store import bind_project_root, sanitized_subprocess_env
+from pmcp import secret_refs as _secret_refs
+from pmcp.secret_refs import SpawnSecrets
+from pmcp.secret_registry import redact_registered, redact_registered_in
 from pmcp.manifest.installer import _operator_safe, _render_install_argv
 from pmcp.parsing import load_json
 from pmcp.remote_auth import (
@@ -311,6 +320,33 @@ def _log_abandoned_owner_failure(name: str, task: asyncio.Future[Any]) -> None:
         f"cancellation: {describe_exception(exc)}\n"
         f"{sanitize_auth_diagnostic(traceback_text, max_length=None)}"
     )
+
+
+class ValidatedSpawns(NamedTuple):
+    """What :meth:`ClientManager.prepare_validated` hands a replacing path."""
+
+    #: The configs to start: each replacement in place of what it superseded.
+    configs: list[ResolvedServerConfig]
+    #: Their resolutions, by name.
+    secrets: dict[str, SpawnSecrets]
+    #: Value-free error messages.
+    errors: list[str]
+    #: Names whose running instance is KEPT and that are not started:
+    #: name -> typed reason (a lookup failure, or ``config_changed``).
+    held: dict[str, str]
+
+
+def _with_overlay(
+    secrets: dict[str, SpawnSecrets] | None, name: str
+) -> SpawnSecrets | None:
+    """The resolution for ``name`` when it resolved something, else ``None``
+    (a config without references spawns exactly as before)."""
+    return _nonempty(None if secrets is None else secrets.get(name))
+
+
+def _nonempty(secrets: SpawnSecrets | None) -> SpawnSecrets | None:
+    """``secrets`` when it resolved something, else ``None``."""
+    return secrets if secrets is not None and secrets.overlay else None
 
 
 def _handshake_error(exc: BaseException) -> str:
@@ -1253,7 +1289,11 @@ def _parse_tool_entries(
     `_reconcile_once` run it *before* removing anything and decide from the
     result whether the listing is usable at all -- see its "offered but none
     parseable" rule. `_index_tools` does the writing.
+
+    Downstream catalog text never carries a resolved secret: the listing is
+    exact-value redacted first (Consiliency/pmcp#487 plan 3.7).
     """
+    tools = redact_registered_in(tools)
     entries: list[tuple[str, ToolInfo]] = []
     known_fields = {
         "name",
@@ -1325,6 +1365,7 @@ def _parse_resource_entries(
     name: str, resources: list[dict[str, Any]]
 ) -> list[tuple[str, ResourceInfo]]:
     """Parse one server's `resources/list` payload. Pure, per `_parse_tool_entries`."""
+    resources = redact_registered_in(resources)
     entries: list[tuple[str, ResourceInfo]] = []
     known_fields = {
         "uri",
@@ -1366,6 +1407,7 @@ def _parse_prompt_entries(
     name: str, prompts: list[dict[str, Any]]
 ) -> list[tuple[str, PromptInfo]]:
     """Parse one server's `prompts/list` payload. Pure, per `_parse_tool_entries`."""
+    prompts = redact_registered_in(prompts)
     entries: list[tuple[str, PromptInfo]] = []
     known_prompt_fields = {
         "name",
@@ -1440,6 +1482,10 @@ def _remote_headers(
         tenant_id=tenant_id,
         project_root=project_root,
     )
+    if "remote_reference_unsupported" in resolution.unavailable_env_vars.values():
+        # A reference in a remote header (Consiliency/pmcp#487 plan 3.2.7):
+        # typed, and the refused value is never kept.
+        raise CredentialUnavailableError("remote_reference_unsupported")
     if resolution.missing_env_vars:
         raise MissingRemoteHeaderAuthError(server_name, resolution.missing_env_vars)
     return resolution.resolved_headers
@@ -1623,6 +1669,15 @@ class ClientManager:
         self._project_root: Path = bind_project_root(project_root)
         self._spawn_semaphore = asyncio.Semaphore(max_concurrent_spawns)
         self._lifecycle_lock = asyncio.Lock()
+        # Config generation per server (Consiliency/pmcp#487 plan 3.5):
+        # bumped whenever a lifecycle call brings a DIFFERENT config for the
+        # name. References are resolved outside the lifecycle lock; the
+        # generation is re-checked once the lock is held, and a changed one
+        # discards the resolution (re-resolved once, then a typed retryable
+        # ``config_changed``).
+        self._config_generations: dict[str, int] = {}
+        self._config_fingerprints: dict[str, str] = {}
+        self._published_configs: dict[str, ResolvedServerConfig] = {}
         # Set once by `abandon_all_now()` and never cleared: see
         # `_connect_server`.
         self._abandoned = False
@@ -1646,7 +1701,11 @@ class ClientManager:
         self._tasks = TaskRegistry()
 
     async def connect_all(
-        self, configs: list[ResolvedServerConfig], retry: bool = True
+        self,
+        configs: list[ResolvedServerConfig],
+        retry: bool = True,
+        *,
+        prepared: dict[str, SpawnSecrets] | None = None,
     ) -> list[str]:
         """Connect to all configured servers in parallel.
 
@@ -1659,12 +1718,297 @@ class ClientManager:
         """
         if not configs:
             return []
+        return await self._run_prepared(
+            configs,
+            lambda ready, secrets: (
+                self._connect_all_unlocked(ready, retry=retry, secrets=secrets)
+                if any(_nonempty(found) for found in secrets.values())
+                else self._connect_all_unlocked(ready, retry=retry)
+            ),
+            prepared=prepared,
+        )
 
-        async with self._lifecycle_lock:
-            return await self._connect_all_unlocked(configs, retry=retry)
+    # --- Secret references: resolve outside the lock (plan 3.5) -------------
+
+    @staticmethod
+    def _fingerprint(config: ResolvedServerConfig) -> str:
+        """What makes two configs for one name the same spawn (plan 3.5)."""
+        try:
+            return json.dumps(
+                [
+                    config.config.model_dump(mode="json"),
+                    sorted(config.credential_sources.items()),
+                    config.resolve_secret_refs,
+                ],
+                sort_keys=True,
+                default=str,
+            )
+        except (TypeError, ValueError, AttributeError):
+            return repr(config)
+
+    def publish_config(self, config: ResolvedServerConfig) -> int:
+        """Publish ``config`` as THE config for its name; the name's generation.
+
+        Called where the manager is handed a replacement -- connect, connect
+        all, restart, refresh, lazy registration, adoption, and
+        ``prepare_configs`` for ``gateway.refresh`` -- never by a resolution
+        or a reconnect (#499 r1 G1). A config whose fingerprint differs from
+        the published one bumps the generation, so every resolution in
+        flight for the old one is discarded.
+        """
+        name = config.name
+        fingerprint = self._fingerprint(config)
+        if self._config_fingerprints.get(name) != fingerprint:
+            self._config_fingerprints[name] = fingerprint
+            self._config_generations[name] = self._config_generations.get(name, 0) + 1
+        self._published_configs[name] = config
+        return self._config_generations.get(name, 0)
+
+    def bump_config_generation(self, name: str) -> None:
+        """Invalidate any resolution in flight for ``name`` without a new config.
+
+        The published config stays; a resolution started before this is
+        re-resolved against it (plan 3.5).
+        """
+        self._config_generations[name] = self._config_generations.get(name, 0) + 1
+
+    def _superseded(self, config: ResolvedServerConfig) -> bool:
+        """Has a different config been published for ``config``'s name?"""
+        published = self._config_fingerprints.get(config.name)
+        return published is not None and published != self._fingerprint(config)
+
+    def _current_config(self, name: str) -> ResolvedServerConfig | None:
+        """The config published for ``name`` now, if any."""
+        return self._published_configs.get(name)
+
+    async def prepare_spawn(self, config: ResolvedServerConfig) -> SpawnSecrets:
+        """Resolve ``config``'s secret references, OUTSIDE the lifecycle lock.
+
+        Never publishes ``config`` (#499 r1 G1): it records the generation
+        current when the resolution started and ``config``'s fingerprint,
+        and the lock-time check discards it if either no longer matches the
+        published config. Raises :class:`CredentialUnavailableError` (typed,
+        value-free). A config the loader marked ``credential_unavailable``
+        fails with that reason -- except a host reason (the token file, the
+        platform), which is looked up again now (plan 3.1, #499 r1 N5).
+
+        When that host reason no longer holds, it is CLEARED on ``config``
+        itself -- the shared published or lazy object -- so the spawn check
+        proceeds (#499 r2 A6, r3 R3-N3). Harmless: a token lost again fails
+        this resolution with the same host reason, a config-intrinsic reason
+        is never cleared, and the fingerprint does not include it.
+        """
+        generation = self._config_generations.get(config.name, 0)
+        fingerprint = self._fingerprint(config)
+        stored = config.credential_unavailable
+        if isinstance(stored, str):
+            if stored not in _secret_refs.HOST_REASONS:
+                raise CredentialUnavailableError(stored)
+            current = _secret_refs.static_failure(config)
+            if current is not None:
+                raise CredentialUnavailableError(current)
+            # The host condition is fixed: the cached host-only reason no
+            # longer stands, so the spawn check proceeds (#499 r2 A6). A
+            # config-intrinsic reason (trust, grammar) is never cleared, and
+            # the spawn still needs this fresh resolution.
+            config.credential_unavailable = None
+        if not isinstance(config.config, LocalMcpServerConfig):
+            return SpawnSecrets({}, generation, fingerprint)
+        overlay = await _secret_refs.resolve_spawn_env(config)
+        return SpawnSecrets(overlay, generation, fingerprint)
+
+    def _stale(self, config: ResolvedServerConfig, secrets: SpawnSecrets) -> bool:
+        """Was ``secrets`` resolved for a config that is no longer published?"""
+        name = config.name
+        if name not in self._config_fingerprints:
+            return False  # nothing published for the name: nothing replaced it
+        return (
+            self._config_generations.get(name, 0) != secrets.generation
+            or self._config_fingerprints[name] != secrets.fingerprint
+            or self._fingerprint(config) != secrets.fingerprint
+        )
+
+    def _record_unavailable(self, name: str, reason: str) -> str:
+        """Report a typed resolution failure on ``name`` (never over a live instance).
+
+        ``reason`` is a ``credential_state`` constant; the text is value-free.
+        """
+        if reason not in REASONS:
+            reason = OUTPUT_INVALID
+        state = f"credential_unavailable ({reason})"
+        message = f"Failed to connect to {name}: {state}"
+        status = self._servers.get(name)
+        if status is None or status.status != ServerStatusEnum.ONLINE:
+            if status is None:
+                status = ServerStatus(
+                    name=name, status=ServerStatusEnum.ERROR, tool_count=0
+                )
+                self._servers[name] = status
+            status.status = ServerStatusEnum.ERROR
+            status.last_error = state
+        logger.warning(message)
+        return message
+
+    async def _prepare_configs(
+        self,
+        configs: list[ResolvedServerConfig],
+        prepared: dict[str, SpawnSecrets] | None = None,
+    ) -> tuple[dict[str, SpawnSecrets], list[str], dict[str, str]]:
+        """Resolve every config (concurrently, bounded by the ``op`` cap).
+
+        ``prepared``: resolutions a caller already made (``gateway.refresh``
+        resolves before its disconnect loop). Returns
+        ``(secrets by name, error messages, failed name -> typed reason)``.
+        """
+        secrets: dict[str, SpawnSecrets] = {}
+        todo: list[ResolvedServerConfig] = []
+        for config in configs:
+            if prepared is not None and config.name in prepared:
+                secrets[config.name] = prepared[config.name]
+            elif config.name not in secrets and config not in todo:
+                todo.append(config)
+
+        async def prepare_one(config: ResolvedServerConfig) -> SpawnSecrets | str:
+            # A failure is its reason (value-free); anything else untyped is
+            # ``output_invalid`` -- never a spawn without its resolution.
+            try:
+                return await self.prepare_spawn(config)
+            except CredentialUnavailableError as exc:
+                return exc.reason
+            except Exception:  # noqa: BLE001 - typed below, never rendered
+                return OUTPUT_INVALID
+
+        results = await asyncio.gather(*(prepare_one(config) for config in todo))
+        errors: list[str] = []
+        failed: dict[str, str] = {}
+        for config, result in zip(todo, results):
+            if isinstance(result, str):
+                errors.append(self._record_unavailable(config.name, result))
+                failed[config.name] = result
+            else:
+                secrets[config.name] = result
+        return secrets, errors, failed
+
+    async def prepare_validated(
+        self, configs: list[ResolvedServerConfig], *, publish: bool = True
+    ) -> ValidatedSpawns:
+        """THE pre-teardown discipline of every lifecycle path that replaces a
+        running server: ``gateway.refresh``, ``ClientManager.refresh`` and
+        ``restart_server`` (plan 3.5; #499 r2 A5, r3 R3-N1).
+
+        Publishes ``configs`` (unless ``publish`` is false), resolves them
+        outside the lifecycle lock, then -- under the lock, BEFORE the caller
+        tears anything down -- checks each resolution against the config
+        published now. A config replaced while it resolved is re-resolved
+        once, outside the lock, against the CURRENT published config, and
+        checked again. A second change (``config_changed``) or a failed
+        lookup puts the name in ``held``: the caller keeps its running
+        instance up and spawns nothing for it. The returned ``configs`` carry
+        each replacement in place of the config it superseded.
+        """
+        if publish:
+            for config in configs:
+                self.publish_config(config)
+        current = list(configs)
+        secrets, errors, failed = await self._prepare_configs(current)
+        held: dict[str, str] = dict(failed)
+        for attempt in range(2):
+            async with self._lifecycle_lock:
+                stale = {
+                    config.name
+                    for config in current
+                    if config.name not in held
+                    and config.name in secrets
+                    and self._stale(config, secrets[config.name])
+                }
+            if not stale:
+                break
+            if attempt == 1:
+                for name in sorted(stale):
+                    errors.append(self._record_unavailable(name, CONFIG_CHANGED))
+                    held[name] = CONFIG_CHANGED
+                break
+            replaced: list[ResolvedServerConfig] = []
+            for index, config in enumerate(current):
+                if config.name not in stale:
+                    continue
+                secrets.pop(config.name, None)
+                replacement = self._current_config(config.name)
+                if replacement is None:
+                    errors.append(self._record_unavailable(config.name, CONFIG_CHANGED))
+                    held[config.name] = CONFIG_CHANGED
+                    continue
+                current[index] = replacement
+                replaced.append(replacement)
+            more, more_errors, more_failed = await self._prepare_configs(replaced)
+            secrets.update(more)
+            errors += more_errors
+            held.update(more_failed)
+        return ValidatedSpawns(current, secrets, errors, held)
+
+    async def _run_prepared(
+        self,
+        configs: list[ResolvedServerConfig],
+        body: Callable[[list[ResolvedServerConfig], dict[str, SpawnSecrets]], Any],
+        *,
+        prepared: dict[str, SpawnSecrets] | None = None,
+    ) -> list[str]:
+        """Publish ``configs``, resolve them outside the lock, then run ``body`` under it.
+
+        A config not already resolved by the caller (``prepared``) is
+        published first: the caller is handing it over as the config for its
+        name. A config whose published config changed while it was resolved
+        is never spawned (#499 r1 G1): the CURRENT published config is
+        re-resolved once and spawned in its place; a second change is a
+        typed retryable ``config_changed``. ``body`` receives the configs
+        still current and their resolutions, and returns error messages.
+        """
+        for config in configs:
+            if prepared is None or config.name not in prepared:
+                self.publish_config(config)
+        secrets, errors, failed = await self._prepare_configs(configs, prepared)
+        pending = [config for config in configs if config.name not in failed]
+        for attempt in range(2):
+            async with self._lifecycle_lock:
+                stale = {
+                    config.name
+                    for config in pending
+                    if config.name in secrets
+                    and self._stale(config, secrets[config.name])
+                }
+                ready = [config for config in pending if config.name not in stale]
+                if ready or not stale:
+                    errors += await body(ready, secrets)
+            if not stale:
+                break
+            if attempt == 1:
+                for name in sorted(stale):
+                    errors.append(self._record_unavailable(name, CONFIG_CHANGED))
+                break
+            # Re-resolve against the config published NOW, never the
+            # caller's superseded object.
+            replaced: list[ResolvedServerConfig] = []
+            for name in sorted(stale):
+                secrets.pop(name, None)
+                current = self._current_config(name)
+                if current is None:
+                    errors.append(self._record_unavailable(name, CONFIG_CHANGED))
+                else:
+                    replaced.append(current)
+            pending = replaced
+            more, more_errors, more_failed = await self._prepare_configs(pending)
+            secrets.update(more)
+            errors += more_errors
+            pending = [config for config in pending if config.name not in more_failed]
+            if not pending:
+                break
+        return errors
 
     async def _connect_all_unlocked(
-        self, configs: list[ResolvedServerConfig], retry: bool = True
+        self,
+        configs: list[ResolvedServerConfig],
+        retry: bool = True,
+        secrets: dict[str, SpawnSecrets] | None = None,
     ) -> list[str]:
         """Connect to all configured servers while caller owns lifecycle lock."""
         if not configs:
@@ -1682,7 +2026,13 @@ class ClientManager:
             task = tasks_by_name.get(config.name)
             if task is None:
                 task = self._track_background_task(
-                    asyncio.create_task(self._connect_singleflight(config, retry)),
+                    asyncio.create_task(
+                        self._connect_singleflight(
+                            config,
+                            retry,
+                            _with_overlay(secrets, config.name),
+                        )
+                    ),
                     config.name,
                 )
                 tasks_by_name[config.name] = task
@@ -1706,7 +2056,10 @@ class ClientManager:
         return errors
 
     async def _connect_singleflight(
-        self, config: ResolvedServerConfig, retry: bool = True
+        self,
+        config: ResolvedServerConfig,
+        retry: bool = True,
+        secrets: SpawnSecrets | None = None,
     ) -> None:
         """Share concurrent connection attempts for the same server name."""
         name = config.name
@@ -1716,10 +2069,20 @@ class ClientManager:
 
         task = self._connect_tasks.get(name)
         if task is None:
+            # ``secrets`` only when a resolution exists: the one-argument
+            # call is unchanged for every config without references.
             if retry:
-                task = asyncio.create_task(self._connect_with_retry(config))
+                task = asyncio.create_task(
+                    self._connect_with_retry(config)
+                    if secrets is None
+                    else self._connect_with_retry(config, secrets)
+                )
             else:
-                task = asyncio.create_task(self._connect_server(config))
+                task = asyncio.create_task(
+                    self._connect_server(config)
+                    if secrets is None
+                    else self._connect_server(config, secrets)
+                )
             task = self._track_background_task(task, name)
             self._connect_tasks[name] = task
 
@@ -1825,6 +2188,8 @@ class ClientManager:
                 continue
 
             self._lazy_configs[name] = config
+            # Its config is now THE one for the name (plan 3.5, #499 r1 G1).
+            self.publish_config(config)
             # Create LAZY status entry so server appears in status listings
             self._servers[name] = ServerStatus(
                 name=name,
@@ -1862,24 +2227,55 @@ class ClientManager:
         Raises:
             ValueError: If server is not registered (neither connected nor lazy)
         """
-        async with self._lifecycle_lock:
-            if self.is_server_online(server_name):
-                return True
+        # Resolve the server's references BEFORE taking the lifecycle lock
+        # (Consiliency/pmcp#487 plan 3.5); re-checked under it.
+        secrets: SpawnSecrets | None = None
+        for attempt in range(2):
+            candidate = self._lazy_configs.get(server_name)
+            if (
+                candidate is not None
+                and not self.is_server_online(server_name)
+                and server_name not in self._connect_tasks
+            ):
+                try:
+                    secrets = await self.prepare_spawn(candidate)
+                except CredentialUnavailableError as exc:
+                    self._record_unavailable(server_name, exc.reason)
+                    return False
+            async with self._lifecycle_lock:
+                if self.is_server_online(server_name):
+                    return True
 
-            if server_name not in self._lazy_configs:
-                if server_name not in self._servers:
-                    raise ValueError(f"Unknown server: {server_name}")
-                return False
+                if server_name not in self._lazy_configs:
+                    if server_name not in self._servers:
+                        raise ValueError(f"Unknown server: {server_name}")
+                    return False
 
-            config = self._lazy_configs[server_name]
-            logger.info(f"Lazy-starting server: {server_name}")
-            task = self._connect_tasks.get(server_name)
-            if task is None:
-                task = self._track_background_task(
-                    asyncio.create_task(self._connect_with_lifecycle_lock(config)),
-                    server_name,
-                )
-                self._connect_tasks[server_name] = task
+                config = self._lazy_configs[server_name]
+                task = self._connect_tasks.get(server_name)
+                if task is None and (
+                    secrets is None
+                    or config is not candidate
+                    or self._stale(config, secrets)
+                ):
+                    if attempt == 0:
+                        continue
+                    self._record_unavailable(server_name, CONFIG_CHANGED)
+                    return False
+                logger.info(f"Lazy-starting server: {server_name}")
+                if task is None:
+                    task = self._track_background_task(
+                        asyncio.create_task(
+                            self._connect_with_lifecycle_lock(
+                                config, _nonempty(secrets)
+                            )
+                        ),
+                        server_name,
+                    )
+                    self._connect_tasks[server_name] = task
+                break
+        else:  # pragma: no cover - the second attempt always returns or breaks
+            return False
 
         try:
             await task
@@ -1898,17 +2294,41 @@ class ClientManager:
                 if self._connect_tasks.get(server_name) is task:
                     self._connect_tasks.pop(server_name, None)
 
-    async def _connect_with_lifecycle_lock(self, config: ResolvedServerConfig) -> None:
+    async def _connect_with_lifecycle_lock(
+        self, config: ResolvedServerConfig, secrets: SpawnSecrets | None = None
+    ) -> None:
         async with self._lifecycle_lock:
-            await self._connect_with_retry(config)
+            if secrets is None:
+                await self._connect_with_retry(config)
+            else:
+                await self._connect_with_retry(config, secrets)
 
     async def connect_server(
-        self, config: ResolvedServerConfig, retry: bool = True
+        self,
+        config: ResolvedServerConfig,
+        retry: bool = True,
+        *,
+        prepared: SpawnSecrets | None = None,
     ) -> list[str]:
-        """Connect one server through same-server single-flight startup."""
-        async with self._lifecycle_lock:
+        """Connect one server through same-server single-flight startup.
+
+        Its secret references are resolved first, outside the lifecycle lock
+        (``prepared``: already resolved by the caller, e.g. a restart that
+        resolved before its teardown).
+        """
+
+        async def body(
+            ready: list[ResolvedServerConfig], secrets: dict[str, SpawnSecrets]
+        ) -> list[str]:
+            if not ready:
+                return []
+            # The config still published for the name: the caller's, or the
+            # replacement it was re-resolved for (#499 r1 G1).
+            current = ready[0]
             try:
-                await self._connect_singleflight(config, retry=retry)
+                await self._connect_singleflight(
+                    current, retry=retry, secrets=_with_overlay(secrets, current.name)
+                )
                 if self.is_server_online(config.name):
                     self._lazy_configs.pop(config.name, None)
                 self._revision_id = _generate_revision_id()
@@ -1919,6 +2339,12 @@ class ClientManager:
                     self._servers[config.name].status = ServerStatusEnum.ERROR
                     self._servers[config.name].last_error = describe_exception(e)
                 return [f"Failed to connect to {config.name}: {describe_exception(e)}"]
+
+        return await self._run_prepared(
+            [config],
+            body,
+            prepared=None if prepared is None else {config.name: prepared},
+        )
 
     def cancel_pending_requests(self, server: str) -> int:
         """Cancel pending requests for one server and return newly cancelled count."""
@@ -2096,15 +2522,40 @@ class ClientManager:
     async def restart_server(
         self, config: ResolvedServerConfig, force: bool = False
     ) -> tuple[bool, int, list[str]]:
-        """Restart one server by disconnecting then connecting the same config."""
-        disconnected, cancelled, error = await self.disconnect_server(
-            config.name, force
-        )
+        """Restart one server by disconnecting then connecting the same config.
+
+        The new instance's secret references are resolved FIRST, before the
+        teardown and outside the lifecycle lock (Consiliency/pmcp#487 plan
+        3.5): a failed lookup leaves the running instance up and returns the
+        typed error -- no new spawn uses an old value, so this is not a
+        fallback.
+        """
+        name = config.name
+        # Validated BEFORE anything destructive (#499 r2 A5): the shared
+        # discipline of every replacing path (prepare_validated).
+        validated = await self.prepare_validated([config])
+        if name in validated.held:
+            return self._restart_refused(name, validated.held[name])
+        target = validated.configs[0]
+        prepared = validated.secrets[name]
+        disconnected, cancelled, error = await self.disconnect_server(name, force)
         if not disconnected:
             return (False, cancelled, [error or "Restart refused."])
 
-        errors = await self.connect_server(config)
+        # The resolution -- its generation and fingerprint, even with an empty
+        # overlay -- always goes with the connect (#499 r2 A4): a replacement
+        # published during the teardown is then detected and resolved, never
+        # overwritten by republishing this config.
+        errors = await self.connect_server(target, prepared=prepared)
         return (len(errors) == 0, cancelled, errors)
+
+    def _restart_refused(self, name: str, reason: str) -> tuple[bool, int, list[str]]:
+        """A restart that tore nothing down: the running instance stays up."""
+        if reason not in REASONS:
+            reason = OUTPUT_INVALID
+        message = f"Restart of {name} refused: credential_unavailable ({reason})"
+        logger.warning(message)
+        return (False, 0, [message])
 
     def is_lazy_server(self, name: str) -> bool:
         """Check if server is registered for lazy start but not yet connected."""
@@ -2114,16 +2565,27 @@ class ClientManager:
         """Get list of servers registered for lazy start."""
         return list(self._lazy_configs.keys())
 
-    async def _connect_with_retry(self, config: ResolvedServerConfig) -> None:
-        """Connect to a server with exponential backoff retry."""
+    async def _connect_with_retry(
+        self, config: ResolvedServerConfig, secrets: SpawnSecrets | None = None
+    ) -> None:
+        """Connect to a server with exponential backoff retry.
+
+        A typed credential failure is never retried (plan 3.5), including
+        ``rate_limited``: retrying cannot change its answer.
+        """
         last_error: Exception | None = None
 
         for attempt in range(MAX_CONNECTION_RETRIES):
             try:
-                await self._connect_server(config)
+                if secrets is None:
+                    await self._connect_server(config)
+                else:
+                    await self._connect_server(config, secrets)
                 return  # Success
             except _ManagerAbandoned:
                 raise  # Not a failure to retry: the gateway is shutting down.
+            except CredentialUnavailableError:
+                raise
             except Exception as e:
                 last_error = e
                 if attempt < MAX_CONNECTION_RETRIES - 1:
@@ -2139,7 +2601,9 @@ class ClientManager:
         if last_error:
             raise last_error
 
-    async def _connect_server(self, config: ResolvedServerConfig) -> None:
+    async def _connect_server(
+        self, config: ResolvedServerConfig, secrets: SpawnSecrets | None = None
+    ) -> None:
         """Connect to a single MCP server.
 
         Every connect path -- startup, `connect_server`, `refresh`, lazy
@@ -2158,7 +2622,7 @@ class ClientManager:
                 await self._connect_sse(config)
             return
 
-        await self._connect_stdio(config)
+        await self._connect_stdio(config, secrets)
 
     def _publish_catalog_change(self, kind: str) -> None:
         """Publish one catalog-kind change to the sink, unconditionally."""
@@ -3193,9 +3657,23 @@ class ClientManager:
             if before[kind] != after[kind]:
                 self._publish_catalog_change(kind)
 
-    async def _connect_stdio(self, config: ResolvedServerConfig) -> None:
-        """Connect to a local stdio MCP server."""
+    async def _connect_stdio(
+        self, config: ResolvedServerConfig, secrets: SpawnSecrets | None = None
+    ) -> None:
+        """Connect to a local stdio MCP server.
+
+        ``secrets``: the overlay its references resolved to, made by the
+        caller outside the lifecycle lock (``prepare_spawn``). A config that
+        has references to resolve and arrives without it -- or with one made
+        for an older generation -- is refused (``resolution_required``,
+        ``config_changed``), never spawned with the literal reference.
+        """
         name = config.name
+        if config.credential_unavailable is not None:
+            raise CredentialUnavailableError(config.credential_unavailable)
+        overlay = _secret_refs.require_resolved(config, secrets)
+        if overlay and secrets is not None and self._stale(config, secrets):
+            raise CredentialUnavailableError(CONFIG_CHANGED)
 
         # Clean up any existing live connection before spawning a replacement
         if name in self._clients:
@@ -3244,7 +3722,12 @@ class ClientManager:
         # Build environment: inherit the gateway env MINUS PMCP-managed secrets
         # (so this server never receives another server's stored credentials),
         # then apply this server's own resolved credentials.
-        env = sanitized_subprocess_env(local_config.env, self._project_root)
+        # A fresh dict per spawn: the resolved values go only into this
+        # child's environment, never onto the config (plan 3.5).
+        env = sanitized_subprocess_env(
+            _secret_refs.apply_overlay(local_config.env, overlay), self._project_root
+        )
+        del overlay
 
         # Spawn process (semaphore caps concurrent spawns to avoid FD exhaustion)
         async with self._spawn_semaphore:
@@ -3761,7 +4244,11 @@ class ClientManager:
                     continue
                 if not line:
                     break
-                logger.debug(f"[{name}] stderr: {line.decode().strip()}")
+                # Exact-value redaction before the line is logged (plan 3.7).
+                logger.debug(
+                    f"[{name}] stderr: "
+                    f"{redact_registered(line.decode('utf-8', 'replace').strip())}"
+                )
         except Exception as e:
             logger.debug(f"[{name}] stderr reader error: {describe_exception(e)}")
 
@@ -4041,6 +4528,15 @@ class ClientManager:
                     return
                 logger.info(f"[{name}] reconnect attempt {attempt}/{len(delays)} ...")
                 try:
+                    # A crashed config that a newer one has replaced is never
+                    # respawned, and never re-published (#499 r1 G1).
+                    if self._superseded(config):
+                        # Recorded on the status, not only logged (#499 r2 N4).
+                        self._record_unavailable(name, CONFIG_CHANGED)
+                        return
+                    # Resolved again from the stored reference, before the
+                    # lock (Consiliency/pmcp#487 plan 3.5).
+                    secrets = await self.prepare_spawn(config)
                     async with self._lifecycle_lock:
                         managed = self._clients.get(name)
                         if managed and managed.status.status == ServerStatusEnum.ONLINE:
@@ -4048,9 +4544,29 @@ class ClientManager:
                                 f"[{name}] already online; skipping reconnect attempt {attempt}"
                             )
                             return
-                        await self._connect_singleflight(config)
+                        if self._superseded(config) or self._stale(config, secrets):
+                            self._record_unavailable(name, CONFIG_CHANGED)
+                            return
+                        resolved = _nonempty(secrets)
+                        if resolved is None:
+                            await self._connect_singleflight(config)
+                        else:
+                            await self._connect_singleflight(config, secrets=resolved)
                     logger.info(f"[{name}] reconnected successfully")
                     return
+                except CredentialUnavailableError as e:
+                    logger.warning(
+                        f"[{name}] reconnect attempt {attempt} failed: "
+                        f"credential_unavailable ({e.reason})"
+                    )
+                    if not _secret_refs.is_retryable_reason(e.reason):
+                        self._record_unavailable(name, e.reason)
+                        # A typed lookup failure is not retried (plan 3.5).
+                        logger.error(
+                            f"[{name}] reconnect stopped: the credential is "
+                            "unavailable; server remains offline"
+                        )
+                        return
                 except Exception as e:
                     safe_error = describe_exception(e)
                     logger.warning(
@@ -4709,10 +5225,41 @@ class ClientManager:
                 release(managed.process)  # its pipes, now (round 10)
 
     async def refresh(self, configs: list[ResolvedServerConfig]) -> list[str]:
-        """Refresh connections (disconnect + reconnect)."""
+        """Refresh connections (disconnect + reconnect).
+
+        Every config's references are resolved first, outside the lock; the
+        teardown follows only then (Consiliency/pmcp#487 plan 3.5).
+        """
+        validated = await self.prepare_validated(configs)
         async with self._lifecycle_lock:
+            return validated.errors + await self._refresh_locked(
+                validated.configs, validated.secrets, set(validated.held)
+            )
+
+    async def _refresh_locked(
+        self,
+        configs: list[ResolvedServerConfig],
+        secrets: dict[str, SpawnSecrets],
+        held: set[str],
+    ) -> list[str]:
+        """``refresh``'s teardown and connect, with the lifecycle lock held.
+
+        A running server in ``held`` (its lookup failed, or its config changed
+        twice while it resolved) is KEPT (plan 3.5, #499 r1 A2): nothing new
+        is spawned with an old value, and tearing it down would turn a
+        credential problem into an outage. Every other server is torn down as
+        before.
+        """
+        keep = {name for name in held if self.is_server_online(name)}
+        if keep:
+            for name in [n for n in list(self._clients) if n not in keep]:
+                await self._disconnect_server_locked(name, 0)
+        else:
             await self._disconnect_all_unlocked()
-            return await self._connect_all_unlocked(configs)
+        ready = [config for config in configs if config.name not in held]
+        if any(_nonempty(secrets.get(config.name)) for config in ready):
+            return await self._connect_all_unlocked(ready, secrets=secrets)
+        return await self._connect_all_unlocked(ready)
 
     async def adopt_process(
         self,
@@ -4751,6 +5298,9 @@ class ClientManager:
             Exception: If MCP initialization fails
         """
         self._refuse_adoption_if_abandoned(name)
+        # The adopted process runs this config: it is THE one for the name
+        # (plan 3.5, #499 r1 G1).
+        self.publish_config(config)
         # Read the group now, while the leader is alive (or an unreaped
         # zombie): a leader that exits during the wait can then still have
         # its descendants killed through the retained id (codex round 7).
@@ -5366,7 +5916,7 @@ class ClientManager:
             timeout_ms=timeout_ms,
         )
 
-        return result
+        return redact_registered_in(result)
 
     async def get_prompt(
         self,
@@ -5403,7 +5953,7 @@ class ClientManager:
             timeout_ms=timeout_ms,
         )
 
-        return result
+        return redact_registered_in(result)
 
     def get_tool(self, tool_id: str) -> ToolInfo | None:
         """Get tool info by ID."""
